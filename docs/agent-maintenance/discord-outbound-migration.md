@@ -1,9 +1,10 @@
-# Discord Outbound Migration — Coverage Map (#1006 v3 / #1280 / #1436)
+# Discord Outbound Migration — Coverage Map (#1006 v3 / #1280 / #1436 / #1457)
 
-> Implementation refresh for #1436: v3 delivery is now live and
-> `dispatch_outbox` is the first direct v3 production callsite.
+> Implementation refresh for #1457: v3 delivery now covers dispatch outbox,
+> review followups, short manual/DM notifications, gateway placeholder sends,
+> and dispatch completion summaries directly.
 >
-> Last refreshed: 2026-04-29 (against `main` @ `c9583ccd`).
+> Last refreshed: 2026-04-30 (against `adk-1457` before merge).
 >
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 
@@ -19,7 +20,7 @@ on the v3 migration path?". It exists because the static analysis report
   delivery}.rs`, with a real `deliver_outbound` implementation in
   `delivery.rs`.
 
-As of #1436, "migrated_v3" means the callsite builds a v3
+As of #1457, "migrated_v3" means the callsite builds a v3
 `DiscordOutboundMessage` and calls `outbound::delivery::deliver_outbound`
 directly. "migrated_v2" means the callsite still uses the legacy facade, whose
 `deliver_outbound` is now a thin compatibility adapter over the v3 delivery
@@ -33,17 +34,17 @@ HTTP path.
 
 | Symbol | Path | Status | When to use |
 |---|---|---|---|
-| `DiscordOutboundMessage` (v3) | `outbound/message.rs:312` | active — first production caller is `dispatch_outbox` | All future sends/edits. Carries `OutboundDeliveryId` (mandatory `correlation_id` + `semantic_event_id`), `OutboundTarget`, `OutboundOperation`, `DiscordOutboundPolicy`. |
-| `OutboundTarget::{Channel, Thread, DmUser}` | `outbound/message.rs:82` | active for channel delivery | Replaces legacy `(channel_id, Option<thread_id>)` pair with sum type. `DmUser` removes the manual `create_dm_channel` step once that path migrates. |
+| `DiscordOutboundMessage` (v3) | `outbound/message.rs:312` | active — multiple production callers | All future sends/edits. Carries `OutboundDeliveryId` (mandatory `correlation_id` + `semantic_event_id`), `OutboundTarget`, `OutboundOperation`, `DiscordOutboundPolicy`. |
+| `OutboundTarget::{Channel, Thread, DmUser}` | `outbound/message.rs:82` | active for channel, thread, and DM delivery | Replaces legacy `(channel_id, Option<thread_id>)` pair with sum type. `DmUser` lets v3 resolve/create the DM channel through `DiscordOutboundClient::resolve_dm_channel`. |
 | `OutboundOperation::{Send, Edit{message_id}}` | `outbound/message.rs:125` | active through v3 and legacy adapter | Encodes send-vs-edit at the type level (legacy used `Option<edit_message_id>`). |
 | `OutboundDedupKey` | `outbound/message.rs:68` | active | Structured key that prevents `("a::b","c")` vs `("a","b::c")` collisions in the legacy delimiter-joined form. |
 | `decide_policy(...) -> DiscordOutboundPolicyDecision` | `outbound/decision.rs:133` | active pure planner | Pure function that turns a v3 message + policy into a delivery plan (split / fallback / dedup). Does not perform I/O. |
 | `DiscordOutboundPolicy` (v3 in `policy.rs`) | `outbound/policy.rs:57` | active | New policy with named presets, including `dispatch_outbox()`, `review_notification()`, and `preserve_inline_content()`. |
-| `DeliveryResult` | `outbound/result.rs:126` | active | Successor of legacy `DeliveryResult`; richer error/fallback tagging. |
-| **v3 delivery** `deliver_outbound<C>(...)` | `outbound/delivery.rs:42` | active | Executes the v3 message/policy/decision/result contract; currently reuses the legacy transport trait and deduper during migration. |
+| `DeliveryResult` | `outbound/result.rs:126` | active | Successor of legacy `DeliveryResult`; richer error/fallback tagging with ordered `DeliveredMessage` metadata. |
+| **v3 delivery** `deliver_outbound<C>(...)` | `outbound/delivery.rs:42` | active | Executes the v3 message/policy/decision/result contract; currently reuses the legacy transport trait and deduper during migration. Split delivery records ordered chunk metadata and duplicate replay preserves it. |
 | **Legacy bridge** `DiscordOutboundMessage` (v2) | `outbound/legacy.rs:159` | compatibility facade | Two-arg constructor `(channel_id, content)` + builder fluent. Older producers still route through this while their callsites migrate. |
 | **Legacy bridge** `deliver_outbound<C>(...)` | `outbound/legacy.rs:455` | compatibility adapter over v3 | Converts v2 message/policy inputs into v3 envelopes, delegates to `outbound::delivery`, then maps v3 results back to legacy result variants. |
-| `OutboundDeduper` | `outbound/legacy.rs:425` | active | In-memory `HashMap<key, message_id>` dedup; one static instance per producer (gateway / discord_io / dispatch / review / health). |
+| `OutboundDeduper` | `outbound/legacy.rs:425` | active | In-memory dedup store. v3 stores serialized `Vec<DeliveredMessage>`; the legacy facade still maps old single-message ids for compatibility. |
 
 Legacy re-exports remain in `outbound/mod.rs`; direct v3 callsites import from
 their submodule paths (`outbound::message`, `outbound::policy`,
@@ -62,9 +63,9 @@ and `outbound::delivery::deliver_outbound` directly.
 | Key | State | v3 ready? | Owner | Source of truth |
 |---|---|---|---|---|
 | `dispatch_outbox` | `migrated_v3` | yes | dispatch / outbox squad | §3.A |
-| `review_notifications` | `migrated_v2` | no | dispatch / review squad | §3.A |
-| `dm_reply` | `migrated_v2` (manual outbound path) | no | health / DM squad | §3.A |
-| `placeholder_sends` | `mixed` (gateway = `migrated_v2`; tmux watcher = `direct`; turn_bridge = `migrated_v2` via gateway) | no | tmux / turn-bridge squad | §3.A + §3.B.placeholder |
+| `review_notifications` | `migrated_v3` | yes | dispatch / review squad | §3.A |
+| `dm_reply` | `mixed` (short text = `migrated_v3`; oversize attachment/chunk shim = compatibility) | partial | health / DM squad | §3.A + §3.B.attachment |
+| `placeholder_sends` | `mixed` (gateway/turn_bridge = `migrated_v3`; tmux watcher = `direct`) | partial | tmux / turn-bridge squad | §3.A + §3.B.placeholder |
 | `dashboard_discord_proxy` | n/a (read-only) | not applicable | dashboard squad | §3.C |
 
 `mixed` for `placeholder_sends` is the load-bearing finding: any future
@@ -73,36 +74,47 @@ allowed", because the streaming rollover path in
 `services/discord/tmux.rs:4750-4900` legitimately bypasses outbound for
 order-preserving multi-message stream continuation (see §4 exclusions).
 
+`mixed` for `dm_reply` is intentionally narrow: sub-2k text now uses
+`OutboundTarget::DmUser(UserId)` and the v3 transport resolves the DM channel.
+Oversize `/api/send` and `/api/senddm` payloads still call the existing
+attachment/chunk helpers until v3 grows attachment-capable transport.
+
 ---
 
 ## 3. Callsite inventory
 
 ### 3.A Migrated through outbound `deliver_outbound`
 
-These callsites already use the unified API. `dispatch_outbox` is direct v3;
-the remaining rows still enter through the legacy compatibility facade, which
-delegates to the v3 delivery engine.
+These callsites already use the unified delivery engine. Rows marked
+`migrated_v3` build a v3 envelope and call `outbound::delivery` directly; rows
+marked `migrated_v2` still enter through the legacy facade, which delegates to
+the v3 delivery engine.
 
 | File:line | Producer | Notes |
 |---|---|---|
-| `src/server/routes/dispatches/discord_delivery.rs:722` (`post_dispatch_message_to_channel_with_delivery`) | `dispatch_outbox` | **migrated_v3**. Builds a v3 `DiscordOutboundMessage` with `OutboundTarget::Channel`, `DiscordOutboundPolicy::dispatch_outbox()`, and summary-based minimal fallback. Correlation = `dispatch:<id>`, semantic = `dispatch:<id>:notify`. |
-| `src/server/routes/dispatches/discord_delivery.rs:3093` (`send_review_result_message_via_http`) | `review_notifications` | Pass/Unknown verdict followups. Correlation = `review:<card_id>`, semantic = `review:<dispatch>:<verdict>:<api_base>`. Per-producer static `review_followup_deduper()`. |
+| `src/server/routes/dispatches/discord_delivery.rs:782` (`post_dispatch_message_to_channel_with_delivery`) | `dispatch_outbox` | **migrated_v3**. Builds a v3 `DiscordOutboundMessage` with `OutboundTarget::Channel`, `DiscordOutboundPolicy::dispatch_outbox()`, and summary-based minimal fallback. Correlation = `dispatch:<id>`, semantic = `dispatch:<id>:notify`. |
+| `src/server/routes/dispatches/discord_delivery.rs:3153` (`send_review_result_message_via_http`) | `review_notifications` | **migrated_v3**. Pass/Unknown verdict followups use `DiscordOutboundPolicy::review_notification()`. Correlation = `review:<card_id>`, semantic = `review:<dispatch>:<verdict>:<api_base>`. Per-producer static `review_followup_deduper()`. |
+| `src/server/routes/dispatches/outbox.rs:1124` (`post_dispatch_completion_summary`) | final dispatch thread callback | **migrated_v3**. Ensures the dispatch thread is postable, then posts the completion summary through v3 with a per-producer `dispatch_completion_summary_deduper()`. |
 | `src/services/issue_announcements.rs:334` (`send_issue_announcement_message`) | issue announcements | Legacy compatibility facade. Review-style policy and per-producer static `issue_announcement_deduper()`. |
 | `src/services/discord/discord_io.rs:423` (`deliver_channel_message`) | CLI text/DM helper | Used by `--discord-sendmessage` / `--discord-senddm` *after* the DM channel has been resolved. Static `discord_io_deduper`. |
-| `src/services/discord/health.rs:2373` (`deliver_manual_notification`) | manual `/api/send` + `dm_reply` | Wraps legacy `deliver_outbound` for sub-2 k-char content; over-limit content falls through to `post_text_attachment` (announce) or `deliver_chunked_manual_notification` (notify). DM path resolves `UserId::create_dm_channel` then re-enters this function. |
-| `src/services/discord/gateway.rs:333` (`send_intake_placeholder`) | `placeholder_sends` (intake) | Posts the `"..."` placeholder before a turn. Static `gateway_deduper`. |
-| `src/services/discord/gateway.rs:353` (`edit_outbound_message`) | `placeholder_sends` (edit) | Wraps `with_edit_message_id`. |
-| `src/services/discord/gateway.rs:379` (`TurnGateway::send_message`) | turn-bridge messages | Used by `turn_bridge/mod.rs` for rollover continuations. |
-| `src/services/discord/gateway.rs:398` (`TurnGateway::edit_message`) | turn-bridge edits | Used by `turn_bridge/mod.rs` for handoff, rollover freeze, snapshot, stable update, and terminal edit. Turn-bridge callsites are migrated transitively via the gateway. |
+| `src/services/discord/health.rs:2802` (`deliver_manual_notification`) | manual `/api/send` | **migrated_v3 for sub-2k text**. Over-limit content remains a compatibility shim to `post_text_attachment` (announce) or `deliver_chunked_manual_notification` (notify). |
+| `src/services/discord/health.rs:2873` (`deliver_manual_dm_notification`) | `dm_reply` / `/api/senddm` | **migrated_v3 for sub-2k text** using `OutboundTarget::DmUser(UserId)`. The v3 transport resolves the DM channel and duplicate delivery returns before a second resolve. Over-limit content keeps the compatibility attachment/chunk path. |
+| `src/services/discord/gateway.rs:359` (`send_intake_placeholder`) | `placeholder_sends` (intake) | **migrated_v3**. Posts the `"..."` placeholder before a turn via direct v3. Uses `preserve_inline_content().without_idempotency()` to preserve streaming behavior. |
+| `src/services/discord/gateway.rs:377` (`edit_outbound_message`) | `placeholder_sends` (edit) | **migrated_v3**. Encodes edit through `OutboundOperation::Edit`. |
+| `src/services/discord/gateway.rs:400` (`TurnGateway::{send_message, edit_message}`) | turn-bridge messages/edits | **migrated_v3 transitively via gateway**. Used for handoff, rollover freeze, snapshot, stable update, and terminal edit. |
 | `src/services/discord/monitoring_status.rs:131` (`update_status_banner`) | monitoring status | Status banner send + edit. `preserve_inline_content` policy. (#1175) |
 | `src/services/discord/meeting_orchestrator.rs:741, 799` (`deliver_meeting_notification`) | meeting status / cancel / parse-error | (#1175) |
 | `src/services/discord/outbound/legacy.rs:*` tests | n/a | 12 test callsites, ignored for coverage. |
 | `src/integration_tests/discord_flow/scenarios.rs:44, 55` | integration test harness | Mock-Discord roundtrip for §1.2 validation. |
 | `src/integration_tests/agents_setup_e2e.rs:259` | integration test | Wizard-ready E2E. |
 
-Total **direct migrated_v3 production callsites: 1** (`dispatch_outbox`).
-Remaining production outbound callsites are still legacy-facade callers
-(excluding tests). Verify with
+Total **direct migrated_v3 production families: 6** (`dispatch_outbox`,
+`review_notifications`, final dispatch completion summaries, short manual
+notifications, short manual DM notifications, and gateway/turn-bridge
+placeholder sends/edits).
+
+Remaining production outbound callsites still include legacy-facade callers
+and explicit compatibility shims (excluding tests). Verify with
 `rg -n 'deliver_outbound\(' src --type rust | rg -v 'integration_tests|outbound/legacy.rs'`.
 
 ### 3.B Direct sends (bypass outbound)
@@ -155,14 +167,16 @@ Total attachments-bucket: **7 callsites**.
 
 #### B.3 Long-message streaming (ordered continuation)
 
-The outbound contract models a single send/edit, not ordered chunk
-continuation. Splitting these would corrupt stream offset bookkeeping.
-Excluded by #1175.
+The v3 text contract can split one completed payload and returns ordered
+`DeliveredMessage` chunk metadata, including duplicate replay. It still does
+not model live streaming continuation, placeholder freeze, or offset
+bookkeeping. Those callsites remain excluded by #1175 until a dedicated
+stream/placeholder lifecycle contract lands.
 
 | File:line | Notes | Triage |
 |---|---|---|
-| `src/services/discord/formatting.rs:1944, 1960, 1963, 1991, 2046, 2153, 2210` (`send_long_message_raw`, `replace_long_message_raw`) | streaming chunker | **blocker**: needs a future contract variant that returns ordered chunk metadata. Out of scope for #1280. |
-| `src/services/discord/router/message_handler.rs:179, 1542, 1571, 2096, 2103, 3104, 3505, 3513, 3531, 3539, 3558, 3563, 3602` | watchdog / restore / upload notices | mixed — some are short, some forward to `send_long_message_raw`. Triage: **medium priority**; candidate for v3 once the chunker contract lands. |
+| `src/services/discord/formatting.rs:1944, 1960, 1963, 1991, 2046, 2153, 2210` (`send_long_message_raw`, `replace_long_message_raw`) | streaming chunker | **blocker**: needs a future streaming lifecycle variant, not just static split metadata. |
+| `src/services/discord/router/message_handler.rs:179, 1542, 1571, 2096, 2103, 3104, 3505, 3513, 3531, 3539, 3558, 3563, 3602` | watchdog / restore / upload notices | mixed — some are short, some forward to `send_long_message_raw`. Triage: **medium priority**; short notices can migrate now, streaming-forwarding paths wait for the lifecycle contract. |
 
 Total chunker-bucket: **20 callsites**.
 
@@ -209,8 +223,8 @@ These overlap with §B.3 in some places — counted once here.
 | `src/server/routes/messages.rs:61` (`create_message`) | INSERT into `messages` (postgres), not a Discord send |
 
 Dashboard never sends to Discord through these routes; the dashboard's send
-button hits `/api/discord/send` which is the manual outbound path covered
-under §3.A (`health.rs:2318`). **No migration needed.**
+button hits the manual outbound API, which is covered under §3.A
+(`health.rs:2802`). **No migration needed.**
 
 ---
 
@@ -221,24 +235,24 @@ under §3.A (`health.rs:2318`). **No migration needed.**
    `outbound::delivery::deliver_outbound` consumes
    `outbound::message::DiscordOutboundMessage`; `outbound/legacy.rs` is now a
    compatibility adapter; `dispatch_outbox` calls v3 directly.
-2. **Next — `review_notifications`.** Same shape as dispatch_outbox,
-   different policy preset. One callsite
-   (`server/routes/dispatches/discord_delivery.rs:3093`).
-3. **Gateway / turn-bridge.** Migrate
-   `services/discord/gateway.rs:285, 306, 335, 354`. Eight transitive turn-bridge
-   callers ride along.
-4. **Manual outbound (`health.rs` `/api/send` + `/api/senddm`).**
-   Includes the DM-channel resolve step. The `OutboundTarget::DmUser(UserId)`
-   v3 variant exists specifically for this; the deliver impl will own the
-   `create_dm_channel` step.
-5. **`discord_io.rs` CLI helpers.** Trivial after manual outbound.
-6. **monitoring_status + meeting_orchestrator.** Already
+2. **Landed in #1457 — review followups, dispatch completion summaries,
+   gateway/turn-bridge, and short manual/DM text.**
+   These callsites now build v3 envelopes directly. `OutboundTarget::DmUser`
+   owns the DM-channel resolve step for `/api/senddm` and duplicate replay uses
+   stored delivery metadata before resolving again.
+3. **Next — attachment-capable v3 transport.**
+   Remove the manual `/api/send` and `/api/senddm` over-2k compatibility shims
+   once v3 can send multipart attachment payloads or explicitly delegate to a
+   chunk/attachment transport variant.
+4. **`discord_io.rs` CLI helpers.** Trivial after attachment-capable transport
+   or after deciding that CLI file upload stays permanently out of scope.
+5. **monitoring_status + meeting_orchestrator.** Already
    migrated to legacy; mechanical port.
-7. **Direct-send candidates (low priority).** §B.1
+6. **Direct-send candidates (low priority).** §B.1
    intake-gate notices, §B.4 tmux lifecycle notices, §B.5 router announces.
    Each is a fixed short string; v3 buys consistent dedup keying.
-8. **Out of scope (separate follow-up issues recommended).**
-   - §B.3 streaming chunker — needs a v3 contract variant for ordered chunks.
+7. **Out of scope (separate follow-up issues recommended).**
+   - §B.3 streaming chunker — needs a v3 stream/placeholder lifecycle variant.
    - §B.4 tmux rollover freeze/post — needs the same contract variant plus a
      "placeholder lifecycle" sub-API.
    - §B.1 ACK / interaction replies — needs interaction-token modeling that
@@ -246,7 +260,25 @@ under §3.A (`health.rs:2318`). **No migration needed.**
 
 ---
 
-## 5. Guardrail proposal (DoD #4)
+## 5. Regression coverage
+
+- `src/services/discord/outbound/delivery.rs`:
+  `v3_split_duplicate_preserves_ordered_chunk_metadata` verifies static v3
+  split delivery preserves chunk order and duplicate replay metadata.
+- `src/services/discord/outbound/delivery.rs`:
+  `v3_dm_user_target_resolves_before_posting` verifies `OutboundTarget::DmUser`
+  resolves before first post and duplicate replay does not resolve the DM
+  channel again.
+- `src/services/discord/turn_bridge/mod.rs`:
+  `final_completion_delivery_stays_blocked_until_terminal_message_commits`
+  verifies final completion delivery remains blocked until the terminal Discord
+  message commit has happened.
+- `src/services/discord/health.rs`:
+  `manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve`
+  verifies `/api/senddm` short text uses v3 DM target semantics and preserves
+  the manual duplicate response contract.
+
+## 6. Guardrail proposal (DoD #4)
 
 To stop new callsites slipping back to direct sends, the recommended belt +
 braces:
@@ -269,7 +301,7 @@ braces:
        contract; #1175 exclusion)
      - §B.2 — file / attachment uploads (multipart path is out of scope
        for the v3 text-message surface)
-     - §B.3 — long-message streaming chunker, ordered-chunk continuation
+     - §B.3 — long-message streaming chunker / placeholder lifecycle
      - §B.4-rollover — tmux rollover freeze/post sequence dependent on
        chunker ordering
 
@@ -293,7 +325,7 @@ braces:
 
 ---
 
-## 6. Validation commands
+## 7. Validation commands
 
 Reproduce the inventory locally:
 
@@ -304,15 +336,18 @@ rg -n '\.send_message\(|\.say\(|\.edit_message\(' src/services/discord src/serve
 # Outbound-layer callsites
 rg -n 'deliver_outbound|DiscordOutboundMessage' src --type rust
 
-# v3 direct imports (dispatch_outbox should be present after #1436)
+# v3 direct imports (direct migrated_v3 callsites should be present after #1457)
 rg -n 'use crate::services::discord::outbound::(message|policy|decision|result|delivery)::' src
 ```
 
-Expected counts as of `c9583ccd` + #1436:
+Expected counts as of the #1457 refresh:
 
-- direct sends in `src/services/discord/**`: **131** matches across **26**
+- direct sends in `src/services/discord/**`: **133** matches across **26**
   files (this includes the explicitly-excluded ACK/attachment/streaming buckets).
 - direct sends in `src/server/routes/**`: **0**.
-- direct migrated_v3 production callsites: **1** (`dispatch_outbox`).
-- legacy-facade production callsites still remain; migrate them in the order
-  above.
+- direct migrated_v3 production families: **6** (`dispatch_outbox`,
+  `review_notifications`, final dispatch completion summaries, short manual
+  notifications, short manual DM notifications, gateway/turn-bridge
+  placeholder sends/edits).
+- legacy-facade production callsites and explicit compatibility shims still
+  remain; migrate them in the order above.

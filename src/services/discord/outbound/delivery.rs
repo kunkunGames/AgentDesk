@@ -68,20 +68,33 @@ where
     let limits = overrides.limits.unwrap_or_default();
     let decision = decide_policy_with_limits(&message, limits);
     let dedup_key = decision.dedup_key.clone();
+    let store_key = dedup_store_key(&dedup_key);
+
+    let stored_duplicate = if message.policy.idempotency_window > Duration::ZERO {
+        dedup.lookup(&store_key)
+    } else {
+        None
+    };
+    if let Some(stored) = stored_duplicate.as_deref() {
+        if let Some(messages) = decode_stored_delivered_messages(stored) {
+            return DeliveryResult::Duplicate {
+                dedup_key,
+                existing_messages: messages,
+            };
+        }
+    }
+
     let (target_channel, delivered_channel_id) =
-        match resolve_primary_delivery_target(&decision.primary_target, &overrides) {
+        match resolve_primary_delivery_target(client, &decision.primary_target, &overrides).await {
             Ok(target) => target,
             Err(reason) => return DeliveryResult::PermanentFailure { reason },
         };
 
-    if message.policy.idempotency_window > Duration::ZERO {
-        let store_key = dedup_store_key(&dedup_key);
-        if let Some(stored) = dedup.lookup(&store_key) {
-            return DeliveryResult::Duplicate {
-                dedup_key,
-                existing_messages: decode_delivered_messages(&stored, delivered_channel_id),
-            };
-        }
+    if let Some(stored) = stored_duplicate {
+        return DeliveryResult::Duplicate {
+            dedup_key,
+            existing_messages: decode_legacy_delivered_messages(&stored, delivered_channel_id),
+        };
     }
 
     match decision.length {
@@ -365,10 +378,14 @@ fn resolve_reference(
     })
 }
 
-fn resolve_primary_delivery_target(
+async fn resolve_primary_delivery_target<C>(
+    client: &C,
     primary_target: &PrimaryDeliveryTarget,
     overrides: &DeliveryTransportOverrides,
-) -> Result<(String, ChannelId), String> {
+) -> Result<(String, ChannelId), String>
+where
+    C: DiscordOutboundClient,
+{
     if let Some(target) = overrides.target_channel.as_ref() {
         return Ok((target.clone(), parse_channel_id_lossy(target)));
     }
@@ -376,10 +393,16 @@ fn resolve_primary_delivery_target(
         PrimaryDeliveryTarget::Channel(channel_id) => {
             Ok((channel_id.get().to_string(), *channel_id))
         }
-        PrimaryDeliveryTarget::DmUser(user_id) => Err(format!(
-            "v3 DmUser delivery for {} requires a DM-resolving transport",
-            user_id.get()
-        )),
+        PrimaryDeliveryTarget::DmUser(user_id) => {
+            let target_channel = client
+                .resolve_dm_channel(&user_id.get().to_string())
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((
+                target_channel.clone(),
+                parse_channel_id_lossy(&target_channel),
+            ))
+        }
     }
 }
 
@@ -422,20 +445,22 @@ fn dedup_store_key(dedup_key: &OutboundDedupKey) -> String {
 }
 
 fn encode_delivered_messages(messages: &[DeliveredMessage]) -> String {
-    let raw: Vec<&str> = messages
-        .iter()
-        .map(|message| message.raw_message_id.as_str())
-        .collect();
-    serde_json::to_string(&raw).unwrap_or_default()
+    serde_json::to_string(messages).unwrap_or_default()
 }
 
-fn decode_delivered_messages(stored: &str, channel_id: ChannelId) -> Vec<DeliveredMessage> {
+fn decode_stored_delivered_messages(stored: &str) -> Option<Vec<DeliveredMessage>> {
+    let messages = serde_json::from_str::<Vec<DeliveredMessage>>(stored).ok()?;
+    (!messages.is_empty()).then_some(messages)
+}
+
+fn decode_legacy_delivered_messages(stored: &str, channel_id: ChannelId) -> Vec<DeliveredMessage> {
     match serde_json::from_str::<Vec<String>>(stored) {
         Ok(raw_ids) if !raw_ids.is_empty() => raw_ids
             .into_iter()
             .map(|raw| DeliveredMessage::single_raw(channel_id, raw))
             .collect(),
-        _ => vec![DeliveredMessage::single_raw(channel_id, stored)],
+        Ok(_) => Vec::new(),
+        Err(_) => vec![DeliveredMessage::single_raw(channel_id, stored)],
     }
 }
 
@@ -482,7 +507,7 @@ fn split_content(content: &str, chunk_limit: usize) -> Vec<String> {
     chunks
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
@@ -492,6 +517,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockClient {
         posts: Arc<Mutex<Vec<(String, String)>>>,
+        dm_resolutions: Arc<Mutex<Vec<String>>>,
         length_failures_remaining: Arc<Mutex<usize>>,
     }
 
@@ -502,6 +528,10 @@ mod tests {
 
         fn posts(&self) -> Vec<(String, String)> {
             self.posts.lock().unwrap().clone()
+        }
+
+        fn dm_resolutions(&self) -> Vec<String> {
+            self.dm_resolutions.lock().unwrap().clone()
         }
     }
 
@@ -524,6 +554,17 @@ mod tests {
                 ));
             }
             Ok(format!("msg-{target_channel}-{}", content.chars().count()))
+        }
+
+        async fn resolve_dm_channel(
+            &self,
+            user_id: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            self.dm_resolutions
+                .lock()
+                .unwrap()
+                .push(user_id.to_string());
+            Ok(format!("9{user_id}"))
         }
     }
 
@@ -585,5 +626,101 @@ mod tests {
             other => panic!("expected duplicate, got {other:?}"),
         }
         assert_eq!(client.posts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn v3_split_duplicate_preserves_ordered_chunk_metadata() {
+        let client = MockClient::default();
+        let dedup = OutboundDeduper::new();
+        let make = || {
+            DiscordOutboundMessage::new(
+                "dispatch:split",
+                "dispatch:split:final",
+                "ABCDEFGHIJK",
+                OutboundTarget::Channel(ChannelId::new(123)),
+                DiscordOutboundPolicy::default(),
+            )
+        };
+        let overrides = DeliveryTransportOverrides {
+            limits: Some(OutboundPolicyLimits::for_tests(4)),
+            ..DeliveryTransportOverrides::default()
+        };
+
+        let first =
+            deliver_outbound_with_overrides(&client, &dedup, make(), overrides.clone()).await;
+        match first {
+            DeliveryResult::Fallback {
+                messages,
+                fallback_used,
+                ..
+            } => {
+                assert_eq!(fallback_used, FallbackUsed::LengthSplit);
+                assert_eq!(messages.len(), 3);
+                assert_eq!(
+                    messages
+                        .iter()
+                        .map(|message| (message.chunk_index, message.chunk_count))
+                        .collect::<Vec<_>>(),
+                    vec![(Some(0), Some(3)), (Some(1), Some(3)), (Some(2), Some(3))]
+                );
+            }
+            other => panic!("expected split fallback, got {other:?}"),
+        }
+
+        let second = deliver_outbound_with_overrides(&client, &dedup, make(), overrides).await;
+        match second {
+            DeliveryResult::Duplicate {
+                existing_messages, ..
+            } => {
+                assert_eq!(
+                    existing_messages
+                        .iter()
+                        .map(|message| (message.chunk_index, message.chunk_count))
+                        .collect::<Vec<_>>(),
+                    vec![(Some(0), Some(3)), (Some(1), Some(3)), (Some(2), Some(3))]
+                );
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        }
+        assert_eq!(
+            client.posts(),
+            vec![
+                ("123".to_string(), "ABCD".to_string()),
+                ("123".to_string(), "EFGH".to_string()),
+                ("123".to_string(), "IJK".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn v3_dm_user_target_resolves_before_posting() {
+        let client = MockClient::default();
+        let dedup = OutboundDeduper::new();
+        let make = || {
+            DiscordOutboundMessage::new(
+                "dm:7",
+                "dm:7:hello",
+                "hello",
+                OutboundTarget::DmUser(poise::serenity_prelude::UserId::new(7)),
+                DiscordOutboundPolicy::review_notification(),
+            )
+        };
+
+        let result = deliver_outbound(&client, &dedup, make()).await;
+
+        assert!(matches!(result, DeliveryResult::Sent { .. }));
+        assert_eq!(client.dm_resolutions(), vec!["7".to_string()]);
+        assert_eq!(
+            client.posts(),
+            vec![("97".to_string(), "hello".to_string())]
+        );
+
+        let duplicate = deliver_outbound(&client, &dedup, make()).await;
+        assert!(matches!(duplicate, DeliveryResult::Duplicate { .. }));
+        assert_eq!(client.dm_resolutions(), vec!["7".to_string()]);
+        assert_eq!(
+            client.posts(),
+            vec![("97".to_string(), "hello".to_string())]
+        );
     }
 }

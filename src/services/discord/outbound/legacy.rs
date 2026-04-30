@@ -418,6 +418,14 @@ pub(crate) trait DiscordOutboundClient: Send + Sync {
             ),
         ))
     }
+
+    /// Resolve or create the DM channel for a Discord user id.
+    async fn resolve_dm_channel(&self, user_id: &str) -> Result<String, DispatchMessagePostError> {
+        Err(DispatchMessagePostError::new(
+            DispatchMessagePostErrorKind::Other,
+            format!("outbound client does not support DM channel resolution for user {user_id}"),
+        ))
+    }
 }
 
 /// In-memory dedup table keyed on `correlation_id::semantic_event_id`. The
@@ -581,6 +589,56 @@ impl DiscordOutboundClient for HttpOutboundClient {
             content,
         )
         .await
+    }
+
+    async fn resolve_dm_channel(&self, user_id: &str) -> Result<String, DispatchMessagePostError> {
+        let url = crate::server::routes::dispatches::discord_delivery::discord_api_url(
+            &self.discord_api_base,
+            "/users/@me/channels",
+        );
+        let response = self
+            .client
+            .post(url)
+            .header("Authorization", format!("Bot {}", self.token))
+            .json(&serde_json::json!({ "recipient_id": user_id }))
+            .send()
+            .await
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("failed to resolve DM channel for user {user_id}: {error}"),
+                )
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(DispatchMessagePostError::new(
+                DispatchMessagePostErrorKind::Other,
+                format!("failed to resolve DM channel for user {user_id}: HTTP {status} {body}"),
+            ));
+        }
+
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("failed to parse DM channel response for user {user_id}: {error}"),
+                )
+            })?;
+        body.get("id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("DM channel response for user {user_id} omitted channel id"),
+                )
+            })
     }
 }
 

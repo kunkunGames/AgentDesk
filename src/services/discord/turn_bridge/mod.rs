@@ -729,6 +729,26 @@ mod terminal_delivery_gate_tests {
     }
 
     #[test]
+    fn final_completion_delivery_stays_blocked_until_terminal_message_commits() {
+        assert!(!should_complete_work_dispatch_after_terminal_delivery(
+            true,
+            false,
+            false,
+            false,
+            false,
+            "final response waiting for Discord delivery",
+        ));
+        assert!(should_complete_work_dispatch_after_terminal_delivery(
+            true,
+            true,
+            false,
+            false,
+            false,
+            "final response delivered",
+        ));
+    }
+
+    #[test]
     fn transport_error_dispatch_failure_requires_terminal_delivery_commit() {
         assert!(should_fail_dispatch_after_terminal_delivery(
             true, true, false,

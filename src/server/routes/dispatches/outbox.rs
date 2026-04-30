@@ -1127,6 +1127,13 @@ async fn post_dispatch_completion_summary(
     message: &str,
     config: &DispatchFollowupConfig,
 ) -> Result<(), String> {
+    use crate::services::discord::outbound::HttpOutboundClient;
+    use crate::services::discord::outbound::delivery::deliver_outbound;
+    use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
+    use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+    use crate::services::discord::outbound::result::DeliveryResult;
+    use poise::serenity_prelude::ChannelId;
+
     let Some(token) = config.notify_bot_token.as_deref() else {
         return Err("no notify bot token".to_string());
     };
@@ -1134,25 +1141,42 @@ async fn post_dispatch_completion_summary(
     let client = reqwest::Client::new();
     ensure_thread_is_postable(&client, token, &config.discord_api_base, thread_id).await?;
 
-    let message_url = discord_api_url(
-        &config.discord_api_base,
-        &format!("/channels/{thread_id}/messages"),
+    let target_channel_id = thread_id
+        .parse::<u64>()
+        .map(ChannelId::new)
+        .map_err(|error| format!("invalid dispatch summary thread id {thread_id}: {error}"))?;
+    let outbound_client =
+        HttpOutboundClient::new(client, token.to_string(), config.discord_api_base.clone());
+    let outbound_msg = DiscordOutboundMessage::new(
+        format!("dispatch:{dispatch_id}"),
+        format!("dispatch:{dispatch_id}:completion-summary"),
+        message,
+        OutboundTarget::Channel(target_channel_id),
+        DiscordOutboundPolicy::review_notification(),
     );
-    let response = client
-        .post(&message_url)
-        .header("Authorization", format!("Bot {}", token))
-        .json(&serde_json::json!({"content": message}))
-        .send()
-        .await
-        .map_err(|err| format!("failed to post dispatch summary for {dispatch_id}: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "failed to post dispatch summary for {dispatch_id}: HTTP {}",
-            response.status()
-        ));
-    }
 
-    Ok(())
+    match deliver_outbound(
+        &outbound_client,
+        dispatch_completion_summary_deduper(),
+        outbound_msg,
+    )
+    .await
+    {
+        DeliveryResult::Sent { .. }
+        | DeliveryResult::Fallback { .. }
+        | DeliveryResult::Duplicate { .. }
+        | DeliveryResult::Skip { .. } => Ok(()),
+        DeliveryResult::PermanentFailure { reason } => Err(format!(
+            "failed to post dispatch summary for {dispatch_id}: {reason}"
+        )),
+    }
+}
+
+fn dispatch_completion_summary_deduper()
+-> &'static crate::services::discord::outbound::OutboundDeduper {
+    static DEDUPER: std::sync::OnceLock<crate::services::discord::outbound::OutboundDeduper> =
+        std::sync::OnceLock::new();
+    DEDUPER.get_or_init(crate::services::discord::outbound::OutboundDeduper::new)
 }
 
 async fn archive_dispatch_thread(

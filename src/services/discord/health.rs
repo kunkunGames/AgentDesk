@@ -19,9 +19,14 @@ use crate::db::Db;
 use crate::server::routes::dispatches::discord_delivery::{
     DispatchMessagePostError, DispatchMessagePostErrorKind,
 };
+use crate::services::discord::outbound::delivery::{
+    deliver_outbound as deliver_v3_outbound, first_raw_message_id,
+};
+use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
+use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+use crate::services::discord::outbound::result::{DeliveryResult, FallbackUsed};
 use crate::services::discord::outbound::{
-    DISCORD_HARD_LIMIT_CHARS, DISCORD_SAFE_LIMIT_CHARS, DeliveryResult, DiscordOutboundClient,
-    DiscordOutboundMessage, DiscordOutboundPolicy, FallbackKind, OutboundDeduper, deliver_outbound,
+    DISCORD_HARD_LIMIT_CHARS, DISCORD_SAFE_LIMIT_CHARS, DiscordOutboundClient, OutboundDeduper,
 };
 use crate::services::provider::ProviderKind;
 
@@ -2738,6 +2743,28 @@ impl DiscordOutboundClient for SerenityManualOutboundClient {
                 DispatchMessagePostError::new(kind, detail)
             })
     }
+
+    async fn resolve_dm_channel(&self, user_id: &str) -> Result<String, DispatchMessagePostError> {
+        let user_id = user_id
+            .parse::<u64>()
+            .map(serenity::UserId::new)
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("invalid Discord user id {user_id}: {error}"),
+                )
+            })?;
+        user_id
+            .create_dm_channel(&*self.http)
+            .await
+            .map(|channel| channel.id.get().to_string())
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("DM channel creation failed: {error}"),
+                )
+            })
+    }
 }
 
 trait ManualOutboundClient: DiscordOutboundClient {
@@ -2808,6 +2835,8 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
 
     let content_len = content.chars().count();
     if content_len > DISCORD_HARD_LIMIT_CHARS {
+        // Compatibility shim: v3 text delivery does not yet own attachment
+        // upload or manual chunk-posting for over-2k `/api/send` payloads.
         let result = match if bot == "announce" {
             client
                 .post_text_attachment(channel_id, content, summary)
@@ -2832,58 +2861,189 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
         return result;
     }
 
-    if content_len > DISCORD_SAFE_LIMIT_CHARS {
-        let result = match client.post_message(channel_id, content).await {
-            Ok(message_id) => ManualDeliveryOutcome::Sent {
-                message_id,
-                delivery: None,
-            },
+    let target_channel = match parse_channel_id_for_manual(channel_id) {
+        Ok(channel_id) => channel_id,
+        Err(outcome) => return outcome,
+    };
+    let result = deliver_manual_v3_text(
+        client,
+        dedup,
+        OutboundTarget::Channel(target_channel),
+        channel_id,
+        content,
+        summary,
+        delivery_id,
+        content_len > DISCORD_SAFE_LIMIT_CHARS,
+    )
+    .await;
+    record_manual_delivery_success(dedup, dedup_key.as_deref(), &result);
+    result
+}
+
+async fn deliver_manual_dm_notification<C: ManualOutboundClient>(
+    client: &C,
+    dedup: &OutboundDeduper,
+    user_id: u64,
+    content: &str,
+    bot: &str,
+    summary: Option<&str>,
+    delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+) -> ManualDeliveryOutcome {
+    let dedup_key = delivery_id.map(|delivery_id| {
+        format!(
+            "{}::{}",
+            delivery_id.correlation_id, delivery_id.semantic_event_id
+        )
+    });
+    if let Some(key) = dedup_key.as_deref() {
+        if dedup.lookup(key).is_some() {
+            return ManualDeliveryOutcome::Sent {
+                message_id: String::new(),
+                delivery: Some("duplicate"),
+            };
+        }
+    }
+
+    let content_len = content.chars().count();
+    if content_len > DISCORD_HARD_LIMIT_CHARS {
+        // Compatibility shim: keep the existing attachment/chunk behavior for
+        // oversize DM payloads while v3 owns the DM channel resolution.
+        let dm_channel = match client.resolve_dm_channel(&user_id.to_string()).await {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                return ManualDeliveryOutcome::Failed {
+                    detail: error.to_string(),
+                };
+            }
+        };
+        let result = match if bot == "announce" {
+            client
+                .post_text_attachment(&dm_channel, content, summary)
+                .await
+                .map(|message_id| ManualDeliveryOutcome::Sent {
+                    message_id,
+                    delivery: Some("summary+txt"),
+                })
+        } else {
+            deliver_chunked_manual_notification(client, &dm_channel, content).await
+        } {
+            Ok(outcome) => outcome,
             Err(error) => ManualDeliveryOutcome::Failed {
                 detail: error.to_string(),
             },
         };
-        if let ManualDeliveryOutcome::Sent { message_id, .. } = &result {
-            if let Some(key) = dedup_key.as_deref() {
-                dedup.record(key, message_id);
-            }
-        }
+        record_manual_delivery_success(dedup, dedup_key.as_deref(), &result);
         return result;
     }
 
-    let mut outbound_msg = DiscordOutboundMessage::new(channel_id, content);
-    if let Some(delivery_id) = delivery_id {
-        outbound_msg = outbound_msg
-            .with_correlation(delivery_id.correlation_id, delivery_id.semantic_event_id);
-    }
-    let policy = DiscordOutboundPolicy::review_notification(
-        summary
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    );
+    let result = deliver_manual_v3_text(
+        client,
+        dedup,
+        OutboundTarget::DmUser(serenity::UserId::new(user_id)),
+        &format!("dm:{user_id}"),
+        content,
+        summary,
+        delivery_id,
+        content_len > DISCORD_SAFE_LIMIT_CHARS,
+    )
+    .await;
+    record_manual_delivery_success(dedup, dedup_key.as_deref(), &result);
+    result
+}
 
-    match deliver_outbound(client, dedup, outbound_msg, policy).await {
-        DeliveryResult::Success { message_id } => ManualDeliveryOutcome::Sent {
-            message_id,
+async fn deliver_manual_v3_text<C: DiscordOutboundClient>(
+    client: &C,
+    dedup: &OutboundDeduper,
+    target: OutboundTarget,
+    target_label: &str,
+    content: &str,
+    summary: Option<&str>,
+    delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+    preserve_inline_content: bool,
+) -> ManualDeliveryOutcome {
+    let mut policy = if preserve_inline_content {
+        DiscordOutboundPolicy::preserve_inline_content()
+    } else {
+        DiscordOutboundPolicy::review_notification()
+    };
+    if delivery_id.is_none() {
+        policy = policy.without_idempotency();
+    }
+    let (correlation_id, semantic_event_id) = delivery_id
+        .map(|delivery_id| {
+            (
+                delivery_id.correlation_id.to_string(),
+                delivery_id.semantic_event_id.to_string(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                format!("manual:no-idempotency:{target_label}"),
+                "manual:no-idempotency".to_string(),
+            )
+        });
+    let mut outbound_msg =
+        DiscordOutboundMessage::new(correlation_id, semantic_event_id, content, target, policy);
+    if let Some(summary) = summary.map(str::trim).filter(|value| !value.is_empty()) {
+        outbound_msg = outbound_msg.with_summary(summary.to_string());
+    }
+
+    match deliver_v3_outbound(client, dedup, outbound_msg).await {
+        DeliveryResult::Sent { messages, .. } => ManualDeliveryOutcome::Sent {
+            message_id: first_raw_message_id(&messages).unwrap_or_default(),
             delivery: None,
         },
-        DeliveryResult::Fallback { message_id, kind } => ManualDeliveryOutcome::Sent {
-            message_id,
-            delivery: Some(match kind {
-                FallbackKind::Truncated => "truncated",
-                FallbackKind::MinimalFallback => "minimal_fallback",
+        DeliveryResult::Fallback {
+            messages,
+            fallback_used,
+            ..
+        } => ManualDeliveryOutcome::Sent {
+            message_id: first_raw_message_id(&messages).unwrap_or_default(),
+            delivery: Some(match fallback_used {
+                FallbackUsed::LengthCompacted => "truncated",
+                FallbackUsed::MinimalFallback => "minimal_fallback",
+                FallbackUsed::LengthSplit => "chunked",
+                FallbackUsed::FileAttachment => "summary+txt",
+                FallbackUsed::ParentChannel => "parent_channel",
             }),
         },
         DeliveryResult::Duplicate { .. } => ManualDeliveryOutcome::Sent {
             message_id: String::new(),
             delivery: Some("duplicate"),
         },
-        DeliveryResult::Skipped { .. } => ManualDeliveryOutcome::Sent {
+        DeliveryResult::Skip { .. } => ManualDeliveryOutcome::Sent {
             message_id: String::new(),
             delivery: Some("skipped"),
         },
-        DeliveryResult::PermanentFailure { detail } => ManualDeliveryOutcome::Failed { detail },
+        DeliveryResult::PermanentFailure { reason } => {
+            ManualDeliveryOutcome::Failed { detail: reason }
+        }
     }
+}
+
+fn record_manual_delivery_success(
+    dedup: &OutboundDeduper,
+    dedup_key: Option<&str>,
+    result: &ManualDeliveryOutcome,
+) {
+    let ManualDeliveryOutcome::Sent { message_id, .. } = result else {
+        return;
+    };
+    if message_id.is_empty() {
+        return;
+    }
+    if let Some(key) = dedup_key {
+        dedup.record(key, message_id);
+    }
+}
+
+fn parse_channel_id_for_manual(channel_id: &str) -> Result<ChannelId, ManualDeliveryOutcome> {
+    channel_id
+        .parse::<u64>()
+        .map(ChannelId::new)
+        .map_err(|error| ManualDeliveryOutcome::Failed {
+            detail: format!("invalid discord channel id {channel_id}: {error}"),
+        })
 }
 
 async fn deliver_chunked_manual_notification<C: ManualOutboundClient>(
@@ -3247,55 +3407,44 @@ pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static s
     let user_id_text = request.user_id.to_string();
     let dm_delivery_id = request.delivery_id();
 
-    use poise::serenity_prelude::UserId;
-    let user_id = UserId::new(request.user_id);
-    match user_id.create_dm_channel(&*http).await {
-        Ok(dm_channel) => match deliver_manual_notification(
-            &SerenityManualOutboundClient { http },
-            manual_notification_deduper(),
-            &dm_channel.id.get().to_string(),
-            &request.content,
-            &request.bot,
-            None,
-            dm_delivery_id
-                .as_ref()
-                .map(|delivery_id| ManualOutboundDeliveryId {
-                    correlation_id: &delivery_id.0,
-                    semantic_event_id: &delivery_id.1,
-                }),
-        )
-        .await
-        {
-            ManualDeliveryOutcome::Sent {
-                message_id,
-                delivery,
-            } => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 📨 DM: → user {} via shared outbound",
-                    request.user_id
-                );
-                let mut response = serde_json::json!({
-                    "ok": true,
-                    "user_id": user_id_text,
-                    "message_id": message_id,
-                });
-                if let Some(delivery) = delivery {
-                    response["delivery"] = serde_json::Value::String(delivery.to_string());
-                }
-                ("200 OK", response.to_string())
+    match deliver_manual_dm_notification(
+        &SerenityManualOutboundClient { http },
+        manual_notification_deduper(),
+        request.user_id,
+        &request.content,
+        &request.bot,
+        None,
+        dm_delivery_id
+            .as_ref()
+            .map(|delivery_id| ManualOutboundDeliveryId {
+                correlation_id: &delivery_id.0,
+                semantic_event_id: &delivery_id.1,
+            }),
+    )
+    .await
+    {
+        ManualDeliveryOutcome::Sent {
+            message_id,
+            delivery,
+        } => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 📨 DM: → user {} via shared outbound",
+                request.user_id
+            );
+            let mut response = serde_json::json!({
+                "ok": true,
+                "user_id": user_id_text,
+                "message_id": message_id,
+            });
+            if let Some(delivery) = delivery {
+                response["delivery"] = serde_json::Value::String(delivery.to_string());
             }
-            ManualDeliveryOutcome::Failed { detail } => (
-                "500 Internal Server Error",
-                format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
-            ),
-        },
-        Err(e) => (
+            ("200 OK", response.to_string())
+        }
+        ManualDeliveryOutcome::Failed { detail } => (
             "500 Internal Server Error",
-            format!(
-                r#"{{"ok":false,"error":"DM channel creation failed: {}"}}"#,
-                e
-            ),
+            format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
         ),
     }
 }
@@ -3774,6 +3923,115 @@ fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str>
     Ok((target, content, source))
 }
 
+#[cfg(test)]
+mod manual_v3_delivery_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct MockManualOutboundClient {
+        posts: Arc<Mutex<Vec<String>>>,
+        post_targets: Arc<Mutex<Vec<String>>>,
+        dm_resolutions: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DiscordOutboundClient for MockManualOutboundClient {
+        async fn post_message(
+            &self,
+            target_channel: &str,
+            content: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            let mut posts = self.posts.lock().unwrap();
+            self.post_targets
+                .lock()
+                .unwrap()
+                .push(target_channel.to_string());
+            posts.push(content.to_string());
+            Ok(format!("message-{}", posts.len()))
+        }
+
+        async fn resolve_dm_channel(
+            &self,
+            user_id: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            self.dm_resolutions
+                .lock()
+                .unwrap()
+                .push(user_id.to_string());
+            Ok("9876".to_string())
+        }
+    }
+
+    impl ManualOutboundClient for MockManualOutboundClient {
+        async fn post_text_attachment(
+            &self,
+            _target_channel: &str,
+            _content: &str,
+            _summary: Option<&str>,
+        ) -> Result<String, DispatchMessagePostError> {
+            Ok("attachment-message-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let delivery_id = ManualOutboundDeliveryId {
+            correlation_id: "senddm:42",
+            semantic_event_id: "senddm:42:hello",
+        };
+
+        let first = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+        let second = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+
+        assert_eq!(
+            first,
+            ManualDeliveryOutcome::Sent {
+                message_id: "message-1".to_string(),
+                delivery: None
+            }
+        );
+        assert_eq!(
+            second,
+            ManualDeliveryOutcome::Sent {
+                message_id: String::new(),
+                delivery: Some("duplicate")
+            }
+        );
+        assert_eq!(
+            client.dm_resolutions.lock().unwrap().clone(),
+            vec!["42".to_string()]
+        );
+        assert_eq!(
+            client.post_targets.lock().unwrap().clone(),
+            vec!["9876".to_string()]
+        );
+        assert_eq!(
+            client.posts.lock().unwrap().clone(),
+            vec!["hello".to_string()]
+        );
+    }
+}
+
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
@@ -3879,18 +4137,35 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockManualOutboundClient {
         posts: Arc<std::sync::Mutex<Vec<String>>>,
+        post_targets: Arc<std::sync::Mutex<Vec<String>>>,
+        dm_resolutions: Arc<std::sync::Mutex<Vec<String>>>,
         attachments: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
     }
 
     impl DiscordOutboundClient for MockManualOutboundClient {
         async fn post_message(
             &self,
-            _target_channel: &str,
+            target_channel: &str,
             content: &str,
         ) -> Result<String, DispatchMessagePostError> {
             let mut posts = self.posts.lock().unwrap();
+            self.post_targets
+                .lock()
+                .unwrap()
+                .push(target_channel.to_string());
             posts.push(content.to_string());
             Ok(format!("message-{}", posts.len()))
+        }
+
+        async fn resolve_dm_channel(
+            &self,
+            user_id: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            self.dm_resolutions
+                .lock()
+                .unwrap()
+                .push(user_id.to_string());
+            Ok("9876".to_string())
         }
     }
 
@@ -3989,6 +4264,64 @@ mod tests {
             }
         );
         assert_eq!(client.posts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let delivery_id = ManualOutboundDeliveryId {
+            correlation_id: "senddm:42",
+            semantic_event_id: "senddm:42:hello",
+        };
+
+        let first = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+        let second = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+
+        assert_eq!(
+            first,
+            ManualDeliveryOutcome::Sent {
+                message_id: "message-1".to_string(),
+                delivery: None
+            }
+        );
+        assert_eq!(
+            second,
+            ManualDeliveryOutcome::Sent {
+                message_id: String::new(),
+                delivery: Some("duplicate")
+            }
+        );
+        assert_eq!(
+            client.dm_resolutions.lock().unwrap().clone(),
+            vec!["42".to_string()]
+        );
+        assert_eq!(
+            client.post_targets.lock().unwrap().clone(),
+            vec!["9876".to_string()]
+        );
+        assert_eq!(
+            client.posts.lock().unwrap().clone(),
+            vec!["hello".to_string()]
+        );
     }
 
     #[tokio::test]

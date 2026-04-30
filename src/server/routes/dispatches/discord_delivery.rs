@@ -3161,12 +3161,15 @@ async fn send_review_result_message_via_http(
     token: &str,
     discord_api_base: &str,
 ) -> Result<(), String> {
-    // #1006 (secondary slice): review followup now routes through the
-    // unified outbound API so it inherits length-safety and dedup support.
-    use crate::services::discord::outbound::{
-        DeliveryResult, DiscordOutboundMessage, DiscordOutboundPolicy, HttpOutboundClient,
-        deliver_outbound,
-    };
+    // #1457: review followups use the v3 envelope directly so final
+    // notification delivery shares the same message/policy/result contract
+    // as dispatch outbox.
+    use crate::services::discord::outbound::HttpOutboundClient;
+    use crate::services::discord::outbound::delivery::deliver_outbound;
+    use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
+    use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+    use crate::services::discord::outbound::result::DeliveryResult;
+    use poise::serenity_prelude::ChannelId;
 
     let client = reqwest::Client::new();
     let target_channel = resolve_review_followup_target_channel(
@@ -3187,26 +3190,33 @@ async fn send_review_result_message_via_http(
         ReviewFollowupKind::Pass => "pass",
         ReviewFollowupKind::Unknown => "unknown",
     };
-    let outbound_msg = DiscordOutboundMessage::new(target_channel.clone(), message)
-        .with_correlation(
-            format!("review:{card_id}"),
-            format!("review:{review_dispatch_id}:{event_kind}:{discord_api_base}"),
-        );
-    let policy = DiscordOutboundPolicy::review_notification(None);
+    let target_channel_id = target_channel
+        .parse::<u64>()
+        .map(ChannelId::new)
+        .map_err(|error| {
+            format!("invalid review followup target channel {target_channel}: {error}")
+        })?;
+    let outbound_msg = DiscordOutboundMessage::new(
+        format!("review:{card_id}"),
+        format!("review:{review_dispatch_id}:{event_kind}:{discord_api_base}"),
+        message,
+        OutboundTarget::Channel(target_channel_id),
+        DiscordOutboundPolicy::review_notification(),
+    );
 
-    match deliver_outbound(&outbound_client, dedup, outbound_msg, policy).await {
-        DeliveryResult::Success { .. } | DeliveryResult::Fallback { .. } => Ok(()),
+    match deliver_outbound(&outbound_client, dedup, outbound_msg).await {
+        DeliveryResult::Sent { .. } | DeliveryResult::Fallback { .. } => Ok(()),
         DeliveryResult::Duplicate { .. } => {
             // Duplicate suppression is a success for the caller.
             Ok(())
         }
-        DeliveryResult::Skipped { .. } => Ok(()),
-        DeliveryResult::PermanentFailure { detail } => match kind {
+        DeliveryResult::Skip { .. } => Ok(()),
+        DeliveryResult::PermanentFailure { reason } => match kind {
             ReviewFollowupKind::Pass => Err(format!(
-                "discord request failed for pass notification: {detail}"
+                "discord request failed for pass notification: {reason}"
             )),
             ReviewFollowupKind::Unknown => Err(format!(
-                "discord request failed for unknown-verdict notification: {detail}"
+                "discord request failed for unknown-verdict notification: {reason}"
             )),
         },
     }
