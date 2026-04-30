@@ -32,6 +32,31 @@ impl Clone for LoadedRoutineScript {
 
 pub type RoutineScriptStore = Arc<Mutex<HashMap<String, LoadedRoutineScript>>>;
 
+pub const MAX_OBSERVATIONS_PER_TICK: usize = 100;
+pub const MAX_OBSERVATION_PAYLOAD_BYTES: usize = 65536;
+pub const MAX_AUTOMATION_INVENTORY_ITEMS: usize = 100;
+pub const MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES: usize = 32768;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationLimits {
+    pub max_observations_per_tick: usize,
+    pub max_observation_payload_bytes: usize,
+    pub max_automation_inventory_items: usize,
+    pub max_automation_inventory_payload_bytes: usize,
+}
+
+impl Default for ObservationLimits {
+    fn default() -> Self {
+        Self {
+            max_observations_per_tick: MAX_OBSERVATIONS_PER_TICK,
+            max_observation_payload_bytes: MAX_OBSERVATION_PAYLOAD_BYTES,
+            max_automation_inventory_items: MAX_AUTOMATION_INVENTORY_ITEMS,
+            max_automation_inventory_payload_bytes: MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RoutineTickContext {
     pub routine: RoutineTickRoutine,
@@ -39,6 +64,11 @@ pub struct RoutineTickContext {
     pub agent: Option<RoutineTickAgent>,
     pub checkpoint: Option<Value>,
     pub now: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observations: Option<Vec<Value>>,
+    #[serde(rename = "automationInventory", skip_serializing_if = "Option::is_none")]
+    pub automation_inventory: Option<Vec<Value>>,
+    pub limits: ObservationLimits,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -656,6 +686,9 @@ mod tests {
                     agent: None,
                     checkpoint: None,
                     now: chrono::Utc::now(),
+                    observations: None,
+                    automation_inventory: None,
+                    limits: ObservationLimits::default(),
                 },
             )
             .unwrap();
@@ -731,6 +764,9 @@ mod tests {
             }),
             checkpoint: None,
             now: chrono::Utc::now(),
+            observations: None,
+            automation_inventory: None,
+            limits: ObservationLimits::default(),
         };
 
         let idle_action = loader
@@ -806,6 +842,9 @@ mod tests {
                     agent: None,
                     checkpoint: None,
                     now: chrono::Utc::now(),
+                    observations: None,
+                    automation_inventory: None,
+                    limits: ObservationLimits::default(),
                 },
             )
             .unwrap_err();
@@ -846,6 +885,9 @@ mod tests {
             agent: None,
             checkpoint: None,
             now: chrono::Utc::now(),
+            observations: None,
+            automation_inventory: None,
+            limits: ObservationLimits::default(),
         };
 
         assert!(matches!(

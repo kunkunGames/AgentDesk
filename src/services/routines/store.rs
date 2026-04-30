@@ -496,6 +496,83 @@ impl RoutineStore {
         .map_err(|e| anyhow!("search routine run results: {e}"))
     }
 
+    /// Fetch recent routine run results formatted as bounded observation items.
+    ///
+    /// Used to populate `ctx.observations` in `RoutineTickContext` so JS routines
+    /// can accumulate evidence of recurring patterns without raw log or DB scanning.
+    /// Results are truncated to `max_items` and `max_payload_bytes` before return.
+    pub async fn fetch_recent_run_observations(
+        &self,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let limit = (max_items as i64).min(100);
+        let rows = sqlx::query(
+            r#"
+            SELECT rr.id,
+                   r.script_ref,
+                   r.name,
+                   rr.action,
+                   rr.status,
+                   rr.result_json,
+                   rr.error,
+                   rr.started_at
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.status IN ('succeeded', 'failed', 'skipped', 'error')
+              AND rr.started_at > NOW() - INTERVAL '24 hours'
+            ORDER BY rr.started_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch routine run observations: {e}"))?;
+
+        let mut observations = Vec::with_capacity(rows.len());
+        let mut total_bytes: usize = 0;
+
+        for row in &rows {
+            let id: String = row.try_get("id").unwrap_or_default();
+            let script_ref: String = row.try_get("script_ref").unwrap_or_default();
+            let name: String = row.try_get("name").unwrap_or_default();
+            let action: Option<String> = row.try_get("action").ok().flatten();
+            let status: String = row.try_get("status").unwrap_or_default();
+            let error: Option<String> = row.try_get("error").ok().flatten();
+            let started_at: DateTime<Utc> =
+                row.try_get("started_at").unwrap_or_else(|_| Utc::now());
+
+            let action_str = action.as_deref().unwrap_or("run");
+            let weight: u8 = if status == "failed" || status == "error" { 2 } else { 1 };
+            let summary = if let Some(ref err) = error {
+                let short_err = if err.len() > 120 { &err[..120] } else { err };
+                format!("{name} {action_str} {status}: {short_err}")
+            } else {
+                format!("{name} {action_str} {status}")
+            };
+
+            let obs = serde_json::json!({
+                "timestamp": started_at.to_rfc3339(),
+                "source": "routine_result",
+                "category": "routine-candidate",
+                "signature": format!("{script_ref}:{action_str}"),
+                "summary": summary,
+                "weight": weight,
+                "evidence_ref": format!("routine_run:{id}"),
+            });
+
+            let bytes = obs.to_string().len();
+            if total_bytes + bytes > max_payload_bytes {
+                break;
+            }
+            total_bytes += bytes;
+            observations.push(obs);
+        }
+
+        Ok(observations)
+    }
+
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
         validate_execution_strategy(&new_routine.execution_strategy)?;
         let schedule = normalize_schedule(new_routine.schedule)?;

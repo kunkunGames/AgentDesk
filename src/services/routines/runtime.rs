@@ -7,7 +7,8 @@ use super::action::RoutineAction;
 use super::agent_executor::RoutineAgentExecutor;
 use super::discord_log::RoutineDiscordLogger;
 use super::loader::{
-    RoutineScriptLoader, RoutineTickAgent, RoutineTickContext, RoutineTickRoutine, RoutineTickRun,
+    ObservationLimits, RoutineScriptLoader, RoutineTickAgent, RoutineTickContext,
+    RoutineTickRoutine, RoutineTickRun, MAX_OBSERVATION_PAYLOAD_BYTES, MAX_OBSERVATIONS_PER_TICK,
 };
 use super::store::{ClaimedRoutineRun, RoutineStore};
 
@@ -70,6 +71,15 @@ pub async fn execute_claimed_script_run(
 ) -> Result<Option<RoutineRunOutcome>> {
     let fresh_context_guaranteed = false;
     let agent = load_tick_agent_context(store, claimed.agent_id.as_deref()).await?;
+    let observations = store
+        .fetch_recent_run_observations(MAX_OBSERVATIONS_PER_TICK, MAX_OBSERVATION_PAYLOAD_BYTES)
+        .await
+        .unwrap_or_default();
+    let observations = if observations.is_empty() {
+        None
+    } else {
+        Some(observations)
+    };
     let context = RoutineTickContext {
         routine: RoutineTickRoutine {
             id: claimed.routine_id.clone(),
@@ -86,6 +96,9 @@ pub async fn execute_claimed_script_run(
         agent,
         checkpoint: claimed.checkpoint.clone(),
         now: chrono::Utc::now(),
+        observations,
+        automation_inventory: None,
+        limits: ObservationLimits::default(),
     };
 
     store.heartbeat_run(&claimed.run_id).await?;
