@@ -167,8 +167,17 @@ function buildSuppressedSet(cp, inventory) {
 }
 
 function dropSuppressedCandidates(cp, suppressedSet) {
-  for (const patternId of Object.keys(cp.candidates || {})) {
+  for (const [patternId, candidate] of Object.entries(cp.candidates || {})) {
     if (suppressedSet.has(patternId)) {
+      const s = candidate.state;
+      if (
+        (s === "accepted" && hasDurableAcceptance(candidate)) ||
+        s === "implemented" ||
+        s === "suppressed" ||
+        s === "rejected"
+      ) {
+        continue;
+      }
       delete cp.candidates[patternId];
     }
   }
@@ -534,15 +543,17 @@ ${handoffAcceptance}
 구현, 파일 수정, 서비스 재시작, memento 쓰기, PR/카드/이슈 생성은 금지합니다.
 이 요청은 제안 전용입니다.`;
 
-  if (raw.length <= PROMPT_CAP_BYTES) {
+  if (Buffer.byteLength(raw) <= PROMPT_CAP_BYTES) {
     return raw;
   }
 
   // Trim examples to fit cap
   const header = raw.split("## 근거 예시")[0];
   const footer = "\n\n## 지시사항\n" + raw.split("## 지시사항\n")[1];
-  const budget = PROMPT_CAP_BYTES - header.length - footer.length - 20;
-  const trimmedEvidence = evidenceLines.slice(0, Math.max(0, budget));
+  const budget = PROMPT_CAP_BYTES - Buffer.byteLength(header) - Buffer.byteLength(footer) - 20;
+  const trimmedEvidence = budget > 0 
+    ? Buffer.from(evidenceLines).slice(0, budget).toString('utf8').replace(/\uFFFD/g, '')
+    : "";
   return header + "## 근거 예시\n" + trimmedEvidence + footer;
 }
 
