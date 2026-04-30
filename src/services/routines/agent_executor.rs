@@ -262,12 +262,16 @@ impl RoutineAgentExecutor {
         }
 
         let metadata = Some(json!({
+            "agent_id": agent_id,
+            "delivery_bot": provider.as_str(),
             "routine_id": claimed.routine_id,
             "routine_run_id": claimed.run_id,
             "script_ref": claimed.script_ref,
             "execution_strategy": claimed.execution_strategy,
             "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
             "turn_id": turn_id.clone(),
+            "parent_channel_id": channel_id_num.to_string(),
+            "discord_thread_id": discord_thread_id,
         }));
         let channel_name_hint = primary_channel
             .chars()
@@ -304,7 +308,7 @@ impl RoutineAgentExecutor {
     ) -> Result<Option<AgentTurnCompletion>> {
         sqlx::query_as(
             r#"
-            SELECT assistant_message, duration_ms, created_at
+            SELECT assistant_message, duration_ms::bigint AS duration_ms, created_at
             FROM session_transcripts
             WHERE turn_id = $1
               AND created_at >= $2
@@ -359,7 +363,7 @@ impl RoutineAgentExecutor {
             .as_deref()
             .and_then(parse_channel_id)
         {
-            match validate_routine_thread(registry, provider_name, thread_id).await {
+            match validate_routine_thread(registry, provider_name, agent_id, thread_id).await {
                 Ok(()) => {
                     return Ok(RoutineThreadTarget {
                         channel_id: thread_id,
@@ -389,9 +393,10 @@ impl RoutineAgentExecutor {
         }
 
         let title = routine_thread_title(&claimed.name, agent_id);
-        let thread_id = create_routine_thread(registry, provider_name, parent_channel_id, &title)
-            .await
-            .map_err(|error| anyhow!("create routine discord thread: {error}"))?;
+        let thread_id =
+            create_routine_thread(registry, provider_name, agent_id, parent_channel_id, &title)
+                .await
+                .map_err(|error| anyhow!("create routine discord thread: {error}"))?;
         let thread_id_string = thread_id.get().to_string();
         if let Err(error) = store
             .update_discord_thread_id(&claimed.routine_id, &thread_id_string)
@@ -435,9 +440,10 @@ fn parse_channel_id(value: &str) -> Option<poise::serenity_prelude::ChannelId> {
 async fn validate_routine_thread(
     registry: &HealthRegistry,
     provider_name: &str,
+    agent_id: &str,
     thread_id: poise::serenity_prelude::ChannelId,
 ) -> Result<()> {
-    let http = resolve_provider_or_notify_http(registry, provider_name).await?;
+    let http = resolve_routine_thread_http(registry, provider_name, agent_id).await?;
     let channel = thread_id
         .to_channel(&*http)
         .await
@@ -462,10 +468,11 @@ async fn validate_routine_thread(
 async fn create_routine_thread(
     registry: &HealthRegistry,
     provider_name: &str,
+    agent_id: &str,
     parent_channel_id: poise::serenity_prelude::ChannelId,
     title: &str,
 ) -> Result<poise::serenity_prelude::ChannelId> {
-    let http = resolve_provider_or_notify_http(registry, provider_name).await?;
+    let http = resolve_routine_thread_http(registry, provider_name, agent_id).await?;
     let thread = parent_channel_id
         .create_thread(
             &*http,
@@ -483,20 +490,27 @@ async fn create_routine_thread(
     Ok(thread.id)
 }
 
-async fn resolve_provider_or_notify_http(
+async fn resolve_routine_thread_http(
     registry: &HealthRegistry,
     provider_name: &str,
+    agent_id: &str,
 ) -> Result<Arc<poise::serenity_prelude::Http>> {
-    match resolve_bot_http(registry, provider_name).await {
-        Ok(http) => Ok(http),
-        Err((_, provider_error)) => resolve_bot_http(registry, "notify")
-            .await
-            .map_err(|(_, notify_error)| {
-                anyhow!(
-                    "provider bot unavailable: {provider_error}; notify bot unavailable: {notify_error}"
-                )
-            }),
+    let mut errors = Vec::new();
+    let mut tried = Vec::new();
+    for bot in [provider_name, agent_id, "notify"] {
+        if bot.trim().is_empty() || tried.contains(&bot) {
+            continue;
+        }
+        tried.push(bot);
+        match resolve_bot_http(registry, bot).await {
+            Ok(http) => return Ok(http),
+            Err((_, error)) => errors.push(format!("{bot}: {error}")),
+        }
     }
+    Err(anyhow!(
+        "no routine discord bot available ({})",
+        errors.join("; ")
+    ))
 }
 
 fn routine_thread_title(routine_name: &str, agent_id: &str) -> String {

@@ -701,9 +701,14 @@ async fn enqueue_headless_delivery(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
     session_key: Option<&str>,
+    delivery_bot: Option<&str>,
     content: &str,
 ) -> Result<(), String> {
     let target = format!("channel:{}", channel_id.get());
+    let bot = delivery_bot
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("notify");
 
     if crate::services::message_outbox::enqueue_outbox_best_effort(
         shared.pg_pool.as_ref(),
@@ -711,7 +716,7 @@ async fn enqueue_headless_delivery(
         crate::services::message_outbox::OutboxMessage {
             target: &target,
             content,
-            bot: "notify",
+            bot,
             source: "headless_turn",
             // Explicit reason_code keeps dedupe consistent across PG/SQLite.
             reason_code: Some("headless.delivery"),
@@ -3033,6 +3038,7 @@ pub(super) fn spawn_turn_bridge(
                     &shared_owned,
                     channel_id,
                     adk_session_key.as_deref(),
+                    inflight_state.delivery_bot.as_deref(),
                     &delivery_response,
                 )
                 .await

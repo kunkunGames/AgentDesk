@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
@@ -173,6 +173,10 @@ impl RoutineStore {
             pool,
             default_timezone: default_timezone.into(),
         }
+    }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        self.pool.as_ref()
     }
 
     /// Claim due routines in a short transaction.
@@ -1139,6 +1143,19 @@ impl RoutineStore {
         next_due_after(schedule, default_timezone, now)
     }
 
+    async fn next_due_from_schedule_anchor_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        schedule: &str,
+        default_timezone: &str,
+        anchor: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>> {
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| anyhow!("load database time for anchored routine schedule: {e}"))?;
+        next_due_after_anchor(schedule, default_timezone, anchor, now)
+    }
+
     async fn insert_running_run(
         tx: &mut Transaction<'_, Postgres>,
         candidate: RoutineClaimCandidate,
@@ -1199,29 +1216,45 @@ impl RoutineStore {
     async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
 
-        let target: Option<(String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT r.id, r.schedule
+        let target: Option<(String, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>)> =
+            sqlx::query_as(
+                r#"
+            SELECT r.id, r.schedule, r.next_due_at, rr.started_at
             FROM routine_runs rr
             JOIN routines r ON r.id = rr.routine_id
             WHERE rr.id = $1
               AND rr.status = 'running'
             FOR UPDATE OF rr, r
             "#,
-        )
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
+            )
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
 
-        let Some((routine_id, schedule)) = target else {
+        let Some((routine_id, schedule, current_next_due_at, started_at)) = target else {
             tx.commit().await?;
             return Ok(false);
         };
         let scheduled_next_due_at = if close.next_due_at.should_update() {
             close.next_due_at.value()
         } else if let Some(schedule) = schedule.as_deref() {
-            Some(Self::next_due_from_schedule_tx(&mut tx, schedule, &self.default_timezone).await?)
+            match current_next_due_at {
+                Some(anchor) if anchor <= started_at => Some(
+                    Self::next_due_from_schedule_anchor_tx(
+                        &mut tx,
+                        schedule,
+                        &self.default_timezone,
+                        anchor,
+                    )
+                    .await?,
+                ),
+                Some(_) => None,
+                None => Some(
+                    Self::next_due_from_schedule_tx(&mut tx, schedule, &self.default_timezone)
+                        .await?,
+                ),
+            }
         } else {
             None
         };
@@ -1369,16 +1402,93 @@ fn next_due_after(
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>> {
     match parse_routine_schedule(schedule)? {
-        ParsedRoutineSchedule::Every(duration) => Ok(now + duration),
-        ParsedRoutineSchedule::Cron(cron) => {
-            let timezone = Tz::from_str(default_timezone)
-                .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
-            let zoned_now = now.with_timezone(&timezone);
-            cron.find_next_occurrence(&zoned_now, false)
-                .map(|value| value.with_timezone(&Utc))
-                .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
-        }
+        ParsedRoutineSchedule::Every(duration) => next_every_due_after(duration, now),
+        ParsedRoutineSchedule::Cron(cron) => next_cron_due_after(cron, default_timezone, now),
     }
+}
+
+fn next_due_after_anchor(
+    schedule: &str,
+    default_timezone: &str,
+    anchor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    match parse_routine_schedule(schedule)? {
+        ParsedRoutineSchedule::Every(duration) => {
+            next_every_due_after_anchor(duration, anchor, now)
+        }
+        ParsedRoutineSchedule::Cron(cron) => next_cron_due_after(cron, default_timezone, now),
+    }
+}
+
+fn next_every_due_after(duration: Duration, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    checked_add_duration(
+        truncate_to_second(now),
+        duration,
+        "compute next routine interval occurrence",
+    )
+}
+
+fn next_every_due_after_anchor(
+    duration: Duration,
+    anchor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let interval_secs = duration.num_seconds();
+    if interval_secs <= 0 {
+        return Err(anyhow!(
+            "routine schedule duration must be greater than zero"
+        ));
+    }
+
+    let anchor = truncate_to_second(anchor);
+    let reference = truncate_to_second(now);
+    let elapsed_secs = reference.signed_duration_since(anchor).num_seconds();
+    let steps = if elapsed_secs < 0 {
+        1
+    } else {
+        elapsed_secs
+            .checked_div(interval_secs)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow!("compute anchored routine interval occurrence: overflow"))?
+    };
+    let total_secs = interval_secs
+        .checked_mul(steps)
+        .ok_or_else(|| anyhow!("compute anchored routine interval occurrence: overflow"))?;
+
+    checked_add_duration(
+        anchor,
+        Duration::seconds(total_secs),
+        "compute anchored routine interval occurrence",
+    )
+}
+
+fn next_cron_due_after(
+    cron: Cron,
+    default_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let timezone = Tz::from_str(default_timezone)
+        .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
+    let zoned_now = now.with_timezone(&timezone);
+    cron.find_next_occurrence(&zoned_now, false)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
+}
+
+fn truncate_to_second(value: DateTime<Utc>) -> DateTime<Utc> {
+    value
+        .with_nanosecond(0)
+        .expect("DateTime<Utc> nanosecond truncation should be valid")
+}
+
+fn checked_add_duration(
+    base: DateTime<Utc>,
+    duration: Duration,
+    context: &'static str,
+) -> Result<DateTime<Utc>> {
+    base.checked_add_signed(duration)
+        .ok_or_else(|| anyhow!("{context}: timestamp overflow"))
 }
 
 fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
@@ -1478,7 +1588,9 @@ struct CloseRun<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_due_after, parse_schedule_interval, validate_routine_schedule};
+    use super::{
+        next_due_after, next_due_after_anchor, parse_schedule_interval, validate_routine_schedule,
+    };
     use chrono::{TimeZone, Timelike, Utc};
 
     // Integration tests that require a live PG connection live in
@@ -1532,6 +1644,39 @@ mod tests {
         assert_eq!(
             next_due,
             Utc.with_ymd_and_hms(2026, 4, 29, 1, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn every_next_due_truncates_subsecond_jitter() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 3, 32, 8)
+            .unwrap()
+            .with_nanosecond(830_000_000)
+            .unwrap();
+        let next_due = next_due_after("@every 1m", "Asia/Seoul", now).unwrap();
+        assert_eq!(
+            next_due,
+            Utc.with_ymd_and_hms(2026, 4, 30, 3, 33, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn anchored_every_next_due_skips_missed_intervals_and_stays_second_aligned() {
+        let anchor = Utc
+            .with_ymd_and_hms(2026, 4, 30, 3, 31, 8)
+            .unwrap()
+            .with_nanosecond(830_000_000)
+            .unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 3, 32, 8)
+            .unwrap()
+            .with_nanosecond(831_000_000)
+            .unwrap();
+        let next_due = next_due_after_anchor("@every 1m", "Asia/Seoul", anchor, now).unwrap();
+        assert_eq!(
+            next_due,
+            Utc.with_ymd_and_hms(2026, 4, 30, 3, 33, 8).unwrap()
         );
     }
 }
