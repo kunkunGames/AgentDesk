@@ -76,16 +76,12 @@ module.exports = function attachActiveMonitor(timeouts, helpers) {
         // has-session returns true for zombie sessions with dead panes;
         // list-panes #{pane_dead} distinguishes live vs dead workers.
         var tmuxAlive = timeouts._tmuxHasLivePane(tmuxName);
-        var inflight = null;
-        var inflightLookupFailed = false;
+        var inflight;
         try {
           inflight = findRecentInflightForSession(swKey, tmuxName);
-        } catch(e) {
-          inflightLookupFailed = true;
-          agentdesk.log.warn("[deadlock] Skipping stale check due to inflight lookup failure: " + swKey + ", " + e);
-        }
-        if (inflightLookupFailed) {
-          continue;
+        } catch (e) {
+          agentdesk.log.warn("[deadlock] Transient error looking up inflight for " + swKey + ": " + e);
+          continue; // transient error, retry next time
         }
         if (!tmuxAlive || !inflight) {
           // #219: Fail any pending dispatch before transitioning to idle.
@@ -131,15 +127,9 @@ module.exports = function attachActiveMonitor(timeouts, helpers) {
         var deadlockKey = "deadlock_check:" + sess.session_key;
         var dlTmuxName = (sess.session_key || "").split(":").pop();
         var tmuxAlive = timeouts._tmuxHasLivePane(dlTmuxName);
-        var inflightProgress;
-        try {
-          inflightProgress = tmuxAlive
-            ? inspectInflightProgress(sess.session_key, dlTmuxName, DEADLOCK_MINUTES, MAX_TURN_MINUTES)
-            : { recent: false, updated_age_min: null, turn_age_min: null, channel_id: null, max_turn_reached: false };
-        } catch(e) {
-          agentdesk.log.warn("[deadlock] Skipping deadlock check due to inflight lookup failure: " + sess.session_key + ", " + e);
-          continue;
-        }
+        var inflightProgress = tmuxAlive
+          ? inspectInflightProgress(sess.session_key, dlTmuxName, DEADLOCK_MINUTES, MAX_TURN_MINUTES)
+          : { recent: false, updated_age_min: null, turn_age_min: null, channel_id: null, max_turn_reached: false };
 
         // Recent terminal output is the authoritative signal for "normal progress".
         // A live pane alone is not enough — hung tools can leave a pane alive forever.
