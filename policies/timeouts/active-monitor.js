@@ -76,7 +76,8 @@ module.exports = function attachActiveMonitor(timeouts, helpers) {
         // has-session returns true for zombie sessions with dead panes;
         // list-panes #{pane_dead} distinguishes live vs dead workers.
         var tmuxAlive = timeouts._tmuxHasLivePane(tmuxName);
-        if (!tmuxAlive) {
+        var inflight = findRecentInflightForSession(swKey, tmuxName);
+        if (!tmuxAlive || !inflight) {
           // #219: Fail any pending dispatch before transitioning to idle.
           // Without this, the dispatch stays "pending" as an orphan and gets
           // re-delivered or auto-completed, causing the failure loop.
