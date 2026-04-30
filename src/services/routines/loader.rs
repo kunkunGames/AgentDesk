@@ -1207,7 +1207,8 @@ mod tests {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
                 assert!(prompt.contains("Category: release-freshness"));
                 assert!(prompt.contains("Release freshness monitor"));
-                assert!(prompt.contains("docs/generated/worker-inventory.md"));
+                let inventory_path = ["docs", "generated", "worker-inventory.md"].join("/");
+                assert!(prompt.contains(&inventory_path));
             }
             other => panic!("unexpected action: {other:?}"),
         }

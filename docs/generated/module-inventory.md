@@ -396,12 +396,12 @@
 | `services::routines` | `src/services/routines/mod.rs` | 27 |  |
 | `services::routines::action` | `src/services/routines/action.rs` | 284 |  |
 | `services::routines::agent_executor` | `src/services/routines/agent_executor.rs` | 680 |  |
-| `services::routines::discord_log` | `src/services/routines/discord_log.rs` | 587 |  |
-| `services::routines::loader` | `src/services/routines/loader.rs` | 1243 | giant-file |
+| `services::routines::discord_log` | `src/services/routines/discord_log.rs` | 592 |  |
+| `services::routines::loader` | `src/services/routines/loader.rs` | 1443 | giant-file |
 | `services::routines::runtime` | `src/services/routines/runtime.rs` | 363 |  |
 | `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 108 |  |
 | `services::routines::session_control` | `src/services/routines/session_control.rs` | 401 |  |
-| `services::routines::store` | `src/services/routines/store.rs` | 1833 | giant-file |
+| `services::routines::store` | `src/services/routines/store.rs` | 2151 | giant-file |
 | `services::service_error` | `src/services/service_error.rs` | 1 |  |
 | `services::session_backend` | `src/services/session_backend.rs` | 1045 | giant-file |
 | `services::settings` | `src/services/settings.rs` | 458 |  |
