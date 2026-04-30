@@ -286,7 +286,7 @@
 | `services::discord::placeholder_cleanup` | `src/services/discord/placeholder_cleanup.rs` | 456 |  |
 | `services::discord::placeholder_controller` | `src/services/discord/placeholder_controller.rs` | 999 |  |
 | `services::discord::placeholder_sweeper` | `src/services/discord/placeholder_sweeper.rs` | 554 |  |
-| `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 2027 | giant-file |
+| `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 2021 | giant-file |
 | `services::discord::queue_io` | `src/services/discord/queue_io.rs` | 570 |  |
 | `services::discord::queued_placeholders_store` | `src/services/discord/queued_placeholders_store.rs` | 412 |  |
 | `services::discord::recovery_engine` | `src/services/discord/recovery_engine.rs` | 4697 | giant-file |
@@ -371,7 +371,7 @@
 | `services::platform::shell` | `src/services/platform/shell.rs` | 128 |  |
 | `services::platform::tmux` | `src/services/platform/tmux.rs` | 298 |  |
 | `services::process` | `src/services/process.rs` | 706 |  |
-| `services::provider` | `src/services/provider.rs` | 2177 | giant-file |
+| `services::provider` | `src/services/provider.rs` | 2170 | giant-file |
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 29 |  |
 | `services::provider_cli::canary` | `src/services/provider_cli/canary.rs` | 240 |  |
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 74 |  |
@@ -388,7 +388,7 @@
 | `services::provider_exec` | `src/services/provider_exec.rs` | 503 |  |
 | `services::provider_runtime` | `src/services/provider_runtime.rs` | 122 |  |
 | `services::queue` | `src/services/queue.rs` | 472 |  |
-| `services::qwen` | `src/services/qwen.rs` | 2466 | giant-file |
+| `services::qwen` | `src/services/qwen.rs` | 2459 | giant-file |
 | `services::qwen_tmux_wrapper` | `src/services/qwen_tmux_wrapper.rs` | 1194 | giant-file |
 | `services::remote_stub` | `src/services/remote_stub.rs` | 45 |  |
 | `services::retrospectives` | `src/services/retrospectives.rs` | 879 |  |
