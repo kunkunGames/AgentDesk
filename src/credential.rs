@@ -29,8 +29,8 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    use std::sync::{Mutex, MutexGuard};
     use std::sync::OnceLock;
+    use std::sync::{Mutex, MutexGuard};
 
     static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
