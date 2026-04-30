@@ -423,15 +423,24 @@ _restart_pending_acknowledged() {
   local detail_json
   detail_json=$(curl -sf --max-time 3 "http://${ADK_DEFAULT_LOOPBACK}:${port}/api/health/detail" 2>/dev/null) || return 1
 
+  # restart_pending is per-provider. Require EVERY provider that exposes
+  # the field to report true — otherwise a multi-provider runtime can
+  # accept new turns on an unsynced provider while we proceed to bootout
+  # (#1447 review P2).
   if _health_json_has_jq; then
     printf '%s\n' "$detail_json" | jq -e '
       (.providers // [])
-      | map(select(.restart_pending == true))
-      | length > 0
+      | map(select(.restart_pending != null))
+      | (length > 0) and all(.restart_pending == true)
     ' >/dev/null 2>&1
     return $?
   fi
 
+  # jq-less fallback: every restart_pending occurrence must be true. If any
+  # is false we fail closed; if none are present we cannot confirm and fail.
+  if printf '%s' "$detail_json" | grep -q '"restart_pending":false'; then
+    return 1
+  fi
   printf '%s' "$detail_json" | grep -q '"restart_pending":true'
 }
 
@@ -479,6 +488,14 @@ request_restart_drain_mode_or_fail() {
       echo "✓ [gate] ${scope} restart drain mode acknowledged by runtime"
       return 0
     fi
+    # #1447 review P2: idle runtime may consume the marker (restart_ctrl
+    # deletes restart_pending and calls exit(0) once all turns drain) before
+    # our 1s poll observes the in-memory flag. If the marker we just wrote
+    # has disappeared, the runtime acknowledged it the only way it can.
+    if [ ! -e "$marker" ]; then
+      echo "▸ [gate] ${scope} restart drain marker consumed by runtime — treating as acknowledged"
+      return 0
+    fi
     sleep 1
     waited=$((waited + 1))
   done
@@ -486,6 +503,12 @@ request_restart_drain_mode_or_fail() {
   job_state=$(_launchd_job_state "$label")
   if [ "$job_state" = "not running" ]; then
     echo "▸ [gate] ${scope} launchd job is not running; restart drain marker staged for next boot"
+    return 0
+  fi
+  # Late-arriving consumption: marker may have been consumed between the
+  # last poll and the post-loop launchd check. Same ack semantics as above.
+  if [ ! -e "$marker" ]; then
+    echo "▸ [gate] ${scope} restart drain marker consumed by runtime during timeout window — treating as acknowledged"
     return 0
   fi
 

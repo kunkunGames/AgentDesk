@@ -72,6 +72,7 @@ echo "== Test 3: assert_restart_helpers_loaded fails when a helper is missing ==
 set +e
 (
   set -e
+  # shellcheck source=/dev/null
   . "$DEFAULTS_SH"
   unset -f request_restart_drain_mode_or_fail
   assert_restart_helpers_loaded >/dev/null 2>&1
@@ -123,10 +124,74 @@ rc=$?
 set -e
 assert_eq "preflight assert blocks restart with EXIT 1" "1" "$rc"
 
-echo "== Test 5: clear_restart_drain_mode removes marker file =="
+echo "== Test 5a: _restart_pending_acknowledged requires ALL providers true =="
+# Stub curl on PATH so _restart_pending_acknowledged sees a controlled
+# /api/health/detail body. Avoids depending on a real listening port.
+TMP_FIXTURE_DIR=$(mktemp -d)
+TMP_RUNTIME=$(mktemp -d)
 TMPDIR_TEST=$(mktemp -d)
-trap 'rm -rf "$TMPDIR_TEST"' EXIT
+trap 'rm -rf "$TMP_FIXTURE_DIR" "$TMP_RUNTIME" "$TMPDIR_TEST"' EXIT
+
+# Build a curl shim that prints the contents of $RESP_FILE for any --max-time
+# request and ignores everything else (mirrors how _restart_pending_acknowledged
+# invokes curl).
+mkdir -p "$TMP_FIXTURE_DIR/bin"
+RESP_FILE="$TMP_FIXTURE_DIR/resp.json"
+cat >"$TMP_FIXTURE_DIR/bin/curl" <<EOF
+#!/usr/bin/env bash
+# Test shim — prints the configured fake health response and exits 0.
+cat "$RESP_FILE"
+EOF
+chmod +x "$TMP_FIXTURE_DIR/bin/curl"
+
+# shellcheck source=/dev/null
+. "$DEFAULTS_SH"
+
+printf '%s' '{"providers":[{"name":"a","restart_pending":true},{"name":"b","restart_pending":false}]}' >"$RESP_FILE"
+set +e
+PATH="$TMP_FIXTURE_DIR/bin:$PATH" _restart_pending_acknowledged 0 >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "ack returns 1 when one provider still false" "1" "$rc"
+
+printf '%s' '{"providers":[{"name":"a","restart_pending":true},{"name":"b","restart_pending":true}]}' >"$RESP_FILE"
+set +e
+PATH="$TMP_FIXTURE_DIR/bin:$PATH" _restart_pending_acknowledged 0 >/dev/null 2>&1
+rc=$?
+set -e
+assert_eq "ack returns 0 when all providers true" "0" "$rc"
+
+echo "== Test 5b: marker-consumed during wait counts as acknowledgement =="
+# Simulate a runtime that deletes the marker mid-wait (the restart_ctrl race
+# Codex flagged in #1447 review). Stub curl to always fail (so health-detail
+# probe never returns success) — the only positive ack path left is the
+# "marker disappeared" branch.
+mkdir -p "$TMP_FIXTURE_DIR/bin_fail"
+cat >"$TMP_FIXTURE_DIR/bin_fail/curl" <<'EOF'
+#!/usr/bin/env bash
+exit 7
+EOF
+chmod +x "$TMP_FIXTURE_DIR/bin_fail/curl"
+
+# Stub _launchd_job_state so the post-loop branch reports "running" — forcing
+# the helper to rely on marker-consumed ack.
+_launchd_job_state() { echo "running"; }
+( sleep 1; rm -f "$TMP_RUNTIME/restart_pending" ) &
+BG_PID=$!
+set +e
+PATH="$TMP_FIXTURE_DIR/bin_fail:$PATH" \
+  AGENTDESK_RESTART_DRAIN_ACK_WAIT=10 \
+  request_restart_drain_mode_or_fail "test" "test.label" 0 "$TMP_RUNTIME" "smoke-test" \
+  >/dev/null 2>&1
+rc=$?
+set -e
+wait "$BG_PID" 2>/dev/null || true
+unset -f _launchd_job_state
+assert_eq "drain helper returns 0 when marker is consumed mid-wait" "0" "$rc"
+
+echo "== Test 6: clear_restart_drain_mode removes marker file =="
 touch "$TMPDIR_TEST/restart_pending"
+# shellcheck source=/dev/null
 . "$DEFAULTS_SH"
 clear_restart_drain_mode "$TMPDIR_TEST" >/dev/null 2>&1 || true
 if [ ! -e "$TMPDIR_TEST/restart_pending" ]; then
