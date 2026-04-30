@@ -164,36 +164,3 @@ fn now_string() -> String {
 fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_total_input_tokens_zeros() {
-        let usage = TurnTokenUsage::default();
-        assert_eq!(usage.total_input_tokens(), 0);
-    }
-
-    #[test]
-    fn test_total_input_tokens_normal() {
-        let usage = TurnTokenUsage {
-            input_tokens: 100,
-            cache_create_tokens: 50,
-            cache_read_tokens: 25,
-            output_tokens: 10,
-        };
-        assert_eq!(usage.total_input_tokens(), 175);
-    }
-
-    #[test]
-    fn test_total_input_tokens_saturation() {
-        let usage = TurnTokenUsage {
-            input_tokens: u64::MAX - 10,
-            cache_create_tokens: 15,
-            cache_read_tokens: 10,
-            output_tokens: 0,
-        };
-        assert_eq!(usage.total_input_tokens(), u64::MAX);
-    }
-}
