@@ -83,6 +83,7 @@ ensure_card_ready_and_assigned() {
 
     if [ "$status" = "backlog" ]; then
         api_patch_json "/api/kanban-cards/$card_id" '{"status":"ready"}' >/dev/null
+        status="ready"
         log "> #$issue: backlog -> ready"
     fi
 

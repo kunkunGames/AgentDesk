@@ -31,7 +31,7 @@ notify_anomaly() {
   body=$(jq -n \
     --arg target "channel:$NOTIFY_CHANNEL" \
     --arg content "$msg" \
-    '{target:$target, content:$content, source:"auto-queue-monitor", bot:"notify"}')
+    '{target:$target, content:$content, source:"auto-queue", bot:"notify"}')
   api_post_json "/api/discord/send" "$body" || true
 }
 
@@ -39,7 +39,7 @@ entry_age_min() {
   local ref_ms="$1"
   local now_ms
   now_ms=$(($(date +%s) * 1000))
-  if [ -z "$ref_ms" ] || [ "$ref_ms" = "null" ] || [ "$ref_ms" -le 0 ] 2>/dev/null; then
+  if [ -z "$ref_ms" ] || [ "$ref_ms" = "null" ] || ! [[ "$ref_ms" =~ ^[0-9]+$ ]] || [ "$ref_ms" -le 0 ]; then
     echo 0
     return
   fi
