@@ -183,6 +183,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routes_tests.rs
+│   │   ├── routines.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── skill_usage_analytics.rs
@@ -318,6 +319,7 @@ src/
 │   │   ├── session_runtime.rs
 │   │   ├── settings.rs
 │   │   ├── shared_memory.rs
+│   │   ├── stall_recovery.rs
 │   │   ├── tmux.rs
 │   │   ├── tmux_error_detect.rs
 │   │   ├── tmux_lifecycle.rs
@@ -372,6 +374,16 @@ src/
 │   │   ├── smoke.rs
 │   │   ├── snapshot.rs
 │   │   └── upgrade.rs
+│   ├── routines/
+│   │   ├── action.rs
+│   │   ├── agent_executor.rs
+│   │   ├── discord_log.rs
+│   │   ├── loader.rs
+│   │   ├── mod.rs
+│   │   ├── runtime.rs
+│   │   ├── runtime_config.rs
+│   │   ├── session_control.rs
+│   │   └── store.rs
 │   ├── slo/
 │   │   └── mod.rs
 │   ├── agent_protocol.rs
