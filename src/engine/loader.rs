@@ -743,8 +743,18 @@ mod tests {
         let hash2 = compute_policy_version(source2);
         let hash1_again = compute_policy_version(source1_again);
 
-        assert_eq!(hash1, hash1_again, "Identical sources should have the same hash");
-        assert_ne!(hash1, hash2, "Different sources should have different hashes");
-        assert_eq!(hash1.len(), 12, "Hash string should be exactly 12 characters long");
+        assert_eq!(
+            hash1, hash1_again,
+            "Identical sources should have the same hash"
+        );
+        assert_ne!(
+            hash1, hash2,
+            "Different sources should have different hashes"
+        );
+        assert_eq!(
+            hash1.len(),
+            12,
+            "Hash string should be exactly 12 characters long"
+        );
     }
 }
