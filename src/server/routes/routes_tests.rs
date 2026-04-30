@@ -4107,7 +4107,7 @@ async fn queue_list_pending_dispatches_pg_only_without_sqlite_mirror() {
     .bind("dispatch-pg-queue-list")
     .bind("card-pg-queue-list")
     .bind("agent-pg-queue-list")
-    .bind("implementation")
+    .bind("review")
     .bind("pending")
     .bind("PG queue list dispatch")
     .bind(0_i32)
@@ -4188,24 +4188,32 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
 
     sqlx::query(
         "INSERT INTO kanban_cards (
-            id, title, status, priority, created_at, updated_at
+            id, title, status, priority, active_thread_id, channel_thread_map, created_at, updated_at
          ) VALUES (
-            $1, $2, $3, $4, NOW(), NOW()
+            $1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW()
          )",
     )
     .bind("card-pg-queue-cancel")
     .bind("Queue PG Cancel")
     .bind("in_progress")
     .bind("high")
+    .bind("thread-review-cancelled")
+    .bind(
+        json!({
+            "111": "thread-review-cancelled",
+            "222": "thread-work-active"
+        })
+        .to_string(),
+    )
     .execute(&pg_pool)
     .await
     .unwrap();
 
     sqlx::query(
         "INSERT INTO task_dispatches (
-            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, thread_id, created_at, updated_at
          ) VALUES (
-            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+            $1, $2, $3, $4, $5, $6, $7, NOW(), NOW()
          )",
     )
     .bind("dispatch-pg-queue-cancel")
@@ -4214,6 +4222,7 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
     .bind("implementation")
     .bind("pending")
     .bind("PG queue cancel dispatch")
+    .bind("thread-review-cancelled")
     .execute(&pg_pool)
     .await
     .unwrap();
@@ -4279,6 +4288,27 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
         "dispatch_notified guard should be cleared"
     );
 
+    let (channel_thread_map, active_thread_id): (Option<serde_json::Value>, Option<String>) =
+        sqlx::query_as(
+            "SELECT channel_thread_map, active_thread_id
+             FROM kanban_cards
+             WHERE id = $1",
+        )
+        .bind("card-pg-queue-cancel")
+        .fetch_one(&pg_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        channel_thread_map,
+        Some(json!({"222": "thread-work-active"})),
+        "cancelled dispatch thread must be removed without dropping sibling work thread"
+    );
+    assert_eq!(
+        active_thread_id.as_deref(),
+        Some("thread-work-active"),
+        "active_thread_id should move away from the cancelled review thread"
+    );
+
     let sqlite_count: i64 = db
         .read_conn()
         .unwrap()
@@ -4289,6 +4319,146 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
         )
         .unwrap();
     assert_eq!(sqlite_count, 0, "sqlite mirror should stay empty");
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn link_dispatch_thread_pg_preserves_concurrent_channel_thread_updates() {
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id)
+         VALUES ($1, $2, '111')
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind("agent-thread-race")
+    .bind("Agent Thread Race")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, channel_thread_map, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, '{}'::jsonb, NOW(), NOW()
+         )",
+    )
+    .bind("card-thread-race")
+    .bind("Thread Race")
+    .bind("in_progress")
+    .bind("high")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    for idx in 0..12 {
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, NOW(), NOW()
+             )",
+        )
+        .bind(format!("dispatch-thread-race-{idx}"))
+        .bind("card-thread-race")
+        .bind("agent-thread-race")
+        .bind("implementation")
+        .bind("dispatched")
+        .bind(format!("Thread race dispatch {idx}"))
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION test_sleep_card_thread_map_update()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             PERFORM pg_sleep(0.03);
+             RETURN NEW;
+         END;
+         $$;
+        ",
+    )
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_sleep_card_thread_map_update
+         BEFORE UPDATE OF channel_thread_map ON kanban_cards
+         FOR EACH ROW
+         EXECUTE FUNCTION test_sleep_card_thread_map_update();",
+    )
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
+    let responses = futures::future::join_all((0..12).map(|idx| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/link-dispatch-thread")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "dispatch_id": format!("dispatch-thread-race-{idx}"),
+                                "thread_id": format!("thread-race-{idx}"),
+                                "channel_id": format!("{}", 9000 + idx),
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+    }))
+    .await;
+    assert_eq!(responses.len(), 12);
+
+    let channel_thread_map: serde_json::Value = sqlx::query_scalar(
+        "SELECT channel_thread_map
+         FROM kanban_cards
+         WHERE id = $1",
+    )
+    .bind("card-thread-race")
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    let map = channel_thread_map
+        .as_object()
+        .expect("channel_thread_map must be an object");
+    assert_eq!(
+        map.len(),
+        12,
+        "concurrent channel thread updates must merge instead of last-writer-wins"
+    );
+    for idx in 0..12 {
+        assert_eq!(
+            map.get(&(9000 + idx).to_string()),
+            Some(&json!(format!("thread-race-{idx}")))
+        );
+    }
 
     pg_pool.close().await;
     pg_db.drop().await;
@@ -22219,6 +22389,140 @@ async fn auto_queue_status_pg_exposes_explicit_thread_links_from_configured_chan
     assert_eq!(
         thread_links[1]["url"],
         "https://discord.com/channels/guild-123/222000000000000002"
+    );
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn auto_queue_status_pg_repairs_thread_links_from_dispatch_history() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+
+    sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
+        .bind("test-repo")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, provider, discord_channel_id, discord_channel_alt,
+            discord_channel_cc, discord_channel_cdx
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind("agent-thread-repair-pg")
+    .bind("Agent Thread Repair PG")
+    .bind("codex")
+    .bind("111")
+    .bind("222")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id,
+            github_issue_number, active_thread_id, channel_thread_map
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb
+         )",
+    )
+    .bind("card-thread-repair-pg")
+    .bind("test-repo")
+    .bind("Issue #1470")
+    .bind("done")
+    .bind("medium")
+    .bind("agent-thread-repair-pg")
+    .bind(1470_i64)
+    .bind("thread-review-cancelled")
+    .bind(json!({"111": "thread-review-cancelled"}).to_string())
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+            thread_id, updated_at
+         ) VALUES
+            ($1, $2, $3, 'implementation', 'completed', $4, $5, NOW() - INTERVAL '2 minutes'),
+            ($6, $2, $3, 'review', 'cancelled', $7, $8, NOW() - INTERVAL '1 minute')",
+    )
+    .bind("dispatch-thread-repair-work")
+    .bind("card-thread-repair-pg")
+    .bind("agent-thread-repair-pg")
+    .bind("Work dispatch")
+    .bind("thread-work-completed")
+    .bind("dispatch-thread-repair-review")
+    .bind("Cancelled review dispatch")
+    .bind("thread-review-cancelled")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("run-thread-repair-pg")
+    .bind("test-repo")
+    .bind("agent-thread-repair-pg")
+    .bind("active")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, priority_rank
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6
+         )",
+    )
+    .bind("entry-thread-repair-pg")
+    .bind("run-thread-repair-pg")
+    .bind("card-thread-repair-pg")
+    .bind("agent-thread-repair-pg")
+    .bind("done")
+    .bind(0_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let mut config = crate::config::Config::default();
+    config.discord.guild_id = Some("guild-123".to_string());
+    let app = test_api_router_with_pg(db, engine, config, None, pg_pool.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/auto-queue/status?agent_id=agent-thread-repair-pg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let thread_links = json["entries"][0]["thread_links"]
+        .as_array()
+        .expect("thread_links must be an array");
+
+    assert_eq!(
+        thread_links,
+        &vec![json!({
+            "role": "work",
+            "label": "work",
+            "channel_id": "222",
+            "thread_id": "thread-work-completed",
+            "url": "https://discord.com/channels/guild-123/thread-work-completed"
+        })],
+        "status should recover the completed work thread and suppress the cancelled review thread"
     );
 
     pg_pool.close().await;

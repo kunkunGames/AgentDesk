@@ -168,35 +168,15 @@ pub(super) async fn set_thread_for_channel_pg(
     channel_id: u64,
     thread_id: &str,
 ) -> Result<(), String> {
-    let existing: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT channel_thread_map::text
-         FROM kanban_cards
-         WHERE id = $1",
-    )
-    .bind(card_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| format!("load postgres thread map for {card_id}: {error}"))?
-    .flatten();
-
-    let mut map: serde_json::Map<String, serde_json::Value> = existing
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or_default();
-    map.insert(
-        channel_id.to_string(),
-        serde_json::Value::String(thread_id.to_string()),
-    );
-    let json_str = serde_json::to_string(&map)
-        .map_err(|error| format!("serialize postgres thread map for {card_id}: {error}"))?;
-
     sqlx::query(
         "UPDATE kanban_cards
-         SET channel_thread_map = $1::jsonb,
+         SET channel_thread_map = COALESCE(channel_thread_map, '{}'::jsonb)
+                                  || jsonb_build_object($1::text, $2::text),
              active_thread_id = $2,
              updated_at = NOW()
          WHERE id = $3",
     )
-    .bind(json_str)
+    .bind(channel_id.to_string())
     .bind(thread_id)
     .bind(card_id)
     .execute(pool)
@@ -213,17 +193,25 @@ pub(super) async fn clear_thread_for_channel_pg(
     card_id: &str,
     channel_id: u64,
 ) -> Result<(), String> {
-    let existing: Option<String> = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT channel_thread_map::text
+    let row = sqlx::query(
+        "SELECT channel_thread_map::text AS channel_thread_map, active_thread_id
          FROM kanban_cards
          WHERE id = $1",
     )
     .bind(card_id)
     .fetch_optional(pool)
     .await
-    .map_err(|error| format!("load postgres thread map for {card_id}: {error}"))?
-    .flatten();
+    .map_err(|error| format!("load postgres thread map for {card_id}: {error}"))?;
 
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let existing: Option<String> = row
+        .try_get("channel_thread_map")
+        .map_err(|error| format!("read postgres thread map for {card_id}: {error}"))?;
+    let active_thread_id: Option<String> = row
+        .try_get("active_thread_id")
+        .map_err(|error| format!("read postgres active thread for {card_id}: {error}"))?;
     let Some(existing) = existing else {
         return Ok(());
     };
@@ -233,16 +221,33 @@ pub(super) async fn clear_thread_for_channel_pg(
         return Ok(());
     };
 
-    map.remove(&channel_id.to_string());
-    let new_json =
-        serde_json::to_string(&map).map_err(|error| format!("serialize thread map: {error}"))?;
+    let removed_thread_id = map
+        .remove(&channel_id.to_string())
+        .and_then(|value| value.as_str().map(std::string::ToString::to_string));
+    let new_json = if map.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&map)
+                .map_err(|error| format!("serialize thread map: {error}"))?,
+        )
+    };
+    let new_active_thread_id = if removed_thread_id.as_deref() == active_thread_id.as_deref() {
+        map.values()
+            .find_map(|value| value.as_str())
+            .map(std::string::ToString::to_string)
+    } else {
+        active_thread_id
+    };
     sqlx::query(
         "UPDATE kanban_cards
          SET channel_thread_map = $1::jsonb,
+             active_thread_id = $2,
              updated_at = NOW()
-         WHERE id = $2",
+         WHERE id = $3",
     )
     .bind(new_json)
+    .bind(new_active_thread_id)
     .bind(card_id)
     .execute(pool)
     .await

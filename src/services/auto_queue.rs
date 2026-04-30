@@ -5,7 +5,7 @@ pub mod runtime;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row as SqlxRow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::field::{Empty, display};
 
 use crate::db::auto_queue::{
@@ -274,6 +274,13 @@ pub struct ThreadLinkView {
 struct ThreadLinkCandidate {
     label: String,
     channel_id: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DispatchThreadFact {
+    dispatch_type: Option<String>,
+    status: String,
+    thread_id: String,
 }
 
 impl AutoQueueService {
@@ -742,7 +749,9 @@ async fn build_entry_view_pg(
                 .with_operation("build_entry_view.list_entry_dispatch_history_pg")
                 .with_context("entry_id", &record.id)
         })?;
-    let thread_links = build_entry_thread_links(&record, bindings.as_ref(), guild_id);
+    let dispatch_thread_facts = list_card_dispatch_thread_facts_pg(pool, &record.card_id).await?;
+    let thread_links =
+        build_entry_thread_links(&record, bindings.as_ref(), guild_id, &dispatch_thread_facts);
     Ok(AutoQueueStatusEntryView::from_record(
         record,
         dispatch_history,
@@ -900,19 +909,38 @@ fn build_entry_thread_links(
     record: &StatusEntryRecord,
     bindings: Option<&crate::db::agents::AgentChannelBindings>,
     guild_id: Option<&str>,
+    dispatch_thread_facts: &[DispatchThreadFact],
 ) -> Vec<ThreadLinkView> {
     let thread_map = parse_card_thread_bindings(record.channel_thread_map.as_deref());
     let active_thread_id = normalized_optional(record.active_thread_id.as_deref());
     let candidates = build_thread_link_candidates(bindings);
+    let canonical_threads = canonical_dispatch_threads_by_channel(dispatch_thread_facts, bindings);
+    let suppressed_thread_ids = latest_invalid_dispatch_thread_ids(dispatch_thread_facts);
 
     if !thread_map.is_empty() {
         let mut links = Vec::new();
         let mut used_channels = BTreeMap::<u64, ()>::new();
 
         for candidate in &candidates {
+            if let Some(canonical_thread_id) = canonical_threads.get(&candidate.channel_id) {
+                used_channels.insert(candidate.channel_id, ());
+                if let Some(thread_id) = canonical_thread_id {
+                    links.push(thread_link_view(
+                        candidate.label.as_str(),
+                        candidate.label.clone(),
+                        Some(candidate.channel_id),
+                        thread_id,
+                        guild_id,
+                    ));
+                }
+                continue;
+            }
             let Some(thread_id) = thread_map.get(&candidate.channel_id) else {
                 continue;
             };
+            if suppressed_thread_ids.contains(thread_id) {
+                continue;
+            }
             used_channels.insert(candidate.channel_id, ());
             links.push(thread_link_view(
                 candidate.label.as_str(),
@@ -925,6 +953,9 @@ fn build_entry_thread_links(
 
         for (channel_id, thread_id) in &thread_map {
             if used_channels.insert(*channel_id, ()).is_none() {
+                if suppressed_thread_ids.contains(thread_id) {
+                    continue;
+                }
                 links.push(thread_link_view(
                     "channel",
                     format!("channel:{channel_id}"),
@@ -938,7 +969,27 @@ fn build_entry_thread_links(
         return links;
     }
 
+    if !canonical_threads.is_empty() {
+        let mut links = Vec::new();
+        for candidate in &candidates {
+            let Some(Some(thread_id)) = canonical_threads.get(&candidate.channel_id) else {
+                continue;
+            };
+            links.push(thread_link_view(
+                candidate.label.as_str(),
+                candidate.label.clone(),
+                Some(candidate.channel_id),
+                thread_id,
+                guild_id,
+            ));
+        }
+        if !links.is_empty() {
+            return links;
+        }
+    }
+
     active_thread_id
+        .filter(|thread_id| !suppressed_thread_ids.contains(thread_id))
         .map(|thread_id| {
             vec![thread_link_view(
                 "active",
@@ -949,6 +1000,106 @@ fn build_entry_thread_links(
             )]
         })
         .unwrap_or_default()
+}
+
+async fn list_card_dispatch_thread_facts_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> ServiceResult<Vec<DispatchThreadFact>> {
+    if card_id.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        "SELECT dispatch_type, status, thread_id
+         FROM task_dispatches
+         WHERE kanban_card_id = $1
+           AND NULLIF(BTRIM(thread_id), '') IS NOT NULL
+         ORDER BY updated_at DESC NULLS LAST,
+                  created_at DESC NULLS LAST,
+                  id DESC",
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| {
+        ServiceError::internal(format!("load dispatch thread facts: {error}"))
+            .with_code(ErrorCode::Database)
+            .with_operation("list_card_dispatch_thread_facts_pg")
+            .with_context("card_id", card_id)
+    })?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(DispatchThreadFact {
+                dispatch_type: row
+                    .try_get("dispatch_type")
+                    .map_err(map_thread_fact_error)?,
+                status: row.try_get("status").map_err(map_thread_fact_error)?,
+                thread_id: row.try_get("thread_id").map_err(map_thread_fact_error)?,
+            })
+        })
+        .collect()
+}
+
+fn map_thread_fact_error(error: sqlx::Error) -> ServiceError {
+    ServiceError::internal(format!("decode dispatch thread fact: {error}"))
+        .with_code(ErrorCode::Database)
+        .with_operation("list_card_dispatch_thread_facts_pg.decode")
+}
+
+fn canonical_dispatch_threads_by_channel(
+    facts: &[DispatchThreadFact],
+    bindings: Option<&crate::db::agents::AgentChannelBindings>,
+) -> BTreeMap<u64, Option<String>> {
+    let mut channels = BTreeMap::new();
+    for fact in facts {
+        let Some(channel_id) = dispatch_thread_channel_id(fact, bindings) else {
+            continue;
+        };
+        channels.entry(channel_id).or_insert_with(|| {
+            if dispatch_thread_status_suppresses_link(&fact.status) {
+                None
+            } else {
+                Some(fact.thread_id.clone())
+            }
+        });
+    }
+    channels
+}
+
+fn latest_invalid_dispatch_thread_ids(facts: &[DispatchThreadFact]) -> BTreeSet<String> {
+    let mut statuses = BTreeMap::<String, bool>::new();
+    for fact in facts {
+        statuses
+            .entry(fact.thread_id.clone())
+            .or_insert_with(|| dispatch_thread_status_suppresses_link(&fact.status));
+    }
+    statuses
+        .into_iter()
+        .filter_map(|(thread_id, suppress)| suppress.then_some(thread_id))
+        .collect()
+}
+
+fn dispatch_thread_channel_id(
+    fact: &DispatchThreadFact,
+    bindings: Option<&crate::db::agents::AgentChannelBindings>,
+) -> Option<u64> {
+    let bindings = bindings?;
+    let channel = if crate::server::routes::dispatches::use_counter_model_channel(
+        fact.dispatch_type.as_deref(),
+    ) {
+        bindings.counter_model_channel()
+    } else {
+        bindings.primary_channel()
+    };
+    channel
+        .as_deref()
+        .and_then(crate::server::routes::dispatches::parse_channel_id)
+}
+
+fn dispatch_thread_status_suppresses_link(status: &str) -> bool {
+    matches!(status, "cancelled" | "failed" | "expired")
 }
 
 fn build_thread_link_candidates(
