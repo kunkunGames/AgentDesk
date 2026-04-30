@@ -959,12 +959,9 @@ Any other message is sent to {p}.
 
             let attachment = CreateAttachment::path(path).await?;
             rate_limit_wait(&data.shared, channel_id).await;
-            let _ = crate::services::discord::outbound::message_outbox::send_message(
-                &data.shared,
-                channel_id,
-                CreateMessage::new().add_file(attachment),
-            )
-            .await;
+            let _ = channel_id
+                .send_message(&ctx.http, CreateMessage::new().add_file(attachment))
+                .await;
             return Ok(true);
         }
 
@@ -1226,12 +1223,12 @@ Any other message is sent to {p}.
             };
 
             rate_limit_wait(&data.shared, channel_id).await;
-            let confirm = crate::services::discord::outbound::message_outbox::send_message(
-                &data.shared,
-                channel_id,
-                CreateMessage::new().content(format!("Running skill: `/{skill}`")),
-            )
-            .await?;
+            let confirm = channel_id
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new().content(format!("Running skill: `/{skill}`")),
+                )
+                .await?;
 
             handle_text_message(
                 ctx,

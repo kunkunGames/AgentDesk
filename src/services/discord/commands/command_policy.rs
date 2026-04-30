@@ -71,8 +71,8 @@ pub(in crate::services::discord) fn command_risk(cmd: &str, _arg1: &str) -> Comm
         // cancels its in-flight turn; `!restart` kills+respawns its tmux
         // session; `!debug` toggles the global debug-logging atomic but the
         // operator trusts every authorized user with that switch.
-        "!start" | "!down" | "!cc" | "!meeting" | "!fast" | "!clear"
-        | "!deletesession" | "!stop" | "!restart" | "!debug" => CommandRisk::Mutating,
+        "!start" | "!down" | "!cc" | "!meeting" | "!fast" | "!clear" | "!deletesession"
+        | "!stop" | "!restart" | "!debug" => CommandRisk::Mutating,
 
         // Shell execution and tool allowlist mutation — equivalent to RCE.
         "!shell" | "!allowed" => CommandRisk::ShellOrToolGrant,

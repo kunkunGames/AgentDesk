@@ -142,7 +142,7 @@
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 |  |
 | `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 134 |  |
 | `runtime_layout::skill_sync` | `src/runtime_layout/skill_sync.rs` | 685 |  |
-| `server` | `src/server/mod.rs` | 3344 | giant-file |
+| `server` | `src/server/mod.rs` | 3347 | giant-file |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 92 |  |
 | `server::maintenance` | `src/server/maintenance.rs` | 916 |  |
 | `server::routes` | `src/server/routes/mod.rs` | 283 |  |
@@ -198,7 +198,7 @@
 | `server::routes::review_verdict::tuning_aggregate` | `src/server/routes/review_verdict/tuning_aggregate.rs` | 707 |  |
 | `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 554 |  |
 | `server::routes::reviews` | `src/server/routes/reviews.rs` | 530 |  |
-| `server::routes::routines` | `src/server/routes/routines.rs` | 760 |  |
+| `server::routes::routines` | `src/server/routes/routines.rs` | 761 |  |
 | `server::routes::session_activity` | `src/server/routes/session_activity.rs` | 405 |  |
 | `server::routes::settings` | `src/server/routes/settings.rs` | 1476 | giant-file |
 | `server::routes::skill_usage_analytics` | `src/server/routes/skill_usage_analytics.rs` | 328 |  |
@@ -245,7 +245,7 @@
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 723 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1166 | giant-file |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 97 |  |
-| `services::discord::commands::command_policy` | `src/services/discord/commands/command_policy.rs` | 521 |  |
+| `services::discord::commands::command_policy` | `src/services/discord/commands/command_policy.rs` | 520 |  |
 | `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1810 | giant-file |
 | `services::discord::commands::control` | `src/services/discord/commands/control.rs` | 842 |  |
 | `services::discord::commands::diagnostics` | `src/services/discord/commands/diagnostics.rs` | 1047 | giant-file |
@@ -258,7 +258,7 @@
 | `services::discord::commands::restart` | `src/services/discord/commands/restart.rs` | 346 |  |
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 370 |  |
 | `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 397 |  |
-| `services::discord::commands::text_commands` | `src/services/discord/commands/text_commands.rs` | 1271 | giant-file |
+| `services::discord::commands::text_commands` | `src/services/discord/commands/text_commands.rs` | 1262 | giant-file |
 | `services::discord::discord_io` | `src/services/discord/discord_io.rs` | 558 |  |
 | `services::discord::formatting` | `src/services/discord/formatting.rs` | 3105 | giant-file |
 | `services::discord::gateway` | `src/services/discord/gateway.rs` | 826 |  |
@@ -301,7 +301,7 @@
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 22 |  |
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
 | `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 1777 | giant-file |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 7315 | giant-file |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 7304 | giant-file |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 129 |  |
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 2658 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 373 |  |
@@ -396,7 +396,7 @@
 | `services::routines` | `src/services/routines/mod.rs` | 27 |  |
 | `services::routines::action` | `src/services/routines/action.rs` | 284 |  |
 | `services::routines::agent_executor` | `src/services/routines/agent_executor.rs` | 680 |  |
-| `services::routines::discord_log` | `src/services/routines/discord_log.rs` | 592 |  |
+| `services::routines::discord_log` | `src/services/routines/discord_log.rs` | 677 |  |
 | `services::routines::loader` | `src/services/routines/loader.rs` | 1443 | giant-file |
 | `services::routines::runtime` | `src/services/routines/runtime.rs` | 363 |  |
 | `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 108 |  |

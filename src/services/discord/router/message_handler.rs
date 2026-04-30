@@ -5033,17 +5033,6 @@ Any other message is sent to {p}.
             }
 
             // ── Commands with arguments ──
-            "!model" => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!("  [{ts}] ◀ [{}] !model {} {}", msg.author.name, arg1, arg2);
-                let _ = msg
-                    .reply(
-                        &ctx.http,
-                        "Model picker text commands are deprecated. Use `/model`.",
-                    )
-                    .await;
-                return Ok(true);
-            }
 
             "!allowed" => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
