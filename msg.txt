@@ -1,0 +1,5 @@
+🧪 Add tests for read_bot_token
+
+🎯 What: The `read_bot_token` function lacked automated tests, leaving potential gaps in verifying its expected behavior, especially how it processes empty tokens and missing files.
+📊 Coverage: Added a test module using `EnvVarGuard` to test reading a successfully trimmed token, handling missing token files, and correctly returning `None` for empty/whitespace-only tokens.
+✨ Result: Enhanced the reliability and coverage of the `credential.rs` module, making the behavior of `read_bot_token` fully verifiable and resistant to regressions.

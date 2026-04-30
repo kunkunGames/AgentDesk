@@ -22,3 +22,78 @@ pub fn read_bot_token(name: &str) -> Option<String> {
     let path = crate::runtime_layout::credential_token_path(&root, name);
     read_trimmed_token(&path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // A helper to safely manage environment variables in tests.
+    struct EnvVarGuard {
+        key: String,
+        previous_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &str, path: &Path) -> Self {
+            let previous_value = std::env::var_os(key);
+            unsafe { std::env::set_var(key, path) };
+            Self {
+                key: key.to_string(),
+                previous_value,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous_value {
+                Some(val) => unsafe { std::env::set_var(&self.key, val) },
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_bot_token_success() {
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+
+        let root = temp.path();
+        let _ = crate::runtime_layout::ensure_credential_layout(root);
+        let path = crate::runtime_layout::credential_token_path(root, "my_bot");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "  my_secret_token  ").unwrap();
+
+        assert_eq!(
+            read_bot_token("my_bot"),
+            Some("my_secret_token".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_bot_token_not_found() {
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+
+        let root = temp.path();
+        let _ = crate::runtime_layout::ensure_credential_layout(root);
+
+        assert_eq!(read_bot_token("missing_bot"), None);
+    }
+
+    #[test]
+    fn test_read_bot_token_empty_or_whitespace() {
+        let temp = TempDir::new().unwrap();
+        let _guard = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+
+        let root = temp.path();
+        let _ = crate::runtime_layout::ensure_credential_layout(root);
+        let path = crate::runtime_layout::credential_token_path(root, "empty_bot");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "   \n \t ").unwrap();
+
+        assert_eq!(read_bot_token("empty_bot"), None);
+    }
+}
