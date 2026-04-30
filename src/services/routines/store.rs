@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
@@ -12,6 +12,132 @@ use uuid::Uuid;
 
 pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
 const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn bounded_observation_push(
+    observations: &mut Vec<Value>,
+    total_bytes: &mut usize,
+    max_items: usize,
+    max_payload_bytes: usize,
+    obs: Value,
+) -> bool {
+    if observations.len() >= max_items {
+        return false;
+    }
+    let bytes = obs.to_string().len();
+    if *total_bytes + bytes > max_payload_bytes {
+        return false;
+    }
+    *total_bytes += bytes;
+    observations.push(obs);
+    true
+}
+
+fn json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+fn json_count(value: &Value) -> u64 {
+    value
+        .get("count")
+        .or_else(|| value.get("occurrences"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .clamp(1, 50)
+}
+
+fn default_observation_category(source_kind: &str) -> &'static str {
+    match source_kind {
+        "memento_digest" => "memento-hygiene",
+        "release_freshness" => "release-freshness",
+        _ => "routine-candidate",
+    }
+}
+
+fn default_observation_source(source_kind: &str) -> &'static str {
+    match source_kind {
+        "memento_digest" => "memento_digest",
+        "release_freshness" => "precomputed_digest",
+        _ => "precomputed_digest",
+    }
+}
+
+fn precomputed_observation_from_kv(
+    key: &str,
+    raw_value: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<Value> {
+    let payload: Value = serde_json::from_str(raw_value?.trim()).ok()?;
+    let suffix = key.strip_prefix("routine_observation:").unwrap_or(key);
+    let (source_kind, key_topic) = suffix
+        .split_once(':')
+        .map(|(kind, topic)| (kind, topic))
+        .unwrap_or((suffix, suffix));
+    let topic = json_str(&payload, "topic").unwrap_or(key_topic);
+    let count = json_count(&payload);
+    let category =
+        json_str(&payload, "category").unwrap_or_else(|| default_observation_category(source_kind));
+    let source =
+        json_str(&payload, "source").unwrap_or_else(|| default_observation_source(source_kind));
+    let signature = json_str(&payload, "signature")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{category}:{topic}"));
+    let timestamp = json_str(&payload, "timestamp")
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| now.to_rfc3339());
+    let weight = payload
+        .get("weight")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| if count >= 5 { 2 } else { 1 })
+        .clamp(1, 2);
+    let latest_examples = payload
+        .get("latest_examples")
+        .or_else(|| payload.get("examples"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|example| truncate_chars(example.trim(), 80))
+                .filter(|example| !example.is_empty())
+                .take(3)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let example_suffix = if latest_examples.is_empty() {
+        String::new()
+    } else {
+        format!("; latest examples: {}", latest_examples.join(" | "))
+    };
+    let summary = truncate_chars(
+        &format!("{topic}: {count} digest signal(s){example_suffix}"),
+        240,
+    );
+
+    Some(serde_json::json!({
+        "timestamp": timestamp,
+        "source": source,
+        "category": category,
+        "signature": signature,
+        "summary": summary,
+        "weight": weight,
+        "occurrences": count,
+        "evidence_ref": format!("kv_meta:{key}"),
+    }))
+}
 
 /// Durable PG-backed store for routines and routine_runs.
 ///
@@ -173,6 +299,10 @@ impl RoutineStore {
             pool,
             default_timezone: default_timezone.into(),
         }
+    }
+
+    pub(crate) fn pool(&self) -> &PgPool {
+        self.pool.as_ref()
     }
 
     /// Claim due routines in a short transaction.
@@ -490,6 +620,305 @@ impl RoutineStore {
         .fetch_all(&*self.pool)
         .await
         .map_err(|e| anyhow!("search routine run results: {e}"))
+    }
+
+    /// Fetch recent routine and system signals formatted as bounded observation items.
+    ///
+    /// Used to populate `ctx.observations` in `RoutineTickContext` so JS routines
+    /// can accumulate evidence of recurring patterns without raw log or DB scanning.
+    /// Precomputed digest rows must be stored under `routine_observation:*` keys
+    /// in `kv_meta`; this keeps memento-derived inputs bounded to topic/count/examples
+    /// snapshots instead of raw memory bodies.
+    /// Results are truncated to `max_items` and `max_payload_bytes` before return.
+    pub async fn fetch_recent_run_observations(
+        &self,
+        current_script_ref: Option<&str>,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        if max_items == 0 || max_payload_bytes == 0 {
+            return Ok(Vec::new());
+        }
+
+        let limit = (max_items as i64).min(100);
+        let mut observations = Vec::with_capacity(max_items.min(100));
+        let mut total_bytes: usize = 0;
+        let now = Utc::now();
+
+        let digest_rows = sqlx::query(
+            r#"
+            SELECT key, value
+            FROM kv_meta
+            WHERE key LIKE 'routine_observation:%'
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY key ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit.min(50))
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch precomputed routine observations: {e}"))?;
+
+        for row in &digest_rows {
+            let key: String = row.try_get("key").unwrap_or_default();
+            let value: Option<String> = row.try_get("value").ok().flatten();
+            let Some(obs) = precomputed_observation_from_kv(&key, value.as_deref(), now) else {
+                continue;
+            };
+            if !bounded_observation_push(
+                &mut observations,
+                &mut total_bytes,
+                max_items,
+                max_payload_bytes,
+                obs,
+            ) {
+                return Ok(observations);
+            }
+        }
+
+        let api_rows = sqlx::query(
+            r#"
+            SELECT fingerprint,
+                   endpoint,
+                   friction_type,
+                   docs_category,
+                   title,
+                   event_count,
+                   COALESCE(last_event_at, updated_at, created_at) AS last_seen_at
+            FROM api_friction_issues
+            WHERE COALESCE(last_event_at, updated_at, created_at) > NOW() - INTERVAL '30 days'
+              AND event_count >= 2
+            ORDER BY COALESCE(last_event_at, updated_at, created_at) DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit.min(20))
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch api friction observations: {e}"))?;
+
+        for row in &api_rows {
+            let fingerprint: String = row.try_get("fingerprint").unwrap_or_default();
+            let endpoint: String = row.try_get("endpoint").unwrap_or_default();
+            let friction_type: String = row.try_get("friction_type").unwrap_or_default();
+            let title: String = row.try_get("title").unwrap_or_default();
+            let docs_category: Option<String> = row.try_get("docs_category").ok().flatten();
+            let event_count: i32 = row.try_get("event_count").unwrap_or(1);
+            let last_seen_at: DateTime<Utc> =
+                row.try_get("last_seen_at").unwrap_or_else(|_| Utc::now());
+            let docs_suffix = docs_category
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(" docs={value}"))
+                .unwrap_or_default();
+            let summary = truncate_chars(
+                &format!(
+                    "{endpoint} {friction_type}: {} ({event_count} reports{docs_suffix})",
+                    title.trim()
+                ),
+                240,
+            );
+            let obs = serde_json::json!({
+                "timestamp": last_seen_at.to_rfc3339(),
+                "source": "api_friction",
+                "category": "api-friction",
+                "signature": format!("api-friction:{fingerprint}"),
+                "summary": summary,
+                "weight": 2,
+                "occurrences": event_count.max(1).min(50),
+                "evidence_ref": format!("api_friction_issues:{fingerprint}"),
+            });
+            if !bounded_observation_push(
+                &mut observations,
+                &mut total_bytes,
+                max_items,
+                max_payload_bytes,
+                obs,
+            ) {
+                return Ok(observations);
+            }
+        }
+
+        let outbox_rows = sqlx::query(
+            r#"
+            SELECT COALESCE(NULLIF(source, ''), 'message_outbox') AS source,
+                   COALESCE(NULLIF(reason_code, ''), status) AS reason_code,
+                   status,
+                   COUNT(*)::BIGINT AS occurrence_count,
+                   MAX(created_at) AS last_seen_at,
+                   MAX(error) FILTER (WHERE error IS NOT NULL) AS last_error
+            FROM message_outbox
+            WHERE created_at > NOW() - INTERVAL '24 hours'
+              AND (status IN ('failed', 'error') OR error IS NOT NULL)
+            GROUP BY source, reason_code, status
+            ORDER BY MAX(created_at) DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit.min(20))
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch outbox delivery observations: {e}"))?;
+
+        for row in &outbox_rows {
+            let source: String = row
+                .try_get("source")
+                .unwrap_or_else(|_| "message_outbox".into());
+            let reason_code: String = row.try_get("reason_code").unwrap_or_default();
+            let status: String = row.try_get("status").unwrap_or_default();
+            let occurrence_count: i64 = row.try_get("occurrence_count").unwrap_or(1);
+            let last_seen_at: DateTime<Utc> =
+                row.try_get("last_seen_at").unwrap_or_else(|_| Utc::now());
+            let last_error: Option<String> = row.try_get("last_error").ok().flatten();
+            let summary =
+                if let Some(error) = last_error.as_deref().filter(|value| !value.is_empty()) {
+                    format!(
+                        "{source} outbox {status} for {reason_code}: {}",
+                        truncate_chars(error, 120)
+                    )
+                } else {
+                    format!("{source} outbox {status} for {reason_code}")
+                };
+            let obs = serde_json::json!({
+                "timestamp": last_seen_at.to_rfc3339(),
+                "source": "message_outbox",
+                "category": "outbox-delivery",
+                "signature": format!("outbox-delivery:{source}:{reason_code}:{status}"),
+                "summary": truncate_chars(&summary, 240),
+                "weight": 2,
+                "occurrences": occurrence_count.max(1).min(50),
+                "evidence_ref": format!("message_outbox:{source}:{reason_code}:{status}"),
+            });
+            if !bounded_observation_push(
+                &mut observations,
+                &mut total_bytes,
+                max_items,
+                max_payload_bytes,
+                obs,
+            ) {
+                return Ok(observations);
+            }
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT rr.id,
+                   r.script_ref,
+                   r.name,
+                   rr.action,
+                   rr.status,
+                   rr.result_json,
+                   rr.error,
+                   rr.started_at
+            FROM routine_runs rr
+            JOIN routines r ON r.id = rr.routine_id
+            WHERE rr.status IN ('succeeded', 'failed', 'skipped', 'error')
+              AND rr.started_at > NOW() - INTERVAL '24 hours'
+              AND ($1::text IS NULL OR r.script_ref <> $1)
+            ORDER BY rr.started_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(current_script_ref)
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch routine run observations: {e}"))?;
+
+        for row in &rows {
+            let id: String = row.try_get("id").unwrap_or_default();
+            let script_ref: String = row.try_get("script_ref").unwrap_or_default();
+            let name: String = row.try_get("name").unwrap_or_default();
+            let action: Option<String> = row.try_get("action").ok().flatten();
+            let status: String = row.try_get("status").unwrap_or_default();
+            let error: Option<String> = row.try_get("error").ok().flatten();
+            let started_at: DateTime<Utc> =
+                row.try_get("started_at").unwrap_or_else(|_| Utc::now());
+
+            let action_str = action.as_deref().unwrap_or("run");
+            let weight: u8 = if status == "failed" || status == "error" {
+                2
+            } else {
+                1
+            };
+            let summary = if let Some(ref err) = error {
+                let short_err = truncate_chars(err, 120);
+                format!("{name} {action_str} {status}: {short_err}")
+            } else {
+                format!("{name} {action_str} {status}")
+            };
+
+            let obs = serde_json::json!({
+                "timestamp": started_at.to_rfc3339(),
+                "source": "routine_result",
+                "category": "routine-candidate",
+                "signature": format!("{script_ref}:{action_str}"),
+                "summary": summary,
+                "weight": weight,
+                "evidence_ref": format!("routine_run:{id}"),
+            });
+
+            if !bounded_observation_push(
+                &mut observations,
+                &mut total_bytes,
+                max_items,
+                max_payload_bytes,
+                obs,
+            ) {
+                return Ok(observations);
+            }
+        }
+
+        Ok(observations)
+    }
+
+    pub async fn fetch_active_routine_automation_inventory(
+        &self,
+        max_items: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let limit = (max_items as i64).min(100);
+        let rows = sqlx::query(
+            r#"
+            SELECT script_ref, name, updated_at
+            FROM routines
+            WHERE status <> 'detached'
+            ORDER BY updated_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("fetch active routine automation inventory: {e}"))?;
+
+        let mut inventory = Vec::with_capacity(rows.len());
+        let mut total_bytes: usize = 0;
+
+        for row in &rows {
+            let script_ref: String = row.try_get("script_ref").unwrap_or_default();
+            let name: String = row.try_get("name").unwrap_or_default();
+            let updated_at: DateTime<Utc> =
+                row.try_get("updated_at").unwrap_or_else(|_| Utc::now());
+
+            let item = serde_json::json!({
+                "pattern_id": format!("{script_ref}:*"),
+                "status": "implemented",
+                "reason": "registered routine",
+                "source_ref": format!("routine:{name}"),
+                "updated_at": updated_at.to_rfc3339(),
+            });
+
+            let bytes = item.to_string().len();
+            if total_bytes + bytes > max_payload_bytes {
+                break;
+            }
+            total_bytes += bytes;
+            inventory.push(item);
+        }
+
+        Ok(inventory)
     }
 
     pub async fn attach_routine(&self, new_routine: NewRoutine) -> Result<RoutineRecord> {
@@ -1139,6 +1568,19 @@ impl RoutineStore {
         next_due_after(schedule, default_timezone, now)
     }
 
+    async fn next_due_from_schedule_anchor_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        schedule: &str,
+        default_timezone: &str,
+        anchor: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>> {
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|e| anyhow!("load database time for anchored routine schedule: {e}"))?;
+        next_due_after_anchor(schedule, default_timezone, anchor, now)
+    }
+
     async fn insert_running_run(
         tx: &mut Transaction<'_, Postgres>,
         candidate: RoutineClaimCandidate,
@@ -1199,29 +1641,45 @@ impl RoutineStore {
     async fn close_run(&self, run_id: &str, close: CloseRun<'_>) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
 
-        let target: Option<(String, Option<String>)> = sqlx::query_as(
-            r#"
-            SELECT r.id, r.schedule
+        let target: Option<(String, Option<String>, Option<DateTime<Utc>>, DateTime<Utc>)> =
+            sqlx::query_as(
+                r#"
+            SELECT r.id, r.schedule, r.next_due_at, rr.started_at
             FROM routine_runs rr
             JOIN routines r ON r.id = rr.routine_id
             WHERE rr.id = $1
               AND rr.status = 'running'
             FOR UPDATE OF rr, r
             "#,
-        )
-        .bind(run_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
+            )
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| anyhow!("close run {run_id}: lock running run: {e}"))?;
 
-        let Some((routine_id, schedule)) = target else {
+        let Some((routine_id, schedule, current_next_due_at, started_at)) = target else {
             tx.commit().await?;
             return Ok(false);
         };
         let scheduled_next_due_at = if close.next_due_at.should_update() {
             close.next_due_at.value()
         } else if let Some(schedule) = schedule.as_deref() {
-            Some(Self::next_due_from_schedule_tx(&mut tx, schedule, &self.default_timezone).await?)
+            match current_next_due_at {
+                Some(anchor) if anchor <= started_at => Some(
+                    Self::next_due_from_schedule_anchor_tx(
+                        &mut tx,
+                        schedule,
+                        &self.default_timezone,
+                        anchor,
+                    )
+                    .await?,
+                ),
+                Some(_) => None,
+                None => Some(
+                    Self::next_due_from_schedule_tx(&mut tx, schedule, &self.default_timezone)
+                        .await?,
+                ),
+            }
         } else {
             None
         };
@@ -1369,16 +1827,93 @@ fn next_due_after(
     now: DateTime<Utc>,
 ) -> Result<DateTime<Utc>> {
     match parse_routine_schedule(schedule)? {
-        ParsedRoutineSchedule::Every(duration) => Ok(now + duration),
-        ParsedRoutineSchedule::Cron(cron) => {
-            let timezone = Tz::from_str(default_timezone)
-                .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
-            let zoned_now = now.with_timezone(&timezone);
-            cron.find_next_occurrence(&zoned_now, false)
-                .map(|value| value.with_timezone(&Utc))
-                .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
-        }
+        ParsedRoutineSchedule::Every(duration) => next_every_due_after(duration, now),
+        ParsedRoutineSchedule::Cron(cron) => next_cron_due_after(cron, default_timezone, now),
     }
+}
+
+fn next_due_after_anchor(
+    schedule: &str,
+    default_timezone: &str,
+    anchor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    match parse_routine_schedule(schedule)? {
+        ParsedRoutineSchedule::Every(duration) => {
+            next_every_due_after_anchor(duration, anchor, now)
+        }
+        ParsedRoutineSchedule::Cron(cron) => next_cron_due_after(cron, default_timezone, now),
+    }
+}
+
+fn next_every_due_after(duration: Duration, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    checked_add_duration(
+        truncate_to_second(now),
+        duration,
+        "compute next routine interval occurrence",
+    )
+}
+
+fn next_every_due_after_anchor(
+    duration: Duration,
+    anchor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let interval_secs = duration.num_seconds();
+    if interval_secs <= 0 {
+        return Err(anyhow!(
+            "routine schedule duration must be greater than zero"
+        ));
+    }
+
+    let anchor = truncate_to_second(anchor);
+    let reference = truncate_to_second(now);
+    let elapsed_secs = reference.signed_duration_since(anchor).num_seconds();
+    let steps = if elapsed_secs < 0 {
+        1
+    } else {
+        elapsed_secs
+            .checked_div(interval_secs)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow!("compute anchored routine interval occurrence: overflow"))?
+    };
+    let total_secs = interval_secs
+        .checked_mul(steps)
+        .ok_or_else(|| anyhow!("compute anchored routine interval occurrence: overflow"))?;
+
+    checked_add_duration(
+        anchor,
+        Duration::seconds(total_secs),
+        "compute anchored routine interval occurrence",
+    )
+}
+
+fn next_cron_due_after(
+    cron: Cron,
+    default_timezone: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    let timezone = Tz::from_str(default_timezone)
+        .map_err(|_| anyhow!("invalid routines.default_timezone '{default_timezone}'"))?;
+    let zoned_now = now.with_timezone(&timezone);
+    cron.find_next_occurrence(&zoned_now, false)
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|e| anyhow!("compute next routine cron occurrence: {e}"))
+}
+
+fn truncate_to_second(value: DateTime<Utc>) -> DateTime<Utc> {
+    value
+        .with_nanosecond(0)
+        .expect("DateTime<Utc> nanosecond truncation should be valid")
+}
+
+fn checked_add_duration(
+    base: DateTime<Utc>,
+    duration: Duration,
+    context: &'static str,
+) -> Result<DateTime<Utc>> {
+    base.checked_add_signed(duration)
+        .ok_or_else(|| anyhow!("{context}: timestamp overflow"))
 }
 
 fn parse_schedule_interval(schedule: &str) -> Result<Duration> {
@@ -1478,8 +2013,12 @@ struct CloseRun<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_due_after, parse_schedule_interval, validate_routine_schedule};
+    use super::{
+        next_due_after, next_due_after_anchor, parse_schedule_interval,
+        precomputed_observation_from_kv, truncate_chars, validate_routine_schedule,
+    };
     use chrono::{TimeZone, Timelike, Utc};
+    use serde_json::Value;
 
     // Integration tests that require a live PG connection live in
     // src/integration_tests.rs and are gated on the `integration` feature.
@@ -1533,5 +2072,80 @@ mod tests {
             next_due,
             Utc.with_ymd_and_hms(2026, 4, 29, 1, 0, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn every_next_due_truncates_subsecond_jitter() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 3, 32, 8)
+            .unwrap()
+            .with_nanosecond(830_000_000)
+            .unwrap();
+        let next_due = next_due_after("@every 1m", "Asia/Seoul", now).unwrap();
+        assert_eq!(
+            next_due,
+            Utc.with_ymd_and_hms(2026, 4, 30, 3, 33, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn anchored_every_next_due_skips_missed_intervals_and_stays_second_aligned() {
+        let anchor = Utc
+            .with_ymd_and_hms(2026, 4, 30, 3, 31, 8)
+            .unwrap()
+            .with_nanosecond(830_000_000)
+            .unwrap();
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 30, 3, 32, 8)
+            .unwrap()
+            .with_nanosecond(831_000_000)
+            .unwrap();
+        let next_due = next_due_after_anchor("@every 1m", "Asia/Seoul", anchor, now).unwrap();
+        assert_eq!(
+            next_due,
+            Utc.with_ymd_and_hms(2026, 4, 30, 3, 33, 8).unwrap()
+        );
+    }
+
+    #[test]
+    fn truncate_chars_does_not_split_multibyte_text() {
+        let text = "가".repeat(121);
+        let truncated = truncate_chars(&text, 120);
+        assert!(truncated.ends_with("..."));
+        assert_eq!(truncated.trim_end_matches("...").chars().count(), 120);
+    }
+
+    #[test]
+    fn precomputed_memento_digest_observation_uses_digest_fields_only() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 30, 7, 0, 0).unwrap();
+        let raw = serde_json::json!({
+            "topic": "api friction repeats",
+            "count": 7,
+            "latest_examples": ["GET /api/docs before retry", "kanban docs lookup"],
+            "raw_memory_body": "SECRET_RAW_MEMORY_BODY_SHOULD_NOT_LEAK",
+            "timestamp": "2026-04-30T06:59:00Z"
+        })
+        .to_string();
+
+        let obs = precomputed_observation_from_kv(
+            "routine_observation:memento_digest:api-friction",
+            Some(&raw),
+            now,
+        )
+        .expect("digest observation");
+
+        assert_eq!(
+            obs.get("source").and_then(Value::as_str),
+            Some("memento_digest")
+        );
+        assert_eq!(
+            obs.get("category").and_then(Value::as_str),
+            Some("memento-hygiene")
+        );
+        assert_eq!(obs.get("occurrences").and_then(Value::as_u64), Some(7));
+        let summary = obs.get("summary").and_then(Value::as_str).unwrap();
+        assert!(summary.contains("api friction repeats"));
+        assert!(summary.contains("GET /api/docs before retry"));
+        assert!(!summary.contains("SECRET_RAW_MEMORY_BODY"));
     }
 }

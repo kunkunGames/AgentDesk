@@ -555,8 +555,9 @@ fn routine_discord_logger(state: &AppState) -> AppResult<RoutineDiscordLogger> {
             "postgres pool unavailable; routines require postgresql",
         ));
     };
-    Ok(RoutineDiscordLogger::new_with_health_target(
+    Ok(RoutineDiscordLogger::new_with_health_registry(
         std::sync::Arc::new(pool),
+        state.health_registry.clone(),
         routine_health_target(&state.config),
     ))
 }

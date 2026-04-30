@@ -1647,7 +1647,7 @@ pub async fn resolve_bot_http(
             // Look up provider bot (e.g. "claude", "codex")
             let clients = registry.discord_http.lock().await;
             for (name, http) in clients.iter() {
-                if name == provider {
+                if bot_names_match(name, provider) {
                     return Ok(http.clone());
                 }
             }
@@ -1656,6 +1656,22 @@ pub async fn resolve_bot_http(
                 format!(r#"{{"ok":false,"error":"unknown bot: {provider}"}}"#),
             ))
         }
+    }
+}
+
+fn bot_names_match(registered: &str, requested: &str) -> bool {
+    let registered = registered.trim();
+    let requested = requested.trim();
+    if registered == requested || registered.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+
+    match (
+        ProviderKind::from_str(registered),
+        ProviderKind::from_str(requested),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -2118,6 +2134,65 @@ async fn resolve_agent_target_channel_id_pg(
     })
 }
 
+async fn routine_thread_parent_hint(
+    pg_pool: Option<&PgPool>,
+    thread_channel_id: ChannelId,
+) -> Option<ChannelId> {
+    let Some(pg_pool) = pg_pool else {
+        return None;
+    };
+
+    let agent_id = match sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT agent_id
+          FROM routines
+         WHERE discord_thread_id = $1
+           AND agent_id IS NOT NULL
+           AND status <> 'detached'
+         ORDER BY updated_at DESC
+         LIMIT 1
+        "#,
+    )
+    .bind(thread_channel_id.get().to_string())
+    .fetch_optional(pg_pool)
+    .await
+    {
+        Ok(Some(agent_id)) => agent_id,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                "routine thread auth lookup failed for {}: {}",
+                thread_channel_id.get(),
+                error
+            );
+            return None;
+        }
+    };
+
+    let bindings = match crate::db::agents::load_agent_channel_bindings_pg(pg_pool, &agent_id).await
+    {
+        Ok(Some(bindings)) => bindings,
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::warn!(
+                "routine thread auth failed to load agent bindings for {agent_id}: {error}"
+            );
+            return None;
+        }
+    };
+
+    let Some(primary_channel) = bindings.primary_channel() else {
+        return None;
+    };
+    let Some(parent_channel_id) = parse_channel_target_value(&primary_channel) else {
+        tracing::warn!(
+            "routine thread auth found invalid primary channel for {agent_id}: {primary_channel}"
+        );
+        return None;
+    };
+    Some(ChannelId::new(parent_channel_id))
+}
+
 fn resolve_channel_target(target: &str) -> Result<u64, SendTargetResolutionError> {
     let channel_target = target.strip_prefix("channel:").unwrap_or(target);
     parse_channel_target_value(channel_target).ok_or(SendTargetResolutionError::BadRequest(
@@ -2234,19 +2309,7 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
     let channel_id = ChannelId::new(channel_id_raw);
 
     // Validate source is a known agent role_id or internal system source
-    const INTERNAL_SOURCES: &[&str] = &[
-        "kanban-rules",
-        "triage-rules",
-        "review-automation",
-        "auto-queue",
-        "pipeline",
-        "system",
-        "timeouts",
-        "merge-automation",
-        "dashboard",
-        "routine-runtime",
-    ];
-    if !INTERNAL_SOURCES.contains(&source) && !super::settings::is_known_agent(source) {
+    if !is_allowed_send_source(source) {
         return (
             "403 Forbidden",
             format!(
@@ -2260,12 +2323,23 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
     // If the target is a thread, resolve its parent channel and check that instead.
     // Pass channel name so byChannelName-style configs can match.
     if super::settings::resolve_role_binding(channel_id, None).is_none() {
+        let routine_parent_hint = routine_thread_parent_hint(pg_pool, channel_id).await;
         let mut authorized = false;
         // Try resolving as a thread: fetch channel info and check parent_id
         if let Ok(http) = resolve_bot_http(registry, bot).await {
             if let Ok(channel) = channel_id.to_channel(&*http).await {
                 if let Some(guild_channel) = channel.guild() {
                     if let Some(parent_id) = guild_channel.parent_id {
+                        if let Some(expected_parent) = routine_parent_hint {
+                            if expected_parent != parent_id {
+                                tracing::warn!(
+                                    target_channel_id = channel_id.get(),
+                                    actual_parent_id = parent_id.get(),
+                                    expected_parent_id = expected_parent.get(),
+                                    "routine thread parent hint did not match Discord parent"
+                                );
+                            }
+                        }
                         // Resolve parent channel name for byChannelName configs
                         let parent_name = if let Ok(parent_ch) = parent_id.to_channel(&*http).await
                         {
@@ -2309,6 +2383,23 @@ pub(crate) async fn send_message_with_backends_and_delivery_id(
         delivery_id,
     )
     .await
+}
+
+fn is_allowed_send_source(source: &str) -> bool {
+    const INTERNAL_SOURCES: &[&str] = &[
+        "kanban-rules",
+        "triage-rules",
+        "review-automation",
+        "auto-queue",
+        "pipeline",
+        "system",
+        "timeouts",
+        "merge-automation",
+        "dashboard",
+        "routine-runtime",
+        "headless_turn",
+    ];
+    INTERNAL_SOURCES.contains(&source) || super::settings::is_known_agent(source)
 }
 
 async fn send_resolved_manual_message_with_client<C: ManualOutboundClient>(
@@ -3542,6 +3633,13 @@ mod tests {
         assert!(result.is_ok());
         let (_, _, source) = result.unwrap();
         assert_eq!(source, "unknown");
+    }
+
+    #[test]
+    fn headless_turn_is_allowed_internal_send_source() {
+        assert!(is_allowed_send_source("headless_turn"));
+        assert!(is_allowed_send_source("routine-runtime"));
+        assert!(!is_allowed_send_source("not-a-real-source"));
     }
 
     #[derive(Clone, Default)]

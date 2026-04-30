@@ -32,12 +32,46 @@ impl Clone for LoadedRoutineScript {
 
 pub type RoutineScriptStore = Arc<Mutex<HashMap<String, LoadedRoutineScript>>>;
 
+pub const MAX_OBSERVATIONS_PER_TICK: usize = 100;
+pub const MAX_OBSERVATION_PAYLOAD_BYTES: usize = 65536;
+pub const MAX_AUTOMATION_INVENTORY_ITEMS: usize = 100;
+pub const MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES: usize = 32768;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationLimits {
+    pub max_observations_per_tick: usize,
+    pub max_observation_payload_bytes: usize,
+    pub max_automation_inventory_items: usize,
+    pub max_automation_inventory_payload_bytes: usize,
+}
+
+impl Default for ObservationLimits {
+    fn default() -> Self {
+        Self {
+            max_observations_per_tick: MAX_OBSERVATIONS_PER_TICK,
+            max_observation_payload_bytes: MAX_OBSERVATION_PAYLOAD_BYTES,
+            max_automation_inventory_items: MAX_AUTOMATION_INVENTORY_ITEMS,
+            max_automation_inventory_payload_bytes: MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RoutineTickContext {
     pub routine: RoutineTickRoutine,
     pub run: RoutineTickRun,
+    pub agent: Option<RoutineTickAgent>,
     pub checkpoint: Option<Value>,
     pub now: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observations: Option<Vec<Value>>,
+    #[serde(
+        rename = "automationInventory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub automation_inventory: Option<Vec<Value>>,
+    pub limits: ObservationLimits,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +88,15 @@ pub struct RoutineTickRoutine {
 pub struct RoutineTickRun {
     pub id: String,
     pub lease_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutineTickAgent {
+    pub id: String,
+    pub status: String,
+    pub is_idle: bool,
+    pub current_task_id: Option<String>,
+    pub current_thread_channel_id: Option<String>,
 }
 
 /// Isolated QuickJS loader for `agentdesk.routines.register({ name, tick })`.
@@ -643,8 +686,12 @@ mod tests {
                         id: "run-1".to_string(),
                         lease_expires_at: chrono::Utc::now(),
                     },
+                    agent: None,
                     checkpoint: None,
                     now: chrono::Utc::now(),
+                    observations: None,
+                    automation_inventory: None,
+                    limits: ObservationLimits::default(),
                 },
             )
             .unwrap();
@@ -662,6 +709,99 @@ mod tests {
                 );
             }
             other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exposes_tick_agent_idle_state_to_js() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-idle.js");
+        std::fs::write(
+            &path,
+            r#"
+            agentdesk.routines.register({
+              name: "Agent Idle",
+              tick(ctx) {
+                if (!ctx.agent.is_idle) {
+                  return {
+                    action: "skip",
+                    reason: "agent not idle",
+                    result: { isIdle: ctx.agent.is_idle },
+                    lastResult: "skipped"
+                  };
+                }
+
+                return {
+                  action: "complete",
+                  result: { isIdle: ctx.agent.is_idle },
+                  lastResult: "idle"
+                };
+              }
+            });
+            "#,
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        loader.load_script(dir.path(), &path).unwrap();
+
+        let context_for = |is_idle: bool| RoutineTickContext {
+            routine: RoutineTickRoutine {
+                id: "routine-1".to_string(),
+                agent_id: Some("monitoring".to_string()),
+                script_ref: "agent-idle.js".to_string(),
+                name: "Agent Idle".to_string(),
+                execution_strategy: "fresh".to_string(),
+                fresh_context_guaranteed: false,
+            },
+            run: RoutineTickRun {
+                id: "run-1".to_string(),
+                lease_expires_at: chrono::Utc::now(),
+            },
+            agent: Some(RoutineTickAgent {
+                id: "monitoring".to_string(),
+                status: if is_idle { "idle" } else { "working" }.to_string(),
+                is_idle,
+                current_task_id: None,
+                current_thread_channel_id: None,
+            }),
+            checkpoint: None,
+            now: chrono::Utc::now(),
+            observations: None,
+            automation_inventory: None,
+            limits: ObservationLimits::default(),
+        };
+
+        let idle_action = loader
+            .execute_tick("agent-idle.js", context_for(true))
+            .unwrap();
+        match idle_action {
+            crate::services::routines::RoutineAction::Complete {
+                result_json,
+                last_result,
+                ..
+            } => {
+                assert_eq!(last_result.as_deref(), Some("idle"));
+                assert_eq!(result_json.unwrap(), serde_json::json!({"isIdle": true}));
+            }
+            other => panic!("unexpected idle action: {other:?}"),
+        }
+
+        let working_action = loader
+            .execute_tick("agent-idle.js", context_for(false))
+            .unwrap();
+        match working_action {
+            crate::services::routines::RoutineAction::Skip {
+                reason,
+                result_json,
+                last_result,
+                ..
+            } => {
+                assert_eq!(reason.as_deref(), Some("agent not idle"));
+                assert_eq!(last_result.as_deref(), Some("skipped"));
+                assert_eq!(result_json.unwrap(), serde_json::json!({"isIdle": false}));
+            }
+            other => panic!("unexpected working action: {other:?}"),
         }
     }
 
@@ -702,8 +842,12 @@ mod tests {
                         id: "run-1".to_string(),
                         lease_expires_at: chrono::Utc::now(),
                     },
+                    agent: None,
                     checkpoint: None,
                     now: chrono::Utc::now(),
+                    observations: None,
+                    automation_inventory: None,
+                    limits: ObservationLimits::default(),
                 },
             )
             .unwrap_err();
@@ -719,11 +863,13 @@ mod tests {
     fn bundled_sample_routines_load_and_validate() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("routines");
         let loader = RoutineScriptLoader::new().unwrap();
-        assert_eq!(loader.load_dir(&root).unwrap(), 2);
+        assert_eq!(loader.load_dir(&root).unwrap(), 4);
         assert_eq!(
             loader.script_refs().unwrap(),
             vec![
                 "agent-checkpoint-review.js".to_string(),
+                "monitoring/automation-candidate-recommender.js".to_string(),
+                "monitoring/working-watchdog.js".to_string(),
                 "script-summary.js".to_string(),
             ]
         );
@@ -741,8 +887,12 @@ mod tests {
                 id: "run-1".to_string(),
                 lease_expires_at: chrono::Utc::now(),
             },
+            agent: None,
             checkpoint: None,
             now: chrono::Utc::now(),
+            observations: None,
+            automation_inventory: None,
+            limits: ObservationLimits::default(),
         };
 
         assert!(matches!(
@@ -757,11 +907,537 @@ mod tests {
         assert!(matches!(
             loader
                 .execute_tick(
+                    "monitoring/automation-candidate-recommender.js",
+                    context_for(
+                        "monitoring/automation-candidate-recommender.js",
+                        "automation-candidate-recommender"
+                    )
+                )
+                .unwrap(),
+            crate::services::routines::RoutineAction::Complete { .. }
+        ));
+        assert!(matches!(
+            loader
+                .execute_tick(
+                    "monitoring/working-watchdog.js",
+                    context_for(
+                        "monitoring/working-watchdog.js",
+                        "monitoring-working-watchdog"
+                    )
+                )
+                .unwrap(),
+            crate::services::routines::RoutineAction::Complete { .. }
+        ));
+        assert!(matches!(
+            loader
+                .execute_tick(
                     "agent-checkpoint-review.js",
                     context_for("agent-checkpoint-review.js", "agent-checkpoint-review")
                 )
                 .unwrap(),
             crate::services::routines::RoutineAction::Agent { .. }
         ));
+    }
+
+    fn automation_recommender_context(
+        checkpoint: Option<serde_json::Value>,
+        observations: Vec<serde_json::Value>,
+        automation_inventory: Vec<serde_json::Value>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> RoutineTickContext {
+        RoutineTickContext {
+            routine: RoutineTickRoutine {
+                id: "routine-automation".to_string(),
+                agent_id: Some("maker".to_string()),
+                script_ref: "monitoring/automation-candidate-recommender.js".to_string(),
+                name: "automation-candidate-recommender".to_string(),
+                execution_strategy: "fresh".to_string(),
+                fresh_context_guaranteed: false,
+            },
+            run: RoutineTickRun {
+                id: "run-automation".to_string(),
+                lease_expires_at: now,
+            },
+            agent: None,
+            checkpoint,
+            now,
+            observations: Some(observations),
+            automation_inventory: Some(automation_inventory),
+            limits: ObservationLimits::default(),
+        }
+    }
+
+    fn automation_recommender_loader() -> RoutineScriptLoader {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("routines");
+        let loader = RoutineScriptLoader::new().unwrap();
+        loader
+            .load_script(
+                &root,
+                &root.join("monitoring/automation-candidate-recommender.js"),
+            )
+            .unwrap();
+        loader
+    }
+
+    fn routine_observation(signature: &str, weight: u8, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "source": "routine_result",
+            "category": "routine-candidate",
+            "signature": signature,
+            "summary": "routine completed with repeated evidence",
+            "weight": weight,
+            "evidence_ref": format!("routine_run:{signature}:{timestamp}"),
+        })
+    }
+
+    fn categorized_observation(
+        signature: &str,
+        category: &str,
+        source: &str,
+        occurrences: u8,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "timestamp": timestamp,
+            "source": source,
+            "category": category,
+            "signature": signature,
+            "summary": format!("{category} repeated evidence"),
+            "weight": 2,
+            "occurrences": occurrences,
+            "evidence_ref": format!("{source}:{signature}:{timestamp}"),
+        })
+    }
+
+    #[test]
+    fn automation_recommender_inventory_wildcard_suppresses_matching_observations() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = (0..6)
+            .map(|_| {
+                routine_observation(
+                    "monitoring/working-watchdog.js:complete",
+                    2,
+                    "2026-04-30T06:59:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        let inventory = vec![serde_json::json!({
+            "pattern_id": "monitoring/working-watchdog.js:*",
+            "status": "implemented",
+            "reason": "registered routine",
+            "source_ref": "routine:monitoring-working-watchdog",
+            "updated_at": "2026-04-30T06:00:00Z"
+        })];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, inventory, now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+                let checkpoint = checkpoint.unwrap();
+                assert_eq!(
+                    checkpoint
+                        .get("candidates")
+                        .and_then(Value::as_object)
+                        .unwrap()
+                        .len(),
+                    0
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_uses_weight_for_error_assessment_and_persists_fields() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = (0..5)
+            .map(|_| routine_observation("ops/retry.js:complete", 2, "2026-04-30T06:59:00Z"))
+            .collect::<Vec<_>>();
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent {
+                prompt, checkpoint, ..
+            } => {
+                assert!(prompt.contains("Automatic retry or alert"));
+                let checkpoint = checkpoint.unwrap();
+                let candidate = checkpoint
+                    .pointer("/candidates/ops~1retry.js:complete")
+                    .expect("candidate should be persisted");
+                assert_eq!(
+                    candidate
+                        .get("suggested_automation")
+                        .and_then(Value::as_str),
+                    Some("Automatic retry or alert when this routine fails repeatedly")
+                );
+                assert_eq!(
+                    candidate
+                        .get("recommended_execution")
+                        .and_then(Value::as_str),
+                    Some("agent")
+                );
+                assert!(candidate.get("before_after").is_some());
+                assert!(candidate.get("expected_files").is_some());
+                assert!(candidate.get("expected_side_effects").is_some());
+                assert!(candidate.get("verification_method").is_some());
+                assert_eq!(
+                    candidate
+                        .pointer("/gated_handoff/status")
+                        .and_then(Value::as_str),
+                    Some("requires_human_approval")
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_prompt_includes_quality_sections_and_gated_handoff() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = (0..5)
+            .map(|_| routine_observation("ops/retry.js:complete", 2, "2026-04-30T06:59:00Z"))
+            .collect::<Vec<_>>();
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("## Before / After"));
+                assert!(prompt.contains("## Expected Implementation Files"));
+                assert!(prompt.contains("## Verification Method"));
+                assert!(prompt.contains("## Gated Handoff Draft"));
+                assert!(prompt.contains("requires_human_approval"));
+                assert!(prompt.contains("DO NOT implement"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_expands_api_friction_category() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = vec![categorized_observation(
+            "api-friction:/api/docs/kanban",
+            "api-friction",
+            "api_friction",
+            5,
+            "2026-04-30T06:59:00Z",
+        )];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent {
+                prompt, checkpoint, ..
+            } => {
+                assert!(prompt.contains("Category: api-friction"));
+                assert!(prompt.contains("API friction monitor"));
+                assert!(prompt.contains("src/services/api_friction.rs"));
+                let candidate = checkpoint
+                    .unwrap()
+                    .pointer("/candidates/api-friction:~1api~1docs~1kanban/category")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string();
+                assert_eq!(candidate, "api-friction");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_expands_release_and_outbox_categories() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let release_action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(
+                    None,
+                    vec![categorized_observation(
+                        "release-freshness:worker-inventory",
+                        "release-freshness",
+                        "precomputed_digest",
+                        5,
+                        "2026-04-30T06:59:00Z",
+                    )],
+                    vec![],
+                    now,
+                ),
+            )
+            .unwrap();
+        match release_action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("Category: release-freshness"));
+                assert!(prompt.contains("Release freshness monitor"));
+                let inventory_path = ["docs", "generated", "worker-inventory.md"].join("/");
+                assert!(prompt.contains(&inventory_path));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        let outbox_action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(
+                    None,
+                    vec![categorized_observation(
+                        "outbox-delivery:notify:routine_run_failed",
+                        "outbox-delivery",
+                        "message_outbox",
+                        5,
+                        "2026-04-30T06:59:00Z",
+                    )],
+                    vec![],
+                    now,
+                ),
+            )
+            .unwrap();
+        match outbox_action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("Category: outbox-delivery"));
+                assert!(prompt.contains("Message outbox delivery monitor"));
+                assert!(prompt.contains("src/services/message_outbox.rs"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_accepts_memento_digest_occurrence_counts() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = vec![categorized_observation(
+            "memento-hygiene:api-friction-memory",
+            "memento-hygiene",
+            "memento_digest",
+            5,
+            "2026-04-30T06:59:00Z",
+        )];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent {
+                prompt, checkpoint, ..
+            } => {
+                assert!(prompt.contains("Category: memento-hygiene"));
+                assert!(prompt.contains("Memento hygiene digest monitor"));
+                assert!(prompt.contains("src/services/memory"));
+                assert_eq!(
+                    checkpoint
+                        .unwrap()
+                        .pointer("/candidates/memento-hygiene:api-friction-memory/evidence_count")
+                        .and_then(Value::as_i64),
+                    Some(5)
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_requires_minimum_evidence_count_before_agent_action() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = (0..4)
+            .map(|_| routine_observation("ops/bursty.js:complete", 2, "2026-04-30T06:59:00Z"))
+            .collect::<Vec<_>>();
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+                let checkpoint = checkpoint.unwrap();
+                let candidate = checkpoint
+                    .pointer("/candidates/ops~1bursty.js:complete")
+                    .expect("candidate should be tracked below the evidence floor");
+                assert_eq!(candidate.get("score").and_then(Value::as_i64), Some(100));
+                assert_eq!(
+                    candidate.get("evidence_count").and_then(Value::as_i64),
+                    Some(4)
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_expires_stale_candidates_before_escalation() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let checkpoint = serde_json::json!({
+            "version": 1,
+            "cursors": {},
+            "candidates": {
+                "stale.js:complete": {
+                    "category": "routine-candidate",
+                    "state": "observing",
+                    "score": 100,
+                    "evidence_count": 20,
+                    "first_seen_at": "2026-03-01T00:00:00Z",
+                    "last_seen_at": "2026-03-01T00:00:00Z",
+                    "examples": [],
+                    "last_recommended_at": null,
+                    "last_recommendation_hash": null,
+                    "cooldown_until": null,
+                    "automation_ref": null
+                }
+            },
+            "suppressions": {},
+            "recommendations": [],
+            "last_tick_at": null,
+            "stats": {
+                "ticks": 0,
+                "observations_seen": 0,
+                "agent_escalations": 0,
+                "recommendations_today": 0,
+                "recommendation_day": null
+            }
+        });
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(Some(checkpoint), vec![], vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+                assert_eq!(
+                    checkpoint
+                        .unwrap()
+                        .pointer("/candidates/stale.js:complete/state")
+                        .and_then(Value::as_str),
+                    Some("expired")
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_checkpoint_guard_prunes_lru_candidate_first() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let checkpoint = serde_json::json!({
+            "version": 1,
+            "cursors": {},
+            "candidates": {
+                "old-high-score.js:complete": {
+                    "category": "routine-candidate",
+                    "state": "observing",
+                    "score": 99,
+                    "evidence_count": 20,
+                    "first_seen_at": "2026-04-20T00:00:00Z",
+                    "last_seen_at": "2026-04-20T00:00:00Z",
+                    "examples": [{"summary": "x".repeat(70000), "timestamp": "2026-04-20T00:00:00Z"}],
+                    "last_recommended_at": null,
+                    "last_recommendation_hash": null,
+                    "cooldown_until": null,
+                    "automation_ref": null
+                },
+                "recent-low-score.js:complete": {
+                    "category": "routine-candidate",
+                    "state": "observing",
+                    "score": 1,
+                    "evidence_count": 1,
+                    "first_seen_at": "2026-04-30T06:59:00Z",
+                    "last_seen_at": "2026-04-30T06:59:00Z",
+                    "examples": [],
+                    "last_recommended_at": null,
+                    "last_recommendation_hash": null,
+                    "cooldown_until": null,
+                    "automation_ref": null
+                }
+            },
+            "suppressions": {},
+            "recommendations": [],
+            "last_tick_at": null,
+            "stats": {
+                "ticks": 0,
+                "observations_seen": 0,
+                "agent_escalations": 0,
+                "recommendations_today": 3,
+                "recommendation_day": "2026-04-30"
+            }
+        });
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(Some(checkpoint), vec![], vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+                let candidates = checkpoint
+                    .unwrap()
+                    .get("candidates")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap();
+                assert!(!candidates.contains_key("old-high-score.js:complete"));
+                assert!(candidates.contains_key("recent-low-score.js:complete"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 }
