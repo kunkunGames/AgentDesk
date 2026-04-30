@@ -1404,7 +1404,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kanban-cards/{id}/transition",
             "kanban",
-            "Transition a single card with administrative force-transition semantics. Canonical runtime path is /transition; the old /force-transition path is removed. Requires explicit Bearer auth. Single-call complete: do NOT chain /redispatch, /retry, or /auto-queue/generate after it (#1442). Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint in the response.",
+            "Transition a single card with administrative force-transition semantics. Canonical runtime path is /transition; the old /force-transition path is removed. Requires explicit Bearer auth. Single-call complete: do NOT chain /redispatch, /retry, or /auto-queue/generate after it (#1442). Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint in the response. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
@@ -1446,7 +1446,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"error": "status is required"}),
         )
         .with_curl("curl -X POST http://localhost:8787/api/kanban-cards/card-1/transition -H 'Content-Type: application/json' -d '{\"status\":\"ready\",\"cancel_dispatches\":true}'"),
-        ep("POST", "/api/kanban-cards/{id}/retry", "kanban", "Retry card: re-execute the same failed step with the same intent and context (optionally swapping assignee). Distinct from /redispatch (creates a NEW dispatch id), /resume (continues a checkpointed turn), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /auto-queue/generate after it (#1442).")
+        ep("POST", "/api/kanban-cards/{id}/retry", "kanban", "Retry card: re-execute the same failed step with the same intent and context (optionally swapping assignee). Distinct from /redispatch (creates a NEW dispatch id), /resume (continues a checkpointed turn), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /auto-queue/generate after it (#1442). See /api/docs/card-lifecycle-ops for the full decision tree (#1443).")
             .with_params([
                 ("id", path_param("Kanban card ID")),
                 (
@@ -1477,7 +1477,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kanban-cards/{id}/redispatch",
             "kanban",
-            "Redispatch: cancel the current live dispatch and create a brand-new dispatch entry with a new dispatch_id for the same card intent. Distinct from /retry (re-executes the SAME step with the same params), /resume (continues a checkpoint), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /auto-queue/generate after it (#1442).",
+            "Redispatch: cancel the current live dispatch and create a brand-new dispatch entry with a new dispatch_id for the same card intent. Distinct from /retry (re-executes the SAME step with the same params), /resume (continues a checkpoint), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /auto-queue/generate after it (#1442). See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
@@ -2510,7 +2510,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/auto-queue/generate",
             "auto-queue",
-            "Generate auto-queue entries. Single-call complete: do NOT chain /redispatch, /retry, or /transition for the same card after it (#1442). Inspect skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter in the response to see structured skip reasons.",
+            "Generate auto-queue entries. Single-call complete: do NOT chain /redispatch, /retry, or /transition for the same card after it (#1442). Inspect skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter in the response to see structured skip reasons. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
         .with_params([
             (
@@ -2657,7 +2657,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/auto-queue/dispatch-next",
             "auto-queue",
-            "Dispatch the next pending auto-queue entries",
+            "Dispatch the next pending auto-queue entries. See /api/docs/card-lifecycle-ops for the full decision tree on when to call /generate vs /dispatch-next (#1443).",
         )
         .with_params([
             (
@@ -3565,6 +3565,10 @@ pub async fn api_help() -> (StatusCode, Json<Value>) {
 /// When `?format=flat` is passed, returns the full flat endpoint list
 /// (preserved for backward-compatible tooling and the endpoint-coverage
 /// contract tests).
+///
+/// #1443 also surfaces a `guides` array so callers discover the
+/// long-form decision-tree pages (e.g. card-lifecycle-ops) without having
+/// to read source.
 pub async fn api_docs(Query(query): Query<ApiDocsQuery>) -> (StatusCode, Json<Value>) {
     let endpoints = all_endpoints();
     if query
@@ -3590,12 +3594,222 @@ pub async fn api_docs(Query(query): Query<ApiDocsQuery>) -> (StatusCode, Json<Va
         })
         .collect();
 
-    (StatusCode::OK, Json(json!({ "groups": groups })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "groups": groups,
+            "guides": guide_index(),
+        })),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// #1443 — Long-form guide pages.
+//
+// The endpoint catalogue answers "what does this endpoint do?", but the
+// 2026-04-30 #1435 incident showed that callers also need a higher-level
+// "which of these overlapping endpoints do I call right now?" decision tree.
+// `guide_index` powers the `guides` field on the `/api/docs` root, and each
+// guide has a dedicated handler returning the full body.
+// ---------------------------------------------------------------------------
+
+/// #1443 — header marker exposing the most recent main commit this guide was
+/// authored against. Update alongside the prose any time the underlying
+/// lifecycle endpoints change shape, per the
+/// `docs/agent-maintenance/index.md` freshness convention (#1432).
+pub(crate) const CARD_LIFECYCLE_OPS_LAST_REFRESHED: &str =
+    "Last refreshed: 2026-04-30 against main @ f74cad35 (post #1442/#1444/#1446/#1448)";
+
+/// #1443 list of long-form guide pages exposed under `/api/docs/...`.
+fn guide_index() -> Vec<Value> {
+    vec![json!({
+        "name": "card-lifecycle-ops",
+        "title": "Card Lifecycle Ops Guide",
+        "path": "/api/docs/card-lifecycle-ops",
+        "summary": "Decision tree + endpoint reference for /redispatch, /retry, /transition, /auto-queue/generate, /dispatch-next. Read this BEFORE chaining card-lifecycle calls.",
+    })]
+}
+
+/// GET /api/docs/card-lifecycle-ops — #1443.
+///
+/// Long-form decision tree for card-lifecycle operations
+/// (/redispatch, /retry, /transition, /auto-queue/generate, /dispatch-next).
+/// Authored to make the 2026-04-30 #1435 duplicate-dispatch incident
+/// non-repeatable: every common scenario maps to a single-call answer, and
+/// the anti-pattern section names the exact 3-call chain that caused the
+/// outage.
+///
+/// Routed through `resolve_docs_segment` (the shared `/api/docs/{segment}`
+/// resolver), so this dedicated handler is reserved for in-process callers
+/// (e.g. CLI shims) that want the body without going through the segment
+/// dispatcher.
+#[allow(dead_code)]
+pub async fn api_docs_card_lifecycle_ops() -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(card_lifecycle_ops_body()))
+}
+
+fn card_lifecycle_ops_body() -> Value {
+    json!({
+        "title": "Card Lifecycle Ops Guide",
+        "path": "/api/docs/card-lifecycle-ops",
+        "last_refreshed": CARD_LIFECYCLE_OPS_LAST_REFRESHED,
+        "purpose": "Single source of truth for choosing among /redispatch, /retry, /transition, /auto-queue/generate, and /dispatch-next. The 2026-04-30 #1435 incident chained three of these and created duplicate dispatches. Read the decision tree FIRST, then the anti-pattern, then the endpoint table.",
+        "sections": {
+            "1_decision_tree": {
+                "heading": "Section 1: Decision Tree",
+                "intro": "Pick the row that matches the symptom. Each answer is a single call — do NOT chain.",
+                "scenarios": [
+                    {
+                        "scenario": "Card stuck in review/dilemma_pending, want to restart",
+                        "single_call": "POST /api/kanban-cards/{id}/redispatch",
+                        "notes": "Cancels the live dispatch and creates a brand-new dispatch_id. Inspect new_dispatch_id and cancelled_dispatch_id in the response. Do NOT follow with /transition or /auto-queue/generate."
+                    },
+                    {
+                        "scenario": "Card done, want to retry the same failed step",
+                        "single_call": "POST /api/kanban-cards/{id}/retry",
+                        "notes": "Re-executes the same failed step with the same intent (optional assignee swap via assignee_agent_id). Inspect new_dispatch_id and next_action. Do NOT follow with /transition or /auto-queue/generate."
+                    },
+                    {
+                        "scenario": "Force card to a specific status",
+                        "single_call": "POST /api/kanban-cards/{id}/transition with {\"status\": \"<target>\"}",
+                        "notes": "If the card has an active dispatch and target=ready, the call returns 409 Conflict (#1444 guard). Pass {\"force\": true} (or legacy cancel_dispatches=true) to cancel + re-transition in one call. Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint."
+                    },
+                    {
+                        "scenario": "Bulk push N issues into the auto-queue",
+                        "single_call": "POST /api/auto-queue/generate with {\"issue_numbers\": [...]}",
+                        "notes": "Bulk only — never use to restart a single card that already has an active dispatch (it will silent-skip and surface skipped_due_to_active_dispatch). Inspect skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter."
+                    },
+                    {
+                        "scenario": "Trigger the next dispatch from an existing run",
+                        "single_call": "POST /api/auto-queue/dispatch-next",
+                        "notes": "Use only after /generate has produced pending entries. Returns dispatched[], count, active_groups, pending_groups."
+                    }
+                ]
+            },
+            "2_endpoint_reference_table": {
+                "heading": "Section 2: Endpoint Reference Table",
+                "columns": ["endpoint", "when_to_use", "single_call_complete", "common_pitfall"],
+                "rows": [
+                    {
+                        "endpoint": "POST /api/kanban-cards/{id}/redispatch",
+                        "when_to_use": "Card has a live (pending/dispatched) dispatch and you want to restart with a brand-new dispatch_id.",
+                        "single_call_complete": "Y",
+                        "common_pitfall": "Chaining /transition or /auto-queue/generate after it creates duplicate dispatches (#1442 incident)."
+                    },
+                    {
+                        "endpoint": "POST /api/kanban-cards/{id}/retry",
+                        "when_to_use": "Card landed in a failed terminal state and you want to re-run the SAME step.",
+                        "single_call_complete": "Y",
+                        "common_pitfall": "Calling on a card with no failed dispatch returns 409. Do NOT chain /transition or /generate."
+                    },
+                    {
+                        "endpoint": "POST /api/kanban-cards/{id}/transition",
+                        "when_to_use": "Administrative move to a specific target status (the canonical /force-transition path).",
+                        "single_call_complete": "Y",
+                        "common_pitfall": "target=ready while a dispatch is live returns 409 unless force=true (#1444 guard). Without force, callers used to chain /redispatch + /transition + /generate — that is the exact #1435 anti-pattern."
+                    },
+                    {
+                        "endpoint": "POST /api/auto-queue/generate",
+                        "when_to_use": "Bulk push of multiple issue numbers into a queue run.",
+                        "single_call_complete": "Y for the bulk intent",
+                        "common_pitfall": "Not a single-card restart tool. Cards that already have a live dispatch are silently skipped and reported in skipped_due_to_active_dispatch — do not retry by chaining /redispatch first."
+                    },
+                    {
+                        "endpoint": "POST /api/auto-queue/dispatch-next",
+                        "when_to_use": "Move the next pending entry of an existing run to dispatched.",
+                        "single_call_complete": "Y",
+                        "common_pitfall": "No-op if there are no pending entries; check the dispatched[] length before assuming progress."
+                    }
+                ]
+            },
+            "3_anti_pattern": {
+                "heading": "Section 3: Anti-pattern (today's #1435 incident)",
+                "wrong_pattern": [
+                    "POST /api/kanban-cards/{id}/redispatch              # creates dispatch A",
+                    "POST /api/kanban-cards/{id}/transition status:ready # cancels A, creates dispatch B  <- WRONG: this is implicit",
+                    "POST /api/auto-queue/generate                       # creates dispatch C  <- WRONG: silent-skip works but caller did not know"
+                ],
+                "why_it_broke": "Each of /redispatch, /transition status:ready, and /auto-queue/generate is single-call complete. Chaining them produced three dispatches for one card and the runtime started executing all three, causing the duplicate-dispatch outage on 2026-04-30.",
+                "how_it_is_prevented_now": [
+                    "#1442 added new_dispatch_id, cancelled_dispatch_id(s), and next_action_hint to /redispatch, /retry, and /transition responses. next_action_hint is 'none_required' on the success path — if a caller sees that and still chains another mutation, it is a caller bug, not a missing signal.",
+                    "#1444 added a 409 Conflict guard on /transition status:ready when an active dispatch exists. Callers must explicitly opt in via force=true (or legacy cancel_dispatches=true) to override.",
+                    "#1444 also made /auto-queue/generate and /dispatch-next surface structured skips (skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter) instead of silently dropping the entry, so even a misuse is observable from the response."
+                ],
+                "right_pattern": "Pick ONE row from Section 1 and call it ONCE. Inspect new_dispatch_id, cancelled_dispatch_id(s), next_action_hint, and skipped_due_to_*. Do NOT call a second mutation unless next_action_hint says so."
+            },
+            "4_new_response_fields": {
+                "heading": "Section 4: New Response Fields (from #1442 / #1444)",
+                "fields": [
+                    {
+                        "field": "new_dispatch_id",
+                        "source": "/redispatch, /retry, /transition (when a fresh dispatch is created)",
+                        "notes": "String. Confirms that a new dispatch row was inserted; absence means the call was a no-op."
+                    },
+                    {
+                        "field": "cancelled_dispatch_id (singular)",
+                        "source": "/redispatch, /retry",
+                        "notes": "String or null. Only populated when the cancel helper actually transitioned a pending/dispatched row to cancelled."
+                    },
+                    {
+                        "field": "cancelled_dispatch_ids (plural)",
+                        "source": "/transition (force-transition path)",
+                        "notes": "Array of dispatch IDs cancelled by the cleanup pass; pairs with cancelled_dispatches count."
+                    },
+                    {
+                        "field": "next_action_hint",
+                        "source": "/transition, /redispatch, /retry",
+                        "notes": "Concrete next action string. 'none_required' on the success path; otherwise names the exact endpoint to call. If it says 'none_required', do NOT chain another mutation."
+                    },
+                    {
+                        "field": "skipped_due_to_active_dispatch",
+                        "source": "/auto-queue/generate",
+                        "notes": "Array of {issue_number, existing_dispatch_id} entries that were silently skipped because the card already had a live dispatch."
+                    },
+                    {
+                        "field": "skipped_due_to_dependency",
+                        "source": "/auto-queue/generate",
+                        "notes": "Array of {issue_number, unresolved_deps[]} entries skipped because dependency cards were not yet done."
+                    },
+                    {
+                        "field": "skipped_due_to_filter",
+                        "source": "/auto-queue/generate",
+                        "notes": "Array of entries skipped by repo/agent_id filters."
+                    },
+                    {
+                        "field": "409 Conflict response",
+                        "source": "/transition with status=ready and an active dispatch",
+                        "notes": "Body shape: {error, active_dispatch_id, active_dispatch_ids, next_action_hint}. Override with {\"force\": true} (or legacy cancel_dispatches=true)."
+                    }
+                ]
+            },
+            "5_cross_references": {
+                "heading": "Section 5: Cross-references",
+                "links": [
+                    {"label": "Issue #1442 — response schema (new_dispatch_id, next_action_hint)", "url": "https://github.com/itismyfield/AgentDesk/issues/1442"},
+                    {"label": "Issue #1444 — 409 idempotency guard + structured silent-skip", "url": "https://github.com/itismyfield/AgentDesk/issues/1444"},
+                    {"label": "Issue #1446 — stall watchdog and THREAD-GUARD stale cleanup", "url": "https://github.com/itismyfield/AgentDesk/issues/1446"},
+                    {"label": "Issue #1448 — announce-bot turn-leak fix (issue-card template block-list)", "url": "https://github.com/itismyfield/AgentDesk/issues/1448"},
+                    {"label": "docs/agent-maintenance/index.md — freshness convention", "path": "docs/agent-maintenance/index.md"},
+                    {"label": "docs/source-of-truth.md — canonical edit paths index", "path": "docs/source-of-truth.md"}
+                ]
+            }
+        }
+    })
 }
 
 /// Core logic for the single-segment docs route, shared between the HTTP
 /// handler and the in-process CLI helper. Returns `(status, headers, body)`.
 fn resolve_docs_segment(segment: &str, flat: bool) -> (StatusCode, HeaderMap, Value) {
+    // #1443: long-form guide pages take precedence over group/category
+    // resolution so callers can reach `/api/docs/card-lifecycle-ops` (etc.)
+    // through the same single-segment route used by the rest of the docs
+    // tree. Guides ignore the `?format=flat` switch — there is no endpoint
+    // list to flatten.
+    if segment == "card-lifecycle-ops" {
+        let _ = flat;
+        return (StatusCode::OK, HeaderMap::new(), card_lifecycle_ops_body());
+    }
+
     let endpoints = all_endpoints();
 
     // Primary: treat as group name.

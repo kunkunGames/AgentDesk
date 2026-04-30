@@ -20,6 +20,13 @@ pub(crate) use route::{
     AutoQueueActivateDeps, activate_with_bridge_pg, activate_with_deps, activate_with_deps_pg,
 };
 
+/// POST /api/auto-queue/generate
+///
+/// Bulk push of multiple issue numbers into a queue run. Single-call
+/// complete: do NOT chain /redispatch, /retry, or /transition for the
+/// same card after it (#1442). Cards with an active dispatch are silently
+/// skipped and surfaced via `skipped_due_to_active_dispatch` (#1444). See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn generate(
     state: State<AppState>,
     body: Json<GenerateBody>,

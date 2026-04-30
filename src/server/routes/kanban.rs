@@ -866,7 +866,8 @@ pub async fn delete_card(
 /// This endpoint is single-call complete. Do NOT chain /transition or
 /// /auto-queue/generate after it — that creates duplicate dispatches
 /// (see #1442 incident). Inspect `new_dispatch_id` and `next_action` in
-/// the response to confirm the new dispatch was created.
+/// the response to confirm the new dispatch was created. See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn retry_card(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1051,7 +1052,8 @@ pub async fn retry_card(
 /// This endpoint is single-call complete. Do NOT chain /transition or
 /// /auto-queue/generate after it — that creates duplicate dispatches
 /// (see #1442 incident). Inspect `new_dispatch_id` and `next_action` in
-/// the response to confirm the new dispatch was created.
+/// the response to confirm the new dispatch was created. See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn redispatch_card(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -4024,7 +4026,8 @@ async fn clear_all_threads_pg(pool: &sqlx::PgPool, card_id: &str) -> anyhow::Res
 /// /retry, or /auto-queue/generate after it — that creates duplicate
 /// dispatches (see #1442 incident). Inspect `cancelled_dispatch_ids`,
 /// `created_dispatch_id`, and `next_action_hint` in the response to
-/// determine whether any follow-up is genuinely required.
+/// determine whether any follow-up is genuinely required. See
+/// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
 pub async fn force_transition(
     State(state): State<AppState>,
     Path(id): Path<String>,

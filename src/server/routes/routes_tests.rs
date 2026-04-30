@@ -9617,6 +9617,103 @@ async fn api_docs_retry_redispatch_resume_reopen_semantics_are_distinguished() {
     }
 }
 
+/// #1443: the `/api/docs/card-lifecycle-ops` decision-tree page must be
+/// reachable through the standard `/api/docs/{segment}` route and must
+/// surface the markers the incident response team relies on so callers
+/// cannot accidentally repeat the 2026-04-30 #1435 chained-call pattern.
+///
+/// The page is also surfaced in the `/api/docs` index `guides` array so
+/// agents discover it without reading source.
+#[tokio::test]
+async fn api_docs_card_lifecycle_ops_guide_is_reachable_and_complete() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    // Index lists the guide so callers discover the path.
+    let index_response = app
+        .clone()
+        .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(index_response.status(), StatusCode::OK);
+    let index_bytes = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let index_json: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    let guides = index_json["guides"]
+        .as_array()
+        .expect("/docs index must list long-form guides under 'guides'");
+    let lifecycle_entry = guides
+        .iter()
+        .find(|guide| guide["name"] == "card-lifecycle-ops")
+        .expect("/docs index must surface the card-lifecycle-ops guide");
+    assert_eq!(
+        lifecycle_entry["path"], "/api/docs/card-lifecycle-ops",
+        "lifecycle guide path must be /api/docs/card-lifecycle-ops"
+    );
+
+    // Guide page itself is reachable through the standard /docs/{segment}
+    // route and contains the markers the incident postmortem requires.
+    let guide_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/card-lifecycle-ops")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guide_response.status(), StatusCode::OK);
+    let guide_bytes = axum::body::to_bytes(guide_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let guide_text = String::from_utf8(guide_bytes.to_vec()).unwrap();
+    let guide_json: serde_json::Value = serde_json::from_str(&guide_text).unwrap();
+
+    assert_eq!(guide_json["title"], "Card Lifecycle Ops Guide");
+    assert_eq!(guide_json["path"], "/api/docs/card-lifecycle-ops");
+
+    let last_refreshed = guide_json["last_refreshed"]
+        .as_str()
+        .expect("guide must declare a last_refreshed marker (#1432 freshness gate)");
+    assert!(
+        last_refreshed.starts_with("Last refreshed:"),
+        "last_refreshed marker must follow the 'Last refreshed: <date> against main @ <sha>' convention: {last_refreshed}"
+    );
+    assert!(
+        last_refreshed.contains("main @"),
+        "last_refreshed marker must pin the main commit sha per #1432: {last_refreshed}"
+    );
+
+    // The doc body must mention the structured markers so callers learn the
+    // contract: anti-pattern wording, the next_action_hint field name, and
+    // the 409 guard.
+    let lower = guide_text.to_lowercase();
+    assert!(
+        lower.contains("anti-pattern"),
+        "guide must contain an 'Anti-pattern' section naming today's incident"
+    );
+    assert!(
+        guide_text.contains("next_action_hint"),
+        "guide must reference the next_action_hint response field (#1442)"
+    );
+    assert!(
+        guide_text.contains("409"),
+        "guide must reference the 409 Conflict guard (#1444)"
+    );
+    assert!(
+        guide_text.contains("skipped_due_to_active_dispatch"),
+        "guide must reference skipped_due_to_active_dispatch (#1444)"
+    );
+    assert!(
+        guide_text.contains("/api/auto-queue/generate")
+            && guide_text.contains("/api/kanban-cards/{id}/redispatch")
+            && guide_text.contains("/api/kanban-cards/{id}/transition"),
+        "guide must enumerate the five lifecycle endpoints by exact path"
+    );
+}
+
 #[tokio::test]
 async fn skills_catalog_pg_filters_stale_entries_and_exposes_disk_presence() {
     let _env_lock = env_lock();
