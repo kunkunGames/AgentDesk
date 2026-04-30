@@ -169,6 +169,69 @@ _resolve_default_release_binary() {
     printf '%s/release/agentdesk\n' "$target_dir"
 }
 
+_check_repo_remote_freshness() {
+    [ "${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}" != "1" ] || return 0
+    [ "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" != "1" ] || return 0
+    [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] || return 0
+    git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+    local upstream_ref remote_name remote_branch head_sha upstream_sha behind_count
+    upstream_ref="$(git -C "$REPO" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+    if [ -z "$upstream_ref" ]; then
+        echo "⚠ No git upstream configured for $(git -C "$REPO" branch --show-current 2>/dev/null || echo HEAD); skipping remote freshness check"
+        return 0
+    fi
+
+    remote_name="${upstream_ref%%/*}"
+    remote_branch="${upstream_ref#*/}"
+    echo "▸ Checking git freshness against ${upstream_ref}..."
+    if ! git -C "$REPO" fetch --quiet "$remote_name" "$remote_branch"; then
+        echo "✗ Could not refresh ${upstream_ref}; refusing release deploy from unverifiable source"
+        echo "  Set AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS=1 only for an intentional offline deploy."
+        exit 1
+    fi
+
+    head_sha="$(git -C "$REPO" rev-parse HEAD)"
+    upstream_sha="$(git -C "$REPO" rev-parse "$upstream_ref")"
+    [ "$head_sha" != "$upstream_sha" ] || return 0
+
+    behind_count="$(git -C "$REPO" rev-list --count "HEAD..$upstream_ref" 2>/dev/null || echo 0)"
+    if [ "$behind_count" != "0" ]; then
+        echo "✗ Repo HEAD is behind ${upstream_ref} by ${behind_count} commit(s); refusing stale release deploy"
+        echo "  Pull/rebase before deploy, or set AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS=1 only when intentional."
+        exit 1
+    fi
+}
+
+_assert_release_binary_runtime_surface() {
+    # If this source tree contains durable routines, the staged binary must expose
+    # the matching worker/API surface. This catches deploying an older binary that
+    # can pass /api/health while silently dropping scheduled routine execution.
+    [ -f "$REPO/src/services/routines/runtime.rs" ] || return 0
+    [ -f "$REPO/src/server/routes/routines.rs" ] || return 0
+    command -v strings >/dev/null 2>&1 || {
+        echo "✗ 'strings' is required for release binary surface validation"
+        exit 1
+    }
+
+    local surface_dump
+    surface_dump="$(mktemp "${TMPDIR:-/tmp}/agentdesk-binary-surface.XXXXXX")"
+    strings "$SOURCE_BINARY" >"$surface_dump"
+    if ! grep -Fq "routine-runtime" "$surface_dump"; then
+        rm -f "$surface_dump"
+        echo "✗ Source binary is missing the routine-runtime worker surface: $SOURCE_BINARY"
+        echo "  Rebuild from a routines-enabled checkout before deploying release."
+        exit 1
+    fi
+    if ! grep -Fq "/api/routines" "$surface_dump"; then
+        rm -f "$surface_dump"
+        echo "✗ Source binary is missing the /api/routines API surface: $SOURCE_BINARY"
+        echo "  Rebuild from a routines-enabled checkout before deploying release."
+        exit 1
+    fi
+    rm -f "$surface_dump"
+}
+
 _finalize_detached_helper() {
     local status="${1:-0}"
     [ "$DEPLOY_DETACHED_CHILD" = "1" ] || return 0
@@ -282,6 +345,7 @@ export AGENTDESK_CODESIGN_IDENTITY=$(printf '%q' "${AGENTDESK_CODESIGN_IDENTITY:
 export AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=$(printf '%q' "${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-}")
 export AGENTDESK_DEPLOY_BINARY=$(printf '%q' "${AGENTDESK_DEPLOY_BINARY:-}")
 export AGENTDESK_DEPLOY_SKIP_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}")
+export AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}")
 export AGENTDESK_DEPLOY_LOCK_FILE=$(printf '%q' "$DEPLOY_LOCK_FILE")
 export AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS=$(printf '%q' "$DEPLOY_LOCK_TIMEOUT_SECS")
 unset AGENTDESK_DEPLOY_LOCK_HELD
@@ -367,6 +431,7 @@ fi
 # Build the release binary from the current workspace by default so deploy
 # always ships code compiled from the current HEAD. When a validated external
 # artifact is provided explicitly, keep the existing override behavior.
+_check_repo_remote_freshness
 if [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     SOURCE_BINARY="$AGENTDESK_DEPLOY_BINARY"
 else
@@ -470,6 +535,8 @@ if [ "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" != "1" ] && [ -z "${AGENTDESK_DEPLO
         exit 1
     fi
 fi
+
+_assert_release_binary_runtime_surface
 
 # Copy and sign the binary before stopping release. This keeps a missing
 # certificate or failed codesign from taking down a healthy dcserver.

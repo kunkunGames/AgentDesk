@@ -1,11 +1,16 @@
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Value, json};
+use sqlx::Row;
 
 use super::action::RoutineAction;
 use super::agent_executor::RoutineAgentExecutor;
 use super::discord_log::RoutineDiscordLogger;
-use super::loader::{RoutineScriptLoader, RoutineTickContext, RoutineTickRoutine, RoutineTickRun};
+use super::loader::{
+    MAX_AUTOMATION_INVENTORY_ITEMS, MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES,
+    MAX_OBSERVATION_PAYLOAD_BYTES, MAX_OBSERVATIONS_PER_TICK, ObservationLimits,
+    RoutineScriptLoader, RoutineTickAgent, RoutineTickContext, RoutineTickRoutine, RoutineTickRun,
+};
 use super::store::{ClaimedRoutineRun, RoutineStore};
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +71,32 @@ pub async fn execute_claimed_script_run(
     claimed: ClaimedRoutineRun,
 ) -> Result<Option<RoutineRunOutcome>> {
     let fresh_context_guaranteed = false;
+    let agent = load_tick_agent_context(store, claimed.agent_id.as_deref()).await?;
+    let observations = store
+        .fetch_recent_run_observations(
+            Some(&claimed.script_ref),
+            MAX_OBSERVATIONS_PER_TICK,
+            MAX_OBSERVATION_PAYLOAD_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+    let observations = if observations.is_empty() {
+        None
+    } else {
+        Some(observations)
+    };
+    let automation_inventory = store
+        .fetch_active_routine_automation_inventory(
+            MAX_AUTOMATION_INVENTORY_ITEMS,
+            MAX_AUTOMATION_INVENTORY_PAYLOAD_BYTES,
+        )
+        .await
+        .unwrap_or_default();
+    let automation_inventory = if automation_inventory.is_empty() {
+        None
+    } else {
+        Some(automation_inventory)
+    };
     let context = RoutineTickContext {
         routine: RoutineTickRoutine {
             id: claimed.routine_id.clone(),
@@ -79,8 +110,12 @@ pub async fn execute_claimed_script_run(
             id: claimed.run_id.clone(),
             lease_expires_at: claimed.lease_expires_at,
         },
+        agent,
         checkpoint: claimed.checkpoint.clone(),
         now: chrono::Utc::now(),
+        observations,
+        automation_inventory,
+        limits: ObservationLimits::default(),
     };
 
     store.heartbeat_run(&claimed.run_id).await?;
@@ -119,6 +154,76 @@ pub async fn execute_claimed_script_run(
         fresh_context_guaranteed,
     )
     .await
+}
+
+async fn load_tick_agent_context(
+    store: &RoutineStore,
+    agent_id: Option<&str>,
+) -> Result<Option<RoutineTickAgent>> {
+    let Some(agent_id) = agent_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+
+    let row = sqlx::query(
+        r#"
+        SELECT a.id,
+               COALESCE(NULLIF(BTRIM(a.status), ''), 'idle') AS status,
+               (SELECT td2.id
+                  FROM task_dispatches td2
+                  JOIN kanban_cards kc ON kc.latest_dispatch_id = td2.id
+                 WHERE td2.to_agent_id = a.id
+                   AND kc.status = 'in_progress'
+                 ORDER BY td2.created_at DESC NULLS LAST, td2.id DESC
+                 LIMIT 1) AS current_task_id,
+               (SELECT s.thread_channel_id
+                  FROM sessions s
+                 WHERE s.agent_id = a.id
+                   AND s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working')
+                 ORDER BY s.last_heartbeat DESC NULLS LAST, s.id DESC
+                 LIMIT 1) AS current_thread_channel_id,
+               EXISTS (
+                   SELECT 1
+                    FROM sessions s
+                   WHERE s.agent_id = a.id
+                      AND s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working')
+               ) AS has_busy_session
+          FROM agents a
+         WHERE a.id = $1
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_optional(store.pool())
+    .await
+    .map_err(|error| anyhow::anyhow!("load routine tick agent context for {agent_id}: {error}"))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let status = row
+        .try_get::<String, _>("status")
+        .unwrap_or_else(|_| "idle".to_string());
+    let current_task_id = row
+        .try_get::<Option<String>, _>("current_task_id")
+        .ok()
+        .flatten();
+    let current_thread_channel_id = row
+        .try_get::<Option<String>, _>("current_thread_channel_id")
+        .ok()
+        .flatten();
+    let has_busy_session = row.try_get::<bool, _>("has_busy_session").unwrap_or(false);
+    let has_active_task = current_task_id.is_some();
+    let has_busy_signal =
+        has_busy_session || current_thread_channel_id.is_some() || has_active_task;
+    let is_idle = status == "idle" && !has_busy_signal;
+
+    Ok(Some(RoutineTickAgent {
+        id: agent_id.to_string(),
+        status,
+        is_idle,
+        current_task_id,
+        current_thread_channel_id,
+    }))
 }
 
 async fn close_action(

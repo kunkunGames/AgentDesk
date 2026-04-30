@@ -9,6 +9,7 @@ use crate::services::memory::{
 use crate::services::provider::{CancelToken, cancel_requested};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, PartialEq, Eq)]
 struct MemoryInjectionPlan<'a> {
@@ -73,6 +74,46 @@ fn parse_watchdog_alert_channel_id(raw: &str) -> Option<serenity::ChannelId> {
         .ok()
         .filter(|id| *id > 0)
         .map(serenity::ChannelId::new)
+}
+
+fn metadata_parent_channel_id(metadata: Option<&serde_json::Value>) -> Option<serenity::ChannelId> {
+    metadata
+        .and_then(|value| value.get("parent_channel_id"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|id| *id > 0)
+        .map(serenity::ChannelId::new)
+}
+
+fn metadata_delivery_bot(metadata: Option<&serde_json::Value>) -> Option<String> {
+    metadata
+        .and_then(|value| value.get("delivery_bot"))
+        .and_then(|value| value.as_str())
+        .and_then(normalize_delivery_bot_name)
+}
+
+fn normalize_delivery_bot_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn resolve_headless_workspace(
+    channel_id: serenity::ChannelId,
+    channel_name_hint: Option<&str>,
+    metadata: Option<&serde_json::Value>,
+) -> Option<String> {
+    settings::resolve_workspace(channel_id, channel_name_hint).or_else(|| {
+        metadata_parent_channel_id(metadata)
+            .and_then(|parent_channel_id| settings::resolve_workspace(parent_channel_id, None))
+    })
 }
 
 fn configured_watchdog_alert_channel_id() -> Option<serenity::ChannelId> {
@@ -651,9 +692,45 @@ impl std::fmt::Display for HeadlessTurnStartError {
 
 impl std::error::Error for HeadlessTurnStartError {}
 
+const HEADLESS_TURN_MESSAGE_ID_BASE: u64 = 9_100_000_000_000_000_000;
+const HEADLESS_TURN_MESSAGE_ID_EPOCH_MILLIS: u64 = 1_700_000_000_000;
+const HEADLESS_TURN_MESSAGE_IDS_PER_MILLI: u64 = 1_024;
+
 fn next_headless_turn_message_id() -> MessageId {
-    static HEADLESS_TURN_MESSAGE_ID_SEQ: AtomicU64 = AtomicU64::new(9_100_000_000_000_000_000);
+    static HEADLESS_TURN_MESSAGE_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+    ensure_headless_turn_message_id_seeded(&HEADLESS_TURN_MESSAGE_ID_SEQ);
     MessageId::new(HEADLESS_TURN_MESSAGE_ID_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+fn ensure_headless_turn_message_id_seeded(sequence: &AtomicU64) {
+    if sequence.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let _ = sequence.compare_exchange(
+        0,
+        headless_turn_message_id_seed(current_unix_millis(), std::process::id()),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn headless_turn_message_id_seed(now_millis: u64, process_id: u32) -> u64 {
+    let max_elapsed_millis =
+        (u64::MAX - HEADLESS_TURN_MESSAGE_ID_BASE - (HEADLESS_TURN_MESSAGE_IDS_PER_MILLI - 1))
+            / HEADLESS_TURN_MESSAGE_IDS_PER_MILLI;
+    let elapsed_millis = now_millis
+        .saturating_sub(HEADLESS_TURN_MESSAGE_ID_EPOCH_MILLIS)
+        .min(max_elapsed_millis);
+    HEADLESS_TURN_MESSAGE_ID_BASE
+        + (elapsed_millis * HEADLESS_TURN_MESSAGE_IDS_PER_MILLI)
+        + (u64::from(process_id) % HEADLESS_TURN_MESSAGE_IDS_PER_MILLI)
 }
 
 pub(in crate::services::discord) fn reserve_headless_turn() -> HeadlessTurnReservation {
@@ -830,8 +907,12 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
             }
             info
         } else {
-            let workspace = settings::resolve_workspace(channel_id, channel_name_hint.as_deref())
-                .ok_or_else(|| {
+            let workspace = resolve_headless_workspace(
+                channel_id,
+                channel_name_hint.as_deref(),
+                metadata.as_ref(),
+            )
+            .ok_or_else(|| {
                 HeadlessTurnStartError::Internal(format!(
                     "no workspace resolved for headless turn channel {}",
                     channel_id.get()
@@ -1428,6 +1509,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     inflight_state.set_worktree_context(worktree_path, worktree_branch, base_commit);
     inflight_state.logical_channel_id = Some(channel_id.get());
     inflight_state.session_key = adk_session_key.clone();
+    inflight_state.delivery_bot = metadata_delivery_bot(metadata.as_ref());
     if let Err(error) = save_inflight_state(&inflight_state) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!("  [{ts}]   ⚠ inflight state save failed: {error}");
@@ -5587,6 +5669,35 @@ mod tests {
             born_generation: 0,
             assistant_turns: 0,
         }
+    }
+
+    #[test]
+    fn headless_turn_message_id_seed_uses_time_and_process() {
+        let seed = headless_turn_message_id_seed(1_777_500_000_000, 42);
+        let later_seed = headless_turn_message_id_seed(1_777_500_000_001, 42);
+        let other_process_seed = headless_turn_message_id_seed(1_777_500_000_000, 43);
+
+        assert!(seed >= HEADLESS_TURN_MESSAGE_ID_BASE);
+        assert!(later_seed > seed);
+        assert_ne!(seed, other_process_seed);
+    }
+
+    #[test]
+    fn metadata_delivery_bot_uses_safe_explicit_bot_only() {
+        let explicit = serde_json::json!({
+            "delivery_bot": " opencode ",
+            "agent_id": "fallback"
+        });
+        assert_eq!(
+            metadata_delivery_bot(Some(&explicit)).as_deref(),
+            Some("opencode")
+        );
+
+        let fallback = serde_json::json!({"agent_id": "monitoring"});
+        assert_eq!(metadata_delivery_bot(Some(&fallback)), None);
+
+        let invalid = serde_json::json!({"delivery_bot": "not valid"});
+        assert_eq!(metadata_delivery_bot(Some(&invalid)), None);
     }
 
     #[test]

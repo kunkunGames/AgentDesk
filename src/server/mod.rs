@@ -3288,8 +3288,11 @@ async fn routine_runtime_loop(
 
     let store =
         RoutineStore::new_with_timezone(pg_pool.clone(), routines_config.default_timezone.clone());
-    let discord_logger =
-        RoutineDiscordLogger::new_with_health_target(pg_pool.clone(), routine_health_target);
+    let discord_logger = RoutineDiscordLogger::new_with_health_registry(
+        pg_pool.clone(),
+        health_registry.clone(),
+        routine_health_target,
+    );
     let agent_executor =
         RoutineAgentExecutor::new(pg_pool, health_registry, routines_config.agent_timeout_secs);
     match store.recover_stale_running_runs().await {

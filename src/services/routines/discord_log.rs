@@ -1,6 +1,9 @@
+use chrono::Datelike;
 use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
+
+use crate::services::discord::health::{HealthRegistry, resolve_bot_http};
 
 use super::runtime::RoutineRunOutcome;
 use super::store::{ClaimedRoutineRun, RecoveredRoutineRun, RoutineRecord, RoutineStore};
@@ -8,6 +11,7 @@ use super::store::{ClaimedRoutineRun, RecoveredRoutineRun, RoutineRecord, Routin
 #[derive(Clone)]
 pub struct RoutineDiscordLogger {
     pool: Arc<PgPool>,
+    health_registry: Option<Arc<HealthRegistry>>,
     health_target: Option<String>,
 }
 
@@ -21,9 +25,14 @@ pub struct RoutineDiscordLogStatus {
 }
 
 impl RoutineDiscordLogger {
-    pub fn new_with_health_target(pool: Arc<PgPool>, health_target: Option<String>) -> Self {
+    pub fn new_with_health_registry(
+        pool: Arc<PgPool>,
+        health_registry: Option<Arc<HealthRegistry>>,
+        health_target: Option<String>,
+    ) -> Self {
         Self {
             pool,
+            health_registry,
             health_target,
         }
     }
@@ -134,25 +143,37 @@ impl RoutineDiscordLogger {
         recovered: &RecoveredRoutineRun,
     ) -> RoutineDiscordLogStatus {
         let message = recovery_message(recovered);
-        let target = recovered
+        let status = if recovered
             .discord_thread_id
             .as_deref()
             .and_then(channel_target_from_id)
-            .or_else(|| self.health_target.clone());
-        let status = match target {
-            Some(target) => {
-                self.log_to_target(
-                    &target,
-                    "routine_recovery_resumed",
-                    &format!(
-                        "routine:{}:run:{}:recovery",
-                        recovered.routine_id, recovered.run_id
-                    ),
-                    &message,
-                )
-                .await
-            }
-            None => RoutineDiscordLogStatus::skipped(),
+            .is_some()
+        {
+            self.log_to_routine_target(
+                recovered.agent_id.as_deref(),
+                recovered.discord_thread_id.as_deref(),
+                "routine_recovery_resumed",
+                &format!(
+                    "routine:{}:run:{}:recovery",
+                    recovered.routine_id, recovered.run_id
+                ),
+                &message,
+            )
+            .await
+        } else if let Some(target) = self.health_target.as_deref() {
+            self.log_to_target(
+                target,
+                "notify",
+                "routine_recovery_resumed",
+                &format!(
+                    "routine:{}:run:{}:recovery",
+                    recovered.routine_id, recovered.run_id
+                ),
+                &message,
+            )
+            .await
+        } else {
+            RoutineDiscordLogStatus::skipped()
         };
         self.persist_run_log_status(store, &recovered.run_id, &status)
             .await;
@@ -168,8 +189,26 @@ impl RoutineDiscordLogger {
         content: &str,
     ) -> RoutineDiscordLogStatus {
         if let Some(target) = discord_thread_id.and_then(channel_target_from_id) {
+            let bot = match normalized_agent_id(agent_id) {
+                Some(agent_id) => match resolve_agent_log_bot(
+                    &self.pool,
+                    self.health_registry.as_deref(),
+                    agent_id,
+                )
+                .await
+                {
+                    Ok(bot) => bot,
+                    Err(error) => {
+                        tracing::warn!(
+                            "routine thread log bot resolution failed for {agent_id}: {error}"
+                        );
+                        return RoutineDiscordLogStatus::failed(error);
+                    }
+                },
+                None => "notify".to_string(),
+            };
             return self
-                .log_to_target(&target, reason_code, session_key, content)
+                .log_to_target(&target, &bot, reason_code, session_key, content)
                 .await;
         }
 
@@ -184,13 +223,24 @@ impl RoutineDiscordLogger {
             }
         };
 
-        self.log_to_target(&target, reason_code, session_key, content)
+        let bot = match resolve_agent_log_bot(&self.pool, self.health_registry.as_deref(), agent_id)
+            .await
+        {
+            Ok(bot) => bot,
+            Err(error) => {
+                tracing::warn!("routine log bot resolution failed for {agent_id}: {error}");
+                return RoutineDiscordLogStatus::failed(error);
+            }
+        };
+
+        self.log_to_target(&target, &bot, reason_code, session_key, content)
             .await
     }
 
     async fn log_to_target(
         &self,
         target: &str,
+        bot: &str,
         reason_code: &str,
         session_key: &str,
         content: &str,
@@ -200,7 +250,7 @@ impl RoutineDiscordLogger {
             crate::services::message_outbox::OutboxMessage {
                 target,
                 content,
-                bot: "notify",
+                bot,
                 source: "routine-runtime",
                 reason_code: Some(reason_code),
                 session_key: Some(session_key),
@@ -337,6 +387,75 @@ async fn resolve_agent_channel_target(pool: &PgPool, agent_id: &str) -> Result<S
     Ok(format!("channel:{channel_id}"))
 }
 
+async fn resolve_agent_provider_bot(pool: &PgPool, agent_id: &str) -> Result<String, String> {
+    let bindings = crate::db::agents::load_agent_channel_bindings_pg(pool, agent_id)
+        .await
+        .map_err(|error| format!("load agent bindings for routine log {agent_id}: {error}"))?
+        .ok_or_else(|| format!("agent {agent_id} not found for routine log"))?;
+    bindings
+        .resolved_primary_provider_kind()
+        .map(|provider| provider.as_str().to_string())
+        .ok_or_else(|| format!("agent {agent_id} has no primary provider for routine log"))
+}
+
+async fn resolve_agent_log_bot(
+    pool: &PgPool,
+    health_registry: Option<&HealthRegistry>,
+    agent_id: &str,
+) -> Result<String, String> {
+    let provider_bot = match resolve_agent_provider_bot(pool, agent_id).await {
+        Ok(bot) => Some(bot),
+        Err(error) => {
+            tracing::warn!(
+                "routine log provider bot lookup failed for {agent_id}: {error}; trying fallback bots"
+            );
+            None
+        }
+    };
+    let candidates = routine_log_bot_candidates(provider_bot.as_deref(), Some(agent_id));
+    resolve_available_log_bot(health_registry, &candidates).await
+}
+
+async fn resolve_available_log_bot(
+    health_registry: Option<&HealthRegistry>,
+    candidates: &[String],
+) -> Result<String, String> {
+    let Some(health_registry) = health_registry else {
+        return candidates
+            .first()
+            .cloned()
+            .ok_or_else(|| "no routine discord log bot candidates".to_string());
+    };
+
+    let mut errors = Vec::new();
+    for bot in candidates {
+        match resolve_bot_http(health_registry, bot).await {
+            Ok(_) => return Ok(bot.clone()),
+            Err((status, error)) => errors.push(format!("{bot}: {status} {error}")),
+        }
+    }
+
+    Err(format!(
+        "no routine discord log bot available ({})",
+        errors.join("; ")
+    ))
+}
+
+fn routine_log_bot_candidates(provider_bot: Option<&str>, agent_id: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for bot in [provider_bot, agent_id, Some("notify")]
+        .into_iter()
+        .flatten()
+    {
+        let bot = bot.trim();
+        if bot.is_empty() || candidates.iter().any(|candidate| candidate == bot) {
+            continue;
+        }
+        candidates.push(bot.to_string());
+    }
+    candidates
+}
+
 fn normalized_agent_id(agent_id: Option<&str>) -> Option<&str> {
     agent_id.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -371,16 +490,18 @@ fn recovery_message(recovered: &RecoveredRoutineRun) -> String {
 
 fn run_started_message(claimed: &ClaimedRoutineRun) -> String {
     format!(
-        "루틴 실행 시작: {} / run {} / script {}",
+        "[{}] 루틴 실행 시작: {} / run {} / script {}",
+        routine_log_timestamp(),
         compact(&claimed.name, 80),
         short_id(&claimed.run_id),
-        compact(&claimed.script_ref, 80)
+        script_ref_for_message(&claimed.script_ref, 80)
     )
 }
 
 fn run_outcome_message(routine: &RoutineRecord, outcome: &RoutineRunOutcome) -> String {
     let mut message = format!(
-        "루틴 실행 결과: {} / run {} / action {} / status {}",
+        "[{}] 루틴 실행 결과: {} / run {} / action \"{}\" / status \"{}\"",
+        routine_log_timestamp(),
         compact(&routine.name, 80),
         short_id(&outcome.run_id),
         outcome.action,
@@ -395,6 +516,32 @@ fn run_outcome_message(routine: &RoutineRecord, outcome: &RoutineRunOutcome) -> 
         message.push_str(&compact(error, 160));
     }
     message
+}
+
+fn script_ref_for_message(value: &str, max_chars: usize) -> String {
+    compact(&value.split('/').collect::<Vec<_>>().join(" / "), max_chars)
+}
+
+fn routine_log_timestamp() -> String {
+    let now = chrono::Utc::now().with_timezone(&chrono_tz::Asia::Seoul);
+    format!(
+        "{} {} {}",
+        now.format("%Y-%m-%d"),
+        korean_weekday(now.weekday()),
+        now.format("%H:%M:%S")
+    )
+}
+
+fn korean_weekday(weekday: chrono::Weekday) -> &'static str {
+    match weekday {
+        chrono::Weekday::Mon => "월",
+        chrono::Weekday::Tue => "화",
+        chrono::Weekday::Wed => "수",
+        chrono::Weekday::Thu => "목",
+        chrono::Weekday::Fri => "금",
+        chrono::Weekday::Sat => "토",
+        chrono::Weekday::Sun => "일",
+    }
 }
 
 fn short_id(value: &str) -> String {
@@ -455,10 +602,36 @@ mod tests {
 
         let message = run_outcome_message(&routine, &outcome);
 
+        assert!(message.starts_with("["));
+        assert!(message.contains("] 루틴 실행 결과: Daily Summary"));
         assert!(message.contains("Daily Summary"));
         assert!(message.contains("run-1234"));
-        assert!(message.contains("status failed"));
+        assert!(message.contains("action \"complete\""));
+        assert!(message.contains("status \"failed\""));
         assert!(message.contains("error boom"));
+    }
+
+    #[test]
+    fn run_started_message_includes_timestamp_and_readable_script_ref() {
+        let claimed = ClaimedRoutineRun {
+            run_id: "21e14c13-0000-0000-0000-000000000000".to_string(),
+            routine_id: "routine-123456789".to_string(),
+            agent_id: Some("monitoring".to_string()),
+            script_ref: "monitoring/working-watchdog.js".to_string(),
+            name: "monitoring-working-watchdog".to_string(),
+            execution_strategy: "fresh".to_string(),
+            checkpoint: None,
+            discord_thread_id: None,
+            timeout_secs: None,
+            lease_expires_at: Utc::now(),
+        };
+
+        let message = run_started_message(&claimed);
+
+        assert!(message.starts_with("["));
+        assert!(message.contains("] 루틴 실행 시작: monitoring-working-watchdog"));
+        assert!(message.contains("run 21e14c13"));
+        assert!(message.contains("script monitoring / working-watchdog.js"));
     }
 
     #[test]
@@ -467,6 +640,19 @@ mod tests {
         assert_eq!(status.status, "skipped");
         assert_eq!(status.warning_code, None);
         assert_eq!(status.warning, None);
+    }
+
+    #[test]
+    fn routine_log_bot_candidates_dedupes_and_keeps_notify_fallback() {
+        assert_eq!(
+            routine_log_bot_candidates(Some("codex"), Some("maker")),
+            vec!["codex", "maker", "notify"]
+        );
+        assert_eq!(
+            routine_log_bot_candidates(Some(" maker "), Some("maker")),
+            vec!["maker", "notify"]
+        );
+        assert_eq!(routine_log_bot_candidates(None, Some("")), vec!["notify"]);
     }
 
     #[test]

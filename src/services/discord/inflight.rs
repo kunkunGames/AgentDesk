@@ -106,6 +106,9 @@ pub(super) struct InflightTurnState {
     /// ADK session key (hostname:session-name) for long-turn diagnostics.
     #[serde(default)]
     pub session_key: Option<String>,
+    /// Preferred Discord bot key for terminal headless delivery.
+    #[serde(default)]
+    pub delivery_bot: Option<String>,
     /// Active dispatch ID for long-turn diagnostics.
     #[serde(default)]
     pub dispatch_id: Option<String>,
@@ -212,6 +215,7 @@ impl InflightTurnState {
             any_tool_used: false,
             has_post_tool_text: false,
             session_key: None,
+            delivery_bot: None,
             dispatch_id: None,
             last_watcher_relayed_offset: None,
             last_watcher_relayed_generation_mtime_ns: None,

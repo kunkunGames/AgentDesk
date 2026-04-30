@@ -183,6 +183,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routes_tests.rs
+│   │   ├── routines.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── skill_usage_analytics.rs
@@ -383,6 +384,16 @@ src/
 │   │   ├── smoke.rs
 │   │   ├── snapshot.rs
 │   │   └── upgrade.rs
+│   ├── routines/
+│   │   ├── action.rs
+│   │   ├── agent_executor.rs
+│   │   ├── discord_log.rs
+│   │   ├── loader.rs
+│   │   ├── mod.rs
+│   │   ├── runtime.rs
+│   │   ├── runtime_config.rs
+│   │   ├── session_control.rs
+│   │   └── store.rs
 │   ├── slo/
 │   │   └── mod.rs
 │   ├── agent_protocol.rs
