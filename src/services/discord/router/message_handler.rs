@@ -1475,6 +1475,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
                             native_fast_mode_override,
                             compact_percent_for_claude,
                             cache_ttl_minutes,
+                            None,
                         ),
                         ProviderKind::Codex => codex::execute_command_streaming(
                             &context_prompt,
@@ -3914,6 +3915,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         channel_name: channel_name.clone(),
         execution_mode: Some("discord_turn".to_string()),
     };
+    let dispatch_type_for_mcp = dispatch_type_str.clone();
 
     // Run the provider in a blocking thread
     let provider_for_blocking = provider.clone();
@@ -3939,6 +3941,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                             native_fast_mode_override,
                             compact_percent_for_claude,
                             cache_ttl_minutes,
+                            dispatch_type_for_mcp.as_deref(),
                         ),
                         ProviderKind::Codex => codex::execute_command_streaming(
                             &context_prompt,

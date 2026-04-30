@@ -994,6 +994,99 @@ mod dispatch_contract_tests {
         assert!(contract.contains("\"merge_verified\":{\"status\":\"pass\"}"));
         assert!(contract.contains("review verdict API는 사용하지 않는다"));
     }
+
+    #[test]
+    fn review_lite_prompt_keeps_review_contract_while_trimming_full_sections() {
+        use super::super::settings::RoleBinding;
+
+        let binding = RoleBinding {
+            role_id: "project-agentdesk".to_string(),
+            prompt_file: "/nonexistent".to_string(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            peer_agents_enabled: true,
+            quality_feedback_injection_enabled: true,
+            memory: Default::default(),
+        };
+        let dispatch_context = serde_json::json!({
+            "repo": "itismyfield/AgentDesk",
+            "issue_number": 1473,
+            "review_quality_scope_reminder": "Review only the requested change and directly related regressions.",
+            "review_verdict_guidance": "Use improve when actionable regressions are found.",
+            "verdict_endpoint": "POST /api/review-verdict"
+        });
+        let dispatch_context_raw = dispatch_context.to_string();
+        let current_task = CurrentTaskContext {
+            dispatch_id: Some("dispatch-review-1473"),
+            card_id: Some("card-1473"),
+            dispatch_title: Some("[Review] #1473"),
+            dispatch_context: Some(&dispatch_context_raw),
+            card_title: Some("trim review MCP catalog"),
+            github_issue_url: Some("https://github.com/itismyfield/AgentDesk/issues/1473"),
+        };
+        let shared_knowledge = Some("[Shared Agent Knowledge]\n".repeat(80));
+        let longterm_catalog = Some("- memory.md: detailed operational memory\n".repeat(80));
+
+        let full_prompt = build_system_prompt(
+            "ctx",
+            &[],
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            Some(&binding),
+            false,
+            DispatchProfile::Full,
+            Some("implementation"),
+            Some(&current_task),
+            shared_knowledge.as_deref(),
+            longterm_catalog.as_deref(),
+            Some(&ResolvedMemorySettings {
+                backend: MemoryBackendKind::File,
+                ..ResolvedMemorySettings::default()
+            }),
+            false,
+        );
+        let review_prompt = build_system_prompt(
+            "ctx",
+            &[],
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            Some(&binding),
+            false,
+            DispatchProfile::ReviewLite,
+            Some("review"),
+            Some(&current_task),
+            shared_knowledge.as_deref(),
+            longterm_catalog.as_deref(),
+            Some(&ResolvedMemorySettings {
+                backend: MemoryBackendKind::File,
+                ..ResolvedMemorySettings::default()
+            }),
+            false,
+        );
+
+        assert!(review_prompt.contains("[Review Rules]"));
+        assert!(review_prompt.contains("Review Scope Reminder"));
+        assert!(review_prompt.contains("Review Verdict Guidance"));
+        assert!(review_prompt.contains("Verdict Endpoint: POST /api/review-verdict"));
+        assert!(!review_prompt.contains("[Long-term Memory]"));
+        assert!(!review_prompt.contains("[Proactive Memory Guidance]"));
+
+        let review_words = review_prompt.split_whitespace().count();
+        let full_words = full_prompt.split_whitespace().count();
+        if std::env::var_os("AGENTDESK_PRINT_REVIEW_LITE_BASELINE").is_some() {
+            eprintln!(
+                "review_lite_prompt_baseline review_chars={} review_words={} full_chars={} full_words={}",
+                review_prompt.len(),
+                review_words,
+                full_prompt.len(),
+                full_words
+            );
+        }
+        assert!(review_words * 2 < full_words);
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]

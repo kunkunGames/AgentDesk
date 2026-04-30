@@ -36,8 +36,8 @@ fn resolve_claude_binary() -> crate::services::platform::BinaryResolution {
     crate::services::platform::resolve_provider_binary("claude")
 }
 
-fn append_claude_mcp_config_arg(args: &mut Vec<String>) {
-    if let Some(config_json) = crate::services::mcp_config::claude_mcp_config_arg() {
+fn append_claude_mcp_config_arg(args: &mut Vec<String>, dispatch_type: Option<&str>) {
+    if let Some(config_json) = crate::services::mcp_config::claude_mcp_config_arg(dispatch_type) {
         args.push("--mcp-config".to_string());
         args.push(config_json);
     }
@@ -214,7 +214,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
 - Use headers (## Title) to organize longer responses
 - Keep formatting minimal and terminal-friendly"#.to_string(),
     ];
-    append_claude_mcp_config_arg(&mut args);
+    append_claude_mcp_config_arg(&mut args, None);
 
     // Resume session if available
     if let Some(sid) = session_id {
@@ -476,6 +476,7 @@ pub fn execute_command_streaming(
     fast_mode_enabled: Option<bool>,
     compact_percent: Option<u64>,
     cache_ttl_minutes: Option<u32>,
+    dispatch_type: Option<&str>,
 ) -> Result<(), String> {
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
@@ -526,7 +527,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         "--output-format".to_string(),
         "stream-json".to_string(),
     ];
-    append_claude_mcp_config_arg(&mut args);
+    append_claude_mcp_config_arg(&mut args, dispatch_type);
     append_claude_fast_mode_arg(&mut args, fast_mode_enabled);
 
     // Apply model override if specified (e.g. "opus", "sonnet", "haiku")
@@ -1964,7 +1965,7 @@ mod tests {
         unsafe { std::env::set_var("AGENTDESK_CONFIG", &config_path) };
 
         let mut args = vec!["-p".to_string()];
-        append_claude_mcp_config_arg(&mut args);
+        append_claude_mcp_config_arg(&mut args, None);
 
         assert_eq!(args, vec!["-p".to_string()]);
 

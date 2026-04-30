@@ -11,6 +11,25 @@ use crate::services::provider::ProviderKind;
 const CODEX_SYNC_STATE_FILE: &str = "codex-mcp-sync-state.json";
 const OPENCODE_SYNC_STATE_FILE: &str = "opencode-mcp-sync-state.json";
 const MEMENTO_SERVER_NAME: &str = "memento";
+const REVIEW_MCP_ALLOWLIST_ENV: &str = "AGENTDESK_REVIEW_MCP_ALLOWLIST";
+const DEFAULT_REVIEW_MCP_ALLOWLIST: &[&str] = &[
+    "memento",
+    "github",
+    "github-mcp",
+    "github_mcp",
+    "gh",
+    "git",
+    "filesystem",
+    "file",
+    "files",
+    "fs",
+    "grep",
+    "ripgrep",
+    "rg",
+    "editor",
+    "edit",
+    "apply_patch",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedMcpServer {
@@ -57,14 +76,17 @@ pub(crate) fn provider_has_mcp_server(provider: &ProviderKind, server_name: &str
     }
 }
 
-pub(crate) fn claude_mcp_config_arg() -> Option<String> {
-    let servers = load_runtime_mcp_servers();
+pub(crate) fn claude_mcp_config_arg(dispatch_type: Option<&str>) -> Option<String> {
+    let servers = load_runtime_mcp_servers(dispatch_type);
     claude_mcp_config_arg_from_servers(&servers)
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) fn claude_mcp_config_arg_from_config(config: &Config) -> Option<String> {
-    let servers = resolved_mcp_servers(config);
+#[cfg(test)]
+pub(crate) fn claude_mcp_config_arg_from_config(
+    config: &Config,
+    dispatch_type: Option<&str>,
+) -> Option<String> {
+    let servers = resolved_mcp_servers(config, dispatch_type);
     claude_mcp_config_arg_from_servers(&servers)
 }
 
@@ -73,7 +95,7 @@ pub(crate) fn sync_codex_mcp_servers(config: &Config) -> Result<(), String> {
         .ok_or_else(|| "AGENTDESK_ROOT_DIR is unavailable".to_string())?;
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(CODEX_SYNC_STATE_FILE);
-    let desired = resolved_mcp_servers(config);
+    let desired = resolved_mcp_servers(config, None);
     let previous = load_codex_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
@@ -130,7 +152,7 @@ pub(crate) fn sync_opencode_mcp_servers(config: &Config) -> Result<(), String> {
         .ok_or_else(|| "AGENTDESK_ROOT_DIR is unavailable".to_string())?;
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(OPENCODE_SYNC_STATE_FILE);
-    let desired = resolved_mcp_servers(config);
+    let desired = resolved_mcp_servers(config, None);
     let previous = load_opencode_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
@@ -216,11 +238,48 @@ fn claude_mcp_config_arg_from_servers(
     .ok()
 }
 
-fn resolved_mcp_servers(config: &Config) -> BTreeMap<String, ResolvedMcpServer> {
-    config
+fn resolved_mcp_servers(
+    config: &Config,
+    dispatch_type: Option<&str>,
+) -> BTreeMap<String, ResolvedMcpServer> {
+    let servers = config
         .mcp_servers
         .iter()
         .filter_map(|(name, server)| resolve_mcp_server(name, server))
+        .collect::<Vec<_>>();
+
+    if !review_mcp_slim_mode_enabled(dispatch_type) {
+        return servers
+            .into_iter()
+            .map(|server| (server.name.clone(), server))
+            .collect();
+    }
+
+    let allowlist = review_mcp_allowlist(config);
+    let (allowed, filtered): (Vec<_>, Vec<_>) = servers
+        .into_iter()
+        .partition(|server| allowlist.contains(&normalize_mcp_server_name(&server.name)));
+    if !filtered.is_empty() {
+        let filtered_names = filtered
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            "[mcp] review slim mode filtered {} MCP server(s): {}",
+            filtered.len(),
+            filtered_names
+        );
+    }
+    if allowed.is_empty() && !config.mcp_servers.is_empty() {
+        tracing::warn!(
+            "[mcp] review slim mode produced an empty MCP catalog; set {} or review_mcp_allowlist in agentdesk.yaml if the reviewer needs MCP tools",
+            REVIEW_MCP_ALLOWLIST_ENV
+        );
+    }
+
+    allowed
+        .into_iter()
         .map(|server| (server.name.clone(), server))
         .collect()
 }
@@ -248,14 +307,150 @@ fn resolve_mcp_server(name: &str, server: &McpServerConfig) -> Option<ResolvedMc
     })
 }
 
-fn load_runtime_mcp_servers() -> BTreeMap<String, ResolvedMcpServer> {
+fn load_runtime_mcp_servers(dispatch_type: Option<&str>) -> BTreeMap<String, ResolvedMcpServer> {
     load_runtime_config()
-        .map(|config| resolved_mcp_servers(&config))
+        .map(|config| resolved_mcp_servers(&config, dispatch_type))
         .unwrap_or_default()
 }
 
 fn runtime_config_contains_server(server_name: &str) -> bool {
-    load_runtime_mcp_servers().contains_key(server_name)
+    load_runtime_mcp_servers(None).contains_key(server_name)
+}
+
+fn review_mcp_slim_mode_enabled(dispatch_type: Option<&str>) -> bool {
+    matches!(dispatch_type, Some("review") | Some("review-decision"))
+}
+
+fn review_mcp_allowlist(config: &Config) -> BTreeSet<String> {
+    let mut allowlist = DEFAULT_REVIEW_MCP_ALLOWLIST
+        .iter()
+        .map(|name| normalize_mcp_server_name(name))
+        .collect::<BTreeSet<_>>();
+
+    allowlist.extend(
+        config
+            .review_mcp_allowlist
+            .iter()
+            .map(|name| normalize_mcp_server_name(name))
+            .filter(|name| !name.is_empty()),
+    );
+
+    if let Some(raw) = std::env::var_os(REVIEW_MCP_ALLOWLIST_ENV) {
+        allowlist.extend(parse_review_mcp_allowlist(raw.to_string_lossy().as_ref()));
+    }
+
+    allowlist
+}
+
+fn parse_review_mcp_allowlist(raw: &str) -> impl Iterator<Item = String> + '_ {
+    raw.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .map(normalize_mcp_server_name)
+        .filter(|name| !name.is_empty())
+}
+
+fn normalize_mcp_server_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod review_slim_tests {
+    use super::*;
+    use serde_json::Value;
+
+    static REVIEW_ALLOWLIST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_clean_review_allowlist_env<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = REVIEW_ALLOWLIST_ENV_LOCK.lock().unwrap();
+        let previous_review_mcp_allowlist = std::env::var_os(REVIEW_MCP_ALLOWLIST_ENV);
+        unsafe { std::env::remove_var(REVIEW_MCP_ALLOWLIST_ENV) };
+        f();
+        match previous_review_mcp_allowlist {
+            Some(value) => unsafe { std::env::set_var(REVIEW_MCP_ALLOWLIST_ENV, value) },
+            None => unsafe { std::env::remove_var(REVIEW_MCP_ALLOWLIST_ENV) },
+        }
+    }
+
+    fn config_with_servers(names: &[&str]) -> Config {
+        let mut config = Config::default();
+        for name in names {
+            config.mcp_servers.insert(
+                (*name).to_string(),
+                McpServerConfig {
+                    url: format!("http://localhost/{name}"),
+                    auth: None,
+                },
+            );
+        }
+        config
+    }
+
+    fn rendered_mcp_servers(config: &Config, dispatch_type: Option<&str>) -> Value {
+        let rendered = claude_mcp_config_arg_from_config(config, dispatch_type).expect("config");
+        serde_json::from_str(&rendered).expect("mcp config json")
+    }
+
+    #[test]
+    fn claude_mcp_config_arg_keeps_full_catalog_for_non_review_dispatches() {
+        with_clean_review_allowlist_env(|| {
+            let config = config_with_servers(&["memento", "github", "family-morning-briefing"]);
+
+            let value = rendered_mcp_servers(&config, Some("implementation"));
+
+            assert!(value["mcpServers"]["memento"].is_object());
+            assert!(value["mcpServers"]["github"].is_object());
+            assert!(value["mcpServers"]["family-morning-briefing"].is_object());
+        });
+    }
+
+    #[test]
+    fn claude_mcp_config_arg_filters_review_catalog_to_allowlist() {
+        with_clean_review_allowlist_env(|| {
+            let config = config_with_servers(&[
+                "memento",
+                "github",
+                "family-morning-briefing",
+                "architecture",
+            ]);
+
+            let value = rendered_mcp_servers(&config, Some("review"));
+
+            assert!(value["mcpServers"]["memento"].is_object());
+            assert!(value["mcpServers"]["github"].is_object());
+            assert!(value["mcpServers"]["family-morning-briefing"].is_null());
+            assert!(value["mcpServers"]["architecture"].is_null());
+        });
+    }
+
+    #[test]
+    fn claude_mcp_config_arg_extends_review_allowlist_from_config_and_env() {
+        with_clean_review_allowlist_env(|| {
+            unsafe {
+                std::env::set_var(
+                    REVIEW_MCP_ALLOWLIST_ENV,
+                    "family-morning-briefing, screenshot",
+                )
+            };
+            let mut config = config_with_servers(&[
+                "memento",
+                "family-morning-briefing",
+                "architecture",
+                "screenshot",
+                "speech",
+            ]);
+            config.review_mcp_allowlist.push("architecture".to_string());
+
+            let value = rendered_mcp_servers(&config, Some("review-decision"));
+
+            assert!(value["mcpServers"]["memento"].is_object());
+            assert!(value["mcpServers"]["family-morning-briefing"].is_object());
+            assert!(value["mcpServers"]["architecture"].is_object());
+            assert!(value["mcpServers"]["screenshot"].is_object());
+            assert!(value["mcpServers"]["speech"].is_null());
+        });
+    }
 }
 
 fn current_home_dir() -> Option<PathBuf> {
@@ -471,10 +666,12 @@ mod tests {
         let previous_home = std::env::var_os("HOME");
         let previous_userprofile = std::env::var_os("USERPROFILE");
         let previous_path = std::env::var_os("PATH");
+        let previous_review_mcp_allowlist = std::env::var_os(REVIEW_MCP_ALLOWLIST_ENV);
         unsafe {
             std::env::set_var("AGENTDESK_ROOT_DIR", &runtime_root);
             std::env::set_var("HOME", temp.path());
             std::env::set_var("USERPROFILE", temp.path());
+            std::env::remove_var(REVIEW_MCP_ALLOWLIST_ENV);
         }
         f(temp.path());
         match previous_root {
@@ -492,6 +689,10 @@ mod tests {
         match previous_path {
             Some(value) => unsafe { std::env::set_var("PATH", value) },
             None => unsafe { std::env::remove_var("PATH") },
+        }
+        match previous_review_mcp_allowlist {
+            Some(value) => unsafe { std::env::set_var(REVIEW_MCP_ALLOWLIST_ENV, value) },
+            None => unsafe { std::env::remove_var(REVIEW_MCP_ALLOWLIST_ENV) },
         }
     }
 
@@ -517,7 +718,7 @@ mod tests {
             },
         );
 
-        let rendered = claude_mcp_config_arg_from_config(&config).expect("config");
+        let rendered = claude_mcp_config_arg_from_config(&config, None).expect("config");
         let value: Value = serde_json::from_str(&rendered).unwrap();
 
         assert_eq!(

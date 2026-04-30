@@ -13,6 +13,8 @@ pub struct Config {
     pub shared_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_mcp_allowlist: Vec<String>,
     #[serde(default)]
     pub agents: Vec<AgentDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1228,6 +1230,7 @@ impl Default for Config {
             discord: DiscordConfig::default(),
             shared_prompt: None,
             mcp_servers: std::collections::BTreeMap::new(),
+            review_mcp_allowlist: Vec::new(),
             agents: Vec::new(),
             meeting: None,
             github: GitHubConfig::default(),

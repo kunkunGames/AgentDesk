@@ -193,6 +193,7 @@ pub async fn execute_structured_with_context(
                     None,
                     None,
                     None,
+                    None,
                 ),
                 ProviderKind::Codex => codex::execute_command_streaming(
                     &prompt,

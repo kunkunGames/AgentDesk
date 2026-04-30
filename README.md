@@ -297,6 +297,7 @@ mcp_servers:
     auth:
       type: bearer
       token_env_var: MEMENTO_ACCESS_KEY
+review_mcp_allowlist: [memento, github] # optional: extra MCP servers exposed to review/review-decision dispatches
 
 shared_prompt: ~/.adk/release/config/agents/_shared.prompt.md
 
