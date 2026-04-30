@@ -1325,6 +1325,14 @@ impl TestHealthHarness {
         self.registry.clone()
     }
 
+    /// #1446 — expose the inner `SharedData` so router-level intake tests
+    /// can drive `dispatch_thread_parents` / mailbox state directly. Test-
+    /// only accessor; the harness retains its own `Arc` clone, so the
+    /// returned handle is safe to operate on after the harness is dropped.
+    pub(crate) fn shared(&self) -> Arc<SharedData> {
+        self.shared.clone()
+    }
+
     pub(crate) fn set_reconcile_done(&self, done: bool) {
         self.shared
             .reconcile_done
@@ -3069,6 +3077,230 @@ pub fn spawn_watchdog(port: u16) {
         .expect("Failed to spawn watchdog thread");
 }
 
+/// #1446 stall-deadlock recovery — pure decision helper for the
+/// `stall_watchdog` periodic loop. Returns `true` when the watchdog should
+/// force-clean a watcher's state. The caller is responsible for actually
+/// invoking the cleanup (so the helper can be exercised by unit tests
+/// without a live `SharedData`).
+///
+/// Both gates must hold:
+/// - `attached == true` and `desynced == true` (snapshot already classified
+///   the watcher as detached/diverged), AND
+/// - `inflight_updated_at` is older than `threshold_secs` seconds
+///   (defaults to `2 * INFLIGHT_STALENESS_THRESHOLD_SECS`).
+///
+/// Either signal alone is insufficient — a fresh desynced watcher might
+/// just be mid-stream and a stale-but-synced one might be waiting on an
+/// idle agent. The conjunction is the actual stall pattern from issue
+/// #1446 (parent channel queues forever because thread inflight stayed
+/// behind after the dispatch terminated).
+pub(super) fn stall_watchdog_should_force_clean(
+    attached: bool,
+    desynced: bool,
+    inflight_updated_at: Option<&str>,
+    now_unix_secs: i64,
+    threshold_secs: u64,
+) -> bool {
+    if !attached || !desynced {
+        return false;
+    }
+    let Some(updated_at) = inflight_updated_at else {
+        return false;
+    };
+    let Some(updated_at_unix) = super::inflight::parse_updated_at_unix(updated_at) else {
+        return false;
+    };
+    let age_secs = now_unix_secs.saturating_sub(updated_at_unix);
+    age_secs >= 0 && (age_secs as u64) >= threshold_secs
+}
+
+/// Watchdog tick interval. Picked to converge inside ~1 cycle once the
+/// `2x` staleness window has elapsed, while staying well below the
+/// gateway-lease keepalive cadence so we never starve the gateway loop.
+pub(super) const STALL_WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+/// Initial delay before the first watchdog pass — mirrors
+/// `placeholder_sweeper::INITIAL_DELAY_SECS` so we never observe a freshly
+/// recovered turn as "desynced" mid-bootstrap.
+pub(super) const STALL_WATCHDOG_INITIAL_DELAY_SECS: u64 = 90;
+
+/// Force-cleanup window: requires `inflight_updated_at` to be at least
+/// this old before the watchdog clears the desynced watcher. Strictly
+/// larger than `INFLIGHT_STALENESS_THRESHOLD_SECS` (the THREAD-GUARD's
+/// trigger) so the watchdog never races ahead of an in-flight intake call.
+pub(super) const STALL_WATCHDOG_THRESHOLD_SECS: u64 =
+    2 * super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS;
+
+/// Run a single stall-watchdog pass against one provider+SharedData.
+///
+/// Iterates every attached watcher (via `tmux_watchers.iter()`), pulls the
+/// `WatcherStateSnapshot` for the owning channel, and force-cleans any
+/// channel whose snapshot satisfies `stall_watchdog_should_force_clean`.
+/// Returns the number of channels cleaned this pass for telemetry/logging.
+pub(super) async fn run_stall_watchdog_pass(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+) -> usize {
+    let Some(shared) = shared_for_provider(registry, provider).await else {
+        return 0;
+    };
+    let candidate_channels: Vec<ChannelId> = shared
+        .tmux_watchers
+        .iter()
+        .filter_map(|entry| {
+            shared
+                .tmux_watchers
+                .owner_channel_for_tmux_session(entry.key())
+        })
+        .collect();
+    if candidate_channels.is_empty() {
+        return 0;
+    }
+    let now_unix_secs = chrono::Utc::now().timestamp();
+    let mut cleaned = 0usize;
+    for channel_id in candidate_channels {
+        let snapshot = match registry.snapshot_watcher_state(channel_id.get()).await {
+            Some(snapshot) => snapshot,
+            None => continue,
+        };
+        let should_clean = stall_watchdog_should_force_clean(
+            snapshot.attached,
+            snapshot.desynced,
+            snapshot.inflight_updated_at.as_deref(),
+            now_unix_secs,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        );
+        if !should_clean {
+            continue;
+        }
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚡ STALL-WATCHDOG: forced cleanup for desynced channel {}",
+            channel_id
+        );
+        // Force cleanup mirrors THREAD-GUARD's stale path:
+        //   1. clear inflight state file (releases the durable lock)
+        //   2. cancel the mailbox active turn (releases in-memory lock)
+        //   3. drop any parent → thread mapping that points at this channel
+        //      (so the parent's THREAD-GUARD stops queueing)
+        super::inflight::delete_inflight_state_file(provider, channel_id.get());
+        let _ = mailbox_cancel_active_turn(&shared, channel_id).await;
+        shared
+            .dispatch_thread_parents
+            .retain(|_, thread_id| *thread_id != channel_id);
+        cleaned += 1;
+    }
+    cleaned
+}
+
+/// Spawn the long-lived background task that runs the stall watchdog at
+/// `STALL_WATCHDOG_INTERVAL_SECS` cadence for the given provider. Should
+/// be called once per provider during dcserver bootstrap, alongside
+/// `placeholder_sweeper::spawn_placeholder_sweeper`.
+pub fn spawn_stall_watchdog(registry: Arc<HealthRegistry>, provider: ProviderKind) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(
+            STALL_WATCHDOG_INITIAL_DELAY_SECS,
+        ))
+        .await;
+        loop {
+            let cleaned = run_stall_watchdog_pass(&registry, &provider).await;
+            if cleaned > 0 {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] ⚡ stall-watchdog ({}): cleaned={}",
+                    provider.as_str(),
+                    cleaned
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(STALL_WATCHDOG_INTERVAL_SECS)).await;
+        }
+    });
+}
+
+/// #1446 — pure-helper tests for the stall-watchdog decision logic.
+/// Always-on (`#[cfg(test)]`) because the helper has no filesystem/runtime
+/// dependencies; the legacy-sqlite-tests gate would prevent these from
+/// running in normal `cargo test --bin agentdesk` invocations.
+#[cfg(test)]
+mod stall_watchdog_pure_tests {
+    use super::{STALL_WATCHDOG_THRESHOLD_SECS, stall_watchdog_should_force_clean};
+    use chrono::TimeZone;
+
+    /// All three signals (`attached`, `desynced`, stale `updated_at`) must
+    /// be present before the watchdog cleans. A regression that drops any
+    /// one of the AND-conditions is caught by these inversions.
+    #[test]
+    fn stall_watchdog_should_force_clean_requires_all_signals() {
+        let now_unix = chrono::Utc::now().timestamp();
+        let stale_unix = now_unix - (STALL_WATCHDOG_THRESHOLD_SECS as i64) - 1;
+        let to_local = |unix: i64| {
+            chrono::Local
+                .timestamp_opt(unix, 0)
+                .single()
+                .expect("valid local time")
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        let stale_str = to_local(stale_unix);
+        let fresh_str = to_local(now_unix - 5);
+
+        // Happy path: attached + desynced + stale → clean.
+        assert!(stall_watchdog_should_force_clean(
+            true,
+            true,
+            Some(stale_str.as_str()),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // detached → no clean.
+        assert!(!stall_watchdog_should_force_clean(
+            false,
+            true,
+            Some(stale_str.as_str()),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // synced → no clean.
+        assert!(!stall_watchdog_should_force_clean(
+            true,
+            false,
+            Some(stale_str.as_str()),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // fresh updated_at → no clean (live-turn safety net).
+        assert!(!stall_watchdog_should_force_clean(
+            true,
+            true,
+            Some(fresh_str.as_str()),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // missing updated_at → no clean.
+        assert!(!stall_watchdog_should_force_clean(
+            true,
+            true,
+            None,
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // unparseable updated_at → no clean.
+        assert!(!stall_watchdog_should_force_clean(
+            true,
+            true,
+            Some("not-a-real-timestamp"),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+    }
+}
+
 /// Parse a /api/send JSON body and extract (target, content, source).
 /// Returns Err with an error message on invalid input.
 /// Factored out of handle_send for testability.
@@ -3100,6 +3332,7 @@ fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str>
 mod tests {
     use super::*;
     use crate::services::discord::DISCORD_MSG_LIMIT;
+    use chrono::TimeZone;
     use poise::serenity_prelude::{MessageId, UserId};
 
     struct TestTmuxSession {
@@ -4529,5 +4762,206 @@ mod tests {
         assert_eq!(status, "409 Conflict");
         assert!(message.contains("StaleOutputPath"));
         assert!(message.contains("fd 5w"));
+    }
+
+    /// #1446 Layer 3 (integration) — the watchdog must force-clean a
+    /// channel whose snapshot satisfies the conjunction (attached +
+    /// desynced + stale inflight). We construct that exact state via the
+    /// existing `TestHealthHarness` + a tmux session so the snapshot's
+    /// `live_tmux_orphaned` branch fires (`tmux_alive && inflight_state &&
+    /// !attached && relay_stale` — by routing the watcher binding to a
+    /// DIFFERENT channel than the inflight, the inflight channel reports
+    /// `attached=false` from the binding view but the snapshot still
+    /// classifies it as `attached` via `inflight_owner_matches_channel`
+    /// when the watcher owner-map points back at it).
+    ///
+    /// We rely on the simpler `tmux_session_mismatch && relay_stale`
+    /// desync path: seed two watcher bindings for the same tmux name from
+    /// two different channels, write an inflight whose `tmux_session_name`
+    /// disagrees with the binding, and pin the relay-coord to a stale
+    /// timestamp.
+    #[tokio::test]
+    async fn stall_watchdog_force_cleans_desynced_attached_watcher() {
+        let Some(tmux_guard) = start_test_tmux_session("watchdog-clean") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id: u64 = 700_111_222_333_444_001;
+        // Bind the live tmux session to this channel — establishes
+        // `attached=true` via the watcher owner-map.
+        harness.seed_watcher_for_tmux(channel_id, &tmux_guard.name);
+
+        // Write an inflight pointing at the SAME live tmux session and an
+        // output capture file with bytes the relay never advanced past.
+        let output_path = temp.path().join("watchdog-clean-output.jsonl");
+        std::fs::write(&output_path, vec![b'x'; 256]).expect("seed output capture");
+        let mut inflight = super::super::inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("watchdog-clean".to_string()),
+            42,
+            8_001,
+            8_002,
+            String::new(),
+            Some("session-watchdog-clean".to_string()),
+            Some(tmux_guard.name.clone()),
+            Some(output_path.to_string_lossy().into_owned()),
+            None,
+            0,
+        );
+        // Backdate updated_at WAY beyond the watchdog threshold. The
+        // snapshot's `parse_started_at_unix` reads the same encoding the
+        // helper uses, so this also drives the staleness check.
+        let stale_unix =
+            chrono::Utc::now().timestamp() - (super::STALL_WATCHDOG_THRESHOLD_SECS as i64) - 60;
+        let stale_local = chrono::Local
+            .timestamp_opt(stale_unix, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        inflight.started_at = stale_local.clone();
+        inflight.updated_at = stale_local.clone();
+        super::super::inflight::save_inflight_state(&inflight)
+            .expect("write seeded stale inflight JSON");
+        // Re-stamp updated_at on disk (save_inflight_state rewrites it to
+        // now) — write the JSON directly to bypass the auto-stamp.
+        let json = serde_json::to_string_pretty(&inflight).expect("serialize stale inflight");
+        let inflight_path = super::super::inflight::inflight_runtime_root()
+            .expect("inflight root override")
+            .join("codex")
+            .join(format!("{channel_id}.json"));
+        std::fs::write(&inflight_path, json).expect("rewrite stale inflight on disk");
+
+        // Backdate the relay-coord too so `relay_stale` fires.
+        let coord = harness.shared.tmux_relay_coord(ChannelId::new(channel_id));
+        coord.last_relay_ts_ms.store(
+            chrono::Utc::now().timestamp_millis() - WATCHER_STATE_DESYNC_STALE_MS - 5_000,
+            std::sync::atomic::Ordering::Release,
+        );
+        coord
+            .confirmed_end_offset
+            .store(8, std::sync::atomic::Ordering::Release);
+
+        // Seed dispatch_thread_parents so the watchdog's parent-mapping
+        // cleanup path is also exercised.
+        let parent_channel_id: u64 = 700_111_222_333_444_999;
+        harness.shared.dispatch_thread_parents.insert(
+            ChannelId::new(parent_channel_id),
+            ChannelId::new(channel_id),
+        );
+
+        // Sanity: snapshot must classify this as desynced before the run.
+        let pre_snapshot = harness
+            .registry()
+            .snapshot_watcher_state(channel_id)
+            .await
+            .expect("seeded inflight should surface a snapshot");
+        assert!(pre_snapshot.attached, "watcher binding implies attached");
+        assert!(
+            pre_snapshot.desynced,
+            "stale capture-lag must classify as desynced before watchdog runs"
+        );
+        assert!(
+            pre_snapshot.inflight_state_present,
+            "inflight file must be present pre-watchdog"
+        );
+
+        // Run the watchdog pass.
+        let cleaned =
+            super::run_stall_watchdog_pass(&harness.registry(), &ProviderKind::Codex).await;
+        assert_eq!(
+            cleaned, 1,
+            "watchdog must report cleaning exactly 1 channel"
+        );
+
+        // Inflight file must be gone.
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_none(),
+            "watchdog must delete the stale inflight state file"
+        );
+        // Parent → thread mapping must be cleared.
+        assert!(
+            !harness
+                .shared
+                .dispatch_thread_parents
+                .contains_key(&ChannelId::new(parent_channel_id)),
+            "watchdog must drop the dispatch_thread_parents entry pointing at the cleaned channel"
+        );
+    }
+
+    /// #1446 Layer 3 — the watchdog must NOT touch a channel whose
+    /// inflight `updated_at` is fresh, even if it happens to look
+    /// desynced for an unrelated reason. This is the false-positive guard
+    /// that protects healthy long-running turns.
+    #[tokio::test]
+    async fn stall_watchdog_skips_fresh_inflight_even_if_desynced() {
+        let Some(tmux_guard) = start_test_tmux_session("watchdog-skip-fresh") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id: u64 = 700_111_222_333_555_001;
+        harness.seed_watcher_for_tmux(channel_id, &tmux_guard.name);
+
+        let output_path = temp.path().join("watchdog-skip-fresh-output.jsonl");
+        std::fs::write(&output_path, vec![b'x'; 256]).expect("seed output capture");
+        let mut inflight = super::super::inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("watchdog-skip-fresh".to_string()),
+            42,
+            8_011,
+            8_012,
+            String::new(),
+            Some("session-watchdog-skip-fresh".to_string()),
+            Some(tmux_guard.name.clone()),
+            Some(output_path.to_string_lossy().into_owned()),
+            None,
+            0,
+        );
+        // FRESH updated_at — save_inflight_state will stamp `now()` and
+        // we leave it as-is.
+        inflight.started_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        super::super::inflight::save_inflight_state(&inflight)
+            .expect("write seeded fresh inflight JSON");
+
+        let coord = harness.shared.tmux_relay_coord(ChannelId::new(channel_id));
+        coord.last_relay_ts_ms.store(
+            chrono::Utc::now().timestamp_millis() - WATCHER_STATE_DESYNC_STALE_MS - 5_000,
+            std::sync::atomic::Ordering::Release,
+        );
+
+        let cleaned =
+            super::run_stall_watchdog_pass(&harness.registry(), &ProviderKind::Codex).await;
+        assert_eq!(
+            cleaned, 0,
+            "watchdog must NOT clean a fresh-updated_at channel even if desynced"
+        );
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_some(),
+            "fresh inflight must survive the watchdog"
+        );
     }
 }

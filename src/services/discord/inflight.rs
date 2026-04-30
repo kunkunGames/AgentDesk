@@ -23,6 +23,18 @@ const INFLIGHT_MAX_AGE_SECS: u64 = 300; // 5 minutes
 const DRAIN_RESTART_MAX_AGE_SECS: u64 = 1800; // 30 minutes
 const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
 
+/// #1446 stall-deadlock recovery: an inflight state is treated as "stale"
+/// (i.e. the dispatch that wrote it almost certainly already terminated
+/// without cleanup) when its persisted `updated_at` has not advanced for
+/// this many seconds. THREAD-GUARD uses this exact threshold; the
+/// stall-watchdog uses `2x` to stay strictly more conservative than any
+/// caller that has already observed the state directly.
+///
+/// Tuned to stay well above the placeholder sweeper's `STALL_THRESHOLD_SECS`
+/// (60s) and any normal stream cadence so we never false-positive a
+/// healthy long turn.
+pub(super) const INFLIGHT_STALENESS_THRESHOLD_SECS: u64 = 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InflightTurnState {
     pub version: u32,
@@ -326,6 +338,34 @@ pub(super) fn parse_started_at_unix(started_at: &str) -> Option<i64> {
         .from_local_datetime(&naive)
         .single()
         .map(|local| local.timestamp())
+}
+
+/// Parse a persisted `updated_at` field (same `now_string` localtime form
+/// as `started_at`) back into a Unix timestamp. Wrapper kept distinct from
+/// `parse_started_at_unix` purely for call-site readability — both fields
+/// share the same encoding but represent different lifecycle moments.
+pub(super) fn parse_updated_at_unix(updated_at: &str) -> Option<i64> {
+    parse_started_at_unix(updated_at)
+}
+
+/// #1446 stall-deadlock recovery: returns `true` when the persisted
+/// `updated_at` of an inflight state is older than
+/// `threshold_secs` seconds relative to `now_unix_secs`.
+///
+/// Returns `false` if `updated_at` is unparseable — staleness should never
+/// be inferred from missing data. This keeps the helper safe to call from
+/// the THREAD-GUARD and stall-watchdog paths even when a partially
+/// migrated state file is on disk.
+pub(super) fn inflight_state_is_stale(
+    state: &InflightTurnState,
+    now_unix_secs: i64,
+    threshold_secs: u64,
+) -> bool {
+    let Some(updated_at_unix) = parse_updated_at_unix(&state.updated_at) else {
+        return false;
+    };
+    let age_secs = now_unix_secs.saturating_sub(updated_at_unix);
+    age_secs >= 0 && (age_secs as u64) >= threshold_secs
 }
 
 fn turn_id_for_state(state: &InflightTurnState) -> Option<String> {
@@ -760,6 +800,74 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
         states.push(state);
     }
     states
+}
+
+/// #1446 Layer 1 — `inflight_state_is_stale` is a pure helper with no
+/// filesystem or runtime dependencies, so we keep its test always-on
+/// (`#[cfg(test)]`) rather than gating it on the `legacy-sqlite-tests`
+/// feature like the rest of this file. The legacy-gated tests below
+/// require a live SQLite test harness and cannot run in plain `cargo
+/// test --bin agentdesk` invocations.
+#[cfg(test)]
+mod stall_recovery_tests {
+    use super::{INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState, inflight_state_is_stale};
+    use crate::services::provider::ProviderKind;
+    use chrono::TimeZone;
+
+    /// `inflight_state_is_stale` must flip to true once `updated_at` is
+    /// older than the configured threshold and stay false for fresh state.
+    #[test]
+    fn inflight_state_is_stale_returns_true_after_threshold() {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Codex,
+            42,
+            Some("adk-cdx".to_string()),
+            7,
+            8,
+            9,
+            "hello".to_string(),
+            None,
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            None,
+            None,
+            0,
+        );
+
+        // Anchor `now` and derive `updated_at` from it deterministically so
+        // the test is independent of wall clock.
+        let now_unix = chrono::Utc::now().timestamp();
+        let fresh_unix = now_unix - 5;
+        let stale_unix = now_unix - (INFLIGHT_STALENESS_THRESHOLD_SECS as i64) - 1;
+
+        let to_local = |unix: i64| {
+            chrono::Local
+                .timestamp_opt(unix, 0)
+                .single()
+                .expect("valid local time")
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+
+        state.updated_at = to_local(fresh_unix);
+        assert!(
+            !inflight_state_is_stale(&state, now_unix, INFLIGHT_STALENESS_THRESHOLD_SECS),
+            "fresh state must NOT be reported as stale"
+        );
+
+        state.updated_at = to_local(stale_unix);
+        assert!(
+            inflight_state_is_stale(&state, now_unix, INFLIGHT_STALENESS_THRESHOLD_SECS),
+            "state older than threshold must be reported as stale"
+        );
+
+        // Unparseable timestamp must default to "not stale" — never infer
+        // staleness from missing data.
+        state.updated_at = "garbage-not-a-date".to_string();
+        assert!(
+            !inflight_state_is_stale(&state, now_unix, INFLIGHT_STALENESS_THRESHOLD_SECS),
+            "unparseable updated_at must NOT be treated as stale"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
