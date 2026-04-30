@@ -286,6 +286,18 @@ class LegacySqliteCheck(unittest.TestCase):
             hits = list(legacy_sqlite.CHECK.runner(set()))
         self.assertEqual(_files(hits), {"scripts/auto-queue-monitor.sh"})
 
+    def test_auto_queue_monitor_notification_source_is_allowed(self) -> None:
+        monitor = (REPO_ROOT / "scripts" / "auto-queue-monitor.sh").read_text(
+            encoding="utf-8"
+        )
+        discord_health = (
+            REPO_ROOT / "src" / "services" / "discord" / "health.rs"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('source:"auto-queue"', monitor)
+        self.assertNotIn('source:"auto-queue-monitor"', monitor)
+        self.assertIn('"auto-queue"', discord_health)
+
 
 class SourceOfTruthAliasCheck(unittest.TestCase):
     def test_flags_writes_to_alias_paths(self) -> None:
