@@ -1381,10 +1381,6 @@ impl TestHealthHarness {
             .store(restart_pending, std::sync::atomic::Ordering::Relaxed);
     }
 
-    fn shared(&self) -> Arc<SharedData> {
-        self.shared.clone()
-    }
-
     pub(crate) fn set_deferred_hooks(&self, count: usize) {
         self.shared
             .deferred_hook_backlog

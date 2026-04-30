@@ -28,6 +28,22 @@ use poise::serenity_prelude as serenity;
 use super::SharedData;
 use crate::services::provider::CancelToken;
 
+/// Saturating decrement of `shared.global_active`. The naive
+/// `fetch_sub(1)` can wrap `0 → usize::MAX` when the counter was never
+/// incremented for this turn — `reregister_active_turn_from_inflight`
+/// re-creates a mailbox cancel token after a dcserver restart without
+/// touching `global_active` because the parent counter was already lost
+/// with the previous process. A wrapped counter convinces health /
+/// deferred-restart that an active turn exists forever.
+fn saturating_decrement_global_active(shared: &SharedData) -> bool {
+    shared
+        .global_active
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(1)
+        })
+        .is_ok()
+}
+
 /// Finalize the bookkeeping that `mailbox_clear_channel` does **not**
 /// perform on its own when the original turn task is already dead.
 ///
@@ -62,11 +78,12 @@ pub(super) fn finalize_orphaned_clear(
         },
         reason,
     );
-    shared.global_active.fetch_sub(1, Ordering::Relaxed);
+    let counter_decremented = saturating_decrement_global_active(shared);
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
-        "  [{ts}] 🔄 stall-recovery: finalized orphaned clear for channel {} (reason={})",
+        "  [{ts}] 🔄 stall-recovery: finalized orphaned clear for channel {} (reason={}, global_active_decremented={})",
         channel_id,
-        reason
+        reason,
+        counter_decremented
     );
 }
