@@ -208,7 +208,6 @@ impl RoutineScriptLoader {
             .contains_key(script_ref))
     }
 
-    #[cfg(test)]
     pub fn script_refs(&self) -> Result<Vec<String>> {
         let mut refs: Vec<String> = self
             .scripts
@@ -1047,6 +1046,80 @@ mod tests {
                     checkpoint
                         .get("candidates")
                         .and_then(Value::as_object)
+                        .unwrap()
+                        .len(),
+                    0
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_inventory_wildcard_drops_matching_checkpoint_candidates() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let checkpoint = serde_json::json!({
+            "version": 1,
+            "cursors": {},
+            "candidates": {
+                "monitoring/working-watchdog.js:complete": {
+                    "category": "routine-candidate",
+                    "state": "recommended",
+                    "score": 100,
+                    "evidence_count": 89,
+                    "cooldown_until": null
+                }
+            },
+            "suppressions": {},
+            "recommendations": [{
+                "pattern_id": "monitoring/working-watchdog.js:complete",
+                "recommended_at": "2026-04-30T06:59:00Z",
+                "hash": "existing",
+                "score": 100,
+                "evidence_count": 89
+            }],
+            "last_tick_at": "2026-04-30T06:59:00Z",
+            "stats": {
+                "ticks": 7,
+                "observations_seen": 100,
+                "agent_escalations": 1,
+                "recommendations_today": 1,
+                "recommendation_day": "2026-04-30"
+            }
+        });
+        let inventory = vec![serde_json::json!({
+            "pattern_id": "monitoring/working-watchdog.js:*",
+            "status": "implemented",
+            "reason": "registered routine",
+            "source_ref": "routine:monitoring-working-watchdog",
+            "updated_at": "2026-04-30T06:00:00Z"
+        })];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(Some(checkpoint), vec![], inventory, now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+                let checkpoint = checkpoint.unwrap();
+                assert_eq!(
+                    checkpoint
+                        .get("candidates")
+                        .and_then(Value::as_object)
+                        .unwrap()
+                        .len(),
+                    0
+                );
+                assert_eq!(
+                    checkpoint
+                        .get("recommendations")
+                        .and_then(Value::as_array)
                         .unwrap()
                         .len(),
                     0

@@ -166,6 +166,18 @@ function buildSuppressedSet(cp, inventory) {
   };
 }
 
+function dropSuppressedCandidates(cp, suppressedSet) {
+  for (const patternId of Object.keys(cp.candidates || {})) {
+    if (suppressedSet.has(patternId)) {
+      delete cp.candidates[patternId];
+    }
+  }
+
+  if (Array.isArray(cp.recommendations)) {
+    cp.recommendations = cp.recommendations.filter((item) => !suppressedSet.has(item.pattern_id));
+  }
+}
+
 // --- Expired suppression cleanup ---
 
 function pruneExpiredSuppressions(cp, nowStr) {
@@ -543,6 +555,7 @@ agentdesk.routines.register({
     expireStaleCandidates(cp, nowStr);
 
     const suppressedSet = buildSuppressedSet(cp, inventory);
+    dropSuppressedCandidates(cp, suppressedSet);
     scoreObservations(cp, observations, suppressedSet, nowStr);
 
     cp.stats.ticks++;
