@@ -43,7 +43,7 @@ direct_discord_sends = [
   "src/services/discord/health.rs:2797",
   "src/services/discord/meeting_orchestrator.rs:654",
   "src/services/discord/meeting_orchestrator.rs:678",
-  "src/services/discord/mod.rs:2179",
+  "src/services/discord/mod.rs:2178",
   "src/services/discord/monitoring_status.rs:50",
   "src/services/discord/monitoring_status.rs:74",
   "src/services/discord/placeholder_controller.rs:202",

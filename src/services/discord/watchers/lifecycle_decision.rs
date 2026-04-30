@@ -143,6 +143,8 @@ pub(super) fn watcher_output_poll_decision(
 pub(super) struct MissingInflightFallbackPlan {
     pub(super) warn: bool,
     pub(super) trigger_reattach: bool,
+    // Forward-compatible with relay recovery actions; current callers only need
+    // the warn/reattach/suppression parts of the decision.
     pub(super) mark_degraded: bool,
     pub(super) suppressed_by_recent_stop: bool,
 }
