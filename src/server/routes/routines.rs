@@ -380,12 +380,11 @@ pub async fn run_routine_now(
         AppError::internal(format!("routine script loader init failed: {error}"))
             .with_code(ErrorCode::Internal)
     })?;
-    loader
-        .load_dir(&state.config.routines.dir)
-        .map_err(|error| {
-            AppError::internal(format!("routine script registry load failed: {error}"))
-                .with_code(ErrorCode::Config)
-        })?;
+    let routine_script_dirs = state.config.routines.script_dirs();
+    loader.load_dirs(&routine_script_dirs).map_err(|error| {
+        AppError::internal(format!("routine script registry load failed: {error}"))
+            .with_code(ErrorCode::Config)
+    })?;
 
     let Some(claimed) = store
         .claim_run_now(&routine_id)
