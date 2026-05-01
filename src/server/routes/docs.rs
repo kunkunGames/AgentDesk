@@ -3035,7 +3035,14 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "Attach a file-backed routine row without starting an agent action.",
         )
         .with_params([
-            ("script_ref", body_param("string", true, "Routine script path relative to routines.dir")),
+            (
+                "script_ref",
+                body_param(
+                    "string",
+                    true,
+                    "Routine script path relative to routines.dir or routines.additional_dirs",
+                ),
+            ),
             ("name", body_param("string", false, "Human-readable routine name")),
             ("agent_id", body_param("string", false, "Optional attached agent id")),
             ("execution_strategy", body_param("string", false, "fresh or persistent")),

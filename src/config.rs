@@ -1242,9 +1242,15 @@ pub struct RoutinesConfig {
     /// SQLite-only deployments are unaffected when this is false.
     #[serde(default)]
     pub enabled: bool,
-    /// Directory containing *.js routine scripts. Defaults to `./routines`.
+    /// Release-managed directory containing bundled *.js routine scripts.
+    /// Defaults to `./routines`.
     #[serde(default = "default_routines_dir")]
     pub dir: PathBuf,
+    /// Additional operator-managed routine script directories. These are loaded
+    /// after `dir`, so a script with the same relative path overrides the
+    /// bundled script without being copied into the release directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_dirs: Vec<PathBuf>,
     /// How often the due-scan tick runs, in seconds. Defaults to 30.
     #[serde(default = "default_routines_tick_interval_secs")]
     pub tick_interval_secs: u64,
@@ -1270,6 +1276,7 @@ impl Default for RoutinesConfig {
         Self {
             enabled: false,
             dir: default_routines_dir(),
+            additional_dirs: Vec::new(),
             tick_interval_secs: default_routines_tick_interval_secs(),
             max_due_per_tick: default_routines_max_due_per_tick(),
             max_agent_polls_per_tick: default_routines_max_agent_polls_per_tick(),
@@ -1283,6 +1290,16 @@ impl Default for RoutinesConfig {
 impl RoutinesConfig {
     pub fn is_default(&self) -> bool {
         *self == RoutinesConfig::default()
+    }
+
+    pub fn script_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::with_capacity(1 + self.additional_dirs.len());
+        for dir in std::iter::once(&self.dir).chain(self.additional_dirs.iter()) {
+            if !dirs.contains(dir) {
+                dirs.push(dir.clone());
+            }
+        }
+        dirs
     }
 }
 
@@ -1308,6 +1325,32 @@ fn default_routines_timezone() -> String {
 
 fn default_routines_agent_timeout_secs() -> u64 {
     30 * 60
+}
+
+#[cfg(test)]
+mod routine_config_unit_tests {
+    use super::*;
+
+    #[test]
+    fn routine_script_dirs_preserve_default_then_operator_order() {
+        let config = RoutinesConfig {
+            additional_dirs: vec![
+                PathBuf::from("/Users/kunkun/routines"),
+                PathBuf::from("./routines"),
+                PathBuf::from("/Volumes/ops/agentdesk-routines"),
+            ],
+            ..RoutinesConfig::default()
+        };
+
+        assert_eq!(
+            config.script_dirs(),
+            vec![
+                PathBuf::from("./routines"),
+                PathBuf::from("/Users/kunkun/routines"),
+                PathBuf::from("/Volumes/ops/agentdesk-routines")
+            ]
+        );
+    }
 }
 
 impl Default for DataConfig {
@@ -1736,6 +1779,11 @@ mod tests {
         assert_eq!(config.routines, RoutinesConfig::default());
         assert!(!config.routines.enabled);
         assert_eq!(config.routines.dir, PathBuf::from("./routines"));
+        assert!(config.routines.additional_dirs.is_empty());
+        assert_eq!(
+            config.routines.script_dirs(),
+            vec![PathBuf::from("./routines")]
+        );
         assert_eq!(config.routines.tick_interval_secs, 30);
         assert_eq!(config.routines.max_due_per_tick, 10);
         assert_eq!(config.routines.max_agent_polls_per_tick, 10);
@@ -1760,12 +1808,30 @@ server:
 routines:
   enabled: true
   dir: ./ops-routines
+  additional_dirs:
+    - /Users/kunkun/routines
+    - /Users/kunkun/private-routines
 "#,
         )
         .unwrap();
 
         assert!(config.routines.enabled);
         assert_eq!(config.routines.dir, PathBuf::from("./ops-routines"));
+        assert_eq!(
+            config.routines.additional_dirs,
+            vec![
+                PathBuf::from("/Users/kunkun/routines"),
+                PathBuf::from("/Users/kunkun/private-routines")
+            ]
+        );
+        assert_eq!(
+            config.routines.script_dirs(),
+            vec![
+                PathBuf::from("./ops-routines"),
+                PathBuf::from("/Users/kunkun/routines"),
+                PathBuf::from("/Users/kunkun/private-routines")
+            ]
+        );
         assert_eq!(config.routines.tick_interval_secs, 30);
         assert_eq!(config.routines.max_due_per_tick, 10);
         assert_eq!(config.routines.max_agent_polls_per_tick, 10);
@@ -1798,6 +1864,10 @@ routines:
         config.routines = RoutinesConfig {
             enabled: true,
             dir: PathBuf::from("./routines-prod"),
+            additional_dirs: vec![
+                PathBuf::from("/Users/kunkun/routines"),
+                PathBuf::from("/Volumes/ops/agentdesk-routines"),
+            ],
             tick_interval_secs: 15,
             max_due_per_tick: 25,
             max_agent_polls_per_tick: 50,
