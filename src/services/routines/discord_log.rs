@@ -99,7 +99,7 @@ impl RoutineDiscordLogger {
         claimed: &ClaimedRoutineRun,
         observation_count: usize,
         automation_inventory_count: usize,
-        checkpoint_present: bool,
+        checkpoint: Option<&Value>,
     ) -> RoutineDiscordLogStatus {
         let status = self
             .log_to_routine_target(
@@ -114,7 +114,7 @@ impl RoutineDiscordLogger {
                     claimed,
                     observation_count,
                     automation_inventory_count,
-                    checkpoint_present,
+                    checkpoint,
                 ),
             )
             .await;
@@ -559,17 +559,24 @@ fn run_js_inputs_message(
     claimed: &ClaimedRoutineRun,
     observation_count: usize,
     automation_inventory_count: usize,
-    checkpoint_present: bool,
+    checkpoint: Option<&Value>,
 ) -> String {
-    format!(
-        "[{}] 루틴 JS 처리 준비: {} / run {} / observations {} / inventory {} / checkpoint {}",
+    let mut message = format!(
+        "[{}] 루틴 JS 처리 준비: {} / run {} / observations {} / inventory {}",
         routine_log_timestamp(),
         compact(&claimed.name, 80),
         short_id(&claimed.run_id),
         observation_count,
         automation_inventory_count,
-        present_label(checkpoint_present)
-    )
+    );
+    match checkpoint {
+        None => message.push_str(" / checkpoint 없음"),
+        Some(cp) => {
+            message.push_str("\ncheckpoint: ");
+            message.push_str(&compact_multiline(&cp.to_string(), 400));
+        }
+    }
+    message
 }
 
 fn run_js_action_message(
@@ -588,8 +595,8 @@ fn run_js_action_message(
         present_label(checkpoint_update)
     );
     if let Some(summary) = summary.filter(|value| !value.trim().is_empty()) {
-        message.push_str("\n요약: ");
-        message.push_str(&compact_multiline(summary, 360));
+        message.push_str("\n상세: ");
+        message.push_str(&compact_multiline(summary, 600));
     }
     if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
         message.push_str("\n에이전트 프롬프트: ");
@@ -857,7 +864,7 @@ mod tests {
         assert!(message.contains("루틴 JS 처리 결과"));
         assert!(message.contains("action \"agent\""));
         assert!(message.contains("checkpoint 있음"));
-        assert!(message.contains("요약: agent prompt generated"));
+        assert!(message.contains("상세: agent prompt generated"));
         assert!(message.contains("에이전트 프롬프트: # 자동화 후보 추천 / 근거: 반복 실패"));
     }
 

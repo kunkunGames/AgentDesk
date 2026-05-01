@@ -143,7 +143,7 @@ pub async fn execute_claimed_script_run(
                 &claimed,
                 observation_count,
                 automation_inventory_count,
-                claimed.checkpoint.is_some(),
+                claimed.checkpoint.as_ref(),
             )
             .await;
     }
@@ -201,7 +201,7 @@ pub async fn execute_claimed_script_run(
                 store,
                 &claimed,
                 action.action_name(),
-                action_summary(&action).as_deref(),
+                action_detail(&action).as_deref(),
                 action_prompt(&action),
                 action_has_checkpoint(&action),
             )
@@ -218,15 +218,39 @@ pub async fn execute_claimed_script_run(
     .await
 }
 
-fn action_summary(action: &RoutineAction) -> Option<String> {
+fn action_detail(action: &RoutineAction) -> Option<String> {
     match action {
         RoutineAction::Complete {
             result_json,
             last_result,
             ..
-        } => last_result
-            .clone()
-            .or_else(|| result_json_summary(result_json.as_ref())),
+        } => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(text) = last_result.as_deref().filter(|s| !s.trim().is_empty()) {
+                parts.push(text.to_string());
+            }
+            if let Some(json) = result_json {
+                for key in [
+                    "candidates_scored",
+                    "new_candidates",
+                    "recommendations",
+                    "suppressed",
+                    "candidates",
+                    "outcome_summary",
+                    "summary",
+                    "status",
+                ] {
+                    if let Some(v) = json.get(key) {
+                        parts.push(format!("{}={}", key, compact_json_val(v)));
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" / "))
+            }
+        }
         RoutineAction::Skip {
             reason,
             result_json,
@@ -245,10 +269,25 @@ fn action_summary(action: &RoutineAction) -> Option<String> {
             .clone()
             .or_else(|| reason.clone())
             .or_else(|| result_json_summary(result_json.as_ref())),
-        RoutineAction::Agent { prompt, .. } => Some(format!(
-            "agent prompt generated ({} chars)",
-            prompt.chars().count()
-        )),
+        RoutineAction::Agent { prompt, .. } => {
+            let char_count = prompt.chars().count();
+            let preview: String = prompt.chars().take(300).collect();
+            let suffix = if char_count > 300 { "…" } else { "" };
+            Some(format!("({char_count}자) {preview}{suffix}"))
+        }
+    }
+}
+
+fn compact_json_val(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Array(arr) => format!("[{}개]", arr.len()),
+        other => {
+            let s = other.to_string();
+            if s.len() > 80 { format!("{}…", &s[..80]) } else { s }
+        }
     }
 }
 
