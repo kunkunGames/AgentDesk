@@ -37,6 +37,7 @@ struct RoutineScriptCandidate {
     root_index: usize,
     root: PathBuf,
     path: PathBuf,
+    cached: Option<LoadedRoutineScript>,
 }
 
 pub const MAX_OBSERVATIONS_PER_TICK: usize = 100;
@@ -150,10 +151,22 @@ impl RoutineScriptLoader {
     pub fn load_dirs(&self, roots: &[PathBuf]) -> Result<usize> {
         let mut seen_refs = HashSet::new();
         let mut candidates_by_ref: BTreeMap<String, Vec<RoutineScriptCandidate>> = BTreeMap::new();
+        let existing_scripts: HashMap<String, LoadedRoutineScript> = self
+            .scripts
+            .lock()
+            .map_err(|_| anyhow!("routine script store lock poisoned"))?
+            .clone();
 
         for (root_index, root) in roots.iter().enumerate() {
             if !root.exists() {
                 tracing::warn!("Routines directory does not exist: {}", root.display());
+                add_cached_candidates_for_root(
+                    &existing_scripts,
+                    &mut candidates_by_ref,
+                    &mut seen_refs,
+                    root_index,
+                    root,
+                );
                 continue;
             }
 
@@ -163,6 +176,13 @@ impl RoutineScriptLoader {
                     routines_dir = %root.display(),
                     error = %e,
                     "failed to scan routines directory; skipping root"
+                );
+                add_cached_candidates_for_root(
+                    &existing_scripts,
+                    &mut candidates_by_ref,
+                    &mut seen_refs,
+                    root_index,
+                    root,
                 );
                 continue;
             }
@@ -178,17 +198,12 @@ impl RoutineScriptLoader {
                         root_index,
                         root: root.clone(),
                         path,
+                        cached: None,
                     });
             }
         }
 
-        let existing_refs: HashSet<String> = self
-            .scripts
-            .lock()
-            .map_err(|_| anyhow!("routine script store lock poisoned"))?
-            .keys()
-            .cloned()
-            .collect();
+        let existing_refs: HashSet<String> = existing_scripts.keys().cloned().collect();
 
         let mut loaded = 0;
         let mut loaded_scripts = Vec::new();
@@ -196,6 +211,16 @@ impl RoutineScriptLoader {
             let has_existing = existing_refs.contains(&script_ref);
             let mut selected = None;
             for candidate in candidates.iter().rev() {
+                if let Some(script) = &candidate.cached {
+                    tracing::warn!(
+                        routine_script = %script_ref,
+                        root = %candidate.root.display(),
+                        root_index = candidate.root_index,
+                        "preserving cached routine script after root scan failure"
+                    );
+                    selected = Some((script.clone(), false));
+                    break;
+                }
                 match load_single_routine_script(&candidate.root, &candidate.path) {
                     Ok(script) => {
                         if candidates.len() > 1 {
@@ -206,7 +231,7 @@ impl RoutineScriptLoader {
                                 "selected routine script override"
                             );
                         }
-                        selected = Some(script);
+                        selected = Some((script, true));
                         break;
                     }
                     Err(e) => {
@@ -222,10 +247,14 @@ impl RoutineScriptLoader {
                 }
             }
 
-            if let Some(script) = selected {
+            if let Some((script, fresh_load)) = selected {
                 let script_ref = script.script_ref.clone();
-                loaded += 1;
-                tracing::info!(routine_script = %script_ref, "loaded routine script");
+                if fresh_load {
+                    loaded += 1;
+                    tracing::info!(routine_script = %script_ref, "loaded routine script");
+                } else {
+                    tracing::debug!(routine_script = %script_ref, "kept cached routine script");
+                }
                 loaded_scripts.push(script);
             }
         }
@@ -565,6 +594,30 @@ fn script_ref(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+fn add_cached_candidates_for_root(
+    existing_scripts: &HashMap<String, LoadedRoutineScript>,
+    candidates_by_ref: &mut BTreeMap<String, Vec<RoutineScriptCandidate>>,
+    seen_refs: &mut HashSet<String>,
+    root_index: usize,
+    root: &Path,
+) {
+    for (script_ref, script) in existing_scripts
+        .iter()
+        .filter(|(_, script)| script.file.starts_with(root))
+    {
+        seen_refs.insert(script_ref.clone());
+        candidates_by_ref
+            .entry(script_ref.clone())
+            .or_default()
+            .push(RoutineScriptCandidate {
+                root_index,
+                root: root.to_path_buf(),
+                path: script.file.clone(),
+                cached: Some(script.clone()),
+            });
+    }
+}
+
 fn collect_routine_script_paths(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
@@ -776,6 +829,50 @@ mod tests {
         assert_eq!(
             loader.get_script("healthy.js").unwrap().unwrap().file,
             healthy_root.join("healthy.js")
+        );
+    }
+
+    #[test]
+    fn load_dirs_preserves_cached_override_when_root_scan_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = temp.path().join("bundled");
+        let operator = temp.path().join("operator");
+        std::fs::create_dir_all(&bundled).unwrap();
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::write(
+            bundled.join("shared.js"),
+            "agentdesk.routines.register({ name: 'Bundled Shared', tick() { return { action: 'skip' }; } });",
+        )
+        .unwrap();
+        std::fs::write(
+            operator.join("shared.js"),
+            "agentdesk.routines.register({ name: 'Operator Shared', tick() { return { action: 'skip' }; } });",
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        let roots = [bundled.clone(), operator.clone()];
+        assert_eq!(loader.load_dirs(&roots).unwrap(), 1);
+        assert_eq!(
+            loader.get_script("shared.js").unwrap().unwrap().name,
+            "Operator Shared"
+        );
+
+        std::fs::remove_dir_all(&operator).unwrap();
+        std::fs::write(&operator, "not a directory").unwrap();
+
+        assert_eq!(loader.load_dirs(&roots).unwrap(), 0);
+        assert_eq!(
+            loader.get_script("shared.js").unwrap().unwrap().name,
+            "Operator Shared"
+        );
+
+        std::fs::remove_file(&operator).unwrap();
+
+        assert_eq!(loader.load_dirs(&roots).unwrap(), 0);
+        assert_eq!(
+            loader.get_script("shared.js").unwrap().unwrap().name,
+            "Operator Shared"
         );
     }
 
