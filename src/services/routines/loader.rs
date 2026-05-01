@@ -140,7 +140,9 @@ impl RoutineScriptLoader {
         Ok(script_ref)
     }
 
-    #[cfg(test)]
+    // Backward-compatible single-directory shim for callers that have not
+    // migrated to `load_dirs`.
+    #[allow(dead_code)]
     pub fn load_dir(&self, root: &Path) -> Result<usize> {
         self.load_dirs(&[root.to_path_buf()])
     }
