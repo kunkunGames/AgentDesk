@@ -1061,6 +1061,18 @@ mod tests {
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.starts_with("성공 요약:"))
                 );
+                assert!(
+                    result
+                        .get("suppression_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(
+                            |summary| summary.contains("automation inventory status=implemented")
+                        )
+                );
+                assert_eq!(
+                    result.get("scoring_summary").and_then(Value::as_str),
+                    Some("scored=0, suppressed=6")
+                );
                 let checkpoint = checkpoint.unwrap();
                 assert_eq!(
                     checkpoint
@@ -1188,6 +1200,24 @@ mod tests {
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.starts_with("실패 요약:"))
                 );
+                assert!(
+                    candidate
+                        .get("decision_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("선택 이유:"))
+                );
+                assert!(
+                    candidate
+                        .get("top_evidence_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("repeated evidence"))
+                );
+                assert_eq!(
+                    candidate
+                        .get("score_delta_last_tick")
+                        .and_then(Value::as_f64),
+                    Some(150.0)
+                );
                 assert_eq!(
                     candidate
                         .get("recommended_execution")
@@ -1209,6 +1239,12 @@ mod tests {
                         .pointer("/recommendations/0/outcome_summary")
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.starts_with("실패 요약:"))
+                );
+                assert!(
+                    checkpoint
+                        .pointer("/recommendations/0/decision_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("선택 이유:"))
                 );
             }
             other => panic!("unexpected action: {other:?}"),
@@ -1236,7 +1272,11 @@ mod tests {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
                 assert!(prompt.contains("에이전트가 도출한 내용은 반드시 한국어"));
                 assert!(prompt.contains("## 성공/실패 한 줄 요약"));
+                assert!(prompt.contains("## 선택 판단 근거"));
                 assert!(prompt.contains("## 루트 기반 JS 자동화 패턴 탐지 가이드"));
+                assert!(prompt.contains("## 자료 범위 및 검색 정책"));
+                assert!(prompt.contains("외부 웹자료 검색은 기본 동작이 아닙니다"));
+                assert!(prompt.contains("PostgreSQL-backed routine observation"));
                 assert!(prompt.contains("루트 원인 또는 반복 수동 작업 가설"));
                 assert!(prompt.contains("rule-vs-agent 선택 이유"));
                 assert!(prompt.contains("오탐/중복 억제 방법"));
@@ -1448,7 +1488,24 @@ mod tests {
             .unwrap();
 
         match action {
-            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+            crate::services::routines::RoutineAction::Complete {
+                result_json,
+                checkpoint,
+                ..
+            } => {
+                let result = result_json.expect("complete action should explain why no agent ran");
+                assert!(
+                    result
+                        .get("decision_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("최소 5회 미만"))
+                );
+                assert!(
+                    result
+                        .get("top_evidence_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("score=100"))
+                );
                 let checkpoint = checkpoint.unwrap();
                 let candidate = checkpoint
                     .pointer("/candidates/ops~1bursty.js:complete")

@@ -231,12 +231,16 @@ fn action_detail(action: &RoutineAction) -> Option<String> {
             }
             if let Some(json) = result_json {
                 for key in [
+                    "outcome_summary",
+                    "decision_summary",
+                    "top_evidence_summary",
+                    "suppression_summary",
+                    "scoring_summary",
                     "candidates_scored",
                     "new_candidates",
                     "recommendations",
                     "suppressed",
                     "candidates",
-                    "outcome_summary",
                     "summary",
                     "status",
                 ] {
@@ -269,12 +273,55 @@ fn action_detail(action: &RoutineAction) -> Option<String> {
             .clone()
             .or_else(|| reason.clone())
             .or_else(|| result_json_summary(result_json.as_ref())),
-        RoutineAction::Agent { prompt, .. } => {
+        RoutineAction::Agent {
+            prompt, checkpoint, ..
+        } => {
             let char_count = prompt.chars().count();
             let preview: String = prompt.chars().take(300).collect();
             let suffix = if char_count > 300 { "…" } else { "" };
-            Some(format!("({char_count}자) {preview}{suffix}"))
+            let mut parts = Vec::new();
+            if let Some(summary) = latest_recommendation_summary(checkpoint.as_ref()) {
+                parts.push(summary);
+            }
+            parts.push(format!(
+                "agent prompt generated ({char_count}자): {preview}{suffix}"
+            ));
+            Some(parts.join(" / "))
         }
+    }
+}
+
+fn latest_recommendation_summary(checkpoint: Option<&Value>) -> Option<String> {
+    let latest = checkpoint?
+        .get("recommendations")
+        .and_then(Value::as_array)?
+        .last()?;
+    let mut parts = Vec::new();
+    for key in [
+        "decision_summary",
+        "outcome_summary",
+        "top_evidence_summary",
+    ] {
+        if let Some(text) = latest
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(text.to_string());
+        }
+    }
+    if let Some(delta) = latest.get("score_delta_last_tick") {
+        if let Some(delta) = delta.as_i64() {
+            parts.push(format!("score_delta_last_tick={delta}"));
+        } else if let Some(delta) = delta.as_f64() {
+            parts.push(format!("score_delta_last_tick={delta:.1}"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" / "))
     }
 }
 
@@ -619,7 +666,8 @@ async fn close_action(
 mod tests {
     use serde_json::json;
 
-    use super::merge_loaded_script_automation_inventory;
+    use super::{action_detail, merge_loaded_script_automation_inventory};
+    use crate::services::routines::RoutineAction;
 
     #[test]
     fn loaded_script_refs_extend_automation_inventory_as_implemented_prefixes() {
@@ -711,5 +759,28 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("monitoring/a.js:*")
         );
+    }
+
+    #[test]
+    fn agent_action_detail_includes_checkpoint_decision_summary() {
+        let action = RoutineAction::Agent {
+            prompt: "# 자동화 후보 추천\n패턴: api-friction".to_string(),
+            checkpoint: Some(json!({
+                "recommendations": [{
+                    "decision_summary": "선택 이유: api-friction 후보가 기준을 충족했습니다.",
+                    "outcome_summary": "실패 요약: API 마찰 패턴이 7회 반복됐습니다.",
+                    "top_evidence_summary": "1) /api/docs 우회 반복 (occurrences=7, weight=2)",
+                    "score_delta_last_tick": 70
+                }]
+            })),
+            next_due_at: None,
+        };
+
+        let detail = action_detail(&action).expect("agent action detail");
+
+        assert!(detail.contains("선택 이유:"));
+        assert!(detail.contains("실패 요약:"));
+        assert!(detail.contains("/api/docs 우회 반복"));
+        assert!(detail.contains("score_delta_last_tick=70"));
     }
 }

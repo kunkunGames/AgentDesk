@@ -595,11 +595,11 @@ fn run_js_action_message(
         present_label(checkpoint_update)
     );
     if let Some(summary) = summary.filter(|value| !value.trim().is_empty()) {
-        message.push_str("\n상세: ");
+        message.push_str("\nJS 처리 요약: ");
         message.push_str(&compact_multiline(summary, 600));
     }
     if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
-        message.push_str("\n에이전트 프롬프트: ");
+        message.push_str("\n에이전트 프롬프트 요약: ");
         message.push_str(&compact_multiline(prompt, 900));
     }
     message
@@ -627,7 +627,7 @@ fn run_outcome_message(routine: &RoutineRecord, outcome: &RoutineRunOutcome) -> 
         message.push_str(&compact(&summary, 220));
     }
     if let Some(response) = agent_response_preview(outcome.result_json.as_ref()) {
-        message.push_str("\n에이전트 응답: ");
+        message.push_str("\n에이전트 응답 요약: ");
         message.push_str(&compact_multiline(&response, 900));
     }
     message
@@ -830,7 +830,9 @@ mod tests {
 
         let message = run_outcome_message(&routine, &outcome);
 
-        assert!(message.contains("에이전트 응답: 자동화 후보는 보류합니다. / 근거가 부족합니다."));
+        assert!(
+            message.contains("에이전트 응답 요약: 자동화 후보는 보류합니다. / 근거가 부족합니다.")
+        );
     }
 
     #[test]
@@ -859,8 +861,8 @@ mod tests {
         assert!(message.contains("루틴 JS 처리 결과"));
         assert!(message.contains("action \"agent\""));
         assert!(message.contains("checkpoint 있음"));
-        assert!(message.contains("상세: agent prompt generated"));
-        assert!(message.contains("에이전트 프롬프트: # 자동화 후보 추천 / 근거: 반복 실패"));
+        assert!(message.contains("JS 처리 요약: agent prompt generated"));
+        assert!(message.contains("에이전트 프롬프트 요약: # 자동화 후보 추천 / 근거: 반복 실패"));
     }
 
     #[test]

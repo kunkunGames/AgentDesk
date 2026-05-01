@@ -91,6 +91,94 @@ function observationOccurrences(obs) {
   return Math.min(50, Math.floor(value));
 }
 
+function compactText(value, maxChars) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxChars);
+}
+
+function topEvidenceForCandidate(candidate, limit) {
+  return (candidate.examples || [])
+    .slice(-limit)
+    .reverse()
+    .map((example) => ({
+      summary: compactText(example.summary, 140),
+      timestamp: example.timestamp || null,
+      evidence_ref: example.evidence_ref || null,
+      weight: example.weight || 1,
+      occurrences: example.occurrences || 1,
+    }));
+}
+
+function topEvidenceSummaryForCandidate(candidate) {
+  const evidence = topEvidenceForCandidate(candidate, 2);
+  if (evidence.length === 0) return "핵심 근거 없음";
+  return evidence
+    .map(
+      (item, index) =>
+        `${index + 1}) ${item.summary || "요약 없음"} (occurrences=${item.occurrences}, weight=${item.weight})`
+    )
+    .join(" / ");
+}
+
+function topCandidateEvidence(cp, limit) {
+  return Object.entries(cp.candidates || {})
+    .filter(([, candidate]) => candidate.state === "observing" || candidate.state === "recommended")
+    .sort(([, a], [, b]) => (b.score || 0) - (a.score || 0))
+    .slice(0, limit)
+    .map(([patternId, candidate]) => ({
+      pattern_id: patternId,
+      score: candidate.score || 0,
+      score_delta_last_tick: candidate.score_delta_last_tick || 0,
+      evidence_count: candidate.evidence_count || 0,
+      latest_evidence: topEvidenceSummaryForCandidate(candidate),
+    }));
+}
+
+function topCandidateEvidenceSummary(cp) {
+  const top = topCandidateEvidence(cp, 3);
+  if (top.length === 0) return "관찰 중인 후보 없음";
+  return top
+    .map(
+      (item, index) =>
+        `${index + 1}) ${item.pattern_id}: score=${item.score}, delta=${item.score_delta_last_tick}, evidence=${item.evidence_count}, 근거=${item.latest_evidence}`
+    )
+    .join(" / ");
+}
+
+function suppressionSummary(suppressedObservations, droppedCandidates) {
+  const parts = [];
+  for (const item of (suppressedObservations || []).slice(0, 3)) {
+    parts.push(`${item.pattern_id}: ${item.reason}`);
+  }
+  for (const item of (droppedCandidates || []).slice(0, 3)) {
+    parts.push(`${item.pattern_id}: ${item.reason}`);
+  }
+  return parts.length ? parts.join(" / ") : "중복/억제 후보 없음";
+}
+
+function noEscalationReason(cp, nowStr) {
+  if (cp.stats.recommendations_today >= DAILY_CAP) {
+    return `보류 이유: 일일 추천 한도 ${DAILY_CAP}개에 도달했습니다.`;
+  }
+  const top = topCandidateEvidence(cp, 1)[0];
+  if (!top) {
+    return "보류 이유: 관찰된 후보가 없습니다.";
+  }
+  const candidate = cp.candidates[top.pattern_id] || {};
+  if ((candidate.evidence_count || 0) < 5) {
+    return `보류 이유: 최상위 후보 ${top.pattern_id}의 근거가 ${candidate.evidence_count || 0}회로 최소 5회 미만입니다.`;
+  }
+  if ((candidate.score || 0) < SCORE_THRESHOLD) {
+    return `보류 이유: 최상위 후보 ${top.pattern_id}의 점수 ${candidate.score || 0}가 기준 ${SCORE_THRESHOLD} 미만입니다.`;
+  }
+  if (candidate.cooldown_until && candidate.cooldown_until > nowStr) {
+    return `보류 이유: 최상위 후보 ${top.pattern_id}가 ${candidate.cooldown_until}까지 쿨다운 중입니다.`;
+  }
+  return `보류 이유: 최상위 후보 ${top.pattern_id}는 중복 추천 해시 또는 게이트 조건으로 보류됐습니다.`;
+}
+
 function utf8CharBytes(ch) {
   const codePoint = ch.codePointAt(0);
   if (codePoint <= 0x7f) return 1;
@@ -137,15 +225,15 @@ function hasDurableAcceptance(entry) {
 }
 
 function buildSuppressedSet(cp, inventory) {
-  const exact = new Set();
+  const exact = new Map();
   const prefixes = [];
 
-  function addPattern(patternId) {
+  function addPattern(patternId, reason) {
     if (!patternId) return;
     if (patternId.endsWith(":*")) {
-      prefixes.push(patternId.slice(0, -1));
+      prefixes.push({ prefix: patternId.slice(0, -1), reason });
     } else {
-      exact.add(patternId);
+      exact.set(patternId, reason);
     }
   }
 
@@ -158,7 +246,7 @@ function buildSuppressedSet(cp, inventory) {
       state === "suppressed" ||
       state === "rejected"
     ) {
-      addPattern(patternId);
+      addPattern(patternId, `checkpoint suppression state=${state}`);
     }
   }
 
@@ -171,7 +259,10 @@ function buildSuppressedSet(cp, inventory) {
         item.status === "suppressed" ||
         item.status === "rejected")
     ) {
-      addPattern(item.pattern_id);
+      addPattern(
+        item.pattern_id,
+        `automation inventory status=${item.status}${item.source_ref ? ` ref=${item.source_ref}` : ""}`
+      );
     }
   }
 
@@ -184,18 +275,24 @@ function buildSuppressedSet(cp, inventory) {
       s === "suppressed" ||
       s === "rejected"
     ) {
-      addPattern(patternId);
+      addPattern(patternId, `candidate state=${s}`);
     }
   }
 
   return {
     has(patternId) {
-      return exact.has(patternId) || prefixes.some((prefix) => patternId.startsWith(prefix));
+      return exact.has(patternId) || prefixes.some((item) => patternId.startsWith(item.prefix));
+    },
+    reason(patternId) {
+      if (exact.has(patternId)) return exact.get(patternId);
+      const matched = prefixes.find((item) => patternId.startsWith(item.prefix));
+      return matched ? matched.reason : null;
     },
   };
 }
 
 function dropSuppressedCandidates(cp, suppressedSet) {
+  const dropped = [];
   for (const [patternId, candidate] of Object.entries(cp.candidates || {})) {
     if (suppressedSet.has(patternId)) {
       const s = candidate.state;
@@ -207,6 +304,11 @@ function dropSuppressedCandidates(cp, suppressedSet) {
       ) {
         continue;
       }
+      dropped.push({
+        pattern_id: patternId,
+        state: s,
+        reason: suppressedSet.reason(patternId) || "suppressed by inventory/checkpoint",
+      });
       delete cp.candidates[patternId];
     }
   }
@@ -214,6 +316,8 @@ function dropSuppressedCandidates(cp, suppressedSet) {
   if (Array.isArray(cp.recommendations)) {
     cp.recommendations = cp.recommendations.filter((item) => !suppressedSet.has(item.pattern_id));
   }
+
+  return dropped.slice(0, 5);
 }
 
 // --- Expired suppression cleanup ---
@@ -246,13 +350,29 @@ function expireStaleCandidates(cp, nowStr) {
 
 function scoreObservations(cp, observations, suppressedSet, nowStr) {
   const thirtyMinAgo = new Date(new Date(nowStr).getTime() - 30 * 60 * 1000).toISOString();
+  const report = {
+    scored: 0,
+    suppressed: [],
+  };
+
+  for (const candidate of Object.values(cp.candidates || {})) {
+    candidate.score_delta_last_tick = 0;
+    candidate.scored_observations_last_tick = 0;
+    candidate.last_score_reason = null;
+  }
 
   for (const obs of observations) {
     cp.stats.observations_seen++;
 
     const patternId = obs.signature;
     if (!patternId) continue;
-    if (suppressedSet.has(patternId)) continue;
+    if (suppressedSet.has(patternId)) {
+      report.suppressed.push({
+        pattern_id: patternId,
+        reason: suppressedSet.reason(patternId) || "suppressed by inventory/checkpoint",
+      });
+      continue;
+    }
 
     const category = normalizeCategory(obs.category);
     let candidate = cp.candidates[patternId];
@@ -302,11 +422,19 @@ function scoreObservations(cp, observations, suppressedSet, nowStr) {
     }
 
     // Recency bonus
+    const recencyBonus = obs.timestamp && obs.timestamp >= thirtyMinAgo ? WEIGHT_RECENCY_BONUS : 0;
     if (obs.timestamp && obs.timestamp >= thirtyMinAgo) {
-      delta += WEIGHT_RECENCY_BONUS;
+      delta += recencyBonus;
     }
 
     candidate.score = Math.min(100, candidate.score + delta);
+    candidate.score_delta_last_tick = (candidate.score_delta_last_tick || 0) + delta;
+    candidate.scored_observations_last_tick =
+      (candidate.scored_observations_last_tick || 0) + 1;
+    candidate.last_score_reason =
+      `weight=${weight}, occurrences=${occurrences}, recency_bonus=${recencyBonus}`;
+    candidate.last_scored_at = nowStr;
+    report.scored++;
 
     // Keep up to 3 examples
     if (candidate.examples.length < MAX_EXAMPLES_PER_CANDIDATE) {
@@ -314,11 +442,14 @@ function scoreObservations(cp, observations, suppressedSet, nowStr) {
         summary: obs.summary,
         timestamp: obs.timestamp,
         evidence_ref: obs.evidence_ref,
+        source: obs.source,
         weight,
         occurrences,
       });
     }
   }
+
+  return report;
 }
 
 // --- Find best escalation candidate ---
@@ -363,6 +494,8 @@ function findEscalationCandidate(cp, nowStr) {
 function markRecommended(cp, escalation, nowStr) {
   const { patternId, candidate, hash } = escalation;
   const assessment = candidateAssessment(patternId, candidate);
+  const decisionSummary = candidateDecisionSummary(patternId, candidate, assessment);
+  const topEvidenceSummary = topEvidenceSummaryForCandidate(candidate);
   candidate.state = "recommended";
   candidate.last_recommended_at = nowStr;
   candidate.last_recommendation_hash = hash;
@@ -375,6 +508,9 @@ function markRecommended(cp, escalation, nowStr) {
   candidate.expected_side_effects = assessment.expectedSideEffects;
   candidate.verification_method = assessment.verificationMethod;
   candidate.gated_handoff = assessment.gatedHandoff;
+  candidate.decision_summary = decisionSummary;
+  candidate.top_evidence = topEvidenceForCandidate(candidate, 3);
+  candidate.top_evidence_summary = topEvidenceSummary;
   cp.stats.recommendations_today++;
   cp.stats.agent_escalations++;
   cp.recommendations.push({
@@ -382,8 +518,11 @@ function markRecommended(cp, escalation, nowStr) {
     recommended_at: nowStr,
     hash,
     score: candidate.score,
+    score_delta_last_tick: candidate.score_delta_last_tick || 0,
     evidence_count: candidate.evidence_count,
     outcome_summary: assessment.outcomeSummary,
+    decision_summary: decisionSummary,
+    top_evidence_summary: topEvidenceSummary,
   });
   // Keep recommendations list bounded
   if (cp.recommendations.length > 50) {
@@ -499,6 +638,14 @@ function candidateAssessment(patternId, candidate) {
   };
 }
 
+function candidateDecisionSummary(patternId, candidate, assessment) {
+  const score = candidate.score || 0;
+  const delta = candidate.score_delta_last_tick || 0;
+  const evidenceCount = candidate.evidence_count || 0;
+  const evidenceSummary = topEvidenceSummaryForCandidate(candidate);
+  return `선택 이유: ${patternId} 후보가 score=${score}, delta=${delta}, evidence=${evidenceCount}로 기준을 충족했습니다. ${assessment.outcomeSummary} 핵심 근거: ${evidenceSummary}`;
+}
+
 function buildPrompt(escalation) {
   const { patternId, candidate } = escalation;
   const evidenceLines = (candidate.examples || [])
@@ -515,6 +662,9 @@ function buildPrompt(escalation) {
     outcomeSummary,
     gatedHandoff,
   } = candidateAssessment(patternId, candidate);
+  const decisionSummary = candidateDecisionSummary(patternId, candidate, {
+    outcomeSummary,
+  });
   const handoffAcceptance = (gatedHandoff.kanban_card_draft.acceptance || [])
     .map((item) => `- ${item}`)
     .join("\n");
@@ -532,12 +682,21 @@ ${evidenceLines || "(기록 없음)"}
 ## 성공/실패 한 줄 요약
 ${outcomeSummary}
 
+## 선택 판단 근거
+${decisionSummary}
+
 ## 루트 기반 JS 자동화 패턴 탐지 가이드
 - 이 제안은 runtime이 제공한 bounded observation, checkpoint, automation inventory만 근거로 판단합니다.
 - 같은 증상이 아니라 같은 루트 원인 또는 같은 수동 작업이 반복되는지 pattern/category/count/first-last/example을 연결해 설명합니다.
 - 단순 빈도만 보지 말고 최근성, 실패 weight, 운영 ROI, 부작용, 이미 구현/억제된 자동화와의 중복 가능성을 함께 평가합니다.
 - 규칙으로 충분한 deterministic retry/check/threshold인지, 문맥 판단과 코드 변경 설계가 필요한 agent 주도 자동화인지 구분합니다.
 - 근거가 부족하거나 오탐 가능성이 높으면 자동화 보류로 결론을 내립니다.
+
+## 자료 범위 및 검색 정책
+- 기본 판단 근거는 PostgreSQL-backed routine observation/checkpoint/inventory, 로그 기반 observation, memento-mcp digest observation입니다.
+- 유저 프롬프트와 메모리는 runtime이 구조화 observation 또는 승인된 digest로 제공한 범위만 사용합니다.
+- 외부 웹자료 검색은 기본 동작이 아닙니다. 최신 외부 문서/버전 확인이 꼭 필요하면 opt-in evidence provider 필요성을 제안만 합니다.
+- 이 프롬프트 안에서 임의 웹 검색, 지속 크롤링, memento 쓰기, DB 직접 우회는 수행하지 않습니다.
 
 ## Before / After
 - Before: ${beforeAfter.before}
@@ -631,8 +790,8 @@ agentdesk.routines.register({
     expireStaleCandidates(cp, nowStr);
 
     const suppressedSet = buildSuppressedSet(cp, inventory);
-    dropSuppressedCandidates(cp, suppressedSet);
-    scoreObservations(cp, observations, suppressedSet, nowStr);
+    const droppedCandidates = dropSuppressedCandidates(cp, suppressedSet);
+    const scoringReport = scoreObservations(cp, observations, suppressedSet, nowStr);
 
     cp.stats.ticks++;
     cp.last_tick_at = nowStr;
@@ -645,12 +804,20 @@ agentdesk.routines.register({
       ).length;
       const summary = `관찰=${observations.length}, 후보=${activeCandidates}, 오늘 추천=${cp.stats.recommendations_today}`;
       const outcomeSummary = `성공 요약: 새 자동화 추천 후보 없음 (${summary})`;
+      const decisionSummary = noEscalationReason(cp, nowStr);
+      const topEvidenceSummary = topCandidateEvidenceSummary(cp);
+      const suppressedSummary = suppressionSummary(scoringReport.suppressed, droppedCandidates);
+      const scoringSummary = `scored=${scoringReport.scored}, suppressed=${scoringReport.suppressed.length + droppedCandidates.length}`;
       return {
         action: "complete",
         result: {
           status: "ok",
           summary,
           outcome_summary: outcomeSummary,
+          decision_summary: decisionSummary,
+          top_evidence_summary: topEvidenceSummary,
+          suppression_summary: suppressedSummary,
+          scoring_summary: scoringSummary,
           observation_count: observations.length,
           active_candidate_count: activeCandidates,
           recommendations_today: cp.stats.recommendations_today,
