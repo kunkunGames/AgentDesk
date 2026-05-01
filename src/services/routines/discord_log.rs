@@ -573,10 +573,60 @@ fn run_js_inputs_message(
         None => message.push_str(" / checkpoint 없음"),
         Some(cp) => {
             message.push_str("\ncheckpoint: ");
-            message.push_str(&compact_multiline(&cp.to_string(), 400));
+            message.push_str(&checkpoint_state_summary(cp));
         }
     }
     message
+}
+
+fn checkpoint_state_summary(cp: &Value) -> String {
+    let mut state_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    if let Some(candidates) = cp.get("candidates").and_then(Value::as_object) {
+        for candidate in candidates.values() {
+            let state = candidate
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            *state_counts.entry(state).or_insert(0) += 1;
+        }
+    }
+    let mut parts: Vec<String> = state_counts
+        .iter()
+        .map(|(state, count)| format!("{state}:{count}"))
+        .collect();
+    if let Some(latest_rec) = cp
+        .get("recommendations")
+        .and_then(Value::as_array)
+        .and_then(|recs| recs.last())
+    {
+        let pattern_id = latest_rec
+            .get("pattern_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let summary = latest_rec
+            .get("outcome_summary")
+            .or_else(|| latest_rec.get("decision_summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !pattern_id.is_empty() {
+            let rec_line = if summary.is_empty() {
+                format!("최근 추천: {}", compact(pattern_id, 60))
+            } else {
+                format!(
+                    "최근 추천: {} — {}",
+                    compact(pattern_id, 60),
+                    compact(summary, 120)
+                )
+            };
+            parts.push(rec_line);
+        }
+    }
+    if parts.is_empty() {
+        "비어 있음".to_string()
+    } else {
+        parts.join(" / ")
+    }
 }
 
 fn run_js_action_message(
@@ -927,5 +977,33 @@ mod tests {
             classify_warning("failed to enqueue routine discord log: db down"),
             "message_outbox_enqueue_failed"
         );
+    }
+
+    #[test]
+    fn checkpoint_state_summary_formats_counts_and_latest_recommendation() {
+        let cp = serde_json::json!({
+            "candidates": {
+                "routine-candidate:foo": {"state": "watching"},
+                "routine-candidate:bar": {"state": "watching"},
+                "routine-candidate:baz": {"state": "recommended"},
+                "routine-candidate:qux": {"state": "suppressed"}
+            },
+            "recommendations": [
+                {"pattern_id": "routine-candidate:old", "outcome_summary": "이전 요약"},
+                {"pattern_id": "routine-candidate:baz", "outcome_summary": "반복 패턴 5회, 루틴화 후보"}
+            ]
+        });
+        let summary = checkpoint_state_summary(&cp);
+        assert!(summary.contains("recommended:1"), "must show recommended count: {summary}");
+        assert!(summary.contains("suppressed:1"), "must show suppressed count: {summary}");
+        assert!(summary.contains("watching:2"), "must show watching count: {summary}");
+        assert!(summary.contains("routine-candidate:baz"), "must show latest pattern_id: {summary}");
+        assert!(summary.contains("반복 패턴 5회"), "must show outcome_summary: {summary}");
+    }
+
+    #[test]
+    fn checkpoint_state_summary_empty_checkpoint() {
+        let cp = serde_json::json!({});
+        assert_eq!(checkpoint_state_summary(&cp), "비어 있음");
     }
 }
