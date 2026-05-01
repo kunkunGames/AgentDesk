@@ -6,10 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId, UserId};
 
-use super::outbound::{
-    DeliveryResult, DiscordOutboundClient, DiscordOutboundMessage, DiscordOutboundPolicy,
-    OutboundDeduper, deliver_outbound,
+use super::outbound::delivery::{deliver_outbound, first_raw_message_id};
+use super::outbound::message::{
+    DiscordOutboundMessage, OutboundOperation, OutboundReferenceContext, OutboundTarget,
 };
+use super::outbound::policy::DiscordOutboundPolicy;
+use super::outbound::result::DeliveryResult;
+use super::outbound::{DiscordOutboundClient, OutboundDeduper};
 use super::router;
 use super::router::handle_text_message;
 use super::turn_bridge::auto_retry_with_history;
@@ -124,17 +127,27 @@ impl DiscordGateway {
 
 fn outbound_delivery_error(result: DeliveryResult) -> Result<Option<MessageId>, String> {
     match result {
-        DeliveryResult::Success { message_id } => parse_message_id(&message_id).map(Some),
-        DeliveryResult::Fallback { message_id, kind } => {
+        DeliveryResult::Sent { messages, .. } => first_raw_message_id(&messages)
+            .map(|message_id| parse_message_id(&message_id))
+            .transpose(),
+        DeliveryResult::Fallback {
+            messages,
+            fallback_used,
+            ..
+        } => {
+            let message_id = first_raw_message_id(&messages).unwrap_or_default();
             tracing::info!(
                 delivery_status = "fallback",
-                fallback_kind = ?kind,
+                fallback_kind = ?fallback_used,
                 message_id,
                 "[discord] outbound delivery used fallback"
             );
             parse_message_id(&message_id).map(Some)
         }
-        DeliveryResult::Duplicate { message_id } => {
+        DeliveryResult::Duplicate {
+            existing_messages, ..
+        } => {
+            let message_id = first_raw_message_id(&existing_messages);
             tracing::info!(
                 delivery_status = "duplicate",
                 ?message_id,
@@ -145,15 +158,15 @@ fn outbound_delivery_error(result: DeliveryResult) -> Result<Option<MessageId>, 
                 None => Ok(None),
             }
         }
-        DeliveryResult::Skipped { reason } => {
+        DeliveryResult::Skip { reason } => {
             tracing::info!(
                 delivery_status = "skip",
-                ?reason,
+                reason,
                 "[discord] outbound delivery skipped"
             );
             Ok(None)
         }
-        DeliveryResult::PermanentFailure { detail } => Err(detail),
+        DeliveryResult::PermanentFailure { reason } => Err(reason),
     }
 }
 
@@ -165,7 +178,20 @@ fn parse_message_id(message_id: &str) -> Result<MessageId, String> {
 }
 
 fn outbound_policy() -> DiscordOutboundPolicy {
-    DiscordOutboundPolicy::preserve_inline_content()
+    DiscordOutboundPolicy::preserve_inline_content().without_idempotency()
+}
+
+fn gateway_outbound_message(
+    channel_id: ChannelId,
+    content: impl Into<String>,
+) -> DiscordOutboundMessage {
+    DiscordOutboundMessage::new(
+        format!("gateway:{}", channel_id.get()),
+        "gateway:no-idempotency",
+        content,
+        OutboundTarget::Channel(channel_id),
+        outbound_policy(),
+    )
 }
 
 fn gateway_deduper() -> &'static OutboundDeduper {
@@ -337,17 +363,15 @@ pub(super) async fn send_intake_placeholder(
     reference: Option<(ChannelId, MessageId)>,
 ) -> Result<MessageId, String> {
     let client = SerenityTurnOutboundClient { http, shared };
-    let mut msg = DiscordOutboundMessage::new(channel_id.get().to_string(), "...");
+    let mut msg = gateway_outbound_message(channel_id, "...");
     if let Some((reference_channel, reference_message)) = reference {
-        msg = msg.with_reference(
-            reference_channel.get().to_string(),
-            reference_message.get().to_string(),
-        );
+        msg = msg.with_reference(OutboundReferenceContext::reply_to(
+            reference_channel,
+            reference_message,
+        ));
     }
-    outbound_delivery_error(
-        deliver_outbound(&client, gateway_deduper(), msg, outbound_policy()).await,
-    )?
-    .ok_or_else(|| "intake placeholder delivery was skipped".to_string())
+    outbound_delivery_error(deliver_outbound(&client, gateway_deduper(), msg).await)?
+        .ok_or_else(|| "intake placeholder delivery was skipped".to_string())
 }
 
 pub(super) async fn edit_outbound_message(
@@ -358,12 +382,9 @@ pub(super) async fn edit_outbound_message(
     content: &str,
 ) -> Result<(), String> {
     let client = SerenityTurnOutboundClient { http, shared };
-    let msg = DiscordOutboundMessage::new(channel_id.get().to_string(), content)
-        .with_edit_message_id(message_id.get().to_string());
-    outbound_delivery_error(
-        deliver_outbound(&client, gateway_deduper(), msg, outbound_policy()).await,
-    )
-    .map(|_| ())
+    let msg = gateway_outbound_message(channel_id, content)
+        .with_operation(OutboundOperation::Edit { message_id });
+    outbound_delivery_error(deliver_outbound(&client, gateway_deduper(), msg).await).map(|_| ())
 }
 
 fn live_bot_owner_provider(live_turn: Option<&LiveDiscordTurnContext>) -> Option<ProviderKind> {
@@ -387,11 +408,9 @@ impl TurnGateway for DiscordGateway {
                 http: self.http.clone(),
                 shared: self.shared.clone(),
             };
-            let msg = DiscordOutboundMessage::new(channel_id.get().to_string(), content);
-            outbound_delivery_error(
-                deliver_outbound(&client, gateway_deduper(), msg, outbound_policy()).await,
-            )?
-            .ok_or_else(|| "message delivery was skipped".to_string())
+            let msg = gateway_outbound_message(channel_id, content);
+            outbound_delivery_error(deliver_outbound(&client, gateway_deduper(), msg).await)?
+                .ok_or_else(|| "message delivery was skipped".to_string())
         })
     }
 
@@ -406,12 +425,10 @@ impl TurnGateway for DiscordGateway {
                 http: self.http.clone(),
                 shared: self.shared.clone(),
             };
-            let msg = DiscordOutboundMessage::new(channel_id.get().to_string(), content)
-                .with_edit_message_id(message_id.get().to_string());
-            outbound_delivery_error(
-                deliver_outbound(&client, gateway_deduper(), msg, outbound_policy()).await,
-            )
-            .map(|_| ())
+            let msg = gateway_outbound_message(channel_id, content)
+                .with_operation(OutboundOperation::Edit { message_id });
+            outbound_delivery_error(deliver_outbound(&client, gateway_deduper(), msg).await)
+                .map(|_| ())
         })
     }
 
@@ -676,10 +693,9 @@ impl TurnGateway for HeadlessGateway {
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{drain_merged_queued_placeholders, live_bot_owner_provider, outbound_policy};
-    use crate::services::discord::outbound::{
-        DISCORD_HARD_LIMIT_CHARS, SplitStrategy, ThreadFallback,
-    };
+    use crate::services::discord::outbound::policy::{FallbackPolicy, LengthStrategy};
     use poise::serenity_prelude::{ChannelId, MessageId};
+    use std::time::Duration;
 
     #[test]
     fn live_bot_owner_provider_requires_live_turn_context() {
@@ -690,10 +706,9 @@ mod tests {
     fn gateway_outbound_policy_preserves_streaming_chunks() {
         let policy = outbound_policy();
 
-        assert_eq!(policy.max_len, DISCORD_HARD_LIMIT_CHARS);
-        assert_eq!(policy.split_strategy, SplitStrategy::RejectOverLimit);
-        assert_eq!(policy.thread_fallback, ThreadFallback::None);
-        assert!(policy.minimal_fallback.is_none());
+        assert_eq!(policy.length_strategy, LengthStrategy::RejectOverLimit);
+        assert_eq!(policy.fallback, FallbackPolicy::None);
+        assert_eq!(policy.idempotency_window, Duration::ZERO);
     }
 
     // codex review round-6 P2 (#1332): the two `drain_merged_queued_placeholders`

@@ -1,5 +1,6 @@
 use super::commit_resolver::upstream_base_ref;
 use super::git_command;
+use std::path::{Path, PathBuf};
 
 /// Worktree info: (path, branch, commit).
 #[derive(Clone)]
@@ -7,6 +8,23 @@ pub struct WorktreeInfo {
     pub path: String,
     pub branch: String,
     pub commit: String,
+}
+
+#[derive(Clone)]
+pub struct EnsuredWorktreeInfo {
+    pub path: String,
+    pub branch: String,
+    pub commit: String,
+    pub created: bool,
+}
+
+#[derive(Default)]
+pub struct ManagedWorktreeCleanup {
+    pub removed: usize,
+    pub skipped_dirty: usize,
+    pub skipped_unmerged: usize,
+    pub skipped_unmanaged: usize,
+    pub failed: usize,
 }
 
 /// Find an active git worktree whose recent commits reference the given issue number.
@@ -131,6 +149,170 @@ pub fn find_worktree_for_issue(repo_dir: &str, issue_number: i64) -> Option<Work
         }
     }
     Some(matches[best_idx].clone())
+}
+
+fn sanitize_path_segment(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "repo".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) fn managed_worktrees_root(repo_dir: &str) -> Option<PathBuf> {
+    let repo_name = Path::new(repo_dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_path_segment)
+        .unwrap_or_else(|| "repo".to_string());
+    crate::config::runtime_root().map(|root| root.join("worktrees").join(repo_name))
+}
+
+pub fn ensure_worktree_for_issue(
+    repo_dir: &str,
+    issue_number: i64,
+) -> Result<EnsuredWorktreeInfo, String> {
+    if let Some(existing) = find_worktree_for_issue(repo_dir, issue_number) {
+        return Ok(EnsuredWorktreeInfo {
+            path: existing.path,
+            branch: existing.branch,
+            commit: existing.commit,
+            created: false,
+        });
+    }
+
+    let root = managed_worktrees_root(repo_dir)
+        .ok_or_else(|| "cannot resolve AgentDesk runtime root for managed worktree".to_string())?;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| format!("create managed worktree root '{}': {error}", root.display()))?;
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let branch = format!("adk/auto/issue-{issue_number}-{timestamp}");
+    let path = root.join(format!("issue-{issue_number}-{timestamp}"));
+    let base_ref = upstream_base_ref(repo_dir);
+    let output = git_command()
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            path.to_str()
+                .ok_or_else(|| format!("managed worktree path is not UTF-8: {}", path.display()))?,
+            &base_ref,
+        ])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|error| format!("git worktree add failed for issue #{issue_number}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree add failed for issue #{}: {} {}",
+            issue_number,
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
+        ));
+    }
+
+    let commit = git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    Ok(EnsuredWorktreeInfo {
+        path: path.to_string_lossy().into_owned(),
+        branch,
+        commit,
+        created: true,
+    })
+}
+
+fn is_managed_worktree_path(repo_dir: &str, worktree_path: &str) -> bool {
+    let Some(root) = managed_worktrees_root(repo_dir) else {
+        return false;
+    };
+    let canonical_root = std::fs::canonicalize(root).ok();
+    let canonical_path = std::fs::canonicalize(worktree_path).ok();
+    match (canonical_root, canonical_path) {
+        (Some(root), Some(path)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
+fn worktree_head_is_merged_to_mainline(repo_dir: &str, worktree_path: &str) -> Option<bool> {
+    let head = git_command()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|head| !head.is_empty())?;
+    let base_ref = upstream_base_ref(repo_dir);
+    let status = git_command()
+        .args(["merge-base", "--is-ancestor", &head, &base_ref])
+        .current_dir(repo_dir)
+        .status()
+        .ok()?;
+    Some(status.success())
+}
+
+pub fn cleanup_managed_worktree(repo_dir: &str, worktree_path: &str) -> ManagedWorktreeCleanup {
+    let mut cleanup = ManagedWorktreeCleanup::default();
+    if !is_managed_worktree_path(repo_dir, worktree_path) {
+        cleanup.skipped_unmanaged += 1;
+        return cleanup;
+    }
+    if !Path::new(worktree_path).exists() {
+        cleanup.skipped_unmanaged += 1;
+        return cleanup;
+    }
+    let dirty = git_command()
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+        .unwrap_or(true);
+    if dirty {
+        cleanup.skipped_dirty += 1;
+        return cleanup;
+    }
+    if worktree_head_is_merged_to_mainline(repo_dir, worktree_path) != Some(true) {
+        cleanup.skipped_unmerged += 1;
+        return cleanup;
+    }
+
+    let removed = git_command()
+        .args(["worktree", "remove", worktree_path])
+        .current_dir(repo_dir)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if removed {
+        let _ = git_command()
+            .args(["worktree", "prune"])
+            .current_dir(repo_dir)
+            .output();
+        cleanup.removed += 1;
+    } else {
+        cleanup.failed += 1;
+    }
+    cleanup
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]

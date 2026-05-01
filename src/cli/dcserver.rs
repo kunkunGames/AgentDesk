@@ -1299,7 +1299,7 @@ pub fn handle_dcserver(token: Option<String>) {
         crate::services::termination_audit::init_audit_db(Some(discord_pg_pool.clone()));
 
         // Start axum HTTP server (background task) — now serves all API
-        // endpoints including /api/send, /api/senddm, /api/health
+        // endpoints including /api/discord/send, /api/discord/send-dm, /api/health
         let http_port = ad_config.server.port;
         match PolicyEngine::new_with_pg(&ad_config, Some(discord_pg_pool.clone())) {
             Ok(engine) => {
@@ -1330,6 +1330,8 @@ pub fn handle_dcserver(token: Option<String>) {
         }
         // HTTP API port for self-referencing requests (dcserver → own HTTP server)
         let api_port = ad_config.server.port;
+        let placeholder_live_events_enabled = ad_config.placeholder.live_events_enabled;
+        let status_panel_v2_enabled = ad_config.placeholder.status_panel_v2_enabled;
 
         // Self-watchdog: probes the axum server's /api/health endpoint
         services::discord::health::spawn_watchdog(api_port);
@@ -1372,9 +1374,17 @@ pub fn handle_dcserver(token: Option<String>) {
                         api_port,
                         pg_pool: Some(discord_pg_pool),
                         engine: discord_engine,
+                        placeholder_live_events_enabled,
+                        status_panel_v2_enabled,
                     },
                 )
                 .await;
+                if ad_config.cluster.enabled {
+                    eprintln!(
+                        "  ▸ Cluster standby : Discord gateway lease unavailable; keeping HTTP and worker heartbeat online"
+                    );
+                    std::future::pending::<()>().await;
+                }
             }
             None => {
                 let configs = launch_configs;
@@ -1441,6 +1451,8 @@ pub fn handle_dcserver(token: Option<String>) {
                     let port = api_port;
                     let pg_pool_clone = Some(discord_pg_pool.clone());
                     let engine_clone = discord_engine.clone();
+                    let live_events_enabled = placeholder_live_events_enabled;
+                    let status_panel_v2 = status_panel_v2_enabled;
                     tasks.push(tokio::spawn(async move {
                         services::discord::run_bot(
                             &config.token,
@@ -1455,6 +1467,8 @@ pub fn handle_dcserver(token: Option<String>) {
                                 api_port: port,
                                 pg_pool: pg_pool_clone,
                                 engine: engine_clone,
+                                placeholder_live_events_enabled: live_events_enabled,
+                                status_panel_v2_enabled: status_panel_v2,
                             },
                         )
                         .await;
@@ -1465,6 +1479,12 @@ pub fn handle_dcserver(token: Option<String>) {
                     if let Err(e) = task.await {
                         eprintln!("  ⚠ bot task terminated unexpectedly: {e}");
                     }
+                }
+                if ad_config.cluster.enabled {
+                    eprintln!(
+                        "  ▸ Cluster standby : Discord gateway leases unavailable; keeping HTTP and worker heartbeat online"
+                    );
+                    std::future::pending::<()>().await;
                 }
             }
         }

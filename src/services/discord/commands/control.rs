@@ -13,9 +13,9 @@ use super::super::{
     Context, Error, SharedData, check_auth, mailbox_cancel_active_turn, mailbox_clear_channel,
 };
 use super::config::{
-    any_fast_mode_reset_pending, clear_fast_mode_reset_pending_for_channel,
-    clear_fast_mode_reset_pending_for_provider, fast_mode_reset_pending_for_provider,
-    fast_mode_reset_pending_key, sync_session_reset_pending,
+    any_fast_mode_reset_pending, clear_codex_goals_reset_pending_for_channel,
+    clear_fast_mode_reset_pending_for_channel, clear_fast_mode_reset_pending_for_provider,
+    fast_mode_reset_pending_for_provider, fast_mode_reset_pending_key, sync_session_reset_pending,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +64,7 @@ fn managed_session_reset_behavior(provider: &ProviderKind) -> ManagedSessionRese
 fn pending_session_reset_plan(
     provider: &ProviderKind,
     fast_mode_reset_pending: bool,
+    codex_goals_reset_pending: bool,
     model_reset_pending: bool,
     legacy_session_reset_pending: bool,
 ) -> Option<PendingSessionResetPlan> {
@@ -71,6 +72,12 @@ fn pending_session_reset_plan(
         return Some(PendingSessionResetPlan {
             reset_source: "fast mode reset pending",
             recreate_tmux: matches!(provider, ProviderKind::Claude | ProviderKind::Codex),
+        });
+    }
+    if codex_goals_reset_pending {
+        return Some(PendingSessionResetPlan {
+            reset_source: "codex goals reset pending",
+            recreate_tmux: matches!(provider, ProviderKind::Codex),
         });
     }
     if model_reset_pending {
@@ -273,14 +280,22 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
 ) {
     let fast_mode_reset_pending =
         fast_mode_reset_pending_for_provider(shared, fast_mode_channel_id, provider);
+    let codex_goals_reset_pending = matches!(provider, ProviderKind::Codex)
+        && shared
+            .codex_goals_session_reset_pending
+            .contains(&fast_mode_channel_id);
     let model_reset_pending = shared.model_session_reset_pending.contains(&channel_id);
     let legacy_session_reset_pending = shared.session_reset_pending.contains(&channel_id)
         && !any_fast_mode_reset_pending(shared, fast_mode_channel_id)
+        && !shared
+            .codex_goals_session_reset_pending
+            .contains(&fast_mode_channel_id)
         && !model_reset_pending;
 
     let Some(plan) = pending_session_reset_plan(
         provider,
         fast_mode_reset_pending,
+        codex_goals_reset_pending,
         model_reset_pending,
         legacy_session_reset_pending,
     ) else {
@@ -306,6 +321,10 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
     if fast_mode_reset_pending {
         clear_fast_mode_reset_pending_for_provider(shared, fast_mode_channel_id, provider);
         persist_fast_mode_reset_marker(shared, fast_mode_channel_id, provider, false).await;
+    }
+    if codex_goals_reset_pending {
+        clear_codex_goals_reset_pending_for_channel(shared, fast_mode_channel_id);
+        persist_codex_goals_reset_marker(shared, fast_mode_channel_id, false).await;
     }
     if model_reset_pending {
         shared.model_session_reset_pending.remove(&channel_id);
@@ -355,9 +374,11 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
     shared.dispatch_role_overrides.remove(&channel_id);
 
     clear_fast_mode_reset_pending_for_channel(shared, channel_id);
+    clear_codex_goals_reset_pending_for_channel(shared, channel_id);
     shared.model_session_reset_pending.remove(&channel_id);
     shared.session_reset_pending.remove(&channel_id);
     clear_all_fast_mode_reset_markers(shared, channel_id).await;
+    persist_codex_goals_reset_marker(shared, channel_id, false).await;
 
     if let Some(token) = cleared.removed_token {
         // #1218: keep all stop sites converging on `stop_active_turn` so the
@@ -630,14 +651,14 @@ mod tests {
     #[test]
     fn pending_session_reset_plan_recreates_claude_and_codex_tmux_for_fast_mode() {
         assert_eq!(
-            pending_session_reset_plan(&ProviderKind::Claude, true, false, false),
+            pending_session_reset_plan(&ProviderKind::Claude, true, false, false, false),
             Some(PendingSessionResetPlan {
                 reset_source: "fast mode reset pending",
                 recreate_tmux: true,
             })
         );
         assert_eq!(
-            pending_session_reset_plan(&ProviderKind::Codex, true, false, false),
+            pending_session_reset_plan(&ProviderKind::Codex, true, false, false, false),
             Some(PendingSessionResetPlan {
                 reset_source: "fast mode reset pending",
                 recreate_tmux: true,
@@ -648,22 +669,40 @@ mod tests {
     #[test]
     fn pending_session_reset_plan_prefers_specific_flags_and_keeps_legacy_fallback() {
         assert_eq!(
-            pending_session_reset_plan(&ProviderKind::Claude, false, true, true),
+            pending_session_reset_plan(&ProviderKind::Claude, false, false, true, true),
             Some(PendingSessionResetPlan {
                 reset_source: "model session reset pending",
                 recreate_tmux: false,
             })
         );
         assert_eq!(
-            pending_session_reset_plan(&ProviderKind::Gemini, false, false, true),
+            pending_session_reset_plan(&ProviderKind::Gemini, false, false, false, true),
             Some(PendingSessionResetPlan {
                 reset_source: "session reset pending",
                 recreate_tmux: false,
             })
         );
         assert_eq!(
-            pending_session_reset_plan(&ProviderKind::Gemini, false, false, false),
+            pending_session_reset_plan(&ProviderKind::Gemini, false, false, false, false),
             None
+        );
+    }
+
+    #[test]
+    fn pending_session_reset_plan_recreates_codex_tmux_for_goals() {
+        assert_eq!(
+            pending_session_reset_plan(&ProviderKind::Codex, false, true, false, false),
+            Some(PendingSessionResetPlan {
+                reset_source: "codex goals reset pending",
+                recreate_tmux: true,
+            })
+        );
+        assert_eq!(
+            pending_session_reset_plan(&ProviderKind::Claude, false, true, false, false),
+            Some(PendingSessionResetPlan {
+                reset_source: "codex goals reset pending",
+                recreate_tmux: false,
+            })
         );
     }
 
@@ -820,6 +859,29 @@ async fn persist_fast_mode_reset_marker(
         settings
             .channel_fast_mode_reset_pending
             .remove(&provider_key);
+    }
+    save_bot_settings(token, &settings);
+}
+
+async fn persist_codex_goals_reset_marker(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    pending: bool,
+) {
+    let Some(token) = shared.cached_bot_token.get() else {
+        return;
+    };
+
+    let channel_key = channel_id.get().to_string();
+    let mut settings = shared.settings.write().await;
+    if pending {
+        settings
+            .channel_codex_goals_reset_pending
+            .insert(channel_key);
+    } else {
+        settings
+            .channel_codex_goals_reset_pending
+            .remove(&channel_key);
     }
     save_bot_settings(token, &settings);
 }

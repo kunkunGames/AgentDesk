@@ -116,12 +116,6 @@ impl EndpointDoc {
         self.curl_example = Some(curl);
         self
     }
-
-    fn deprecated_alias(mut self, canonical_path: &'static str) -> Self {
-        self.deprecated = true;
-        self.canonical_path = Some(canonical_path);
-        self
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,13 +232,13 @@ pub(crate) const TOP_40_PAIRED_PATHS: &[(&str, &str)] = &[
     ("POST", "/api/dispatches"),
     ("GET", "/api/dispatches/{id}"),
     ("PATCH", "/api/dispatches/{id}"),
-    ("POST", "/api/auto-queue/generate"),
-    ("POST", "/api/auto-queue/dispatch-next"),
-    ("GET", "/api/auto-queue/status"),
-    ("POST", "/api/auto-queue/pause"),
-    ("POST", "/api/auto-queue/resume"),
-    ("POST", "/api/auto-queue/cancel"),
-    ("PATCH", "/api/auto-queue/reorder"),
+    ("POST", "/api/queue/generate"),
+    ("POST", "/api/queue/dispatch-next"),
+    ("GET", "/api/queue/status"),
+    ("POST", "/api/queue/pause"),
+    ("POST", "/api/queue/resume"),
+    ("POST", "/api/queue/cancel"),
+    ("PATCH", "/api/queue/reorder"),
     ("POST", "/api/github/issues/create"),
     ("GET", "/api/pipeline/cards/{card_id}"),
     ("GET", "/api/analytics/observability"),
@@ -271,7 +265,8 @@ fn canonical_category(category: &str) -> &'static str {
         "dispatches" | "dispatched-sessions" | "internal" | "messages" | "sessions" => "dispatches",
         "auto-queue" | "cron" | "queue" => "queue",
         "routines" => "routines",
-        "analytics" | "auth" | "docs" | "health" | "monitoring" | "stats" | "provider-cli" => "ops",
+        "analytics" | "auth" | "cluster" | "docs" | "health" | "monitoring" | "stats"
+        | "provider-cli" => "ops",
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
         | "skills" => "admin",
@@ -327,7 +322,7 @@ fn category_to_group(category: &str) -> &'static str {
         "settings" | "onboarding" | "skills" | "offices" | "departments" | "memory" => "config",
         // observability — analytics, metrics, events, slo, diagnostics,
         // monitoring, stats, health, auth
-        "analytics" | "monitoring" | "stats" | "health" | "auth" => "observability",
+        "analytics" | "cluster" | "monitoring" | "stats" | "health" | "auth" => "observability",
         // internal — debug, testing, internal endpoints, docs discovery
         "internal" | "docs" => "internal",
         _ => "internal",
@@ -402,6 +397,7 @@ fn category_description(category: &str) -> &'static str {
             "Auto-queue generation, activation, slot repair, and queue execution control."
         }
         "cron" => "Registered cron jobs per agent.",
+        "cluster" => "Multinode worker-node registry, heartbeat, and role diagnostics.",
         "departments" => "Department CRUD and ordering.",
         "discord" => "Discord delivery helpers, bindings, message reads, and DM reply hooks.",
         "dispatched-sessions" => "Persisted dispatched-session lifecycle and cleanup helpers.",
@@ -548,6 +544,406 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_curl("curl http://localhost:8787/api/health/detail"),
         ep(
             "GET",
+            "/api/cluster/nodes",
+            "cluster",
+            "Protected multinode worker registry view with configured/effective role, heartbeat, labels, and capabilities.",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "cluster": {
+                    "enabled": true,
+                    "configured_role": "auto",
+                    "lease_ttl_secs": 30,
+                    "heartbeat_interval_secs": 10
+                },
+                "nodes": [{
+                    "instance_id": "mac-mini",
+                    "hostname": "mac-mini",
+                    "role": "auto",
+                    "effective_role": "leader",
+                    "status": "online",
+                    "labels": ["mac-mini"],
+                    "capabilities": {"providers": ["codex"]}
+                }]
+            }),
+        )
+        .with_error_example(
+            503,
+            json!({}),
+            json!({"error": "postgres unavailable"}),
+        )
+        .with_curl("curl http://localhost:8787/api/cluster/nodes"),
+        ep(
+            "GET",
+            "/api/cluster/routing-diagnostics",
+            "cluster",
+            "Explain which multinode workers satisfy a required capability set and why excluded workers do not match.",
+        )
+        .with_example(
+            json!({"required": "{\"labels\":[\"mac-book\"],\"providers\":[\"codex\"],\"mcp\":{\"filesystem\":{\"healthy\":true}}}"}),
+            json!({
+                "required": {
+                    "labels": ["mac-book"],
+                    "providers": ["codex"],
+                    "mcp": {"filesystem": {"healthy": true}}
+                },
+                "decisions": [{
+                    "instance_id": "mac-book-release",
+                    "eligible": true,
+                    "reasons": []
+                }, {
+                    "instance_id": "mac-mini-release",
+                    "eligible": false,
+                    "reasons": ["missing label 'mac-book'"]
+                }]
+            }),
+        )
+        .with_error_example(
+            400,
+            json!({"required": "{not-json"}),
+            json!({"error": "invalid required JSON: expected object key"}),
+        )
+        .with_error_example(
+            503,
+            json!({}),
+            json!({"error": "postgres unavailable"}),
+        )
+        .with_curl("curl --get http://localhost:8787/api/cluster/routing-diagnostics --data-urlencode 'required={\"labels\":[\"mac-book\"],\"providers\":[\"codex\"]}'"),
+        ep(
+            "GET",
+            "/api/cluster/resource-locks",
+            "cluster",
+            "List active multinode resource locks used to serialize exclusive worker resources such as Unreal editor/test execution.",
+        )
+        .with_example(
+            json!({"include_expired": false}),
+            json!({
+                "default_ttl_secs": 900,
+                "locks": [{
+                    "lock_key": "unreal:project:CookingHeart",
+                    "holder_instance_id": "mac-book-release",
+                    "holder_job_id": "phase-compile",
+                    "metadata": {"phase": "compile"},
+                    "expires_at": "2026-05-01T06:25:00Z",
+                    "heartbeat_at": "2026-05-01T06:10:00Z",
+                    "created_at": "2026-05-01T06:10:00Z",
+                    "updated_at": "2026-05-01T06:10:00Z"
+                }]
+            }),
+        )
+        .with_error_example(
+            503,
+            json!({}),
+            json!({"error": "postgres unavailable"}),
+        )
+        .with_curl("curl http://localhost:8787/api/cluster/resource-locks"),
+        ep(
+            "POST",
+            "/api/cluster/resource-locks/acquire",
+            "cluster",
+            "Acquire or renew a PG-backed exclusive resource lock. Conflicting active holders return 409 with the current holder.",
+        )
+        .with_example(
+            json!({
+                "lock_key": "unreal:project:CookingHeart",
+                "holder_instance_id": "mac-book-release",
+                "holder_job_id": "phase-compile",
+                "ttl_secs": 900,
+                "metadata": {"phase": "compile"}
+            }),
+            json!({
+                "acquired": true,
+                "lock": {
+                    "lock_key": "unreal:project:CookingHeart",
+                    "holder_instance_id": "mac-book-release",
+                    "holder_job_id": "phase-compile"
+                },
+                "current": null
+            }),
+        )
+        .with_error_example(
+            409,
+            json!({
+                "lock_key": "unreal:project:CookingHeart",
+                "holder_instance_id": "mac-mini-release",
+                "holder_job_id": "phase-compile"
+            }),
+            json!({"acquired": false, "lock": null, "current": {"holder_instance_id": "mac-book-release"}}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/resource-locks/acquire -H 'content-type: application/json' -d '{\"lock_key\":\"unreal:project:CookingHeart\",\"holder_instance_id\":\"mac-book-release\",\"holder_job_id\":\"phase-compile\"}'"),
+        ep(
+            "POST",
+            "/api/cluster/resource-locks/heartbeat",
+            "cluster",
+            "Extend a resource lock only when the same holder still owns the lock.",
+        )
+        .with_example(
+            json!({
+                "lock_key": "unreal:project:CookingHeart",
+                "holder_instance_id": "mac-book-release",
+                "holder_job_id": "phase-compile",
+                "ttl_secs": 900
+            }),
+            json!({"ok": true, "lock": {"lock_key": "unreal:project:CookingHeart"}}),
+        )
+        .with_error_example(
+            409,
+            json!({}),
+            json!({"ok": false, "error": "lock is not held by requester or has expired"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/resource-locks/heartbeat -H 'content-type: application/json' -d '{\"lock_key\":\"unreal:project:CookingHeart\",\"holder_instance_id\":\"mac-book-release\",\"holder_job_id\":\"phase-compile\"}'"),
+        ep(
+            "POST",
+            "/api/cluster/resource-locks/release",
+            "cluster",
+            "Release a resource lock only when lock key, holder instance, and holder job all match.",
+        )
+        .with_example(
+            json!({
+                "lock_key": "unreal:project:CookingHeart",
+                "holder_instance_id": "mac-book-release",
+                "holder_job_id": "phase-compile"
+            }),
+            json!({"released": true}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/resource-locks/release -H 'content-type: application/json' -d '{\"lock_key\":\"unreal:project:CookingHeart\",\"holder_instance_id\":\"mac-book-release\",\"holder_job_id\":\"phase-compile\"}'"),
+        ep(
+            "POST",
+            "/api/cluster/resource-locks/reclaim-expired",
+            "cluster",
+            "Delete expired resource locks so crashed workers do not permanently hold exclusive resources.",
+        )
+        .with_example(json!({}), json!({"reclaimed": 1}))
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/resource-locks/reclaim-expired"),
+        ep(
+            "GET",
+            "/api/cluster/test-phase-runs",
+            "cluster",
+            "List deterministic test phase evidence records by phase, head SHA, and status for multinode merge gates.",
+        )
+        .with_example(
+            json!({"phase_key": "unreal-smoke", "head_sha": "abc123", "status": "passed"}),
+            json!({
+                "runs": [{
+                    "id": "tpr-123",
+                    "idempotency_key": "unreal-smoke:abc123",
+                    "phase_key": "unreal-smoke",
+                    "head_sha": "abc123",
+                    "status": "passed",
+                    "required_capabilities": {"labels": ["mac-book"], "unreal": true},
+                    "resource_lock_key": "unreal:project:CookingHeart",
+                    "evidence": {"log": "passed"},
+                    "completed_at": "2026-05-01T06:30:00Z"
+                }]
+            }),
+        )
+        .with_error_example(
+            503,
+            json!({}),
+            json!({"error": "postgres unavailable"}),
+        )
+        .with_curl("curl --get http://localhost:8787/api/cluster/test-phase-runs --data-urlencode phase_key=unreal-smoke --data-urlencode head_sha=abc123"),
+        ep(
+            "POST",
+            "/api/cluster/test-phase-runs/upsert",
+            "cluster",
+            "Create or update the idempotent evidence row for one test phase and commit head SHA.",
+        )
+        .with_example(
+            json!({
+                "phase_key": "unreal-smoke",
+                "head_sha": "abc123",
+                "status": "passed",
+                "issue_id": "881",
+                "card_id": "card-881",
+                "required_capabilities": {"labels": ["mac-book"], "unreal": true},
+                "resource_lock_key": "unreal:project:CookingHeart",
+                "holder_instance_id": "mac-book-release",
+                "holder_job_id": "phase-unreal-smoke-abc123",
+                "evidence": {"runner": "deterministic-phase-runner", "result": "passed"}
+            }),
+            json!({
+                "run": {
+                    "idempotency_key": "unreal-smoke:abc123",
+                    "phase_key": "unreal-smoke",
+                    "head_sha": "abc123",
+                    "status": "passed"
+                }
+            }),
+        )
+        .with_error_example(
+            400,
+            json!({"phase_key": "", "head_sha": "abc123"}),
+            json!({"error": "phase_key is required"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/test-phase-runs/upsert -H 'content-type: application/json' -d '{\"phase_key\":\"unreal-smoke\",\"head_sha\":\"abc123\",\"status\":\"passed\"}'"),
+        ep(
+            "POST",
+            "/api/cluster/test-phase-runs/start",
+            "cluster",
+            "Acquire the required resource lock and mark a deterministic test phase as running.",
+        )
+        .with_example(
+            json!({
+                "phase_key": "unreal-smoke",
+                "head_sha": "abc123",
+                "resource_lock_key": "unreal:project:CookingHeart",
+                "holder_instance_id": "mac-book-release",
+                "holder_job_id": "phase-unreal-smoke-abc123",
+                "ttl_secs": 900,
+                "required_capabilities": {"labels": ["mac-book"], "unreal": true}
+            }),
+            json!({
+                "started": true,
+                "run": {
+                    "phase_key": "unreal-smoke",
+                    "head_sha": "abc123",
+                    "status": "running"
+                },
+                "lock": {"lock_key": "unreal:project:CookingHeart"},
+                "current_lock": null
+            }),
+        )
+        .with_error_example(
+            409,
+            json!({}),
+            json!({"started": false, "run": null, "lock": null, "current_lock": {"holder_instance_id": "mac-mini-release"}}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/test-phase-runs/start -H 'content-type: application/json' -d '{\"phase_key\":\"unreal-smoke\",\"head_sha\":\"abc123\",\"resource_lock_key\":\"unreal:project:CookingHeart\",\"holder_instance_id\":\"mac-book-release\",\"holder_job_id\":\"phase-unreal-smoke-abc123\"}'"),
+        ep(
+            "POST",
+            "/api/cluster/test-phase-runs/complete",
+            "cluster",
+            "Record terminal phase evidence and optionally release the resource lock held by the runner.",
+        )
+        .with_example(
+            json!({
+                "phase_key": "unreal-smoke",
+                "head_sha": "abc123",
+                "status": "passed",
+                "release_lock": true,
+                "evidence": {"result": "passed", "log_path": "Saved/Logs/phase.log"}
+            }),
+            json!({
+                "run": {
+                    "phase_key": "unreal-smoke",
+                    "head_sha": "abc123",
+                    "status": "passed"
+                },
+                "lock_released": true
+            }),
+        )
+        .with_error_example(
+            400,
+            json!({"phase_key": "unreal-smoke", "head_sha": "abc123", "status": "running"}),
+            json!({"error": "complete requires status passed, failed, or canceled"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/test-phase-runs/complete -H 'content-type: application/json' -d '{\"phase_key\":\"unreal-smoke\",\"head_sha\":\"abc123\",\"status\":\"passed\",\"release_lock\":true}'"),
+        ep(
+            "GET",
+            "/api/cluster/test-phase-runs/evidence",
+            "cluster",
+            "Fetch the latest passing evidence for a required phase/head SHA pair. Merge gates should use this shape before accepting phase evidence.",
+        )
+        .with_example(
+            json!({"phase_key": "unreal-smoke", "head_sha": "abc123"}),
+            json!({
+                "ok": true,
+                "run": {
+                    "phase_key": "unreal-smoke",
+                    "head_sha": "abc123",
+                    "status": "passed",
+                    "evidence": {"result": "passed"}
+                }
+            }),
+        )
+        .with_error_example(
+            404,
+            json!({"phase_key": "unreal-smoke", "head_sha": "missing"}),
+            json!({"ok": false, "error": "passing evidence not found"}),
+        )
+        .with_curl("curl --get http://localhost:8787/api/cluster/test-phase-runs/evidence --data-urlencode phase_key=unreal-smoke --data-urlencode head_sha=abc123"),
+        ep(
+            "POST",
+            "/api/cluster/task-dispatches/claim",
+            "cluster",
+            "Atomically claim pending task_dispatches for a worker with PG row locking and capability-match diagnostics.",
+        )
+        .with_example(
+            json!({
+                "claim_owner": "mac-book-release",
+                "ttl_secs": 600,
+                "limit": 10,
+                "dispatch_type": "implementation"
+            }),
+            json!({
+                "claimed": [{
+                    "id": "dispatch-123",
+                    "claim_owner": "mac-book-release",
+                    "required_capabilities": {"labels": ["mac-book"]}
+                }],
+                "skipped": [{
+                    "id": "dispatch-456",
+                    "reasons": ["missing label 'mac-mini'"]
+                }]
+            }),
+        )
+        .with_error_example(
+            400,
+            json!({"claim_owner": ""}),
+            json!({"error": "claim_owner is required"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/task-dispatches/claim -H 'content-type: application/json' -d '{\"claim_owner\":\"mac-book-release\",\"limit\":10}'"),
+        ep(
+            "GET",
+            "/api/cluster/issue-specs",
+            "cluster",
+            "List parsed Issue-as-Spec contracts, including required phases consumed by merge gates.",
+        )
+        .with_example(
+            json!({"card_id": "card-881"}),
+            json!({
+                "specs": [{
+                    "issue_id": "881",
+                    "card_id": "card-881",
+                    "required_phases": ["unreal-smoke"],
+                    "validation_errors": []
+                }]
+            }),
+        )
+        .with_curl("curl --get http://localhost:8787/api/cluster/issue-specs --data-urlencode card_id=card-881"),
+        ep(
+            "POST",
+            "/api/cluster/issue-specs/upsert",
+            "cluster",
+            "Parse a GitHub issue body into acceptance criteria, test plan, DoD, and required phase keys.",
+        )
+        .with_example(
+            json!({
+                "issue_id": "881",
+                "card_id": "card-881",
+                "repo_id": "itismyfield/AgentDesk",
+                "issue_number": 881,
+                "head_sha": "abc123",
+                "body": "## Acceptance Criteria\n- Evidence is persisted\n\n## Test Plan\n- Run regression\n\n## Definition of Done\n- Gate consumes evidence\n\n## Required Phases\n- Unreal Smoke"
+            }),
+            json!({
+                "spec": {
+                    "issue_id": "881",
+                    "required_phases": ["unreal-smoke"],
+                    "validation_errors": []
+                }
+            }),
+        )
+        .with_error_example(
+            400,
+            json!({"issue_id": "", "body": ""}),
+            json!({"error": "issue_id is required"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/cluster/issue-specs/upsert -H 'content-type: application/json' -d '{\"issue_id\":\"881\",\"body\":\"## Acceptance Criteria\\n- Done\\n\\n## Test Plan\\n- Test\\n\\n## Definition of Done\\n- Ship\"}'"),
+        ep(
+            "GET",
             "/api/doctor/startup/latest",
             "health",
             "Local/protected latest startup doctor artifact envelope for agent rescue and diagnosis.",
@@ -595,6 +991,46 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_curl("curl -X POST http://localhost:8787/api/doctor/stale-mailbox/repair -H 'Content-Type: application/json' -d '{\"channel_id\":1486017489027469493}'"),
         ep(
             "POST",
+            "/api/channels/{id}/relay-recovery",
+            "health",
+            "Local/protected relay recovery dry-run endpoint with bounded apply for safe local auto-heal actions.",
+        )
+        .with_params([
+            ("id", path_param("Discord channel snowflake")),
+            (
+                "provider",
+                body_param("string", false, "Optional provider filter such as codex"),
+            ),
+            (
+                "apply",
+                body_param("boolean", false, "Default false. When true, only eligible bounded local cleanup may run"),
+            ),
+        ])
+        .with_example(
+            json!({"body": {"provider": "codex", "apply": false}}),
+            json!({
+                "ok": true,
+                "mode": "dry_run",
+                "applied": false,
+                "skipped": false,
+                "decision": {
+                    "relay_stall_state": "orphan_pending_token",
+                    "action": "clear_orphan_pending_token",
+                    "reason": "mailbox holds a cancel token without bridge, watcher, or live tmux evidence",
+                    "evidence": {"mailbox_has_cancel_token": true, "bridge_inflight_present": false, "watcher_attached": false},
+                    "affected": {"channel_id": "1486017489027469493", "provider": "codex"},
+                    "auto_heal": {"eligible": true, "bounded": true, "max_attempts_per_window": 1, "window_secs": 600}
+                }
+            }),
+        )
+        .with_error_example(
+            403,
+            json!({"body": {"provider": "codex"}}),
+            json!({"ok": false, "error": "auth_token required for non-loopback host"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/channels/1486017489027469493/relay-recovery -H 'Content-Type: application/json' -d '{\"provider\":\"codex\",\"apply\":false}'"),
+        ep(
+            "POST",
             "/api/discord/send",
             "discord",
             "Send a Discord channel message",
@@ -613,8 +1049,6 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"error": "channel_id is required"}),
         )
         .with_curl("curl -X POST http://localhost:8787/api/discord/send -H 'Content-Type: application/json' -d '{\"channel_id\":\"1473922824350601297\",\"message\":\"hello\"}'"),
-        ep("POST", "/api/send", "discord", "Deprecated alias for /api/discord/send")
-            .deprecated_alias("/api/discord/send"),
         ep(
             "POST",
             "/api/discord/send-to-agent",
@@ -646,13 +1080,6 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_curl("curl -X POST http://localhost:8787/api/discord/send-to-agent -H 'Content-Type: application/json' -d '{\"role_id\":\"project-agentdesk\",\"message\":\"deploy done\"}'"),
         ep(
             "POST",
-            "/api/send_to_agent",
-            "discord",
-            "Deprecated alias for /api/discord/send-to-agent",
-        )
-        .deprecated_alias("/api/discord/send-to-agent"),
-        ep(
-            "POST",
             "/api/discord/send-dm",
             "discord",
             "Send a Discord direct message",
@@ -671,8 +1098,6 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"error": "user_id is required"}),
         )
         .with_curl("curl -X POST http://localhost:8787/api/discord/send-dm -H 'Content-Type: application/json' -d '{\"user_id\":\"100000000000000000\",\"message\":\"heads-up\"}'"),
-        ep("POST", "/api/senddm", "discord", "Deprecated alias for /api/discord/send-dm")
-            .deprecated_alias("/api/discord/send-dm"),
         ep("GET", "/api/agents", "agents", "List all agents")
             .with_example(
                 json!({}),
@@ -898,6 +1323,37 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "agents",
             "Send runtime signal to agent // TODO: example",
         ),
+        ep(
+            "POST",
+            "/api/agents/{id}/message",
+            "agents",
+            "Send a trigger-capable agent handoff via the announce bot",
+        )
+        .with_params([
+            ("id", path_param("Target agent id")),
+            ("from_agent_id", body_param("string", true, "Source agent id")),
+            ("message", body_param("string", true, "Message body")),
+            (
+                "channel_kind",
+                body_param("string", false, "Target binding: cc (default) or cdx")
+                    .with_enum(&["cc", "cdx"])
+                    .with_default(json!("cc")),
+            ),
+            (
+                "prefix",
+                body_param("boolean", false, "Add the handoff prefix").with_default(true),
+            ),
+        ])
+        .with_example(
+            json!({"path": {"id": "adk-dashboard"}, "body": {"from_agent_id": "project-agentdesk", "message": "hello", "channel_kind": "cc", "prefix": true}}),
+            json!({"to_agent_id": "adk-dashboard", "channel_id": "1473922824350601297", "channel_kind": "cc", "message_id": "1500000000000000002", "bot": "announce", "prefixed": true}),
+        )
+        .with_error_example(
+            422,
+            json!({"path": {"id": "adk-dashboard"}, "body": {"from_agent_id": "project-agentdesk", "message": "hello", "channel_kind": "cc"}}),
+            json!({"error": "channel_kind unset", "to_agent_id": "adk-dashboard", "channel_kind": "cc", "available_kinds": ["cdx"]}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/agents/adk-dashboard/message -H 'Content-Type: application/json' -d '{\"from_agent_id\":\"project-agentdesk\",\"message\":\"hello\",\"channel_kind\":\"cc\",\"prefix\":true}'"),
         ep(
             "GET",
             "/api/agents/{id}/cron",
@@ -1408,7 +1864,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kanban-cards/{id}/transition",
             "kanban",
-            "Transition a single card with administrative force-transition semantics. Canonical runtime path is /transition; the old /force-transition path is removed. Requires explicit Bearer auth. Single-call complete: do NOT chain /redispatch, /retry, or /auto-queue/generate after it (#1442). Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint in the response. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
+            "Transition a single card with administrative force-transition semantics. Canonical runtime path is /transition; the old /force-transition path is removed. Requires explicit Bearer auth. Single-call complete: do NOT chain /redispatch, /retry, or /queue/generate after it (#1442). Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint in the response. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
@@ -1440,7 +1896,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 "cancelled_dispatches": 1,
                 "cancelled_dispatch_ids": ["dispatch-abc"],
                 "created_dispatch_id": null,
-                "next_action_hint": "call /api/auto-queue/generate to dispatch newly-ready card",
+                "next_action_hint": "call /api/queue/generate to dispatch newly-ready card",
                 "skipped_auto_queue_entries": 1
             }),
         )
@@ -1450,7 +1906,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"error": "status is required"}),
         )
         .with_curl("curl -X POST http://localhost:8787/api/kanban-cards/card-1/transition -H 'Content-Type: application/json' -d '{\"status\":\"ready\",\"cancel_dispatches\":true}'"),
-        ep("POST", "/api/kanban-cards/{id}/retry", "kanban", "Retry card: re-execute the same failed step with the same intent and context (optionally swapping assignee). Distinct from /redispatch (creates a NEW dispatch id), /resume (continues a checkpointed turn), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /auto-queue/generate after it (#1442). See /api/docs/card-lifecycle-ops for the full decision tree (#1443).")
+        ep("POST", "/api/kanban-cards/{id}/retry", "kanban", "Retry card: re-execute the same failed step with the same intent and context (optionally swapping assignee). Distinct from /redispatch (creates a NEW dispatch id), /resume (continues a checkpointed turn), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /queue/generate after it (#1442). See /api/docs/card-lifecycle-ops for the full decision tree (#1443).")
             .with_params([
                 ("id", path_param("Kanban card ID")),
                 (
@@ -1481,7 +1937,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kanban-cards/{id}/redispatch",
             "kanban",
-            "Redispatch: cancel the current live dispatch and create a brand-new dispatch entry with a new dispatch_id for the same card intent. Distinct from /retry (re-executes the SAME step with the same params), /resume (continues a checkpoint), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /auto-queue/generate after it (#1442). See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
+            "Redispatch: cancel the current live dispatch and create a brand-new dispatch entry with a new dispatch_id for the same card intent. Distinct from /retry (re-executes the SAME step with the same params), /resume (continues a checkpoint), and /reopen (re-admits a closed card). Single-call complete: do NOT chain /transition or /queue/generate after it (#1442). See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
@@ -1978,13 +2434,6 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"error": "dod is required and must contain 1-10 entries"}),
         )
         .with_curl("curl -X POST http://localhost:8787/api/github/issues/create -H 'Content-Type: application/json' -d '{\"repo\":\"ADK\",\"title\":\"Example\",\"background\":\"bg\",\"content\":[\"do thing\"],\"dod\":[\"it works\"]}'"),
-        ep(
-            "POST",
-            "/api/issues",
-            "github",
-            "Deprecated alias for /api/github/issues/create",
-        )
-        .deprecated_alias("/api/github/issues/create"),
         ep("POST", "/api/github/repos", "github", "Register GitHub repo // TODO: example"),
         ep(
             "POST",
@@ -2392,7 +2841,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ep("POST", "/api/messages", "messages", "Create message // TODO: example"),
         ep(
             "GET",
-            "/api/discord-bindings",
+            "/api/discord/bindings",
             "discord",
             "List Discord bindings // TODO: example",
         ),
@@ -2723,7 +3172,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "POST",
-            "/api/auto-queue/generate",
+            "/api/queue/generate",
             "auto-queue",
             "Generate auto-queue entries. Single-call complete: do NOT chain /redispatch, /retry, or /transition for the same card after it (#1442). Inspect skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter in the response to see structured skip reasons. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
@@ -2735,6 +3184,15 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             (
                 "agent_id",
                 body_param("string", false, "Filter cards by assigned agent"),
+            ),
+            (
+                "auto_assign_agent",
+                body_param(
+                    "boolean",
+                    false,
+                    "Assign unowned explicit issue_numbers or entries to agent_id before queue generation",
+                )
+                .with_default(false),
             ),
             (
                 "issue_numbers",
@@ -2799,78 +3257,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"body": {"repo": "test-repo", "issue_numbers": []}}),
             json!({"error": "issue_numbers or entries must be non-empty"}),
         )
-        .with_curl("curl -X POST http://localhost:8787/api/auto-queue/generate -H 'Content-Type: application/json' -d '{\"repo\":\"test-repo\",\"issue_numbers\":[423,405]}'"),
+        .with_curl("curl -X POST http://localhost:8787/api/queue/generate -H 'Content-Type: application/json' -d '{\"repo\":\"test-repo\",\"issue_numbers\":[423,405]}'"),
         ep(
             "POST",
-            "/api/auto-queue/dispatch",
-            "auto-queue",
-            "Deprecated (#1064): use /api/auto-queue/generate + /api/auto-queue/dispatch-next. Remains functional for legacy CLI callers with the groups body shape.",
-        )
-        .with_params([
-            (
-                "repo",
-                body_param("string", false, "Restrict issues to one repository"),
-            ),
-            (
-                "agent_id",
-                body_param(
-                    "string",
-                    false,
-                    "Target agent; also used for auto-assignment when requested",
-                ),
-            ),
-            (
-                "groups",
-                body_param(
-                    "object[]",
-                    true,
-                    "Ordered issue groups. Each item accepts issues, sequential, batch_phase, and thread_group",
-                ),
-            ),
-            (
-                "unified_thread",
-                body_param(
-                    "boolean",
-                    false,
-                    "Accepted for compatibility but ignored; slot pooling stays enabled",
-                )
-                .with_default(false),
-            ),
-            (
-                "activate",
-                body_param("boolean", false, "Immediately promote and dispatch the generated run")
-                    .with_default(true),
-            ),
-            (
-                "review_mode",
-                body_param(
-                    "string",
-                    false,
-                    "Run review mode: 'enabled' keeps the normal review gate; 'disabled' skips review dispatch creation and relies on main-merge detection to advance the card and queue entry to done",
-                )
-                .with_default("enabled"),
-            ),
-            (
-                "auto_assign_agent",
-                body_param(
-                    "boolean",
-                    false,
-                    "Assign unowned cards to agent_id before queue generation",
-                )
-                .with_default(true),
-            ),
-            (
-                "max_concurrent_threads",
-                body_param("number", false, "Upper bound for simultaneously active groups"),
-            ),
-        ])
-        .with_example(
-            json!({"body": {"repo": "test-repo", "agent_id": "project-agentdesk", "groups": [{"issues": [423, 405], "sequential": true}, {"issues": [407]}], "review_mode": "disabled", "unified_thread": true, "activate": true, "auto_assign_agent": true, "max_concurrent_threads": 2}}),
-            json!({"run": {"id": "run-1", "status": "active", "review_mode": "disabled", "thread_group_count": 2, "max_concurrent_threads": 2}, "entries": [{"id": "entry-1", "github_issue_number": 423, "thread_group": 0, "priority_rank": 0, "status": "dispatched"}], "thread_groups": {"0": {"status": "active"}, "1": {"status": "pending"}}, "activated": true, "dispatch": {"count": 1}}),
-        ),
-        ep(
-            "POST",
-            "/api/auto-queue/dispatch-next",
+            "/api/queue/dispatch-next",
             "auto-queue",
             "Dispatch the next pending auto-queue entries. See /api/docs/card-lifecycle-ops for the full decision tree on when to call /generate vs /dispatch-next (#1443).",
         )
@@ -2919,10 +3309,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"body": {"run_id": "run-ghost"}}),
             json!({"error": "auto-queue run not found: run-ghost"}),
         )
-        .with_curl("curl -X POST http://localhost:8787/api/auto-queue/dispatch-next -H 'Content-Type: application/json' -d '{\"repo\":\"test-repo\"}'"),
+        .with_curl("curl -X POST http://localhost:8787/api/queue/dispatch-next -H 'Content-Type: application/json' -d '{\"repo\":\"test-repo\"}'"),
         ep(
             "GET",
-            "/api/auto-queue/status",
+            "/api/queue/status",
             "auto-queue",
             "Get latest auto-queue run state",
         )
@@ -2945,10 +3335,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"query": {"repo": "no-such-repo"}}),
             json!({"error": "no auto-queue run for repo: no-such-repo"}),
         )
-        .with_curl("curl 'http://localhost:8787/api/auto-queue/status?repo=test-repo'"),
+        .with_curl("curl 'http://localhost:8787/api/queue/status?repo=test-repo'"),
         ep(
             "GET",
-            "/api/auto-queue/history",
+            "/api/queue/history",
             "auto-queue",
             "List recent auto-queue runs with outcome metrics",
         )
@@ -2996,7 +3386,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "PATCH",
-            "/api/auto-queue/entries/{id}",
+            "/api/queue/entries/{id}",
             "auto-queue",
             "Update one pending auto-queue entry",
         )
@@ -3021,7 +3411,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "PATCH",
-            "/api/auto-queue/entries/{id}/skip",
+            "/api/queue/entries/{id}/skip",
             "auto-queue",
             "Skip a pending auto-queue entry",
         )
@@ -3032,7 +3422,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "PATCH",
-            "/api/auto-queue/runs/{id}",
+            "/api/queue/runs/{id}",
             "auto-queue",
             "Update auto-queue run metadata",
         )
@@ -3061,33 +3451,33 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "PATCH",
-            "/api/auto-queue/reorder",
+            "/api/queue/reorder",
             "auto-queue",
             "Reorder pending auto-queue entries",
         )
         .with_params([
             (
-                "orderedIds",
+                "ordered_ids",
                 body_param("string[]", true, "Ordered entry ids in desired priority order"),
             ),
             (
-                "agentId",
+                "agent_id",
                 body_param("string", false, "Optional agent scope for reordering"),
             ),
         ])
         .with_example(
-            json!({"body": {"orderedIds": ["entry-2", "entry-1"], "agentId": "agent-1"}}),
+            json!({"body": {"ordered_ids": ["entry-2", "entry-1"], "agent_id": "agent-1"}}),
             json!({"ok": true}),
         )
         .with_error_example(
             400,
-            json!({"body": {"agentId": "agent-1"}}),
-            json!({"error": "orderedIds is required"}),
+            json!({"body": {"agent_id": "agent-1"}}),
+            json!({"error": "ordered_ids is required"}),
         )
-        .with_curl("curl -X PATCH http://localhost:8787/api/auto-queue/reorder -H 'Content-Type: application/json' -d '{\"orderedIds\":[\"entry-2\",\"entry-1\"],\"agentId\":\"agent-1\"}'"),
+        .with_curl("curl -X PATCH http://localhost:8787/api/queue/reorder -H 'Content-Type: application/json' -d '{\"ordered_ids\":[\"entry-2\",\"entry-1\"],\"agent_id\":\"agent-1\"}'"),
         ep(
             "POST",
-            "/api/auto-queue/slots/{agent_id}/{slot_index}/reset-thread",
+            "/api/queue/slots/{agent_id}/{slot_index}/reset-thread",
             "auto-queue",
             "Reset a slot-thread binding for an agent",
         )
@@ -3111,7 +3501,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "POST",
-            "/api/auto-queue/reset",
+            "/api/queue/reset",
             "auto-queue",
             "Reset one agent queue and clear its queue entries",
         )
@@ -3122,7 +3512,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "POST",
-            "/api/auto-queue/reset-global",
+            "/api/queue/reset-global",
             "auto-queue",
             "Reset all queues with an explicit confirmation token",
         )
@@ -3140,7 +3530,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ),
         ep(
             "POST",
-            "/api/auto-queue/pause",
+            "/api/queue/pause",
             "auto-queue",
             "Soft-pause active runs",
         )
@@ -3168,10 +3558,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({}),
             json!({"error": "no active runs to pause"}),
         )
-        .with_curl("curl -X POST http://localhost:8787/api/auto-queue/pause -H 'Content-Type: application/json' -d '{}'"),
+        .with_curl("curl -X POST http://localhost:8787/api/queue/pause -H 'Content-Type: application/json' -d '{}'"),
         ep(
             "POST",
-            "/api/auto-queue/resume",
+            "/api/queue/resume",
             "auto-queue",
             "Resume paused runs and dispatch next entries: continues a run from its paused checkpoint (vs. /retry which re-executes a failed step, /redispatch which creates a new dispatch id, or /reopen which re-admits a closed card).",
         )
@@ -3181,10 +3571,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({}),
             json!({"error": "no paused runs to resume"}),
         )
-        .with_curl("curl -X POST http://localhost:8787/api/auto-queue/resume"),
+        .with_curl("curl -X POST http://localhost:8787/api/queue/resume"),
         ep(
             "POST",
-            "/api/auto-queue/cancel",
+            "/api/queue/cancel",
             "auto-queue",
             "Cancel active or paused runs and skip pending entries",
         )
@@ -3197,10 +3587,10 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({}),
             json!({"error": "no cancellable runs"}),
         )
-        .with_curl("curl -X POST http://localhost:8787/api/auto-queue/cancel -H 'Content-Type: application/json' -d '{}'"),
+        .with_curl("curl -X POST http://localhost:8787/api/queue/cancel -H 'Content-Type: application/json' -d '{}'"),
         ep(
             "POST",
-            "/api/auto-queue/runs/{id}/order",
+            "/api/queue/runs/{id}/order",
             "auto-queue",
             "Submit ordered cards for a pending run",
         )
@@ -3225,7 +3615,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         ])
         .with_example(
             json!({"path": {"id": "run-1"}, "body": {"order": [423, 405], "rationale": "dependency-first"}}),
-            json!({"ok": true, "created": 2, "run_id": "run-1", "message": "Queue active. Call POST /api/auto-queue/dispatch-next to start dispatching."}),
+            json!({"ok": true, "created": 2, "run_id": "run-1", "message": "Queue active. Call POST /api/queue/dispatch-next to start dispatching."}),
         ),
         ep(
             "GET",
@@ -3511,7 +3901,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         )
         .with_example(
             json!({}),
-            json!({"categories": [{"name": "queue", "count": 15}], "endpoints": [{"method": "POST", "path": "/api/auto-queue/dispatch", "category": "queue", "subcategory": "auto-queue"}]}),
+            json!({"categories": [{"name": "queue", "count": 15}], "endpoints": [{"method": "POST", "path": "/api/queue/generate", "category": "queue", "subcategory": "auto-queue"}]}),
         ),
         ep(
             "GET",
@@ -3590,37 +3980,16 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_curl("curl -X POST http://localhost:8787/api/reviews/verdict -H 'Content-Type: application/json' -d '{\"card_id\":\"card-1\",\"verdict\":\"approved\",\"summary\":\"LGTM\"}'"),
         ep(
             "POST",
-            "/api/review-verdict",
-            "reviews",
-            "Deprecated alias for /api/reviews/verdict",
-        )
-        .deprecated_alias("/api/reviews/verdict"),
-        ep(
-            "POST",
             "/api/reviews/decision",
             "reviews",
             "Submit review-decision action // TODO: example",
         ),
         ep(
             "POST",
-            "/api/review-decision",
-            "reviews",
-            "Deprecated alias for /api/reviews/decision",
-        )
-        .deprecated_alias("/api/reviews/decision"),
-        ep(
-            "POST",
             "/api/reviews/tuning/aggregate",
             "reviews",
             "Aggregate review-tuning outcomes // TODO: example",
         ),
-        ep(
-            "POST",
-            "/api/review-tuning/aggregate",
-            "reviews",
-            "Deprecated alias for /api/reviews/tuning/aggregate",
-        )
-        .deprecated_alias("/api/reviews/tuning/aggregate"),
         ep(
             "POST",
             "/api/pm-decision",
@@ -3870,14 +4239,14 @@ fn guide_index() -> Vec<Value> {
         "name": "card-lifecycle-ops",
         "title": "Card Lifecycle Ops Guide",
         "path": "/api/docs/card-lifecycle-ops",
-        "summary": "Decision tree + endpoint reference for /redispatch, /retry, /transition, /auto-queue/generate, /dispatch-next. Read this BEFORE chaining card-lifecycle calls.",
+        "summary": "Decision tree + endpoint reference for /redispatch, /retry, /transition, /queue/generate, /dispatch-next. Read this BEFORE chaining card-lifecycle calls.",
     })]
 }
 
 /// GET /api/docs/card-lifecycle-ops — #1443.
 ///
 /// Long-form decision tree for card-lifecycle operations
-/// (/redispatch, /retry, /transition, /auto-queue/generate, /dispatch-next).
+/// (/redispatch, /retry, /transition, /queue/generate, /dispatch-next).
 /// Authored to make the 2026-04-30 #1435 duplicate-dispatch incident
 /// non-repeatable: every common scenario maps to a single-call answer, and
 /// the anti-pattern section names the exact 3-call chain that caused the
@@ -3897,7 +4266,7 @@ fn card_lifecycle_ops_body() -> Value {
         "title": "Card Lifecycle Ops Guide",
         "path": "/api/docs/card-lifecycle-ops",
         "last_refreshed": CARD_LIFECYCLE_OPS_LAST_REFRESHED,
-        "purpose": "Single source of truth for choosing among /redispatch, /retry, /transition, /auto-queue/generate, and /dispatch-next. The 2026-04-30 #1435 incident chained three of these and created duplicate dispatches. Read the decision tree FIRST, then the anti-pattern, then the endpoint table.",
+        "purpose": "Single source of truth for choosing among /redispatch, /retry, /transition, /queue/generate, and /dispatch-next. The 2026-04-30 #1435 incident chained three of these and created duplicate dispatches. Read the decision tree FIRST, then the anti-pattern, then the endpoint table.",
         "sections": {
             "1_decision_tree": {
                 "heading": "Section 1: Decision Tree",
@@ -3906,12 +4275,12 @@ fn card_lifecycle_ops_body() -> Value {
                     {
                         "scenario": "Card stuck in review/dilemma_pending, want to restart",
                         "single_call": "POST /api/kanban-cards/{id}/redispatch",
-                        "notes": "Cancels the live dispatch and creates a brand-new dispatch_id. Inspect new_dispatch_id, cancelled_dispatch_id, and next_action in the response. Do NOT follow with /transition or /auto-queue/generate."
+                        "notes": "Cancels the live dispatch and creates a brand-new dispatch_id. Inspect new_dispatch_id, cancelled_dispatch_id, and next_action in the response. Do NOT follow with /transition or /queue/generate."
                     },
                     {
                         "scenario": "Card done, want to retry the same failed step",
                         "single_call": "POST /api/kanban-cards/{id}/retry",
-                        "notes": "Re-executes the same failed step with the same intent (optional assignee swap via assignee_agent_id). Inspect new_dispatch_id, cancelled_dispatch_id, and next_action. Do NOT follow with /transition or /auto-queue/generate."
+                        "notes": "Re-executes the same failed step with the same intent (optional assignee swap via assignee_agent_id). Inspect new_dispatch_id, cancelled_dispatch_id, and next_action. Do NOT follow with /transition or /queue/generate."
                     },
                     {
                         "scenario": "Force card to a specific status",
@@ -3920,12 +4289,12 @@ fn card_lifecycle_ops_body() -> Value {
                     },
                     {
                         "scenario": "Bulk push N issues into the auto-queue",
-                        "single_call": "POST /api/auto-queue/generate with {\"issue_numbers\": [...]}",
+                        "single_call": "POST /api/queue/generate with {\"issue_numbers\": [...]}",
                         "notes": "Bulk only — never use to restart a single card that already has an active dispatch (it will silent-skip and surface skipped_due_to_active_dispatch). Inspect skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter."
                     },
                     {
                         "scenario": "Trigger the next dispatch from an existing run",
-                        "single_call": "POST /api/auto-queue/dispatch-next",
+                        "single_call": "POST /api/queue/dispatch-next",
                         "notes": "Use only after /generate has produced pending entries. Returns dispatched[], count, active_groups, pending_groups."
                     }
                 ]
@@ -3938,7 +4307,7 @@ fn card_lifecycle_ops_body() -> Value {
                         "endpoint": "POST /api/kanban-cards/{id}/redispatch",
                         "when_to_use": "Card has a live (pending/dispatched) dispatch and you want to restart with a brand-new dispatch_id.",
                         "single_call_complete": "Y",
-                        "common_pitfall": "Chaining /transition or /auto-queue/generate after it creates duplicate dispatches (#1442 incident)."
+                        "common_pitfall": "Chaining /transition or /queue/generate after it creates duplicate dispatches (#1442 incident)."
                     },
                     {
                         "endpoint": "POST /api/kanban-cards/{id}/retry",
@@ -3953,13 +4322,13 @@ fn card_lifecycle_ops_body() -> Value {
                         "common_pitfall": "target=ready while a dispatch is live returns 409 unless force=true (#1444 guard). Without force, callers used to chain /redispatch + /transition + /generate — that is the exact #1435 anti-pattern."
                     },
                     {
-                        "endpoint": "POST /api/auto-queue/generate",
+                        "endpoint": "POST /api/queue/generate",
                         "when_to_use": "Bulk push of multiple issue numbers into a queue run.",
                         "single_call_complete": "Y for the bulk intent",
                         "common_pitfall": "Not a single-card restart tool. Cards that already have a live dispatch are silently skipped and reported in skipped_due_to_active_dispatch — do not retry by chaining /redispatch first."
                     },
                     {
-                        "endpoint": "POST /api/auto-queue/dispatch-next",
+                        "endpoint": "POST /api/queue/dispatch-next",
                         "when_to_use": "Move the next pending entry of an existing run to dispatched.",
                         "single_call_complete": "Y",
                         "common_pitfall": "No-op if there are no pending entries; check the dispatched[] length before assuming progress."
@@ -3971,13 +4340,13 @@ fn card_lifecycle_ops_body() -> Value {
                 "wrong_pattern": [
                     "POST /api/kanban-cards/{id}/redispatch              # creates dispatch A",
                     "POST /api/kanban-cards/{id}/transition status:ready # cancels A, creates dispatch B  <- WRONG: this cancel+create is implicit; caller did not realize a fresh dispatch was made",
-                    "POST /api/auto-queue/generate                       # adds the card to a queue run; a subsequent /dispatch-next (or activate=true) then creates dispatch C  <- WRONG: silent-skip exists for cards with an active dispatch but is easy to miss in the response"
+                    "POST /api/queue/generate                       # adds the card to a queue run; a subsequent /dispatch-next (or activate=true) then creates dispatch C  <- WRONG: silent-skip exists for cards with an active dispatch but is easy to miss in the response"
                 ],
-                "why_it_broke": "Each of /redispatch, /transition status:ready, and the /auto-queue/generate -> /dispatch-next chain is single-call complete for its intent. Chaining them produced multiple live dispatch rows for one card (dispatch A from /redispatch, dispatch B from /transition's force-transition cleanup, plus the queue-run path from /generate that the activate hook then turned into dispatch C). The runtime started executing the duplicates, causing the outage on 2026-04-30. Note: /generate by itself creates queue entries — dispatch rows are produced by /dispatch-next or the activate=true shortcut.",
+                "why_it_broke": "Each of /redispatch, /transition status:ready, and the /queue/generate -> /dispatch-next chain is single-call complete for its intent. Chaining them produced multiple live dispatch rows for one card (dispatch A from /redispatch, dispatch B from /transition's force-transition cleanup, plus the queue-run path from /generate that the activate hook then turned into dispatch C). The runtime started executing the duplicates, causing the outage on 2026-04-30. Note: /generate by itself creates queue entries — dispatch rows are produced by /dispatch-next or the activate=true shortcut.",
                 "how_it_is_prevented_now": [
                     "#1442 added new_dispatch_id and cancelled_dispatch_id(s) to /redispatch, /retry, and /transition responses, plus a per-endpoint follow-up signal: /redispatch and /retry return `next_action` (a fixed marker such as 'none_required' or 'assign_agent_then_call_redispatch'); /transition returns `next_action_hint` (a free-form sentence naming the exact follow-up). On the success path both are 'none_required' / point at no further action — if a caller sees that and still chains another mutation, it is a caller bug, not a missing signal.",
                     "#1444 added a 409 Conflict guard on /transition status:ready when an active dispatch exists. Callers must explicitly opt in via force=true (or legacy cancel_dispatches=true) to override.",
-                    "#1444 also made /auto-queue/generate surface structured skips (skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter) instead of silently dropping the entry, so even a misuse is observable from the response. Note: /dispatch-next does NOT return these arrays — it only reports `dispatched`, `count`, `active_groups`, and `pending_groups`."
+                    "#1444 also made /queue/generate surface structured skips (skipped_due_to_active_dispatch / skipped_due_to_dependency / skipped_due_to_filter) instead of silently dropping the entry, so even a misuse is observable from the response. Note: /dispatch-next does NOT return these arrays — it only reports `dispatched`, `count`, `active_groups`, and `pending_groups`."
                 ],
                 "right_pattern": "Pick ONE row from Section 1 and call it ONCE. Inspect new_dispatch_id, cancelled_dispatch_id(s), next_action / next_action_hint, and (for /generate) skipped_due_to_*. Do NOT call a second mutation unless next_action / next_action_hint says so."
             },
@@ -4012,21 +4381,21 @@ fn card_lifecycle_ops_body() -> Value {
                     {
                         "field": "next_action_hint",
                         "source": "/transition (force-transition path; also returned in the 409 body)",
-                        "notes": "Free-form sentence naming the exact follow-up — for example 'call /api/auto-queue/generate to dispatch newly-ready card', or guidance on the 409 override. Distinct from /redispatch and /retry's `next_action` field."
+                        "notes": "Free-form sentence naming the exact follow-up — for example 'call /api/queue/generate to dispatch newly-ready card', or guidance on the 409 override. Distinct from /redispatch and /retry's `next_action` field."
                     },
                     {
                         "field": "skipped_due_to_active_dispatch",
-                        "source": "/auto-queue/generate (NOT /dispatch-next)",
+                        "source": "/queue/generate (NOT /dispatch-next)",
                         "notes": "Array of {issue_number, existing_dispatch_id} entries that were silently skipped because the card already had a live dispatch."
                     },
                     {
                         "field": "skipped_due_to_dependency",
-                        "source": "/auto-queue/generate (NOT /dispatch-next)",
+                        "source": "/queue/generate (NOT /dispatch-next)",
                         "notes": "Array of {issue_number, unresolved_deps[]} entries skipped because dependency cards were not yet done."
                     },
                     {
                         "field": "skipped_due_to_filter",
-                        "source": "/auto-queue/generate (NOT /dispatch-next)",
+                        "source": "/queue/generate (NOT /dispatch-next)",
                         "notes": "Array of entries skipped by repo/agent_id filters."
                     },
                     {

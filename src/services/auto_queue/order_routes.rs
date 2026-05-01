@@ -11,7 +11,7 @@ pub struct OrderBody {
     pub reasoning: Option<String>,
 }
 
-/// POST /api/auto-queue/runs/:id/order
+/// POST /api/queue/runs/:id/order
 /// Authenticated callback: provides the ordered card list for a pending run.
 pub(super) async fn resolve_submit_order_card_with_pg(
     pool: &sqlx::PgPool,
@@ -247,7 +247,7 @@ pub(super) async fn submit_order_with_pg(
             "ok": true,
             "created": created,
             "run_id": run_id,
-            "message": "Queue active. Call POST /api/auto-queue/dispatch-next to start dispatching.",
+            "message": "Queue active. Call POST /api/queue/dispatch-next to start dispatching.",
         })),
     )
 }
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_thread_reset_requires_new_assignment() {
+    fn slot_thread_reset_is_not_implicit_for_auto_queue_assignment() {
         let conn = slot_reset_conn();
         conn.execute(
             "INSERT INTO auto_queue_slots (agent_id, slot_index, thread_id_map)
@@ -338,12 +338,12 @@ mod tests {
             "same-run slot rebind must keep the existing thread binding"
         );
         assert!(
-            slot_requires_thread_reset_before_reuse(&conn, "agent-a", 0, true, false),
-            "cross-run reclaim must reset preserved slot bindings"
+            !slot_requires_thread_reset_before_reuse(&conn, "agent-a", 0, true, false),
+            "cross-run reclaim must keep the existing slot binding unless explicitly reset"
         );
         assert!(
-            slot_requires_thread_reset_before_reuse(&conn, "agent-a", 0, false, true),
-            "different-group same-run reuse must also reset preserved slot bindings"
+            !slot_requires_thread_reset_before_reuse(&conn, "agent-a", 0, false, true),
+            "different-group same-run reuse must keep the existing slot binding"
         );
     }
 
@@ -549,7 +549,6 @@ mod tests {
     }
 
     // ── #1065 param standardization tests ───────────────────────────────
-    // Canonical body uses snake_case. Legacy camelCase kept via serde alias.
 
     #[test]
     fn param_standardization_reorder_body_accepts_snake_case() {
@@ -561,23 +560,17 @@ mod tests {
     }
 
     #[test]
-    fn param_standardization_reorder_body_accepts_legacy_camel_case_alias() {
+    fn param_standardization_reorder_body_rejects_legacy_camel_case_alias() {
         let payload = r#"{"orderedIds":["a","b"],"agentId":"agent-x"}"#;
-        let body: super::ReorderBody = serde_json::from_str(payload)
-            .expect("legacy camelCase payload must still parse via serde alias");
-        assert_eq!(body.ordered_ids, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(body.agent_id.as_deref(), Some("agent-x"));
+        assert!(
+            serde_json::from_str::<super::ReorderBody>(payload).is_err(),
+            "legacy camelCase payload must not parse after #904 path cleanup"
+        );
     }
 
     #[test]
-    fn path_prefix_canonical_queue_and_legacy_auto_queue_both_mount() {
-        // Sanity-check: ensure both prefixes are wired. The ops router mounts
-        // /api/queue/* (canonical #1065) alongside /api/auto-queue/* (legacy alias).
-        // This test guards against accidental removal of either mount.
-        // We only assert the canonical handler names compile; the router wiring
-        // is covered by the api_inventory integration tests.
+    fn path_prefix_canonical_queue_handlers_compile() {
         let _ = super::generate;
-        let _ = super::dispatch;
         let _ = super::reorder;
     }
 }

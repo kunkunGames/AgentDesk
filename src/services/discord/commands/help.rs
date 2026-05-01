@@ -8,7 +8,10 @@ use crate::services::provider::ProviderKind;
 fn build_main_help_body(provider: &ProviderKind) -> String {
     let provider_name = provider.display_name();
     let model_section = match provider {
-        ProviderKind::Claude | ProviderKind::Codex => {
+        ProviderKind::Codex => {
+            "\n`/model` — Open the model picker for this channel\n`/fast` — Toggle native fast mode for this channel\n`/goals` — Toggle Codex goals for this channel"
+        }
+        ProviderKind::Claude => {
             "\n`/model` — Open the model picker for this channel\n`/fast` — Toggle native fast mode for this channel"
         }
         _ => "\n`/model` — Open the model picker for this channel",

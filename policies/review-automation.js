@@ -530,7 +530,7 @@ var reviewAutomation = {
     });
   },
 
-  // ── Review Verdict — from /api/review-verdict ─────────────
+  // ── Review Verdict — from /api/reviews/verdict ─────────────
   onReviewVerdict: function(payload) {
     if (!payload.card_id || !payload.verdict) return;
     processVerdict(payload.card_id, payload.verdict, payload, {

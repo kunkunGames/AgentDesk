@@ -781,7 +781,7 @@ function OfficeManualWarningOverlay({
                 }
               }}
             >
-              {/* Compact "!" pill styled to match the in-canvas Pixi
+              {/* Compact "<!>" pill styled to match the in-canvas Pixi
                   nameplate (white 85% rounded-rect with subtle border)
                   so the warning tag reads as part of the same visual
                   language. The yellow glyph is the only colored
@@ -792,7 +792,7 @@ function OfficeManualWarningOverlay({
                   else buttonRefs.current.delete(warning.cardId);
                 }}
                 type="button"
-                className="relative inline-flex h-7 w-7 items-center justify-center rounded-full border transition-colors focus:outline-none focus:ring-2"
+                className="relative inline-flex h-7 min-w-9 items-center justify-center rounded-[10px] border px-1.5 transition-colors focus:outline-none focus:ring-2"
                 style={{
                   borderColor: "color-mix(in srgb, white 38%, var(--th-border) 62%)",
                   background:
@@ -821,10 +821,10 @@ function OfficeManualWarningOverlay({
                   }}
                 />
                 <span
-                  className="text-[15px] font-bold leading-none"
+                  className="font-mono text-[11px] font-bold leading-none"
                   style={{ color: "var(--th-accent-warn)" }}
                 >
-                  !
+                  &lt;!&gt;
                 </span>
               </button>
             </div>

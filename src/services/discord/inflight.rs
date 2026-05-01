@@ -18,7 +18,7 @@ use super::runtime_store::{atomic_write, discord_inflight_root};
 use crate::services::agent_protocol::TaskNotificationKind;
 use crate::services::provider::ProviderKind;
 
-const INFLIGHT_STATE_VERSION: u32 = 5;
+const INFLIGHT_STATE_VERSION: u32 = 6;
 const INFLIGHT_MAX_AGE_SECS: u64 = 300; // 5 minutes
 const DRAIN_RESTART_MAX_AGE_SECS: u64 = 1800; // 30 minutes
 const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
@@ -55,6 +55,10 @@ pub(super) struct InflightTurnState {
     pub thread_title: Option<String>,
     pub request_owner_user_id: u64,
     pub user_msg_id: u64,
+    /// Discord message id for the live status panel when status-panel-v2 is
+    /// enabled. `current_msg_id` remains the assistant response message.
+    #[serde(default)]
+    pub status_message_id: Option<u64>,
     pub current_msg_id: u64,
     pub current_msg_len: usize,
     pub user_text: String,
@@ -185,6 +189,7 @@ impl InflightTurnState {
             thread_title: None,
             request_owner_user_id,
             user_msg_id,
+            status_message_id: None,
             current_msg_id,
             current_msg_len: 0,
             user_text,
@@ -820,9 +825,13 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
 /// test --bin agentdesk` invocations.
 #[cfg(test)]
 mod stall_recovery_tests {
-    use super::{INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState, inflight_state_is_stale};
+    use super::{
+        INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState, inflight_state_is_stale,
+        load_inflight_states_from_root, save_inflight_state_in_root,
+    };
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+    use tempfile::TempDir;
 
     /// `inflight_state_is_stale` must flip to true once `updated_at` is
     /// older than the configured threshold and stay false for fresh state.
@@ -877,6 +886,33 @@ mod stall_recovery_tests {
             !inflight_state_is_stale(&state, now_unix, INFLIGHT_STALENESS_THRESHOLD_SECS),
             "unparseable updated_at must NOT be treated as stale"
         );
+    }
+
+    #[test]
+    fn status_message_id_round_trips_for_status_panel_resume() {
+        let temp = TempDir::new().unwrap();
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            42,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        state.status_message_id = Some(123_456);
+
+        save_inflight_state_in_root(temp.path(), &state).expect("save inflight state");
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status_message_id, Some(123_456));
+        assert_eq!(loaded[0].current_msg_id, 99);
     }
 }
 

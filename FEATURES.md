@@ -83,17 +83,17 @@ Two tables manage the auto-queue:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/auto-queue/generate` | POST | Manual generation trigger |
-| `/api/auto-queue/dispatch-next` | POST | Manual activation trigger (formerly `/api/auto-queue/activate`, removed in #1064) |
-| `/api/auto-queue/status` | GET | Current queue status |
-| `/api/auto-queue/entries/{id}/skip` | PATCH | Skip queue entry |
-| `/api/auto-queue/runs/{id}` | PATCH | Update run |
-| `/api/auto-queue/reorder` | PATCH | Reorder queue |
-| `/api/auto-queue/reset` | POST | Reset one agent queue |
-| `/api/auto-queue/reset-global` | POST | Reset all queues with confirmation |
-| `/api/auto-queue/pause` | POST | Pause queue |
-| `/api/auto-queue/resume` | POST | Resume queue |
-| `/api/auto-queue/cancel` | POST | Cancel queue |
+| `/api/queue/generate` | POST | Manual generation trigger |
+| `/api/queue/dispatch-next` | POST | Manual activation trigger (formerly `/api/auto-queue/activate`, removed in #1064) |
+| `/api/queue/status` | GET | Current queue status |
+| `/api/queue/entries/{id}/skip` | PATCH | Skip queue entry |
+| `/api/queue/runs/{id}` | PATCH | Update run |
+| `/api/queue/reorder` | PATCH | Reorder queue |
+| `/api/queue/reset` | POST | Reset one agent queue |
+| `/api/queue/reset-global` | POST | Reset all queues with confirmation |
+| `/api/queue/pause` | POST | Pause queue |
+| `/api/queue/resume` | POST | Resume queue |
+| `/api/queue/cancel` | POST | Cancel queue |
 
 ---
 

@@ -184,42 +184,101 @@ pub(super) fn thread_guard_inflight_is_stale(
         .unwrap_or(false)
 }
 
-/// #1446 Layer 2 — full force-clean predicate. Requires BOTH:
-///   1. `thread_guard_inflight_is_stale` (persisted `updated_at` is older
-///      than `INFLIGHT_STALENESS_THRESHOLD_SECS`), AND
-///   2. the watcher-state snapshot for the thread reports
-///      `desynced == true` (capture-lag, cross-owner mismatch, or live-
-///      tmux orphan with no relay heartbeat — the same conjunction the
-///      stall-watchdog uses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleActiveTurnProofClassification {
+    LiveOrUnclear,
+    RelayStalled,
+    QueueBlockedOrphan,
+    ExplicitBackgroundStatus,
+}
+
+fn classify_stale_active_turn_proof(
+    inflight: &super::super::inflight::InflightTurnState,
+    snapshot: &super::super::health::WatcherStateSnapshot,
+    now_unix_secs: i64,
+) -> StaleActiveTurnProofClassification {
+    if !super::super::inflight::inflight_state_is_stale(
+        inflight,
+        now_unix_secs,
+        super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS,
+    ) {
+        return StaleActiveTurnProofClassification::LiveOrUnclear;
+    }
+
+    if inflight.long_running_placeholder_active {
+        return StaleActiveTurnProofClassification::ExplicitBackgroundStatus;
+    }
+
+    if snapshot.desynced {
+        return StaleActiveTurnProofClassification::RelayStalled;
+    }
+
+    if !snapshot.inflight_state_present {
+        return StaleActiveTurnProofClassification::LiveOrUnclear;
+    }
+
+    if snapshot.mailbox_active_user_msg_id.is_some()
+        && snapshot.mailbox_active_user_msg_id != Some(inflight.user_msg_id)
+    {
+        return StaleActiveTurnProofClassification::LiveOrUnclear;
+    }
+
+    if !snapshot.attached && snapshot.tmux_session_alive != Some(true) {
+        return StaleActiveTurnProofClassification::QueueBlockedOrphan;
+    }
+
+    StaleActiveTurnProofClassification::LiveOrUnclear
+}
+
+async fn classify_channel_stale_active_turn_proof(
+    shared: &std::sync::Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+    now_unix_secs: i64,
+) -> StaleActiveTurnProofClassification {
+    let Some(inflight) = super::super::inflight::load_inflight_state(provider, channel_id.get())
+    else {
+        return StaleActiveTurnProofClassification::LiveOrUnclear;
+    };
+    let Some(registry) = shared.health_registry.upgrade() else {
+        return StaleActiveTurnProofClassification::LiveOrUnclear;
+    };
+    let Some(snapshot) = registry
+        .snapshot_watcher_state_for_provider(provider, channel_id.get())
+        .await
+    else {
+        return StaleActiveTurnProofClassification::LiveOrUnclear;
+    };
+    classify_stale_active_turn_proof(&inflight, &snapshot, now_unix_secs)
+}
+
+/// #1446 / #1456 — full force-clean predicate. Requires stale persisted
+/// inflight state plus either:
+///   1. the watcher-state snapshot for the thread reports `desynced == true`
+///      (capture-lag, cross-owner mismatch, or live-tmux orphan with no
+///      relay heartbeat — the same conjunction the stall-watchdog uses), or
+///   2. the mailbox active-turn proof has no live owner (`attached == false`
+///      and no live tmux session), which is the queue-blocked fail-open path.
 ///
 /// Without the snapshot's desync corroboration we would force-clean a
 /// healthy long-running turn whose `updated_at` simply has not advanced
-/// because no chunk hit the bridge in the last 5 minutes. Returning
-/// `false` when the registry is unreachable is the conservative default —
-/// a missing registry happens during startup before the stall-watchdog
-/// would also be running, so deferring cleanup costs nothing.
+/// because no chunk hit the bridge in the last 5 minutes. The no-owner path
+/// is intentionally narrower: live tmux sessions and explicit background
+/// placeholder status are preserved. Returning `false` when the registry is
+/// unreachable is the conservative default — a missing registry happens
+/// during startup before the stall-watchdog would also be running, so
+/// deferring cleanup costs nothing.
 pub(super) async fn thread_guard_should_force_clean_stale_thread(
     shared: &std::sync::Arc<SharedData>,
     provider: &ProviderKind,
     thread_id: serenity::ChannelId,
     now_unix_secs: i64,
 ) -> bool {
-    if !thread_guard_inflight_is_stale(provider, thread_id, now_unix_secs) {
-        return false;
-    }
-    let Some(registry) = shared.health_registry.upgrade() else {
-        return false;
-    };
-    // Provider-scoped snapshot — multi-provider deployments may share a
-    // Discord channel, so the unscoped variant could return a different
-    // provider's state and we'd misread `desynced`.
-    let Some(snapshot) = registry
-        .snapshot_watcher_state_for_provider(provider, thread_id.get())
-        .await
-    else {
-        return false;
-    };
-    snapshot.desynced
+    matches!(
+        classify_channel_stale_active_turn_proof(shared, provider, thread_id, now_unix_secs).await,
+        StaleActiveTurnProofClassification::RelayStalled
+            | StaleActiveTurnProofClassification::QueueBlockedOrphan
+    )
 }
 
 /// #1446 Layer 2 — perform the THREAD-GUARD's stale-thread cleanup:
@@ -267,6 +326,62 @@ pub(super) async fn thread_guard_force_clean_stale_thread(
         cleared.removed_token,
         "1446_thread_guard_stale_inflight",
     );
+}
+
+async fn release_queue_blocked_stale_active_turn(
+    shared: &std::sync::Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+    now_unix_secs: i64,
+) -> bool {
+    let classification =
+        classify_channel_stale_active_turn_proof(shared, provider, channel_id, now_unix_secs).await;
+    if classification != StaleActiveTurnProofClassification::QueueBlockedOrphan {
+        return false;
+    }
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::warn!(
+        "  [{ts}] 🔓 QUEUE-GUARD: stale active-turn proof for channel {} has no live owner; releasing mailbox and proceeding",
+        channel_id
+    );
+    super::super::inflight::delete_inflight_state_file(provider, channel_id.get());
+    super::super::clear_watchdog_deadline_override(channel_id.get()).await;
+    let finish = mailbox_finish_turn(shared, provider, channel_id).await;
+    super::super::stall_recovery::finalize_orphaned_clear(
+        shared,
+        channel_id,
+        finish.removed_token,
+        "1456_queue_blocked_stale_proof",
+    );
+    shared
+        .dispatch_thread_parents
+        .retain(|_, thread_id| *thread_id != channel_id);
+    if !finish.has_pending {
+        shared.dispatch_role_overrides.remove(&channel_id);
+    }
+    true
+}
+
+async fn mailbox_has_live_active_turn_or_cleanup_stale_proof(
+    shared: &std::sync::Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+) -> bool {
+    if !mailbox_has_active_turn(shared, channel_id).await {
+        return false;
+    }
+    if release_queue_blocked_stale_active_turn(
+        shared,
+        provider,
+        channel_id,
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    {
+        return mailbox_has_active_turn(shared, channel_id).await;
+    }
+    true
 }
 
 fn should_merge_consecutive_messages(text: &str, is_allowed_bot: bool) -> bool {
@@ -474,9 +589,12 @@ async fn handle_reaction_remove(
                 return Ok(());
             }
 
-            let stop_lookup =
-                super::message_handler::cancel_text_stop_token_mailbox(&data.shared, channel_id)
-                    .await;
+            let stop_lookup = super::message_handler::cancel_text_stop_token_mailbox(
+                &data.shared,
+                &data.provider,
+                channel_id,
+            )
+            .await;
             match stop_lookup {
                 super::message_handler::TextStopLookup::Stop(token) => {
                     // #1218: stop_active_turn sends the provider abort key
@@ -1057,7 +1175,13 @@ pub(in crate::services::discord) async fn handle_event(
             // of starting a parallel turn that would stomp the current
             // placeholder.
             if text.starts_with("DISPATCH:") {
-                if mailbox_has_active_turn(&data.shared, channel_id).await {
+                if mailbox_has_live_active_turn_or_cleanup_stale_proof(
+                    &data.shared,
+                    &data.provider,
+                    channel_id,
+                )
+                .await
+                {
                     let outcome = enqueue_soft_intervention(
                         data,
                         channel_id,
@@ -1090,7 +1214,13 @@ pub(in crate::services::discord) async fn handle_event(
             }
 
             // Queue messages while AI is in progress (executed as next turn after current finishes)
-            if mailbox_has_active_turn(&data.shared, channel_id).await {
+            if mailbox_has_live_active_turn_or_cleanup_stale_proof(
+                &data.shared,
+                &data.provider,
+                channel_id,
+            )
+            .await
+            {
                 let outcome = enqueue_soft_intervention(
                     data,
                     channel_id,
@@ -1418,6 +1548,90 @@ mod thread_guard_stale_pure_tests {
         std::fs::write(&path, json).expect("write seeded inflight");
     }
 
+    fn inflight_with_updated_at(
+        provider: &ProviderKind,
+        channel_id: u64,
+        updated_at: &str,
+    ) -> super::super::super::inflight::InflightTurnState {
+        let mut state = super::super::super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("test-thread-guard".to_string()),
+            42,
+            8_001,
+            8_002,
+            "test-input".to_string(),
+            Some("test-session".to_string()),
+            Some("stale-proof-tmux".to_string()),
+            None,
+            None,
+            0,
+        );
+        state.updated_at = updated_at.to_string();
+        state.started_at = updated_at.to_string();
+        state
+    }
+
+    fn watcher_snapshot(
+        provider: &ProviderKind,
+        channel_id: u64,
+        user_msg_id: u64,
+        attached: bool,
+        tmux_session_alive: Option<bool>,
+        desynced: bool,
+    ) -> super::super::super::health::WatcherStateSnapshot {
+        let relay_health = super::super::super::relay_health::RelayHealthSnapshot {
+            provider: provider.as_str().to_string(),
+            channel_id,
+            active_turn: super::super::super::relay_health::RelayActiveTurn::Foreground,
+            tmux_session: Some("stale-proof-tmux".to_string()),
+            tmux_alive: tmux_session_alive,
+            watcher_attached: attached,
+            watcher_owner_channel_id: attached.then_some(channel_id),
+            watcher_owns_live_relay: false,
+            bridge_inflight_present: true,
+            bridge_current_msg_id: Some(8_002),
+            mailbox_has_cancel_token: true,
+            mailbox_active_user_msg_id: Some(user_msg_id),
+            queue_depth: 0,
+            pending_discord_callback_msg_id: Some(8_002),
+            pending_thread_proof: false,
+            parent_channel_id: None,
+            thread_channel_id: None,
+            last_relay_ts_ms: None,
+            last_outbound_activity_ms: None,
+            last_capture_offset: None,
+            last_relay_offset: 0,
+            unread_bytes: None,
+            desynced,
+            stale_thread_proof: false,
+        };
+        let relay_stall_state =
+            super::super::super::relay_health::RelayStallClassifier::classify(&relay_health);
+        super::super::super::health::WatcherStateSnapshot {
+            provider: provider.as_str().to_string(),
+            attached,
+            tmux_session: Some("stale-proof-tmux".to_string()),
+            watcher_owner_channel_id: attached.then_some(channel_id),
+            last_relay_offset: 0,
+            inflight_state_present: true,
+            last_relay_ts_ms: 0,
+            last_capture_offset: None,
+            unread_bytes: None,
+            desynced,
+            reconnect_count: 0,
+            inflight_started_at: None,
+            inflight_updated_at: None,
+            inflight_user_msg_id: Some(user_msg_id),
+            inflight_current_msg_id: Some(8_002),
+            tmux_session_alive,
+            has_pending_queue: false,
+            mailbox_active_user_msg_id: Some(user_msg_id),
+            relay_stall_state,
+            relay_health,
+        }
+    }
+
     /// Scoped env-var override for `AGENTDESK_ROOT_DIR`. Restores the
     /// previous value (or removes the var) on drop. Used so the always-on
     /// test does not leak state into adjacent test runs that may also rely
@@ -1491,6 +1705,65 @@ mod thread_guard_stale_pure_tests {
                 now_unix
             ),
             "fresh inflight (updated_at={fresh_at}) must NOT be classified as stale"
+        );
+    }
+
+    /// #1456: a stale active-turn proof with no attached watcher and no live
+    /// tmux owner must be classified as queue-blocked orphan state. The intake
+    /// gate uses this to release the mailbox before the new user message takes
+    /// the normal streaming path instead of being queued forever.
+    #[test]
+    fn stale_active_turn_proof_classifies_no_owner_as_queue_blocked_orphan() {
+        let provider = ProviderKind::Codex;
+        let channel_id = 900_000_000_000_910u64;
+        let now_unix = chrono::Utc::now().timestamp();
+        let stale_at = local_at_offset(
+            now_unix,
+            -(super::super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64) - 5,
+        );
+        let inflight = inflight_with_updated_at(&provider, channel_id, &stale_at);
+        let snapshot = watcher_snapshot(
+            &provider,
+            channel_id,
+            inflight.user_msg_id,
+            false,
+            Some(false),
+            false,
+        );
+
+        assert_eq!(
+            super::classify_stale_active_turn_proof(&inflight, &snapshot, now_unix),
+            super::StaleActiveTurnProofClassification::QueueBlockedOrphan
+        );
+    }
+
+    /// #1456: explicit background placeholders are a visible status surface,
+    /// not disposable stale proof. Even if their inflight timestamp is old,
+    /// the fail-open classifier must preserve them instead of taking the
+    /// cleanup path that would cancel the owning session.
+    #[test]
+    fn stale_active_turn_proof_preserves_explicit_background_status() {
+        let provider = ProviderKind::Codex;
+        let channel_id = 900_000_000_000_911u64;
+        let now_unix = chrono::Utc::now().timestamp();
+        let stale_at = local_at_offset(
+            now_unix,
+            -(super::super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64) - 5,
+        );
+        let mut inflight = inflight_with_updated_at(&provider, channel_id, &stale_at);
+        inflight.long_running_placeholder_active = true;
+        let snapshot = watcher_snapshot(
+            &provider,
+            channel_id,
+            inflight.user_msg_id,
+            false,
+            Some(false),
+            false,
+        );
+
+        assert_eq!(
+            super::classify_stale_active_turn_proof(&inflight, &snapshot, now_unix),
+            super::StaleActiveTurnProofClassification::ExplicitBackgroundStatus
         );
     }
 }

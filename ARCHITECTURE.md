@@ -47,7 +47,6 @@ src/
 │   ├── run.rs
 │   └── utils.rs
 ├── compat/
-│   ├── deprecated_alias.rs
 │   ├── legacy_tmp_paths.rs
 │   └── mod.rs
 ├── db/
@@ -154,6 +153,7 @@ src/
 │   │   ├── analytics.rs
 │   │   ├── auth.rs
 │   │   ├── auto_queue.rs
+│   │   ├── cluster.rs
 │   │   ├── cron_api.rs
 │   │   ├── departments.rs
 │   │   ├── discord.rs
@@ -191,10 +191,16 @@ src/
 │   │   ├── stats.rs
 │   │   ├── termination_events.rs
 │   │   └── v1.rs
+│   ├── cluster.rs
 │   ├── cron_catalog.rs
+│   ├── issue_specs.rs
 │   ├── maintenance.rs
 │   ├── mod.rs
+│   ├── multinode_regression.rs
+│   ├── resource_locks.rs
 │   ├── state.rs
+│   ├── task_dispatch_claims.rs
+│   ├── test_phase_runs.rs
 │   ├── worker_registry.rs
 │   └── ws.rs
 ├── services/
@@ -218,7 +224,6 @@ src/
 │   │   ├── planning.rs
 │   │   ├── query.rs
 │   │   ├── route.rs
-│   │   ├── route_dispatch.rs
 │   │   ├── route_generate.rs
 │   │   ├── route_types.rs
 │   │   ├── runtime.rs
@@ -279,8 +284,10 @@ src/
 │   │   │   ├── tests.rs
 │   │   │   └── tmux_runtime.rs
 │   │   ├── watchers/
-│   │   │   └── lifecycle.rs
+│   │   │   ├── lifecycle.rs
+│   │   │   └── lifecycle_decision.rs
 │   │   ├── adk_session.rs
+│   │   ├── agent_handoff.rs
 │   │   ├── agentdesk_config.rs
 │   │   ├── discord_io.rs
 │   │   ├── formatting.rs
@@ -303,11 +310,14 @@ src/
 │   │   ├── org_writer.rs
 │   │   ├── placeholder_cleanup.rs
 │   │   ├── placeholder_controller.rs
+│   │   ├── placeholder_live_events.rs
 │   │   ├── placeholder_sweeper.rs
 │   │   ├── prompt_builder.rs
 │   │   ├── queue_io.rs
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── recovery_engine.rs
+│   │   ├── relay_health.rs
+│   │   ├── relay_recovery.rs
 │   │   ├── response_sanitizer.rs
 │   │   ├── restart_ctrl.rs
 │   │   ├── restart_mode.rs

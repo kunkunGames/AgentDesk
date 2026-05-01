@@ -1,7 +1,7 @@
 use axum::{
     Json,
     body::Bytes,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -39,6 +39,13 @@ struct ChannelSessionState {
 struct StaleMailboxRepairRequest {
     channel_id: u64,
     expected_has_cancel_token: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RelayRecoveryRequest {
+    provider: Option<String>,
+    #[serde(default)]
+    apply: bool,
 }
 
 fn discord_control_endpoints_allowed(
@@ -115,6 +122,14 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        let cluster_standby_without_gateway =
+            cluster_standby_without_gateway(state, server_up, &degraded_reasons).await;
+        if cluster_standby_without_gateway {
+            status = health::HealthStatus::Healthy;
+            degraded_reasons.retain(|reason| reason.as_str() != Some("no_providers_registered"));
+            json["fully_recovered"] = serde_json::json!(true);
+            json["cluster_standby"] = serde_json::json!(true);
+        }
 
         if !server_up {
             status = status.worsen(health::HealthStatus::Unhealthy);
@@ -256,6 +271,10 @@ fn public_health_json(json: serde_json::Value) -> serde_json::Value {
         .get("fully_recovered")
         .cloned()
         .unwrap_or_else(|| server_up.clone());
+    let cluster_standby = json
+        .get("cluster_standby")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(false));
     let degraded = status.as_str().is_some_and(|status| status != "healthy");
     serde_json::json!({
         "ok": !degraded,
@@ -265,8 +284,55 @@ fn public_health_json(json: serde_json::Value) -> serde_json::Value {
         "dashboard": dashboard,
         "server_up": server_up,
         "fully_recovered": fully_recovered,
+        "cluster_standby": cluster_standby,
         "degraded": degraded,
     })
+}
+
+async fn cluster_standby_without_gateway(
+    state: &AppState,
+    server_up: bool,
+    degraded_reasons: &[serde_json::Value],
+) -> bool {
+    if !server_up || !state.config.cluster.enabled {
+        return false;
+    }
+    if !degraded_reasons
+        .iter()
+        .any(|reason| reason.as_str() == Some("no_providers_registered"))
+    {
+        return false;
+    }
+    let instance_id = state
+        .config
+        .cluster
+        .instance_id
+        .as_deref()
+        .unwrap_or("")
+        .trim();
+    if instance_id.is_empty() {
+        return false;
+    }
+    let Some(pool) = state.pg_pool_ref() else {
+        return false;
+    };
+    let ttl_secs = state.config.cluster.lease_ttl_secs.max(1) as f64;
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT effective_role
+          FROM worker_nodes
+         WHERE instance_id = $1
+           AND last_heartbeat_at >= NOW() - ($2::double precision * INTERVAL '1 second')
+        "#,
+    )
+    .bind(instance_id)
+    .bind(ttl_secs)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .as_deref()
+        == Some("worker")
 }
 
 fn stale_mailbox_repair_applied(
@@ -644,7 +710,72 @@ pub async fn stale_mailbox_repair_handler(
         .into_response()
 }
 
-/// POST /api/send — agent-to-agent native routing.
+/// POST /api/channels/{id}/relay-recovery — protected/local relay recovery dry-run.
+pub async fn relay_recovery_handler(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Path(channel_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !discord_control_endpoints_allowed(&state.config, Some(peer_addr)) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"ok": false, "error": "auth_token required for non-loopback host"})),
+        )
+            .into_response();
+    }
+
+    let channel_id = match channel_id.parse::<u64>() {
+        Ok(channel_id) if channel_id > 0 => channel_id,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "channel_id must be a numeric Discord channel ID"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(ref registry) = state.health_registry else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok": false, "error": "Discord not available (standalone mode)"})),
+        )
+            .into_response();
+    };
+
+    let request = if body.is_empty() {
+        RelayRecoveryRequest::default()
+    } else {
+        let body_str = String::from_utf8_lossy(&body);
+        match serde_json::from_str::<RelayRecoveryRequest>(&body_str) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("invalid request: {error}")
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let provider = request.provider.as_deref();
+    let (status_str, response_body) =
+        health::handle_relay_recovery(registry, provider, channel_id, request.apply).await;
+    let status = parse_status_code(status_str);
+    let json: serde_json::Value =
+        serde_json::from_str(&response_body).unwrap_or(serde_json::json!({"error": "internal"}));
+    (status, Json(json)).into_response()
+}
+
+/// POST /api/discord/send — agent-to-agent native routing.
 ///
 /// Requires `ConnectInfo<SocketAddr>` injected by the server bootstrap
 /// (see `boot.rs::run_with_state` and `mod.rs::launch_*` which both call
@@ -721,7 +852,7 @@ pub async fn rebind_inflight_handler(
     (status, Json(json)).into_response()
 }
 
-/// POST /api/send_to_agent — role_id-based agent routing.
+/// POST /api/discord/send-to-agent — role_id-based agent routing.
 ///
 /// See `send_handler` for the rationale on the mandatory
 /// `ConnectInfo<SocketAddr>` extractor.
@@ -755,7 +886,7 @@ pub async fn send_to_agent_handler(
     (status, Json(json)).into_response()
 }
 
-/// POST /api/senddm — send a DM to a Discord user.
+/// POST /api/discord/send-dm — send a DM to a Discord user.
 ///
 /// See `send_handler` for the rationale on the mandatory
 /// `ConnectInfo<SocketAddr>` extractor.

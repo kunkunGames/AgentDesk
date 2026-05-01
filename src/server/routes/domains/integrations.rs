@@ -1,14 +1,11 @@
 use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
+    Router,
     routing::{get, patch, post},
 };
-use serde_json::Value;
 
 use super::super::{
-    ApiRouter, AppState, discord, dm_reply, github, github_dashboard, log_deprecated_alias,
-    meetings, protected_api_domain,
+    ApiRouter, AppState, discord, dm_reply, github, github_dashboard, meetings,
+    protected_api_domain,
 };
 
 // Category: integrations
@@ -17,7 +14,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
     protected_api_domain(
         Router::new()
             .route("/github/issues/create", post(github::create_issue))
-            .route("/issues", post(deprecated_create_issue))
             .route(
                 "/github/repos",
                 get(github::list_repos).post(github::register_repo),
@@ -31,7 +27,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route("/github-closed-today", get(github_dashboard::closed_today))
             .route("/discord/bindings", get(discord::list_bindings))
-            .route("/discord-bindings", get(deprecated_discord_bindings))
             .route(
                 "/discord/channels/{id}/messages",
                 get(discord::channel_messages),
@@ -69,17 +64,4 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             ),
         state,
     )
-}
-
-async fn deprecated_create_issue(
-    State(state): State<AppState>,
-    Json(body): Json<github::CreateIssueBody>,
-) -> (StatusCode, Json<Value>) {
-    log_deprecated_alias("/api/issues", "/api/github/issues/create");
-    github::create_issue(State(state), Json(body)).await
-}
-
-async fn deprecated_discord_bindings(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    log_deprecated_alias("/api/discord-bindings", "/api/discord/bindings");
-    discord::list_bindings(State(state)).await
 }

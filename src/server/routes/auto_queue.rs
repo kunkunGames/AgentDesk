@@ -10,9 +10,9 @@ use crate::services::auto_queue::route;
 
 #[allow(unused_imports)]
 pub use route::{
-    ActivateBody, AddRunEntryBody, CancelQuery, DispatchBody, DispatchGroupBody, GenerateBody,
-    GenerateEntryBody, HistoryQuery, OrderBody, PauseBody, RebindSlotBody, ReorderBody, ResetBody,
-    ResetGlobalBody, StatusQuery, UpdateEntryBody, UpdateRunBody,
+    ActivateBody, AddRunEntryBody, CancelQuery, GenerateBody, GenerateEntryBody, HistoryQuery,
+    OrderBody, PauseBody, RebindSlotBody, ReorderBody, ResetBody, ResetGlobalBody, StatusQuery,
+    UpdateEntryBody, UpdateRunBody,
 };
 
 #[allow(unused_imports)]
@@ -20,7 +20,7 @@ pub(crate) use route::{
     AutoQueueActivateDeps, activate_with_bridge_pg, activate_with_deps, activate_with_deps_pg,
 };
 
-/// POST /api/auto-queue/generate
+/// POST /api/queue/generate
 ///
 /// Bulk push of multiple issue numbers into a queue run. Single-call
 /// complete: do NOT chain /redispatch, /retry, or /transition for the
@@ -39,13 +39,6 @@ pub async fn activate(
     body: Json<ActivateBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     route::activate(state, body).await
-}
-
-pub async fn dispatch(
-    state: State<AppState>,
-    body: Json<DispatchBody>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    route::dispatch(state, body).await
 }
 
 pub async fn status(

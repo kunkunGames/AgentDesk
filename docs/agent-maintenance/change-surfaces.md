@@ -108,10 +108,15 @@
     extraction; still giant-file territory).
   - `src/services/discord/recovery_engine.rs` (4697 lines).
   - `src/services/discord/health.rs` (4533 lines).
+  - `src/services/discord/placeholder_controller.rs` (1237 lines).
+  - `src/services/discord/placeholder_live_events.rs` (1203 lines).
   - `src/services/discord/router/message_handler.rs` (7158 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (3645 lines).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines; provider
+    stop-token/tmux binding runtime, split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (2096 lines).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines).
   - `src/services/discord/formatting.rs` (3105 lines).
   - `src/services/discord/settings.rs` (2394 lines).
   - `src/services/discord/prompt_builder.rs` (2027 lines).
@@ -253,6 +258,11 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/platform/shell.rs` (1507) — split owned by #1281
   (GitClient extraction).
 - `src/services/platform/binary_resolver.rs` (1377).
+- `src/services/mcp_config.rs` (1072).
+- `src/services/routines/{store.rs (2178), loader.rs (2013),
+  discord_log.rs (1056)}` — durable routine storage, script loading, and
+  Discord notification plumbing. Split before broadening behavior outside the
+  current routine API/runtime contract.
 - `src/services/discord/mod.rs` (5519),
   `src/services/discord_config_audit.rs` (1310), and
   `src/services/qwen_tmux_wrapper.rs` (1194).

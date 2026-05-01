@@ -7,7 +7,7 @@ use serenity::{ChannelId, MessageId, UserId};
 
 use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEventKind};
 use crate::db::turns::TurnTokenUsage;
-use crate::services::agent_protocol::TaskNotificationKind;
+use crate::services::agent_protocol::{StatusEvent, TaskNotificationKind};
 use crate::services::message_outbox::{
     OutboxMessage, enqueue_lifecycle_notification_best_effort, enqueue_outbox_best_effort,
 };
@@ -28,6 +28,9 @@ use super::formatting::{
 use super::placeholder_cleanup::{
     PlaceholderCleanupOperation, PlaceholderCleanupOutcome, PlaceholderCleanupRecord,
     classify_delete_error,
+};
+use super::placeholder_live_events::{
+    RecentPlaceholderEvent, events_from_json, status_events_from_json,
 };
 use super::settings::{
     channel_supports_provider, load_last_remote_profile, load_last_session_path,
@@ -52,17 +55,20 @@ use super::{
 mod watcher_lifecycle;
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(crate) use self::watcher_lifecycle::WatcherClaimOutcome;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(in crate::services::discord) use self::watcher_lifecycle::try_claim_watcher;
 use self::watcher_lifecycle::*;
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) use self::watcher_lifecycle::{
-    WATCHER_POST_TERMINAL_IDLE_WINDOW, WatcherClaimOutcome, WatcherStopDecision, WatcherStopInput,
-    watcher_stop_decision_after_terminal_success,
-};
 pub(in crate::services::discord) use self::watcher_lifecycle::{
     claim_or_reuse_watcher, clear_recovery_handled_channels,
     fail_dispatch_for_ready_for_input_stall, refresh_session_heartbeat_from_tmux_output,
     restore_tmux_watchers, session_belongs_to_current_runtime, store_recovery_handled_channels,
+};
+use super::watcher_lifecycle_decision::*;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(crate) use super::watcher_lifecycle_decision::{
+    WATCHER_POST_TERMINAL_IDLE_WINDOW, WatcherStopDecision, WatcherStopInput,
+    watcher_stop_decision_after_terminal_success,
 };
 const READY_FOR_INPUT_IDLE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const WATCHER_ACTIVITY_HEARTBEAT_INTERVAL: std::time::Duration =
@@ -568,6 +574,7 @@ pub(super) struct WatcherLineOutcome {
 #[derive(Debug, Clone)]
 pub(super) struct RestoredWatcherTurn {
     current_msg_id: MessageId,
+    status_message_id: Option<MessageId>,
     response_sent_offset: usize,
     full_response: String,
     last_edit_text: String,
@@ -578,6 +585,7 @@ pub(super) struct RestoredWatcherTurn {
 #[derive(Debug)]
 struct WatcherStreamSeed {
     placeholder_msg_id: Option<MessageId>,
+    status_panel_msg_id: Option<MessageId>,
     response_sent_offset: usize,
     full_response: String,
     last_edit_text: String,
@@ -637,6 +645,7 @@ pub(super) fn restored_watcher_turn_from_inflight(
         normalize_response_sent_offset(&state.full_response, state.response_sent_offset);
     Some(RestoredWatcherTurn {
         current_msg_id: MessageId::new(state.current_msg_id),
+        status_message_id: state.status_message_id.map(MessageId::new),
         response_sent_offset,
         full_response: state.full_response.clone(),
         last_edit_text: reconstructed_inflight_placeholder_body(state),
@@ -649,6 +658,7 @@ fn watcher_stream_seed(restored_turn: Option<RestoredWatcherTurn>) -> WatcherStr
     match restored_turn {
         Some(restored) => WatcherStreamSeed {
             placeholder_msg_id: Some(restored.current_msg_id),
+            status_panel_msg_id: restored.status_message_id,
             response_sent_offset: restored.response_sent_offset,
             full_response: restored.full_response,
             last_edit_text: restored.last_edit_text,
@@ -657,6 +667,7 @@ fn watcher_stream_seed(restored_turn: Option<RestoredWatcherTurn>) -> WatcherStr
         },
         None => WatcherStreamSeed {
             placeholder_msg_id: None,
+            status_panel_msg_id: None,
             response_sent_offset: 0,
             full_response: String::new(),
             last_edit_text: String::new(),
@@ -2451,15 +2462,57 @@ fn persist_watcher_stream_progress(
     let _ = super::inflight::save_inflight_state(&inflight);
 }
 
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub(super) async fn test_finish_restored_watcher_active_turn(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    finish_mailbox_on_completion: bool,
+    delegated_finalize_owed: bool,
+    stop_source: &'static str,
+) {
+    finish_restored_watcher_active_turn(
+        shared,
+        provider,
+        channel_id,
+        finish_mailbox_on_completion,
+        delegated_finalize_owed,
+        stop_source,
+    )
+    .await
+}
+
 async fn finish_restored_watcher_active_turn(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
     finish_mailbox_on_completion: bool,
+    delegated_finalize_owed: bool,
     stop_source: &'static str,
 ) {
-    if !finish_mailbox_on_completion {
+    // Either flag implies the watcher must clear the channel mailbox now:
+    //   * `finish_mailbox_on_completion` → inflight-restore semantics (a
+    //     restored/recovered watcher inherits its turn from the bridge, so
+    //     it owns the cancel_token when the turn ends). Pre-existing.
+    //   * `delegated_finalize_owed` → bridge handed finalization debt to the
+    //     watcher because it skipped `mailbox_finish_turn` to avoid racing
+    //     the in-flight watcher relay. New for #1452.
+    //
+    // The two flags can coincide (e.g., a recovered watcher whose first
+    // post-recovery turn also went through stream-lost handoff). Calling
+    // `mailbox_finish_turn` once per turn is idempotent for our purposes —
+    // the second call would just observe an empty active slot — but we
+    // gate on the OR to keep the call site to a single place.
+    if !finish_mailbox_on_completion && !delegated_finalize_owed {
         return;
+    }
+
+    if delegated_finalize_owed {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] watcher_finalized_delegated_turn: clearing channel {} mailbox after bridge→watcher handoff (#1452)",
+            channel_id.get()
+        );
     }
 
     let finish = super::mailbox_finish_turn(shared, provider, channel_id).await;
@@ -2505,6 +2558,7 @@ pub(super) async fn tmux_output_watcher(
     pause_epoch: Arc<std::sync::atomic::AtomicU64>,
     turn_delivered: Arc<std::sync::atomic::AtomicBool>,
     last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
+    mailbox_finalize_owed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     tmux_output_watcher_with_restore(
         channel_id,
@@ -2519,6 +2573,7 @@ pub(super) async fn tmux_output_watcher(
         pause_epoch,
         turn_delivered,
         last_heartbeat_ts_ms,
+        mailbox_finalize_owed,
         None,
     )
     .await;
@@ -2539,6 +2594,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
     pause_epoch: Arc<std::sync::atomic::AtomicU64>,
     turn_delivered: Arc<std::sync::atomic::AtomicBool>,
     last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
+    mailbox_finalize_owed: Arc<std::sync::atomic::AtomicBool>,
     restored_turn: Option<RestoredWatcherTurn>,
 ) {
     use std::io::{Read, Seek, SeekFrom};
@@ -2906,6 +2962,9 @@ pub(super) async fn tmux_output_watcher_with_restore(
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let mut spin_idx: usize = 0;
         let mut placeholder_msg_id: Option<serenity::MessageId> = stream_seed.placeholder_msg_id;
+        let status_panel_msg_id: Option<serenity::MessageId> = stream_seed.status_panel_msg_id;
+        let mut last_status_panel_text = String::new();
+        let status_panel_started_at = chrono::Utc::now().timestamp();
         let mut last_edit_text = stream_seed.last_edit_text;
         let mut response_sent_offset = stream_seed.response_sent_offset;
         let finish_mailbox_on_completion = stream_seed.finish_mailbox_on_completion;
@@ -2923,6 +2982,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             &mut full_response,
             &mut tool_state,
         );
+        let live_events_dirty = flush_placeholder_live_events(&shared, channel_id, &mut tool_state);
         let mut found_result = initial_outcome.found_result;
         let mut is_prompt_too_long = initial_outcome.is_prompt_too_long;
         let mut is_auth_error = initial_outcome.is_auth_error;
@@ -3000,12 +3060,16 @@ pub(super) async fn tmux_output_watcher_with_restore(
             let turn_start = tokio::time::Instant::now();
             let turn_timeout = super::turn_watchdog_timeout();
             let mut last_status_update = tokio::time::Instant::now();
+            if live_events_dirty {
+                force_next_watcher_status_update(&mut last_status_update);
+            }
             let mut ready_for_input_tracker =
                 crate::services::provider::ReadyForInputIdleTracker::default();
             let mut last_ready_probe_at: Option<std::time::Instant> = None;
             let mut last_liveness_probe_at = tokio::time::Instant::now();
             let mut tmux_death_observed = false;
             let mut ready_for_input_failure_notice: Option<String> = None;
+            let mut ready_for_input_stall_dispatch_id: Option<String> = None;
             let mut streaming_suppressed_by_recent_stop = false;
 
             while !found_result && turn_start.elapsed() < turn_timeout {
@@ -3056,6 +3120,9 @@ pub(super) async fn tmux_output_watcher_with_restore(
                             &mut full_response,
                             &mut tool_state,
                         );
+                        if flush_placeholder_live_events(&shared, channel_id, &mut tool_state) {
+                            force_next_watcher_status_update(&mut last_status_update);
+                        }
                         found_result = found_result || outcome.found_result;
                         is_prompt_too_long = is_prompt_too_long || outcome.is_prompt_too_long;
                         is_auth_error = is_auth_error || outcome.is_auth_error;
@@ -3212,65 +3279,10 @@ pub(super) async fn tmux_output_watcher_with_restore(
                                         .and_then(|state| state.dispatch_id)
                                     });
                                     if let Some(dispatch_id) = dispatch_id {
-                                        match fail_dispatch_for_ready_for_input_stall(
-                                            &shared,
-                                            &dispatch_id,
-                                            &tmux_session_name,
-                                        )
-                                        .await
-                                        {
-                                            Ok(result) => {
-                                                tracing::warn!(
-                                                    "  [{ts}] ⚠ watcher marked post-work Ready-for-input stall as failed for {} / dispatch {} (card={:?}, card_marked={}, human_alert_sent={})",
-                                                    tmux_session_name,
-                                                    dispatch_id,
-                                                    result.card_id,
-                                                    result.card_marked,
-                                                    result.human_alert_sent
-                                                );
-                                                if let Some(state) = super::inflight::load_inflight_state(
-                                                    &watcher_provider,
-                                                    channel_id.get(),
-                                                )
-                                                .filter(|state| !state.rebind_origin)
-                                                {
-                                                    let user_msg_id = serenity::MessageId::new(state.user_msg_id);
-                                                    super::formatting::remove_reaction_raw(
-                                                        &http,
-                                                        channel_id,
-                                                        user_msg_id,
-                                                        '⏳',
-                                                    )
-                                                    .await;
-                                                    super::formatting::add_reaction_raw(
-                                                        &http,
-                                                        channel_id,
-                                                        user_msg_id,
-                                                        '⚠',
-                                                    )
-                                                    .await;
-                                                }
-                                                super::inflight::clear_inflight_state(
-                                                    &watcher_provider,
-                                                    channel_id.get(),
-                                                );
-                                                ready_for_input_failure_notice = Some(format!(
-                                                    "⚠️ 작업 후 `Ready for input` 상태에서 멈춰 dispatch를 실패 처리했습니다.\n사유: {READY_FOR_INPUT_STUCK_REASON}"
-                                                ));
-                                            }
-                                            Err(error) => {
-                                                tracing::warn!(
-                                                    "  [{ts}] ⚠ watcher failed to persist Ready-for-input stall failure for {} / dispatch {}: {}",
-                                                    tmux_session_name,
-                                                    dispatch_id,
-                                                    error
-                                                );
-                                                ready_for_input_failure_notice = Some(format!(
-                                                    "⚠️ 작업 후 `Ready for input` 상태에서 멈췄지만 dispatch 실패 처리를 저장하지 못했습니다.\n사유: {}",
-                                                    truncate_str(&error, 300)
-                                                ));
-                                            }
-                                        }
+                                        ready_for_input_stall_dispatch_id = Some(dispatch_id);
+                                        ready_for_input_failure_notice = Some(format!(
+                                            "⚠️ 작업 후 `Ready for input` 상태에서 멈춰 dispatch를 실패 처리합니다.\n사유: {READY_FOR_INPUT_STUCK_REASON}"
+                                        ));
                                     } else {
                                         tracing::warn!(
                                             "  [{ts}] ⚠ watcher detected post-work Ready-for-input stall for {} but could not resolve a dispatched task",
@@ -3302,6 +3314,40 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     last_status_update = tokio::time::Instant::now();
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
+
+                    if shared.status_panel_v2_enabled
+                        && let Some(status_msg_id) = status_panel_msg_id
+                    {
+                        let panel_text = shared.placeholder_live_events.render_status_panel(
+                            channel_id,
+                            &watcher_provider,
+                            status_panel_started_at,
+                        );
+                        if panel_text != last_status_panel_text {
+                            rate_limit_wait(&shared, channel_id).await;
+                            match channel_id
+                                .edit_message(
+                                    &http,
+                                    status_msg_id,
+                                    serenity::EditMessage::new().content(&panel_text),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    last_status_panel_text = panel_text;
+                                }
+                                Err(error) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::warn!(
+                                        "  [{ts}] ⚠ tmux status-panel-v2 edit failed for msg {} in channel {}: {}",
+                                        status_msg_id.get(),
+                                        channel_id.get(),
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     let has_assistant_response_for_streaming = !full_response.trim().is_empty();
                     let recent_stop_for_streaming = if has_assistant_response_for_streaming {
@@ -3361,7 +3407,9 @@ pub(super) async fn tmux_output_watcher_with_restore(
                             break;
                         }
 
-                        let status_block = super::formatting::build_placeholder_status_block(
+                        let status_block = build_watcher_placeholder_status_block(
+                            &shared,
+                            channel_id,
                             indicator,
                             tool_state.prev_tool_status.as_deref(),
                             tool_state.current_tool_line.as_deref(),
@@ -3443,7 +3491,9 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         }
                     }
 
-                    let status_block = super::formatting::build_placeholder_status_block(
+                    let status_block = build_watcher_placeholder_status_block(
+                        &shared,
+                        channel_id,
                         indicator,
                         tool_state.prev_tool_status.as_deref(),
                         tool_state.current_tool_line.as_deref(),
@@ -3509,22 +3559,120 @@ pub(super) async fn tmux_output_watcher_with_restore(
             }
 
             if let Some(notice) = ready_for_input_failure_notice {
-                match placeholder_msg_id {
+                let notice_ok = match placeholder_msg_id {
                     Some(msg_id) => {
                         rate_limit_wait(&shared, channel_id).await;
-                        let _ = channel_id
+                        channel_id
                             .edit_message(
                                 &http,
                                 msg_id,
                                 serenity::EditMessage::new().content(&notice),
                             )
-                            .await;
+                            .await
+                            .is_ok()
                     }
-                    None => {
-                        let _ = channel_id.say(&http, &notice).await;
+                    None => channel_id.say(&http, &notice).await.is_ok(),
+                };
+                if !notice_ok {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ watcher: Ready-for-input stall notice failed before dispatch failure — preserving inflight for retry"
+                    );
+                    finish_monitor_auto_turn_if_claimed(
+                        &shared,
+                        &watcher_provider,
+                        channel_id,
+                        &mut monitor_auto_turn_claimed,
+                        &mut monitor_auto_turn_finished,
+                    )
+                    .await;
+                    continue;
+                }
+
+                if let Some(dispatch_id) = ready_for_input_stall_dispatch_id {
+                    match fail_dispatch_for_ready_for_input_stall(
+                        &shared,
+                        &dispatch_id,
+                        &tmux_session_name,
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] ⚠ watcher marked post-work Ready-for-input stall as failed for {} / dispatch {} (card={:?}, card_marked={}, human_alert_sent={})",
+                                tmux_session_name,
+                                dispatch_id,
+                                result.card_id,
+                                result.card_marked,
+                                result.human_alert_sent
+                            );
+                            if let Some(state) = super::inflight::load_inflight_state(
+                                &watcher_provider,
+                                channel_id.get(),
+                            )
+                            .filter(|state| !state.rebind_origin)
+                            {
+                                let user_msg_id = serenity::MessageId::new(state.user_msg_id);
+                                super::formatting::remove_reaction_raw(
+                                    &http,
+                                    channel_id,
+                                    user_msg_id,
+                                    '⏳',
+                                )
+                                .await;
+                                super::formatting::add_reaction_raw(
+                                    &http,
+                                    channel_id,
+                                    user_msg_id,
+                                    '⚠',
+                                )
+                                .await;
+                            }
+                            super::inflight::clear_inflight_state(
+                                &watcher_provider,
+                                channel_id.get(),
+                            );
+                        }
+                        Err(error) => {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] ⚠ watcher failed to persist Ready-for-input stall failure for {} / dispatch {}: {}",
+                                tmux_session_name,
+                                dispatch_id,
+                                error
+                            );
+                            let failure_notice = format!(
+                                "⚠️ 작업 후 `Ready for input` 상태에서 멈췄지만 dispatch 실패 처리를 저장하지 못했습니다.\n사유: {}",
+                                truncate_str(&error, 300)
+                            );
+                            match placeholder_msg_id {
+                                Some(msg_id) => {
+                                    rate_limit_wait(&shared, channel_id).await;
+                                    let _ = channel_id
+                                        .edit_message(
+                                            &http,
+                                            msg_id,
+                                            serenity::EditMessage::new().content(&failure_notice),
+                                        )
+                                        .await;
+                                }
+                                None => {
+                                    let _ = channel_id.say(&http, &failure_notice).await;
+                                }
+                            }
+                        }
                     }
                 }
                 clear_provider_overload_retry_state(channel_id);
+                finish_monitor_auto_turn_if_claimed(
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    &mut monitor_auto_turn_claimed,
+                    &mut monitor_auto_turn_finished,
+                )
+                .await;
                 continue;
             }
         }
@@ -3670,16 +3818,30 @@ pub(super) async fn tmux_output_watcher_with_restore(
                 "⚠️ 인증이 만료되어 현재 dispatch를 실패 처리했습니다. 세션을 종료합니다.\n관리자가 CLI에서 재인증(`/login`)을 완료한 후 다시 디스패치해주세요.\n\n사유: {}",
                 truncate_str(auth_detail, 300)
             );
-            match placeholder_msg_id {
+            let notice_ok = match placeholder_msg_id {
                 Some(msg_id) => {
                     rate_limit_wait(&shared, channel_id).await;
-                    let _ = channel_id
+                    channel_id
                         .edit_message(&http, msg_id, serenity::EditMessage::new().content(&notice))
-                        .await;
+                        .await
+                        .is_ok()
                 }
-                None => {
-                    let _ = channel_id.say(&http, &notice).await;
-                }
+                None => channel_id.say(&http, &notice).await.is_ok(),
+            };
+            if !notice_ok {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ watcher: auth error notice failed before dispatch failure — preserving inflight for retry"
+                );
+                finish_monitor_auto_turn_if_claimed(
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    &mut monitor_auto_turn_claimed,
+                    &mut monitor_auto_turn_finished,
+                )
+                .await;
+                continue;
             }
             // #897 round-3 Medium: skip reaction work for `rebind_origin`
             // inflights — their `user_msg_id=0` identifies no real Discord
@@ -3790,20 +3952,34 @@ pub(super) async fn tmux_output_watcher_with_restore(
             )
             .await;
 
-            match placeholder_msg_id {
+            let notice_ok = match placeholder_msg_id {
                 Some(msg_id) => {
                     rate_limit_wait(&shared, channel_id).await;
-                    let _ = channel_id
+                    channel_id
                         .edit_message(
                             &http,
                             msg_id,
                             serenity::EditMessage::new().content(&retry_notice),
                         )
-                        .await;
+                        .await
+                        .is_ok()
                 }
-                None => {
-                    let _ = channel_id.say(&http, &retry_notice).await;
-                }
+                None => channel_id.say(&http, &retry_notice).await.is_ok(),
+            };
+            if !notice_ok {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ watcher: provider overload notice failed before retry/failure handling — preserving inflight for retry"
+                );
+                finish_monitor_auto_turn_if_claimed(
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    &mut monitor_auto_turn_claimed,
+                    &mut monitor_auto_turn_finished,
+                )
+                .await;
+                continue;
             }
 
             // #897 round-3 Medium: skip reaction + retry scheduling for
@@ -4078,7 +4254,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             }
             // Auto-retry: persist Discord history for LLM injection, then queue the
             // original user message as an internal follow-up instead of self-routing
-            // through /api/send announce.
+            // through /api/discord/send announce.
             //
             // #897 round-4 Medium: a `rebind_origin` inflight has no real
             // user message or text to retry with (`user_msg_id=0`,
@@ -4253,10 +4429,17 @@ pub(super) async fn tmux_output_watcher_with_restore(
             "monitor/task-notification watcher relays must not use notify-bot outbox"
         );
         let relay_ok = if relay_decision.should_direct_send {
-            let formatted = super::formatting::format_for_discord_with_provider(
-                current_response,
-                &watcher_provider,
-            );
+            let formatted = if shared.status_panel_v2_enabled {
+                super::formatting::format_for_discord_with_status_panel(
+                    current_response,
+                    &watcher_provider,
+                )
+            } else {
+                super::formatting::format_for_discord_with_provider(
+                    current_response,
+                    &watcher_provider,
+                )
+            };
             let relay_text = if relay_decision.should_tag_monitor_origin {
                 super::prepend_monitor_auto_turn_origin(&formatted)
             } else {
@@ -4522,11 +4705,12 @@ pub(super) async fn tmux_output_watcher_with_restore(
             false
         };
         let relay_suppressed = relay_decision.suppressed;
+        let terminal_output_committed = relay_ok || relay_suppressed;
 
         // Advance the shared confirmed-delivery watermark on any committed
         // direct emission or empty-turn cleanup. CAS loop ensures we only ever move the
         // watermark FORWARD, even if some other instance has raced ahead.
-        if relay_ok || relay_suppressed {
+        if terminal_output_committed {
             advance_watcher_confirmed_end(
                 &shared,
                 &watcher_provider,
@@ -4566,14 +4750,17 @@ pub(super) async fn tmux_output_watcher_with_restore(
         }
 
         // Mark user message as completed: ⏳ → ✅ when inflight metadata is
-        // available. #897 round-3 Medium: skip the reaction + transcript +
-        // analytics block entirely for `rebind_origin` inflights. Their
-        // `user_msg_id=0` points at no real message, and persisting a
-        // transcript with `turn_id=discord:<channel>:0` poisons
-        // session_transcripts / turn_analytics. The notify-bot outbox
-        // enqueue above already delivered the recovered response to the
-        // user; nothing else on the success path is legitimate here.
-        if let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin) {
+        // available and terminal output is committed. #897 round-3 Medium:
+        // skip the reaction + transcript + analytics block entirely for
+        // `rebind_origin` inflights. Their `user_msg_id=0` points at no real
+        // message, and persisting a transcript with
+        // `turn_id=discord:<channel>:0` poisons session_transcripts /
+        // turn_analytics. The notify-bot outbox enqueue above already
+        // delivered the recovered response to the user; nothing else on the
+        // success path is legitimate here.
+        if terminal_output_committed
+            && let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin)
+        {
             let user_msg_id = serenity::MessageId::new(state.user_msg_id);
             super::formatting::remove_reaction_raw(&http, channel_id, user_msg_id, '⏳').await;
             super::formatting::add_reaction_raw(&http, channel_id, user_msg_id, '✅').await;
@@ -4842,32 +5029,63 @@ pub(super) async fn tmux_output_watcher_with_restore(
                 drop(data);
             }
             turn_result_relayed = true;
-            if dispatch_ok {
+            // #1452 (Codex iter 3 P2): only consume the handoff debt when
+            // we are actually going to finalize. If `dispatch_ok` is false
+            // (e.g., dispatch type lookup or fallback completion failed)
+            // we'd skip `finish_restored_watcher_active_turn` anyway —
+            // swapping early would leave the debt cleared with no
+            // finalization, and a bridge racing this path would then see
+            // `false` and skip its own finish too, leaving the channel
+            // mailbox active forever.
+            //
+            // Swap inside the `if dispatch_ok` arm so:
+            //   * Acquire — observes the bridge's prior `Release` store of
+            //     `true` (and any inflight writes that preceded it) before
+            //     we decide to call `mailbox_finish_turn`.
+            //   * Release — publishes our reset back to `false`, so a
+            //     watcher that survives into the next turn (e.g., paused
+            //     between dispatches) will see `false` on its next swap
+            //     and will not accidentally clear that turn's freshly
+            //     registered cancel_token.
+            //
+            // When `dispatch_ok = false` we deliberately leave the debt in
+            // place; the bridge's later `compare_exchange(true, false, ...)`
+            // will revoke it and run `mailbox_finish_turn` on its side.
+            let delegated_finalize_owed = if dispatch_ok {
+                let owed = mailbox_finalize_owed.swap(false, std::sync::atomic::Ordering::AcqRel);
                 super::inflight::clear_inflight_state(&provider_kind, channel_id.get());
                 finish_restored_watcher_active_turn(
                     &shared,
                     &provider_kind,
                     channel_id,
                     finish_mailbox_on_completion,
+                    owed,
                     "restored watcher completed with queued backlog",
                 )
                 .await;
-            }
+                owed
+            } else {
+                false
+            };
             let mailbox = shared.mailbox(channel_id);
             let has_active_turn = mailbox.has_active_turn().await;
-            let should_kickoff_queue =
-                if finish_mailbox_on_completion || monitor_auto_turn_finished || has_active_turn {
-                    false
-                } else {
-                    mailbox
-                        .has_pending_soft_queue(super::queue_persistence_context(
-                            &shared,
-                            &provider_kind,
-                            channel_id,
-                        ))
-                        .await
-                        .has_pending
-                };
+            let watcher_handled_mailbox_finish =
+                finish_mailbox_on_completion || delegated_finalize_owed;
+            let should_kickoff_queue = if watcher_handled_mailbox_finish
+                || monitor_auto_turn_finished
+                || has_active_turn
+            {
+                false
+            } else {
+                mailbox
+                    .has_pending_soft_queue(super::queue_persistence_context(
+                        &shared,
+                        &provider_kind,
+                        channel_id,
+                    ))
+                    .await
+                    .has_pending
+            };
             if dispatch_ok && should_kickoff_queue {
                 super::schedule_deferred_idle_queue_kickoff(
                     shared.clone(),
@@ -4881,7 +5099,6 @@ pub(super) async fn tmux_output_watcher_with_restore(
             tracing::warn!("  [{ts}] ⚠ watcher: relay failed — preserving inflight for retry");
         }
 
-        let terminal_output_committed = relay_ok || relay_suppressed;
         let tmux_alive_for_missing_inflight =
             if inflight_state.is_none() && resolved_did.is_none() && terminal_output_committed {
                 probe_tmux_session_liveness(&tmux_session_name).await
@@ -5276,6 +5493,10 @@ pub(super) struct WatcherToolState {
     pub has_post_tool_text: bool,
     /// Structured transcript events collected during watcher replay
     pub transcript_events: Vec<SessionTranscriptEvent>,
+    /// Recent user-visible tool/system events for Active placeholder cards.
+    placeholder_events: Vec<RecentPlaceholderEvent>,
+    /// Provider-normalized status events for the status-panel-v2 message.
+    status_events: Vec<StatusEvent>,
 }
 
 impl WatcherToolState {
@@ -5287,7 +5508,22 @@ impl WatcherToolState {
             any_tool_used: false,
             has_post_tool_text: false,
             transcript_events: Vec::new(),
+            placeholder_events: Vec::new(),
+            status_events: Vec::new(),
         }
+    }
+
+    fn record_placeholder_events_from_json(&mut self, value: &serde_json::Value) {
+        self.placeholder_events.extend(events_from_json(value));
+        self.status_events.extend(status_events_from_json(value));
+    }
+
+    fn take_placeholder_events(&mut self) -> Vec<RecentPlaceholderEvent> {
+        std::mem::take(&mut self.placeholder_events)
+    }
+
+    fn take_status_events(&mut self) -> Vec<StatusEvent> {
+        std::mem::take(&mut self.status_events)
     }
 
     fn set_current_tool_line(&mut self, next_tool_line: Option<String>) {
@@ -5317,6 +5553,58 @@ impl WatcherToolState {
     }
 }
 
+fn flush_placeholder_live_events(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    tool_state: &mut WatcherToolState,
+) -> bool {
+    let events = tool_state.take_placeholder_events();
+    let status_events = tool_state.take_status_events();
+    let mut dirty = false;
+    if (shared.placeholder_live_events_enabled || shared.status_panel_v2_enabled)
+        && !events.is_empty()
+    {
+        shared.placeholder_live_events.push_many(channel_id, events);
+        dirty = true;
+    }
+    if shared.status_panel_v2_enabled && !status_events.is_empty() {
+        shared
+            .placeholder_live_events
+            .push_status_events(channel_id, status_events);
+        dirty = true;
+    }
+    dirty
+}
+
+fn force_next_watcher_status_update(last_status_update: &mut tokio::time::Instant) {
+    *last_status_update = tokio::time::Instant::now() - super::status_update_interval();
+}
+
+fn build_watcher_placeholder_status_block(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    indicator: &str,
+    prev_tool_status: Option<&str>,
+    current_tool_line: Option<&str>,
+    full_response: &str,
+) -> String {
+    if shared.status_panel_v2_enabled {
+        return super::formatting::build_processing_status_block(indicator);
+    }
+    let status_block = super::formatting::build_placeholder_status_block(
+        indicator,
+        prev_tool_status,
+        current_tool_line,
+        full_response,
+    );
+    if shared.placeholder_live_events_enabled
+        && let Some(block) = shared.placeholder_live_events.render_block(channel_id)
+    {
+        return format!("{status_block}\n{block}");
+    }
+    status_block
+}
+
 /// Process buffered lines for the tmux watcher.
 /// Extracts text content, tracks tool status, and detects result events.
 /// Returns true if a "result" event was found.
@@ -5338,6 +5626,7 @@ pub(super) fn process_watcher_lines(
         // Parse the JSON line
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
             observe_stream_context(&val, state);
+            tool_state.record_placeholder_events_from_json(&val);
             let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match event_type {
                 "assistant" => {
@@ -5834,6 +6123,7 @@ mod tests {
             last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
                 super::super::tmux_watcher_now_ms(),
             )),
+            mailbox_finalize_owed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -7907,6 +8197,7 @@ mod tests {
             &provider,
             channel_id,
             true,
+            false,
             "restored_watcher_finish_does_not_underflow_global_active",
         )
         .await;

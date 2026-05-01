@@ -1,6 +1,6 @@
 use super::settings::{
     MemoryBackendKind, ResolvedMemorySettings, discord_token_hash, load_review_tuning_guidance,
-    load_role_prompt, load_shared_prompt_for_profile, render_peer_agent_guidance,
+    load_role_prompt, render_peer_agent_guidance,
 };
 use super::*;
 use crate::services::memory::{
@@ -386,7 +386,7 @@ fn render_dispatch_contract(
                 "[Dispatch Contract]\n\
                  - 응답 첫 줄에 반드시 `VERDICT: pass|improve|reject|rework` 중 하나를 적는다.\n\
                  - 리뷰 결과는 GitHub issue 코멘트로 남긴다.\n\
-                 - verdict 제출 경로: `POST /api/review-verdict` (`dispatch_id={dispatch_id}`).\n\
+                 - verdict 제출 경로: `POST /api/reviews/verdict` (`dispatch_id={dispatch_id}`).\n\
                  - `improve`/`reject`/`rework`면 구체적 `notes`와 `items`를 포함한다."
             ))
         }
@@ -395,7 +395,7 @@ fn render_dispatch_contract(
             Some(format!(
                 "[Dispatch Contract]\n\
                  - 카운터 리뷰 피드백을 읽고 `accept|dispute|dismiss` 중 하나를 고른다.\n\
-                 - decision 제출 경로: `POST /api/review-decision` (`card_id={card_id}`).\n\
+                 - decision 제출 경로: `POST /api/reviews/decision` (`card_id={card_id}`).\n\
                  - accept는 피드백 수용 후 rework, dispute는 반박 후 재리뷰, dismiss는 무시 후 done 경로다."
             ))
         }
@@ -564,12 +564,8 @@ fn proactive_memory_guidance(
                 "`recall` MCP tool",
                 "`remember` MCP tool",
                 format!(
-                    "\n- 스코프 규칙: 전역 정보는 `workspace`를 생략하고 `agentId`를 `default`로 둔다.\n\
-                     - 스코프 규칙: 현재 프로젝트/도메인 사실과 기술 결정은 `workspace={workspace_scope}` + `agentId=default`로 저장한다.\n\
-                     - 스코프 규칙: 이 에이전트만의 반복 에러, 작업 습관, 도구 사용 패턴은 `workspace={agent_workspace}` + `agentId={agent_id}`로 저장한다.\n\
-                     - 현재 채널 힌트: workspace 스코프 이름은 `{workspace_scope}`, 에이전트 스코프 이름은 `{agent_workspace}`, 에이전트 ID는 `{agent_id}`다.\n\
-                     - 원칙: 전역이 아니면 `workspace`를 명시하고, 에이전트 전용이 아니면 `agentId`는 `default`를 유지한다.\n\
-                     - 참고: 턴 시작 `context` 주입과 세션 종료 시 `reflect`는 서버가 담당한다. 턴 중 보강만 `recall`/`remember`로 수행한다."
+                    "\n- scope hints: project=`workspace={workspace_scope}, agentId=default`; agent-private=`workspace={agent_workspace}, agentId={agent_id}`.\n\
+                     - full memory policy: `docs/memory-scope.md`; read it before broad memory cleanup or scope changes."
                 ),
             )
         }
@@ -577,37 +573,42 @@ fn proactive_memory_guidance(
 
     Some(format!(
         "\n\n[Proactive Memory Guidance]\n\
-         이 세션에서 `{backend_name}` 메모리를 사용할 수 있습니다.\n\
-         - 읽기: {read_tool} — 새로운 맥락 발견 시 추가 조회\n\
-         - 쓰기: {write_tool} — 중요한 결정/에러/절차 발견 시 기록\n\
-         - 트리거: 에러 원인 확정, 아키텍처 결정, 설정 변경, \"이전에\" 언급 시{extra_note}"
+         `{backend_name}` memory is available. Use {read_tool} for explicit past-context/error/config lookups; use {write_tool} only for confirmed decisions, root causes, or config changes.{extra_note}"
     ))
 }
 
 fn api_friction_guidance(profile: DispatchProfile) -> Option<String> {
     (profile == DispatchProfile::Full).then_some(
         "\n\n[ADK API Usage]\n\
-         - ADK API 작업 전에는 먼저 `GET /api/docs` 또는 `GET /api/docs/{category}`로 관련 엔드포인트를 확인한다.\n\
-         - API 호출이 실패하면 `sqlite3`나 legacy SQL 우회로로 돌아가지 말고 `/api/docs`에서 대안 엔드포인트를 다시 찾는다.\n\
-         - 같은 엔드포인트 재시도, DB 직접 우회, 과도한 다단계 API 호출, `/api/docs` 없이 시행착오 탐색은 `API friction`으로 본다.\n\
-         - API friction이 발생하면 응답 마지막 줄에 단일 행 JSON marker를 남긴다: `API_FRICTION: {\"endpoint\":\"/api/docs/kanban\",\"friction_type\":\"docs-bypass\",\"summary\":\"...\",\"workaround\":\"sqlite3\",\"suggested_fix\":\"...\",\"docs_category\":\"kanban\",\"keywords\":[\"/api/docs/kanban\",\"sqlite3\"]}`\n\
-         - 서버가 이 marker를 사용자 응답에서 제거하고 `topic=api-friction`, `type=error`로 구조화 저장한다."
+         Before ADK API work, inspect `GET /api/docs` or `GET /api/docs/{category}`. If docs are missing/wrong, do not use sqlite fallback; report one `API_FRICTION: {...}` marker with endpoint, summary, workaround, and suggested_fix."
             .to_string(),
     )
 }
+
+fn shared_agent_rules_lookup() -> &'static str {
+    "\n\n[Shared Agent Rules Index]\n\
+     - Keep changes scoped, verified, and no broader than the current request.\n\
+     - Verify user claims against code/data before acting.\n\
+     - Prefer `rg` and narrow reads; avoid dumping long tool output.\n\
+     - Do not use sqlite for ADK operational data; inspect `/api/docs` first.\n\
+     - Source-of-truth map: `docs/source-of-truth.md`; read it before editing prompts, config, skills, policies, or memory surfaces.\n\
+     - Memory scope map: `docs/memory-scope.md`; read it before memory cleanup or scope decisions.\n\
+     - Full shared prompt source: `~/ObsidianVault/RemoteVault/adk-config/agents/_shared.prompt.md`; read it only when the task needs the detailed shared policy."
+}
 /// Dispatch prompt profile — controls which system prompt sections are injected.
-/// `Full` includes everything (used for implementation dispatches and normal turns).
+/// `Full` includes the normal Discord contract plus compact lookup indexes
+/// (used for implementation dispatches and normal turns).
 /// `Lite` is an opt-in channel profile for low-frequency general channels.
 /// `ReviewLite` strips peer agents, long-term memory, and skills to reduce token cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DispatchProfile {
-    /// Full system prompt — all sections included (implementation, normal turns)
+    /// Full system prompt — normal turns with compact shared-rule indexes.
     Full,
     /// Lightweight general-channel prompt. Keeps the base Discord/tooling
     /// context but skips shared prompt files, role prompts, and heavy memory.
     Lite,
     /// Minimal prompt for review/review-decision dispatches.
-    /// Includes: base context, shared agent rules, role binding.
+    /// Includes: base context, review rules.
     /// Excludes: skills, peer agent directory, long-term memory.
     ReviewLite,
 }
@@ -814,14 +815,14 @@ pub(super) fn build_system_prompt(
     if let Some(binding) = role_binding {
         // ReviewLite: inject minimal review rules instead of full shared prompt.
         // review and review-decision have different contracts:
-        //   review          → read code, post review comment, submit verdict via /api/review-verdict
-        //   review-decision → read counter-review feedback, submit accept/dispute/dismiss via /api/review-decision
+        //   review          → read code, post review comment, submit verdict via /api/reviews/verdict
+        //   review-decision → read counter-review feedback, submit accept/dispute/dismiss via /api/reviews/decision
         if profile == DispatchProfile::ReviewLite {
             system_prompt_owned.push_str(&match dispatch_type {
                 Some("review-decision") => "\n\n[Review Decision Rules]\n\
                      - 한국어로 소통한다\n\
                      - 카운터 리뷰 피드백을 읽고 accept/dispute/dismiss 중 결정한다\n\
-                     - POST /api/review-decision {card_id, decision, comment}로 결정을 제출한다\n\
+                     - POST /api/reviews/decision {card_id, decision, comment}로 결정을 제출한다\n\
                      - decision: accept(피드백 수용→rework), dispute(반박→재리뷰), dismiss(무시→done)"
                         .to_string(),
                 _ => "\n\n[Review Rules]\n\
@@ -848,14 +849,11 @@ pub(super) fn build_system_prompt(
                  - 현재 요청에 필요한 범위만 확인하고 불필요한 파일 탐색을 피한다\n\
                  - 큰 변경이나 장시간 작업이 필요하면 먼저 범위와 다음 행동을 짧게 확인한다",
             );
-        } else if let Some(shared_prompt) = load_shared_prompt_for_profile("full") {
-            // Full profile: inject the `full` + `all` sections of the shared agent prompt.
-            // Profile-gated blocks (`review-lite`, `headless`) are stripped at load time.
-            system_prompt_owned.push_str("\n\n[Shared Agent Rules]\n");
-            system_prompt_owned.push_str(&shared_prompt);
+        } else {
+            system_prompt_owned.push_str(shared_agent_rules_lookup());
             tracing::warn!(
-                "  [role-map] Injected shared prompt ({} chars) for channel {}",
-                shared_prompt.len(),
+                "  [role-map] Injected compact shared rule index ({} chars) for channel {}",
+                shared_agent_rules_lookup().len(),
                 channel_id.get()
             );
         }
@@ -995,6 +993,99 @@ mod dispatch_contract_tests {
         assert!(contract.contains("\"verdict\":\"phase_gate_passed\""));
         assert!(contract.contains("\"merge_verified\":{\"status\":\"pass\"}"));
         assert!(contract.contains("review verdict API는 사용하지 않는다"));
+    }
+
+    #[test]
+    fn review_lite_prompt_keeps_review_contract_while_trimming_full_sections() {
+        use super::super::settings::RoleBinding;
+
+        let binding = RoleBinding {
+            role_id: "project-agentdesk".to_string(),
+            prompt_file: "/nonexistent".to_string(),
+            provider: None,
+            model: None,
+            reasoning_effort: None,
+            peer_agents_enabled: true,
+            quality_feedback_injection_enabled: true,
+            memory: Default::default(),
+        };
+        let dispatch_context = serde_json::json!({
+            "repo": "itismyfield/AgentDesk",
+            "issue_number": 1473,
+            "review_quality_scope_reminder": "Review only the requested change and directly related regressions.",
+            "review_verdict_guidance": "Use improve when actionable regressions are found.",
+            "verdict_endpoint": "POST /api/reviews/verdict"
+        });
+        let dispatch_context_raw = dispatch_context.to_string();
+        let current_task = CurrentTaskContext {
+            dispatch_id: Some("dispatch-review-1473"),
+            card_id: Some("card-1473"),
+            dispatch_title: Some("[Review] #1473"),
+            dispatch_context: Some(&dispatch_context_raw),
+            card_title: Some("trim review MCP catalog"),
+            github_issue_url: Some("https://github.com/itismyfield/AgentDesk/issues/1473"),
+        };
+        let shared_knowledge = Some("[Shared Agent Knowledge]\n".repeat(80));
+        let longterm_catalog = Some("- memory.md: detailed operational memory\n".repeat(80));
+
+        let full_prompt = build_system_prompt(
+            "ctx",
+            &[],
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            Some(&binding),
+            false,
+            DispatchProfile::Full,
+            Some("implementation"),
+            Some(&current_task),
+            shared_knowledge.as_deref(),
+            longterm_catalog.as_deref(),
+            Some(&ResolvedMemorySettings {
+                backend: MemoryBackendKind::File,
+                ..ResolvedMemorySettings::default()
+            }),
+            false,
+        );
+        let review_prompt = build_system_prompt(
+            "ctx",
+            &[],
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            Some(&binding),
+            false,
+            DispatchProfile::ReviewLite,
+            Some("review"),
+            Some(&current_task),
+            shared_knowledge.as_deref(),
+            longterm_catalog.as_deref(),
+            Some(&ResolvedMemorySettings {
+                backend: MemoryBackendKind::File,
+                ..ResolvedMemorySettings::default()
+            }),
+            false,
+        );
+
+        assert!(review_prompt.contains("[Review Rules]"));
+        assert!(review_prompt.contains("Review Scope Reminder"));
+        assert!(review_prompt.contains("Review Verdict Guidance"));
+        assert!(review_prompt.contains("Verdict Endpoint: POST /api/reviews/verdict"));
+        assert!(!review_prompt.contains("[Long-term Memory]"));
+        assert!(!review_prompt.contains("[Proactive Memory Guidance]"));
+
+        let review_words = review_prompt.split_whitespace().count();
+        let full_words = full_prompt.split_whitespace().count();
+        if std::env::var_os("AGENTDESK_PRINT_REVIEW_LITE_BASELINE").is_some() {
+            eprintln!(
+                "review_lite_prompt_baseline review_chars={} review_words={} full_chars={} full_words={}",
+                review_prompt.len(),
+                review_words,
+                full_prompt.len(),
+                full_words
+            );
+        }
+        assert!(review_words * 2 < full_words);
     }
 }
 
@@ -1369,10 +1460,10 @@ mod tests {
             false,
         );
         // review should NOT contain decision API
-        assert!(!review_prompt.contains("/api/review-decision"));
+        assert!(!review_prompt.contains("/api/reviews/decision"));
         assert!(review_prompt.contains("[Review Rules]"));
         // review-decision should contain decision API and options
-        assert!(decision_prompt.contains("/api/review-decision"));
+        assert!(decision_prompt.contains("/api/reviews/decision"));
         assert!(decision_prompt.contains("accept/dispute/dismiss"));
         assert!(decision_prompt.contains("[Review Decision Rules]"));
     }
@@ -1485,15 +1576,11 @@ mod tests {
         assert!(prompt.contains("[Proactive Memory Guidance]"));
         assert!(prompt.contains("`recall` MCP tool"));
         assert!(prompt.contains("`remember` MCP tool"));
-        assert!(prompt.contains("`context`"));
-        assert!(prompt.contains("`reflect`"));
-        assert!(prompt.contains("`workspace`를 생략"));
-        assert!(prompt.contains("`workspace=agentdesk` + `agentId=default`"));
-        assert!(
-            prompt
-                .contains("`workspace=agentdesk-project-agentdesk` + `agentId=project-agentdesk`")
-        );
-        assert!(prompt.contains("workspace 스코프 이름은 `agentdesk`"));
+        assert!(prompt.contains("full memory policy: `docs/memory-scope.md`"));
+        assert!(prompt.contains("project=`workspace=agentdesk, agentId=default`"));
+        assert!(prompt.contains(
+            "agent-private=`workspace=agentdesk-project-agentdesk, agentId=project-agentdesk`"
+        ));
         assert!(!prompt.contains("tool_feedback("));
     }
 
@@ -1604,7 +1691,7 @@ mod tests {
             "noop_reason": "feature already exists",
             "review_quality_checklist": ["edge case", "error handling"],
             "review_verdict_guidance": "quality issue가 보이면 improve",
-            "verdict_endpoint": "POST /api/review-verdict",
+            "verdict_endpoint": "POST /api/reviews/verdict",
             "ci_recovery": {
                 "job_name": "dashboard-build",
                 "reason": "Code job failed: dashboard-build",
@@ -1643,9 +1730,9 @@ mod tests {
         assert!(prompt.contains("Review Mode: noop_verification"));
         assert!(prompt.contains("Review Branch: wt/671-dispatch"));
         assert!(prompt.contains("Reviewed Commit: abc12345deadbeef"));
-        assert!(prompt.contains("Verdict Endpoint: POST /api/review-verdict"));
+        assert!(prompt.contains("Verdict Endpoint: POST /api/reviews/verdict"));
         assert!(prompt.contains("CI Recovery Job: dashboard-build"));
-        assert!(prompt.contains("`POST /api/review-verdict` (`dispatch_id=dispatch-review-671`)"));
+        assert!(prompt.contains("`POST /api/reviews/verdict` (`dispatch_id=dispatch-review-671`)"));
         assert!(prompt.contains("Review Quality Checklist"));
     }
 
@@ -1658,7 +1745,7 @@ mod tests {
             "issue_number": 692,
             "pr_number": 366,
             "reviewed_commit": "feedfacecafebeef",
-            "decision_endpoint": "POST /api/review-decision",
+            "decision_endpoint": "POST /api/reviews/decision",
             "verdict": "rework"
         });
         let dispatch_context_raw = dispatch_context.to_string();
@@ -1706,8 +1793,8 @@ mod tests {
         assert!(prompt.contains("Review Issue: #692"));
         assert!(prompt.contains("Review PR: #366"));
         assert!(prompt.contains("Reviewed Commit: feedfacecafebeef"));
-        assert!(prompt.contains("Decision Endpoint: POST /api/review-decision"));
-        assert!(rules_section.contains("POST /api/review-decision {card_id, decision, comment}"));
+        assert!(prompt.contains("Decision Endpoint: POST /api/reviews/decision"));
+        assert!(rules_section.contains("POST /api/reviews/decision {card_id, decision, comment}"));
         assert!(!rules_section.contains("owner/repo"));
         assert!(!rules_section.contains("#366"));
         assert!(!rules_section.contains("feedfacecafebeef"));

@@ -325,6 +325,7 @@ fn attach_paused_turn_watcher(
         let last_heartbeat_ts_ms = Arc::new(std::sync::atomic::AtomicI64::new(
             super::super::tmux_watcher_now_ms(),
         ));
+        let mailbox_finalize_owed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handle = TmuxWatcherHandle {
             tmux_session_name: tmux_session_name.clone(),
             paused: paused.clone(),
@@ -333,6 +334,7 @@ fn attach_paused_turn_watcher(
             pause_epoch: pause_epoch.clone(),
             turn_delivered: turn_delivered.clone(),
             last_heartbeat_ts_ms: last_heartbeat_ts_ms.clone(),
+            mailbox_finalize_owed: mailbox_finalize_owed.clone(),
         };
         let claim = super::super::tmux::claim_or_reuse_watcher(
             &shared.tmux_watchers,
@@ -365,6 +367,7 @@ fn attach_paused_turn_watcher(
                 pause_epoch,
                 turn_delivered,
                 last_heartbeat_ts_ms,
+                mailbox_finalize_owed,
             ));
         }
     }
@@ -593,6 +596,17 @@ fn native_fast_mode_override_for_turn(
 ) -> Option<bool> {
     if matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
         channel_fast_mode_setting
+    } else {
+        None
+    }
+}
+
+fn codex_goals_override_for_turn(
+    provider: &ProviderKind,
+    channel_codex_goals_setting: Option<bool>,
+) -> Option<bool> {
+    if matches!(provider, ProviderKind::Codex) {
+        channel_codex_goals_setting
     } else {
         None
     }
@@ -1554,6 +1568,10 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, fast_mode_channel_id).await,
     );
+    let codex_goals_override = codex_goals_override_for_turn(
+        &provider,
+        super::super::commands::channel_codex_goals_setting(shared, fast_mode_channel_id).await,
+    );
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
     let compact_percent = ctx_thresholds.compact_pct_for(&provider);
     let model_context_window = provider.resolve_context_window(model_for_turn.as_deref());
@@ -1600,6 +1618,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                             native_fast_mode_override,
                             compact_percent_for_claude,
                             cache_ttl_minutes,
+                            None,
                         ),
                         ProviderKind::Codex => codex::execute_command_streaming(
                             &context_prompt,
@@ -1615,6 +1634,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                             Some(provider_for_blocking.clone()),
                             model_for_turn.as_deref(),
                             native_fast_mode_override,
+                            codex_goals_override,
                             compact_token_limit_for_codex,
                         ),
                         ProviderKind::Gemini => gemini::execute_command_streaming(
@@ -3331,7 +3351,7 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     let placeholder_msg_id = if let Some(existing) = queued_placeholder_handoff {
         // Drive the controller from Queued → Active so the user sees the
-        // existing `📬 메시지 대기 중` card morph into `🔄 백그라운드 처리 중`
+        // existing `📬 메시지 대기 중` card morph into `🔄 응답 처리 중`
         // at the exact moment the queued turn starts. The streaming path will
         // overwrite this Active card with response text shortly after; the
         // brief Active beat is the visible "we picked your queued message up"
@@ -4012,6 +4032,10 @@ pub(in crate::services::discord) async fn handle_text_message(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, fast_mode_channel_id).await,
     );
+    let codex_goals_override = codex_goals_override_for_turn(
+        &provider,
+        super::super::commands::channel_codex_goals_setting(shared, fast_mode_channel_id).await,
+    );
 
     // Fetch context compact percent from ADK settings (provider-specific)
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
@@ -4039,6 +4063,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         channel_name: channel_name.clone(),
         execution_mode: Some("discord_turn".to_string()),
     };
+    let dispatch_type_for_mcp = dispatch_type_str.clone();
 
     // Run the provider in a blocking thread
     let provider_for_blocking = provider.clone();
@@ -4064,6 +4089,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                             native_fast_mode_override,
                             compact_percent_for_claude,
                             cache_ttl_minutes,
+                            dispatch_type_for_mcp.as_deref(),
                         ),
                         ProviderKind::Codex => codex::execute_command_streaming(
                             &context_prompt,
@@ -4079,6 +4105,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                             Some(provider_for_blocking.clone()),
                             model_for_turn.as_deref(),
                             native_fast_mode_override,
+                            codex_goals_override,
                             compact_token_limit_for_codex,
                         ),
                         ProviderKind::Gemini => gemini::execute_command_streaming(
@@ -4418,12 +4445,21 @@ pub(super) async fn lookup_text_stop_token_mailbox(
 
 pub(super) async fn cancel_text_stop_token_mailbox(
     shared: &Arc<SharedData>,
+    provider: &ProviderKind,
     channel_id: serenity::ChannelId,
 ) -> TextStopLookup {
     let result = super::super::mailbox_cancel_active_turn(shared, channel_id).await;
     match result.token {
         Some(_) if result.already_stopping => TextStopLookup::AlreadyStopping,
-        Some(token) => TextStopLookup::Stop(token),
+        Some(token) => {
+            super::super::ensure_cancel_token_bound_from_inflight(
+                provider,
+                channel_id,
+                &token,
+                "text stop mailbox lookup",
+            );
+            TextStopLookup::Stop(token)
+        }
         None => TextStopLookup::NoActiveTurn,
     }
 }
@@ -4675,7 +4711,8 @@ pub(super) async fn handle_text_command(
                 // turn whose `child_pid` is `None` (handoff/restart/Codex
                 // TUI). The previous code only called `cancel_active_token`
                 // here, so those runs never received an abort key.
-                let stop_lookup = cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
+                let stop_lookup =
+                    cancel_text_stop_token_mailbox(&data.shared, &data.provider, channel_id).await;
                 match stop_lookup {
                     TextStopLookup::Stop(token) => {
                         super::super::turn_bridge::stop_active_turn(
@@ -5428,17 +5465,20 @@ Any other message is sent to {p}.
                     }
                     "stop" => {
                         // #441: flows through cancel_text_stop_token_mailbox (mailbox_cancel_active_turn)
-                        // → cancel_active_token → token.cancelled triggers turn_bridge loop exit
+                        // → stop_active_turn → token.cancelled triggers turn_bridge loop exit
                         // → mailbox_finish_turn canonical cleanup
                         let stop_lookup =
-                            cancel_text_stop_token_mailbox(&data.shared, channel_id).await;
+                            cancel_text_stop_token_mailbox(&data.shared, &data.provider, channel_id)
+                                .await;
                         match stop_lookup {
                             TextStopLookup::Stop(token) => {
-                                super::super::turn_bridge::cancel_active_token(
+                                super::super::turn_bridge::stop_active_turn(
+                                    &data.provider,
                                     &token,
                                     super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
                                     "!cc stop",
-                                );
+                                )
+                                .await;
                                 super::super::commands::notify_turn_stop(
                                     &ctx.http,
                                     &data.shared,
@@ -6065,6 +6105,22 @@ mod tests {
         );
         assert_eq!(
             native_fast_mode_override_for_turn(&ProviderKind::Gemini, Some(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_goals_override_only_applies_to_codex() {
+        assert_eq!(
+            codex_goals_override_for_turn(&ProviderKind::Codex, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            codex_goals_override_for_turn(&ProviderKind::Codex, Some(false)),
+            Some(false)
+        );
+        assert_eq!(
+            codex_goals_override_for_turn(&ProviderKind::Claude, Some(true)),
             None
         );
     }
@@ -6728,6 +6784,7 @@ mod tests {
                 last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
                     super::super::super::tmux_watcher_now_ms(),
                 )),
+                mailbox_finalize_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
 

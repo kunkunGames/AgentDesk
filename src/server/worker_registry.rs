@@ -9,6 +9,7 @@ use crate::services::discord::health::HealthRegistry;
 use crate::services::routines::validate_routine_runtime_config;
 use sqlx::PgPool;
 
+use super::cluster::ClusterRuntime;
 use super::ws::{BatchBuffer, BroadcastTx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +119,21 @@ impl WorkerShutdownPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerExecutionScope {
+    LeaderOnly,
+    WorkerLocal,
+}
+
+impl WorkerExecutionScope {
+    pub(crate) const fn as_doc_str(self) -> &'static str {
+        match self {
+            Self::LeaderOnly => "leader_only",
+            Self::WorkerLocal => "worker_local",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WorkerSpec {
     id: ServerWorkerId,
     pub(crate) name: &'static str,
@@ -129,6 +145,7 @@ pub(crate) struct WorkerSpec {
     pub(crate) start_order: u8,
     pub(crate) restart_policy: WorkerRestartPolicy,
     pub(crate) shutdown_policy: WorkerShutdownPolicy,
+    pub(crate) execution_scope: WorkerExecutionScope,
     pub(crate) health_owner: &'static str,
     pub(crate) notes: &'static str,
 }
@@ -145,6 +162,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 10,
         restart_policy: WorkerRestartPolicy::SkipWhenDisabled,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "tracing logs and GitHub sync side effects",
         notes: "Skipped when github.sync_interval_minutes <= 0 or gh CLI is unavailable",
     },
@@ -159,6 +177,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 20,
         restart_policy: WorkerRestartPolicy::ManualProcessRestart,
         shutdown_policy: WorkerShutdownPolicy::ProcessExit,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "kv_meta last_tick_* keys and memory health refresh",
         notes: "Uses a dedicated current-thread Tokio runtime to avoid engine lock deadlocks",
     },
@@ -173,6 +192,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 30,
         restart_policy: WorkerRestartPolicy::LoopOwned,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "rate_limit_cache freshness and tracing logs",
         notes: "Runs immediately on startup and then every 120 seconds",
     },
@@ -187,6 +207,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 35,
         restart_policy: WorkerRestartPolicy::LoopOwned,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "kv_meta maintenance_job:* keys and tracing logs",
         notes: "Static registry seeded with a noop heartbeat; first runs are staggered after startup",
     },
@@ -201,6 +222,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 40,
         restart_policy: WorkerRestartPolicy::LoopOwned,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "message_outbox row state and delivery tracing",
         notes: "Waits three seconds for Discord runtime readiness before polling with adaptive backoff",
     },
@@ -215,8 +237,9 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 50,
         restart_policy: WorkerRestartPolicy::LoopOwned,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::WorkerLocal,
         health_owner: "dispatch outbox tables and delivery tracing",
-        notes: "Shares the boot-reconcile boundary with other DB-backed recovery workers",
+        notes: "Runs on each cluster node; PostgreSQL row claims and capability filters select the worker",
     },
     WorkerSpec {
         id: ServerWorkerId::RoutineRuntime,
@@ -229,6 +252,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 55,
         restart_policy: WorkerRestartPolicy::SkipWhenDisabled,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "routine_runs row state and tracing logs",
         notes: "Skipped when routines.enabled=false or postgres pool unavailable; \
                 performs boot recovery of stale running runs before the tick loop starts",
@@ -244,6 +268,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 60,
         restart_policy: WorkerRestartPolicy::LoopOwned,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "failed DM notification rows and retry tracing",
         notes: "Skips the immediate tick and only starts retries after the first interval",
     },
@@ -258,6 +283,7 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
         start_order: 70,
         restart_policy: WorkerRestartPolicy::LoopOwned,
         shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
+        execution_scope: WorkerExecutionScope::WorkerLocal,
         health_owner: "websocket broadcast throughput and tracing logs",
         notes: "Starts after the broadcast sender exists because it owns the shared batch buffer",
     },
@@ -283,6 +309,7 @@ pub(crate) struct SupervisedWorkerRegistry {
     engine: PolicyEngine,
     health_registry: Option<Arc<HealthRegistry>>,
     pg_pool: Option<Arc<PgPool>>,
+    cluster_runtime: ClusterRuntime,
     running: Vec<RunningWorker>,
 }
 
@@ -292,12 +319,14 @@ impl SupervisedWorkerRegistry {
         engine: PolicyEngine,
         health_registry: Option<Arc<HealthRegistry>>,
         pg_pool: Option<Arc<PgPool>>,
+        cluster_runtime: ClusterRuntime,
     ) -> Self {
         Self {
             config,
             engine,
             health_registry,
             pg_pool,
+            cluster_runtime,
             running: Vec::new(),
         }
     }
@@ -346,6 +375,12 @@ impl SupervisedWorkerRegistry {
         let mut batch_buffer = None;
         for spec in WORKER_SPECS {
             if spec.start_stage != stage || self.is_started(spec.id) {
+                continue;
+            }
+            if spec.execution_scope == WorkerExecutionScope::LeaderOnly
+                && !self.cluster_runtime.is_leader()
+            {
+                self.log_skip(spec, "cluster node does not hold leader lease");
                 continue;
             }
             self.log_start(spec);
@@ -401,6 +436,7 @@ impl SupervisedWorkerRegistry {
                         .map_err(|e| {
                         anyhow!("failed to initialize dedicated policy tick engine: {e}")
                     })?;
+                let tick_cluster_runtime = self.cluster_runtime.clone();
                 self.register_thread(spec, "policy-tick", move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -409,7 +445,11 @@ impl SupervisedWorkerRegistry {
                             tracing::warn!("Fatal: failed to create policy-tick runtime: {e}");
                             std::process::exit(1);
                         });
-                    rt.block_on(super::policy_tick_loop(tick_engine, Some(tick_pg_pool)));
+                    rt.block_on(super::policy_tick_loop(
+                        tick_engine,
+                        Some(tick_pg_pool),
+                        Some(tick_cluster_runtime),
+                    ));
                 })?;
                 Ok(None)
             }
@@ -449,8 +489,13 @@ impl SupervisedWorkerRegistry {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
+                let claim_owner = self.cluster_runtime.instance_id().to_string();
                 self.register_tokio(spec, async move {
-                    super::routes::dispatches::dispatch_outbox_loop(dispatch_outbox_pg_pool).await;
+                    super::routes::dispatches::dispatch_outbox_loop(
+                        dispatch_outbox_pg_pool,
+                        claim_owner,
+                    )
+                    .await;
                 });
                 Ok(None)
             }
@@ -526,12 +571,37 @@ impl SupervisedWorkerRegistry {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let future = Self::fence_leader_tokio_worker(spec, self.cluster_runtime.clone(), future);
         self.running.push(RunningWorker {
             spec,
             _handle: WorkerHandle::Tokio {
                 _handle: tokio::spawn(future),
             },
         });
+    }
+
+    async fn fence_leader_tokio_worker<F>(
+        spec: WorkerSpec,
+        cluster_runtime: ClusterRuntime,
+        future: F,
+    ) where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if spec.execution_scope != WorkerExecutionScope::LeaderOnly {
+            future.await;
+            return;
+        }
+        tokio::pin!(future);
+        tokio::select! {
+            _ = &mut future => {}
+            _ = cluster_runtime.wait_until_not_leader() => {
+                tracing::warn!(
+                    worker = spec.name,
+                    instance_id = cluster_runtime.instance_id(),
+                    "leader-only worker self-fenced after cluster leadership was lost"
+                );
+            }
+        }
     }
 
     fn register_thread<F>(&mut self, spec: WorkerSpec, name: &str, body: F) -> Result<()>
@@ -561,6 +631,7 @@ impl SupervisedWorkerRegistry {
             order = spec.start_order,
             restart = spec.restart_policy.as_doc_str(),
             shutdown = spec.shutdown_policy.as_doc_str(),
+            execution_scope = spec.execution_scope.as_doc_str(),
             owner = spec.owner,
             health = spec.health_owner,
             responsibility = spec.responsibility,
@@ -573,6 +644,7 @@ impl SupervisedWorkerRegistry {
         tracing::info!(
             worker = spec.name,
             stage = spec.start_stage.as_doc_str(),
+            execution_scope = spec.execution_scope.as_doc_str(),
             reason,
             "skipping supervised worker"
         );
@@ -581,7 +653,9 @@ impl SupervisedWorkerRegistry {
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
-    use super::{BOOT_ONLY_STEPS, WORKER_SPECS, WorkerShutdownPolicy, WorkerStartStage};
+    use super::{
+        BOOT_ONLY_STEPS, WORKER_SPECS, WorkerExecutionScope, WorkerShutdownPolicy, WorkerStartStage,
+    };
 
     #[test]
     fn boot_steps_are_explicit_and_ordered() {
@@ -623,6 +697,20 @@ mod tests {
                 .filter(|spec| spec.shutdown_policy == WorkerShutdownPolicy::ProcessExit)
                 .count(),
             1
+        );
+        assert_eq!(
+            WORKER_SPECS
+                .iter()
+                .filter(|spec| spec.execution_scope == WorkerExecutionScope::LeaderOnly)
+                .count(),
+            6
+        );
+        assert_eq!(
+            WORKER_SPECS
+                .iter()
+                .filter(|spec| spec.execution_scope == WorkerExecutionScope::WorkerLocal)
+                .count(),
+            2
         );
         assert!(WORKER_SPECS.iter().all(|spec| !spec.owner.is_empty()));
         assert!(

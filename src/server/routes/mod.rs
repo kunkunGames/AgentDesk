@@ -4,6 +4,7 @@ mod agents_setup;
 pub mod analytics;
 pub mod auth;
 pub mod auto_queue;
+pub mod cluster;
 pub mod cron_api;
 pub mod departments;
 pub mod discord;
@@ -108,14 +109,6 @@ impl AppState {
 }
 
 pub(crate) type ApiRouter = Router<AppState>;
-
-pub(crate) fn log_deprecated_alias(old_path: &'static str, canonical_path: &'static str) {
-    tracing::warn!(
-        old_path,
-        canonical_path,
-        "deprecated API alias called; use canonical path"
-    );
-}
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 impl AppState {

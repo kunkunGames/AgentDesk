@@ -1,6 +1,6 @@
 use super::*;
 
-/// POST /api/auto-queue/generate
+/// POST /api/queue/generate
 ///
 /// Creates a queue run from ready cards, ordered by priority.
 ///
@@ -39,6 +39,25 @@ pub async fn generate(
                 .collect::<Vec<_>>()
         })
         .or_else(|| body.issue_numbers.clone().filter(|nums| !nums.is_empty()));
+    if body.auto_assign_agent.unwrap_or(false)
+        && let (Some(agent_id), Some(issue_numbers)) = (
+            body.agent_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+            requested_issue_numbers.as_ref(),
+        )
+    {
+        let mut cards =
+            match resolve_dispatch_cards_with_pg(pool, body.repo.as_deref(), issue_numbers).await {
+                Ok(cards) => cards,
+                Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+            };
+        if let Err(error) =
+            apply_dispatch_agent_assignments_with_pg(pool, &mut cards, Some(agent_id), true).await
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+        }
+    }
     // (index, batch_phase, thread_group)
     let requested_entry_meta: HashMap<i64, (usize, i64, Option<i64>)> = requested_entries
         .as_ref()
@@ -133,7 +152,7 @@ pub async fn generate(
     // #1444 idempotency guard: filter out any candidate card that already has
     // a pending/dispatched dispatch. This prevents the #1442 incident pattern
     // where `/redispatch` creates a new dispatch and a follow-up
-    // `/auto-queue/generate` would silently create another. The filtered
+    // `/queue/generate` would silently create another. The filtered
     // cards get reported under `skipped_due_to_active_dispatch` so callers
     // see WHY their issue didn't make it into the run.
     //
@@ -567,7 +586,7 @@ pub async fn generate(
     )
 }
 
-/// Structured skip-reason breakdown for `/api/auto-queue/generate` (#1442).
+/// Structured skip-reason breakdown for `/api/queue/generate` (#1442).
 #[derive(Debug, Default)]
 pub(crate) struct GenerateSkipBreakdown {
     pub active_dispatch: Vec<serde_json::Value>,
@@ -671,7 +690,7 @@ pub(crate) async fn collect_generate_skip_breakdown(
 
 /// #1444 idempotency helper: returns the dispatch_id when the card already
 /// has a pending/dispatched dispatch on `task_dispatches`, otherwise None.
-/// Used by `/api/auto-queue/generate` to silently skip cards that would
+/// Used by `/api/queue/generate` to silently skip cards that would
 /// otherwise queue up a duplicate dispatch on top of an in-flight one.
 ///
 /// Returns a `Result` so callers can fail closed on lookup errors (codex

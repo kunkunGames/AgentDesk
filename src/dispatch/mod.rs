@@ -158,6 +158,18 @@ pub fn cancel_dispatch_and_reset_auto_queue_on_conn(
         dispatch_status.as_deref(),
         Some("cancelled") | Some("failed")
     ) {
+        conn.execute(
+            "UPDATE sessions
+             SET status = CASE
+                     WHEN status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working') THEN 'idle'
+                     ELSE status
+                 END,
+                 active_dispatch_id = NULL,
+                 session_info = ?1
+             WHERE active_dispatch_id = ?2",
+            sqlite_test::params!["Dispatch cancelled", dispatch_id],
+        )?;
+
         // #815: user / external explicit stops must move the entry to a
         // non-dispatchable terminal status so the next auto-queue tick does
         // not immediately re-dispatch the same entry. System cancels (retry
@@ -241,7 +253,7 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
     let cancel_payload = reason.map(|value| json!({ "reason": value }));
 
     let current = sqlx::query(
-        "SELECT status, kanban_card_id, dispatch_type
+        "SELECT status, kanban_card_id, dispatch_type, thread_id
          FROM task_dispatches
          WHERE id = $1",
     )
@@ -297,6 +309,43 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
         return Ok(0);
     }
 
+    let kanban_card_id = current
+        .try_get::<Option<String>, _>("kanban_card_id")
+        .ok()
+        .flatten();
+    let dispatch_type = current
+        .try_get::<Option<String>, _>("dispatch_type")
+        .ok()
+        .flatten();
+    let thread_id = current
+        .try_get::<Option<String>, _>("thread_id")
+        .ok()
+        .flatten();
+    clear_cancelled_dispatch_thread_link_on_pg_tx(
+        tx,
+        dispatch_id,
+        kanban_card_id.as_deref(),
+        thread_id.as_deref(),
+    )
+    .await?;
+
+    sqlx::query(
+        "UPDATE sessions
+         SET status = CASE
+                 WHEN status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working') THEN 'idle'
+                 ELSE status
+             END,
+             active_dispatch_id = NULL,
+             session_info = $1,
+             last_heartbeat = NOW()
+         WHERE active_dispatch_id = $2",
+    )
+    .bind("Dispatch cancelled")
+    .bind(dispatch_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| format!("clear postgres session dispatch link {dispatch_id}: {error}"))?;
+
     let _ = sqlx::query(
         "INSERT INTO dispatch_events (
             dispatch_id,
@@ -309,18 +358,8 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
         ) VALUES ($1, $2, $3, $4, 'cancelled', 'cancel_dispatch', $5)",
     )
     .bind(dispatch_id)
-    .bind(
-        current
-            .try_get::<Option<String>, _>("kanban_card_id")
-            .ok()
-            .flatten(),
-    )
-    .bind(
-        current
-            .try_get::<Option<String>, _>("dispatch_type")
-            .ok()
-            .flatten(),
-    )
+    .bind(kanban_card_id)
+    .bind(dispatch_type)
     .bind(&current_status)
     .bind(cancel_payload.clone())
     .execute(&mut **tx)
@@ -391,6 +430,136 @@ pub async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx(
     }
 
     Ok(changed)
+}
+
+fn normalized_dispatch_thread_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn thread_map_value_matches(value: &serde_json::Value, thread_id: &str) -> bool {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                value
+                    .as_u64()
+                    .is_some_and(|value| value.to_string() == thread_id)
+            },
+            |value| value == thread_id,
+        )
+}
+
+async fn clear_cancelled_dispatch_thread_link_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch_id: &str,
+    card_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(card_id) = normalized_dispatch_thread_id(card_id) else {
+        return Ok(());
+    };
+    let Some(thread_id) = normalized_dispatch_thread_id(thread_id) else {
+        return Ok(());
+    };
+
+    let still_referenced_by_live_dispatch: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM task_dispatches
+             WHERE kanban_card_id = $1
+               AND thread_id = $2
+               AND id <> $3
+               AND status NOT IN ('cancelled', 'failed', 'expired')
+         )",
+    )
+    .bind(&card_id)
+    .bind(&thread_id)
+    .bind(dispatch_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| format!("check live thread references for {dispatch_id}: {error}"))?;
+    if still_referenced_by_live_dispatch {
+        return Ok(());
+    }
+
+    let row = sqlx::query(
+        "SELECT channel_thread_map::text AS channel_thread_map, active_thread_id
+         FROM kanban_cards
+         WHERE id = $1
+         FOR UPDATE",
+    )
+    .bind(&card_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| {
+        format!("load card thread map for cancelled dispatch {dispatch_id}: {error}")
+    })?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let map_json: Option<String> = row.try_get("channel_thread_map").map_err(|error| {
+        format!("read card thread map for cancelled dispatch {dispatch_id}: {error}")
+    })?;
+    let active_thread_id: Option<String> = row.try_get("active_thread_id").map_err(|error| {
+        format!("read active thread for cancelled dispatch {dispatch_id}: {error}")
+    })?;
+
+    let mut map = map_json
+        .as_deref()
+        .and_then(|raw| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok()
+        })
+        .unwrap_or_default();
+    let before_len = map.len();
+    map.retain(|_, value| !thread_map_value_matches(value, &thread_id));
+    let removed_from_map = map.len() != before_len;
+    let active_matches = active_thread_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| value == thread_id);
+
+    if !removed_from_map && !active_matches {
+        return Ok(());
+    }
+
+    let new_map = if map.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&map)
+                .map_err(|error| format!("serialize card thread map for {card_id}: {error}"))?,
+        )
+    };
+    let new_active_thread_id = if active_matches {
+        map.values()
+            .find_map(|value| value.as_str())
+            .map(std::string::ToString::to_string)
+    } else {
+        active_thread_id
+    };
+
+    sqlx::query(
+        "UPDATE kanban_cards
+         SET channel_thread_map = $1::jsonb,
+             active_thread_id = $2,
+             updated_at = NOW()
+         WHERE id = $3",
+    )
+    .bind(new_map)
+    .bind(new_active_thread_id)
+    .bind(&card_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| {
+        format!("clear cancelled dispatch thread link for {dispatch_id}/{card_id}: {error}")
+    })?;
+
+    Ok(())
 }
 
 /// Cancel all live dispatches for a card without resetting auto-queue entries.
@@ -1353,6 +1522,12 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_key, agent_id, provider, status, active_dispatch_id, session_info, created_at) \
+             VALUES ('session-aq', 'agent-1', 'claude', 'turn_active', 'dispatch-aq', 'live dispatch', datetime('now'))",
+            [],
+        )
+        .unwrap();
 
         let cancelled =
             cancel_dispatch_and_reset_auto_queue_on_conn(&conn, "dispatch-aq", Some("test"))
@@ -1377,6 +1552,20 @@ mod tests {
             .unwrap();
         assert_eq!(entry_status, "pending");
         assert!(entry_dispatch_id.is_none());
+        let (session_status, active_dispatch_id, session_info): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, active_dispatch_id, session_info FROM sessions WHERE session_key = 'session-aq'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session_status, "idle");
+        assert!(active_dispatch_id.is_none());
+        assert_eq!(session_info.as_deref(), Some("Dispatch cancelled"));
         assert_eq!(
             load_dispatch_events(&conn, "dispatch-aq"),
             vec![(
@@ -1386,6 +1575,57 @@ mod tests {
             )],
             "dispatch cancellation must be audited"
         );
+    }
+
+    #[test]
+    fn terminal_dispatch_status_clears_linked_session_active_dispatch() {
+        let db = test_db();
+        let conn = db.separate_conn().unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, created_at, updated_at) \
+             VALUES ('card-terminal-session', 'Terminal Session Card', 'in_progress', 'agent-1', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at) \
+             VALUES ('dispatch-terminal-session', 'card-terminal-session', 'agent-1', 'implementation', 'dispatched', 'Terminal Session', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_key, agent_id, provider, status, active_dispatch_id, session_info, created_at) \
+             VALUES ('session-terminal-session', 'agent-1', 'codex', 'turn_active', 'dispatch-terminal-session', 'live dispatch', datetime('now'))",
+            [],
+        )
+        .unwrap();
+
+        let changed = set_dispatch_status_on_conn(
+            &conn,
+            "dispatch-terminal-session",
+            "completed",
+            Some(&serde_json::json!({"completed_commit": "abc123"})),
+            "api",
+            Some(&["dispatched"]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(changed, 1);
+
+        let (session_status, active_dispatch_id, session_info): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT status, active_dispatch_id, session_info FROM sessions WHERE session_key = 'session-terminal-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(session_status, "idle");
+        assert!(active_dispatch_id.is_none());
+        assert_eq!(session_info.as_deref(), Some("Dispatch completed"));
     }
 
     // ── #815 regression: user reaction-stop must not re-dispatch ──────

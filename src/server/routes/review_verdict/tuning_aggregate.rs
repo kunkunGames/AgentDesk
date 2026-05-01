@@ -436,7 +436,7 @@ fn write_review_tuning_guidance_file(guidance: &str) {
     let _ = std::fs::write(&guidance_path, guidance);
 }
 
-/// POST /api/review-tuning/aggregate
+/// POST /api/reviews/tuning/aggregate
 ///
 /// Aggregates review tuning outcomes (FP/FN rates per finding category)
 /// and writes tuning guidance to kv_meta + a file for prompt injection.

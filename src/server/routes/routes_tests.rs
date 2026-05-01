@@ -831,12 +831,18 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
                 "/dispatched-sessions/webhook",
                 axum::routing::post(|| async { StatusCode::CREATED }),
             )
-            .route("/send", axum::routing::post(|| async { StatusCode::OK }))
             .route(
-                "/send_to_agent",
+                "/discord/send",
                 axum::routing::post(|| async { StatusCode::OK }),
             )
-            .route("/senddm", axum::routing::post(|| async { StatusCode::OK }))
+            .route(
+                "/discord/send-to-agent",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
+            .route(
+                "/discord/send-dm",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
             .route("/settings", axum::routing::get(|| async { StatusCode::OK })),
         state.clone(),
     )
@@ -884,7 +890,7 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/send")
+                .uri("/discord/send")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -897,7 +903,7 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/send_to_agent")
+                .uri("/discord/send-to-agent")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -909,7 +915,7 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/senddm")
+                .uri("/discord/send-dm")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1289,7 +1295,7 @@ async fn discord_control_endpoints_require_auth_token_on_non_loopback_host() {
 
     let mut request = Request::builder()
         .method("POST")
-        .uri("/send")
+        .uri("/discord/send")
         .body(Body::from("{}"))
         .unwrap();
     request.extensions_mut().insert(axum::extract::ConnectInfo(
@@ -1302,7 +1308,7 @@ async fn discord_control_endpoints_require_auth_token_on_non_loopback_host() {
 
     let mut send_to_agent_request = Request::builder()
         .method("POST")
-        .uri("/send_to_agent")
+        .uri("/discord/send-to-agent")
         .body(Body::from(r#"{"role_id":"ch-pd","message":"hello"}"#))
         .unwrap();
     send_to_agent_request
@@ -1326,7 +1332,7 @@ async fn discord_control_endpoints_allow_loopback_without_auth_token() {
 
     let mut request = Request::builder()
         .method("POST")
-        .uri("/send")
+        .uri("/discord/send")
         .body(Body::from("{}"))
         .unwrap();
     request.extensions_mut().insert(axum::extract::ConnectInfo(
@@ -1347,7 +1353,7 @@ async fn send_to_agent_returns_not_found_for_unknown_role_id() {
 
     let mut request = Request::builder()
         .method("POST")
-        .uri("/send_to_agent")
+        .uri("/discord/send-to-agent")
         .body(Body::from(r#"{"role_id":"missing","message":"hello"}"#))
         .unwrap();
     request.extensions_mut().insert(axum::extract::ConnectInfo(
@@ -4107,7 +4113,7 @@ async fn queue_list_pending_dispatches_pg_only_without_sqlite_mirror() {
     .bind("dispatch-pg-queue-list")
     .bind("card-pg-queue-list")
     .bind("agent-pg-queue-list")
-    .bind("implementation")
+    .bind("review")
     .bind("pending")
     .bind("PG queue list dispatch")
     .bind(0_i32)
@@ -4188,24 +4194,32 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
 
     sqlx::query(
         "INSERT INTO kanban_cards (
-            id, title, status, priority, created_at, updated_at
+            id, title, status, priority, active_thread_id, channel_thread_map, created_at, updated_at
          ) VALUES (
-            $1, $2, $3, $4, NOW(), NOW()
+            $1, $2, $3, $4, $5, $6::jsonb, NOW(), NOW()
          )",
     )
     .bind("card-pg-queue-cancel")
     .bind("Queue PG Cancel")
     .bind("in_progress")
     .bind("high")
+    .bind("thread-review-cancelled")
+    .bind(
+        json!({
+            "111": "thread-review-cancelled",
+            "222": "thread-work-active"
+        })
+        .to_string(),
+    )
     .execute(&pg_pool)
     .await
     .unwrap();
 
     sqlx::query(
         "INSERT INTO task_dispatches (
-            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, thread_id, created_at, updated_at
          ) VALUES (
-            $1, $2, $3, $4, $5, $6, NOW(), NOW()
+            $1, $2, $3, $4, $5, $6, $7, NOW(), NOW()
          )",
     )
     .bind("dispatch-pg-queue-cancel")
@@ -4214,6 +4228,7 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
     .bind("implementation")
     .bind("pending")
     .bind("PG queue cancel dispatch")
+    .bind("thread-review-cancelled")
     .execute(&pg_pool)
     .await
     .unwrap();
@@ -4279,6 +4294,27 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
         "dispatch_notified guard should be cleared"
     );
 
+    let (channel_thread_map, active_thread_id): (Option<serde_json::Value>, Option<String>) =
+        sqlx::query_as(
+            "SELECT channel_thread_map, active_thread_id
+             FROM kanban_cards
+             WHERE id = $1",
+        )
+        .bind("card-pg-queue-cancel")
+        .fetch_one(&pg_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        channel_thread_map,
+        Some(json!({"222": "thread-work-active"})),
+        "cancelled dispatch thread must be removed without dropping sibling work thread"
+    );
+    assert_eq!(
+        active_thread_id.as_deref(),
+        Some("thread-work-active"),
+        "active_thread_id should move away from the cancelled review thread"
+    );
+
     let sqlite_count: i64 = db
         .read_conn()
         .unwrap()
@@ -4289,6 +4325,146 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
         )
         .unwrap();
     assert_eq!(sqlite_count, 0, "sqlite mirror should stay empty");
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn link_dispatch_thread_pg_preserves_concurrent_channel_thread_updates() {
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id)
+         VALUES ($1, $2, '111')
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind("agent-thread-race")
+    .bind("Agent Thread Race")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, priority, channel_thread_map, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, $4, '{}'::jsonb, NOW(), NOW()
+         )",
+    )
+    .bind("card-thread-race")
+    .bind("Thread Race")
+    .bind("in_progress")
+    .bind("high")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    for idx in 0..12 {
+        sqlx::query(
+            "INSERT INTO task_dispatches (
+                id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, NOW(), NOW()
+             )",
+        )
+        .bind(format!("dispatch-thread-race-{idx}"))
+        .bind("card-thread-race")
+        .bind("agent-thread-race")
+        .bind("implementation")
+        .bind("dispatched")
+        .bind(format!("Thread race dispatch {idx}"))
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION test_sleep_card_thread_map_update()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             PERFORM pg_sleep(0.03);
+             RETURN NEW;
+         END;
+         $$;
+        ",
+    )
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_sleep_card_thread_map_update
+         BEFORE UPDATE OF channel_thread_map ON kanban_cards
+         FOR EACH ROW
+         EXECUTE FUNCTION test_sleep_card_thread_map_update();",
+    )
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
+    let responses = futures::future::join_all((0..12).map(|idx| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/link-dispatch-thread")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "dispatch_id": format!("dispatch-thread-race-{idx}"),
+                                "thread_id": format!("thread-race-{idx}"),
+                                "channel_id": format!("{}", 9000 + idx),
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        }
+    }))
+    .await;
+    assert_eq!(responses.len(), 12);
+
+    let channel_thread_map: serde_json::Value = sqlx::query_scalar(
+        "SELECT channel_thread_map
+         FROM kanban_cards
+         WHERE id = $1",
+    )
+    .bind("card-thread-race")
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    let map = channel_thread_map
+        .as_object()
+        .expect("channel_thread_map must be an object");
+    assert_eq!(
+        map.len(),
+        12,
+        "concurrent channel thread updates must merge instead of last-writer-wins"
+    );
+    for idx in 0..12 {
+        assert_eq!(
+            map.get(&(9000 + idx).to_string()),
+            Some(&json!(format!("thread-race-{idx}")))
+        );
+    }
 
     pg_pool.close().await;
     pg_db.drop().await;
@@ -7559,7 +7735,7 @@ async fn api_docs_category_exposes_auto_queue_params_and_examples() {
         .expect("category detail must include endpoint array");
     let generate = endpoints
         .iter()
-        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/auto-queue/generate")
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/queue/generate")
         .expect("auto-queue generate endpoint must be present");
     assert!(
         generate["params"].get("mode").is_none(),
@@ -7573,19 +7749,22 @@ async fn api_docs_category_exposes_auto_queue_params_and_examples() {
         generate["example"]["response"]["run"]["unified_thread"],
         serde_json::json!(false)
     );
+    assert_eq!(
+        generate["params"]["auto_assign_agent"]["default"],
+        serde_json::json!(false)
+    );
 
-    let dispatch = endpoints
+    let dispatch_next = endpoints
         .iter()
-        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/auto-queue/dispatch")
-        .expect("auto-queue dispatch endpoint must be present");
-    assert_eq!(dispatch["params"]["groups"]["required"], true);
-    assert_eq!(dispatch["params"]["activate"]["default"], true);
-    assert_eq!(dispatch["params"]["auto_assign_agent"]["default"], true);
-    assert_eq!(dispatch["example"]["response"]["dispatch"]["count"], 1);
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/queue/dispatch-next")
+        .expect("auto-queue dispatch-next endpoint must be present");
+    assert_eq!(dispatch_next["params"]["run_id"]["required"], false);
+    assert_eq!(dispatch_next["params"]["active_only"]["default"], false);
+    assert_eq!(dispatch_next["example"]["response"]["count"], 1);
 
     let pause = endpoints
         .iter()
-        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/auto-queue/pause")
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/queue/pause")
         .expect("auto-queue pause endpoint must be present");
     assert_eq!(pause["params"]["force"]["type"], "boolean");
     assert_eq!(pause["params"]["force"]["default"], false);
@@ -7738,6 +7917,15 @@ async fn api_docs_category_exposes_agents_turn_start_contract() {
     assert_eq!(setup["params"]["dry_run"]["type"], "boolean");
     assert_eq!(setup["params"]["provider"]["enum"][0], "claude");
     assert_eq!(setup["example"]["response"]["dry_run"], true);
+
+    let message = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/agents/{id}/message")
+        .expect("agents message endpoint must be present");
+    assert_eq!(message["params"]["from_agent_id"]["required"], true);
+    assert_eq!(message["params"]["channel_kind"]["default"], "cc");
+    assert_eq!(message["params"]["prefix"]["default"], true);
+    assert_eq!(message["example"]["response"]["bot"], "announce");
 }
 
 #[tokio::test]
@@ -8547,7 +8735,7 @@ async fn create_issue_route_pg_builds_pmd_body_and_agent_label() {
                         "title": "create-issue 스킬을 ADK API로 승격",
                         "background": "AgentDesk 내부에서 PMD 포맷 이슈를 서버 API로 직접 생성해야 한다.",
                         "content": [
-                            "POST /api/issues 엔드포인트를 추가한다.",
+                            "POST /api/github/issues/create 엔드포인트를 추가한다.",
                             "서버에서 PMD 마크다운 포맷을 강제한다."
                         ],
                         "dod": [
@@ -8626,7 +8814,7 @@ async fn create_issue_route_pg_builds_pmd_body_and_agent_label() {
         issue_body
             .contains("## 배경\nAgentDesk 내부에서 PMD 포맷 이슈를 서버 API로 직접 생성해야 한다.")
     );
-    assert!(issue_body.contains("## 내용\n- POST /api/issues 엔드포인트를 추가한다.\n- 서버에서 PMD 마크다운 포맷을 강제한다."));
+    assert!(issue_body.contains("## 내용\n- POST /api/github/issues/create 엔드포인트를 추가한다.\n- 서버에서 PMD 마크다운 포맷을 강제한다."));
     assert!(issue_body.contains("## DoD\n- [ ] 성공 시 issue URL과 번호를 반환한다\n- [ ] DoD 항목은 체크리스트로 렌더링된다"));
     assert!(!issue_body.contains("## 의존성"));
     assert!(!issue_body.contains("## 리스크"));
@@ -9247,6 +9435,7 @@ async fn health_docs_list_doctor_discovery_endpoints() {
         ("GET", "/api/health/detail"),
         ("GET", "/api/doctor/startup/latest"),
         ("POST", "/api/doctor/stale-mailbox/repair"),
+        ("POST", "/api/channels/{id}/relay-recovery"),
     ] {
         assert!(
             endpoints
@@ -9285,16 +9474,16 @@ async fn api_docs_flat_format_lists_routes_missing_from_legacy_docs() {
     for path in [
         "/api/kanban-cards/{id}/reopen",
         "/api/reviews/decision",
-        "/api/auto-queue/dispatch",
-        "/api/auto-queue/dispatch-next",
-        "/api/auto-queue/entries/{id}",
-        "/api/auto-queue/slots/{agent_id}/{slot_index}/reset-thread",
+        "/api/queue/dispatch-next",
+        "/api/queue/entries/{id}",
+        "/api/queue/slots/{agent_id}/{slot_index}/reset-thread",
         "/api/help",
         "/api/docs/{group}",
         "/api/docs/{group}/{category}",
         "/api/health/detail",
         "/api/doctor/startup/latest",
         "/api/doctor/stale-mailbox/repair",
+        "/api/channels/{id}/relay-recovery",
         "/api/github/issues/create",
         "/api/sessions/{id}/tmux-output",
         "/api/stats/memento",
@@ -9347,6 +9536,9 @@ async fn api_docs_flat_format_omits_removed_legacy_routes() {
         "/api/re-review",
         "/api/hook/session",
         "/api/auto-queue/activate",
+        "/api/auto-queue/dispatch",
+        "/api/queue/activate",
+        "/api/queue/dispatch",
         "/api/kanban-cards/bulk-action",
         "/api/kanban-cards/batch-transition",
         "/api/kanban-cards/{id}/force-transition",
@@ -9360,7 +9552,7 @@ async fn api_docs_flat_format_omits_removed_legacy_routes() {
     assert!(
         endpoints
             .iter()
-            .any(|ep| ep["method"] == "POST" && ep["path"] == "/api/auto-queue/runs/{id}/order"),
+            .any(|ep| ep["method"] == "POST" && ep["path"] == "/api/queue/runs/{id}/order"),
         "flat docs must keep the submit_order callback route"
     );
 }
@@ -9389,6 +9581,9 @@ async fn removed_legacy_routes_return_not_found() {
         ("POST", "/hook/session"),
         ("DELETE", "/hook/session"),
         ("POST", "/auto-queue/activate"),
+        ("POST", "/auto-queue/dispatch"),
+        ("POST", "/queue/activate"),
+        ("POST", "/queue/dispatch"),
         ("POST", "/kanban-cards/bulk-action"),
         ("POST", "/kanban-cards/batch-transition"),
         ("POST", "/kanban-cards/card-x/force-transition"),
@@ -9444,13 +9639,13 @@ async fn api_help_exposes_detailed_endpoint_inventory() {
             .any(|category| category["name"] == "queue"),
         "/help must expose category summaries"
     );
-    let dispatch = json["endpoints"]
+    let generate = json["endpoints"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|ep| ep["path"] == "/api/auto-queue/dispatch")
-        .expect("/help must include the declarative dispatch endpoint");
-    assert_eq!(dispatch["params"]["groups"]["required"], true);
+        .find(|ep| ep["path"] == "/api/queue/generate")
+        .expect("/help must include the queue generate endpoint");
+    assert_eq!(generate["params"]["entries"]["required"], false);
 }
 
 #[tokio::test]
@@ -9801,7 +9996,7 @@ async fn api_docs_card_lifecycle_ops_guide_is_reachable_and_complete() {
         "guide must reference skipped_due_to_active_dispatch (#1444)"
     );
     assert!(
-        guide_text.contains("/api/auto-queue/generate")
+        guide_text.contains("/api/queue/generate")
             && guide_text.contains("/api/kanban-cards/{id}/redispatch")
             && guide_text.contains("/api/kanban-cards/{id}/transition"),
         "guide must enumerate the five lifecycle endpoints by exact path"
@@ -14303,7 +14498,7 @@ async fn force_transition_succeeds_with_correct_channel_pg() {
 
 /// #1442 — `/redispatch` response must surface `new_dispatch_id`,
 /// `cancelled_dispatch_id`, and `next_action` so callers do not chain
-/// `/transition` or `/auto-queue/generate` and create duplicates.
+/// `/transition` or `/queue/generate` and create duplicates.
 #[tokio::test]
 async fn redispatch_response_includes_dispatch_ids_and_next_action_pg_1442() {
     let (_repo, _repo_guard) = setup_test_repo();
@@ -14519,7 +14714,7 @@ async fn transition_response_includes_cancelled_ids_and_next_action_hint_pg_1442
     pg_db.drop().await;
 }
 
-/// #1442 — `/api/auto-queue/generate` response must include the structured
+/// #1442 — `/api/queue/generate` response must include the structured
 /// `skipped_due_to_active_dispatch` array when a requested issue already has
 /// an active dispatch (the silent-skip case that drove the original bug).
 #[tokio::test]
@@ -14590,7 +14785,7 @@ async fn auto_queue_generate_response_breaks_down_skipped_active_dispatch_pg_144
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"repo":"test-repo","issue_numbers":[1442001,1442002]}"#,
@@ -14638,7 +14833,7 @@ async fn auto_queue_generate_response_breaks_down_skipped_active_dispatch_pg_144
 //
 // Regression coverage for the "duplicate dispatch" incident pattern:
 // `/redispatch` is single-call complete, but callers used to chain
-// `/transition status:ready` and `/auto-queue/generate` after it, which
+// `/transition status:ready` and `/queue/generate` after it, which
 // silently cancelled the just-created dispatch and made a second one. The
 // guards below reject such follow-up calls server-side so caller behaviour
 // can no longer regress past the protections added in #1442.
@@ -15034,7 +15229,7 @@ async fn auto_queue_generate_skips_card_with_active_dispatch_pg_1444() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"repo":"test-repo","issue_numbers":[1444011,1444012]}"#,
@@ -15088,7 +15283,7 @@ async fn auto_queue_generate_skips_card_with_active_dispatch_pg_1444() {
     pg_db.drop().await;
 }
 
-/// #1444: when /api/auto-queue/dispatch-next encounters an entry whose card
+/// #1444: when /api/queue/dispatch-next encounters an entry whose card
 /// already has an active dispatch, it must reuse the existing dispatch
 /// (no duplicate creation) and emit the DISPATCH-NEXT skip log marker. We
 /// verify the no-duplicate property — the card's latest_dispatch_id must
@@ -15181,7 +15376,7 @@ async fn dispatch_next_skips_card_with_active_dispatch_pg_1444() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"repo":"test-repo"}"#))
                 .unwrap(),
@@ -15230,7 +15425,7 @@ async fn dispatch_next_skips_card_with_active_dispatch_pg_1444() {
 
 /// #1444 incident regression: replay today's bug — call /redispatch (which
 /// is single-call complete and creates one new dispatch), then chain the
-/// redundant /transition status:ready and /auto-queue/generate calls. The
+/// redundant /transition status:ready and /queue/generate calls. The
 /// guards must reject the follow-ups so the second dispatch is NEVER
 /// created.
 #[tokio::test]
@@ -15349,14 +15544,14 @@ async fn idempotency_guards_block_duplicate_dispatch_after_redispatch_pg_1444() 
         "redundant transition→ready must 409 because the redispatched dispatch is still active"
     );
 
-    // Step 3 — the wrongly chained /auto-queue/generate. Card must be
+    // Step 3 — the wrongly chained /queue/generate. Card must be
     // reported under skipped_due_to_active_dispatch and NOT enter a run.
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"repo":"test-repo","issue_numbers":[1444100]}"#,
@@ -16446,7 +16641,7 @@ async fn dispute_repeat_pg_does_not_reuse_poisoned_review_target() {
     let dispute_request = |dispatch_id: &str| {
         Request::builder()
             .method("POST")
-            .uri("/review-decision")
+            .uri("/reviews/decision")
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
@@ -17615,7 +17810,7 @@ async fn auto_queue_dispatch_prepares_backlog_cards_and_auto_assigns_agent() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch")
+                .uri("/queue/dispatch")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -17706,7 +17901,7 @@ async fn auto_queue_dispatch_persists_review_mode_in_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch")
+                .uri("/queue/dispatch")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -17804,7 +17999,7 @@ async fn auto_queue_dispatch_rejects_when_live_run_exists_without_force() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch")
+                .uri("/queue/dispatch")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -17958,7 +18153,7 @@ async fn auto_queue_dispatch_force_cancels_live_run_and_creates_new_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch")
+                .uri("/queue/dispatch")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18088,7 +18283,7 @@ async fn auto_queue_add_run_entry_creates_pending_entry_for_active_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-add-entry-active/entries")
+                .uri("/queue/runs/run-add-entry-active/entries")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -18170,7 +18365,7 @@ async fn auto_queue_add_run_entry_rejects_non_active_runs() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-add-entry-cancelled/entries")
+                .uri("/queue/runs/run-add-entry-cancelled/entries")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -18231,7 +18426,7 @@ async fn auto_queue_add_run_entry_rejects_non_ready_cards() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-add-entry-ready-only/entries")
+                .uri("/queue/runs/run-add-entry-ready-only/entries")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -18304,7 +18499,7 @@ async fn auto_queue_update_entry_moves_pending_entry_and_syncs_run_groups() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/entries/entry-update-2")
+                .uri("/queue/entries/entry-update-2")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18379,7 +18574,7 @@ async fn auto_queue_update_entry_restores_skipped_entry_to_pending() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/entries/entry-update-restore")
+                .uri("/queue/entries/entry-update-restore")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18482,7 +18677,7 @@ async fn auto_queue_update_entry_updates_batch_phase_only_and_with_priority_rank
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/entries/entry-update-phase")
+                .uri("/queue/entries/entry-update-phase")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18519,7 +18714,7 @@ async fn auto_queue_update_entry_updates_batch_phase_only_and_with_priority_rank
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/entries/entry-update-phase")
+                .uri("/queue/entries/entry-update-phase")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18581,7 +18776,7 @@ async fn auto_queue_update_run_updates_max_concurrent_threads_only_and_with_stat
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/runs/run-update-max")
+                .uri("/queue/runs/run-update-max")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18614,7 +18809,7 @@ async fn auto_queue_update_run_updates_max_concurrent_threads_only_and_with_stat
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/runs/run-update-max")
+                .uri("/queue/runs/run-update-max")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18686,7 +18881,7 @@ async fn auto_queue_update_run_pg_updates_max_concurrent_threads_only_and_with_s
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/runs/run-update-max-pg")
+                .uri("/queue/runs/run-update-max-pg")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18716,7 +18911,7 @@ async fn auto_queue_update_run_pg_updates_max_concurrent_threads_only_and_with_s
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/runs/run-update-max-pg")
+                .uri("/queue/runs/run-update-max-pg")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18789,7 +18984,7 @@ async fn auto_queue_rebind_slot_assigns_run_and_updates_dispatched_entry_slot() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/slots/agent-rebind/1/rebind")
+                .uri("/queue/slots/agent-rebind/1/rebind")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -18971,7 +19166,7 @@ async fn auto_queue_restore_run_restores_skipped_entries_by_card_state() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-restore/restore")
+                .uri("/queue/runs/run-restore/restore")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -19105,7 +19300,7 @@ async fn auto_queue_cancel_restore_reloads_user_cancelled_entries() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel?run_id=run-restore-user-cancelled")
+                .uri("/queue/cancel?run_id=run-restore-user-cancelled")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -19139,7 +19334,7 @@ async fn auto_queue_cancel_restore_reloads_user_cancelled_entries() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-restore-user-cancelled/restore")
+                .uri("/queue/runs/run-restore-user-cancelled/restore")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -19195,7 +19390,7 @@ async fn auto_queue_restore_run_rejects_active_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-restore-active/restore")
+                .uri("/queue/runs/run-restore-active/restore")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -19287,7 +19482,7 @@ async fn auto_queue_restore_run_retries_from_restoring_after_partial_failure() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-restore-retry/restore")
+                .uri("/queue/runs/run-restore-retry/restore")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -19351,7 +19546,7 @@ async fn auto_queue_restore_run_retries_from_restoring_after_partial_failure() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-restore-retry/restore")
+                .uri("/queue/runs/run-restore-retry/restore")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -19441,7 +19636,7 @@ async fn auto_queue_activate_run_id_does_not_dispatch_restoring_runs() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -19529,7 +19724,7 @@ async fn auto_queue_activate_active_only_does_not_promote_generated_runs() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -19615,7 +19810,7 @@ async fn auto_queue_activate_requested_card_not_blocked_by_own_status() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -19692,7 +19887,7 @@ async fn auto_queue_activate_walks_backlog_card_to_dispatchable_state() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -19806,7 +20001,7 @@ async fn auto_queue_activate_walk_respects_requested_hook_skip() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -19895,7 +20090,7 @@ async fn auto_queue_activate_legacy_unified_thread_run_dispatches_via_slot_pool(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20012,7 +20207,7 @@ async fn auto_queue_activate_consult_required_creates_consultation_dispatch() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20131,7 +20326,7 @@ async fn auto_queue_activate_consult_required_prefers_registry_counterpart_provi
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20202,7 +20397,7 @@ async fn auto_queue_activate_already_applied_skips_entry_and_completes_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20339,7 +20534,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20462,7 +20657,7 @@ async fn auto_queue_activate_reuses_released_slot_for_next_group() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20632,7 +20827,7 @@ async fn auto_queue_activate_dispatch_create_failure_releases_reserved_slot() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20758,7 +20953,7 @@ async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20813,7 +21008,7 @@ async fn auto_queue_activate_reuses_same_group_slot_with_fresh_session_each_time
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20958,7 +21153,7 @@ async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -20986,7 +21181,7 @@ async fn auto_queue_activate_does_not_dispatch_same_group_follow_up_while_prior_
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -21123,7 +21318,7 @@ async fn auto_queue_activate_expands_slot_pool_to_run_max_concurrency() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -21277,7 +21472,7 @@ async fn auto_queue_activate_allows_same_agent_parallel_across_runs_when_free_sl
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -21382,7 +21577,7 @@ async fn auto_queue_activate_keeps_single_slot_agent_single_dispatched_group() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -21793,7 +21988,7 @@ async fn smart_generate_pg_creates_correct_thread_groups_and_batch_phases() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -21918,7 +22113,7 @@ async fn auto_queue_generate_rolls_back_when_entry_insert_fails() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -22018,7 +22213,7 @@ async fn auto_queue_status_exposes_explicit_thread_links_from_configured_channel
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?agent_id=agent-thread-links")
+                .uri("/queue/status?agent_id=agent-thread-links")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -22138,7 +22333,7 @@ async fn auto_queue_history_returns_recent_runs_with_summary_metrics() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/history?repo=test-repo&limit=2")
+                .uri("/queue/history?repo=test-repo&limit=2")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -22262,7 +22457,7 @@ async fn auto_queue_status_pg_exposes_explicit_thread_links_from_configured_chan
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?agent_id=agent-thread-links-pg")
+                .uri("/queue/status?agent_id=agent-thread-links-pg")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -22293,6 +22488,140 @@ async fn auto_queue_status_pg_exposes_explicit_thread_links_from_configured_chan
     assert_eq!(
         thread_links[1]["url"],
         "https://discord.com/channels/guild-123/222000000000000002"
+    );
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn auto_queue_status_pg_repairs_thread_links_from_dispatch_history() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+
+    sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
+        .bind("test-repo")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, provider, discord_channel_id, discord_channel_alt,
+            discord_channel_cc, discord_channel_cdx
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind("agent-thread-repair-pg")
+    .bind("Agent Thread Repair PG")
+    .bind("codex")
+    .bind("111")
+    .bind("222")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id,
+            github_issue_number, active_thread_id, channel_thread_map
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb
+         )",
+    )
+    .bind("card-thread-repair-pg")
+    .bind("test-repo")
+    .bind("Issue #1470")
+    .bind("done")
+    .bind("medium")
+    .bind("agent-thread-repair-pg")
+    .bind(1470_i64)
+    .bind("thread-review-cancelled")
+    .bind(json!({"111": "thread-review-cancelled"}).to_string())
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title,
+            thread_id, updated_at
+         ) VALUES
+            ($1, $2, $3, 'implementation', 'completed', $4, $5, NOW() - INTERVAL '2 minutes'),
+            ($6, $2, $3, 'review', 'cancelled', $7, $8, NOW() - INTERVAL '1 minute')",
+    )
+    .bind("dispatch-thread-repair-work")
+    .bind("card-thread-repair-pg")
+    .bind("agent-thread-repair-pg")
+    .bind("Work dispatch")
+    .bind("thread-work-completed")
+    .bind("dispatch-thread-repair-review")
+    .bind("Cancelled review dispatch")
+    .bind("thread-review-cancelled")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("run-thread-repair-pg")
+    .bind("test-repo")
+    .bind("agent-thread-repair-pg")
+    .bind("active")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, priority_rank
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6
+         )",
+    )
+    .bind("entry-thread-repair-pg")
+    .bind("run-thread-repair-pg")
+    .bind("card-thread-repair-pg")
+    .bind("agent-thread-repair-pg")
+    .bind("done")
+    .bind(0_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let mut config = crate::config::Config::default();
+    config.discord.guild_id = Some("guild-123".to_string());
+    let app = test_api_router_with_pg(db, engine, config, None, pg_pool.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/queue/status?agent_id=agent-thread-repair-pg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let thread_links = json["entries"][0]["thread_links"]
+        .as_array()
+        .expect("thread_links must be an array");
+
+    assert_eq!(
+        thread_links,
+        &vec![json!({
+            "role": "work",
+            "label": "work",
+            "channel_id": "222",
+            "thread_id": "thread-work-completed",
+            "url": "https://discord.com/channels/guild-123/thread-work-completed"
+        })],
+        "status should recover the completed work thread and suppress the cancelled review thread"
     );
 
     pg_pool.close().await;
@@ -22433,7 +22762,7 @@ async fn auto_queue_history_pg_returns_recent_runs_with_summary_metrics() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/history?repo=test-repo&limit=2")
+                .uri("/queue/history?repo=test-repo&limit=2")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -22571,7 +22900,7 @@ async fn auto_queue_reset_pg_preserves_active_runs_on_global_reset() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/reset-global")
+                .uri("/queue/reset-global")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"confirmation_token":"confirm-global-reset"}"#,
@@ -22720,11 +23049,11 @@ async fn auto_queue_reorder_pg_updates_priority_ranks() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/auto-queue/reorder")
+                .uri("/queue/reorder")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
-                        "orderedIds": [
+                        "ordered_ids": [
                             "entry-reorder-3-pg",
                             "entry-reorder-1-pg",
                             "entry-reorder-2-pg"
@@ -22856,7 +23185,7 @@ async fn auto_queue_add_run_entry_pg_creates_pending_entry_for_active_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-add-entry-active-pg/entries")
+                .uri("/queue/runs/run-add-entry-active-pg/entries")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
@@ -22993,7 +23322,7 @@ async fn auto_queue_submit_order_pg_activates_pending_run_and_skips_non_dispatch
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/runs/run-submit-order-pg/order")
+                .uri("/queue/runs/run-submit-order-pg/order")
                 .header("content-type", "application/json")
                 .header("x-channel-id", "pmd-chan-123")
                 .header("x-agent-id", "project-agentdesk")
@@ -23104,7 +23433,7 @@ async fn auto_queue_status_legacy_thread_falls_back_to_active_label_without_url_
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?agent_id=agent-thread-links-legacy")
+                .uri("/queue/status?agent_id=agent-thread-links-legacy")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -23184,7 +23513,7 @@ async fn auto_queue_status_scopes_global_run_entries_by_repo_and_agent() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?repo=test-repo&agent_id=agent-scope-a")
+                .uri("/queue/status?repo=test-repo&agent_id=agent-scope-a")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -23264,7 +23593,7 @@ async fn auto_queue_generate_issue_numbers_filters_cards_and_promotes_backlog() 
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23342,7 +23671,7 @@ async fn auto_queue_generate_rejects_when_live_run_exists_without_force() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23427,7 +23756,7 @@ async fn auto_queue_generate_empty_state_reports_filtered_counts() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23471,7 +23800,7 @@ async fn auto_queue_generate_accepts_but_ignores_unified_thread_flag() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23537,7 +23866,7 @@ async fn auto_queue_generate_entries_payload_persists_batch_phases() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23614,7 +23943,7 @@ async fn generate_smart_planner_pg_groups_by_file_paths_and_recommends_threads()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23669,7 +23998,7 @@ async fn generate_smart_planner_pg_groups_by_file_paths_and_recommends_threads()
     let status_resp = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?repo=test-repo")
+                .uri("/queue/status?repo=test-repo")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -23712,7 +24041,7 @@ async fn generate_smart_planner_pg_without_file_paths_uses_dependency_only_group
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23803,7 +24132,7 @@ async fn generate_pg_ignores_non_dependency_issue_references_in_description() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23871,7 +24200,7 @@ async fn generate_pg_excludes_card_with_explicit_external_dependency() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23921,7 +24250,7 @@ async fn generate_pg_ignores_legacy_mode_and_still_uses_smart_planner() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -23986,7 +24315,7 @@ async fn smart_activate_pg_dispatches_multiple_groups() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -24008,7 +24337,7 @@ async fn smart_activate_pg_dispatches_multiple_groups() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -24040,7 +24369,7 @@ async fn smart_activate_pg_dispatches_multiple_groups() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?repo=test-repo")
+                .uri("/queue/status?repo=test-repo")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -24100,7 +24429,7 @@ async fn generate_pg_ignores_legacy_parallel_toggle_and_keeps_smart_groups() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -24198,7 +24527,7 @@ async fn activate_waits_for_current_batch_phase_pg_before_dispatching_next_phase
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -24247,7 +24576,7 @@ async fn activate_waits_for_current_batch_phase_pg_before_dispatching_next_phase
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -24283,7 +24612,7 @@ async fn activate_waits_for_current_batch_phase_pg_before_dispatching_next_phase
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -24465,7 +24794,7 @@ async fn auto_queue_pause_soft_does_not_cancel_live_dispatches_or_release_slots(
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/pause")
+                .uri("/queue/pause")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -24703,7 +25032,7 @@ async fn auto_queue_pause_force_cancels_live_dispatches_and_releases_slots() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/pause")
+                .uri("/queue/pause")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({"force": true})).unwrap(),
@@ -24993,7 +25322,7 @@ async fn auto_queue_pause_pg_soft_does_not_cancel_live_dispatches_or_release_slo
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/pause")
+                .uri("/queue/pause")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -25128,7 +25457,7 @@ async fn auto_queue_reset_slot_thread_pg_clears_slot_binding_without_sqlite_mirr
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/slots/agent-reset-slot-pg/0/reset-thread")
+                .uri("/queue/slots/agent-reset-slot-pg/0/reset-thread")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -25270,7 +25599,7 @@ async fn auto_queue_cancel_cancels_live_dispatches_skips_entries_and_releases_sl
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel")
+                .uri("/queue/cancel")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -25418,7 +25747,7 @@ async fn auto_queue_cancel_includes_restoring_runs() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel")
+                .uri("/queue/cancel")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -25541,7 +25870,7 @@ async fn auto_queue_cancel_targets_only_requested_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel?run_id=run-cancel-target-b")
+                .uri("/queue/cancel?run_id=run-cancel-target-b")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -25702,7 +26031,7 @@ async fn auto_queue_cancel_pg_targets_only_requested_run() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel?run_id=run-cancel-target-b-pg")
+                .uri("/queue/cancel?run_id=run-cancel-target-b-pg")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -25931,7 +26260,7 @@ async fn auto_queue_cancel_pg_cancels_live_dispatches_skips_entries_and_releases
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel")
+                .uri("/queue/cancel")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -26136,7 +26465,7 @@ async fn auto_queue_cancel_pg_includes_restoring_runs() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel")
+                .uri("/queue/cancel")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -26273,7 +26602,7 @@ async fn auto_queue_cancel_pg_sweeps_user_cancelled_entries() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel?run_id=run-cancel-user-cancelled-pg")
+                .uri("/queue/cancel?run_id=run-cancel-user-cancelled-pg")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -26414,7 +26743,7 @@ async fn auto_queue_cancel_surfaces_warning_when_slot_release_fails() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel")
+                .uri("/queue/cancel")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -26563,7 +26892,7 @@ async fn auto_queue_cancel_also_cancels_phase_gate_dispatches_and_deletes_gate_r
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/cancel")
+                .uri("/queue/cancel")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -26744,7 +27073,7 @@ async fn activate_run_id_blocks_phase_gate_paused_runs_pg_path() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -26867,7 +27196,7 @@ async fn auto_queue_activate_dispatches_pg_only_run_without_sqlite_mirror() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -27076,7 +27405,7 @@ async fn resume_run_skips_phase_gate_blocked_runs_pg_path() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/resume")
+                .uri("/queue/resume")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -27132,7 +27461,7 @@ async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/generate")
+                .uri("/queue/generate")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -27186,7 +27515,7 @@ async fn auto_queue_activate_ignores_legacy_max_concurrent_per_agent() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/dispatch-next")
+                .uri("/queue/dispatch-next")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_string(&serde_json::json!({
@@ -27357,6 +27686,90 @@ async fn auto_queue_recovery_resets_orphan_phantom_and_cancelled_entries_pg() {
         Some("dispatch-valid"),
         "valid entry dispatch_id must be preserved"
     );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn orphan_recovery_rollback_terminalizes_auto_queue_entry_pg() {
+    crate::pipeline::ensure_loaded();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let db = test_db();
+    let engine = test_engine_with_pg(&db, pool.clone());
+
+    seed_repo_pg(&pool, "test-repo").await;
+    seed_agent_pg(&pool, "agent-orphan-aq").await;
+    seed_auto_queue_card_pg(
+        &pool,
+        "card-orphan-aq",
+        9101,
+        "in_progress",
+        "agent-orphan-aq",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+        ) VALUES (
+            'dispatch-orphan-aq', 'card-orphan-aq', 'agent-orphan-aq',
+            'implementation', 'pending', 'orphan aq',
+            NOW() - INTERVAL '10 minutes', NOW() - INTERVAL '10 minutes'
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE kanban_cards
+         SET latest_dispatch_id = 'dispatch-orphan-aq'
+         WHERE id = 'card-orphan-aq'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+         VALUES ('run-orphan-aq', 'test-repo', 'agent-orphan-aq', 'active')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, dispatched_at
+        ) VALUES (
+            'entry-orphan-aq', 'run-orphan-aq', 'card-orphan-aq', 'agent-orphan-aq',
+            'dispatched', 'dispatch-orphan-aq', 0, NOW() - INTERVAL '10 minutes'
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let supervisor = crate::supervisor::RuntimeSupervisor::new(Some(pool.clone()), engine);
+    assert_eq!(
+        supervisor
+            .mark_dispatch_failed_for_test("dispatch-orphan-aq")
+            .unwrap(),
+        1
+    );
+    let (dispatch_status, entry_status, entry_dispatch_id): (String, String, Option<String>) =
+        sqlx::query_as(
+            "SELECT td.status, aq.status, aq.dispatch_id
+         FROM task_dispatches td
+         JOIN auto_queue_entries aq ON aq.dispatch_id = td.id
+         WHERE td.id = 'dispatch-orphan-aq'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(dispatch_status, "failed");
+    assert_eq!(
+        entry_status, "failed",
+        "orphan rollback must not leave the auto-queue entry dispatched"
+    );
+    assert_eq!(entry_dispatch_id.as_deref(), Some("dispatch-orphan-aq"));
 
     pool.close().await;
     pg_db.drop().await;
@@ -28606,7 +29019,7 @@ async fn auto_queue_reset_completes_generated_and_pending_runs() {
             Request::builder()
                 .method("POST")
                 .header("content-type", "application/json")
-                .uri("/auto-queue/reset")
+                .uri("/queue/reset")
                 .body(Body::from(r#"{"agent_id":"agent-reset"}"#))
                 .unwrap(),
         )
@@ -28624,7 +29037,7 @@ async fn auto_queue_reset_completes_generated_and_pending_runs() {
     let status_response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?agent_id=agent-reset")
+                .uri("/queue/status?agent_id=agent-reset")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -28735,7 +29148,7 @@ async fn auto_queue_reset_with_agent_id_only_clears_matching_agent_scope() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/reset")
+                .uri("/queue/reset")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"agent_id":"agent-reset-a"}"#))
                 .unwrap(),
@@ -28797,7 +29210,7 @@ async fn auto_queue_reset_with_agent_id_only_clears_matching_agent_scope() {
     let status_response = app
         .oneshot(
             Request::builder()
-                .uri("/auto-queue/status?agent_id=agent-reset-b")
+                .uri("/queue/status?agent_id=agent-reset-b")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -28877,7 +29290,7 @@ async fn auto_queue_reset_requires_agent_id_and_reset_global_requires_confirmati
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/reset")
+                .uri("/queue/reset")
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
                 .unwrap(),
@@ -28896,7 +29309,7 @@ async fn auto_queue_reset_requires_agent_id_and_reset_global_requires_confirmati
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/auto-queue/reset-global")
+                .uri("/queue/reset-global")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"confirmation_token":"confirm-global-reset"}"#,
@@ -29596,8 +30009,16 @@ fn callsites_migrated_off_legacy_api_paths_1069() {
     // /api/dispatched-sessions/webhook for the unparameterized POST/DELETE.
     let banned: &[&str] = &[
         "/api/re-review",
-        "/api/auto-queue/activate",
+        "/api/review-verdict",
+        "/api/review-decision",
+        "/api/review-tuning/",
+        "/api/send",
+        "/api/send_to_agent",
+        "/api/senddm",
+        "/api/issues",
         "/api/discord-bindings",
+        "/api/auto-queue/",
+        "/api/queue/activate",
     ];
 
     // Roots that frontend / policy / script / skill / config callsites live in.

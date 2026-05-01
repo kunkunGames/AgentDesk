@@ -397,7 +397,7 @@ var rules = {
         var verdict = null;
         var resultJson = dispatch[0].result;
 
-        // 1. Check dispatch result (set by /api/review-verdict callback)
+        // 1. Check dispatch result (set by /api/reviews/verdict callback)
         if (resultJson) {
           try {
             var parsed = JSON.parse(resultJson);

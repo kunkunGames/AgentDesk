@@ -8,6 +8,9 @@ use serenity::{ChannelId, CreateMessage};
 use sqlx::PgPool;
 
 use super::formatting::{build_long_message_attachment, split_message};
+use super::relay_health::{
+    RelayActiveTurn, RelayHealthSnapshot, RelayStallClassifier, RelayStallState,
+};
 use super::{
     SharedData, clear_inflight_state, mailbox_cancel_active_turn, mailbox_clear_channel,
     mailbox_clear_recovery_marker, mailbox_finish_turn,
@@ -16,9 +19,14 @@ use crate::db::Db;
 use crate::server::routes::dispatches::discord_delivery::{
     DispatchMessagePostError, DispatchMessagePostErrorKind,
 };
+use crate::services::discord::outbound::delivery::{
+    deliver_outbound as deliver_v3_outbound, first_raw_message_id,
+};
+use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
+use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+use crate::services::discord::outbound::result::{DeliveryResult, FallbackUsed};
 use crate::services::discord::outbound::{
-    DISCORD_HARD_LIMIT_CHARS, DISCORD_SAFE_LIMIT_CHARS, DeliveryResult, DiscordOutboundClient,
-    DiscordOutboundMessage, DiscordOutboundPolicy, FallbackKind, OutboundDeduper, deliver_outbound,
+    DISCORD_HARD_LIMIT_CHARS, DISCORD_SAFE_LIMIT_CHARS, DiscordOutboundClient, OutboundDeduper,
 };
 use crate::services::provider::ProviderKind;
 
@@ -104,6 +112,13 @@ pub struct WatcherStateSnapshot {
     /// mailbox is idle (no active turn).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mailbox_active_user_msg_id: Option<u64>,
+    /// #1455: Pure relay-stall classifier output derived from the nested
+    /// relay-health snapshot. Read-only diagnostic; no recovery behavior is
+    /// triggered from this value.
+    pub(in crate::services::discord) relay_stall_state: RelayStallState,
+    /// #1455: Focused relay-health model shared with the detailed health
+    /// endpoint and future recovery/UI code.
+    pub(in crate::services::discord) relay_health: RelayHealthSnapshot,
 }
 
 impl HealthStatus {
@@ -154,6 +169,8 @@ struct MailboxHealthSnapshot {
     tmux_present: bool,
     process_present: bool,
     active_dispatch_present: bool,
+    relay_stall_state: RelayStallState,
+    relay_health: RelayHealthSnapshot,
 }
 
 #[derive(Debug, Serialize)]
@@ -176,6 +193,169 @@ pub struct DiscordHealthSnapshot {
 impl DiscordHealthSnapshot {
     pub fn status(&self) -> HealthStatus {
         self.status
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RelayThreadProofSnapshot {
+    parent_channel_id: Option<u64>,
+    thread_channel_id: Option<u64>,
+    stale_thread_proof: bool,
+}
+
+fn relay_active_turn_from_inflight(
+    mailbox_has_cancel_token: bool,
+    inflight: Option<&super::inflight::InflightTurnState>,
+) -> RelayActiveTurn {
+    if !mailbox_has_cancel_token && inflight.is_none() {
+        return RelayActiveTurn::None;
+    }
+
+    if inflight.is_some_and(|state| {
+        state.long_running_placeholder_active || state.task_notification_kind.is_some()
+    }) {
+        RelayActiveTurn::ExplicitBackground
+    } else {
+        RelayActiveTurn::Foreground
+    }
+}
+
+fn last_outbound_activity_ms(
+    last_relay_ts_ms: i64,
+    inflight: Option<&super::inflight::InflightTurnState>,
+) -> Option<i64> {
+    if last_relay_ts_ms > 0 {
+        return Some(last_relay_ts_ms);
+    }
+
+    let inflight = inflight?;
+    let has_discord_write_evidence = inflight.current_msg_len > 0
+        || inflight.response_sent_offset > 0
+        || inflight.last_watcher_relayed_offset.is_some();
+    if !has_discord_write_evidence {
+        return None;
+    }
+
+    super::inflight::parse_updated_at_unix(&inflight.updated_at)
+        .and_then(|seconds| seconds.checked_mul(1000))
+}
+
+fn trace_relay_health_classification(
+    relay_health: &RelayHealthSnapshot,
+    relay_stall_state: RelayStallState,
+) {
+    if relay_stall_state.should_log_at_debug() {
+        tracing::debug!(
+            target: "agentdesk::discord::relay_health",
+            provider = relay_health.provider.as_str(),
+            channel_id = relay_health.channel_id,
+            relay_stall_state = relay_stall_state.as_str(),
+            queue_depth = relay_health.queue_depth,
+            tmux_alive = ?relay_health.tmux_alive,
+            desynced = relay_health.desynced,
+            pending_thread_proof = relay_health.pending_thread_proof,
+            "relay health classified"
+        );
+    } else {
+        tracing::trace!(
+            target: "agentdesk::discord::relay_health",
+            provider = relay_health.provider.as_str(),
+            channel_id = relay_health.channel_id,
+            relay_stall_state = relay_stall_state.as_str(),
+            queue_depth = relay_health.queue_depth,
+            "relay health classified"
+        );
+    }
+}
+
+async fn relay_thread_proof_for_channel(
+    shared: &SharedData,
+    provider: Option<&ProviderKind>,
+    channel_id: ChannelId,
+    current_channel_has_live_evidence: bool,
+) -> RelayThreadProofSnapshot {
+    let thread_channel_id = shared
+        .dispatch_thread_parents
+        .get(&channel_id)
+        .map(|entry| entry.value().get());
+    let parent_channel_id = shared
+        .dispatch_thread_parents
+        .iter()
+        .find_map(|entry| (*entry.value() == channel_id).then_some(entry.key().get()));
+
+    let child_has_live_evidence = match thread_channel_id {
+        Some(thread_id) => {
+            let thread_channel = ChannelId::new(thread_id);
+            let thread_mailbox = super::mailbox_snapshot(shared, thread_channel).await;
+            let thread_inflight = provider
+                .and_then(|provider| super::inflight::load_inflight_state(provider, thread_id));
+            thread_mailbox.cancel_token.is_some()
+                || thread_inflight.is_some()
+                || shared.tmux_watchers.contains_key(&thread_channel)
+        }
+        None => false,
+    };
+
+    RelayThreadProofSnapshot {
+        parent_channel_id,
+        thread_channel_id,
+        stale_thread_proof: thread_channel_id.is_some_and(|_| !child_has_live_evidence)
+            || parent_channel_id.is_some_and(|_| !current_channel_has_live_evidence),
+    }
+}
+
+struct RelayHealthBuildInput {
+    provider: String,
+    channel_id: u64,
+    mailbox_has_cancel_token: bool,
+    mailbox_active_user_msg_id: Option<u64>,
+    queue_depth: usize,
+    watcher_attached: bool,
+    watcher_owner_channel_id: Option<u64>,
+    tmux_session: Option<String>,
+    tmux_alive: Option<bool>,
+    bridge_inflight_present: bool,
+    bridge_current_msg_id: Option<u64>,
+    watcher_owns_live_relay: bool,
+    last_relay_ts_ms: i64,
+    last_relay_offset: u64,
+    last_capture_offset: Option<u64>,
+    unread_bytes: Option<u64>,
+    desynced: bool,
+    thread_proof: RelayThreadProofSnapshot,
+    active_turn: RelayActiveTurn,
+    last_outbound_activity_ms: Option<i64>,
+}
+
+fn build_relay_health_snapshot(input: RelayHealthBuildInput) -> RelayHealthSnapshot {
+    RelayHealthSnapshot {
+        provider: input.provider,
+        channel_id: input.channel_id,
+        active_turn: input.active_turn,
+        tmux_session: input.tmux_session,
+        tmux_alive: input.tmux_alive,
+        watcher_attached: input.watcher_attached,
+        watcher_owner_channel_id: input.watcher_owner_channel_id,
+        watcher_owns_live_relay: input.watcher_owns_live_relay,
+        bridge_inflight_present: input.bridge_inflight_present,
+        bridge_current_msg_id: input.bridge_current_msg_id,
+        mailbox_has_cancel_token: input.mailbox_has_cancel_token,
+        mailbox_active_user_msg_id: input.mailbox_active_user_msg_id,
+        queue_depth: input.queue_depth,
+        pending_discord_callback_msg_id: input
+            .bridge_current_msg_id
+            .or(input.mailbox_active_user_msg_id),
+        pending_thread_proof: input.thread_proof.parent_channel_id.is_some()
+            || input.thread_proof.thread_channel_id.is_some(),
+        parent_channel_id: input.thread_proof.parent_channel_id,
+        thread_channel_id: input.thread_proof.thread_channel_id,
+        last_relay_ts_ms: (input.last_relay_ts_ms > 0).then_some(input.last_relay_ts_ms),
+        last_outbound_activity_ms: input.last_outbound_activity_ms,
+        last_capture_offset: input.last_capture_offset,
+        last_relay_offset: input.last_relay_offset,
+        unread_bytes: input.unread_bytes,
+        desynced: input.desynced,
+        stale_thread_proof: input.thread_proof.stale_thread_proof,
     }
 }
 
@@ -226,6 +406,18 @@ impl HealthRegistry {
 
     pub(super) async fn registered_provider_count(&self) -> usize {
         self.providers.lock().await.len()
+    }
+
+    pub(in crate::services::discord) async fn shared_for_provider(
+        &self,
+        provider: &ProviderKind,
+    ) -> Option<Arc<SharedData>> {
+        self.providers
+            .lock()
+            .await
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(provider.as_str()))
+            .map(|entry| entry.shared.clone())
     }
 
     pub(super) async fn register_http(&self, provider: String, http: Arc<serenity::Http>) {
@@ -294,7 +486,9 @@ impl HealthRegistry {
                     } else {
                         "🔔"
                     };
-                    tracing::info!("  [{ts}] {emoji} {bot_name} bot loaded for /api/send routing");
+                    tracing::info!(
+                        "  [{ts}] {emoji} {bot_name} bot loaded for /api/discord/send routing"
+                    );
                 }
             }
         }
@@ -351,8 +545,10 @@ impl HealthRegistry {
             }
             let shared = entry.shared.clone();
             let watcher_binding = shared.tmux_watchers.channel_binding(&channel);
-            let inflight = ProviderKind::from_str(&entry.name)
-                .and_then(|pk| super::inflight::load_inflight_state(&pk, channel_id));
+            let provider_kind = ProviderKind::from_str(&entry.name);
+            let inflight = provider_kind
+                .as_ref()
+                .and_then(|pk| super::inflight::load_inflight_state(pk, channel_id));
             let inflight_tmux_session = inflight
                 .as_ref()
                 .and_then(|state| state.tmux_session_name.clone());
@@ -378,11 +574,22 @@ impl HealthRegistry {
                 && watcher_binding_tmux_session.is_some()
                 && inflight_tmux_session.is_some();
             let mailbox_snapshot = super::mailbox_snapshot(&shared, channel).await;
+            let mailbox_has_cancel_token = mailbox_snapshot.cancel_token.is_some();
             let mailbox_active_user_msg_id =
                 mailbox_snapshot.active_user_message_id.map(|id| id.get());
             let has_pending_queue = !mailbox_snapshot.intervention_queue.is_empty();
             let mailbox_engaged = mailbox_active_user_msg_id.is_some() || has_pending_queue;
-            if !attached && !has_relay_coord && !inflight_state_present && !mailbox_engaged {
+            let has_thread_proof = shared.dispatch_thread_parents.contains_key(&channel)
+                || shared
+                    .dispatch_thread_parents
+                    .iter()
+                    .any(|entry| *entry.value() == channel);
+            if !attached
+                && !has_relay_coord
+                && !inflight_state_present
+                && !mailbox_engaged
+                && !has_thread_proof
+            {
                 continue;
             }
             let (last_relay_offset, last_relay_ts_ms, reconnect_count) = shared
@@ -475,6 +682,44 @@ impl HealthRegistry {
                 && relay_stale;
             let desynced =
                 capture_lagged || live_tmux_orphaned || (tmux_session_mismatch && relay_stale);
+            let active_turn =
+                relay_active_turn_from_inflight(mailbox_has_cancel_token, inflight.as_ref());
+            let relay_thread_proof = relay_thread_proof_for_channel(
+                &shared,
+                provider_kind.as_ref(),
+                channel,
+                mailbox_has_cancel_token || inflight_state_present || attached,
+            )
+            .await;
+            let relay_health = build_relay_health_snapshot(RelayHealthBuildInput {
+                provider: entry.name.clone(),
+                channel_id,
+                mailbox_has_cancel_token,
+                mailbox_active_user_msg_id,
+                queue_depth: mailbox_snapshot.intervention_queue.len(),
+                watcher_attached: attached,
+                watcher_owner_channel_id,
+                tmux_session: tmux_session.clone(),
+                tmux_alive: tmux_session_alive,
+                bridge_inflight_present: inflight_state_present,
+                bridge_current_msg_id: inflight_current_msg_id,
+                watcher_owns_live_relay: inflight
+                    .as_ref()
+                    .is_some_and(|state| state.watcher_owns_live_relay),
+                last_relay_ts_ms,
+                last_relay_offset,
+                last_capture_offset,
+                unread_bytes,
+                desynced,
+                thread_proof: relay_thread_proof,
+                active_turn,
+                last_outbound_activity_ms: last_outbound_activity_ms(
+                    last_relay_ts_ms,
+                    inflight.as_ref(),
+                ),
+            });
+            let relay_stall_state = RelayStallClassifier::classify(&relay_health);
+            trace_relay_health_classification(&relay_health, relay_stall_state);
             return Some(WatcherStateSnapshot {
                 provider: entry.name.clone(),
                 attached,
@@ -494,6 +739,8 @@ impl HealthRegistry {
                 tmux_session_alive,
                 has_pending_queue,
                 mailbox_active_user_msg_id,
+                relay_stall_state,
+                relay_health,
             });
         }
         None
@@ -545,11 +792,7 @@ async fn shared_for_provider(
     registry: &HealthRegistry,
     provider: &ProviderKind,
 ) -> Option<Arc<SharedData>> {
-    let providers = registry.providers.lock().await;
-    providers
-        .iter()
-        .find(|entry| entry.name.eq_ignore_ascii_case(provider.as_str()))
-        .map(|entry| entry.shared.clone())
+    registry.shared_for_provider(provider).await
 }
 
 async fn wait_for_turn_end(
@@ -606,7 +849,7 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
 
     if let Some(token) = result.token.as_ref() {
         let termination_recorded = if !result.already_stopping || cleanup_requested {
-            super::turn_bridge::cancel_active_token(token, cleanup_policy, reason)
+            super::turn_bridge::stop_active_turn(&provider, token, cleanup_policy, reason).await
         } else {
             false
         };
@@ -631,7 +874,7 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
     let mut termination_recorded = false;
     if let Some(token) = finish.removed_token.as_ref() {
         termination_recorded =
-            super::turn_bridge::cancel_active_token(token, cleanup_policy, reason);
+            super::turn_bridge::stop_active_turn(&provider, token, cleanup_policy, reason).await;
     }
     apply_runtime_hard_stop_cleanup(
         &shared,
@@ -1012,11 +1255,13 @@ pub async fn clear_provider_channel_runtime(
 
     let cleared = mailbox_clear_channel(&shared, &provider, channel_id).await;
     if let Some(token) = cleared.removed_token {
-        super::turn_bridge::cancel_active_token(
+        super::turn_bridge::stop_active_turn(
+            &provider,
             &token,
             super::TmuxCleanupPolicy::PreserveSession,
             "auto-queue slot clear",
-        );
+        )
+        .await;
         decrement_counter(shared.global_active.as_ref());
     }
 
@@ -1133,37 +1378,169 @@ async fn build_health_snapshot_with_options(
         if include_mailbox_details {
             let provider_kind = ProviderKind::from_str(&entry.name);
             for (channel_id, snapshot) in &mailbox_snapshots {
+                let channel = *channel_id;
                 let inflight_state = provider_kind
                     .as_ref()
-                    .and_then(|pk| super::inflight::load_inflight_state(pk, channel_id.get()));
-                let tmux_session_name = inflight_state
+                    .and_then(|pk| super::inflight::load_inflight_state(pk, channel.get()));
+                let watcher_binding = entry.shared.tmux_watchers.channel_binding(&channel);
+                let watcher_attached = watcher_binding.is_some();
+                let watcher_binding_tmux_session = watcher_binding
                     .as_ref()
-                    .and_then(|state| state.tmux_session_name.as_deref());
-                let tmux_present =
-                    tmux_session_name.is_some_and(crate::services::platform::tmux::has_session);
+                    .map(|binding| binding.tmux_session_name.clone());
+                let inflight_tmux_session = inflight_state
+                    .as_ref()
+                    .and_then(|state| state.tmux_session_name.clone());
+                let inflight_owner_channel_id = inflight_tmux_session.as_deref().and_then(|tmux| {
+                    entry
+                        .shared
+                        .tmux_watchers
+                        .owner_channel_for_tmux_session(tmux)
+                });
+                let watcher_owner_channel_id = watcher_binding
+                    .as_ref()
+                    .map(|binding| binding.owner_channel_id)
+                    .or(inflight_owner_channel_id)
+                    .map(|id| id.get());
+                let tmux_session_name = watcher_binding_tmux_session
+                    .clone()
+                    .or_else(|| inflight_tmux_session.clone());
+                let relay_state_matches_inflight = match (
+                    inflight_tmux_session.as_deref(),
+                    watcher_binding_tmux_session.as_deref(),
+                ) {
+                    (Some(inflight_tmux), Some(binding_tmux)) => inflight_tmux == binding_tmux,
+                    _ => true,
+                };
+                let inflight_state_present = inflight_state.is_some();
+                let tmux_session_mismatch = inflight_state_present
+                    && !relay_state_matches_inflight
+                    && watcher_binding_tmux_session.is_some()
+                    && inflight_tmux_session.is_some();
+                let tmux_present = tmux_session_name
+                    .as_deref()
+                    .is_some_and(crate::services::platform::tmux::has_session);
                 let process_present = tmux_session_name
+                    .as_deref()
                     .is_some_and(|name| crate::services::platform::tmux::pane_pid(name).is_some());
+                let (last_relay_offset, last_relay_ts_ms) = entry
+                    .shared
+                    .tmux_relay_coords
+                    .get(&channel)
+                    .map(|coord| {
+                        (
+                            coord
+                                .confirmed_end_offset
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            coord
+                                .last_relay_ts_ms
+                                .load(std::sync::atomic::Ordering::Acquire),
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                let last_capture_offset = inflight_state
+                    .as_ref()
+                    .and_then(|state| state.output_path.as_deref())
+                    .and_then(|path| std::fs::metadata(path).ok().map(|meta| meta.len()));
+                let unread_bytes = relay_state_matches_inflight
+                    .then(|| {
+                        last_capture_offset.map(|capture| capture.saturating_sub(last_relay_offset))
+                    })
+                    .flatten();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let relay_stale_anchor_ms = if last_relay_ts_ms > 0 {
+                    Some(last_relay_ts_ms)
+                } else {
+                    inflight_state
+                        .as_ref()
+                        .and_then(|state| super::inflight::parse_started_at_unix(&state.started_at))
+                        .and_then(|seconds| seconds.checked_mul(1000))
+                };
+                let relay_stale = relay_stale_anchor_ms
+                    .map(|anchor_ms| {
+                        now_ms.saturating_sub(anchor_ms) >= WATCHER_STATE_DESYNC_STALE_MS
+                    })
+                    .unwrap_or(false);
+                let capture_lagged = last_capture_offset
+                    .map(|capture| {
+                        relay_state_matches_inflight
+                            && inflight_state_present
+                            && capture != last_relay_offset
+                            && relay_stale
+                    })
+                    .unwrap_or(false);
+                let live_tmux_orphaned =
+                    tmux_present && inflight_state_present && !watcher_attached && relay_stale;
+                let desynced =
+                    capture_lagged || live_tmux_orphaned || (tmux_session_mismatch && relay_stale);
+                let mailbox_has_cancel_token = snapshot.cancel_token.is_some();
+                let queue_depth = snapshot.intervention_queue.len();
+                let mailbox_active_user_msg_id = snapshot.active_user_message_id.map(|id| id.get());
+                let relay_thread_proof = relay_thread_proof_for_channel(
+                    &entry.shared,
+                    provider_kind.as_ref(),
+                    channel,
+                    mailbox_has_cancel_token || inflight_state_present || watcher_attached,
+                )
+                .await;
+                let active_turn = relay_active_turn_from_inflight(
+                    mailbox_has_cancel_token,
+                    inflight_state.as_ref(),
+                );
+                let relay_health = build_relay_health_snapshot(RelayHealthBuildInput {
+                    provider: entry.name.clone(),
+                    channel_id: channel.get(),
+                    mailbox_has_cancel_token,
+                    mailbox_active_user_msg_id,
+                    queue_depth,
+                    watcher_attached,
+                    watcher_owner_channel_id,
+                    tmux_session: tmux_session_name.clone(),
+                    tmux_alive: tmux_session_name.as_ref().map(|_| tmux_present),
+                    bridge_inflight_present: inflight_state_present,
+                    bridge_current_msg_id: inflight_state
+                        .as_ref()
+                        .map(|state| state.current_msg_id)
+                        .filter(|id| *id != 0),
+                    watcher_owns_live_relay: inflight_state
+                        .as_ref()
+                        .is_some_and(|state| state.watcher_owns_live_relay),
+                    last_relay_ts_ms,
+                    last_relay_offset,
+                    last_capture_offset,
+                    unread_bytes,
+                    desynced,
+                    thread_proof: relay_thread_proof,
+                    active_turn,
+                    last_outbound_activity_ms: last_outbound_activity_ms(
+                        last_relay_ts_ms,
+                        inflight_state.as_ref(),
+                    ),
+                });
+                let relay_stall_state = RelayStallClassifier::classify(&relay_health);
+                trace_relay_health_classification(&relay_health, relay_stall_state);
                 mailbox_entries.push(MailboxHealthSnapshot {
                     provider: entry.name.clone(),
-                    channel_id: channel_id.get(),
-                    has_cancel_token: snapshot.cancel_token.is_some(),
-                    queue_depth: snapshot.intervention_queue.len(),
+                    channel_id: channel.get(),
+                    has_cancel_token: mailbox_has_cancel_token,
+                    queue_depth,
                     recovery_started: snapshot.recovery_started_at.is_some(),
                     active_request_owner: snapshot.active_request_owner.map(|id| id.get()),
-                    active_user_message_id: snapshot.active_user_message_id.map(|id| id.get()),
-                    agent_turn_status: if snapshot.cancel_token.is_some() {
+                    active_user_message_id: mailbox_active_user_msg_id,
+                    agent_turn_status: if mailbox_has_cancel_token {
                         "active"
                     } else {
                         "idle"
                     },
-                    watcher_attached: entry.shared.tmux_watchers.contains_key(channel_id),
-                    inflight_state_present: inflight_state.is_some(),
+                    watcher_attached,
+                    inflight_state_present,
                     tmux_present,
                     process_present,
                     active_dispatch_present: inflight_state
                         .as_ref()
                         .and_then(|state| state.dispatch_id.as_deref())
                         .is_some(),
+                    relay_stall_state,
+                    relay_health,
                 });
             }
         }
@@ -1297,6 +1674,11 @@ impl TestHealthHarness {
             placeholder_controller: Arc::new(
                 super::placeholder_controller::PlaceholderController::default(),
             ),
+            placeholder_live_events: Arc::new(
+                super::placeholder_live_events::PlaceholderLiveEvents::default(),
+            ),
+            placeholder_live_events_enabled: false,
+            status_panel_v2_enabled: false,
             queued_placeholders: dashmap::DashMap::new(),
             queue_exit_placeholder_clears: dashmap::DashMap::new(),
             queued_placeholders_persist_locks: dashmap::DashMap::new(),
@@ -1320,6 +1702,8 @@ impl TestHealthHarness {
             model_overrides: dashmap::DashMap::new(),
             fast_mode_channels: dashmap::DashSet::new(),
             fast_mode_session_reset_pending: dashmap::DashSet::new(),
+            codex_goals_channels: dashmap::DashSet::new(),
+            codex_goals_session_reset_pending: dashmap::DashSet::new(),
             model_session_reset_pending: dashmap::DashSet::new(),
             session_reset_pending: dashmap::DashSet::new(),
             model_picker_pending: dashmap::DashMap::new(),
@@ -1581,6 +1965,7 @@ impl TestHealthHarness {
                 last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
                     super::tmux_watcher_now_ms(),
                 )),
+                mailbox_finalize_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         cancel
@@ -1604,6 +1989,7 @@ impl TestHealthHarness {
                 last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
                     super::tmux_watcher_now_ms(),
                 )),
+                mailbox_finalize_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         cancel
@@ -2244,7 +2630,7 @@ async fn resolve_send_target_channel_id_with_backends(
     }
 }
 
-/// Handle POST /api/send — agent-to-agent native routing.
+/// Handle POST /api/discord/send — agent-to-agent native routing.
 /// Accepts JSON: {"target":"channel:<id>|channel:<name>|agent:<roleId>", "content":"...", "source":"role-id", "bot":"announce|notify", "summary":"..."}
 ///
 /// `summary` is optional minimal fallback content if Discord rejects the
@@ -2523,6 +2909,28 @@ impl DiscordOutboundClient for SerenityManualOutboundClient {
                 DispatchMessagePostError::new(kind, detail)
             })
     }
+
+    async fn resolve_dm_channel(&self, user_id: &str) -> Result<String, DispatchMessagePostError> {
+        let user_id = user_id
+            .parse::<u64>()
+            .map(serenity::UserId::new)
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("invalid Discord user id {user_id}: {error}"),
+                )
+            })?;
+        user_id
+            .create_dm_channel(&*self.http)
+            .await
+            .map(|channel| channel.id.get().to_string())
+            .map_err(|error| {
+                DispatchMessagePostError::new(
+                    DispatchMessagePostErrorKind::Other,
+                    format!("DM channel creation failed: {error}"),
+                )
+            })
+    }
 }
 
 trait ManualOutboundClient: DiscordOutboundClient {
@@ -2593,6 +3001,8 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
 
     let content_len = content.chars().count();
     if content_len > DISCORD_HARD_LIMIT_CHARS {
+        // Compatibility shim: v3 text delivery does not yet own attachment
+        // upload or manual chunk-posting for over-2k `/api/discord/send` payloads.
         let result = match if bot == "announce" {
             client
                 .post_text_attachment(channel_id, content, summary)
@@ -2617,58 +3027,189 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
         return result;
     }
 
-    if content_len > DISCORD_SAFE_LIMIT_CHARS {
-        let result = match client.post_message(channel_id, content).await {
-            Ok(message_id) => ManualDeliveryOutcome::Sent {
-                message_id,
-                delivery: None,
-            },
+    let target_channel = match parse_channel_id_for_manual(channel_id) {
+        Ok(channel_id) => channel_id,
+        Err(outcome) => return outcome,
+    };
+    let result = deliver_manual_v3_text(
+        client,
+        dedup,
+        OutboundTarget::Channel(target_channel),
+        channel_id,
+        content,
+        summary,
+        delivery_id,
+        content_len > DISCORD_SAFE_LIMIT_CHARS,
+    )
+    .await;
+    record_manual_delivery_success(dedup, dedup_key.as_deref(), &result);
+    result
+}
+
+async fn deliver_manual_dm_notification<C: ManualOutboundClient>(
+    client: &C,
+    dedup: &OutboundDeduper,
+    user_id: u64,
+    content: &str,
+    bot: &str,
+    summary: Option<&str>,
+    delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+) -> ManualDeliveryOutcome {
+    let dedup_key = delivery_id.map(|delivery_id| {
+        format!(
+            "{}::{}",
+            delivery_id.correlation_id, delivery_id.semantic_event_id
+        )
+    });
+    if let Some(key) = dedup_key.as_deref() {
+        if dedup.lookup(key).is_some() {
+            return ManualDeliveryOutcome::Sent {
+                message_id: String::new(),
+                delivery: Some("duplicate"),
+            };
+        }
+    }
+
+    let content_len = content.chars().count();
+    if content_len > DISCORD_HARD_LIMIT_CHARS {
+        // Compatibility shim: keep the existing attachment/chunk behavior for
+        // oversize DM payloads while v3 owns the DM channel resolution.
+        let dm_channel = match client.resolve_dm_channel(&user_id.to_string()).await {
+            Ok(channel_id) => channel_id,
+            Err(error) => {
+                return ManualDeliveryOutcome::Failed {
+                    detail: error.to_string(),
+                };
+            }
+        };
+        let result = match if bot == "announce" {
+            client
+                .post_text_attachment(&dm_channel, content, summary)
+                .await
+                .map(|message_id| ManualDeliveryOutcome::Sent {
+                    message_id,
+                    delivery: Some("summary+txt"),
+                })
+        } else {
+            deliver_chunked_manual_notification(client, &dm_channel, content).await
+        } {
+            Ok(outcome) => outcome,
             Err(error) => ManualDeliveryOutcome::Failed {
                 detail: error.to_string(),
             },
         };
-        if let ManualDeliveryOutcome::Sent { message_id, .. } = &result {
-            if let Some(key) = dedup_key.as_deref() {
-                dedup.record(key, message_id);
-            }
-        }
+        record_manual_delivery_success(dedup, dedup_key.as_deref(), &result);
         return result;
     }
 
-    let mut outbound_msg = DiscordOutboundMessage::new(channel_id, content);
-    if let Some(delivery_id) = delivery_id {
-        outbound_msg = outbound_msg
-            .with_correlation(delivery_id.correlation_id, delivery_id.semantic_event_id);
-    }
-    let policy = DiscordOutboundPolicy::review_notification(
-        summary
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    );
+    let result = deliver_manual_v3_text(
+        client,
+        dedup,
+        OutboundTarget::DmUser(serenity::UserId::new(user_id)),
+        &format!("dm:{user_id}"),
+        content,
+        summary,
+        delivery_id,
+        content_len > DISCORD_SAFE_LIMIT_CHARS,
+    )
+    .await;
+    record_manual_delivery_success(dedup, dedup_key.as_deref(), &result);
+    result
+}
 
-    match deliver_outbound(client, dedup, outbound_msg, policy).await {
-        DeliveryResult::Success { message_id } => ManualDeliveryOutcome::Sent {
-            message_id,
+async fn deliver_manual_v3_text<C: DiscordOutboundClient>(
+    client: &C,
+    dedup: &OutboundDeduper,
+    target: OutboundTarget,
+    target_label: &str,
+    content: &str,
+    summary: Option<&str>,
+    delivery_id: Option<ManualOutboundDeliveryId<'_>>,
+    preserve_inline_content: bool,
+) -> ManualDeliveryOutcome {
+    let mut policy = if preserve_inline_content {
+        DiscordOutboundPolicy::preserve_inline_content()
+    } else {
+        DiscordOutboundPolicy::review_notification()
+    };
+    if delivery_id.is_none() {
+        policy = policy.without_idempotency();
+    }
+    let (correlation_id, semantic_event_id) = delivery_id
+        .map(|delivery_id| {
+            (
+                delivery_id.correlation_id.to_string(),
+                delivery_id.semantic_event_id.to_string(),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                format!("manual:no-idempotency:{target_label}"),
+                "manual:no-idempotency".to_string(),
+            )
+        });
+    let mut outbound_msg =
+        DiscordOutboundMessage::new(correlation_id, semantic_event_id, content, target, policy);
+    if let Some(summary) = summary.map(str::trim).filter(|value| !value.is_empty()) {
+        outbound_msg = outbound_msg.with_summary(summary.to_string());
+    }
+
+    match deliver_v3_outbound(client, dedup, outbound_msg).await {
+        DeliveryResult::Sent { messages, .. } => ManualDeliveryOutcome::Sent {
+            message_id: first_raw_message_id(&messages).unwrap_or_default(),
             delivery: None,
         },
-        DeliveryResult::Fallback { message_id, kind } => ManualDeliveryOutcome::Sent {
-            message_id,
-            delivery: Some(match kind {
-                FallbackKind::Truncated => "truncated",
-                FallbackKind::MinimalFallback => "minimal_fallback",
+        DeliveryResult::Fallback {
+            messages,
+            fallback_used,
+            ..
+        } => ManualDeliveryOutcome::Sent {
+            message_id: first_raw_message_id(&messages).unwrap_or_default(),
+            delivery: Some(match fallback_used {
+                FallbackUsed::LengthCompacted => "truncated",
+                FallbackUsed::MinimalFallback => "minimal_fallback",
+                FallbackUsed::LengthSplit => "chunked",
+                FallbackUsed::FileAttachment => "summary+txt",
+                FallbackUsed::ParentChannel => "parent_channel",
             }),
         },
         DeliveryResult::Duplicate { .. } => ManualDeliveryOutcome::Sent {
             message_id: String::new(),
             delivery: Some("duplicate"),
         },
-        DeliveryResult::Skipped { .. } => ManualDeliveryOutcome::Sent {
+        DeliveryResult::Skip { .. } => ManualDeliveryOutcome::Sent {
             message_id: String::new(),
             delivery: Some("skipped"),
         },
-        DeliveryResult::PermanentFailure { detail } => ManualDeliveryOutcome::Failed { detail },
+        DeliveryResult::PermanentFailure { reason } => {
+            ManualDeliveryOutcome::Failed { detail: reason }
+        }
     }
+}
+
+fn record_manual_delivery_success(
+    dedup: &OutboundDeduper,
+    dedup_key: Option<&str>,
+    result: &ManualDeliveryOutcome,
+) {
+    let ManualDeliveryOutcome::Sent { message_id, .. } = result else {
+        return;
+    };
+    if message_id.is_empty() {
+        return;
+    }
+    if let Some(key) = dedup_key {
+        dedup.record(key, message_id);
+    }
+}
+
+fn parse_channel_id_for_manual(channel_id: &str) -> Result<ChannelId, ManualDeliveryOutcome> {
+    channel_id
+        .parse::<u64>()
+        .map(ChannelId::new)
+        .map_err(|error| ManualDeliveryOutcome::Failed {
+            detail: format!("invalid discord channel id {channel_id}: {error}"),
+        })
 }
 
 async fn deliver_chunked_manual_notification<C: ManualOutboundClient>(
@@ -2895,6 +3436,32 @@ pub async fn handle_rebind_inflight<'a>(
     }
 }
 
+/// #1462: Handle relay recovery dry-run / bounded auto-heal for one channel.
+///
+/// `apply=false` is the default and only returns the proposed action with
+/// evidence. `apply=true` is intentionally conservative: only local,
+/// idempotent cleanup paths marked eligible by the recovery planner can run.
+pub async fn handle_relay_recovery<'a>(
+    registry: &HealthRegistry,
+    provider: Option<&str>,
+    channel_id: u64,
+    apply: bool,
+) -> (&'a str, String) {
+    match super::relay_recovery::run_relay_recovery(registry, provider, channel_id, apply).await {
+        Ok(response) => (
+            "200 OK",
+            serde_json::to_string(&response).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to serialize relay recovery response: {error}")
+                })
+                .to_string()
+            }),
+        ),
+        Err(error) => (error.status_str(), error.body().to_string()),
+    }
+}
+
 fn rebind_error_status_and_message(
     err: &super::recovery_engine::RebindError,
 ) -> (&'static str, String) {
@@ -2985,7 +3552,7 @@ pub async fn handle_send_to_agent(
     .await
 }
 
-/// Handle POST /api/senddm — send a DM to a Discord user.
+/// Handle POST /api/discord/send-dm — send a DM to a Discord user.
 /// Accepts JSON:
 /// {"user_id":"...", "content":"...", "bot":"announce|notify|claude|codex"}
 pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, String) {
@@ -3006,55 +3573,44 @@ pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static s
     let user_id_text = request.user_id.to_string();
     let dm_delivery_id = request.delivery_id();
 
-    use poise::serenity_prelude::UserId;
-    let user_id = UserId::new(request.user_id);
-    match user_id.create_dm_channel(&*http).await {
-        Ok(dm_channel) => match deliver_manual_notification(
-            &SerenityManualOutboundClient { http },
-            manual_notification_deduper(),
-            &dm_channel.id.get().to_string(),
-            &request.content,
-            &request.bot,
-            None,
-            dm_delivery_id
-                .as_ref()
-                .map(|delivery_id| ManualOutboundDeliveryId {
-                    correlation_id: &delivery_id.0,
-                    semantic_event_id: &delivery_id.1,
-                }),
-        )
-        .await
-        {
-            ManualDeliveryOutcome::Sent {
-                message_id,
-                delivery,
-            } => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 📨 DM: → user {} via shared outbound",
-                    request.user_id
-                );
-                let mut response = serde_json::json!({
-                    "ok": true,
-                    "user_id": user_id_text,
-                    "message_id": message_id,
-                });
-                if let Some(delivery) = delivery {
-                    response["delivery"] = serde_json::Value::String(delivery.to_string());
-                }
-                ("200 OK", response.to_string())
+    match deliver_manual_dm_notification(
+        &SerenityManualOutboundClient { http },
+        manual_notification_deduper(),
+        request.user_id,
+        &request.content,
+        &request.bot,
+        None,
+        dm_delivery_id
+            .as_ref()
+            .map(|delivery_id| ManualOutboundDeliveryId {
+                correlation_id: &delivery_id.0,
+                semantic_event_id: &delivery_id.1,
+            }),
+    )
+    .await
+    {
+        ManualDeliveryOutcome::Sent {
+            message_id,
+            delivery,
+        } => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 📨 DM: → user {} via shared outbound",
+                request.user_id
+            );
+            let mut response = serde_json::json!({
+                "ok": true,
+                "user_id": user_id_text,
+                "message_id": message_id,
+            });
+            if let Some(delivery) = delivery {
+                response["delivery"] = serde_json::Value::String(delivery.to_string());
             }
-            ManualDeliveryOutcome::Failed { detail } => (
-                "500 Internal Server Error",
-                format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
-            ),
-        },
-        Err(e) => (
+            ("200 OK", response.to_string())
+        }
+        ManualDeliveryOutcome::Failed { detail } => (
             "500 Internal Server Error",
-            format!(
-                r#"{{"ok":false,"error":"DM channel creation failed: {}"}}"#,
-                e
-            ),
+            format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
         ),
     }
 }
@@ -3506,7 +4062,7 @@ mod stall_watchdog_pure_tests {
     }
 }
 
-/// Parse a /api/send JSON body and extract (target, content, source).
+/// Parse a /api/discord/send JSON body and extract (target, content, source).
 /// Returns Err with an error message on invalid input.
 /// Factored out of handle_send for testability.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3531,6 +4087,115 @@ fn parse_send_body(body: &str) -> Result<(String, String, String), &'static str>
         .unwrap_or("unknown")
         .to_string();
     Ok((target, content, source))
+}
+
+#[cfg(test)]
+mod manual_v3_delivery_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct MockManualOutboundClient {
+        posts: Arc<Mutex<Vec<String>>>,
+        post_targets: Arc<Mutex<Vec<String>>>,
+        dm_resolutions: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl DiscordOutboundClient for MockManualOutboundClient {
+        async fn post_message(
+            &self,
+            target_channel: &str,
+            content: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            let mut posts = self.posts.lock().unwrap();
+            self.post_targets
+                .lock()
+                .unwrap()
+                .push(target_channel.to_string());
+            posts.push(content.to_string());
+            Ok(format!("message-{}", posts.len()))
+        }
+
+        async fn resolve_dm_channel(
+            &self,
+            user_id: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            self.dm_resolutions
+                .lock()
+                .unwrap()
+                .push(user_id.to_string());
+            Ok("9876".to_string())
+        }
+    }
+
+    impl ManualOutboundClient for MockManualOutboundClient {
+        async fn post_text_attachment(
+            &self,
+            _target_channel: &str,
+            _content: &str,
+            _summary: Option<&str>,
+        ) -> Result<String, DispatchMessagePostError> {
+            Ok("attachment-message-1".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let delivery_id = ManualOutboundDeliveryId {
+            correlation_id: "senddm:42",
+            semantic_event_id: "senddm:42:hello",
+        };
+
+        let first = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+        let second = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+
+        assert_eq!(
+            first,
+            ManualDeliveryOutcome::Sent {
+                message_id: "message-1".to_string(),
+                delivery: None
+            }
+        );
+        assert_eq!(
+            second,
+            ManualDeliveryOutcome::Sent {
+                message_id: String::new(),
+                delivery: Some("duplicate")
+            }
+        );
+        assert_eq!(
+            client.dm_resolutions.lock().unwrap().clone(),
+            vec!["42".to_string()]
+        );
+        assert_eq!(
+            client.post_targets.lock().unwrap().clone(),
+            vec!["9876".to_string()]
+        );
+        assert_eq!(
+            client.posts.lock().unwrap().clone(),
+            vec!["hello".to_string()]
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -3645,18 +4310,35 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockManualOutboundClient {
         posts: Arc<std::sync::Mutex<Vec<String>>>,
+        post_targets: Arc<std::sync::Mutex<Vec<String>>>,
+        dm_resolutions: Arc<std::sync::Mutex<Vec<String>>>,
         attachments: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
     }
 
     impl DiscordOutboundClient for MockManualOutboundClient {
         async fn post_message(
             &self,
-            _target_channel: &str,
+            target_channel: &str,
             content: &str,
         ) -> Result<String, DispatchMessagePostError> {
             let mut posts = self.posts.lock().unwrap();
+            self.post_targets
+                .lock()
+                .unwrap()
+                .push(target_channel.to_string());
             posts.push(content.to_string());
             Ok(format!("message-{}", posts.len()))
+        }
+
+        async fn resolve_dm_channel(
+            &self,
+            user_id: &str,
+        ) -> Result<String, DispatchMessagePostError> {
+            self.dm_resolutions
+                .lock()
+                .unwrap()
+                .push(user_id.to_string());
+            Ok("9876".to_string())
         }
     }
 
@@ -3755,6 +4437,64 @@ mod tests {
             }
         );
         assert_eq!(client.posts.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve() {
+        let client = MockManualOutboundClient::default();
+        let dedup = OutboundDeduper::new();
+        let delivery_id = ManualOutboundDeliveryId {
+            correlation_id: "senddm:42",
+            semantic_event_id: "senddm:42:hello",
+        };
+
+        let first = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+        let second = deliver_manual_dm_notification(
+            &client,
+            &dedup,
+            42,
+            "hello",
+            "announce",
+            None,
+            Some(delivery_id),
+        )
+        .await;
+
+        assert_eq!(
+            first,
+            ManualDeliveryOutcome::Sent {
+                message_id: "message-1".to_string(),
+                delivery: None
+            }
+        );
+        assert_eq!(
+            second,
+            ManualDeliveryOutcome::Sent {
+                message_id: String::new(),
+                delivery: Some("duplicate")
+            }
+        );
+        assert_eq!(
+            client.dm_resolutions.lock().unwrap().clone(),
+            vec!["42".to_string()]
+        );
+        assert_eq!(
+            client.post_targets.lock().unwrap().clone(),
+            vec!["9876".to_string()]
+        );
+        assert_eq!(
+            client.posts.lock().unwrap().clone(),
+            vec!["hello".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -4117,6 +4857,9 @@ mod tests {
         // Idle mailbox: no active turn, no queued interventions.
         assert!(!snapshot.has_pending_queue);
         assert!(snapshot.mailbox_active_user_msg_id.is_none());
+        assert_eq!(snapshot.relay_stall_state, RelayStallState::Healthy);
+        assert_eq!(snapshot.relay_health.active_turn, RelayActiveTurn::None);
+        assert!(snapshot.relay_health.watcher_attached);
 
         // Serialization shape matches the HTTP response contract. Fields
         // marked `skip_serializing_if = "Option::is_none"` are intentionally
@@ -4135,6 +4878,8 @@ mod tests {
             "reconnect_count",
             "has_pending_queue",
             "watcher_owner_channel_id",
+            "relay_stall_state",
+            "relay_health",
         ] {
             assert!(
                 obj.contains_key(field),

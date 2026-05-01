@@ -1,7 +1,8 @@
 use poise::serenity_prelude as serenity;
+use regex::Regex;
 use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use super::{DISCORD_MSG_LIMIT, SharedData, rate_limit_wait};
 use crate::utils::format::tail_with_ellipsis_bytes;
@@ -13,8 +14,25 @@ const UTF8_ELLIPSIS_EXTRA_BYTES: usize = "…".len().saturating_sub(1);
 const THINKING_STATUS_MAX_BYTES: usize = 600;
 const TOOL_STATUS_MAX_BYTES: usize = 300;
 
+pub(super) fn redact_sensitive_for_placeholder(input: &str) -> String {
+    static OPENAI_KEY_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}").expect("valid key regex"));
+    static BEARER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bBearer\s+\S+").expect("valid bearer token regex"));
+    static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(password|token|api[_-]?key)=\S+")
+            .expect("valid secret assignment regex")
+    });
+
+    let redacted = OPENAI_KEY_RE.replace_all(input, "***");
+    let redacted = BEARER_RE.replace_all(&redacted, "Bearer ***");
+    ASSIGNMENT_RE
+        .replace_all(&redacted, "${1}=***")
+        .into_owned()
+}
+
 /// Inline footer appended to a summary when a long message is delivered as a
-/// `.txt` attachment via `/api/send`.
+/// `.txt` attachment via `/api/discord/send`.
 const ATTACHMENT_FOOTER_PREFIX: &str = "📎 전문은 첨부 파일 참고";
 
 /// All available tools with (name, description, is_destructive)
@@ -214,10 +232,11 @@ mod tests {
         LongRunningCloseTrigger, MonitorHandoffReason, MonitorHandoffStatus,
         ReplaceLongMessageOutcome, build_monitor_handoff_placeholder,
         build_monitor_handoff_placeholder_with_context, build_placeholder_status_block,
-        canonical_tool_name, classify_long_running_tool, convert_markdown_tables,
-        escape_for_code_fence, filter_codex_tool_logs, finalize_in_progress_tool_status,
-        format_for_discord_with_provider, normalize_allowed_tools, preserve_previous_tool_status,
-        replace_long_message_outcome_to_result,
+        build_processing_status_block, canonical_tool_name, classify_long_running_tool,
+        convert_markdown_tables, escape_for_code_fence, filter_codex_tool_logs,
+        finalize_in_progress_tool_status, format_for_discord_with_provider,
+        normalize_allowed_tools, preserve_previous_tool_status,
+        replace_long_message_outcome_to_result, strip_codex_tool_log_lines,
     };
 
     #[test]
@@ -248,19 +267,21 @@ mod tests {
     }
 
     #[test]
-    fn replace_long_message_wrapper_does_not_report_fallback_send_as_success() {
+    fn replace_long_message_wrapper_treats_fallback_send_as_delivery_success() {
         assert!(
             replace_long_message_outcome_to_result(ReplaceLongMessageOutcome::EditedOriginal)
                 .is_ok()
         );
 
-        let error = replace_long_message_outcome_to_result(
+        let result = replace_long_message_outcome_to_result(
             ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
                 edit_error: "HTTP 403 Forbidden".to_string(),
             },
-        )
-        .expect_err("fallback send leaves original replace obligation open");
-        assert!(error.to_string().contains("HTTP 403"));
+        );
+        assert!(
+            result.is_ok(),
+            "fallback send committed visible delivery, so recovery callers can finalize"
+        );
     }
 
     #[test]
@@ -1163,6 +1184,11 @@ mod tests {
     }
 
     #[test]
+    fn test_build_processing_status_block_uses_spinner_processing() {
+        assert_eq!(build_processing_status_block("⠋"), "⠋ Processing...");
+    }
+
+    #[test]
     fn test_build_placeholder_status_block_keeps_utf8_text_within_byte_budget() {
         let placeholder = build_placeholder_status_block(
             "⠋",
@@ -1180,6 +1206,14 @@ mod tests {
             finalize_in_progress_tool_status("⚙ Bash: cargo build"),
             "⚠ Bash: cargo build"
         );
+    }
+
+    #[test]
+    fn test_strip_codex_tool_log_lines_removes_markers_outside_code_blocks() {
+        let input =
+            "[Bash] /bin/zsh -lc \"ls\"\nkeep\n```\n[Read] keep in code\n```\n[Task] worker";
+        let output = strip_codex_tool_log_lines(input);
+        assert_eq!(output, "keep\n```\n[Read] keep in code\n```");
     }
 
     #[test]
@@ -1255,10 +1289,10 @@ mod tests {
             None,
         );
         let expected = concat!(
-            "🔄 **백그라운드 처리 중**\n",
-            "> **도구**: ⚙ Bash: cargo build · **사유**: 직결 스트림 끊김 — watcher 이어받음\n",
+            "🔄 **응답 처리 중**\n",
+            "> **도구**: ⚙ Bash: cargo build · **사유**: 응답 스트림 전환 — watcher 이어받음\n",
             "> **시작**: <t:1700000000:R>\n",
-            "완료 시 이 채널로 결과 이어서 보냅니다.",
+            "완료 시 이 채널로 결과를 이어서 표시합니다.",
         );
         assert_eq!(text, expected);
     }
@@ -1287,7 +1321,7 @@ mod tests {
             None,
             None,
         );
-        assert!(completed.starts_with("✅ **백그라운드 완료**\n"));
+        assert!(completed.starts_with("✅ **응답 완료**\n"));
         assert!(completed.contains("**도구**: —"));
         assert!(completed.contains("결과가 위에 도착했습니다."));
 
@@ -1300,7 +1334,7 @@ mod tests {
             None,
             None,
         );
-        assert!(failed.starts_with("❌ **백그라운드 실패**: exit code 137\n"));
+        assert!(failed.starts_with("❌ **응답 실패**: exit code 137\n"));
         assert!(failed.contains("**사유**: 응답 지연 — watcher 이어받음"));
 
         let timed_out = build_monitor_handoff_placeholder(
@@ -1310,7 +1344,7 @@ mod tests {
             None,
             None,
         );
-        assert!(timed_out.starts_with("⏱ **백그라운드 타임아웃**\n"));
+        assert!(timed_out.starts_with("⏱ **응답 타임아웃**\n"));
 
         let aborted = build_monitor_handoff_placeholder(
             MonitorHandoffStatus::Aborted,
@@ -1319,7 +1353,7 @@ mod tests {
             None,
             None,
         );
-        assert!(aborted.starts_with("⚠ **백그라운드 중단** (모니터 연결 끊김)\n"));
+        assert!(aborted.starts_with("⚠ **응답 중단**\n"));
     }
 
     // #1332: Queued status renders the dedicated `📬 메시지 대기 중` card
@@ -1978,6 +2012,37 @@ pub(super) fn filter_codex_tool_logs(s: &str) -> String {
     result.join("\n")
 }
 
+/// Remove Codex CLI tool-call marker lines from response text.
+///
+/// Status panel v2 surfaces tool progress separately, so final/streaming body
+/// content should not keep `[Bash] ...` style marker lines. Lines inside code
+/// fences are preserved.
+pub(super) fn strip_codex_tool_log_lines(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static TOOL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        let names = tool_name_pattern();
+        Regex::new(&format!(r"^\s*\[({names})\](\s.*)?$")).unwrap()
+    });
+
+    let mut result = Vec::new();
+    let mut in_code_block = false;
+
+    for line in s.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push(line.to_string());
+            continue;
+        }
+        if in_code_block || !TOOL_RE.is_match(line) {
+            result.push(line.to_string());
+        }
+    }
+
+    result.join("\n")
+}
+
 /// Apply Codex tool-log filter (if provider is Codex) then format for Discord.
 pub(super) fn format_for_discord_with_provider(
     s: &str,
@@ -1993,6 +2058,36 @@ pub(super) fn format_for_discord_with_provider(
     };
     let cleaned = strip_placeholder_lines(input);
     format_for_discord(&cleaned)
+}
+
+/// Format provider output when the separate status panel is active.
+pub(super) fn format_for_discord_with_status_panel(
+    s: &str,
+    provider: &crate::services::provider::ProviderKind,
+) -> String {
+    let sanitized = super::response_sanitizer::sanitize_hidden_context(s);
+    let filtered;
+    let input = if matches!(provider, crate::services::provider::ProviderKind::Codex) {
+        filtered = strip_codex_tool_log_lines(&sanitized);
+        &filtered
+    } else {
+        &sanitized
+    };
+    let cleaned = strip_placeholder_lines(input);
+    format_for_discord(&cleaned)
+}
+
+#[cfg(test)]
+mod status_panel_v2_formatter_tests {
+    use super::format_for_discord_with_provider;
+    use crate::services::provider::ProviderKind;
+
+    #[test]
+    fn status_panel_disabled_codex_formatter_keeps_legacy_tool_markers() {
+        let input = "[Bash] /bin/zsh -lc \"ls\"\nkeep";
+        let output = format_for_discord_with_provider(input, &ProviderKind::Codex);
+        assert_eq!(output, "⚙️ Bash\nkeep");
+    }
 }
 
 /// Remove ephemeral placeholder lines (e.g. "⏳ 대기 중...") from the final
@@ -2277,10 +2372,7 @@ pub(super) async fn replace_long_message_raw(
 fn replace_long_message_outcome_to_result(outcome: ReplaceLongMessageOutcome) -> Result<(), Error> {
     match outcome {
         ReplaceLongMessageOutcome::EditedOriginal => Ok(()),
-        ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error } => Err(format!(
-            "original message edit failed before fallback send succeeded: {edit_error}"
-        )
-        .into()),
+        ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { .. } => Ok(()),
     }
 }
 
@@ -2292,8 +2384,9 @@ pub(super) enum ReplaceLongMessageOutcome {
 
 /// Replace an existing Discord message and report whether the original
 /// placeholder was actually edited. If the edit fails but the fallback send
-/// succeeds, callers that own placeholder lifecycle can still delete or
-/// terminal-edit the stale original.
+/// succeeds, wrapper callers treat delivery as committed, while callers that
+/// own placeholder lifecycle can still use this outcomeful variant to delete
+/// or terminal-edit the stale original.
 pub(super) async fn replace_long_message_raw_with_outcome(
     http: &serenity::Http,
     channel_id: ChannelId,
@@ -2428,7 +2521,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
 /// Split a message into chunks that fit within Discord's 2000 char limit.
 /// Handles code block boundaries correctly. Used by stream/slash-command/recovery
 /// paths where overflow is delivered as additional inline messages. The manual
-/// `/api/send` route uses the shared outbound API length policy instead.
+/// `/api/discord/send` route uses the shared outbound API length policy instead.
 ///
 /// Emits structured `tracing::debug!` logs at `target: "discord::chunker"` for
 /// every chunk produced (chunk_index, byte_len, boundary_kind, in_code_block).
@@ -2775,7 +2868,7 @@ pub(super) enum MonitorHandoffReason {
 impl MonitorHandoffReason {
     fn label(self) -> &'static str {
         match self {
-            Self::AsyncDispatch => "직결 스트림 끊김 — watcher 이어받음",
+            Self::AsyncDispatch => "응답 스트림 전환 — watcher 이어받음",
             Self::InlineTimeout => "응답 지연 — watcher 이어받음",
             Self::ExplicitCall => "백그라운드 도구 실행 중",
             Self::Queued => "앞선 턴 진행 중",
@@ -2804,30 +2897,57 @@ const MONITOR_HANDOFF_TOOL_MAX_BYTES: usize = 80;
 const MONITOR_HANDOFF_COMMAND_MAX_BYTES: usize = 80;
 const MONITOR_HANDOFF_REASON_DETAIL_MAX_BYTES: usize = 80;
 
-fn monitor_handoff_header(status: MonitorHandoffStatus<'_>) -> String {
+fn monitor_handoff_uses_background_label(reason: MonitorHandoffReason) -> bool {
+    matches!(reason, MonitorHandoffReason::ExplicitCall)
+}
+
+fn monitor_handoff_header(
+    status: MonitorHandoffStatus<'_>,
+    reason: MonitorHandoffReason,
+) -> String {
+    let background_label = monitor_handoff_uses_background_label(reason);
     match status {
         MonitorHandoffStatus::Queued => "📬 **메시지 대기 중**".to_string(),
-        MonitorHandoffStatus::Active => "🔄 **백그라운드 처리 중**".to_string(),
-        MonitorHandoffStatus::Completed => "✅ **백그라운드 완료**".to_string(),
+        MonitorHandoffStatus::Active if background_label => "🔄 **백그라운드 처리 중**".to_string(),
+        MonitorHandoffStatus::Active => "🔄 **응답 처리 중**".to_string(),
+        MonitorHandoffStatus::Completed if background_label => "✅ **백그라운드 완료**".to_string(),
+        MonitorHandoffStatus::Completed => "✅ **응답 완료**".to_string(),
         MonitorHandoffStatus::Failed { reason } => {
             let trimmed = reason.trim();
+            let label = if background_label {
+                "백그라운드 실패"
+            } else {
+                "응답 실패"
+            };
             if trimmed.is_empty() {
-                "❌ **백그라운드 실패**".to_string()
+                format!("❌ **{label}**")
             } else {
                 let truncated =
                     truncate_for_status_bytes(trimmed, MONITOR_HANDOFF_COMMAND_MAX_BYTES);
-                format!("❌ **백그라운드 실패**: {truncated}")
+                format!("❌ **{label}**: {truncated}")
             }
         }
-        MonitorHandoffStatus::TimedOut => "⏱ **백그라운드 타임아웃**".to_string(),
-        MonitorHandoffStatus::Aborted => "⚠ **백그라운드 중단** (모니터 연결 끊김)".to_string(),
+        MonitorHandoffStatus::TimedOut if background_label => {
+            "⏱ **백그라운드 타임아웃**".to_string()
+        }
+        MonitorHandoffStatus::TimedOut => "⏱ **응답 타임아웃**".to_string(),
+        MonitorHandoffStatus::Aborted if background_label => {
+            "⚠ **백그라운드 중단** (모니터 연결 끊김)".to_string()
+        }
+        MonitorHandoffStatus::Aborted => "⚠ **응답 중단**".to_string(),
     }
 }
 
-fn monitor_handoff_footer(status: MonitorHandoffStatus<'_>) -> &'static str {
+fn monitor_handoff_footer(
+    status: MonitorHandoffStatus<'_>,
+    reason: MonitorHandoffReason,
+) -> &'static str {
     match status {
         MonitorHandoffStatus::Queued => "현재 진행 중인 턴 완료 후 처리 시작합니다.",
-        MonitorHandoffStatus::Active => "완료 시 이 채널로 결과 이어서 보냅니다.",
+        MonitorHandoffStatus::Active if monitor_handoff_uses_background_label(reason) => {
+            "완료 시 이 채널로 결과 이어서 보냅니다."
+        }
+        MonitorHandoffStatus::Active => "완료 시 이 채널로 결과를 이어서 표시합니다.",
         MonitorHandoffStatus::Completed => "결과가 위에 도착했습니다.",
         MonitorHandoffStatus::Failed { .. } => "자세한 사유는 다음 응답을 확인해 주세요.",
         MonitorHandoffStatus::TimedOut => "타임아웃 임계를 넘어 종료되었습니다.",
@@ -2884,8 +3004,34 @@ pub(super) fn build_monitor_handoff_placeholder_with_context(
     request_line: Option<&str>,
     progress_line: Option<&str>,
 ) -> String {
-    let header = monitor_handoff_header(status);
-    let footer = monitor_handoff_footer(status);
+    build_monitor_handoff_placeholder_with_live_events(
+        status,
+        reason,
+        started_at_unix,
+        tool_summary,
+        command_summary,
+        reason_detail,
+        context_line,
+        request_line,
+        progress_line,
+        None,
+    )
+}
+
+pub(super) fn build_monitor_handoff_placeholder_with_live_events(
+    status: MonitorHandoffStatus<'_>,
+    reason: MonitorHandoffReason,
+    started_at_unix: i64,
+    tool_summary: Option<&str>,
+    command_summary: Option<&str>,
+    reason_detail: Option<&str>,
+    context_line: Option<&str>,
+    request_line: Option<&str>,
+    progress_line: Option<&str>,
+    live_events_block: Option<&str>,
+) -> String {
+    let header = monitor_handoff_header(status, reason);
+    let footer = monitor_handoff_footer(status, reason);
 
     let tool_field = tool_summary
         .map(|raw| {
@@ -2988,6 +3134,14 @@ pub(super) fn build_monitor_handoff_placeholder_with_context(
     }
     lines.push(format!("> **시작**: <t:{started_at_unix}:R>"));
     lines.push(footer.to_string());
+    if matches!(status, MonitorHandoffStatus::Active)
+        && let Some(block) = live_events_block.and_then(|raw| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+    {
+        lines.push(block.to_string());
+    }
 
     lines.join("\n")
 }
@@ -3083,6 +3237,10 @@ pub(super) fn build_placeholder_status_block(
     let raw_tool_status = resolve_raw_tool_status(current_tool_line, full_response);
     let tool_status = humanize_tool_status(raw_tool_status);
     format!("{indicator} {tool_status}")
+}
+
+pub(super) fn build_processing_status_block(indicator: &str) -> String {
+    build_placeholder_status_block(indicator, None, None, "")
 }
 
 fn truncate_for_status_bytes(s: &str, max_bytes: usize) -> String {

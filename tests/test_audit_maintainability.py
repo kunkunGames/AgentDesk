@@ -68,12 +68,15 @@ class _FakeSrcTree:
         for rel, body in self.files.items():
             _write(root, rel, body)
         src_root = root / "src"
+        scripts_root = root / "scripts"
         # Patch the module-level constants used by the checks.
         p_repo = mock.patch.object(common, "REPO_ROOT", root)
         p_src = mock.patch.object(common, "SRC_ROOT", src_root)
+        p_scripts = mock.patch.object(common, "SCRIPTS_ROOT", scripts_root)
         p_repo.start()
         p_src.start()
-        self._patches.extend([p_repo, p_src])
+        p_scripts.start()
+        self._patches.extend([p_repo, p_src, p_scripts])
         return root
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -264,6 +267,36 @@ class LegacySqliteCheck(unittest.TestCase):
         ):
             hits = list(legacy_sqlite.CHECK.runner(set()))
         self.assertEqual(_files(hits), {"src/services/foo.rs"})
+
+    def test_flags_runtime_sqlite_in_operational_shell_scripts(self) -> None:
+        stale = """
+        DB="$HOME/.adk/release/data/agentdesk.sqlite"
+        sqlite3 "$DB" "SELECT id FROM auto_queue_runs"
+        """
+        clean = """
+        curl -sf "$API/api/queue/status" | jq .
+        """
+        with _FakeSrcTree(
+            {
+                "src/main.rs": "fn main() {}\n",
+                "scripts/auto-queue-monitor.sh": stale,
+                "scripts/queue-stability-batch.sh": clean,
+            }
+        ):
+            hits = list(legacy_sqlite.CHECK.runner(set()))
+        self.assertEqual(_files(hits), {"scripts/auto-queue-monitor.sh"})
+
+    def test_auto_queue_monitor_notification_source_is_allowed(self) -> None:
+        monitor = (REPO_ROOT / "scripts" / "auto-queue-monitor.sh").read_text(
+            encoding="utf-8"
+        )
+        discord_health = (
+            REPO_ROOT / "src" / "services" / "discord" / "health.rs"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('source:"auto-queue"', monitor)
+        self.assertNotIn('source:"auto-queue-monitor"', monitor)
+        self.assertIn('"auto-queue"', discord_health)
 
 
 class SourceOfTruthAliasCheck(unittest.TestCase):

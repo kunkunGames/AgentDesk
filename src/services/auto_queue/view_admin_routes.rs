@@ -1,6 +1,6 @@
 use super::*;
 
-/// GET /api/auto-queue/status
+/// GET /api/queue/status
 pub async fn status(
     State(state): State<AppState>,
     Query(query): Query<StatusQuery>,
@@ -22,7 +22,7 @@ pub async fn status(
     }
 }
 
-/// GET /api/auto-queue/history
+/// GET /api/queue/history
 pub async fn history(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
@@ -112,7 +112,7 @@ pub async fn history(
     )
 }
 
-/// PATCH /api/auto-queue/entries/{id}
+/// PATCH /api/queue/entries/{id}
 pub(super) async fn update_entry_with_pg(
     state: &AppState,
     id: &str,
@@ -344,7 +344,7 @@ pub async fn update_entry(
     update_entry_with_pg(&state, &id, &body, requested_status, &pg_pool).await
 }
 
-/// POST /api/auto-queue/runs/{id}/entries
+/// POST /api/queue/runs/{id}/entries
 pub(super) async fn add_run_entry_with_pg(
     state: &AppState,
     run_id: &str,
@@ -560,7 +560,7 @@ pub async fn add_run_entry(
     add_run_entry_with_pg(&state, &run_id, &body, batch_phase, &pg_pool).await
 }
 
-/// POST /api/auto-queue/runs/{id}/restore
+/// POST /api/queue/runs/{id}/restore
 pub(super) async fn restore_run_with_pg(
     state: &AppState,
     run_id: &str,

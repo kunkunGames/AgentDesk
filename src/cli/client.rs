@@ -510,7 +510,7 @@ fn render_cards_table(cards: &[Value]) -> String {
 pub fn cmd_status() -> Result<(), String> {
     let health = get_json("/api/health")?;
     let sessions = get_json("/api/dispatched-sessions?include_merged=1")?;
-    let queue = get_json("/api/auto-queue/status")?;
+    let queue = get_json("/api/queue/status")?;
 
     let version = health
         .get("version")
@@ -552,7 +552,7 @@ pub fn cmd_status() -> Result<(), String> {
     let queue_entries = queue
         .get("entries")
         .and_then(Value::as_array)
-        .ok_or_else(|| "invalid /api/auto-queue/status response".to_string())?;
+        .ok_or_else(|| "invalid /api/queue/status response".to_string())?;
     let mut counts = BTreeMap::<String, usize>::new();
     for entry in queue_entries {
         let status = entry
@@ -637,9 +637,28 @@ pub fn cmd_dispatch(
     }
 
     let groups = parse_dispatch_groups(issue_groups)?;
+    let entries: Vec<Value> = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(thread_group, group)| {
+            group
+                .get("issues")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |issue| {
+                    issue.as_i64().map(|issue_number| {
+                        serde_json::json!({
+                            "issue_number": issue_number,
+                            "thread_group": thread_group as i64,
+                            "batch_phase": 0,
+                        })
+                    })
+                })
+        })
+        .collect();
     let mut body = serde_json::json!({
-        "groups": groups,
-        "activate": activate,
+        "entries": entries,
     });
     if unified {
         body["unified_thread"] = serde_json::json!(true);
@@ -655,7 +674,35 @@ pub fn cmd_dispatch(
         body["repo"] = serde_json::json!(repo);
     }
 
-    let value = post_json("/api/auto-queue/dispatch", Some(body))?;
+    let mut value = post_json("/api/queue/generate", Some(body))?;
+    if activate {
+        let run_id = value
+            .get("run")
+            .and_then(|run| run.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "invalid /api/queue/generate response: missing run.id".to_string())?
+            .to_string();
+        let mut activate_body = serde_json::json!({ "run_id": run_id });
+        if unified {
+            activate_body["unified_thread"] = serde_json::json!(true);
+        }
+        if let Some(agent_id) = agent_id.map(str::trim).filter(|value| !value.is_empty()) {
+            activate_body["agent_id"] = serde_json::json!(agent_id);
+        }
+        if let Some(repo) = value
+            .get("run")
+            .and_then(|run| run.get("repo"))
+            .and_then(Value::as_str)
+            .filter(|repo| !repo.is_empty())
+        {
+            activate_body["repo"] = serde_json::json!(repo);
+        }
+        let dispatch = post_json("/api/queue/dispatch-next", Some(activate_body))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("activated".to_string(), serde_json::json!(true));
+            obj.insert("dispatch".to_string(), dispatch);
+        }
+    }
     print_json(&value);
     Ok(())
 }
@@ -882,7 +929,7 @@ pub fn cmd_advance(issue_number: &str) -> Result<(), String> {
 ///
 /// Show auto-queue status with work/review thread links.
 pub fn cmd_queue() -> Result<(), String> {
-    let data = get_json("/api/auto-queue/status")?;
+    let data = get_json("/api/queue/status")?;
     let entries = data["entries"].as_array().ok_or("No entries")?;
     let run = &data["run"];
 
@@ -1275,16 +1322,31 @@ mod tests {
         })
     }
 
-    async fn dispatch_handler(
-        State(state): State<Arc<Mutex<Option<serde_json::Value>>>>,
+    #[derive(Default)]
+    struct DispatchMockState {
+        generate: Option<serde_json::Value>,
+        activate: Option<serde_json::Value>,
+    }
+
+    async fn dispatch_generate_handler(
+        State(state): State<Arc<Mutex<DispatchMockState>>>,
         Json(body): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
-        *state.lock().unwrap() = Some(body);
+        state.lock().unwrap().generate = Some(body);
         Json(json!({
-            "run": {"id": "run-dispatch", "status": "active"},
-            "entries": [],
-            "thread_groups": {},
-            "activated": true
+            "run": {"id": "run-dispatch", "repo": "itismyfield/AgentDesk", "status": "generated"},
+            "entries": []
+        }))
+    }
+
+    async fn dispatch_activate_handler(
+        State(state): State<Arc<Mutex<DispatchMockState>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        state.lock().unwrap().activate = Some(body);
+        Json(json!({
+            "count": 1,
+            "dispatched": []
         }))
     }
 
@@ -1382,9 +1444,10 @@ mod tests {
                 ],
             );
 
-            let captured = Arc::new(Mutex::new(None));
+            let captured = Arc::new(Mutex::new(DispatchMockState::default()));
             let app = Router::new()
-                .route("/api/auto-queue/dispatch", post(dispatch_handler))
+                .route("/api/queue/generate", post(dispatch_generate_handler))
+                .route("/api/queue/dispatch-next", post(dispatch_activate_handler))
                 .with_state(captured.clone());
 
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1408,21 +1471,31 @@ mod tests {
             server.abort();
             assert!(result.is_ok(), "cmd_dispatch failed: {result:?}");
 
-            let payload = captured
-                .lock()
-                .unwrap()
-                .clone()
-                .expect("dispatch payload must be captured");
-            assert_eq!(payload["repo"], "itismyfield/AgentDesk");
-            assert_eq!(payload["agent_id"], "project-agentdesk");
-            assert_eq!(payload["auto_assign_agent"], true);
-            assert_eq!(payload["activate"], true);
-            assert_eq!(payload["unified_thread"], true);
-            assert_eq!(payload["max_concurrent_threads"], 2);
-            assert_eq!(payload["groups"][0]["issues"], json!([423, 405]));
-            assert_eq!(payload["groups"][0]["sequential"], true);
-            assert_eq!(payload["groups"][1]["issues"], json!([407]));
-            assert_eq!(payload["groups"][1]["sequential"], false);
+            let state = captured.lock().unwrap();
+            let generate_payload = state
+                .generate
+                .as_ref()
+                .expect("generate payload must be captured");
+            assert_eq!(generate_payload["repo"], "itismyfield/AgentDesk");
+            assert_eq!(generate_payload["agent_id"], "project-agentdesk");
+            assert_eq!(generate_payload["auto_assign_agent"], true);
+            assert_eq!(generate_payload["unified_thread"], true);
+            assert_eq!(generate_payload["max_concurrent_threads"], 2);
+            assert_eq!(generate_payload["entries"][0]["issue_number"], 423);
+            assert_eq!(generate_payload["entries"][0]["thread_group"], 0);
+            assert_eq!(generate_payload["entries"][1]["issue_number"], 405);
+            assert_eq!(generate_payload["entries"][1]["thread_group"], 0);
+            assert_eq!(generate_payload["entries"][2]["issue_number"], 407);
+            assert_eq!(generate_payload["entries"][2]["thread_group"], 1);
+
+            let activate_payload = state
+                .activate
+                .as_ref()
+                .expect("dispatch-next payload must be captured");
+            assert_eq!(activate_payload["run_id"], "run-dispatch");
+            assert_eq!(activate_payload["repo"], "itismyfield/AgentDesk");
+            assert_eq!(activate_payload["agent_id"], "project-agentdesk");
+            assert_eq!(activate_payload["unified_thread"], true);
         });
     }
 

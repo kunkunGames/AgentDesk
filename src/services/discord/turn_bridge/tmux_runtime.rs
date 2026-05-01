@@ -34,6 +34,7 @@ impl TmuxCleanupPolicy {
 }
 
 const PROVIDER_INTERRUPT_SETTLE: Duration = Duration::from_millis(750);
+const PROVIDER_HARD_STOP_GRACE: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProviderTurnInterruptPlan {
@@ -45,6 +46,7 @@ pub(in crate::services::discord) struct ProviderTurnInterruptOutcome {
     pub tmux_session: Option<String>,
     pub sent_keys: bool,
     pub fallback_sigint_pid: Option<u32>,
+    pub missing_tmux_session: bool,
 }
 
 fn provider_turn_interrupt_plan(provider: &ProviderKind) -> Option<ProviderTurnInterruptPlan> {
@@ -93,10 +95,16 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
         .and_then(|guard| guard.clone());
     let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
     let Some(tmux_session_name) = tmux_session.as_deref() else {
+        tracing::error!(
+            "provider turn interrupt skipped: provider={} reason={} error=cancel_token_missing_tmux_session",
+            provider.as_str(),
+            reason
+        );
         return ProviderTurnInterruptOutcome {
             tmux_session,
             sent_keys: false,
             fallback_sigint_pid: None,
+            missing_tmux_session: true,
         };
     };
     let Some(plan) = provider_turn_interrupt_plan(provider) else {
@@ -104,6 +112,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
             tmux_session,
             sent_keys: false,
             fallback_sigint_pid: None,
+            missing_tmux_session: false,
         };
     };
 
@@ -164,6 +173,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
             tmux_session,
             sent_keys,
             fallback_sigint_pid: None,
+            missing_tmux_session: false,
         };
     }
 
@@ -224,7 +234,62 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
         tmux_session,
         sent_keys,
         fallback_sigint_pid,
+        missing_tmux_session: false,
     }
+}
+
+pub(in crate::services::discord) fn cancel_token_has_tmux_session(token: &CancelToken) -> bool {
+    token
+        .tmux_session
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .is_some()
+}
+
+pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
+    provider: &ProviderKind,
+    token: &Arc<CancelToken>,
+    tmux_session_name: &str,
+    reason: &str,
+) -> Option<u32> {
+    if let Ok(mut guard) = token.tmux_session.lock() {
+        if guard.as_deref() != Some(tmux_session_name) {
+            *guard = Some(tmux_session_name.to_string());
+        }
+    } else {
+        tracing::error!(
+            "cancel token tmux rebind failed: provider={} session={} reason={} error=tmux_session_lock_poisoned",
+            provider.as_str(),
+            tmux_session_name,
+            reason
+        );
+    }
+
+    let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
+    let provider_pid = provider_cli_pid_in_tmux(tmux_session_name, provider, tracked_child_pid);
+    if let Some(pid) = provider_pid {
+        if let Ok(mut guard) = token.child_pid.lock()
+            && guard.is_none()
+        {
+            *guard = Some(pid);
+        }
+        tracing::info!(
+            "cancel token tmux runtime rebound: provider={} session={} pid={} reason={}",
+            provider.as_str(),
+            tmux_session_name,
+            pid,
+            reason
+        );
+    } else {
+        tracing::warn!(
+            "cancel token tmux runtime rebound without provider pid: provider={} session={} reason={}",
+            provider.as_str(),
+            tmux_session_name,
+            reason
+        );
+    }
+    provider_pid
 }
 
 /// Standard turn-stop sequence: send the provider abort key (e.g. C-c) FIRST,
@@ -250,8 +315,107 @@ pub(in crate::services::discord) async fn stop_active_turn(
     cleanup_policy: TmuxCleanupPolicy,
     reason: &str,
 ) -> bool {
-    interrupt_provider_cli_turn(provider, token, reason).await;
-    cancel_active_token(token, cleanup_policy, reason)
+    let interrupt_outcome = interrupt_provider_cli_turn(provider, token, reason).await;
+    let termination_recorded = cancel_active_token(token, cleanup_policy, reason);
+    hard_stop_unresponsive_provider_cli_turn(
+        provider,
+        token,
+        cleanup_policy,
+        &interrupt_outcome,
+        reason,
+    )
+    .await;
+    termination_recorded
+}
+
+async fn hard_stop_unresponsive_provider_cli_turn(
+    provider: &ProviderKind,
+    token: &Arc<CancelToken>,
+    cleanup_policy: TmuxCleanupPolicy,
+    interrupt_outcome: &ProviderTurnInterruptOutcome,
+    reason: &str,
+) {
+    if cleanup_policy.should_cleanup_tmux() {
+        return;
+    }
+
+    let tmux_session_name = interrupt_outcome.tmux_session.clone().or_else(|| {
+        token
+            .tmux_session
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    });
+    let Some(tmux_session_name) = tmux_session_name else {
+        tracing::error!(
+            "provider hard-stop skipped: provider={} reason={} error=cancel_token_missing_tmux_session interrupt_missing_tmux_session={}",
+            provider.as_str(),
+            reason,
+            interrupt_outcome.missing_tmux_session
+        );
+        return;
+    };
+
+    tokio::time::sleep(PROVIDER_HARD_STOP_GRACE).await;
+
+    let tracked_child_pid = token.child_pid.lock().ok().and_then(|guard| *guard);
+    let provider_for_probe = provider.clone();
+    let session_for_probe = tmux_session_name.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        let session_alive = crate::services::platform::tmux::pane_pid(&session_for_probe).is_some();
+        let ready_for_input =
+            crate::services::provider::tmux_session_ready_for_input(&session_for_probe);
+        let current_provider_pid =
+            provider_cli_pid_in_tmux(&session_for_probe, &provider_for_probe, tracked_child_pid);
+        (session_alive, ready_for_input, current_provider_pid)
+    })
+    .await;
+
+    let (session_alive, ready_for_input, current_provider_pid) = match probe {
+        Ok(values) => values,
+        Err(error) => {
+            tracing::warn!(
+                "provider hard-stop probe join error: provider={} session={} reason={} error={}",
+                provider.as_str(),
+                tmux_session_name,
+                reason,
+                error
+            );
+            (false, false, None)
+        }
+    };
+
+    let Some(pid) = hard_stop_pid_for_unresponsive_provider(
+        cleanup_policy,
+        session_alive,
+        ready_for_input,
+        current_provider_pid,
+        interrupt_outcome.fallback_sigint_pid,
+    ) else {
+        return;
+    };
+
+    tracing::warn!(
+        "provider turn did not stop after interrupt; killing provider pid: provider={} session={} pid={} reason={}",
+        provider.as_str(),
+        tmux_session_name,
+        pid,
+        reason
+    );
+    crate::services::process::kill_pid_tree(pid);
+}
+
+fn hard_stop_pid_for_unresponsive_provider(
+    cleanup_policy: TmuxCleanupPolicy,
+    session_alive: bool,
+    ready_for_input: bool,
+    current_provider_pid: Option<u32>,
+    previous_provider_pid: Option<u32>,
+) -> Option<u32> {
+    if cleanup_policy.should_cleanup_tmux() || !session_alive || ready_for_input {
+        return None;
+    }
+    current_provider_pid.or(previous_provider_pid)
 }
 
 pub(in crate::services::discord) fn cancel_active_token(
@@ -567,14 +731,6 @@ pub(super) fn is_dcserver_restart_command(input: &str) -> bool {
         && (lower.contains("kickstart") || lower.contains("bootstrap") || lower.contains("bootout"))
 }
 
-pub(super) fn should_resume_watcher_after_turn(
-    defer_watcher_resume: bool,
-    has_local_queued_turns: bool,
-    can_chain_locally: bool,
-) -> bool {
-    !defer_watcher_resume && !(has_local_queued_turns && can_chain_locally)
-}
-
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{TmuxCleanupPolicy, handoff_interrupted_message, stale_inflight_message};
@@ -684,6 +840,67 @@ mod tests {
     }
 
     #[test]
+    fn hard_stop_targets_only_unresponsive_preserved_provider() {
+        assert_eq!(
+            super::hard_stop_pid_for_unresponsive_provider(
+                TmuxCleanupPolicy::PreserveSession,
+                true,
+                false,
+                Some(42),
+                Some(41),
+            ),
+            Some(42),
+            "current provider PID wins when the tmux session is still busy"
+        );
+        assert_eq!(
+            super::hard_stop_pid_for_unresponsive_provider(
+                TmuxCleanupPolicy::PreserveSession,
+                true,
+                false,
+                None,
+                Some(41),
+            ),
+            Some(41),
+            "the SIGINT fallback PID is retained as a last known provider target"
+        );
+        assert_eq!(
+            super::hard_stop_pid_for_unresponsive_provider(
+                TmuxCleanupPolicy::PreserveSession,
+                true,
+                true,
+                Some(42),
+                Some(41),
+            ),
+            None,
+            "ready_for_input means the provider accepted the interrupt"
+        );
+        assert_eq!(
+            super::hard_stop_pid_for_unresponsive_provider(
+                TmuxCleanupPolicy::CleanupSession {
+                    termination_reason_code: Some("test")
+                },
+                true,
+                false,
+                Some(42),
+                Some(41),
+            ),
+            None,
+            "cleanup-session paths already tear down tmux and must not double-kill"
+        );
+        assert_eq!(
+            super::hard_stop_pid_for_unresponsive_provider(
+                TmuxCleanupPolicy::PreserveSession,
+                false,
+                false,
+                None,
+                Some(41),
+            ),
+            None,
+            "a missing tmux session must not kill a stale last-known PID"
+        );
+    }
+
+    #[test]
     fn preserve_session_cancel_keeps_tmux_session_reference() {
         let token = Arc::new(CancelToken::new());
         *token.tmux_session.lock().unwrap() = Some("AgentDesk-codex-test".to_string());
@@ -752,6 +969,22 @@ mod tests {
         )
         .await;
         assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interrupt_reports_missing_tmux_session_for_naked_token() {
+        let token = Arc::new(CancelToken::new());
+
+        let outcome =
+            super::interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "test naked token")
+                .await;
+
+        assert!(
+            outcome.missing_tmux_session,
+            "naked cancel token must be surfaced as an explicit diagnostic"
+        );
+        assert!(!outcome.sent_keys);
+        assert!(outcome.fallback_sigint_pid.is_none());
     }
 
     #[cfg(unix)]

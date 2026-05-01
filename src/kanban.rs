@@ -165,6 +165,113 @@ pub struct PgTransitionCleanupCounts {
     pub skipped_auto_queue_entries: usize,
 }
 
+fn json_string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|field| field.as_str())
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_string)
+}
+
+fn json_bool_field(value: &serde_json::Value, key: &str) -> bool {
+    value.get(key).and_then(|field| field.as_bool()) == Some(true)
+}
+
+async fn cleanup_terminal_managed_worktrees_pg(
+    pg_pool: &sqlx::PgPool,
+    card_id: &str,
+) -> anyhow::Result<crate::services::platform::shell::ManagedWorktreeCleanup> {
+    let mut summary = crate::services::platform::shell::ManagedWorktreeCleanup::default();
+    let repo_id: Option<String> =
+        sqlx::query_scalar("SELECT repo_id FROM kanban_cards WHERE id = $1")
+            .bind(card_id)
+            .fetch_optional(pg_pool)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("load card repo for managed worktree cleanup {card_id}: {error}")
+            })?
+            .flatten();
+    let repo_dir =
+        match crate::services::platform::shell::resolve_repo_dir_for_target(repo_id.as_deref()) {
+            Ok(Some(path)) => path,
+            Ok(None) => return Ok(summary),
+            Err(error) => {
+                tracing::warn!(
+                    "[kanban] managed worktree cleanup skipped for {}: {}",
+                    card_id,
+                    error
+                );
+                return Ok(summary);
+            }
+        };
+
+    let rows = sqlx::query(
+        "SELECT context::text AS context, result::text AS result
+         FROM task_dispatches
+         WHERE kanban_card_id = $1
+           AND dispatch_type IN ('implementation', 'rework')
+           AND status = 'completed'",
+    )
+    .bind(card_id)
+    .fetch_all(pg_pool)
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!("load managed worktree cleanup dispatches {card_id}: {error}")
+    })?;
+
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let context_raw: Option<String> = row.try_get("context").map_err(|error| {
+            anyhow::anyhow!("decode managed worktree cleanup context for {card_id}: {error}")
+        })?;
+        let result_raw: Option<String> = row.try_get("result").map_err(|error| {
+            anyhow::anyhow!("decode managed worktree cleanup result for {card_id}: {error}")
+        })?;
+        let context_json = context_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let result_json = result_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let managed = context_json
+            .as_ref()
+            .is_some_and(|value| json_bool_field(value, "managed_worktree"));
+        let cleanup_on_terminal = context_json
+            .as_ref()
+            .and_then(|value| json_string_field(value, "managed_worktree_cleanup"))
+            .as_deref()
+            .unwrap_or("terminal")
+            == "terminal";
+        if !managed || !cleanup_on_terminal {
+            continue;
+        }
+        let worktree_path = context_json
+            .as_ref()
+            .and_then(|value| json_string_field(value, "worktree_path"))
+            .or_else(|| {
+                result_json
+                    .as_ref()
+                    .and_then(|value| json_string_field(value, "completed_worktree_path"))
+            });
+        let Some(worktree_path) = worktree_path else {
+            continue;
+        };
+        if !seen.insert(worktree_path.clone()) {
+            continue;
+        }
+        let item =
+            crate::services::platform::shell::cleanup_managed_worktree(&repo_dir, &worktree_path);
+        summary.removed += item.removed;
+        summary.skipped_dirty += item.skipped_dirty;
+        summary.skipped_unmerged += item.skipped_unmerged;
+        summary.skipped_unmanaged += item.skipped_unmanaged;
+        summary.failed += item.failed;
+    }
+
+    Ok(summary)
+}
+
 async fn clear_escalation_alert_state_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     card_id: &str,
@@ -832,6 +939,36 @@ async fn transition_status_with_opts_pg_inner(
     tx.commit()
         .await
         .map_err(|error| anyhow::anyhow!("commit postgres transition tx: {error}"))?;
+
+    if effective.is_terminal(new_status) {
+        match cleanup_terminal_managed_worktrees_pg(pg_pool, card_id).await {
+            Ok(summary) => {
+                if summary.removed > 0
+                    || summary.skipped_dirty > 0
+                    || summary.skipped_unmerged > 0
+                    || summary.skipped_unmanaged > 0
+                    || summary.failed > 0
+                {
+                    tracing::info!(
+                        "[kanban] terminal managed worktree cleanup for {}: removed={}, dirty={}, unmerged={}, unmanaged={}, failed={}",
+                        card_id,
+                        summary.removed,
+                        summary.skipped_dirty,
+                        summary.skipped_unmerged,
+                        summary.skipped_unmanaged,
+                        summary.failed
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[kanban] terminal managed worktree cleanup failed for {}: {}",
+                    card_id,
+                    error
+                );
+            }
+        }
+    }
 
     github_sync_on_transition_pg(pg_pool, &effective, card_id, new_status).await;
     fire_dynamic_hooks(

@@ -150,10 +150,18 @@ pub async fn clear_slot_threads_for_slot_pg(
     slot_index: i64,
 ) -> Result<usize, String> {
     let target = build_slot_clear_target_pg(pool, agent_id, slot_index).await?;
-    let cleared = clear_slot_sessions_pg(pool, &target.thread_channel_ids).await?;
+    let safe_to_clear_thread_ids =
+        filter_safe_slot_thread_reset_targets(pool, &target.thread_channel_ids).await?;
+    let cleared = clear_slot_sessions_pg(pool, &safe_to_clear_thread_ids).await?;
 
     if let Some(registry) = health_registry {
-        let runtime_targets = target.runtime_targets;
+        let safe_to_clear: std::collections::HashSet<u64> =
+            safe_to_clear_thread_ids.iter().copied().collect();
+        let runtime_targets = target
+            .runtime_targets
+            .into_iter()
+            .filter(|target| safe_to_clear.contains(&target.thread_channel_id))
+            .collect::<Vec<_>>();
         tokio::spawn(async move {
             for runtime_target in runtime_targets {
                 crate::services::discord::health::clear_provider_channel_runtime(
@@ -270,20 +278,31 @@ pub async fn reset_slot_thread_bindings_excluding_pg(
     }
 
     let target = build_slot_clear_target_pg(pool, agent_id, slot_index).await?;
-    let archived_threads = archive_slot_threads(&target.thread_channel_ids).await?;
-    let cleared_sessions = clear_slot_sessions_pg(pool, &target.thread_channel_ids).await?;
-    let cleared_bindings = sqlx::query(
-        "UPDATE auto_queue_slots
-         SET thread_id_map = '{}'::jsonb,
-             updated_at = NOW()
-         WHERE agent_id = $1 AND slot_index = $2",
-    )
-    .bind(agent_id)
-    .bind(slot_index)
-    .execute(pool)
-    .await
-    .map_err(|error| format!("clear postgres slot bindings for {agent_id}:{slot_index}: {error}"))?
-    .rows_affected() as usize;
+    let safe_to_clear_thread_ids =
+        filter_safe_slot_thread_reset_targets(pool, &target.thread_channel_ids).await?;
+    let archived_threads = archive_slot_threads(&safe_to_clear_thread_ids).await?;
+    let cleared_sessions = clear_slot_sessions_pg(pool, &safe_to_clear_thread_ids).await?;
+    let cleared_bindings = if safe_to_clear_thread_ids.len() == target.thread_channel_ids.len() {
+        sqlx::query(
+            "UPDATE auto_queue_slots
+             SET thread_id_map = '{}'::jsonb,
+                 updated_at = NOW()
+             WHERE agent_id = $1 AND slot_index = $2",
+        )
+        .bind(agent_id)
+        .bind(slot_index)
+        .execute(pool)
+        .await
+        .map_err(|error| {
+            format!("clear postgres slot bindings for {agent_id}:{slot_index}: {error}")
+        })?
+        .rows_affected() as usize
+    } else {
+        tracing::warn!(
+            "[auto-queue] preserving slot thread bindings for {agent_id}:{slot_index}: active thread archive was deferred"
+        );
+        0
+    };
 
     Ok((archived_threads, cleared_sessions, cleared_bindings))
 }
@@ -326,4 +345,29 @@ async fn archive_slot_threads(thread_channel_ids: &[u64]) -> Result<usize, Strin
     }
 
     Ok(archived)
+}
+
+async fn filter_safe_slot_thread_reset_targets(
+    pool: &PgPool,
+    thread_channel_ids: &[u64],
+) -> Result<Vec<u64>, String> {
+    let mut safe_to_reset = Vec::new();
+    for thread_channel_id in thread_channel_ids {
+        let thread_id = thread_channel_id.to_string();
+        match crate::services::discord::should_defer_thread_archive_pg(Some(pool), &thread_id).await
+        {
+            Ok(true) => {
+                tracing::warn!(
+                    "[auto-queue] skipping slot thread reset for {thread_channel_id}: active turn or fresh inflight still present"
+                );
+            }
+            Ok(false) => safe_to_reset.push(*thread_channel_id),
+            Err(err) => {
+                tracing::warn!(
+                    "[auto-queue] skipping slot thread reset for {thread_channel_id}: active-check failed: {err}"
+                );
+            }
+        }
+    }
+    Ok(safe_to_reset)
 }

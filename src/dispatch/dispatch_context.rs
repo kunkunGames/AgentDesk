@@ -417,11 +417,11 @@ pub(crate) fn inject_review_dispatch_identifiers_sqlite_test(
     match dispatch_type {
         "review" => {
             obj.entry("verdict_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-verdict"));
+                .or_insert_with(|| json!("POST /api/reviews/verdict"));
         }
         "review-decision" => {
             obj.entry("decision_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-decision"));
+                .or_insert_with(|| json!("POST /api/reviews/decision"));
         }
         _ => {}
     }
@@ -1778,6 +1778,36 @@ pub(crate) async fn resolve_card_worktree(
     )
 }
 
+pub(crate) async fn ensure_card_worktree(
+    pool: &PgPool,
+    card_id: &str,
+    context: Option<&serde_json::Value>,
+) -> Result<Option<(String, String, String, bool)>> {
+    let Some((issue_number, _repo_id)) = load_card_issue_repo_pg(pool, card_id).await else {
+        return Ok(None);
+    };
+    let Some(issue_number) = issue_number else {
+        return Ok(None);
+    };
+    let Some(repo_dir) =
+        resolve_card_repo_dir_with_context_pg(pool, card_id, context, "create worktree repo")
+            .await?
+    else {
+        return Ok(None);
+    };
+    let ensured =
+        crate::services::platform::shell::ensure_worktree_for_issue(&repo_dir, issue_number)
+            .map_err(|error| {
+                anyhow::anyhow!("Cannot create worktree for card {card_id}: {error}")
+            })?;
+    Ok(Some((
+        ensured.path,
+        ensured.branch,
+        ensured.commit,
+        ensured.created,
+    )))
+}
+
 /// PG-native variant of [`inject_review_dispatch_identifiers`].
 ///
 /// Mutates `obj` to add review-target identifiers (repo, issue/PR numbers,
@@ -1816,11 +1846,11 @@ pub(crate) async fn inject_review_dispatch_identifiers(
     match dispatch_type {
         "review" => {
             obj.entry("verdict_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-verdict"));
+                .or_insert_with(|| json!("POST /api/reviews/verdict"));
         }
         "review-decision" => {
             obj.entry("decision_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-decision"));
+                .or_insert_with(|| json!("POST /api/reviews/decision"));
         }
         _ => {}
     }
@@ -3002,7 +3032,7 @@ mod tests {
         assert_eq!(parsed["issue_number"], 692);
         assert_eq!(parsed["pr_number"], 901);
         assert_eq!(parsed["reviewed_commit"], reviewed_commit);
-        assert_eq!(parsed["verdict_endpoint"], "POST /api/review-verdict");
+        assert_eq!(parsed["verdict_endpoint"], "POST /api/reviews/verdict");
     }
 
     /// #800: Verify that a recorded `worktree_path` pointing at a now-missing
@@ -3603,7 +3633,7 @@ mod tests {
         );
         assert_eq!(
             obj.get("verdict_endpoint").and_then(|v| v.as_str()),
-            Some("POST /api/review-verdict")
+            Some("POST /api/reviews/verdict")
         );
 
         pool.close().await;
@@ -3632,7 +3662,7 @@ mod tests {
         assert!(obj.get("pr_number").is_none());
         assert_eq!(
             obj.get("decision_endpoint").and_then(|v| v.as_str()),
-            Some("POST /api/review-decision")
+            Some("POST /api/reviews/decision")
         );
 
         pool.close().await;

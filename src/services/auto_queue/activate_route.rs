@@ -1,6 +1,6 @@
 use super::*;
 
-/// POST /api/auto-queue/dispatch-next (formerly /api/auto-queue/activate, removed in #1064)
+/// POST /api/queue/dispatch-next (formerly /api/queue/activate, removed in #1064)
 /// Dispatches the next pending entry in the active run.
 pub async fn activate(
     State(state): State<AppState>,

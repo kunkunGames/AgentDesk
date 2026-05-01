@@ -1,6 +1,6 @@
 use super::*;
 
-/// POST /api/auto-queue/slots/{agent_id}/{slot_index}/rebind
+/// POST /api/queue/slots/{agent_id}/{slot_index}/rebind
 pub(super) async fn rebind_slot_with_pg(
     agent_id: &str,
     slot_index: i64,
@@ -213,7 +213,7 @@ pub async fn rebind_slot(
     rebind_slot_with_pg(&agent_id, slot_index, &body, &pg_pool).await
 }
 
-/// PATCH /api/auto-queue/entries/{id}/skip
+/// PATCH /api/queue/entries/{id}/skip
 pub(super) async fn skip_entry_with_pg(
     id: &str,
     pool: &sqlx::PgPool,

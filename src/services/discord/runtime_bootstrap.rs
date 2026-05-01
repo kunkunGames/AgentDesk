@@ -11,6 +11,8 @@ pub(crate) struct RunBotContext {
     pub(crate) api_port: u16,
     pub(crate) pg_pool: Option<sqlx::PgPool>,
     pub(crate) engine: Option<crate::engine::PolicyEngine>,
+    pub(crate) placeholder_live_events_enabled: bool,
+    pub(crate) status_panel_v2_enabled: bool,
 }
 
 const DISCORD_GATEWAY_LEASE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -58,6 +60,31 @@ fn restored_fast_mode_reset_channels(bot_settings: &DiscordBotSettings) -> Vec<C
         .collect();
     channels.sort_unstable_by_key(|channel_id| channel_id.get());
     channels.dedup_by_key(|channel_id| channel_id.get());
+    channels
+}
+
+fn restored_codex_goals_enabled_channels(bot_settings: &DiscordBotSettings) -> Vec<ChannelId> {
+    let mut channels: Vec<ChannelId> = bot_settings
+        .channel_codex_goals
+        .iter()
+        .filter_map(|(channel_id, enabled)| {
+            if !*enabled {
+                return None;
+            }
+            channel_id.parse::<u64>().ok().map(ChannelId::new)
+        })
+        .collect();
+    channels.sort_unstable_by_key(|channel_id| channel_id.get());
+    channels
+}
+
+fn restored_codex_goals_reset_channels(bot_settings: &DiscordBotSettings) -> Vec<ChannelId> {
+    let mut channels: Vec<ChannelId> = bot_settings
+        .channel_codex_goals_reset_pending
+        .iter()
+        .filter_map(|channel_id| channel_id.parse::<u64>().ok().map(ChannelId::new))
+        .collect();
+    channels.sort_unstable_by_key(|channel_id| channel_id.get());
     channels
 }
 
@@ -381,6 +408,7 @@ async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
     }
 
     let pg_pool = shared.pg_pool.as_ref();
+    clear_stale_session_dispatch_links(pg_pool).await;
 
     // Boot timestamp from dcserver.pid mtime — represents actual process start,
     // not a wall-clock offset that could mis-classify old pending dispatches.
@@ -534,6 +562,104 @@ async fn recover_orphan_pending_dispatches(shared: &Arc<SharedData>) {
     );
 }
 
+async fn clear_stale_session_dispatch_links(pg_pool: Option<&sqlx::PgPool>) {
+    let Some(pool) = pg_pool else {
+        return;
+    };
+
+    match sqlx::query(
+        "UPDATE sessions s
+            SET status = CASE
+                    WHEN s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working') THEN 'idle'
+                    ELSE s.status
+                END,
+                active_dispatch_id = NULL,
+                session_info = 'Cleared stale terminal dispatch link',
+                last_heartbeat = NOW()
+           FROM task_dispatches d
+          WHERE s.active_dispatch_id = d.id
+            AND d.status IN ('completed', 'failed', 'cancelled')
+      RETURNING s.session_key, d.id AS dispatch_id, d.status AS dispatch_status",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            if !rows.is_empty() {
+                let sample = rows
+                    .iter()
+                    .take(5)
+                    .filter_map(|row| {
+                        let session_key = row.try_get::<String, _>("session_key").ok()?;
+                        let dispatch_id = row.try_get::<String, _>("dispatch_id").ok()?;
+                        let dispatch_status = row.try_get::<String, _>("dispatch_status").ok()?;
+                        Some(format!("{session_key}:{dispatch_id}:{dispatch_status}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    cleared = rows.len(),
+                    sample = %sample,
+                    "cleared stale terminal active_dispatch_id links during startup recovery"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to clear stale terminal active_dispatch_id links during startup recovery"
+            );
+        }
+    }
+
+    match sqlx::query(
+        "WITH stale AS (
+             SELECT s.session_key
+               FROM sessions s
+              WHERE s.active_dispatch_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM task_dispatches d WHERE d.id = s.active_dispatch_id
+                )
+         )
+         UPDATE sessions s
+            SET status = CASE
+                    WHEN s.status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working') THEN 'idle'
+                    ELSE s.status
+                END,
+                active_dispatch_id = NULL,
+                session_info = 'Cleared missing dispatch link',
+                last_heartbeat = NOW()
+           FROM stale
+          WHERE s.session_key = stale.session_key
+      RETURNING s.session_key",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => {
+            if !rows.is_empty() {
+                let sample = rows
+                    .iter()
+                    .take(5)
+                    .filter_map(|row| row.try_get::<String, _>("session_key").ok())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::warn!(
+                    cleared = rows.len(),
+                    sample = %sample,
+                    "cleared missing active_dispatch_id links during startup recovery"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to clear missing active_dispatch_id links during startup recovery"
+            );
+        }
+    }
+}
+
 pub(super) fn discord_gateway_intents() -> serenity::GatewayIntents {
     serenity::GatewayIntents::GUILDS
         | serenity::GatewayIntents::GUILD_MESSAGES
@@ -644,6 +770,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         api_port,
         pg_pool,
         engine,
+        placeholder_live_events_enabled,
+        status_panel_v2_enabled,
     } = context;
 
     if let Some(bot_name) = should_skip_agent_runtime_launch(token) {
@@ -755,6 +883,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         restored_fast_mode_enabled_channels_for_provider(&bot_settings, &provider);
     let restored_fast_mode_reset_entries = restored_fast_mode_reset_entries(&bot_settings);
     let restored_fast_mode_reset_channels = restored_fast_mode_reset_channels(&bot_settings);
+    let restored_codex_goals_channels = restored_codex_goals_enabled_channels(&bot_settings);
+    let restored_codex_goals_reset_channels = restored_codex_goals_reset_channels(&bot_settings);
 
     let shared = Arc::new(SharedData {
         core: Mutex::new(CoreState {
@@ -773,6 +903,11 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         placeholder_controller: Arc::new(
             super::placeholder_controller::PlaceholderController::default(),
         ),
+        placeholder_live_events: Arc::new(
+            super::placeholder_live_events::PlaceholderLiveEvents::default(),
+        ),
+        placeholder_live_events_enabled,
+        status_panel_v2_enabled,
         queued_placeholders: dashmap::DashMap::new(),
         queue_exit_placeholder_clears: {
             let map = dashmap::DashMap::new();
@@ -825,6 +960,20 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
             }
             set
         },
+        codex_goals_channels: {
+            let set = dashmap::DashSet::new();
+            for channel_id in &restored_codex_goals_channels {
+                set.insert(*channel_id);
+            }
+            set
+        },
+        codex_goals_session_reset_pending: {
+            let set = dashmap::DashSet::new();
+            for channel_id in &restored_codex_goals_reset_channels {
+                set.insert(*channel_id);
+            }
+            set
+        },
         model_session_reset_pending: {
             let set = dashmap::DashSet::new();
             for (channel_id, _) in &restored_model_overrides {
@@ -838,6 +987,9 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 set.insert(*channel_id);
             }
             for channel_id in &restored_fast_mode_reset_channels {
+                set.insert(*channel_id);
+            }
+            for channel_id in &restored_codex_goals_reset_channels {
                 set.insert(*channel_id);
             }
             set
@@ -902,6 +1054,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         commands::cmd_metrics(),
         commands::cmd_model(),
         commands::cmd_fast(),
+        commands::cmd_goals(),
     ];
     slash_commands.extend([
         commands::cmd_queue(),
@@ -1832,6 +1985,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restored_codex_goals_channels_restore_runtime_settings() {
+        let mut settings = DiscordBotSettings::default();
+        settings.channel_codex_goals.insert("123".to_string(), true);
+        settings
+            .channel_codex_goals
+            .insert("456".to_string(), false);
+        settings
+            .channel_codex_goals_reset_pending
+            .insert("789".to_string());
+
+        assert_eq!(
+            restored_codex_goals_enabled_channels(&settings),
+            vec![ChannelId::new(123)]
+        );
+        assert_eq!(
+            restored_codex_goals_reset_channels(&settings),
+            vec![ChannelId::new(789)]
+        );
+    }
+
     /// codex review round-6 P2 (#1332): the queued-placeholder restore path
     /// must reject any persisted mapping whose `(channel_id, user_msg_id)`
     /// has no corresponding live queue entry by the time `kickoff_idle_queues`
@@ -2536,10 +2710,13 @@ mod tests {
     async fn postgres_discord_gateway_lease_allows_only_one_live_runtime_per_token_hash() {
         let test_db = PgTestDatabase::create().await;
         let config = pg_runtime_test_config(&test_db);
-        let pool = crate::db::postgres::connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool = crate::db::postgres::connect_test_pool_and_migrate_config(
+            &config,
+            "discord runtime bootstrap gateway singleton test pool",
+        )
+        .await
+        .expect("connect and migrate postgres")
+        .expect("postgres pool");
 
         let token_hash = "0123456789abcdef0123456789abcdef";
         let mut first = try_acquire_discord_gateway_lease(&pool, token_hash, &ProviderKind::Codex)
@@ -2575,10 +2752,13 @@ mod tests {
     async fn postgres_discord_gateway_lease_allows_parallel_runtimes_for_different_token_hashes() {
         let test_db = PgTestDatabase::create().await;
         let config = pg_runtime_test_config(&test_db);
-        let pool = crate::db::postgres::connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool = crate::db::postgres::connect_test_pool_and_migrate_config(
+            &config,
+            "discord runtime bootstrap gateway parallel test pool",
+        )
+        .await
+        .expect("connect and migrate postgres")
+        .expect("postgres pool");
 
         let first = try_acquire_discord_gateway_lease(
             &pool,
@@ -2614,14 +2794,20 @@ mod tests {
     async fn postgres_discord_gateway_lease_fails_over_across_separate_runtime_pools() {
         let test_db = PgTestDatabase::create().await;
         let config = pg_runtime_test_config(&test_db);
-        let pool_a = crate::db::postgres::connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres runtime pool A")
-            .expect("postgres runtime pool A");
-        let pool_b = crate::db::postgres::connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres runtime pool B")
-            .expect("postgres runtime pool B");
+        let pool_a = crate::db::postgres::connect_test_pool_and_migrate_config(
+            &config,
+            "discord runtime bootstrap gateway failover test pool A",
+        )
+        .await
+        .expect("connect and migrate postgres runtime pool A")
+        .expect("postgres runtime pool A");
+        let pool_b = crate::db::postgres::connect_test_pool_and_migrate_config(
+            &config,
+            "discord runtime bootstrap gateway failover test pool B",
+        )
+        .await
+        .expect("connect and migrate postgres runtime pool B")
+        .expect("postgres runtime pool B");
 
         let token_hash = "feedfacefeedfacefeedfacefeedface";
         let holder_a = try_acquire_discord_gateway_lease(&pool_a, token_hash, &ProviderKind::Codex)

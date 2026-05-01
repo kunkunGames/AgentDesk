@@ -21,10 +21,9 @@ title Auto-Queue Lifecycle — AgentDesk
 
 |Rust (API / DB)|
 start
-:POST /api/auto-queue/dispatch
-(or /generate + /activate);
+:POST /api/queue/generate;
 
-:Normalize dispatch groups
+:Normalize queue entries
   - Validate issue numbers
   - Resolve kanban cards
   - Apply agent assignments
@@ -58,8 +57,7 @@ end note
 ' 2. ACTIVATION (Run promotion + first dispatches)
 ' ============================================================
 
-:POST /api/auto-queue/dispatch-next
-(or auto-activate from /dispatch);
+:POST /api/queue/dispatch-next;
 
 if (Run status?) then (generated/pending)
   :Promote run -> **active**;

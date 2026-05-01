@@ -198,6 +198,15 @@ pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String
     upsert_kv_meta(pool, "server_port", &config.server.port.to_string()).await?;
     crate::services::settings::seed_runtime_config_defaults_pg(pool, config).await?;
     crate::server::routes::escalation::seed_escalation_defaults_pg(pool, config).await?;
+    let pipeline_path = config.policies.dir.join("default-pipeline.yaml");
+    crate::db::table_metadata::sync_pipeline_stages_from_yaml_pg(pool, &pipeline_path)
+        .await
+        .map_err(|error| {
+            format!(
+                "sync pipeline_stages from {}: {error}",
+                pipeline_path.display()
+            )
+        })?;
 
     for repo_id in normalized_repo_ids(&config.github.repos) {
         register_repo(pool, &repo_id).await?;
@@ -781,6 +790,43 @@ pub(crate) async fn connect_test_pool_and_migrate(
 }
 
 #[cfg(test)]
+pub(crate) async fn connect_test_pool_and_migrate_config(
+    config: &Config,
+    label: &str,
+) -> Result<Option<PgPool>, String> {
+    if !database_enabled(config) {
+        return Ok(None);
+    }
+
+    let mut options = PgConnectOptions::new()
+        .host(&config.database.host)
+        .port(config.database.port)
+        .username(&config.database.user)
+        .database(&config.database.dbname);
+    if let Some(password) = config.database.password.as_deref() {
+        options = options.password(password);
+    }
+
+    let pool = run_test_postgres_sqlx_op(
+        &format!("{label} connect postgres"),
+        PgPoolOptions::new()
+            .max_connections(config.database.pool_max.max(1))
+            .acquire_timeout(TEST_POSTGRES_OP_TIMEOUT)
+            .connect_with(options),
+    )
+    .await?;
+    tokio::time::timeout(TEST_POSTGRES_OP_TIMEOUT, migrate(&pool))
+        .await
+        .map_err(|_| {
+            format!(
+                "{label} migrate postgres timed out after {}s",
+                TEST_POSTGRES_OP_TIMEOUT.as_secs()
+            )
+        })??;
+    Ok(Some(pool))
+}
+
+#[cfg(test)]
 pub(crate) async fn drop_test_database(
     admin_url: &str,
     database_name: &str,
@@ -830,9 +876,9 @@ pub(crate) async fn close_test_pool(pool: PgPool, label: &str) -> Result<(), Str
 mod tests {
     use super::{
         AdvisoryLockLease, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, close_test_pool,
-        config_database_summary, connect_and_migrate, connect_options, create_test_database,
-        database_enabled, database_summary, health_check, run_test_postgres_sqlx_op_with_timeout,
-        startup_pool_settings, startup_reseed,
+        config_database_summary, connect_options, connect_test_pool_and_migrate_config,
+        create_test_database, database_enabled, database_summary, health_check,
+        run_test_postgres_sqlx_op_with_timeout, startup_pool_settings, startup_reseed,
     };
     use sqlx::Row;
     use std::time::Duration;
@@ -993,10 +1039,11 @@ mod tests {
         let test_db = TestDatabase::create().await;
         let config = postgres_test_config(&test_db);
 
-        let pool = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool =
+            connect_test_pool_and_migrate_config(&config, "db::postgres migration test pool")
+                .await
+                .expect("connect and migrate postgres")
+                .expect("postgres pool");
         startup_reseed(&pool, &config)
             .await
             .expect("startup reseed postgres");
@@ -1035,6 +1082,48 @@ mod tests {
             .await
             .expect("count github_repos");
         assert_eq!(repo_count, 1);
+
+        let pipeline_stage_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pipeline_stages WHERE repo_id = '__default__'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count default pipeline_stages");
+        assert!(
+            pipeline_stage_count >= 1,
+            "startup reseed must materialize default pipeline_stages from YAML"
+        );
+
+        let (first_stage, first_stage_order): (String, i64) = sqlx::query_as(
+            "SELECT stage_name, stage_order
+             FROM pipeline_stages
+             WHERE repo_id = '__default__'
+             ORDER BY stage_order
+             LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load first default pipeline stage");
+        assert_eq!(first_stage, "backlog");
+        assert_eq!(first_stage_order, 1);
+
+        let (source_of_truth, file_path, last_synced): (String, Option<String>, bool) =
+            sqlx::query_as(
+                "SELECT source_of_truth, file_path, last_synced_at IS NOT NULL AS last_synced
+                 FROM db_table_metadata
+                 WHERE table_name = 'pipeline_stages'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load pipeline_stages source metadata");
+        assert_eq!(source_of_truth, "file-canonical");
+        assert!(
+            file_path
+                .as_deref()
+                .is_some_and(|path| path.ends_with("default-pipeline.yaml")),
+            "pipeline_stages metadata should record the source YAML path"
+        );
+        assert!(last_synced, "startup reseed must stamp last_synced_at");
 
         let agent_row = sqlx::query(
             "SELECT id, provider, discord_channel_cdx
@@ -1084,10 +1173,11 @@ mod tests {
             avatar_emoji: Some("🛠️".to_string()),
         }];
 
-        let pool = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool =
+            connect_test_pool_and_migrate_config(&config, "db::postgres legacy reseed test pool")
+                .await
+                .expect("connect and migrate postgres")
+                .expect("postgres pool");
 
         sqlx::query(
             "INSERT INTO agents (
@@ -1230,10 +1320,13 @@ mod tests {
             },
         ];
 
-        let pool = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool = connect_test_pool_and_migrate_config(
+            &config,
+            "db::postgres configured legacy reseed test pool",
+        )
+        .await
+        .expect("connect and migrate postgres")
+        .expect("postgres pool");
 
         sqlx::query(
             "INSERT INTO agents (id, name, provider, status, xp)
@@ -1296,10 +1389,13 @@ mod tests {
         let test_db = TestDatabase::create().await;
         let config = postgres_test_config(&test_db);
 
-        let pool = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool = connect_test_pool_and_migrate_config(
+            &config,
+            "db::postgres advisory singleton test pool",
+        )
+        .await
+        .expect("connect and migrate postgres")
+        .expect("postgres pool");
 
         let mut first = AdvisoryLockLease::try_acquire(&pool, 91_001, "test advisory lock")
             .await
@@ -1335,10 +1431,13 @@ mod tests {
         let mut config = postgres_test_config(&test_db);
         config.database.pool_max = 1;
 
-        let pool = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres")
-            .expect("postgres pool");
+        let pool = connect_test_pool_and_migrate_config(
+            &config,
+            "db::postgres advisory pool exhaustion test pool",
+        )
+        .await
+        .expect("connect and migrate postgres")
+        .expect("postgres pool");
 
         let lease = AdvisoryLockLease::try_acquire(&pool, 91_003, "test advisory lock")
             .await
@@ -1361,14 +1460,16 @@ mod tests {
         let test_db = TestDatabase::create().await;
         let config = postgres_test_config(&test_db);
 
-        let pool_a = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres pool A")
-            .expect("postgres pool A");
-        let pool_b = connect_and_migrate(&config)
-            .await
-            .expect("connect and migrate postgres pool B")
-            .expect("postgres pool B");
+        let pool_a =
+            connect_test_pool_and_migrate_config(&config, "db::postgres advisory drop test pool A")
+                .await
+                .expect("connect and migrate postgres pool A")
+                .expect("postgres pool A");
+        let pool_b =
+            connect_test_pool_and_migrate_config(&config, "db::postgres advisory drop test pool B")
+                .await
+                .expect("connect and migrate postgres pool B")
+                .expect("postgres pool B");
 
         let holder_a = AdvisoryLockLease::try_acquire(&pool_a, 91_002, "test advisory lock")
             .await

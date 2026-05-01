@@ -142,6 +142,10 @@ pub(in crate::services::discord) fn native_fast_mode_supported(provider: &Provid
     matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
 }
 
+pub(in crate::services::discord) fn codex_goals_supported(provider: &ProviderKind) -> bool {
+    matches!(provider, ProviderKind::Codex)
+}
+
 pub(in crate::services::discord) async fn channel_fast_mode_setting(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
@@ -149,6 +153,17 @@ pub(in crate::services::discord) async fn channel_fast_mode_setting(
     let settings = shared.settings.read().await;
     settings
         .channel_fast_modes
+        .get(&channel_id.get().to_string())
+        .copied()
+}
+
+pub(in crate::services::discord) async fn channel_codex_goals_setting(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> Option<bool> {
+    let settings = shared.settings.read().await;
+    settings
+        .channel_codex_goals
         .get(&channel_id.get().to_string())
         .copied()
 }
@@ -267,6 +282,9 @@ pub(in crate::services::discord) fn sync_session_reset_pending(
     channel_id: serenity::ChannelId,
 ) {
     if any_fast_mode_reset_pending(shared, channel_id)
+        || shared
+            .codex_goals_session_reset_pending
+            .contains(&channel_id)
         || shared.model_session_reset_pending.contains(&channel_id)
     {
         shared.session_reset_pending.insert(channel_id);
@@ -409,6 +427,13 @@ pub(in crate::services::discord) fn channel_fast_mode_enabled(
     shared.fast_mode_channels.contains(&channel_id)
 }
 
+pub(in crate::services::discord) fn channel_codex_goals_enabled(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> bool {
+    shared.codex_goals_channels.contains(&channel_id)
+}
+
 pub(in crate::services::discord) async fn update_channel_fast_mode(
     shared: &Arc<SharedData>,
     token: &str,
@@ -449,6 +474,48 @@ pub(in crate::services::discord) async fn update_channel_fast_mode(
     shared
         .fast_mode_session_reset_pending
         .insert(fast_mode_reset_pending_key(channel_id, provider));
+    sync_session_reset_pending(shared, channel_id);
+    true
+}
+
+pub(in crate::services::discord) fn clear_codex_goals_reset_pending_for_channel(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+) -> bool {
+    shared
+        .codex_goals_session_reset_pending
+        .remove(&channel_id)
+        .is_some()
+}
+
+pub(in crate::services::discord) async fn update_channel_codex_goals(
+    shared: &Arc<SharedData>,
+    token: &str,
+    channel_id: serenity::ChannelId,
+    enabled: bool,
+) -> bool {
+    let current_enabled = channel_codex_goals_enabled(shared, channel_id);
+    if current_enabled == enabled {
+        return false;
+    }
+
+    if enabled {
+        shared.codex_goals_channels.insert(channel_id);
+    } else {
+        shared.codex_goals_channels.remove(&channel_id);
+    }
+
+    let channel_key = channel_id.get().to_string();
+    let mut settings = shared.settings.write().await;
+    settings
+        .channel_codex_goals
+        .insert(channel_key.clone(), enabled);
+    settings
+        .channel_codex_goals_reset_pending
+        .insert(channel_key);
+    save_bot_settings(token, &settings);
+
+    shared.codex_goals_session_reset_pending.insert(channel_id);
     sync_session_reset_pending(shared, channel_id);
     true
 }

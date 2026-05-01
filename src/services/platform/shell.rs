@@ -8,6 +8,7 @@ use std::process::{Command, Output};
 
 #[allow(unused_imports)]
 pub(crate) use crate::services::git::{
+    ManagedWorktreeCleanup, cleanup_managed_worktree, ensure_worktree_for_issue,
     find_latest_commit_for_issue, find_worktree_for_issue, git_best_commit_for_dispatch,
     git_branch_containing_commit, git_branch_name, git_dispatch_baseline_commit, git_head_commit,
     git_latest_commit_for_issue, git_mainline_commit_for_issue_since, git_mainline_head_commit,

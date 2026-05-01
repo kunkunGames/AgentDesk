@@ -3,7 +3,7 @@
 //! Computes 3 SLO metrics from `observability_events` over a sliding 5-minute
 //! window, persists the aggregates into `slo_aggregates`, and — when a
 //! threshold is crossed and the per-channel cooldown has elapsed — enqueues a
-//! Discord alert through `message_outbox` (delivered via `/api/send`).
+//! Discord alert through `message_outbox` (delivered via `/api/discord/send`).
 //!
 //! The 3 metrics (as defined in Epic #905):
 //!   * `TurnSuccessRate`      — successful turns / total attempts

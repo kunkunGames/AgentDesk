@@ -1,4 +1,5 @@
 mod adk_session;
+pub(crate) mod agent_handoff;
 pub(crate) mod agentdesk_config;
 mod commands;
 mod discord_io;
@@ -22,10 +23,13 @@ pub(crate) mod org_writer;
 pub(crate) mod outbound;
 mod placeholder_cleanup;
 mod placeholder_controller;
+mod placeholder_live_events;
 mod placeholder_sweeper;
 mod prompt_builder;
 mod queue_io;
 mod queued_placeholders_store;
+mod relay_health;
+mod relay_recovery;
 pub(crate) mod response_sanitizer;
 // #1074: landing zone for the future recovery-engine module split
 // (restart / runtime / manual_rebind). See `docs/recovery-paths.md`.
@@ -61,6 +65,8 @@ mod tmux_reaper;
 #[cfg(unix)]
 mod tmux_restart_handoff;
 mod turn_bridge;
+#[path = "watchers/lifecycle_decision.rs"]
+mod watcher_lifecycle_decision;
 
 pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use recovery_engine as recovery;
@@ -432,6 +438,118 @@ pub(crate) fn clear_inflight_by_tmux_name(provider: &ProviderKind, tmux_name: &s
 pub(crate) fn clear_inflight_state_for_channel(provider: &ProviderKind, channel_id: u64) {
     inflight::clear_inflight_state(provider, channel_id);
 }
+
+pub(crate) fn has_fresh_inflight_for_channel(channel_id: u64) -> bool {
+    let now_unix_secs = chrono::Local::now().timestamp();
+    [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::Gemini,
+        ProviderKind::OpenCode,
+        ProviderKind::Qwen,
+    ]
+    .iter()
+    .flat_map(load_inflight_states)
+    .any(|state| {
+        if state.rebind_origin || state.channel_id != channel_id {
+            return false;
+        }
+        if inflight::inflight_state_is_stale(
+            &state,
+            now_unix_secs,
+            inflight::INFLIGHT_STALENESS_THRESHOLD_SECS,
+        ) {
+            return false;
+        }
+        true
+    })
+}
+
+async fn has_active_session_for_thread_pg(
+    pg_pool: Option<&sqlx::PgPool>,
+    thread_id: &str,
+) -> Result<bool, String> {
+    let Some(pool) = pg_pool else {
+        return Ok(false);
+    };
+
+    let row = sqlx::query(
+        "SELECT 1
+         FROM sessions
+         WHERE thread_channel_id = $1
+           AND LOWER(COALESCE(status, '')) IN ('turn_active', 'working')
+           AND COALESCE(last_heartbeat, created_at) > NOW() - INTERVAL '10 minutes'
+         LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("load active session for thread {thread_id}: {error}"))?;
+
+    Ok(row.is_some())
+}
+
+pub(crate) async fn should_defer_thread_archive_pg(
+    pg_pool: Option<&sqlx::PgPool>,
+    thread_id: &str,
+) -> Result<bool, String> {
+    if let Ok(channel_id) = thread_id.parse::<u64>()
+        && has_fresh_inflight_for_channel(channel_id)
+    {
+        return Ok(true);
+    }
+
+    has_active_session_for_thread_pg(pg_pool, thread_id).await
+}
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+mod thread_archive_guard_tests {
+    use super::*;
+    use crate::services::provider::ProviderKind;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn thread_archive_guard_defers_for_fresh_inflight_without_db() {
+        let _guard = runtime_store::lock_test_env();
+        let root = TempDir::new().expect("temp root");
+        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", root.path()) };
+
+        let channel_id = 9_001_455;
+        let state = inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            123,
+            456,
+            789,
+            "active turn".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-codex-adk-cdx-t9001455".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        inflight::save_inflight_state(&state).expect("save inflight");
+
+        assert!(
+            should_defer_thread_archive_pg(None, &channel_id.to_string())
+                .await
+                .expect("archive guard")
+        );
+        assert!(
+            !should_defer_thread_archive_pg(None, "9001456")
+                .await
+                .expect("archive guard")
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+    }
+}
+
 /// Check if a deferred restart has been requested and no active or finalizing turns remain
 /// **across all providers**.
 ///
@@ -517,6 +635,10 @@ pub(super) struct DiscordBotSettings {
     pub(super) channel_fast_modes: std::collections::HashMap<String, bool>,
     /// channel_id (string) → pending native fast mode reset on the next turn
     pub(super) channel_fast_mode_reset_pending: std::collections::HashSet<String>,
+    /// channel_id (string) → Codex goals feature enabled
+    pub(super) channel_codex_goals: std::collections::HashMap<String, bool>,
+    /// channel_id (string) → pending Codex goals session reset on the next turn
+    pub(super) channel_codex_goals_reset_pending: std::collections::HashSet<String>,
     /// Discord user ID of the registered owner (must be configured explicitly)
     pub(super) owner_user_id: Option<u64>,
     /// Additional authorized user IDs (added by owner via /adduser)
@@ -541,6 +663,8 @@ impl Default for DiscordBotSettings {
             channel_model_overrides: std::collections::HashMap::new(),
             channel_fast_modes: std::collections::HashMap::new(),
             channel_fast_mode_reset_pending: std::collections::HashSet::new(),
+            channel_codex_goals: std::collections::HashMap::new(),
+            channel_codex_goals_reset_pending: std::collections::HashSet::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
             allow_all_users: false,
@@ -570,6 +694,50 @@ pub(super) struct TmuxWatcherHandle {
     /// Updated by the watcher task loop. If this stops moving while the registry
     /// still has a slot, the slot is stale and must not suppress a new watcher.
     pub(super) last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
+    /// #1452: turn-scoped finalization debt transferred from bridge to watcher.
+    ///
+    /// When the bridge unpauses a live tmux watcher to take over the
+    /// assistant relay it intentionally skips `mailbox_finish_turn` to
+    /// avoid racing with the still-running watcher turn. Without an
+    /// explicit handoff signal the watcher would also skip the
+    /// finalization (its existing `finish_mailbox_on_completion` gate is
+    /// reserved for inflight-restore semantics), leaving the channel
+    /// mailbox `cancel_token` permanently set and blocking subsequent
+    /// `try_start_turn` calls on brand-new turns.
+    ///
+    /// Protocol:
+    ///   * Bridge unpause: `store(true, Ordering::Release)` at the
+    ///     watcher-unpause site (`turn_bridge/mod.rs` `TmuxReady` branch).
+    ///     The store happens BEFORE `paused.store(false, ...)` so a fast
+    ///     watcher cannot reach its terminal swap before we publish —
+    ///     Codex P1 pointed out that storing later (at the delegation
+    ///     decision in `let has_queued_turns = ...`) is racy.
+    ///   * Bridge non-delegation: when the bridge ends up handling the
+    ///     turn itself, it must take the debt back atomically. It tracks
+    ///     a local `bridge_published_finalize_owed_for_this_turn` flag so
+    ///     it can tell apart "we published debt for this turn" from
+    ///     "we never published" — without this distinction, a paused
+    ///     watcher carried over from a prior turn would leave the
+    ///     handle's value unrelated to the current turn (Codex iter 3 P1).
+    ///     If the flag is set, the bridge runs
+    ///     `compare_exchange(true, false, AcqRel, Acquire)`:
+    ///       * `Ok` → bridge revoked unconsumed debt, runs its own
+    ///         `mailbox_finish_turn`.
+    ///       * `Err(false)` → watcher already swapped and finalized; the
+    ///         bridge MUST skip its own `mailbox_finish_turn` to avoid
+    ///         clearing a turn it no longer owns (Codex P2 from review
+    ///         iter 2).
+    ///     If the flag is NOT set (no `TmuxReady` reached, or watcher
+    ///     missing), the bridge always runs `mailbox_finish_turn`.
+    ///   * Watcher: `swap(false, Ordering::AcqRel)` in its turn-end
+    ///     branch. AcqRel guarantees:
+    ///       1. Acquire — every prior bridge write is observed before we
+    ///          decide to call `mailbox_finish_turn`.
+    ///       2. Release+single-consumer — a paused-survivor watcher
+    ///          cannot accidentally clear a future turn's freshly
+    ///          registered cancel token because the swap returns `false`
+    ///          for it.
+    pub(super) mailbox_finalize_owed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub(super) const TMUX_WATCHER_STALE_HEARTBEAT_MS: i64 = 60_000;
@@ -971,6 +1139,12 @@ pub(super) struct SharedData {
     /// instead of racing.
     pub(in crate::services::discord) placeholder_controller:
         Arc<placeholder_controller::PlaceholderController>,
+    /// Per-channel recent tool/system events rendered in Active placeholder
+    /// cards when `placeholder.live_events_enabled` is enabled.
+    pub(in crate::services::discord) placeholder_live_events:
+        Arc<placeholder_live_events::PlaceholderLiveEvents>,
+    pub(in crate::services::discord) placeholder_live_events_enabled: bool,
+    pub(in crate::services::discord) status_panel_v2_enabled: bool,
     /// #1332: per-channel mapping from a mailbox-queued user message id to the
     /// Discord placeholder message id displaying the `📬 메시지 대기 중` card.
     /// Populated when `mailbox_try_start_turn` reports the new message lost the
@@ -1063,6 +1237,10 @@ pub(super) struct SharedData {
     /// Provider-scoped pending native fast-mode resets, encoded as
     /// `provider:channel_id` strings for mixed-provider dispatch safety.
     pub(super) fast_mode_session_reset_pending: dashmap::DashSet<String>,
+    /// Per-channel Codex goals feature enablement.
+    pub(super) codex_goals_channels: dashmap::DashSet<ChannelId>,
+    /// Channels that must restart Codex before the next turn because goals changed.
+    pub(super) codex_goals_session_reset_pending: dashmap::DashSet<ChannelId>,
     /// Channels that must start a fresh provider session on the next turn
     /// because the effective model override changed.
     pub(super) model_session_reset_pending: dashmap::DashSet<ChannelId>,
@@ -1467,6 +1645,7 @@ pub(crate) mod test_harness_exports {
             last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
                 super::tmux_watcher_now_ms(),
             )),
+            mailbox_finalize_owed: Arc::new(AtomicBool::new(false)),
         };
         let inspector = WatcherHandleInspector {
             cancel,
@@ -1720,6 +1899,9 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         tmux_relay_coords: dashmap::DashMap::new(),
         placeholder_cleanup: Arc::new(placeholder_cleanup::PlaceholderCleanupRegistry::default()),
         placeholder_controller: Arc::new(placeholder_controller::PlaceholderController::default()),
+        placeholder_live_events: Arc::new(placeholder_live_events::PlaceholderLiveEvents::default()),
+        placeholder_live_events_enabled: false,
+        status_panel_v2_enabled: false,
         queued_placeholders: dashmap::DashMap::new(),
         queue_exit_placeholder_clears: dashmap::DashMap::new(),
         queued_placeholders_persist_locks: dashmap::DashMap::new(),
@@ -1743,6 +1925,8 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         model_overrides: dashmap::DashMap::new(),
         fast_mode_channels: dashmap::DashSet::new(),
         fast_mode_session_reset_pending: dashmap::DashSet::new(),
+        codex_goals_channels: dashmap::DashSet::new(),
+        codex_goals_session_reset_pending: dashmap::DashSet::new(),
         model_session_reset_pending: dashmap::DashSet::new(),
         session_reset_pending: dashmap::DashSet::new(),
         model_picker_pending: dashmap::DashMap::new(),
@@ -1923,6 +2107,49 @@ async fn mailbox_recovery_kickoff(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     result
+}
+
+fn ensure_cancel_token_bound_from_inflight_state(
+    provider: &ProviderKind,
+    state: &inflight::InflightTurnState,
+    cancel_token: &Arc<CancelToken>,
+    reason: &str,
+) -> bool {
+    let Some(tmux_session_name) = state.tmux_session_name.as_deref() else {
+        tracing::error!(
+            "cancel token rebind failed: provider={} channel_id={} reason={} error=inflight_missing_tmux_session",
+            provider.as_str(),
+            state.channel_id,
+            reason
+        );
+        return false;
+    };
+
+    turn_bridge::bind_cancel_token_tmux_runtime(provider, cancel_token, tmux_session_name, reason);
+    true
+}
+
+fn ensure_cancel_token_bound_from_inflight(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    cancel_token: &Arc<CancelToken>,
+    reason: &str,
+) -> bool {
+    if turn_bridge::cancel_token_has_tmux_session(cancel_token) {
+        return true;
+    }
+
+    let Some(state) = inflight::load_inflight_state(provider, channel_id.get()) else {
+        tracing::error!(
+            "cancel token rebind failed: provider={} channel_id={} reason={} error=inflight_not_found",
+            provider.as_str(),
+            channel_id.get(),
+            reason
+        );
+        return false;
+    };
+
+    ensure_cancel_token_bound_from_inflight_state(provider, &state, cancel_token, reason)
 }
 
 async fn mailbox_clear_recovery_marker(shared: &SharedData, channel_id: ChannelId) {
@@ -3787,7 +4014,7 @@ mod tests {
             agent_msg
         ));
         // Announce-bot allows arbitrary text by design (it backs dispatch
-        // wrappers, PM/escalation cards, and generic /api/send routing).
+        // wrappers, PM/escalation cards, and generic /api/discord/send routing).
         // Issue-announcement cards moved to notify-bot in the #1448
         // follow-up so they no longer reach this branch at all.
         assert!(is_allowed_turn_sender(

@@ -87,7 +87,7 @@ module.exports = function attachReviewAutoAccept(timeouts, helpers) {
               try {
                 var aggPort = agentdesk.config.get("server_port");
                 if (aggPort) {
-                  agentdesk.http.post("http://127.0.0.1:" + aggPort + "/api/review-tuning/aggregate", {});
+                  agentdesk.http.post("http://127.0.0.1:" + aggPort + "/api/reviews/tuning/aggregate", {});
                 }
               } catch (aggErr) {
                 agentdesk.log.warn("[review-tuning] aggregate trigger failed (non-fatal): " + aggErr);

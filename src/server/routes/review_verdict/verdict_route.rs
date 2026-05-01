@@ -205,7 +205,7 @@ pub struct SubmitVerdictBody {
     pub provider: Option<String>,
 }
 
-/// POST /api/review-verdict
+/// POST /api/reviews/verdict
 ///
 /// Accepts a review verdict and delegates processing to the policy engine
 /// via OnReviewVerdict hook. No hardcoded card state changes.
@@ -247,7 +247,7 @@ pub async fn submit_verdict(
     let effective_commit: Option<String> = {
         // A: Validate dispatch_type — only 'review' dispatches should go through the verdict API.
         //    implementation/rework dispatches have their own completion path (turn_bridge explicit completion),
-        //    review-decision dispatches should use /api/review-decision (accept/dispute/dismiss).
+        //    review-decision dispatches should use /api/reviews/decision (accept/dispute/dismiss).
         match dispatch
             .get("dispatch_type")
             .and_then(|value| value.as_str())

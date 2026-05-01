@@ -13,6 +13,8 @@ pub struct Config {
     pub shared_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_mcp_allowlist: Vec<String>,
     #[serde(default)]
     pub agents: Vec<AgentDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -25,10 +27,14 @@ pub struct Config {
     pub data: DataConfig,
     #[serde(default)]
     pub database: DatabaseConfig,
+    #[serde(default, skip_serializing_if = "ClusterConfig::is_default")]
+    pub cluster: ClusterConfig,
     #[serde(default, skip_serializing_if = "KanbanConfig::is_empty")]
     pub kanban: KanbanConfig,
     #[serde(default, skip_serializing_if = "ReviewConfig::is_empty")]
     pub review: ReviewConfig,
+    #[serde(default, skip_serializing_if = "PlaceholderConfig::is_default")]
+    pub placeholder: PlaceholderConfig,
     #[serde(default, skip_serializing_if = "RuntimeSettingsConfig::is_empty")]
     pub runtime: RuntimeSettingsConfig,
     #[serde(default, skip_serializing_if = "AutomationConfig::is_empty")]
@@ -641,6 +647,45 @@ pub struct DatabaseConfig {
     pub pool_max: u32,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClusterConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
+    #[serde(default = "default_cluster_role")]
+    pub role: String,
+    #[serde(default = "default_cluster_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+    #[serde(default = "default_cluster_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub capabilities: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            instance_id: None,
+            role: default_cluster_role(),
+            heartbeat_interval_secs: default_cluster_heartbeat_interval_secs(),
+            lease_ttl_secs: default_cluster_lease_ttl_secs(),
+            labels: Vec::new(),
+            capabilities: serde_json::Map::new(),
+        }
+    }
+}
+
+impl ClusterConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct KanbanConfig {
@@ -675,6 +720,30 @@ pub struct ReviewConfig {
 impl ReviewConfig {
     pub fn is_empty(&self) -> bool {
         self.enabled.is_none() && self.max_rounds.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PlaceholderConfig {
+    #[serde(default = "default_true")]
+    pub live_events_enabled: bool,
+    #[serde(default = "default_true")]
+    pub status_panel_v2_enabled: bool,
+}
+
+impl Default for PlaceholderConfig {
+    fn default() -> Self {
+        Self {
+            live_events_enabled: true,
+            status_panel_v2_enabled: true,
+        }
+    }
+}
+
+impl PlaceholderConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1090,6 +1159,15 @@ fn default_database_user() -> String {
 fn default_database_pool_max() -> u32 {
     12
 }
+fn default_cluster_role() -> String {
+    "auto".into()
+}
+fn default_cluster_heartbeat_interval_secs() -> u64 {
+    10
+}
+fn default_cluster_lease_ttl_secs() -> u64 {
+    30
+}
 fn default_memory_backend() -> String {
     "auto".into()
 }
@@ -1332,14 +1410,17 @@ impl Default for Config {
             discord: DiscordConfig::default(),
             shared_prompt: None,
             mcp_servers: std::collections::BTreeMap::new(),
+            review_mcp_allowlist: Vec::new(),
             agents: Vec::new(),
             meeting: None,
             github: GitHubConfig::default(),
             policies: PoliciesConfig::default(),
             data: DataConfig::default(),
             database: DatabaseConfig::default(),
+            cluster: ClusterConfig::default(),
             kanban: KanbanConfig::default(),
             review: ReviewConfig::default(),
+            placeholder: PlaceholderConfig::default(),
             runtime: RuntimeSettingsConfig::default(),
             automation: AutomationConfig::default(),
             routines: RoutinesConfig::default(),
@@ -1556,9 +1637,9 @@ mod tests {
         DEFAULT_MEMENTO_MCP_URL, DiscordBotAuthConfig, DiscordConfig, EscalationConfig,
         EscalationMode, EscalationScheduleConfig, FileMemoryConfig, KanbanConfig, McpMemoryConfig,
         McpServerAuthConfig, McpServerAuthType, McpServerConfig, MemoryConfig, OnboardingConfig,
-        ReviewConfig, RoutinesConfig, RuntimeSettingsConfig, is_valid_dispatch_profile,
-        load_from_path, normalize_cache_ttl_minutes, normalize_dispatch_profile,
-        resolve_graceful_config_path, runtime_root, save_to_path,
+        PlaceholderConfig, ReviewConfig, RoutinesConfig, RuntimeSettingsConfig,
+        is_valid_dispatch_profile, load_from_path, normalize_cache_ttl_minutes,
+        normalize_dispatch_profile, resolve_graceful_config_path, runtime_root, save_to_path,
     };
     use std::path::PathBuf;
     use std::sync::MutexGuard;
@@ -1725,6 +1806,47 @@ mod tests {
             !yaml.contains("routines:"),
             "default routines config must be omitted, got: {yaml}"
         );
+    }
+
+    #[test]
+    fn placeholder_config_defaults_enabled_and_omitted_from_yaml() {
+        let config = Config::default();
+
+        assert_eq!(
+            config.placeholder,
+            PlaceholderConfig {
+                live_events_enabled: true,
+                status_panel_v2_enabled: true,
+            }
+        );
+        assert!(config.placeholder.is_default());
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !yaml.contains("placeholder:"),
+            "default placeholder config must be omitted, got: {yaml}"
+        );
+
+        let parsed: Config = serde_yaml::from_str("server: {}\n").unwrap();
+        assert!(parsed.placeholder.live_events_enabled);
+        assert!(parsed.placeholder.status_panel_v2_enabled);
+    }
+
+    #[test]
+    fn placeholder_config_preserves_explicit_disabled_yaml() {
+        let config = Config {
+            placeholder: PlaceholderConfig {
+                live_events_enabled: false,
+                status_panel_v2_enabled: false,
+            },
+            ..Config::default()
+        };
+
+        assert!(!config.placeholder.is_default());
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("placeholder:"));
+        assert!(yaml.contains("live_events_enabled: false"));
+        assert!(yaml.contains("status_panel_v2_enabled: false"));
     }
 
     #[test]

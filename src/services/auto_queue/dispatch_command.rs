@@ -864,7 +864,7 @@ pub(super) fn reorder_entry_ids(
     agent_id: Option<&str>,
 ) -> Result<Vec<String>, String> {
     if ordered_ids.is_empty() {
-        return Err("orderedIds cannot be empty".to_string());
+        return Err("ordered_ids cannot be empty".to_string());
     }
 
     let scope_ids: Vec<String> = entries
@@ -891,7 +891,7 @@ pub(super) fn reorder_entry_ids(
         }
     }
     if replacement_ids.is_empty() {
-        return Err("orderedIds do not match any pending entries in scope".to_string());
+        return Err("ordered_ids do not match any pending entries in scope".to_string());
     }
 
     for id in &scope_ids {

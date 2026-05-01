@@ -11,6 +11,7 @@ use crate::services::tmux_common::RotatingJsonlWriter;
 use crate::services::tmux_wrapper::{InputMode, render_for_terminal};
 
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
+const DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_SECS: u64 = 120;
 
 pub fn run(
     output_file: &str,
@@ -22,6 +23,7 @@ pub fn run(
     reasoning_effort: Option<&str>,
     resume_session_id: Option<&str>,
     fast_mode_enabled: Option<bool>,
+    goals_enabled: Option<bool>,
     input_mode: InputMode,
     compact_token_limit: Option<u64>,
 ) {
@@ -146,6 +148,7 @@ pub fn run(
         &prompt,
         &mut thread_id,
         fast_mode_enabled,
+        goals_enabled,
         compact_token_limit,
     ) {
         emit_result_error(&mut output, &err);
@@ -167,6 +170,7 @@ pub fn run(
             next_prompt.trim(),
             &mut thread_id,
             fast_mode_enabled,
+            goals_enabled,
             compact_token_limit,
         ) {
             emit_result_error(&mut output, &err);
@@ -210,6 +214,15 @@ fn decode_external_prompt(line: &str) -> Result<String, String> {
     Ok(line.to_string())
 }
 
+fn codex_first_event_timeout() -> std::time::Duration {
+    let seconds = std::env::var("AGENTDESK_CODEX_FIRST_EVENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_SECS);
+    std::time::Duration::from_secs(seconds)
+}
+
 fn cleanup(output_file: &str, input_fifo: &str) {
     let _ = std::fs::remove_file(output_file);
     let _ = std::fs::remove_file(input_fifo);
@@ -224,6 +237,7 @@ fn run_turn(
     prompt: &str,
     thread_id: &mut Option<String>,
     fast_mode_enabled: Option<bool>,
+    goals_enabled: Option<bool>,
     compact_token_limit: Option<u64>,
 ) -> Result<(), String> {
     emit_status("[sending...]");
@@ -250,6 +264,14 @@ fn run_turn(
             "--disable".to_string()
         });
         args.push("fast_mode".to_string());
+    }
+    if let Some(enabled) = goals_enabled {
+        args.push(if enabled {
+            "--enable".to_string()
+        } else {
+            "--disable".to_string()
+        });
+        args.push("goals".to_string());
     }
     args.push("exec".to_string());
     if let Some(existing_thread_id) = thread_id.as_deref() {
@@ -280,20 +302,65 @@ fn run_turn(
         .stdout
         .take()
         .ok_or_else(|| "Failed to capture Codex stdout".to_string())?;
-    let mut reader = BufReader::new(stdout);
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Result<Option<String>, String>>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = stdout_tx.send(Ok(None));
+                    break;
+                }
+                Ok(_) => {
+                    if stdout_tx.send(Ok(Some(line))).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = stdout_tx.send(Err(format!("Failed to read Codex output: {err}")));
+                    break;
+                }
+            }
+        }
+    });
+
     let mut stdout_line = String::new();
     let mut final_text = String::new();
     let start = std::time::Instant::now();
     let mut saw_turn_completed = false;
+    let mut saw_any_stdout = false;
+    let first_event_timeout = codex_first_event_timeout();
 
     loop {
-        stdout_line.clear();
-        let read = reader
-            .read_line(&mut stdout_line)
-            .map_err(|e| format!("Failed to read Codex output: {}", e))?;
-        if read == 0 {
+        let next_line = if saw_any_stdout {
+            stdout_rx
+                .recv()
+                .map_err(|_| "Codex stdout reader disconnected".to_string())?
+        } else {
+            match stdout_rx.recv_timeout(first_event_timeout) {
+                Ok(line) => line,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    crate::services::process::kill_pid_tree(child_pid);
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Codex produced no JSON event within {}s after sending prompt",
+                        first_event_timeout.as_secs()
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Codex stdout reader disconnected".to_string());
+                }
+            }
+        };
+
+        let Some(line) = next_line? else {
             break;
-        }
+        };
+
+        saw_any_stdout = true;
+        stdout_line.clear();
+        stdout_line.push_str(&line);
 
         let trimmed = stdout_line.trim();
         if trimmed.is_empty() {
