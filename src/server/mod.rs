@@ -3254,3 +3254,117 @@ async fn dm_reply_retry_loop(pg_pool: Arc<PgPool>) {
         crate::services::discord::retry_failed_dm_notifications(None, Some(pg_pool.as_ref())).await;
     }
 }
+
+async fn routine_runtime_loop(
+    pg_pool: Arc<PgPool>,
+    health_registry: Option<Arc<HealthRegistry>>,
+    routines_config: crate::config::RoutinesConfig,
+    routine_health_target: Option<String>,
+    tick_interval_secs: u64,
+) {
+    use crate::services::routines::{
+        RoutineAction, RoutineAgentExecutor, RoutineDiscordLogger, RoutineScriptLoader,
+        RoutineStore, poll_agent_turns, run_due_tick,
+    };
+    let Some(tick_interval_secs) = std::num::NonZeroU64::new(tick_interval_secs) else {
+        tracing::warn!("routine runtime not started: tick_interval_secs must be greater than zero");
+        return;
+    };
+
+    let _routine_action_validator: fn(serde_json::Value) -> anyhow::Result<RoutineAction> =
+        crate::services::routines::validate_routine_action;
+
+    let script_loader = match RoutineScriptLoader::new() {
+        Ok(loader) => loader,
+        Err(e) => {
+            tracing::warn!(error = %e, "routine runtime not started: script loader init failed");
+            return;
+        }
+    };
+    let routine_script_dirs = routines_config.script_dirs();
+    match script_loader.load_dirs(&routine_script_dirs) {
+        Ok(count) => tracing::info!(count, "routine script registry initialized"),
+        Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
+    }
+
+    let store =
+        RoutineStore::new_with_timezone(pg_pool.clone(), routines_config.default_timezone.clone());
+    let discord_logger = RoutineDiscordLogger::new_with_health_registry(
+        pg_pool.clone(),
+        health_registry.clone(),
+        routine_health_target,
+    );
+    let agent_executor =
+        RoutineAgentExecutor::new(pg_pool, health_registry, routines_config.agent_timeout_secs);
+    match store.recover_stale_running_runs().await {
+        Ok(recovered) if !recovered.is_empty() => {
+            for run in &recovered {
+                discord_logger.log_recovery(&store, run).await;
+            }
+            tracing::info!(
+                recovered = recovered.len(),
+                "routine boot recovery: stale runs marked interrupted"
+            )
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "routine boot recovery failed"),
+    }
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs.get()));
+    loop {
+        interval.tick().await;
+        match store.recover_stale_running_runs().await {
+            Ok(recovered) if !recovered.is_empty() => {
+                for run in &recovered {
+                    discord_logger.log_recovery(&store, run).await;
+                }
+                tracing::info!(
+                    recovered = recovered.len(),
+                    "routine periodic recovery: expired-lease runs marked interrupted"
+                )
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
+        }
+        if routines_config.hot_reload {
+            match script_loader.load_dirs(&routine_script_dirs) {
+                Ok(count) if count > 0 => {
+                    tracing::debug!(count, "routine script registry hot-reload pass complete")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
+            }
+        }
+        match poll_agent_turns(
+            &store,
+            &agent_executor,
+            routines_config.max_agent_polls_per_tick,
+        )
+        .await
+        {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                for outcome in &outcomes {
+                    discord_logger.log_run_outcome(&store, outcome).await;
+                }
+                tracing::info!(count = outcomes.len(), "routine agent turns completed")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "routine agent turn polling failed"),
+        }
+        match run_due_tick(
+            &store,
+            &script_loader,
+            Some(&agent_executor),
+            Some(&discord_logger),
+            routines_config.max_due_per_tick,
+        )
+        .await
+        {
+            Ok(outcomes) if !outcomes.is_empty() => {
+                tracing::info!(count = outcomes.len(), "routine due tick executed")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "routine due tick failed"),
+        }
+    }
+}

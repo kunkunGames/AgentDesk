@@ -450,6 +450,7 @@ pub(crate) async fn cmd_docs(category: Option<&str>, flat: bool) -> Result<(), S
     } else {
         let query = crate::server::routes::docs::ApiDocsQuery {
             format: flat.then(|| "flat".to_string()),
+            category: None,
         };
         let (status, body) = crate::server::routes::docs::api_docs(Query(query)).await;
         route_json(status, body)?

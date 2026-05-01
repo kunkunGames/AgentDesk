@@ -7458,6 +7458,91 @@ async fn api_docs_group_category_kanban_reviews_returns_endpoints() {
     );
 }
 
+#[tokio::test]
+async fn api_docs_group_category_automation_routines_returns_session_controls() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/automation/routines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["group"], "automation");
+    assert_eq!(json["category"], "routines");
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("automation/routines response must include endpoints array");
+    assert!(
+        endpoints
+            .iter()
+            .any(|ep| ep["path"] == "/api/routines/metrics"),
+        "automation/routines must include routine metrics"
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|ep| ep["path"] == "/api/routines/runs/search"),
+        "automation/routines must include routine run result search"
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|ep| ep["path"] == "/api/routines/{id}/session/reset"),
+        "automation/routines must include routine session reset"
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|ep| ep["path"] == "/api/routines/{id}/session/kill"),
+        "automation/routines must include routine session kill"
+    );
+}
+
+#[tokio::test]
+async fn api_docs_query_category_routines_returns_only_routine_endpoints() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs?category=routines")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["group"], "automation");
+    assert_eq!(json["category"], "routines");
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("category query response must include endpoint array");
+    assert!(endpoints.iter().any(|ep| ep["path"] == "/api/routines"));
+    assert!(
+        endpoints.iter().all(|ep| ep["category"] == "routines"),
+        "category=routines must not include queue/cron endpoints"
+    );
+}
+
 /// #1063: unknown group → 404.
 #[tokio::test]
 async fn api_docs_unknown_group_returns_not_found() {

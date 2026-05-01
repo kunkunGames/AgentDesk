@@ -1873,6 +1873,55 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routines_migrations_include_revision_columns_and_indexes() {
+        let pg_db = IntegrationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
+
+        let routines_table: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('public.routines')::text")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let routine_runs_table: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('public.routine_runs')::text")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(routines_table.as_deref(), Some("routines"));
+        assert_eq!(routine_runs_table.as_deref(), Some("routine_runs"));
+
+        let revision_columns: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::BIGINT
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'routines'
+              AND column_name IN ('discord_thread_id', 'timeout_secs')
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(revision_columns, 2);
+
+        for index_name in [
+            "idx_routines_due_scan",
+            "idx_routine_runs_running_lease",
+            "idx_routine_runs_running_agent",
+            "idx_routines_discord_thread_id",
+        ] {
+            let index_exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+                .bind(format!("public.{index_name}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(index_exists.as_deref(), Some(index_name));
+        }
+
+        pg_db.drop().await;
+    }
+
     // ── Scenario 1: Implementation idle does not complete (#115) ────
 
     #[tokio::test]
