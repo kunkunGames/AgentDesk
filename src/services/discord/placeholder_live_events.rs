@@ -9,6 +9,7 @@ use crate::services::agent_protocol::{StatusEvent, StatusTodoItem, StatusTodoSta
 use crate::services::provider::ProviderKind;
 
 const CHANNEL_EVENT_CAPACITY: usize = 20;
+const EVENT_RENDER_LIMIT: usize = 5;
 const EVENT_LINE_MAX_CHARS: usize = 100;
 const EVENT_BLOCK_MAX_CHARS: usize = 1500;
 const STATUS_PANEL_MAX_CHARS: usize = 4096;
@@ -845,7 +846,11 @@ fn render_events<'a>(
     let mut lines = Vec::new();
     let mut used = 0usize;
     let inner_limit = EVENT_BLOCK_MAX_CHARS.saturating_sub("```text\n\n```".len());
-    for line in events.rev().map(RecentPlaceholderEvent::render_line) {
+    for line in events
+        .rev()
+        .take(EVENT_RENDER_LIMIT)
+        .map(RecentPlaceholderEvent::render_line)
+    {
         let line_len = line.chars().count();
         let extra_newline = usize::from(!lines.is_empty());
         if used + extra_newline + line_len > inner_limit {
@@ -955,7 +960,12 @@ mod tests {
         let block = events.render_block(channel_id).unwrap();
         assert!(block.starts_with("```text\n"));
         assert!(block.chars().count() <= EVENT_BLOCK_MAX_CHARS);
-        assert!(!block.contains("echo 0"));
+        let live_lines = block
+            .lines()
+            .filter(|line| line.starts_with("[Bash]"))
+            .collect::<Vec<_>>();
+        assert_eq!(live_lines.len(), EVENT_RENDER_LIMIT);
+        assert!(!block.contains("echo 19"));
         assert!(block.contains("echo 24"));
     }
 

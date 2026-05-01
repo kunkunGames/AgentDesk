@@ -33,7 +33,7 @@ pub struct Config {
     pub kanban: KanbanConfig,
     #[serde(default, skip_serializing_if = "ReviewConfig::is_empty")]
     pub review: ReviewConfig,
-    #[serde(default, skip_serializing_if = "PlaceholderConfig::is_empty")]
+    #[serde(default, skip_serializing_if = "PlaceholderConfig::is_default")]
     pub placeholder: PlaceholderConfig,
     #[serde(default, skip_serializing_if = "RuntimeSettingsConfig::is_empty")]
     pub runtime: RuntimeSettingsConfig,
@@ -723,18 +723,27 @@ impl ReviewConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct PlaceholderConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub live_events_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub status_panel_v2_enabled: bool,
 }
 
+impl Default for PlaceholderConfig {
+    fn default() -> Self {
+        Self {
+            live_events_enabled: true,
+            status_panel_v2_enabled: true,
+        }
+    }
+}
+
 impl PlaceholderConfig {
-    pub fn is_empty(&self) -> bool {
-        !self.live_events_enabled && !self.status_panel_v2_enabled
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1628,9 +1637,9 @@ mod tests {
         DEFAULT_MEMENTO_MCP_URL, DiscordBotAuthConfig, DiscordConfig, EscalationConfig,
         EscalationMode, EscalationScheduleConfig, FileMemoryConfig, KanbanConfig, McpMemoryConfig,
         McpServerAuthConfig, McpServerAuthType, McpServerConfig, MemoryConfig, OnboardingConfig,
-        ReviewConfig, RoutinesConfig, RuntimeSettingsConfig, is_valid_dispatch_profile,
-        load_from_path, normalize_cache_ttl_minutes, normalize_dispatch_profile,
-        resolve_graceful_config_path, runtime_root, save_to_path,
+        PlaceholderConfig, ReviewConfig, RoutinesConfig, RuntimeSettingsConfig,
+        is_valid_dispatch_profile, load_from_path, normalize_cache_ttl_minutes,
+        normalize_dispatch_profile, resolve_graceful_config_path, runtime_root, save_to_path,
     };
     use std::path::PathBuf;
     use std::sync::MutexGuard;
@@ -1797,6 +1806,47 @@ mod tests {
             !yaml.contains("routines:"),
             "default routines config must be omitted, got: {yaml}"
         );
+    }
+
+    #[test]
+    fn placeholder_config_defaults_enabled_and_omitted_from_yaml() {
+        let config = Config::default();
+
+        assert_eq!(
+            config.placeholder,
+            PlaceholderConfig {
+                live_events_enabled: true,
+                status_panel_v2_enabled: true,
+            }
+        );
+        assert!(config.placeholder.is_default());
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(
+            !yaml.contains("placeholder:"),
+            "default placeholder config must be omitted, got: {yaml}"
+        );
+
+        let parsed: Config = serde_yaml::from_str("server: {}\n").unwrap();
+        assert!(parsed.placeholder.live_events_enabled);
+        assert!(parsed.placeholder.status_panel_v2_enabled);
+    }
+
+    #[test]
+    fn placeholder_config_preserves_explicit_disabled_yaml() {
+        let config = Config {
+            placeholder: PlaceholderConfig {
+                live_events_enabled: false,
+                status_panel_v2_enabled: false,
+            },
+            ..Config::default()
+        };
+
+        assert!(!config.placeholder.is_default());
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("placeholder:"));
+        assert!(yaml.contains("live_events_enabled: false"));
+        assert!(yaml.contains("status_panel_v2_enabled: false"));
     }
 
     #[test]
