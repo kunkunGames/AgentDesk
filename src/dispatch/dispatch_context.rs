@@ -417,11 +417,11 @@ pub(crate) fn inject_review_dispatch_identifiers_sqlite_test(
     match dispatch_type {
         "review" => {
             obj.entry("verdict_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-verdict"));
+                .or_insert_with(|| json!("POST /api/reviews/verdict"));
         }
         "review-decision" => {
             obj.entry("decision_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-decision"));
+                .or_insert_with(|| json!("POST /api/reviews/decision"));
         }
         _ => {}
     }
@@ -1846,11 +1846,11 @@ pub(crate) async fn inject_review_dispatch_identifiers(
     match dispatch_type {
         "review" => {
             obj.entry("verdict_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-verdict"));
+                .or_insert_with(|| json!("POST /api/reviews/verdict"));
         }
         "review-decision" => {
             obj.entry("decision_endpoint".to_string())
-                .or_insert_with(|| json!("POST /api/review-decision"));
+                .or_insert_with(|| json!("POST /api/reviews/decision"));
         }
         _ => {}
     }
@@ -3032,7 +3032,7 @@ mod tests {
         assert_eq!(parsed["issue_number"], 692);
         assert_eq!(parsed["pr_number"], 901);
         assert_eq!(parsed["reviewed_commit"], reviewed_commit);
-        assert_eq!(parsed["verdict_endpoint"], "POST /api/review-verdict");
+        assert_eq!(parsed["verdict_endpoint"], "POST /api/reviews/verdict");
     }
 
     /// #800: Verify that a recorded `worktree_path` pointing at a now-missing
@@ -3633,7 +3633,7 @@ mod tests {
         );
         assert_eq!(
             obj.get("verdict_endpoint").and_then(|v| v.as_str()),
-            Some("POST /api/review-verdict")
+            Some("POST /api/reviews/verdict")
         );
 
         pool.close().await;
@@ -3662,7 +3662,7 @@ mod tests {
         assert!(obj.get("pr_number").is_none());
         assert_eq!(
             obj.get("decision_endpoint").and_then(|v| v.as_str()),
-            Some("POST /api/review-decision")
+            Some("POST /api/reviews/decision")
         );
 
         pool.close().await;

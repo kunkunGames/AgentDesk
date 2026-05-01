@@ -12,9 +12,9 @@ title Auto-Queue — 생성 & 슬롯 할당
 |#LightBlue|Rust (API / DB)|
 
 start
-:POST /api/auto-queue/dispatch;
+:POST /api/queue/generate;
 
-:Normalize dispatch groups
+:Normalize queue entries
   - Validate issue numbers
   - Resolve kanban cards
   - Apply agent assignments;
@@ -40,7 +40,7 @@ note right
   dispatched -> pending (recovery)
 end note
 
-:POST /activate;
+:POST /api/queue/dispatch-next;
 
 if (Run status?) then (generated)
   :Promote run -> **active**;

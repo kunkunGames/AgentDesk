@@ -1,15 +1,12 @@
 use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
+    Router,
     routing::{delete, get, patch, post},
 };
-use serde_json::Value;
 
 use super::super::{
     ApiRouter, AppState, auto_queue, cron_api, dispatched_sessions, dispatches, docs, health_api,
-    hooks, log_deprecated_alias, maintenance, messages, pipeline, protected_api_domain,
-    provider_cli_api, queue_api, skills_api, termination_events,
+    hooks, maintenance, messages, pipeline, protected_api_domain, provider_cli_api, queue_api,
+    skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -139,75 +136,30 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/skills/prune", post(skills_api::prune))
             .route("/cron-jobs", get(cron_api::list_cron_jobs))
             .route("/maintenance/jobs", get(maintenance::list_jobs))
-            // Canonical queue routes (#1065): /api/queue/*
-            // Legacy /api/auto-queue/* still mounted (same handlers) for backward compat.
             .route("/queue/generate", post(auto_queue::generate))
-            .route("/auto-queue/generate", post(auto_queue::generate))
-            // #1064: /auto-queue/dispatch is deprecated; prefer /generate + /dispatch-next.
-            // Kept as a functional deprecated alias (logs warning) for CLI callers
-            // that still send the legacy `groups` body shape. TODO(#1064): remove
-            // after migrating src/cli/client.rs::cmd_dispatch to /generate.
-            // #1065: canonical /queue/dispatch routes straight through to the real handler.
-            .route("/queue/dispatch", post(auto_queue::dispatch))
-            .route("/auto-queue/dispatch", post(deprecated_auto_queue_dispatch))
             .route("/queue/dispatch-next", post(auto_queue::activate))
-            .route("/auto-queue/dispatch-next", post(auto_queue::activate))
             .route("/queue/status", get(auto_queue::status))
-            .route("/auto-queue/status", get(auto_queue::status))
             .route("/queue/history", get(auto_queue::history))
-            .route("/auto-queue/history", get(auto_queue::history))
             .route("/queue/entries/{id}", patch(auto_queue::update_entry))
-            .route("/auto-queue/entries/{id}", patch(auto_queue::update_entry))
             .route("/queue/runs/{id}/restore", post(auto_queue::restore_run))
-            .route(
-                "/auto-queue/runs/{id}/restore",
-                post(auto_queue::restore_run),
-            )
             .route("/queue/runs/{id}/entries", post(auto_queue::add_run_entry))
-            .route(
-                "/auto-queue/runs/{id}/entries",
-                post(auto_queue::add_run_entry),
-            )
             .route("/queue/entries/{id}/skip", patch(auto_queue::skip_entry))
-            .route(
-                "/auto-queue/entries/{id}/skip",
-                patch(auto_queue::skip_entry),
-            )
             .route("/queue/runs/{id}", patch(auto_queue::update_run))
-            .route("/auto-queue/runs/{id}", patch(auto_queue::update_run))
             .route("/queue/reorder", patch(auto_queue::reorder))
-            .route("/auto-queue/reorder", patch(auto_queue::reorder))
             .route(
                 "/queue/slots/{agent_id}/{slot_index}/rebind",
-                post(auto_queue::rebind_slot),
-            )
-            .route(
-                "/auto-queue/slots/{agent_id}/{slot_index}/rebind",
                 post(auto_queue::rebind_slot),
             )
             .route(
                 "/queue/slots/{agent_id}/{slot_index}/reset-thread",
                 post(auto_queue::reset_slot_thread),
             )
-            .route(
-                "/auto-queue/slots/{agent_id}/{slot_index}/reset-thread",
-                post(auto_queue::reset_slot_thread),
-            )
             .route("/queue/reset", post(auto_queue::reset))
-            .route("/auto-queue/reset", post(auto_queue::reset))
             .route("/queue/reset-global", post(auto_queue::reset_global))
-            .route("/auto-queue/reset-global", post(auto_queue::reset_global))
             .route("/queue/pause", post(auto_queue::pause))
-            .route("/auto-queue/pause", post(auto_queue::pause))
             .route("/queue/resume", post(auto_queue::resume_run))
-            .route("/auto-queue/resume", post(auto_queue::resume_run))
             .route("/queue/cancel", post(auto_queue::cancel))
-            .route("/auto-queue/cancel", post(auto_queue::cancel))
             .route("/queue/runs/{id}/order", post(auto_queue::submit_order))
-            .route(
-                "/auto-queue/runs/{id}/order",
-                post(auto_queue::submit_order),
-            )
             .route("/channels/{id}/queue", get(queue_api::list_channel_queue))
             .route(
                 "/channels/{id}/watcher-state",
@@ -248,17 +200,4 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             ),
         state,
     )
-}
-
-/// #1064: Deprecated alias for /api/auto-queue/generate (+ /dispatch-next when
-/// the caller set `activate=true`). Kept functional until CLI callers migrate.
-async fn deprecated_auto_queue_dispatch(
-    State(state): State<AppState>,
-    Json(body): Json<auto_queue::DispatchBody>,
-) -> (StatusCode, Json<Value>) {
-    log_deprecated_alias(
-        "/api/auto-queue/dispatch",
-        "/api/auto-queue/generate (+ /api/auto-queue/dispatch-next)",
-    );
-    auto_queue::dispatch(State(state), Json(body)).await
 }

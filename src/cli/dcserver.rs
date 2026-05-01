@@ -1299,7 +1299,7 @@ pub fn handle_dcserver(token: Option<String>) {
         crate::services::termination_audit::init_audit_db(Some(discord_pg_pool.clone()));
 
         // Start axum HTTP server (background task) — now serves all API
-        // endpoints including /api/send, /api/senddm, /api/health
+        // endpoints including /api/discord/send, /api/discord/send-dm, /api/health
         let http_port = ad_config.server.port;
         match PolicyEngine::new_with_pg(&ad_config, Some(discord_pg_pool.clone())) {
             Ok(engine) => {

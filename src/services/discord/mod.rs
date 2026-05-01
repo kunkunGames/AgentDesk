@@ -3959,7 +3959,7 @@ mod tests {
             agent_msg
         ));
         // Announce-bot allows arbitrary text by design (it backs dispatch
-        // wrappers, PM/escalation cards, and generic /api/send routing).
+        // wrappers, PM/escalation cards, and generic /api/discord/send routing).
         // Issue-announcement cards moved to notify-bot in the #1448
         // follow-up so they no longer reach this branch at all.
         assert!(is_allowed_turn_sender(

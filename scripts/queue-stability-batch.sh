@@ -119,7 +119,7 @@ if ! api_get "/api/health" >/dev/null 2>&1; then
     exit 1
 fi
 
-ACTIVE_RUN=$(api_get "/api/auto-queue/history?limit=20" \
+ACTIVE_RUN=$(api_get "/api/queue/history?limit=20" \
     | jq -r 'first(.runs[]? | select(.status == "active" or .status == "pending" or .status == "paused") | "\(.id) \(.status)") // ""')
 if [ -n "$ACTIVE_RUN" ]; then
     log "> Active run exists ($ACTIVE_RUN) - skipping"
@@ -151,7 +151,7 @@ GENERATE_BODY=$(jq -n \
     --argjson entries "$ENTRIES_JSON" \
     '{repo:$repo, entries:$entries}')
 
-GENERATE_RESULT=$(api_post_json "/api/auto-queue/generate" "$GENERATE_BODY")
+GENERATE_RESULT=$(api_post_json "/api/queue/generate" "$GENERATE_BODY")
 RUN_ID=$(printf '%s' "$GENERATE_RESULT" | jq -r '.run.id // ""')
 if [ -z "$RUN_ID" ]; then
     log "x Generate failed"
@@ -175,12 +175,12 @@ fi
 
 # -- Activate ---------------------------------------------------------------
 ACTIVATE_BODY=$(jq -n --arg run_id "$RUN_ID" '{run_id:$run_id}')
-ACTIVATE_RESULT=$(api_post_json "/api/auto-queue/dispatch-next" "$ACTIVATE_BODY")
+ACTIVATE_RESULT=$(api_post_json "/api/queue/dispatch-next" "$ACTIVATE_BODY")
 DISPATCHED=$(printf '%s' "$ACTIVATE_RESULT" | jq -r '.dispatched | length')
 log "OK Activated run $RUN_ID - $DISPATCHED dispatched"
 
 # -- Verify -----------------------------------------------------------------
-api_get "/api/auto-queue/status" \
+api_get "/api/queue/status" \
     | jq -r --arg run "$RUN_ID" '
         if .run.id != $run then
           "warning: latest status is for run " + (.run.id // "none") + ", expected " + $run

@@ -238,7 +238,7 @@
 - `health_returns_503_when_unhealthy` — 비정상 → 503
 - `health_includes_uptime_and_counters` — uptime/counter 포함
 
-### /api/send Endpoint
+### /api/discord/send Endpoint
 - `send_routes_via_announce_bot` — announce 봇으로 메시지 라우팅
 - `send_validates_json` — JSON 검증
 

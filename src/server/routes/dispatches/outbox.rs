@@ -1616,12 +1616,12 @@ pub(super) fn review_submission_hint(
         Some("review") => Some(format!(
             "제출: `{}` (`dispatch_id={dispatch_id}`)",
             trim_context_string(context_json, "verdict_endpoint")
-                .unwrap_or("POST /api/review-verdict")
+                .unwrap_or("POST /api/reviews/verdict")
         )),
         Some("review-decision") => Some(format!(
             "제출: `{}`",
             trim_context_string(context_json, "decision_endpoint")
-                .unwrap_or("POST /api/review-decision")
+                .unwrap_or("POST /api/reviews/decision")
         )),
         _ => None,
     }

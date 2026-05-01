@@ -69,7 +69,7 @@ session_statuses_for_dispatch() {
 }
 
 while true; do
-  STATUS_JSON=$(api_get "/api/auto-queue/status" 2>/dev/null || echo '{}')
+  STATUS_JSON=$(api_get "/api/queue/status" 2>/dev/null || echo '{}')
   RUN_STATUS=$(printf '%s' "$STATUS_JSON" | jq -r '.run.status // ""' 2>/dev/null || true)
   if [ "$RUN_STATUS" != "active" ] && [ "$RUN_STATUS" != "pending" ] && [ "$RUN_STATUS" != "paused" ]; then
     sleep "$INTERVAL"

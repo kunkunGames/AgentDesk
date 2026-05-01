@@ -413,7 +413,7 @@ fn review_dispatch_message_includes_compact_metadata_and_issue_url() {
         "한 줄 지시: 코드 리뷰만 수행하고 상세 범위와 verdict 규칙은 시스템 프롬프트의 [Current Task]를 따르세요."
     ));
     assert!(message.contains("dispatch-1"));
-    assert!(message.contains("`POST /api/review-verdict` (`dispatch_id=dispatch-1`)"));
+    assert!(message.contains("`POST /api/reviews/verdict` (`dispatch_id=dispatch-1`)"));
     assert!(!message.contains("VERDICT: pass|improve|reject|rework"));
     assert!(message.chars().count() <= 500);
 }
@@ -630,7 +630,7 @@ fn review_decision_primary_message_includes_action_instructions() {
                 "issue_number":249,
                 "pr_number":366,
                 "reviewed_commit":"feedfacecafebeef",
-                "decision_endpoint":"POST /api/review-decision"
+                "decision_endpoint":"POST /api/reviews/decision"
             }"#,
         ),
     );
@@ -640,7 +640,7 @@ fn review_decision_primary_message_includes_action_instructions() {
         "한 줄 지시: GitHub 리뷰 피드백을 확인하고 accept/dispute/dismiss 중 하나를 제출하세요."
     ));
     assert!(message.contains("대상: repo=owner/repo, issue=#249, pr=#366, commit=feedfacecaf…"));
-    assert!(message.contains("제출: `POST /api/review-decision`"));
+    assert!(message.contains("제출: `POST /api/reviews/decision`"));
     assert!(message.contains("<https://github.com/itismyfield/AgentDesk/issues/249>"));
     assert!(!message.contains("카운터모델 리뷰 결과"));
     assert!(!message.contains("review-verdict"));
@@ -750,7 +750,7 @@ async fn completed_review_dispatch_with_explicit_verdict_creates_followup() {
     assert!(context.contains("\"reviewed_commit\":\"feedfacecafebeef\""));
     assert!(context.contains("\"issue_number\":692"));
     assert!(context.contains("\"pr_number\":366"));
-    assert!(context.contains("\"decision_endpoint\":\"POST /api/review-decision\""));
+    assert!(context.contains("\"decision_endpoint\":\"POST /api/reviews/decision\""));
     assert!(!context.contains("\"notes\""));
     assert!(!context.contains("\"items\""));
 }
@@ -788,7 +788,7 @@ async fn unknown_review_verdict_followup_includes_target_and_submission_hints() 
             ) VALUES (
                 'dispatch-review', 'card-unknown', 'agent-1', 'review', 'completed',
                 '[Review R1] card-unknown',
-                '{\"repo\":\"owner/repo\",\"issue_number\":692,\"pr_number\":366,\"reviewed_commit\":\"feedfacecafebeef\",\"verdict_endpoint\":\"POST /api/review-verdict\"}',
+                '{\"repo\":\"owner/repo\",\"issue_number\":692,\"pr_number\":366,\"reviewed_commit\":\"feedfacecafebeef\",\"verdict_endpoint\":\"POST /api/reviews/verdict\"}',
                 datetime('now'), datetime('now')
             )",
             [],
@@ -816,7 +816,7 @@ async fn unknown_review_verdict_followup_includes_target_and_submission_hints() 
         .first()
         .expect("followup message should be captured");
     assert!(message.contains("대상: repo=owner/repo, issue=#692, pr=#366, commit=feedfacecaf…"));
-    assert!(message.contains("누락된 verdict 제출 경로 참고: 제출: `POST /api/review-verdict` (`dispatch_id=dispatch-review`)"));
+    assert!(message.contains("누락된 verdict 제출 경로 참고: 제출: `POST /api/reviews/verdict` (`dispatch_id=dispatch-review`)"));
     assert!(message.contains("https://github.com/itismyfield/AgentDesk/issues/692"));
 }
 

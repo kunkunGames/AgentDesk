@@ -949,7 +949,7 @@ pub struct ReviewDecisionBody {
     pub dispatch_id: Option<String>,
 }
 
-/// POST /api/review-decision
+/// POST /api/reviews/decision
 ///
 /// Agent's decision on counter-model review feedback.
 /// - accept: agent will rework based on review → card to in_progress

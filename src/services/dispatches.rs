@@ -148,7 +148,7 @@ impl DispatchService {
             let context = input.result.as_ref();
 
             // Guard: review dispatches MUST carry an explicit verdict.
-            // /api/review-verdict validates this; this path (PATCH
+            // /api/reviews/verdict validates this; this path (PATCH
             // /api/dispatches/:id) previously accepted `{items, notes}` without
             // a verdict, leaving review_state in `reviewing` until timeouts [C]
             // escalated the card to dilemma_pending (see #925 incident).
@@ -166,7 +166,7 @@ impl DispatchService {
                         .is_some_and(|s| !s.is_empty());
                     if !has_verdict {
                         return Err(ServiceError::bad_request(
-                            "review dispatch completion requires explicit verdict — use POST /api/review-verdict",
+                            "review dispatch completion requires explicit verdict — use POST /api/reviews/verdict",
                         )
                         .with_code(ErrorCode::Validation)
                         .with_context("dispatch_id", id));

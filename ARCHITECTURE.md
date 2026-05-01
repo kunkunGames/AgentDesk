@@ -47,7 +47,6 @@ src/
 │   ├── run.rs
 │   └── utils.rs
 ├── compat/
-│   ├── deprecated_alias.rs
 │   ├── legacy_tmp_paths.rs
 │   └── mod.rs
 ├── db/
@@ -217,7 +216,6 @@ src/
 │   │   ├── planning.rs
 │   │   ├── query.rs
 │   │   ├── route.rs
-│   │   ├── route_dispatch.rs
 │   │   ├── route_generate.rs
 │   │   ├── route_types.rs
 │   │   ├── runtime.rs

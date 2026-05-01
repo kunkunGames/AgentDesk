@@ -486,7 +486,9 @@ impl HealthRegistry {
                     } else {
                         "🔔"
                     };
-                    tracing::info!("  [{ts}] {emoji} {bot_name} bot loaded for /api/send routing");
+                    tracing::info!(
+                        "  [{ts}] {emoji} {bot_name} bot loaded for /api/discord/send routing"
+                    );
                 }
             }
         }
@@ -2486,7 +2488,7 @@ async fn resolve_send_target_channel_id_with_backends(
     }
 }
 
-/// Handle POST /api/send — agent-to-agent native routing.
+/// Handle POST /api/discord/send — agent-to-agent native routing.
 /// Accepts JSON: {"target":"channel:<id>|channel:<name>|agent:<roleId>", "content":"...", "source":"role-id", "bot":"announce|notify", "summary":"..."}
 ///
 /// `summary` is optional minimal fallback content if Discord rejects the
@@ -2841,7 +2843,7 @@ async fn deliver_manual_notification<C: ManualOutboundClient>(
     let content_len = content.chars().count();
     if content_len > DISCORD_HARD_LIMIT_CHARS {
         // Compatibility shim: v3 text delivery does not yet own attachment
-        // upload or manual chunk-posting for over-2k `/api/send` payloads.
+        // upload or manual chunk-posting for over-2k `/api/discord/send` payloads.
         let result = match if bot == "announce" {
             client
                 .post_text_attachment(channel_id, content, summary)
@@ -3391,7 +3393,7 @@ pub async fn handle_send_to_agent(
     .await
 }
 
-/// Handle POST /api/senddm — send a DM to a Discord user.
+/// Handle POST /api/discord/send-dm — send a DM to a Discord user.
 /// Accepts JSON:
 /// {"user_id":"...", "content":"...", "bot":"announce|notify|claude|codex"}
 pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static str, String) {
@@ -3901,7 +3903,7 @@ mod stall_watchdog_pure_tests {
     }
 }
 
-/// Parse a /api/send JSON body and extract (target, content, source).
+/// Parse a /api/discord/send JSON body and extract (target, content, source).
 /// Returns Err with an error message on invalid input.
 /// Factored out of handle_send for testability.
 #[cfg_attr(not(test), allow(dead_code))]

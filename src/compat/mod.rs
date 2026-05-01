@@ -23,7 +23,6 @@
 //! | Shim | Purpose | Removal condition |
 //! | --- | --- | --- |
 //! | [`legacy_tmp_session_path`] | Re-export of `services::tmux_common::legacy_tmp_session_path`. Older wrappers (pre-#?? migration) hold open file descriptors under `/tmp/` — this helper lets read-side code discover those files. | #1076: all tmux wrappers have been respawned post-migration (no caller is dated before the `agentdesk_temp_dir()` switchover). Verified when `rg 'legacy_tmp_session_path'` returns only the `src/compat/` reference + this module. |
-//! | [`log_deprecated_alias`] | Used by retired `/api/send*` aliases before they forward to `/api/discord/*`. | #1076: every `log_deprecated_alias` call site has been removed (grep shows zero callers under `src/server/routes/domains/`). |
 //!
 //! ## Adding a shim
 //!
@@ -33,12 +32,10 @@
 //!    with a new row describing the removal condition.
 //! 4. Update the inventory table above.
 
-pub mod deprecated_alias;
 pub mod legacy_tmp_paths;
 
 // Re-exports so callers can `use crate::compat::legacy_tmp_session_path`
 // directly — mirrors the original symbol names so migration is search/replace.
-pub use deprecated_alias::log_deprecated_alias;
 pub use legacy_tmp_paths::legacy_tmp_session_path;
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -73,20 +70,12 @@ mod tests {
     }
 
     fn compat_shims() -> Vec<CompatShim> {
-        vec![
-            CompatShim {
-                name: "legacy_tmp_session_path",
-                condition: "`rg 'legacy_tmp_session_path' src/` returns only compat/ + tmux_common/ + resolve_session_temp_path.",
-                removable_condition: legacy_tmp_session_path_removable,
-                must_remove: false,
-            },
-            CompatShim {
-                name: "log_deprecated_alias",
-                condition: "no caller under src/server/routes/domains/ invokes log_deprecated_alias.",
-                removable_condition: log_deprecated_alias_removable,
-                must_remove: false,
-            },
-        ]
+        vec![CompatShim {
+            name: "legacy_tmp_session_path",
+            condition: "`rg 'legacy_tmp_session_path' src/` returns only compat/ + tmux_common/ + resolve_session_temp_path.",
+            removable_condition: legacy_tmp_session_path_removable,
+            must_remove: false,
+        }]
     }
 
     /// Source-grep helper. Counts non-test callers of `symbol` across the
@@ -148,12 +137,6 @@ mod tests {
         count_non_compat_callers("legacy_tmp_session_path") == 0
     }
 
-    fn log_deprecated_alias_removable() -> bool {
-        // REMOVE_WHEN: no deprecated /api/send* handler in domains/access.rs
-        // still wraps the call.
-        count_non_compat_callers("log_deprecated_alias") == 0
-    }
-
     #[test]
     fn compat_shim_removable_when_condition_met() {
         let shims = compat_shims();
@@ -197,10 +180,6 @@ mod tests {
         assert!(
             names.contains(&"legacy_tmp_session_path"),
             "legacy_tmp_session_path missing from compat inventory"
-        );
-        assert!(
-            names.contains(&"log_deprecated_alias"),
-            "log_deprecated_alias missing from compat inventory"
         );
     }
 }

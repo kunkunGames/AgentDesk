@@ -7,7 +7,7 @@ use sqlx::{PgPool, Row as SqlxRow};
 //
 // agentdesk.dispatch.create(cardId, agentId, dispatchType, title, context?) → dispatchId
 // Creates a task_dispatch row + updates kanban card to "requested".
-// Discord notification is handled by posting to the local /api/send endpoint.
+// Discord notification is handled by posting to the local /api/discord/send endpoint.
 
 pub(super) fn register_dispatch_ops<'js>(
     ctx: &Ctx<'js>,

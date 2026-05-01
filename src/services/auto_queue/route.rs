@@ -41,8 +41,6 @@ mod phase_gate;
 mod planning;
 #[path = "query.rs"]
 mod query;
-#[path = "route_dispatch.rs"]
-mod route_dispatch;
 #[path = "route_generate.rs"]
 mod route_generate;
 #[path = "route_types.rs"]
@@ -59,12 +57,11 @@ pub use control_routes::{
     cancel, pause, reorder, reset, reset_global, reset_slot_thread, resume_run, update_run,
 };
 pub use order_routes::{OrderBody, submit_order};
-pub use route_dispatch::dispatch;
 pub use route_generate::generate;
 pub use route_types::{
-    ActivateBody, AddRunEntryBody, CancelQuery, DispatchBody, DispatchGroupBody, GenerateBody,
-    GenerateEntryBody, HistoryQuery, PauseBody, RebindSlotBody, ReorderBody, ResetBody,
-    ResetGlobalBody, StatusQuery, UpdateEntryBody, UpdateRunBody,
+    ActivateBody, AddRunEntryBody, CancelQuery, GenerateBody, GenerateEntryBody, HistoryQuery,
+    PauseBody, RebindSlotBody, ReorderBody, ResetBody, ResetGlobalBody, StatusQuery,
+    UpdateEntryBody, UpdateRunBody,
 };
 pub use slot_routes::{rebind_slot, skip_entry};
 pub use view_admin_routes::{add_run_entry, history, restore_run, status, update_entry};

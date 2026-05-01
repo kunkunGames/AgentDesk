@@ -4254,7 +4254,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
             }
             // Auto-retry: persist Discord history for LLM injection, then queue the
             // original user message as an internal follow-up instead of self-routing
-            // through /api/send announce.
+            // through /api/discord/send announce.
             //
             // #897 round-4 Medium: a `rebind_origin` inflight has no real
             // user message or text to retry with (`user_msg_id=0`,

@@ -633,9 +633,9 @@ AgentDesk exposes 150+ REST API endpoints. Key groups:
 | Group | Endpoints | Description |
 |-------|-----------|-------------|
 | `/api/agents` | CRUD + signal, skills, timeline | Agent management |
-| `/api/kanban-cards` | CRUD + assign, `/transition`, `/retry`, `/redispatch`, `/rereview`, `/reopen`, batch actions | Work item management. `/transition`, `/retry`, `/redispatch`, and `/auto-queue/generate` are **single-call complete** — do not chain them (#1442). Response fields differ per endpoint: `/retry` and `/redispatch` return `new_dispatch_id` + `next_action`; `/transition` returns `cancelled_dispatch_ids`, `created_dispatch_id`, and `next_action_hint` (and requires `force=true` when an active dispatch exists, #1444); `/auto-queue/generate` returns `run`, `entries`, and the `skipped_due_to_active_dispatch` / `skipped_due_to_dependency` / `skipped_due_to_filter` arrays. |
+| `/api/kanban-cards` | CRUD + assign, `/transition`, `/retry`, `/redispatch`, `/rereview`, `/reopen`, batch actions | Work item management. `/transition`, `/retry`, `/redispatch`, and `/queue/generate` are **single-call complete** — do not chain them (#1442). Response fields differ per endpoint: `/retry` and `/redispatch` return `new_dispatch_id` + `next_action`; `/transition` returns `cancelled_dispatch_ids`, `created_dispatch_id`, and `next_action_hint` (and requires `force=true` when an active dispatch exists, #1444); `/queue/generate` returns `run`, `entries`, and the `skipped_due_to_active_dispatch` / `skipped_due_to_dependency` / `skipped_due_to_filter` arrays. |
 | `/api/dispatches` | CRUD + cancel | Task assignment tracking |
-| `/api/auto-queue` | Generate, activate, reorder, status, slots | Batch-phased work queuing |
+| `/api/queue` | Generate, dispatch-next, reorder, status, slots | Batch-phased work queuing |
 | `/api/sessions` | List, update, cleanup | Agent runtime sessions |
 | `/api/round-table-meetings` | Start, transcript, issues | Multi-agent meetings |
 | `/api/offices` | CRUD + agent assignment, ordering | Virtual office management |
@@ -643,7 +643,7 @@ AgentDesk exposes 150+ REST API endpoints. Key groups:
 | `/api/pipeline` | Stages, config, graphs, card history | Pipeline configuration |
 | `/api/settings` | Company + config/runtime/escalation subroutes | Platform configuration surfaces |
 | `/api/github` | Repo sync, dashboard views, issue actions | GitHub integration |
-| `/api/discord` | `/send`, `/send-to-agent`, `/send-dm`, channel messages, bindings, DM reply hooks. `/api/send`, `/api/send_to_agent`, and `/api/senddm` remain as deprecated aliases. | Discord access layer |
+| `/api/discord` | `/send`, `/send-to-agent`, `/send-dm`, channel messages, bindings, DM reply hooks. Legacy top-level `/api/send*` aliases were removed. | Discord access layer |
 | `/api/health` | Public safe health summary | Service status |
 | `/api/health/detail` | Authenticated/local detailed diagnostics | Provider/runtime diagnostics |
 | `/api/onboarding` | Status, validate, complete | Setup wizard backend |

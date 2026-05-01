@@ -161,7 +161,7 @@ pub async fn update_dispatch(
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(
-                        json!({"error": "review dispatch completion requires explicit verdict — use POST /api/review-verdict"}),
+                        json!({"error": "review dispatch completion requires explicit verdict — use POST /api/reviews/verdict"}),
                     ),
                 );
             }

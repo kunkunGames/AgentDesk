@@ -208,7 +208,7 @@ fn build_pmd_issue_body(body: &CreateIssueBody) -> Result<String, String> {
 
 // ── Handlers ───────────────────────────────────────────────────
 
-/// POST /api/issues
+/// POST /api/github/issues/create
 pub async fn create_issue(
     State(state): State<AppState>,
     Json(body): Json<CreateIssueBody>,

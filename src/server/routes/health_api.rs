@@ -716,7 +716,7 @@ pub async fn relay_recovery_handler(
     (status, Json(json)).into_response()
 }
 
-/// POST /api/send — agent-to-agent native routing.
+/// POST /api/discord/send — agent-to-agent native routing.
 ///
 /// Requires `ConnectInfo<SocketAddr>` injected by the server bootstrap
 /// (see `boot.rs::run_with_state` and `mod.rs::launch_*` which both call
@@ -793,7 +793,7 @@ pub async fn rebind_inflight_handler(
     (status, Json(json)).into_response()
 }
 
-/// POST /api/send_to_agent — role_id-based agent routing.
+/// POST /api/discord/send-to-agent — role_id-based agent routing.
 ///
 /// See `send_handler` for the rationale on the mandatory
 /// `ConnectInfo<SocketAddr>` extractor.
@@ -827,7 +827,7 @@ pub async fn send_to_agent_handler(
     (status, Json(json)).into_response()
 }
 
-/// POST /api/senddm — send a DM to a Discord user.
+/// POST /api/discord/send-dm — send a DM to a Discord user.
 ///
 /// See `send_handler` for the rationale on the mandatory
 /// `ConnectInfo<SocketAddr>` extractor.

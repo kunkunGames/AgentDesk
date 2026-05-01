@@ -29,10 +29,10 @@ completions.
   `background_event` and `src/services/codex_tmux_wrapper.rs` rewrites it to
   `system/task_notification`. The watcher only keys off that canonical JSONL
   event.
-- Agents call the existing `/api/send` endpoint with `bot: "notify"`:
+- Agents call the existing `/api/discord/send` endpoint with `bot: "notify"`:
 
   ```bash
-  curl -sS -XPOST http://127.0.0.1:$ADK_PORT/api/send \
+  curl -sS -XPOST http://127.0.0.1:$ADK_PORT/api/discord/send \
        -H 'Content-Type: application/json' \
        -d '{
              "target":  "channel:1234567890",
@@ -87,5 +87,5 @@ chain so the user can intervene before steps fire.
 - Notify bot id resolution — `resolve_notify_bot_user_id` in
   `src/services/discord/mod.rs` (delegates to
   `HealthRegistry::utility_bot_user_id("notify")`).
-- `/api/send` handler — `send_handler` in
+- `/api/discord/send` handler — `send_handler` in
   `src/server/routes/health_api.rs`, dispatching into `health::handle_send`.

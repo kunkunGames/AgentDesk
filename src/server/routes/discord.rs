@@ -12,7 +12,6 @@ use crate::db::agents::load_all_agent_channel_bindings_pg;
 // ── Handlers ───────────────────────────────────────────────────
 
 /// GET /api/discord/bindings
-/// (Legacy alias: /api/discord-bindings — kept for backward-compat, deprecated via #1065.)
 ///
 /// Reads agent channel bindings from Postgres.
 pub async fn list_bindings(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {

@@ -76,7 +76,7 @@ order-preserving multi-message stream continuation (see §4 exclusions).
 
 `mixed` for `dm_reply` is intentionally narrow: sub-2k text now uses
 `OutboundTarget::DmUser(UserId)` and the v3 transport resolves the DM channel.
-Oversize `/api/send` and `/api/senddm` payloads still call the existing
+Oversize `/api/discord/send` and `/api/discord/send-dm` payloads still call the existing
 attachment/chunk helpers until v3 grows attachment-capable transport.
 
 ---
@@ -97,8 +97,8 @@ the v3 delivery engine.
 | `src/server/routes/dispatches/outbox.rs:1124` (`post_dispatch_completion_summary`) | final dispatch thread callback | **migrated_v3**. Ensures the dispatch thread is postable, then posts the completion summary through v3 with a per-producer `dispatch_completion_summary_deduper()`. |
 | `src/services/issue_announcements.rs:334` (`send_issue_announcement_message`) | issue announcements | Legacy compatibility facade. Review-style policy and per-producer static `issue_announcement_deduper()`. |
 | `src/services/discord/discord_io.rs:423` (`deliver_channel_message`) | CLI text/DM helper | Used by `--discord-sendmessage` / `--discord-senddm` *after* the DM channel has been resolved. Static `discord_io_deduper`. |
-| `src/services/discord/health.rs:2802` (`deliver_manual_notification`) | manual `/api/send` | **migrated_v3 for sub-2k text**. Over-limit content remains a compatibility shim to `post_text_attachment` (announce) or `deliver_chunked_manual_notification` (notify). |
-| `src/services/discord/health.rs:2873` (`deliver_manual_dm_notification`) | `dm_reply` / `/api/senddm` | **migrated_v3 for sub-2k text** using `OutboundTarget::DmUser(UserId)`. The v3 transport resolves the DM channel and duplicate delivery returns before a second resolve. Over-limit content keeps the compatibility attachment/chunk path. |
+| `src/services/discord/health.rs:2802` (`deliver_manual_notification`) | manual `/api/discord/send` | **migrated_v3 for sub-2k text**. Over-limit content remains a compatibility shim to `post_text_attachment` (announce) or `deliver_chunked_manual_notification` (notify). |
+| `src/services/discord/health.rs:2873` (`deliver_manual_dm_notification`) | `dm_reply` / `/api/discord/send-dm` | **migrated_v3 for sub-2k text** using `OutboundTarget::DmUser(UserId)`. The v3 transport resolves the DM channel and duplicate delivery returns before a second resolve. Over-limit content keeps the compatibility attachment/chunk path. |
 | `src/services/discord/gateway.rs:359` (`send_intake_placeholder`) | `placeholder_sends` (intake) | **migrated_v3**. Posts the `"..."` placeholder before a turn via direct v3. Uses `preserve_inline_content().without_idempotency()` to preserve streaming behavior. |
 | `src/services/discord/gateway.rs:377` (`edit_outbound_message`) | `placeholder_sends` (edit) | **migrated_v3**. Encodes edit through `OutboundOperation::Edit`. |
 | `src/services/discord/gateway.rs:400` (`TurnGateway::{send_message, edit_message}`) | turn-bridge messages/edits | **migrated_v3 transitively via gateway**. Used for handoff, rollover freeze, snapshot, stable update, and terminal edit. |
@@ -238,10 +238,10 @@ button hits the manual outbound API, which is covered under §3.A
 2. **Landed in #1457 — review followups, dispatch completion summaries,
    gateway/turn-bridge, and short manual/DM text.**
    These callsites now build v3 envelopes directly. `OutboundTarget::DmUser`
-   owns the DM-channel resolve step for `/api/senddm` and duplicate replay uses
+   owns the DM-channel resolve step for `/api/discord/send-dm` and duplicate replay uses
    stored delivery metadata before resolving again.
 3. **Next — attachment-capable v3 transport.**
-   Remove the manual `/api/send` and `/api/senddm` over-2k compatibility shims
+   Remove the manual `/api/discord/send` and `/api/discord/send-dm` over-2k compatibility shims
    once v3 can send multipart attachment payloads or explicitly delegate to a
    chunk/attachment transport variant.
 4. **`discord_io.rs` CLI helpers.** Trivial after attachment-capable transport
@@ -275,7 +275,7 @@ button hits the manual outbound API, which is covered under §3.A
   message commit has happened.
 - `src/services/discord/health.rs`:
   `manual_dm_notification_uses_v3_dm_target_and_dedupes_before_resolve`
-  verifies `/api/senddm` short text uses v3 DM target semantics and preserves
+  verifies `/api/discord/send-dm` short text uses v3 DM target semantics and preserves
   the manual duplicate response contract.
 
 ## 6. Guardrail proposal (DoD #4)

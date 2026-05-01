@@ -32,7 +32,7 @@ pub(super) fn redact_sensitive_for_placeholder(input: &str) -> String {
 }
 
 /// Inline footer appended to a summary when a long message is delivered as a
-/// `.txt` attachment via `/api/send`.
+/// `.txt` attachment via `/api/discord/send`.
 const ATTACHMENT_FOOTER_PREFIX: &str = "📎 전문은 첨부 파일 참고";
 
 /// All available tools with (name, description, is_destructive)
@@ -2515,7 +2515,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
 /// Split a message into chunks that fit within Discord's 2000 char limit.
 /// Handles code block boundaries correctly. Used by stream/slash-command/recovery
 /// paths where overflow is delivered as additional inline messages. The manual
-/// `/api/send` route uses the shared outbound API length policy instead.
+/// `/api/discord/send` route uses the shared outbound API length policy instead.
 ///
 /// Emits structured `tracing::debug!` logs at `target: "discord::chunker"` for
 /// every chunk produced (chunk_index, byte_len, boundary_kind, in_code_block).

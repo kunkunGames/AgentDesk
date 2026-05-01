@@ -274,7 +274,7 @@ class LegacySqliteCheck(unittest.TestCase):
         sqlite3 "$DB" "SELECT id FROM auto_queue_runs"
         """
         clean = """
-        curl -sf "$API/api/auto-queue/status" | jq .
+        curl -sf "$API/api/queue/status" | jq .
         """
         with _FakeSrcTree(
             {

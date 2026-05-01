@@ -45,7 +45,7 @@ before/after import.
 
 In normal operation the message-outbox worker (`src/server/background.rs` and
 `src/server/mod.rs`) polls `status = 'pending'` rows every few seconds and
-flips them to `sent` once the local `/api/send` HTTP loop accepts them. To
+flips them to `sent` once the local `/api/discord/send` HTTP loop accepts them. To
 drain before cutover:
 
 - Confirm `dcserver` is running and the local HTTP server is reachable. A

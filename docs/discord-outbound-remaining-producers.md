@@ -15,12 +15,12 @@ dispatch, review, placeholder, gateway, and CLI text/DM helpers landed in
   contract. Long meeting transcripts and summaries intentionally keep
   `send_long_message_raw` because the existing contract only models a single
   send/edit, not ordered continuation chunks.
-- `message_outbox`: PG and sqlite drains pass row metadata into `/api/send` as
+- `message_outbox`: PG and sqlite drains pass row metadata into `/api/discord/send` as
   a `ManualOutboundDeliveryId`, so the shared send contract sees the source,
   reason/session correlation, and row semantic event instead of anonymous
   manual delivery.
-- `/api/senddm`: DM content delivery now uses the same manual outbound
-  delivery path as `/api/send` after DM-channel resolution. Callers can pass
+- `/api/discord/send-dm`: DM content delivery now uses the same manual outbound
+  delivery path as `/api/discord/send` after DM-channel resolution. Callers can pass
   `correlation_id` plus `semantic_event_id`, or `idempotency_key`, to opt into
   retry dedupe. Requests without those fields are delivered without semantic
   dedupe so repeated identical DMs are still sent.

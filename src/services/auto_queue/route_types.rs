@@ -15,6 +15,7 @@ pub struct GenerateEntryBody {
 pub struct GenerateBody {
     pub repo: Option<String>,
     pub agent_id: Option<String>,
+    pub auto_assign_agent: Option<bool>,
     pub issue_numbers: Option<Vec<i64>>,
     pub entries: Option<Vec<GenerateEntryBody>>,
     pub review_mode: Option<String>,
@@ -58,13 +59,8 @@ pub struct HistoryQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct ReorderBody {
-    /// Canonical: `ordered_ids` (snake_case).
-    /// Legacy `orderedIds` (camelCase) still accepted via serde alias.
-    #[serde(alias = "orderedIds")]
     pub ordered_ids: Vec<String>,
-    /// Canonical: `agent_id` (snake_case).
-    /// Legacy `agentId` (camelCase) still accepted via serde alias.
-    #[serde(default, alias = "agentId")]
+    #[serde(default)]
     pub agent_id: Option<String>,
 }
 
@@ -74,28 +70,6 @@ pub struct UpdateRunBody {
     pub unified_thread: Option<bool>,
     pub deploy_phases: Option<Vec<i64>>,
     pub max_concurrent_threads: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DispatchGroupBody {
-    pub issues: Vec<i64>,
-    pub sequential: Option<bool>,
-    pub batch_phase: Option<i64>,
-    pub thread_group: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DispatchBody {
-    pub repo: Option<String>,
-    pub agent_id: Option<String>,
-    pub groups: Vec<DispatchGroupBody>,
-    pub review_mode: Option<String>,
-    pub unified_thread: Option<bool>,
-    pub activate: Option<bool>,
-    pub auto_assign_agent: Option<bool>,
-    pub max_concurrent_threads: Option<i64>,
-    pub deploy_phases: Option<Vec<i64>>,
-    pub force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

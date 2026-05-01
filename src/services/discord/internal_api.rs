@@ -234,13 +234,13 @@ pub(super) async fn update_dispatch(
 pub(super) async fn submit_review_decision(
     body: routes::review_verdict::ReviewDecisionBody,
 ) -> Result<Value, String> {
-    request_body(Method::POST, "/api/review-decision", &body).await
+    request_body(Method::POST, "/api/reviews/decision", &body).await
 }
 
 pub(super) async fn submit_review_verdict(
     body: routes::review_verdict::SubmitVerdictBody,
 ) -> Result<Value, String> {
-    request_body(Method::POST, "/api/review-verdict", &body).await
+    request_body(Method::POST, "/api/reviews/verdict", &body).await
 }
 
 pub(super) async fn upsert_meeting(

@@ -5890,7 +5890,7 @@ mod tests {
 
     // ── #195: review-decision accept creates rework dispatch ──────────
     //
-    // Verifies that when an agent accepts review feedback via POST /api/review-decision,
+    // Verifies that when an agent accepts review feedback via POST /api/reviews/decision,
     // a rework dispatch is automatically created and the card transitions to the
     // rework target state (in_progress), NOT directly to review.
     // This prevents the pipeline from getting stuck when the accept decision

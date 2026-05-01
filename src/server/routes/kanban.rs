@@ -864,7 +864,7 @@ pub async fn delete_card(
 /// POST /api/kanban-cards/:id/retry
 ///
 /// This endpoint is single-call complete. Do NOT chain /transition or
-/// /auto-queue/generate after it — that creates duplicate dispatches
+/// /queue/generate after it — that creates duplicate dispatches
 /// (see #1442 incident). Inspect `new_dispatch_id` and `next_action` in
 /// the response to confirm the new dispatch was created. See
 /// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
@@ -1050,7 +1050,7 @@ pub async fn retry_card(
 /// POST /api/kanban-cards/:id/redispatch
 ///
 /// This endpoint is single-call complete. Do NOT chain /transition or
-/// /auto-queue/generate after it — that creates duplicate dispatches
+/// /queue/generate after it — that creates duplicate dispatches
 /// (see #1442 incident). Inspect `new_dispatch_id` and `next_action` in
 /// the response to confirm the new dispatch was created. See
 /// `/api/docs/card-lifecycle-ops` for the full decision tree (#1443).
@@ -4023,7 +4023,7 @@ async fn clear_all_threads_pg(pool: &sqlx::PgPool, card_id: &str) -> anyhow::Res
 /// Requires an explicit Bearer token (no same-origin bypass).
 ///
 /// This endpoint is single-call complete. Do NOT chain /redispatch,
-/// /retry, or /auto-queue/generate after it — that creates duplicate
+/// /retry, or /queue/generate after it — that creates duplicate
 /// dispatches (see #1442 incident). Inspect `cancelled_dispatch_ids`,
 /// `created_dispatch_id`, and `next_action_hint` in the response to
 /// determine whether any follow-up is genuinely required. See
@@ -4074,7 +4074,7 @@ pub async fn force_transition(
     // `ready` while it already has a pending/dispatched dispatch, refuse with
     // 409 unless `force=true` (or legacy `cancel_dispatches=true`) is
     // explicitly set. This stops the #1442 incident pattern where a caller
-    // chains `/redispatch` + `/transition` + `/auto-queue/generate` and
+    // chains `/redispatch` + `/transition` + `/queue/generate` and
     // accidentally creates duplicate dispatches.
     if target_status == "ready" && !force_intent_present && !pre_active_dispatch_ids.is_empty() {
         let active_id = pre_active_dispatch_ids.first().cloned().unwrap_or_default();
@@ -4264,7 +4264,7 @@ pub async fn force_transition(
                 _ => None,
             };
 
-            // Only suggest /auto-queue/generate when the target state is
+            // Only suggest /queue/generate when the target state is
             // actually enqueueable by that endpoint AND no live dispatch
             // remains for the card (codex P2). Suggesting generate while a
             // pending/dispatched dispatch is still in flight queues a card
@@ -4285,7 +4285,7 @@ pub async fn force_transition(
                 // queue. The transition itself is complete; this hint surfaces
                 // the natural follow-up so callers do not silently chain
                 // /redispatch (which would create duplicates — #1442).
-                "call /api/auto-queue/generate to dispatch newly-ready card".to_string()
+                "call /api/queue/generate to dispatch newly-ready card".to_string()
             } else {
                 "none_required".to_string()
             };

@@ -1,6 +1,6 @@
 use super::*;
 
-/// PATCH /api/auto-queue/runs/{id}
+/// PATCH /api/queue/runs/{id}
 pub async fn update_run(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -59,7 +59,7 @@ pub async fn update_run(
     }
 }
 
-/// POST /api/auto-queue/slots/{agent_id}/{slot_index}/reset-thread
+/// POST /api/queue/slots/{agent_id}/{slot_index}/reset-thread
 pub async fn reset_slot_thread(
     State(state): State<AppState>,
     Path((agent_id, slot_index)): Path<(String, i64)>,
@@ -93,7 +93,7 @@ pub async fn reset_slot_thread(
     }
 }
 
-/// POST /api/auto-queue/reset
+/// POST /api/queue/reset
 /// Reset a single agent queue. Requires `agent_id`.
 pub async fn reset(
     State(state): State<AppState>,
@@ -133,7 +133,7 @@ pub async fn reset(
     }
 }
 
-/// POST /api/auto-queue/reset-global
+/// POST /api/queue/reset-global
 /// Global reset requires an explicit confirmation token.
 pub async fn reset_global(
     State(state): State<AppState>,
@@ -170,7 +170,7 @@ pub async fn reset_global(
     }
 }
 
-/// POST /api/auto-queue/pause — soft-pause active runs; `force=true` keeps the legacy cancel path
+/// POST /api/queue/pause — soft-pause active runs; `force=true` keeps the legacy cancel path
 pub async fn pause(
     State(state): State<AppState>,
     body: Bytes,
@@ -212,7 +212,7 @@ pub(super) fn cancel_route_error_response(
     (error.status(), Json(body))
 }
 
-/// POST /api/auto-queue/resume — resume paused runs and dispatch next entry
+/// POST /api/queue/resume — resume paused runs and dispatch next entry
 pub async fn resume_run(State(state): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable_response();
@@ -293,7 +293,7 @@ pub async fn resume_run(State(state): State<AppState>) -> (StatusCode, Json<serd
     )
 }
 
-/// POST /api/auto-queue/cancel — cancel all active/paused runs and pending entries
+/// POST /api/queue/cancel — cancel all active/paused runs and pending entries
 pub async fn cancel(
     State(state): State<AppState>,
     Query(query): Query<CancelQuery>,
@@ -322,7 +322,7 @@ pub async fn cancel(
     }
 }
 
-/// PATCH /api/auto-queue/reorder
+/// PATCH /api/queue/reorder
 pub async fn reorder(
     State(state): State<AppState>,
     Json(body): Json<ReorderBody>,
@@ -337,9 +337,9 @@ pub async fn reorder(
             Json(json!({"error": error.trim_start_matches("not_found:")})),
         ),
         Err(error)
-            if error == "orderedIds cannot be empty"
+            if error == "ordered_ids cannot be empty"
                 || error == "no pending entries found for reorder scope"
-                || error == "orderedIds do not match any pending entries in scope"
+                || error == "ordered_ids do not match any pending entries in scope"
                 || error == "replacement sequence exhausted"
                 || error == "replacement sequence was not fully consumed" =>
         {

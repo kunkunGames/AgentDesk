@@ -1335,7 +1335,6 @@ export interface DiscordBinding {
 }
 
 export async function getDiscordBindings(): Promise<DiscordBinding[]> {
-  // #1065: canonical /api/discord/bindings (legacy /api/discord-bindings still accepted).
   const data = await request<{ bindings: DiscordBinding[] }>(
     "/api/discord/bindings",
   );
@@ -1944,7 +1943,7 @@ export async function generateAutoQueue(
     repo: repo ?? null,
     agent_id: agentId ?? null,
   };
-  return request("/api/auto-queue/generate", {
+  return request("/api/queue/generate", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -1960,7 +1959,7 @@ export async function activateAutoQueue(
   const body: Record<string, unknown> = {};
   if (repo) body.repo = repo;
   if (agentId) body.agent_id = agentId;
-  return request("/api/auto-queue/dispatch-next", {
+  return request("/api/queue/dispatch-next", {
     method: "POST",
     body: JSON.stringify(body),
   });
@@ -1974,7 +1973,7 @@ export async function getAutoQueueStatus(
   if (repo) params.set("repo", repo);
   if (agentId) params.set("agent_id", agentId);
   const qs = params.toString();
-  return request(`/api/auto-queue/status${qs ? `?${qs}` : ""}`);
+  return request(`/api/queue/status${qs ? `?${qs}` : ""}`);
 }
 
 export async function getAutoQueueHistory(
@@ -1986,7 +1985,7 @@ export async function getAutoQueueHistory(
   params.set("limit", String(limit));
   if (repo) params.set("repo", repo);
   if (agentId) params.set("agent_id", agentId);
-  return request(`/api/auto-queue/history?${params.toString()}`);
+  return request(`/api/queue/history?${params.toString()}`);
 }
 
 export async function getPipelineStagesForAgent(
@@ -2001,7 +2000,7 @@ export async function getPipelineStagesForAgent(
 }
 
 export async function skipAutoQueueEntry(id: string): Promise<{ ok: boolean }> {
-  return request(`/api/auto-queue/entries/${id}/skip`, { method: "PATCH" });
+  return request(`/api/queue/entries/${id}/skip`, { method: "PATCH" });
 }
 
 export async function updateAutoQueueEntry(
@@ -2013,7 +2012,7 @@ export async function updateAutoQueueEntry(
     batch_phase?: number;
   },
 ): Promise<{ ok: boolean; entry: DispatchQueueEntry }> {
-  return request(`/api/auto-queue/entries/${id}`, {
+  return request(`/api/queue/entries/${id}`, {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
@@ -2025,7 +2024,7 @@ export async function updateAutoQueueRun(
 ): Promise<{ ok: boolean }> {
   const body: Record<string, unknown> = {};
   if (status !== undefined) body.status = status;
-  return request(`/api/auto-queue/runs/${id}`, {
+  return request(`/api/queue/runs/${id}`, {
     method: "PATCH",
     body: JSON.stringify(body),
   });
@@ -2035,8 +2034,6 @@ export async function reorderAutoQueueEntries(
   orderedIds: string[],
   agentId?: string | null,
 ): Promise<{ ok: boolean }> {
-  // #1065: canonical /api/queue/reorder + snake_case body.
-  // Legacy /api/auto-queue/reorder + {orderedIds, agentId} still accepted via aliases.
   return request("/api/queue/reorder", {
     method: "PATCH",
     body: JSON.stringify({
@@ -2055,7 +2052,7 @@ export interface AutoQueueResetScope {
 export async function resetAutoQueue(
   scope: AutoQueueResetScope,
 ): Promise<{ ok: boolean; deleted_entries: number; completed_runs: number }> {
-  return request("/api/auto-queue/reset", {
+  return request("/api/queue/reset", {
     method: "POST",
     body: JSON.stringify({
       run_id: scope.runId ?? undefined,
@@ -2068,7 +2065,7 @@ export async function resetAutoQueue(
 export async function resetGlobalAutoQueue(
   confirmationToken = "confirm-global-reset",
 ): Promise<{ ok: boolean; deleted_entries: number; completed_runs: number }> {
-  return request("/api/auto-queue/reset-global", {
+  return request("/api/queue/reset-global", {
     method: "POST",
     body: JSON.stringify({
       confirmation_token: confirmationToken,

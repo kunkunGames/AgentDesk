@@ -386,7 +386,7 @@ fn render_dispatch_contract(
                 "[Dispatch Contract]\n\
                  - 응답 첫 줄에 반드시 `VERDICT: pass|improve|reject|rework` 중 하나를 적는다.\n\
                  - 리뷰 결과는 GitHub issue 코멘트로 남긴다.\n\
-                 - verdict 제출 경로: `POST /api/review-verdict` (`dispatch_id={dispatch_id}`).\n\
+                 - verdict 제출 경로: `POST /api/reviews/verdict` (`dispatch_id={dispatch_id}`).\n\
                  - `improve`/`reject`/`rework`면 구체적 `notes`와 `items`를 포함한다."
             ))
         }
@@ -395,7 +395,7 @@ fn render_dispatch_contract(
             Some(format!(
                 "[Dispatch Contract]\n\
                  - 카운터 리뷰 피드백을 읽고 `accept|dispute|dismiss` 중 하나를 고른다.\n\
-                 - decision 제출 경로: `POST /api/review-decision` (`card_id={card_id}`).\n\
+                 - decision 제출 경로: `POST /api/reviews/decision` (`card_id={card_id}`).\n\
                  - accept는 피드백 수용 후 rework, dispute는 반박 후 재리뷰, dismiss는 무시 후 done 경로다."
             ))
         }
@@ -815,14 +815,14 @@ pub(super) fn build_system_prompt(
     if let Some(binding) = role_binding {
         // ReviewLite: inject minimal review rules instead of full shared prompt.
         // review and review-decision have different contracts:
-        //   review          → read code, post review comment, submit verdict via /api/review-verdict
-        //   review-decision → read counter-review feedback, submit accept/dispute/dismiss via /api/review-decision
+        //   review          → read code, post review comment, submit verdict via /api/reviews/verdict
+        //   review-decision → read counter-review feedback, submit accept/dispute/dismiss via /api/reviews/decision
         if profile == DispatchProfile::ReviewLite {
             system_prompt_owned.push_str(&match dispatch_type {
                 Some("review-decision") => "\n\n[Review Decision Rules]\n\
                      - 한국어로 소통한다\n\
                      - 카운터 리뷰 피드백을 읽고 accept/dispute/dismiss 중 결정한다\n\
-                     - POST /api/review-decision {card_id, decision, comment}로 결정을 제출한다\n\
+                     - POST /api/reviews/decision {card_id, decision, comment}로 결정을 제출한다\n\
                      - decision: accept(피드백 수용→rework), dispute(반박→재리뷰), dismiss(무시→done)"
                         .to_string(),
                 _ => "\n\n[Review Rules]\n\
@@ -1014,7 +1014,7 @@ mod dispatch_contract_tests {
             "issue_number": 1473,
             "review_quality_scope_reminder": "Review only the requested change and directly related regressions.",
             "review_verdict_guidance": "Use improve when actionable regressions are found.",
-            "verdict_endpoint": "POST /api/review-verdict"
+            "verdict_endpoint": "POST /api/reviews/verdict"
         });
         let dispatch_context_raw = dispatch_context.to_string();
         let current_task = CurrentTaskContext {
@@ -1070,7 +1070,7 @@ mod dispatch_contract_tests {
         assert!(review_prompt.contains("[Review Rules]"));
         assert!(review_prompt.contains("Review Scope Reminder"));
         assert!(review_prompt.contains("Review Verdict Guidance"));
-        assert!(review_prompt.contains("Verdict Endpoint: POST /api/review-verdict"));
+        assert!(review_prompt.contains("Verdict Endpoint: POST /api/reviews/verdict"));
         assert!(!review_prompt.contains("[Long-term Memory]"));
         assert!(!review_prompt.contains("[Proactive Memory Guidance]"));
 
@@ -1460,10 +1460,10 @@ mod tests {
             false,
         );
         // review should NOT contain decision API
-        assert!(!review_prompt.contains("/api/review-decision"));
+        assert!(!review_prompt.contains("/api/reviews/decision"));
         assert!(review_prompt.contains("[Review Rules]"));
         // review-decision should contain decision API and options
-        assert!(decision_prompt.contains("/api/review-decision"));
+        assert!(decision_prompt.contains("/api/reviews/decision"));
         assert!(decision_prompt.contains("accept/dispute/dismiss"));
         assert!(decision_prompt.contains("[Review Decision Rules]"));
     }
@@ -1691,7 +1691,7 @@ mod tests {
             "noop_reason": "feature already exists",
             "review_quality_checklist": ["edge case", "error handling"],
             "review_verdict_guidance": "quality issue가 보이면 improve",
-            "verdict_endpoint": "POST /api/review-verdict",
+            "verdict_endpoint": "POST /api/reviews/verdict",
             "ci_recovery": {
                 "job_name": "dashboard-build",
                 "reason": "Code job failed: dashboard-build",
@@ -1730,9 +1730,9 @@ mod tests {
         assert!(prompt.contains("Review Mode: noop_verification"));
         assert!(prompt.contains("Review Branch: wt/671-dispatch"));
         assert!(prompt.contains("Reviewed Commit: abc12345deadbeef"));
-        assert!(prompt.contains("Verdict Endpoint: POST /api/review-verdict"));
+        assert!(prompt.contains("Verdict Endpoint: POST /api/reviews/verdict"));
         assert!(prompt.contains("CI Recovery Job: dashboard-build"));
-        assert!(prompt.contains("`POST /api/review-verdict` (`dispatch_id=dispatch-review-671`)"));
+        assert!(prompt.contains("`POST /api/reviews/verdict` (`dispatch_id=dispatch-review-671`)"));
         assert!(prompt.contains("Review Quality Checklist"));
     }
 
@@ -1745,7 +1745,7 @@ mod tests {
             "issue_number": 692,
             "pr_number": 366,
             "reviewed_commit": "feedfacecafebeef",
-            "decision_endpoint": "POST /api/review-decision",
+            "decision_endpoint": "POST /api/reviews/decision",
             "verdict": "rework"
         });
         let dispatch_context_raw = dispatch_context.to_string();
@@ -1793,8 +1793,8 @@ mod tests {
         assert!(prompt.contains("Review Issue: #692"));
         assert!(prompt.contains("Review PR: #366"));
         assert!(prompt.contains("Reviewed Commit: feedfacecafebeef"));
-        assert!(prompt.contains("Decision Endpoint: POST /api/review-decision"));
-        assert!(rules_section.contains("POST /api/review-decision {card_id, decision, comment}"));
+        assert!(prompt.contains("Decision Endpoint: POST /api/reviews/decision"));
+        assert!(rules_section.contains("POST /api/reviews/decision {card_id, decision, comment}"));
         assert!(!rules_section.contains("owner/repo"));
         assert!(!rules_section.contains("#366"));
         assert!(!rules_section.contains("feedfacecafebeef"));
