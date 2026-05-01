@@ -319,9 +319,7 @@ CREATE TABLE IF NOT EXISTS dispatch_outbox (
     next_attempt_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     processed_at    TIMESTAMPTZ,
-    error           TEXT,
-    claimed_at      TIMESTAMPTZ,
-    claim_owner     TEXT
+    error           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS kanban_audit_logs (
@@ -611,8 +609,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_dispatch_outbox_one_shot_action
 
 CREATE INDEX IF NOT EXISTS idx_message_outbox_status_claimed_at
     ON message_outbox(status, claimed_at, id);
-CREATE INDEX IF NOT EXISTS idx_dispatch_outbox_status_claimed_at
-    ON dispatch_outbox(status, claimed_at, next_attempt_at, id);
 
 CREATE INDEX IF NOT EXISTS idx_card_retrospectives_card_created
     ON card_retrospectives(card_id, created_at DESC);
