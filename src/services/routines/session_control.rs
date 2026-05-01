@@ -55,12 +55,14 @@ struct RoutineSessionTarget {
     agent_id: String,
     provider: ProviderKind,
     channel_id: ChannelId,
+    session_id: Option<i64>,
     session_key: Option<String>,
     tmux_session: String,
 }
 
 #[derive(Debug, Clone)]
 struct RoutineSessionRow {
+    id: i64,
     session_key: Option<String>,
     thread_channel_id: Option<String>,
 }
@@ -200,7 +202,8 @@ impl RoutineSessionController {
         let channel = ChannelId::new(target_channel_id);
         let fallback_channel_name =
             fallback_tmux_channel_name(&primary_channel, channel_id, target_channel_id);
-        let session_key = session.and_then(|row| row.session_key);
+        let session_id = session.as_ref().map(|row| row.id);
+        let session_key = session.as_ref().and_then(|row| row.session_key.clone());
         let tmux_session = session_key
             .as_deref()
             .and_then(tmux_name_from_session_key)
@@ -211,6 +214,7 @@ impl RoutineSessionController {
             agent_id,
             provider,
             channel_id: channel,
+            session_id,
             session_key,
             tmux_session,
         })
@@ -227,11 +231,11 @@ impl RoutineSessionController {
         let routine_thread_channel_id = routine_thread_channel_id.map(|value| value.to_string());
         let row = sqlx::query(
             r#"
-            SELECT session_key, thread_channel_id
+            SELECT id, session_key, thread_channel_id
             FROM sessions
             WHERE agent_id = $1
               AND LOWER(COALESCE(provider, '')) = LOWER($2)
-              AND status IN ('working', 'idle', 'connected')
+              AND status IN ('turn_active', 'awaiting_bg', 'awaiting_user', 'working', 'idle', 'connected')
               AND (
                 thread_channel_id = $3
                 OR ($4::text IS NOT NULL AND thread_channel_id = $4)
@@ -243,7 +247,15 @@ impl RoutineSessionController {
                 WHEN thread_channel_id = $3 THEN 1
                 ELSE 2
               END,
-              CASE status WHEN 'working' THEN 0 WHEN 'idle' THEN 1 WHEN 'connected' THEN 2 ELSE 3 END,
+              CASE status
+                WHEN 'turn_active' THEN 0
+                WHEN 'working' THEN 0
+                WHEN 'awaiting_bg' THEN 1
+                WHEN 'awaiting_user' THEN 2
+                WHEN 'idle' THEN 3
+                WHEN 'connected' THEN 4
+                ELSE 5
+              END,
               last_heartbeat DESC NULLS LAST,
               created_at DESC
             LIMIT 1
@@ -259,6 +271,9 @@ impl RoutineSessionController {
 
         row.map(|row| {
             Ok(RoutineSessionRow {
+                id: row
+                    .try_get("id")
+                    .map_err(|error| anyhow!("decode routine session id: {error}"))?,
                 session_key: row
                     .try_get("session_key")
                     .map_err(|error| anyhow!("decode routine session_key: {error}"))?,
@@ -272,6 +287,7 @@ impl RoutineSessionController {
 
     async fn disconnect_matching_sessions(&self, target: &RoutineSessionTarget) -> Result<u64> {
         let session_key = target.session_key.as_deref();
+        let target_channel_id = target.channel_id.get().to_string();
         let result = sqlx::query(
             r#"
             UPDATE sessions
@@ -283,14 +299,16 @@ impl RoutineSessionController {
               AND LOWER(COALESCE(provider, '')) = LOWER($2)
               AND status <> 'disconnected'
               AND (
-                ($3::text IS NOT NULL AND thread_channel_id = $3)
-                OR ($4::text IS NOT NULL AND session_key = $4)
+                ($3::bigint IS NOT NULL AND id = $3)
+                OR ($4::text IS NOT NULL AND thread_channel_id = $4)
+                OR ($5::text IS NOT NULL AND session_key = $5)
               )
             "#,
         )
         .bind(&target.agent_id)
         .bind(target.provider.as_str())
-        .bind(target.channel_id.get().to_string())
+        .bind(target.session_id)
+        .bind(target_channel_id)
         .bind(session_key)
         .execute(&*self.pool)
         .await

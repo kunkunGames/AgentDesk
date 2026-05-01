@@ -116,6 +116,7 @@
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines; provider
     stop-token/tmux binding runtime, split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (2096 lines).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines).
   - `src/services/discord/formatting.rs` (3105 lines).
   - `src/services/discord/settings.rs` (2394 lines).
   - `src/services/discord/prompt_builder.rs` (2027 lines).
