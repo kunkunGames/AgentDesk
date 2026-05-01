@@ -3259,7 +3259,8 @@ async fn routine_runtime_loop(
             return;
         }
     };
-    match script_loader.load_dir(&routines_config.dir) {
+    let routine_script_dirs = routines_config.script_dirs();
+    match script_loader.load_dirs(&routine_script_dirs) {
         Ok(count) => tracing::info!(count, "routine script registry initialized"),
         Err(e) => tracing::warn!(error = %e, "routine script registry initialization failed"),
     }
@@ -3304,7 +3305,7 @@ async fn routine_runtime_loop(
             Err(e) => tracing::warn!(error = %e, "routine periodic recovery failed"),
         }
         if routines_config.hot_reload {
-            match script_loader.load_dir(&routines_config.dir) {
+            match script_loader.load_dirs(&routine_script_dirs) {
                 Ok(count) if count > 0 => {
                     tracing::debug!(count, "routine script registry hot-reload pass complete")
                 }
