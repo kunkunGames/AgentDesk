@@ -39,7 +39,7 @@ pub async fn run_due_tick(
         if let Some(logger) = discord_logger {
             logger.log_run_started(store, &run).await;
         }
-        match execute_claimed_script_run(store, loader, agent_executor, run).await {
+        match execute_claimed_script_run(store, loader, agent_executor, discord_logger, run).await {
             Ok(Some(outcome)) => {
                 if let Some(logger) = discord_logger {
                     logger.log_run_outcome(store, &outcome).await;
@@ -69,6 +69,7 @@ pub async fn execute_claimed_script_run(
     store: &RoutineStore,
     loader: &RoutineScriptLoader,
     agent_executor: Option<&RoutineAgentExecutor>,
+    discord_logger: Option<&RoutineDiscordLogger>,
     claimed: ClaimedRoutineRun,
 ) -> Result<Option<RoutineRunOutcome>> {
     let fresh_context_guaranteed = false;
@@ -91,6 +92,7 @@ pub async fn execute_claimed_script_run(
             Vec::new()
         }
     };
+    let observation_count = observations.len();
     let observations = if observations.is_empty() {
         None
     } else {
@@ -128,11 +130,23 @@ pub async fn execute_claimed_script_run(
             );
         }
     }
+    let automation_inventory_count = automation_inventory.len();
     let automation_inventory = if automation_inventory.is_empty() {
         None
     } else {
         Some(automation_inventory)
     };
+    if let Some(logger) = discord_logger {
+        logger
+            .log_run_js_inputs(
+                store,
+                &claimed,
+                observation_count,
+                automation_inventory_count,
+                claimed.checkpoint.as_ref(),
+            )
+            .await;
+    }
     let context = RoutineTickContext {
         routine: RoutineTickRoutine {
             id: claimed.routine_id.clone(),
@@ -181,6 +195,18 @@ pub async fn execute_claimed_script_run(
             }));
         }
     };
+    if let Some(logger) = discord_logger {
+        logger
+            .log_run_js_action(
+                store,
+                &claimed,
+                action.action_name(),
+                action_detail(&action).as_deref(),
+                action_prompt(&action),
+                action_has_checkpoint(&action),
+            )
+            .await;
+    }
 
     close_action(
         store,
@@ -190,6 +216,158 @@ pub async fn execute_claimed_script_run(
         fresh_context_guaranteed,
     )
     .await
+}
+
+fn action_detail(action: &RoutineAction) -> Option<String> {
+    match action {
+        RoutineAction::Complete {
+            result_json,
+            last_result,
+            ..
+        } => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(text) = last_result.as_deref().filter(|s| !s.trim().is_empty()) {
+                parts.push(text.to_string());
+            }
+            if let Some(json) = result_json {
+                for key in [
+                    "outcome_summary",
+                    "decision_summary",
+                    "top_evidence_summary",
+                    "suppression_summary",
+                    "scoring_summary",
+                    "candidates_scored",
+                    "new_candidates",
+                    "recommendations",
+                    "suppressed",
+                    "candidates",
+                    "summary",
+                    "status",
+                ] {
+                    if let Some(v) = json.get(key) {
+                        parts.push(format!("{}={}", key, compact_json_val(v)));
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" / "))
+            }
+        }
+        RoutineAction::Skip {
+            reason,
+            result_json,
+            last_result,
+            ..
+        } => last_result
+            .clone()
+            .or_else(|| reason.clone())
+            .or_else(|| result_json_summary(result_json.as_ref())),
+        RoutineAction::Pause {
+            reason,
+            result_json,
+            last_result,
+            ..
+        } => last_result
+            .clone()
+            .or_else(|| reason.clone())
+            .or_else(|| result_json_summary(result_json.as_ref())),
+        RoutineAction::Agent {
+            prompt, checkpoint, ..
+        } => {
+            let char_count = prompt.chars().count();
+            let preview: String = prompt.chars().take(300).collect();
+            let suffix = if char_count > 300 { "…" } else { "" };
+            let mut parts = Vec::new();
+            if let Some(summary) = latest_recommendation_summary(checkpoint.as_ref()) {
+                parts.push(summary);
+            }
+            parts.push(format!(
+                "agent prompt generated ({char_count}자): {preview}{suffix}"
+            ));
+            Some(parts.join(" / "))
+        }
+    }
+}
+
+fn latest_recommendation_summary(checkpoint: Option<&Value>) -> Option<String> {
+    let latest = checkpoint?
+        .get("recommendations")
+        .and_then(Value::as_array)?
+        .last()?;
+    let mut parts = Vec::new();
+    for key in [
+        "decision_summary",
+        "outcome_summary",
+        "top_evidence_summary",
+    ] {
+        if let Some(text) = latest
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(text.to_string());
+        }
+    }
+    if let Some(delta) = latest.get("score_delta_last_tick") {
+        if let Some(delta) = delta.as_i64() {
+            parts.push(format!("score_delta_last_tick={delta}"));
+        } else if let Some(delta) = delta.as_f64() {
+            parts.push(format!("score_delta_last_tick={delta:.1}"));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" / "))
+    }
+}
+
+fn compact_json_val(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Array(arr) => format!("[{}개]", arr.len()),
+        other => {
+            let s = other.to_string();
+            if s.len() > 80 {
+                format!("{}…", &s[..80])
+            } else {
+                s
+            }
+        }
+    }
+}
+
+fn action_prompt(action: &RoutineAction) -> Option<&str> {
+    match action {
+        RoutineAction::Agent { prompt, .. } => Some(prompt.as_str()),
+        _ => None,
+    }
+}
+
+fn action_has_checkpoint(action: &RoutineAction) -> bool {
+    match action {
+        RoutineAction::Complete { checkpoint, .. }
+        | RoutineAction::Skip { checkpoint, .. }
+        | RoutineAction::Pause { checkpoint, .. }
+        | RoutineAction::Agent { checkpoint, .. } => checkpoint.is_some(),
+    }
+}
+
+fn result_json_summary(result_json: Option<&Value>) -> Option<String> {
+    let value = result_json?;
+    for key in ["outcome_summary", "summary", "status"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            if !text.trim().is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn merge_loaded_script_automation_inventory(
@@ -488,7 +666,8 @@ async fn close_action(
 mod tests {
     use serde_json::json;
 
-    use super::merge_loaded_script_automation_inventory;
+    use super::{action_detail, merge_loaded_script_automation_inventory};
+    use crate::services::routines::RoutineAction;
 
     #[test]
     fn loaded_script_refs_extend_automation_inventory_as_implemented_prefixes() {
@@ -580,5 +759,28 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("monitoring/a.js:*")
         );
+    }
+
+    #[test]
+    fn agent_action_detail_includes_checkpoint_decision_summary() {
+        let action = RoutineAction::Agent {
+            prompt: "# 자동화 후보 추천\n패턴: api-friction".to_string(),
+            checkpoint: Some(json!({
+                "recommendations": [{
+                    "decision_summary": "선택 이유: api-friction 후보가 기준을 충족했습니다.",
+                    "outcome_summary": "실패 요약: API 마찰 패턴이 7회 반복됐습니다.",
+                    "top_evidence_summary": "1) /api/docs 우회 반복 (occurrences=7, weight=2)",
+                    "score_delta_last_tick": 70
+                }]
+            })),
+            next_due_at: None,
+        };
+
+        let detail = action_detail(&action).expect("agent action detail");
+
+        assert!(detail.contains("선택 이유:"));
+        assert!(detail.contains("실패 요약:"));
+        assert!(detail.contains("/api/docs 우회 반복"));
+        assert!(detail.contains("score_delta_last_tick=70"));
     }
 }

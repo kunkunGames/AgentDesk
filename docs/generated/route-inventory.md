@@ -232,8 +232,8 @@
 | `POST` | `/api/routines/{id}/resume` | `routines::resume_routine` | `src/server/routes/routines.rs:315` | `src/server/routes/domains/ops.rs:157` |
 | `POST` | `/api/routines/{id}/run-now` | `routines::run_routine_now` | `src/server/routes/routines.rs:360` | `src/server/routes/domains/ops.rs:159` |
 | `GET` | `/api/routines/{id}/runs` | `routines::list_routine_runs` | `src/server/routes/routines.rs:206` | `src/server/routes/domains/ops.rs:155` |
-| `POST` | `/api/routines/{id}/session/kill` | `routines::kill_routine_session` | `src/server/routes/routines.rs:442` | `src/server/routes/domains/ops.rs:164` |
-| `POST` | `/api/routines/{id}/session/reset` | `routines::reset_routine_session` | `src/server/routes/routines.rs:435` | `src/server/routes/domains/ops.rs:160` |
+| `POST` | `/api/routines/{id}/session/kill` | `routines::kill_routine_session` | `src/server/routes/routines.rs:448` | `src/server/routes/domains/ops.rs:164` |
+| `POST` | `/api/routines/{id}/session/reset` | `routines::reset_routine_session` | `src/server/routes/routines.rs:441` | `src/server/routes/domains/ops.rs:160` |
 | `POST` | `/api/send` | `deprecated_send_handler` | `src/server/routes/domains/access.rs:36` | `src/server/routes/domains/access.rs:21` |
 | `POST` | `/api/send_to_agent` | `deprecated_send_to_agent_handler` | `src/server/routes/domains/access.rs:45` | `src/server/routes/domains/access.rs:26` |
 | `POST` | `/api/senddm` | `deprecated_senddm_handler` | `src/server/routes/domains/access.rs:54` | `src/server/routes/domains/access.rs:28` |

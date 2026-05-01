@@ -1,5 +1,6 @@
 use chrono::Datelike;
 use serde::Serialize;
+use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -85,6 +86,62 @@ impl RoutineDiscordLogger {
                     claimed.routine_id, claimed.run_id
                 ),
                 &run_started_message(claimed),
+            )
+            .await;
+        self.persist_run_log_status(store, &claimed.run_id, &status)
+            .await;
+        status
+    }
+
+    pub async fn log_run_js_inputs(
+        &self,
+        store: &RoutineStore,
+        claimed: &ClaimedRoutineRun,
+        observation_count: usize,
+        automation_inventory_count: usize,
+        checkpoint: Option<&Value>,
+    ) -> RoutineDiscordLogStatus {
+        let status = self
+            .log_to_routine_target(
+                claimed.agent_id.as_deref(),
+                claimed.discord_thread_id.as_deref(),
+                "routine_js_inputs",
+                &format!(
+                    "routine:{}:run:{}:js-inputs",
+                    claimed.routine_id, claimed.run_id
+                ),
+                &run_js_inputs_message(
+                    claimed,
+                    observation_count,
+                    automation_inventory_count,
+                    checkpoint,
+                ),
+            )
+            .await;
+        self.persist_run_log_status(store, &claimed.run_id, &status)
+            .await;
+        status
+    }
+
+    pub async fn log_run_js_action(
+        &self,
+        store: &RoutineStore,
+        claimed: &ClaimedRoutineRun,
+        action: &str,
+        summary: Option<&str>,
+        prompt: Option<&str>,
+        checkpoint_update: bool,
+    ) -> RoutineDiscordLogStatus {
+        let status = self
+            .log_to_routine_target(
+                claimed.agent_id.as_deref(),
+                claimed.discord_thread_id.as_deref(),
+                "routine_js_action",
+                &format!(
+                    "routine:{}:run:{}:js-action",
+                    claimed.routine_id, claimed.run_id
+                ),
+                &run_js_action_message(claimed, action, summary, prompt, checkpoint_update),
             )
             .await;
         self.persist_run_log_status(store, &claimed.run_id, &status)
@@ -498,6 +555,106 @@ fn run_started_message(claimed: &ClaimedRoutineRun) -> String {
     )
 }
 
+fn run_js_inputs_message(
+    claimed: &ClaimedRoutineRun,
+    observation_count: usize,
+    automation_inventory_count: usize,
+    checkpoint: Option<&Value>,
+) -> String {
+    let mut message = format!(
+        "[{}] 루틴 JS 처리 준비: {} / run {} / observations {} / inventory {}",
+        routine_log_timestamp(),
+        compact(&claimed.name, 80),
+        short_id(&claimed.run_id),
+        observation_count,
+        automation_inventory_count,
+    );
+    match checkpoint {
+        None => message.push_str(" / checkpoint 없음"),
+        Some(cp) => {
+            message.push_str("\ncheckpoint: ");
+            message.push_str(&checkpoint_state_summary(cp));
+        }
+    }
+    message
+}
+
+fn checkpoint_state_summary(cp: &Value) -> String {
+    let mut state_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    if let Some(candidates) = cp.get("candidates").and_then(Value::as_object) {
+        for candidate in candidates.values() {
+            let state = candidate
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            *state_counts.entry(state).or_insert(0) += 1;
+        }
+    }
+    let mut parts: Vec<String> = state_counts
+        .iter()
+        .map(|(state, count)| format!("{state}:{count}"))
+        .collect();
+    if let Some(latest_rec) = cp
+        .get("recommendations")
+        .and_then(Value::as_array)
+        .and_then(|recs| recs.last())
+    {
+        let pattern_id = latest_rec
+            .get("pattern_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let summary = latest_rec
+            .get("outcome_summary")
+            .or_else(|| latest_rec.get("decision_summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !pattern_id.is_empty() {
+            let rec_line = if summary.is_empty() {
+                format!("최근 추천: {}", compact(pattern_id, 60))
+            } else {
+                format!(
+                    "최근 추천: {} - {}",
+                    compact(pattern_id, 60),
+                    compact(summary, 120)
+                )
+            };
+            parts.push(rec_line);
+        }
+    }
+    if parts.is_empty() {
+        "비어 있음".to_string()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn run_js_action_message(
+    claimed: &ClaimedRoutineRun,
+    action: &str,
+    summary: Option<&str>,
+    prompt: Option<&str>,
+    checkpoint_update: bool,
+) -> String {
+    let mut message = format!(
+        "[{}] 루틴 JS 처리 결과: {} / run {} / action \"{}\" / checkpoint {}",
+        routine_log_timestamp(),
+        compact(&claimed.name, 80),
+        short_id(&claimed.run_id),
+        action,
+        present_label(checkpoint_update)
+    );
+    if let Some(summary) = summary.filter(|value| !value.trim().is_empty()) {
+        message.push_str("\nJS 처리 요약: ");
+        message.push_str(&compact_multiline(summary, 600));
+    }
+    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
+        message.push_str("\n에이전트 프롬프트 요약: ");
+        message.push_str(&compact_multiline(prompt, 900));
+    }
+    message
+}
+
 fn run_outcome_message(routine: &RoutineRecord, outcome: &RoutineRunOutcome) -> String {
     let mut message = format!(
         "[{}] 루틴 실행 결과: {} / run {} / action \"{}\" / status \"{}\"",
@@ -519,18 +676,16 @@ fn run_outcome_message(routine: &RoutineRecord, outcome: &RoutineRunOutcome) -> 
         message.push_str(" / 요약 ");
         message.push_str(&compact(&summary, 220));
     }
+    if let Some(response) = agent_response_preview(outcome.result_json.as_ref()) {
+        message.push_str("\n에이전트 응답 요약: ");
+        message.push_str(&compact_multiline(&response, 900));
+    }
     message
 }
 
 fn outcome_summary_for_message(outcome: &RoutineRunOutcome) -> Option<String> {
     let result = outcome.result_json.as_ref()?;
-    for key in [
-        "outcome_summary",
-        "summary",
-        "assistant_message_preview",
-        "reason",
-        "error",
-    ] {
+    for key in ["outcome_summary", "summary", "reason", "error"] {
         if let Some(value) = result
             .get(key)
             .and_then(|value| value.as_str())
@@ -580,6 +735,22 @@ fn compact(value: &str, max_chars: usize) -> String {
         result.push_str("...");
     }
     result
+}
+
+fn compact_multiline(value: &str, max_chars: usize) -> String {
+    compact(&value.replace('\r', "").replace('\n', " / "), max_chars)
+}
+
+fn present_label(value: bool) -> &'static str {
+    if value { "있음" } else { "없음" }
+}
+
+fn agent_response_preview(result_json: Option<&Value>) -> Option<String> {
+    result_json?
+        .get("assistant_message_preview")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
@@ -675,6 +846,108 @@ mod tests {
     }
 
     #[test]
+    fn run_outcome_message_includes_agent_response_preview() {
+        let routine = RoutineRecord {
+            id: "routine-123456789".to_string(),
+            agent_id: Some("maker".to_string()),
+            script_ref: "daily-summary.js".to_string(),
+            name: "Daily Summary".to_string(),
+            status: "enabled".to_string(),
+            execution_strategy: "fresh".to_string(),
+            schedule: None,
+            next_due_at: None,
+            last_run_at: None,
+            last_result: None,
+            checkpoint: None,
+            discord_thread_id: None,
+            timeout_secs: None,
+            in_flight_run_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let outcome = RoutineRunOutcome {
+            run_id: "run-123456789".to_string(),
+            routine_id: routine.id.clone(),
+            script_ref: routine.script_ref.clone(),
+            action: "agent".to_string(),
+            status: "succeeded".to_string(),
+            result_json: Some(json!({
+                "assistant_message_preview": "자동화 후보는 보류합니다.\n근거가 부족합니다."
+            })),
+            error: None,
+            fresh_context_guaranteed: false,
+        };
+
+        let message = run_outcome_message(&routine, &outcome);
+
+        assert!(
+            message.contains("에이전트 응답 요약: 자동화 후보는 보류합니다. / 근거가 부족합니다.")
+        );
+    }
+
+    #[test]
+    fn run_js_action_message_includes_prompt_preview() {
+        let claimed = ClaimedRoutineRun {
+            run_id: "21e14c13-0000-0000-0000-000000000000".to_string(),
+            routine_id: "routine-123456789".to_string(),
+            agent_id: Some("monitoring".to_string()),
+            script_ref: "monitoring/automation-candidate-recommender.js".to_string(),
+            name: "Automation Candidate Recommender".to_string(),
+            execution_strategy: "fresh".to_string(),
+            checkpoint: Some(json!({"version": 1})),
+            discord_thread_id: None,
+            timeout_secs: None,
+            lease_expires_at: Utc::now(),
+        };
+
+        let message = run_js_action_message(
+            &claimed,
+            "agent",
+            Some("agent prompt generated (123 chars)"),
+            Some("# 자동화 후보 추천\n근거: 반복 실패"),
+            true,
+        );
+
+        assert!(message.contains("루틴 JS 처리 결과"));
+        assert!(message.contains("action \"agent\""));
+        assert!(message.contains("checkpoint 있음"));
+        assert!(message.contains("JS 처리 요약: agent prompt generated"));
+        assert!(message.contains("에이전트 프롬프트 요약: # 자동화 후보 추천 / 근거: 반복 실패"));
+    }
+
+    #[test]
+    fn run_js_inputs_message_summarizes_checkpoint_state() {
+        let claimed = ClaimedRoutineRun {
+            run_id: "21e14c13-0000-0000-0000-000000000000".to_string(),
+            routine_id: "routine-123456789".to_string(),
+            agent_id: Some("monitoring".to_string()),
+            script_ref: "monitoring/automation-candidate-recommender.js".to_string(),
+            name: "Automation Candidate Recommender".to_string(),
+            execution_strategy: "fresh".to_string(),
+            checkpoint: Some(json!({"version": 1})),
+            discord_thread_id: None,
+            timeout_secs: None,
+            lease_expires_at: Utc::now(),
+        };
+        let checkpoint = json!({
+            "candidates": {
+                "api-friction:docs-bypass": {"state": "observing"},
+                "ops/retry.js:complete": {"state": "recommended"}
+            },
+            "recommendations": [{
+                "pattern_id": "api-friction:docs-bypass",
+                "outcome_summary": "실패 요약: API 문서 우회가 반복됩니다."
+            }]
+        });
+
+        let message = run_js_inputs_message(&claimed, 4, 2, Some(&checkpoint));
+
+        assert!(message.contains("checkpoint: observing:1 / recommended:1"));
+        assert!(message.contains("최근 추천: api-friction:docs-bypass - 실패 요약"));
+        assert!(!message.contains("\"candidates\""));
+    }
+
+    #[test]
     fn run_started_message_includes_timestamp_and_readable_script_ref() {
         let claimed = ClaimedRoutineRun {
             run_id: "21e14c13-0000-0000-0000-000000000000".to_string(),
@@ -736,5 +1009,48 @@ mod tests {
             classify_warning("failed to enqueue routine discord log: db down"),
             "message_outbox_enqueue_failed"
         );
+    }
+
+    #[test]
+    fn checkpoint_state_summary_formats_counts_and_latest_recommendation() {
+        let cp = serde_json::json!({
+            "candidates": {
+                "routine-candidate:foo": {"state": "watching"},
+                "routine-candidate:bar": {"state": "watching"},
+                "routine-candidate:baz": {"state": "recommended"},
+                "routine-candidate:qux": {"state": "suppressed"}
+            },
+            "recommendations": [
+                {"pattern_id": "routine-candidate:old", "outcome_summary": "이전 요약"},
+                {"pattern_id": "routine-candidate:baz", "outcome_summary": "반복 패턴 5회, 루틴화 후보"}
+            ]
+        });
+        let summary = checkpoint_state_summary(&cp);
+        assert!(
+            summary.contains("recommended:1"),
+            "must show recommended count: {summary}"
+        );
+        assert!(
+            summary.contains("suppressed:1"),
+            "must show suppressed count: {summary}"
+        );
+        assert!(
+            summary.contains("watching:2"),
+            "must show watching count: {summary}"
+        );
+        assert!(
+            summary.contains("routine-candidate:baz"),
+            "must show latest pattern_id: {summary}"
+        );
+        assert!(
+            summary.contains("반복 패턴 5회"),
+            "must show outcome_summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_state_summary_empty_checkpoint() {
+        let cp = serde_json::json!({});
+        assert_eq!(checkpoint_state_summary(&cp), "비어 있음");
     }
 }

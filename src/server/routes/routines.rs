@@ -401,9 +401,15 @@ pub async fn run_routine_now(
     let discord_logger = routine_discord_logger(&state)?;
     discord_logger.log_run_started(&store, &claimed).await;
     let run_id = claimed.run_id.clone();
-    let Some(outcome) = execute_claimed_script_run(&store, &loader, Some(&agent_executor), claimed)
-        .await
-        .map_err(store_error)?
+    let Some(outcome) = execute_claimed_script_run(
+        &store,
+        &loader,
+        Some(&agent_executor),
+        Some(&discord_logger),
+        claimed,
+    )
+    .await
+    .map_err(store_error)?
     else {
         return Err(AppError::conflict(format!(
             "routine run {run_id} was already closed before outcome capture"

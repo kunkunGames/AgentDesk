@@ -1061,6 +1061,16 @@ mod tests {
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.starts_with("성공 요약:"))
                 );
+                assert!(
+                    result
+                        .get("suppression_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("자동화 인벤토리 상태=implemented"))
+                );
+                assert_eq!(
+                    result.get("scoring_summary").and_then(Value::as_str),
+                    Some("scored=0, suppressed=6")
+                );
                 let checkpoint = checkpoint.unwrap();
                 assert_eq!(
                     checkpoint
@@ -1069,6 +1079,45 @@ mod tests {
                         .unwrap()
                         .len(),
                     0
+                );
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_requires_durable_ref_before_accepted_inventory_suppresses() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let observations = (0..5)
+            .map(|_| routine_observation("ops/retry.js:complete", 2, "2026-04-30T06:59:00Z"))
+            .collect::<Vec<_>>();
+        let inventory = vec![serde_json::json!({
+            "pattern_id": "ops/retry.js:complete",
+            "status": "accepted",
+            "reason": "proposal accepted but not implemented",
+            "updated_at": "2026-04-30T06:00:00Z"
+        })];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(None, observations, inventory, now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent {
+                prompt, checkpoint, ..
+            } => {
+                assert!(prompt.contains("지속 증거가 없는 accepted"));
+                let checkpoint = checkpoint.unwrap();
+                assert!(
+                    checkpoint
+                        .pointer("/candidates/ops~1retry.js:complete")
+                        .is_some()
                 );
             }
             other => panic!("unexpected action: {other:?}"),
@@ -1188,6 +1237,24 @@ mod tests {
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.starts_with("실패 요약:"))
                 );
+                assert!(
+                    candidate
+                        .get("decision_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("선택 이유:"))
+                );
+                assert!(
+                    candidate
+                        .get("top_evidence_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("repeated evidence"))
+                );
+                assert_eq!(
+                    candidate
+                        .get("score_delta_last_tick")
+                        .and_then(Value::as_f64),
+                    Some(150.0)
+                );
                 assert_eq!(
                     candidate
                         .get("recommended_execution")
@@ -1209,6 +1276,12 @@ mod tests {
                         .pointer("/recommendations/0/outcome_summary")
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.starts_with("실패 요약:"))
+                );
+                assert!(
+                    checkpoint
+                        .pointer("/recommendations/0/decision_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with("선택 이유:"))
                 );
             }
             other => panic!("unexpected action: {other:?}"),
@@ -1236,16 +1309,83 @@ mod tests {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
                 assert!(prompt.contains("에이전트가 도출한 내용은 반드시 한국어"));
                 assert!(prompt.contains("## 성공/실패 한 줄 요약"));
+                assert!(prompt.contains("## 선택 판단 근거"));
                 assert!(prompt.contains("## 루트 기반 JS 자동화 패턴 탐지 가이드"));
+                assert!(prompt.contains("## 이전 작업/체크포인트 수렴 대응"));
+                assert!(prompt.contains("대체 탐색 경로"));
+                assert!(prompt.contains("반복 제안이 되지 않게"));
+                assert!(prompt.contains("## 이미 자동화됨 판단 기준"));
+                assert!(prompt.contains("automation_ref 또는 source_ref"));
+                assert!(prompt.contains("지속 증거가 없는 accepted"));
+                assert!(prompt.contains("## 자료 범위 및 검색 정책"));
+                assert!(prompt.contains("외부 웹자료 검색은 기본 동작이 아닙니다"));
+                assert!(prompt.contains("PostgreSQL-backed routine observation"));
                 assert!(prompt.contains("루트 원인 또는 반복 수동 작업 가설"));
                 assert!(prompt.contains("rule-vs-agent 선택 이유"));
                 assert!(prompt.contains("오탐/중복 억제 방법"));
+                assert!(prompt.contains("다른 탐색/진행 방식"));
                 assert!(prompt.contains("## Before / After"));
                 assert!(prompt.contains("## 예상 구현 파일"));
                 assert!(prompt.contains("## 검증 방법"));
                 assert!(prompt.contains("## 게이트된 핸드오프 초안"));
                 assert!(prompt.contains("requires_human_approval"));
                 assert!(prompt.contains("구현, 파일 수정, 서비스 재시작"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_recommender_prompt_includes_prior_checkpoint_convergence_guidance() {
+        let loader = automation_recommender_loader();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-30T07:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let checkpoint = serde_json::json!({
+            "version": 1,
+            "cursors": {},
+            "candidates": {
+                "ops/retry.js:complete": {
+                    "category": "routine-candidate",
+                    "state": "recommended",
+                    "score": 70,
+                    "evidence_count": 4,
+                    "examples": [],
+                    "last_recommended_at": "2026-04-30T05:00:00Z",
+                    "last_recommendation_hash": "old-hash",
+                    "cooldown_until": null
+                }
+            },
+            "suppressions": {},
+            "recommendations": [],
+            "last_tick_at": "2026-04-30T06:59:00Z",
+            "stats": {
+                "ticks": 7,
+                "observations_seen": 10,
+                "agent_escalations": 1,
+                "recommendations_today": 0,
+                "recommendation_day": "2026-04-30"
+            }
+        });
+        let observations = vec![routine_observation(
+            "ops/retry.js:complete",
+            1,
+            "2026-04-30T06:59:00Z",
+        )];
+
+        let action = loader
+            .execute_tick(
+                "monitoring/automation-candidate-recommender.js",
+                automation_recommender_context(Some(checkpoint), observations, vec![], now),
+            )
+            .unwrap();
+
+        match action {
+            crate::services::routines::RoutineAction::Agent { prompt, .. } => {
+                assert!(prompt.contains("이 후보는 이전 추천/체크포인트 이력이 있습니다"));
+                assert!(prompt.contains("이전 추천 시각=2026-04-30T05:00:00Z"));
+                assert!(prompt.contains("같은 결론에 수렴하더라도"));
+                assert!(prompt.contains("대체 탐색 경로"));
             }
             other => panic!("unexpected action: {other:?}"),
         }
@@ -1282,6 +1422,9 @@ mod tests {
         match action {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
                 assert!(prompt.len() <= 12_288);
+                assert!(prompt.contains("## 이전 작업/체크포인트 수렴 대응"));
+                assert!(prompt.contains("## 이미 자동화됨 판단 기준"));
+                assert!(prompt.contains("## 자료 범위 및 검색 정책"));
                 assert!(prompt.contains("## 지시사항"));
                 assert!(!prompt.contains('\u{FFFD}'));
             }
@@ -1448,7 +1591,24 @@ mod tests {
             .unwrap();
 
         match action {
-            crate::services::routines::RoutineAction::Complete { checkpoint, .. } => {
+            crate::services::routines::RoutineAction::Complete {
+                result_json,
+                checkpoint,
+                ..
+            } => {
+                let result = result_json.expect("complete action should explain why no agent ran");
+                assert!(
+                    result
+                        .get("decision_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("최소 5회 미만"))
+                );
+                assert!(
+                    result
+                        .get("top_evidence_summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.contains("score=100"))
+                );
                 let checkpoint = checkpoint.unwrap();
                 let candidate = checkpoint
                     .pointer("/candidates/ops~1bursty.js:complete")
