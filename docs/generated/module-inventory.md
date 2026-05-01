@@ -4,7 +4,7 @@
 
 - Production Rust modules: `379`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `90`
+- Giant files: `91`
 
 ## Namespace Summary
 
@@ -146,7 +146,7 @@
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 92 |  |
 | `server::issue_specs` | `src/server/issue_specs.rs` | 396 |  |
 | `server::maintenance` | `src/server/maintenance.rs` | 916 |  |
-| `server::multinode_regression` | `src/server/multinode_regression.rs` | 268 |  |
+| `server::multinode_regression` | `src/server/multinode_regression.rs` | 267 |  |
 | `server::resource_locks` | `src/server/resource_locks.rs` | 412 |  |
 | `server::routes` | `src/server/routes/mod.rs` | 275 |  |
 | `server::routes::agents` | `src/server/routes/agents.rs` | 2351 | giant-file |
@@ -245,7 +245,7 @@
 | `services::claude` | `src/services/claude.rs` | 2478 | giant-file |
 | `services::codex` | `src/services/codex.rs` | 1713 | giant-file |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 734 |  |
-| `services::discord` | `src/services/discord/mod.rs` | 5856 | giant-file |
+| `services::discord` | `src/services/discord/mod.rs` | 5899 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 723 |  |
 | `services::discord::agent_handoff` | `src/services/discord/agent_handoff.rs` | 413 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1166 | giant-file |
@@ -263,7 +263,7 @@
 | `services::discord::commands::restart` | `src/services/discord/commands/restart.rs` | 347 |  |
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 370 |  |
 | `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 389 |  |
-| `services::discord::commands::text_commands` | `src/services/discord/commands/text_commands.rs` | 1266 | giant-file |
+| `services::discord::commands::text_commands` | `src/services/discord/commands/text_commands.rs` | 1277 | giant-file |
 | `services::discord::discord_io` | `src/services/discord/discord_io.rs` | 558 |  |
 | `services::discord::formatting` | `src/services/discord/formatting.rs` | 3253 | giant-file |
 | `services::discord::gateway` | `src/services/discord/gateway.rs` | 841 |  |
@@ -296,7 +296,7 @@
 | `services::discord::prompt_builder` | `src/services/discord/prompt_builder.rs` | 2114 | giant-file |
 | `services::discord::queue_io` | `src/services/discord/queue_io.rs` | 570 |  |
 | `services::discord::queued_placeholders_store` | `src/services/discord/queued_placeholders_store.rs` | 412 |  |
-| `services::discord::recovery_engine` | `src/services/discord/recovery_engine.rs` | 4791 | giant-file |
+| `services::discord::recovery_engine` | `src/services/discord/recovery_engine.rs` | 4828 | giant-file |
 | `services::discord::recovery_paths` | `src/services/discord/recovery_paths/mod.rs` | 29 |  |
 | `services::discord::recovery_paths::shared` | `src/services/discord/recovery_paths/shared.rs` | 59 |  |
 | `services::discord::relay_health` | `src/services/discord/relay_health.rs` | 242 |  |
@@ -308,8 +308,8 @@
 | `services::discord::role_map` | `src/services/discord/role_map.rs` | 860 |  |
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 17 |  |
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
-| `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 2047 | giant-file |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 7204 | giant-file |
+| `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 2050 | giant-file |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 7215 | giant-file |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 129 |  |
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 2844 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 373 |  |
@@ -329,7 +329,7 @@
 | `services::discord::tmux_overload_retry` | `src/services/discord/tmux_overload_retry.rs` | 271 |  |
 | `services::discord::tmux_reaper` | `src/services/discord/tmux_reaper.rs` | 492 |  |
 | `services::discord::tmux_restart_handoff` | `src/services/discord/tmux_restart_handoff.rs` | 597 |  |
-| `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 4178 | giant-file |
+| `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 4180 | giant-file |
 | `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2096 | giant-file |
 | `services::discord::turn_bridge::context_window` | `src/services/discord/turn_bridge/context_window.rs` | 36 |  |
 | `services::discord::turn_bridge::memory_lifecycle` | `src/services/discord/turn_bridge/memory_lifecycle.rs` | 193 |  |
@@ -338,7 +338,7 @@
 | `services::discord::turn_bridge::retry_state` | `src/services/discord/turn_bridge/retry_state.rs` | 191 |  |
 | `services::discord::turn_bridge::skill_usage` | `src/services/discord/turn_bridge/skill_usage.rs` | 145 |  |
 | `services::discord::turn_bridge::stale_resume` | `src/services/discord/turn_bridge/stale_resume.rs` | 87 |  |
-| `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 930 |  |
+| `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 1016 | giant-file |
 | `services::discord::watchers::lifecycle` | `src/services/discord/watchers/lifecycle.rs` | 1969 | giant-file |
 | `services::discord::watchers::lifecycle_decision` | `src/services/discord/watchers/lifecycle_decision.rs` | 261 |  |
 | `services::discord_config_audit` | `src/services/discord_config_audit.rs` | 1352 | giant-file |

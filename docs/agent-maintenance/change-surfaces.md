@@ -113,6 +113,8 @@
   - `src/services/discord/router/message_handler.rs` (7158 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (3645 lines).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines; provider
+    stop-token/tmux binding runtime, split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (2096 lines).
   - `src/services/discord/formatting.rs` (3105 lines).
   - `src/services/discord/settings.rs` (2394 lines).
