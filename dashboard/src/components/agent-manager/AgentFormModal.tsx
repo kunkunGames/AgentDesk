@@ -1,14 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { Department } from "../../types";
 import { localeName, useI18n } from "../../i18n";
-import * as api from "../../api";
 import EmojiPicker from "./EmojiPicker";
 import AgentPromptEditor from "./AgentPromptEditor";
 import type { FormData } from "./types";
 import {
   SurfaceActionButton,
   SurfaceCard,
-  SurfaceNotice,
   SurfaceSubsection,
 } from "../common/SurfacePrimitives";
 
@@ -303,9 +301,6 @@ export default function AgentFormModal({
             </div>
           </SurfaceSubsection>
         </div>
-
-
-
         {/* Actions — full width */}
         <div
           className="mt-5 flex flex-col gap-2 pt-4 sm:flex-row"
