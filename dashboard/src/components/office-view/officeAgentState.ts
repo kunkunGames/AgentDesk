@@ -158,7 +158,7 @@ export function deriveOfficeAgentState(
       );
     }
 
-    if (isManualInterventionCard(card)) {
+    if (!TERMINAL_CARD_STATUSES.has(card.status) && isManualInterventionCard(card)) {
       manualInterventionByAgent.set(
         agentId,
         selectPreferredManualIntervention(manualInterventionByAgent.get(agentId), {

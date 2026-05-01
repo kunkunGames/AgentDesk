@@ -134,4 +134,20 @@ describe("deriveOfficeAgentState", () => {
       reason: null,
     });
   });
+
+  it("ignores terminal cards with historical blocked reasons", () => {
+    const agent = makeAgent();
+
+    const state = deriveOfficeAgentState([agent], [
+      makeCard({
+        id: "card-done-blocked",
+        status: "done",
+        blocked_reason: "pr:create_failed:missing_branch",
+        review_status: "dilemma_pending",
+        updated_at: 1_710_000_300_000,
+      }),
+    ]);
+
+    expect(state.manualInterventionByAgent.has(agent.id)).toBe(false);
+  });
 });
