@@ -1001,7 +1001,7 @@ where
     crate::utils::async_bridge::block_on_pg_result(pool, future_factory, |error| error)
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
