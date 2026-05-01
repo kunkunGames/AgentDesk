@@ -158,7 +158,14 @@ impl RoutineScriptLoader {
             }
 
             let mut entries = Vec::new();
-            collect_routine_script_paths(root, &mut entries)?;
+            if let Err(e) = collect_routine_script_paths(root, &mut entries) {
+                tracing::warn!(
+                    routines_dir = %root.display(),
+                    error = %e,
+                    "failed to scan routines directory; skipping root"
+                );
+                continue;
+            }
             entries.sort();
 
             for path in entries {
@@ -742,6 +749,33 @@ mod tests {
         assert_eq!(
             loader.get_script("shared.js").unwrap().unwrap().name,
             "Operator Shared"
+        );
+    }
+
+    #[test]
+    fn load_dirs_skips_invalid_root_and_keeps_loading_remaining_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let invalid_root = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_root, "not a directory").unwrap();
+        let healthy_root = temp.path().join("healthy");
+        std::fs::create_dir_all(&healthy_root).unwrap();
+        std::fs::write(
+            healthy_root.join("healthy.js"),
+            "agentdesk.routines.register({ name: 'Healthy', tick() { return { action: 'skip' }; } });",
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        assert_eq!(
+            loader
+                .load_dirs(&[invalid_root, healthy_root.clone()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(loader.script_refs().unwrap(), vec!["healthy.js"]);
+        assert_eq!(
+            loader.get_script("healthy.js").unwrap().unwrap().file,
+            healthy_root.join("healthy.js")
         );
     }
 
