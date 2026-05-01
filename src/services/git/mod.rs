@@ -15,7 +15,10 @@ pub use commit_resolver::{
 };
 pub(crate) use remote::parse_github_repo_from_remote;
 pub use repo_resolver::{resolve_repo_dir, resolve_repo_dir_for_id, resolve_repo_dir_for_target};
-pub use worktree_resolver::find_worktree_for_issue;
+pub use worktree_resolver::{
+    ManagedWorktreeCleanup, cleanup_managed_worktree, ensure_worktree_for_issue,
+    find_worktree_for_issue,
+};
 
 pub(crate) fn git_command() -> std::process::Command {
     crate::services::platform::binary_resolver::git_command()

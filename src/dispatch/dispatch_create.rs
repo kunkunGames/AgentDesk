@@ -16,6 +16,7 @@ use super::dispatch_channel::{
 use super::dispatch_context::{
     ReviewTargetTrust, TargetRepoSource, build_review_context,
     dispatch_context_with_session_strategy, dispatch_context_worktree_target,
+    dispatch_type_requires_fresh_worktree, ensure_card_worktree,
     inject_review_dispatch_identifiers, json_string_field, resolve_card_target_repo_ref,
     resolve_card_worktree, resolve_parent_dispatch_context,
 };
@@ -590,9 +591,24 @@ async fn create_dispatch_core_internal(
         let worktree_target = if let Some((wt_path, wt_branch)) =
             dispatch_context_worktree_target(&context_with_session_strategy)?
         {
-            Some((wt_path, wt_branch))
+            Some((wt_path, wt_branch, false))
         } else if phase_gate_sidecar {
             None
+        } else if dispatch_type_requires_fresh_worktree(Some(dispatch_type)) {
+            let (wt_path, wt_branch, _, created) = ensure_card_worktree(
+                pg_pool,
+                kanban_card_id,
+                Some(&context_with_session_strategy),
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot create {} dispatch for card {}: fresh worktree required but card issue/repo could not be resolved",
+                    dispatch_type,
+                    kanban_card_id
+                )
+            })?;
+            Some((wt_path, Some(wt_branch), created))
         } else {
             resolve_card_worktree(
                 pg_pool,
@@ -600,16 +616,20 @@ async fn create_dispatch_core_internal(
                 Some(&context_with_session_strategy),
             )
             .await?
-            .map(|(wt_path, wt_branch, _)| (wt_path, Some(wt_branch)))
+            .map(|(wt_path, wt_branch, _)| (wt_path, Some(wt_branch), false))
         };
 
-        if let Some((wt_path, wt_branch)) = worktree_target
+        if let Some((wt_path, wt_branch, managed_created)) = worktree_target
             && let Ok(mut obj) =
                 serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
         {
             obj.insert("worktree_path".to_string(), json!(wt_path.clone()));
             if let Some(wt_branch) = wt_branch {
                 obj.insert("worktree_branch".to_string(), json!(wt_branch));
+            }
+            if managed_created {
+                obj.insert("managed_worktree".to_string(), json!(true));
+                obj.insert("managed_worktree_cleanup".to_string(), json!("terminal"));
             }
             tracing::info!(
                 "[dispatch] {} dispatch for card {}: injecting worktree_path={}",
