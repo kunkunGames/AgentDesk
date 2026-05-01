@@ -210,6 +210,7 @@ pub async fn execute_structured_with_context(
                     model_ref,
                     None,
                     None,
+                    None,
                 ),
                 ProviderKind::Gemini => gemini::execute_command_streaming(
                     &prompt,

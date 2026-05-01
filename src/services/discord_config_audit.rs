@@ -95,6 +95,8 @@ struct LegacyBotEntry {
     channel_model_overrides: BTreeMap<String, String>,
     channel_fast_modes: BTreeMap<String, bool>,
     channel_fast_mode_reset_pending: BTreeSet<String>,
+    channel_codex_goals: BTreeMap<String, bool>,
+    channel_codex_goals_reset_pending: BTreeSet<String>,
 }
 
 impl ConfigAuditReport {
@@ -424,6 +426,8 @@ fn audit_bot_settings(
         if !legacy.channel_model_overrides.is_empty()
             || !legacy.channel_fast_modes.is_empty()
             || !legacy.channel_fast_mode_reset_pending.is_empty()
+            || !legacy.channel_codex_goals.is_empty()
+            || !legacy.channel_codex_goals_reset_pending.is_empty()
         {
             let mut runtime_entry = Map::new();
             if !legacy.channel_model_overrides.is_empty() {
@@ -442,6 +446,18 @@ fn audit_bot_settings(
                 runtime_entry.insert(
                     "channel_fast_mode_reset_pending".to_string(),
                     serde_json::json!(legacy.channel_fast_mode_reset_pending),
+                );
+            }
+            if !legacy.channel_codex_goals.is_empty() {
+                runtime_entry.insert(
+                    "channel_codex_goals".to_string(),
+                    serde_json::json!(legacy.channel_codex_goals),
+                );
+            }
+            if !legacy.channel_codex_goals_reset_pending.is_empty() {
+                runtime_entry.insert(
+                    "channel_codex_goals_reset_pending".to_string(),
+                    serde_json::json!(legacy.channel_codex_goals_reset_pending),
                 );
             }
             runtime_only_entries.insert(legacy.hash_key.clone(), Value::Object(runtime_entry));
@@ -821,6 +837,32 @@ fn parse_legacy_bot_entry(entry_key: &str, entry_value: &Value) -> LegacyBotEntr
             .unwrap_or_default(),
         channel_fast_mode_reset_pending: entry_value
             .get("channel_fast_mode_reset_pending")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default(),
+        channel_codex_goals: entry_value
+            .get("channel_codex_goals")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(channel_id, enabled)| {
+                        enabled
+                            .as_bool()
+                            .map(|enabled| (channel_id.clone(), enabled))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default(),
+        channel_codex_goals_reset_pending: entry_value
+            .get("channel_codex_goals_reset_pending")
             .and_then(Value::as_array)
             .map(|values| {
                 values

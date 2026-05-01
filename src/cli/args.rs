@@ -238,6 +238,9 @@ pub(crate) enum Commands {
         /// Override Codex native fast mode for every turn in this wrapper session
         #[arg(long, value_enum)]
         fast_mode_state: Option<FastModeStateArg>,
+        /// Override Codex goals feature flag for every turn in this wrapper session
+        #[arg(long, value_enum)]
+        goals_state: Option<FeatureStateArg>,
         /// Working directory (defaults to ".")
         #[arg(long, default_value = ".")]
         cwd: String,
@@ -639,6 +642,13 @@ pub(crate) enum InputModeArg {
 #[derive(Clone, Copy, ValueEnum)]
 #[cfg(unix)]
 pub(crate) enum FastModeStateArg {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+#[cfg(unix)]
+pub(crate) enum FeatureStateArg {
     Enabled,
     Disabled,
 }

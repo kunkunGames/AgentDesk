@@ -22,6 +22,7 @@ pub fn run(
     reasoning_effort: Option<&str>,
     resume_session_id: Option<&str>,
     fast_mode_enabled: Option<bool>,
+    goals_enabled: Option<bool>,
     input_mode: InputMode,
     compact_token_limit: Option<u64>,
 ) {
@@ -146,6 +147,7 @@ pub fn run(
         &prompt,
         &mut thread_id,
         fast_mode_enabled,
+        goals_enabled,
         compact_token_limit,
     ) {
         emit_result_error(&mut output, &err);
@@ -167,6 +169,7 @@ pub fn run(
             next_prompt.trim(),
             &mut thread_id,
             fast_mode_enabled,
+            goals_enabled,
             compact_token_limit,
         ) {
             emit_result_error(&mut output, &err);
@@ -224,6 +227,7 @@ fn run_turn(
     prompt: &str,
     thread_id: &mut Option<String>,
     fast_mode_enabled: Option<bool>,
+    goals_enabled: Option<bool>,
     compact_token_limit: Option<u64>,
 ) -> Result<(), String> {
     emit_status("[sending...]");
@@ -250,6 +254,14 @@ fn run_turn(
             "--disable".to_string()
         });
         args.push("fast_mode".to_string());
+    }
+    if let Some(enabled) = goals_enabled {
+        args.push(if enabled {
+            "--enable".to_string()
+        } else {
+            "--disable".to_string()
+        });
+        args.push("goals".to_string());
     }
     args.push("exec".to_string());
     if let Some(existing_thread_id) = thread_id.as_deref() {

@@ -63,6 +63,31 @@ fn restored_fast_mode_reset_channels(bot_settings: &DiscordBotSettings) -> Vec<C
     channels
 }
 
+fn restored_codex_goals_enabled_channels(bot_settings: &DiscordBotSettings) -> Vec<ChannelId> {
+    let mut channels: Vec<ChannelId> = bot_settings
+        .channel_codex_goals
+        .iter()
+        .filter_map(|(channel_id, enabled)| {
+            if !*enabled {
+                return None;
+            }
+            channel_id.parse::<u64>().ok().map(ChannelId::new)
+        })
+        .collect();
+    channels.sort_unstable_by_key(|channel_id| channel_id.get());
+    channels
+}
+
+fn restored_codex_goals_reset_channels(bot_settings: &DiscordBotSettings) -> Vec<ChannelId> {
+    let mut channels: Vec<ChannelId> = bot_settings
+        .channel_codex_goals_reset_pending
+        .iter()
+        .filter_map(|channel_id| channel_id.parse::<u64>().ok().map(ChannelId::new))
+        .collect();
+    channels.sort_unstable_by_key(|channel_id| channel_id.get());
+    channels
+}
+
 fn discord_gateway_lock_id(token_hash: &str) -> i64 {
     // `discord_token_hash()` returns "discord_<16hex>". Strip the literal prefix
     // so the first 16 chars we sample are actual hex; otherwise the `is_ascii_hexdigit`
@@ -858,6 +883,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         restored_fast_mode_enabled_channels_for_provider(&bot_settings, &provider);
     let restored_fast_mode_reset_entries = restored_fast_mode_reset_entries(&bot_settings);
     let restored_fast_mode_reset_channels = restored_fast_mode_reset_channels(&bot_settings);
+    let restored_codex_goals_channels = restored_codex_goals_enabled_channels(&bot_settings);
+    let restored_codex_goals_reset_channels = restored_codex_goals_reset_channels(&bot_settings);
 
     let shared = Arc::new(SharedData {
         core: Mutex::new(CoreState {
@@ -933,6 +960,20 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
             }
             set
         },
+        codex_goals_channels: {
+            let set = dashmap::DashSet::new();
+            for channel_id in &restored_codex_goals_channels {
+                set.insert(*channel_id);
+            }
+            set
+        },
+        codex_goals_session_reset_pending: {
+            let set = dashmap::DashSet::new();
+            for channel_id in &restored_codex_goals_reset_channels {
+                set.insert(*channel_id);
+            }
+            set
+        },
         model_session_reset_pending: {
             let set = dashmap::DashSet::new();
             for (channel_id, _) in &restored_model_overrides {
@@ -946,6 +987,9 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 set.insert(*channel_id);
             }
             for channel_id in &restored_fast_mode_reset_channels {
+                set.insert(*channel_id);
+            }
+            for channel_id in &restored_codex_goals_reset_channels {
                 set.insert(*channel_id);
             }
             set
@@ -1010,6 +1054,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         commands::cmd_metrics(),
         commands::cmd_model(),
         commands::cmd_fast(),
+        commands::cmd_goals(),
     ];
     slash_commands.extend([
         commands::cmd_queue(),
@@ -1937,6 +1982,27 @@ mod tests {
         assert_eq!(
             restored_fast_mode_reset_channels(&settings),
             vec![ChannelId::new(123), ChannelId::new(456)]
+        );
+    }
+
+    #[test]
+    fn restored_codex_goals_channels_restore_runtime_settings() {
+        let mut settings = DiscordBotSettings::default();
+        settings.channel_codex_goals.insert("123".to_string(), true);
+        settings
+            .channel_codex_goals
+            .insert("456".to_string(), false);
+        settings
+            .channel_codex_goals_reset_pending
+            .insert("789".to_string());
+
+        assert_eq!(
+            restored_codex_goals_enabled_channels(&settings),
+            vec![ChannelId::new(123)]
+        );
+        assert_eq!(
+            restored_codex_goals_reset_channels(&settings),
+            vec![ChannelId::new(789)]
         );
     }
 

@@ -261,6 +261,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             reasoning_effort,
             resume_session_id,
             fast_mode_state,
+            goals_state,
             cwd,
             input_mode,
             compact_token_limit,
@@ -273,6 +274,10 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 super::args::FastModeStateArg::Enabled => true,
                 super::args::FastModeStateArg::Disabled => false,
             });
+            let goals_override = goals_state.map(|state| match state {
+                super::args::FeatureStateArg::Enabled => true,
+                super::args::FeatureStateArg::Disabled => false,
+            });
             crate::services::codex_tmux_wrapper::run(
                 &output_file,
                 &input_fifo,
@@ -283,6 +288,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 reasoning_effort.as_deref(),
                 resume_session_id.as_deref(),
                 fast_mode_override,
+                goals_override,
                 mode,
                 compact_token_limit,
             );

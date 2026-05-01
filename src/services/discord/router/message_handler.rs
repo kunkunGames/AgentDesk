@@ -560,6 +560,17 @@ fn native_fast_mode_override_for_turn(
     }
 }
 
+fn codex_goals_override_for_turn(
+    provider: &ProviderKind,
+    channel_codex_goals_setting: Option<bool>,
+) -> Option<bool> {
+    if matches!(provider, ProviderKind::Codex) {
+        channel_codex_goals_setting
+    } else {
+        None
+    }
+}
+
 fn effective_fast_mode_channel_id(
     channel_id: ChannelId,
     thread_parent: Option<(ChannelId, Option<String>)>,
@@ -1429,6 +1440,10 @@ pub(in crate::services::discord) async fn start_headless_turn(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, fast_mode_channel_id).await,
     );
+    let codex_goals_override = codex_goals_override_for_turn(
+        &provider,
+        super::super::commands::channel_codex_goals_setting(shared, fast_mode_channel_id).await,
+    );
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
     let compact_percent = ctx_thresholds.compact_pct_for(&provider);
     let model_context_window = provider.resolve_context_window(model_for_turn.as_deref());
@@ -1491,6 +1506,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
                             Some(provider_for_blocking.clone()),
                             model_for_turn.as_deref(),
                             native_fast_mode_override,
+                            codex_goals_override,
                             compact_token_limit_for_codex,
                         ),
                         ProviderKind::Gemini => gemini::execute_command_streaming(
@@ -3888,6 +3904,10 @@ pub(in crate::services::discord) async fn handle_text_message(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, fast_mode_channel_id).await,
     );
+    let codex_goals_override = codex_goals_override_for_turn(
+        &provider,
+        super::super::commands::channel_codex_goals_setting(shared, fast_mode_channel_id).await,
+    );
 
     // Fetch context compact percent from ADK settings (provider-specific)
     let ctx_thresholds = super::super::adk_session::fetch_context_thresholds(shared.api_port).await;
@@ -3957,6 +3977,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                             Some(provider_for_blocking.clone()),
                             model_for_turn.as_deref(),
                             native_fast_mode_override,
+                            codex_goals_override,
                             compact_token_limit_for_codex,
                         ),
                         ProviderKind::Gemini => gemini::execute_command_streaming(
@@ -5916,6 +5937,22 @@ mod tests {
         );
         assert_eq!(
             native_fast_mode_override_for_turn(&ProviderKind::Gemini, Some(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_goals_override_only_applies_to_codex() {
+        assert_eq!(
+            codex_goals_override_for_turn(&ProviderKind::Codex, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            codex_goals_override_for_turn(&ProviderKind::Codex, Some(false)),
+            Some(false)
+        );
+        assert_eq!(
+            codex_goals_override_for_turn(&ProviderKind::Claude, Some(true)),
             None
         );
     }

@@ -635,6 +635,10 @@ pub(super) struct DiscordBotSettings {
     pub(super) channel_fast_modes: std::collections::HashMap<String, bool>,
     /// channel_id (string) → pending native fast mode reset on the next turn
     pub(super) channel_fast_mode_reset_pending: std::collections::HashSet<String>,
+    /// channel_id (string) → Codex goals feature enabled
+    pub(super) channel_codex_goals: std::collections::HashMap<String, bool>,
+    /// channel_id (string) → pending Codex goals session reset on the next turn
+    pub(super) channel_codex_goals_reset_pending: std::collections::HashSet<String>,
     /// Discord user ID of the registered owner (must be configured explicitly)
     pub(super) owner_user_id: Option<u64>,
     /// Additional authorized user IDs (added by owner via /adduser)
@@ -659,6 +663,8 @@ impl Default for DiscordBotSettings {
             channel_model_overrides: std::collections::HashMap::new(),
             channel_fast_modes: std::collections::HashMap::new(),
             channel_fast_mode_reset_pending: std::collections::HashSet::new(),
+            channel_codex_goals: std::collections::HashMap::new(),
+            channel_codex_goals_reset_pending: std::collections::HashSet::new(),
             owner_user_id: None,
             allowed_user_ids: Vec::new(),
             allow_all_users: false,
@@ -1231,6 +1237,10 @@ pub(super) struct SharedData {
     /// Provider-scoped pending native fast-mode resets, encoded as
     /// `provider:channel_id` strings for mixed-provider dispatch safety.
     pub(super) fast_mode_session_reset_pending: dashmap::DashSet<String>,
+    /// Per-channel Codex goals feature enablement.
+    pub(super) codex_goals_channels: dashmap::DashSet<ChannelId>,
+    /// Channels that must restart Codex before the next turn because goals changed.
+    pub(super) codex_goals_session_reset_pending: dashmap::DashSet<ChannelId>,
     /// Channels that must start a fresh provider session on the next turn
     /// because the effective model override changed.
     pub(super) model_session_reset_pending: dashmap::DashSet<ChannelId>,
@@ -1915,6 +1925,8 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         model_overrides: dashmap::DashMap::new(),
         fast_mode_channels: dashmap::DashSet::new(),
         fast_mode_session_reset_pending: dashmap::DashSet::new(),
+        codex_goals_channels: dashmap::DashSet::new(),
+        codex_goals_session_reset_pending: dashmap::DashSet::new(),
         model_session_reset_pending: dashmap::DashSet::new(),
         session_reset_pending: dashmap::DashSet::new(),
         model_picker_pending: dashmap::DashMap::new(),
