@@ -14,13 +14,23 @@ UPDATE sessions
 ALTER TABLE sessions
     ALTER COLUMN status SET DEFAULT 'disconnected';
 
-ALTER TABLE sessions
-    ADD CONSTRAINT sessions_status_known_check
-    CHECK (status IN (
-        'turn_active',
-        'awaiting_bg',
-        'awaiting_user',
-        'idle',
-        'disconnected',
-        'aborted'
-    ));
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'sessions_status_known_check'
+           AND conrelid = 'sessions'::regclass
+    ) THEN
+        ALTER TABLE sessions
+            ADD CONSTRAINT sessions_status_known_check
+            CHECK (status IN (
+                'turn_active',
+                'awaiting_bg',
+                'awaiting_user',
+                'idle',
+                'disconnected',
+                'aborted'
+            ));
+    END IF;
+END $$;
