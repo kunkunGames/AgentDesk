@@ -246,7 +246,7 @@ function buildSuppressedSet(cp, inventory) {
       state === "suppressed" ||
       state === "rejected"
     ) {
-      addPattern(patternId, `checkpoint suppression state=${state}`);
+      addPattern(patternId, `체크포인트 억제 상태=${state}`);
     }
   }
 
@@ -261,7 +261,7 @@ function buildSuppressedSet(cp, inventory) {
     ) {
       addPattern(
         item.pattern_id,
-        `automation inventory status=${item.status}${item.source_ref ? ` ref=${item.source_ref}` : ""}`
+        `자동화 인벤토리 상태=${item.status}${item.source_ref ? ` ref=${item.source_ref}` : ""}`
       );
     }
   }
@@ -275,7 +275,7 @@ function buildSuppressedSet(cp, inventory) {
       s === "suppressed" ||
       s === "rejected"
     ) {
-      addPattern(patternId, `candidate state=${s}`);
+      addPattern(patternId, `후보 상태=${s}`);
     }
   }
 
@@ -307,7 +307,7 @@ function dropSuppressedCandidates(cp, suppressedSet) {
       dropped.push({
         pattern_id: patternId,
         state: s,
-        reason: suppressedSet.reason(patternId) || "suppressed by inventory/checkpoint",
+        reason: suppressedSet.reason(patternId) || "인벤토리/체크포인트 기준으로 억제",
       });
       delete cp.candidates[patternId];
     }
@@ -369,7 +369,7 @@ function scoreObservations(cp, observations, suppressedSet, nowStr) {
     if (suppressedSet.has(patternId)) {
       report.suppressed.push({
         pattern_id: patternId,
-        reason: suppressedSet.reason(patternId) || "suppressed by inventory/checkpoint",
+        reason: suppressedSet.reason(patternId) || "인벤토리/체크포인트 기준으로 억제",
       });
       continue;
     }
@@ -646,6 +646,23 @@ function candidateDecisionSummary(patternId, candidate, assessment) {
   return `선택 이유: ${patternId} 후보가 score=${score}, delta=${delta}, evidence=${evidenceCount}로 기준을 충족했습니다. ${assessment.outcomeSummary} 핵심 근거: ${evidenceSummary}`;
 }
 
+function convergenceSummary(candidate) {
+  if (!candidate.last_recommended_at && !candidate.last_recommendation_hash) {
+    return "이 후보는 이전 추천 이력이 없습니다. 현재 tick의 새 근거를 중심으로 평가합니다.";
+  }
+  const parts = [];
+  if (candidate.last_recommended_at) {
+    parts.push(`이전 추천 시각=${candidate.last_recommended_at}`);
+  }
+  if (candidate.last_recommendation_hash) {
+    parts.push(`이전 추천 해시=${candidate.last_recommendation_hash}`);
+  }
+  if (candidate.cooldown_until) {
+    parts.push(`쿨다운 종료=${candidate.cooldown_until}`);
+  }
+  return `이 후보는 이전 추천/체크포인트 이력이 있습니다. ${parts.join(", ")}`;
+}
+
 function buildPrompt(escalation) {
   const { patternId, candidate } = escalation;
   const evidenceLines = (candidate.examples || [])
@@ -692,6 +709,20 @@ ${decisionSummary}
 - 규칙으로 충분한 deterministic retry/check/threshold인지, 문맥 판단과 코드 변경 설계가 필요한 agent 주도 자동화인지 구분합니다.
 - 근거가 부족하거나 오탐 가능성이 높으면 자동화 보류로 결론을 내립니다.
 
+## 이전 작업/체크포인트 수렴 대응
+${convergenceSummary(candidate)}
+- 이전 추천, checkpoint, inventory를 보고 같은 결론에 수렴하더라도 "추가 개선 없음"으로만 끝내지 않습니다.
+- 반복 제안이 되지 않게 새 근거, 새 실패 양상, 새 검증 경로, 기존 자동화의 누락 지점 중 하나를 반드시 확인합니다.
+- 목표 달성을 위해 대체 탐색 경로를 최소 1개 제안합니다: observation 스키마 보강, 로그 수집 위치 변경, suppression/inventory 오탐 점검, rule 기반 작은 자동화, agent 주도 핸드오프 분리, 검증 metric 추가.
+- 여전히 보류라면 다음 tick에서 어떤 근거를 더 수집해야 하는지 한 줄로 남깁니다.
+
+## 이미 자동화됨 판단 기준
+- automation inventory, checkpoint suppression, candidate state 중 하나가 같은 pattern_id 또는 wildcard prefix와 매칭되어야 합니다.
+- status가 implemented/suppressed/rejected이면 이미 처리된 것으로 봅니다.
+- status가 accepted인 경우에는 automation_ref 또는 source_ref 같은 지속 증거(durable proof)가 있을 때만 이미 자동화된 것으로 봅니다.
+- 지속 증거가 없는 accepted 또는 단순 이전 추천 이력은 자동화 완료가 아니라 "이전 제안"으로만 봅니다.
+- 이름이 비슷한 정도로 중복 처리하지 말고 pattern/category/evidence_ref가 같은 루트 원인이나 같은 반복 수동 작업을 가리키는지 확인합니다.
+
 ## 자료 범위 및 검색 정책
 - 기본 판단 근거는 PostgreSQL-backed routine observation/checkpoint/inventory, 로그 기반 observation, memento-mcp digest observation입니다.
 - 유저 프롬프트와 메모리는 runtime이 구조화 observation 또는 승인된 digest로 제공한 범위만 사용합니다.
@@ -727,6 +758,7 @@ ${handoffAcceptance}
 3. 구현한다면 제안 구현 방식, rule-vs-agent 선택 이유, 영향 파일/루틴
 4. 성공/실패에 대한 한 줄 요약
 5. 예상 부작용, 오탐/중복 억제 방법, 자동화 동작 검증 방법
+6. 이전 추천과 같은 결론이면 다른 탐색/진행 방식 또는 추가로 수집할 근거
 
 구현, 파일 수정, 서비스 재시작, memento 쓰기, PR/카드/이슈 생성은 금지합니다.
 이 요청은 제안 전용입니다.`;
@@ -735,12 +767,22 @@ ${handoffAcceptance}
     return raw;
   }
 
-  // Trim examples to fit cap
-  const header = raw.split("## 근거 예시")[0];
-  const footer = "\n\n## 지시사항\n" + raw.split("## 지시사항\n")[1];
-  const budget = PROMPT_CAP_BYTES - utf8ByteLength(header) - utf8ByteLength(footer) - 20;
-  const trimmedEvidence = truncateUtf8(evidenceLines, budget);
-  return header + "## 근거 예시\n" + trimmedEvidence + footer;
+  // Trim examples first while preserving policy and decision sections.
+  const evidenceHeader = "## 근거 예시\n";
+  const [header, restWithEvidence] = raw.split(evidenceHeader);
+  const evidenceBlock = evidenceLines || "(기록 없음)";
+  const rest = restWithEvidence.slice(evidenceBlock.length);
+  const budget =
+    PROMPT_CAP_BYTES -
+    utf8ByteLength(header) -
+    utf8ByteLength(evidenceHeader) -
+    utf8ByteLength(rest) -
+    20;
+  const trimmedEvidence =
+    budget > 32
+      ? truncateUtf8(evidenceBlock, budget)
+      : "(근거 예시는 크기 제한으로 생략됨)";
+  return header + evidenceHeader + trimmedEvidence + rest;
 }
 
 // --- Checkpoint size guard ---

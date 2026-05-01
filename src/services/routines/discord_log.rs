@@ -614,7 +614,7 @@ fn checkpoint_state_summary(cp: &Value) -> String {
                 format!("최근 추천: {}", compact(pattern_id, 60))
             } else {
                 format!(
-                    "최근 추천: {} — {}",
+                    "최근 추천: {} - {}",
                     compact(pattern_id, 60),
                     compact(summary, 120)
                 )
@@ -916,6 +916,38 @@ mod tests {
     }
 
     #[test]
+    fn run_js_inputs_message_summarizes_checkpoint_state() {
+        let claimed = ClaimedRoutineRun {
+            run_id: "21e14c13-0000-0000-0000-000000000000".to_string(),
+            routine_id: "routine-123456789".to_string(),
+            agent_id: Some("monitoring".to_string()),
+            script_ref: "monitoring/automation-candidate-recommender.js".to_string(),
+            name: "Automation Candidate Recommender".to_string(),
+            execution_strategy: "fresh".to_string(),
+            checkpoint: Some(json!({"version": 1})),
+            discord_thread_id: None,
+            timeout_secs: None,
+            lease_expires_at: Utc::now(),
+        };
+        let checkpoint = json!({
+            "candidates": {
+                "api-friction:docs-bypass": {"state": "observing"},
+                "ops/retry.js:complete": {"state": "recommended"}
+            },
+            "recommendations": [{
+                "pattern_id": "api-friction:docs-bypass",
+                "outcome_summary": "실패 요약: API 문서 우회가 반복됩니다."
+            }]
+        });
+
+        let message = run_js_inputs_message(&claimed, 4, 2, Some(&checkpoint));
+
+        assert!(message.contains("checkpoint: observing:1 / recommended:1"));
+        assert!(message.contains("최근 추천: api-friction:docs-bypass - 실패 요약"));
+        assert!(!message.contains("\"candidates\""));
+    }
+
+    #[test]
     fn run_started_message_includes_timestamp_and_readable_script_ref() {
         let claimed = ClaimedRoutineRun {
             run_id: "21e14c13-0000-0000-0000-000000000000".to_string(),
@@ -994,11 +1026,26 @@ mod tests {
             ]
         });
         let summary = checkpoint_state_summary(&cp);
-        assert!(summary.contains("recommended:1"), "must show recommended count: {summary}");
-        assert!(summary.contains("suppressed:1"), "must show suppressed count: {summary}");
-        assert!(summary.contains("watching:2"), "must show watching count: {summary}");
-        assert!(summary.contains("routine-candidate:baz"), "must show latest pattern_id: {summary}");
-        assert!(summary.contains("반복 패턴 5회"), "must show outcome_summary: {summary}");
+        assert!(
+            summary.contains("recommended:1"),
+            "must show recommended count: {summary}"
+        );
+        assert!(
+            summary.contains("suppressed:1"),
+            "must show suppressed count: {summary}"
+        );
+        assert!(
+            summary.contains("watching:2"),
+            "must show watching count: {summary}"
+        );
+        assert!(
+            summary.contains("routine-candidate:baz"),
+            "must show latest pattern_id: {summary}"
+        );
+        assert!(
+            summary.contains("반복 패턴 5회"),
+            "must show outcome_summary: {summary}"
+        );
     }
 
     #[test]
