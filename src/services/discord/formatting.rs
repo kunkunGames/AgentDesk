@@ -2069,6 +2069,19 @@ pub(super) fn format_for_discord_with_status_panel(
     format_for_discord(&cleaned)
 }
 
+#[cfg(test)]
+mod status_panel_v2_formatter_tests {
+    use super::format_for_discord_with_provider;
+    use crate::services::provider::ProviderKind;
+
+    #[test]
+    fn status_panel_disabled_codex_formatter_keeps_legacy_tool_markers() {
+        let input = "[Bash] /bin/zsh -lc \"ls\"\nkeep";
+        let output = format_for_discord_with_provider(input, &ProviderKind::Codex);
+        assert_eq!(output, "⚙️ Bash\nkeep");
+    }
+}
+
 /// Remove ephemeral placeholder lines (e.g. "⏳ 대기 중...") from the final
 /// delivered response.  These lines are useful during streaming but should not
 /// persist in the channel.

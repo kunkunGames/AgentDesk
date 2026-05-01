@@ -28,6 +28,7 @@ use crate::services::observability::session_inventory::{
     format_child_inventory_progress, load_child_inventory_by_parent_key_pg,
 };
 use crate::services::provider::cancel_requested;
+use std::collections::VecDeque;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
 pub(crate) use completion_guard::build_work_dispatch_completion_result;
@@ -258,6 +259,10 @@ fn record_status_panel_events(
     } else {
         false
     }
+}
+
+fn should_open_long_running_placeholder_controller(status_panel_v2_enabled: bool) -> bool {
+    !status_panel_v2_enabled
 }
 
 fn thinking_status_line() -> String {
@@ -1211,6 +1216,7 @@ pub(super) fn spawn_turn_bridge(
         let mut terminal_session_reset_required = false;
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
+        let mut pending_status_tool_results: VecDeque<String> = VecDeque::new();
         // codex round-8 P1 on PR #1308: while a long-running placeholder is
         // active, bump the inflight file's mtime so the sweeper sees the turn
         // as alive. Without this, a healthy 5+ minute background tool would
@@ -1484,6 +1490,7 @@ pub(super) fn spawn_turn_bridge(
                             );
                         }
                         StreamMessage::ToolUse { name, input } => {
+                            pending_status_tool_results.push_back(name.clone());
                             any_tool_used = true;
                             has_post_tool_text = false;
                             inflight_state.any_tool_used = true;
@@ -1620,7 +1627,11 @@ pub(super) fn spawn_turn_bridge(
                                     }
                                 }
                             }
-                            if long_running_placeholder_active.is_none() {
+                            if should_open_long_running_placeholder_controller(
+                                shared_owned.status_panel_v2_enabled,
+                            )
+                                && long_running_placeholder_active.is_none()
+                            {
                                 if let Some((reason, close_trigger, reason_detail)) =
                                     long_running_tool
                                 {
@@ -1721,6 +1732,7 @@ pub(super) fn spawn_turn_bridge(
                             }
                         }
                         StreamMessage::ToolResult { content, is_error } => {
+                            let status_tool_name = pending_status_tool_results.pop_front();
                             // #1084: flag oversize tool outputs + record metrics.
                             // Never mutates `content` — the agent and transcript
                             // still see the raw output; only a warn log + counters
@@ -1743,6 +1755,7 @@ pub(super) fn spawn_turn_bridge(
                                 shared_owned.as_ref(),
                                 channel_id,
                                 super::placeholder_live_events::status_events_from_tool_result(
+                                    status_tool_name.as_deref(),
                                     is_error,
                                 ),
                             );
@@ -4151,4 +4164,15 @@ pub(super) fn spawn_turn_bridge(
 
         // completion_tx is sent automatically by CompletionGuard on drop
     }.instrument(bridge_span));
+}
+
+#[cfg(test)]
+mod status_panel_v2_rework_tests {
+    use super::should_open_long_running_placeholder_controller;
+
+    #[test]
+    fn status_panel_v2_disables_long_running_placeholder_controller() {
+        assert!(!should_open_long_running_placeholder_controller(true));
+        assert!(should_open_long_running_placeholder_controller(false));
+    }
 }

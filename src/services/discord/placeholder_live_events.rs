@@ -453,11 +453,15 @@ pub(super) fn status_events_from_tool_use(name: &str, input: &str) -> Vec<Status
     events
 }
 
-pub(super) fn status_events_from_tool_result(is_error: bool) -> Vec<StatusEvent> {
-    vec![
-        StatusEvent::ToolEnd { success: !is_error },
-        StatusEvent::SubagentEnd { success: !is_error },
-    ]
+pub(super) fn status_events_from_tool_result(
+    tool_name: Option<&str>,
+    is_error: bool,
+) -> Vec<StatusEvent> {
+    let mut events = vec![StatusEvent::ToolEnd { success: !is_error }];
+    if tool_name.is_some_and(is_task_tool) {
+        events.push(StatusEvent::SubagentEnd { success: !is_error });
+    }
+    events
 }
 
 pub(super) fn status_events_from_task_notification(
@@ -680,7 +684,7 @@ fn user_status_events(value: &Value) -> Vec<StatusEvent> {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            status_events_from_tool_result(is_error)
+            status_events_from_tool_result(None, is_error)
         })
         .collect()
 }
@@ -1127,7 +1131,10 @@ mod tests {
             channel_id,
             status_events_from_task_notification("subagent", "running", "found turn bridge"),
         );
-        events.push_status_events(channel_id, status_events_from_tool_result(false));
+        events.push_status_events(
+            channel_id,
+            status_events_from_tool_result(Some("Task"), false),
+        );
 
         let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
         assert!(rendered.contains("Subagents"));
@@ -1176,8 +1183,17 @@ mod tests {
             }
         }));
 
+        assert_eq!(events, vec![StatusEvent::ToolEnd { success: false }]);
+    }
+
+    #[test]
+    fn status_tool_result_closes_subagent_only_for_task_tools() {
         assert_eq!(
-            events,
+            status_events_from_tool_result(Some("Read"), false),
+            vec![StatusEvent::ToolEnd { success: true }]
+        );
+        assert_eq!(
+            status_events_from_tool_result(Some("Task"), true),
             vec![
                 StatusEvent::ToolEnd { success: false },
                 StatusEvent::SubagentEnd { success: false }

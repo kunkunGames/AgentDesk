@@ -821,9 +821,13 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
 /// test --bin agentdesk` invocations.
 #[cfg(test)]
 mod stall_recovery_tests {
-    use super::{INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState, inflight_state_is_stale};
+    use super::{
+        INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState, inflight_state_is_stale,
+        load_inflight_states_from_root, save_inflight_state_in_root,
+    };
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+    use tempfile::TempDir;
 
     /// `inflight_state_is_stale` must flip to true once `updated_at` is
     /// older than the configured threshold and stay false for fresh state.
@@ -878,6 +882,33 @@ mod stall_recovery_tests {
             !inflight_state_is_stale(&state, now_unix, INFLIGHT_STALENESS_THRESHOLD_SECS),
             "unparseable updated_at must NOT be treated as stale"
         );
+    }
+
+    #[test]
+    fn status_message_id_round_trips_for_status_panel_resume() {
+        let temp = TempDir::new().unwrap();
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            42,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        state.status_message_id = Some(123_456);
+
+        save_inflight_state_in_root(temp.path(), &state).expect("save inflight state");
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status_message_id, Some(123_456));
+        assert_eq!(loaded[0].current_msg_id, 99);
     }
 }
 
