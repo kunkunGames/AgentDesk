@@ -635,12 +635,7 @@ fn run_outcome_message(routine: &RoutineRecord, outcome: &RoutineRunOutcome) -> 
 
 fn outcome_summary_for_message(outcome: &RoutineRunOutcome) -> Option<String> {
     let result = outcome.result_json.as_ref()?;
-    for key in [
-        "outcome_summary",
-        "summary",
-        "reason",
-        "error",
-    ] {
+    for key in ["outcome_summary", "summary", "reason", "error"] {
         if let Some(value) = result
             .get(key)
             .and_then(|value| value.as_str())

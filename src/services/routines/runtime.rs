@@ -286,7 +286,11 @@ fn compact_json_val(value: &Value) -> String {
         Value::Array(arr) => format!("[{}개]", arr.len()),
         other => {
             let s = other.to_string();
-            if s.len() > 80 { format!("{}…", &s[..80]) } else { s }
+            if s.len() > 80 {
+                format!("{}…", &s[..80])
+            } else {
+                s
+            }
         }
     }
 }
