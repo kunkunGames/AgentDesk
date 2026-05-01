@@ -1304,8 +1304,8 @@ pub(super) fn spawn_turn_bridge(
         let turn_start = std::time::Instant::now();
 
         if shared_owned.status_panel_v2_enabled && status_panel_msg_id.is_none() {
-            let response_placeholder = "⏳ 응답 준비 중...";
-            match gateway.send_message(channel_id, response_placeholder).await {
+            let response_placeholder = super::formatting::build_processing_status_block(SPINNER[0]);
+            match gateway.send_message(channel_id, &response_placeholder).await {
                 Ok(response_msg_id) => {
                     status_panel_msg_id = Some(current_msg_id);
                     inflight_state.status_message_id = Some(current_msg_id.get());
@@ -2404,7 +2404,7 @@ pub(super) fn spawn_turn_bridge(
 
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     let status_block = if shared_owned.status_panel_v2_enabled {
-                        "⏳ 응답 준비 중...".to_string()
+                        super::formatting::build_processing_status_block(indicator)
                     } else {
                         super::formatting::build_placeholder_status_block(
                             indicator,
@@ -2525,7 +2525,7 @@ pub(super) fn spawn_turn_bridge(
                 let current_portion =
                     response_portion_after_offset(&full_response, response_sent_offset);
                 let status_block = if shared_owned.status_panel_v2_enabled {
-                    "⏳ 응답 준비 중...".to_string()
+                    super::formatting::build_processing_status_block(indicator)
                 } else {
                     super::formatting::build_placeholder_status_block(
                         indicator,

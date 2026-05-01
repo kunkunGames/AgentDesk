@@ -232,9 +232,10 @@ mod tests {
         LongRunningCloseTrigger, MonitorHandoffReason, MonitorHandoffStatus,
         ReplaceLongMessageOutcome, build_monitor_handoff_placeholder,
         build_monitor_handoff_placeholder_with_context, build_placeholder_status_block,
-        canonical_tool_name, classify_long_running_tool, convert_markdown_tables,
-        escape_for_code_fence, filter_codex_tool_logs, finalize_in_progress_tool_status,
-        format_for_discord_with_provider, normalize_allowed_tools, preserve_previous_tool_status,
+        build_processing_status_block, canonical_tool_name, classify_long_running_tool,
+        convert_markdown_tables, escape_for_code_fence, filter_codex_tool_logs,
+        finalize_in_progress_tool_status, format_for_discord_with_provider,
+        normalize_allowed_tools, preserve_previous_tool_status,
         replace_long_message_outcome_to_result, strip_codex_tool_log_lines,
     };
 
@@ -1180,6 +1181,11 @@ mod tests {
             "",
         );
         assert_eq!(placeholder, "⠋ ⚙ Bash: cargo build");
+    }
+
+    #[test]
+    fn test_build_processing_status_block_uses_spinner_processing() {
+        assert_eq!(build_processing_status_block("⠋"), "⠋ Processing...");
     }
 
     #[test]
@@ -3231,6 +3237,10 @@ pub(super) fn build_placeholder_status_block(
     let raw_tool_status = resolve_raw_tool_status(current_tool_line, full_response);
     let tool_status = humanize_tool_status(raw_tool_status);
     format!("{indicator} {tool_status}")
+}
+
+pub(super) fn build_processing_status_block(indicator: &str) -> String {
+    build_placeholder_status_block(indicator, None, None, "")
 }
 
 fn truncate_for_status_bytes(s: &str, max_bytes: usize) -> String {

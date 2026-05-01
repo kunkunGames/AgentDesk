@@ -5589,7 +5589,7 @@ fn build_watcher_placeholder_status_block(
     full_response: &str,
 ) -> String {
     if shared.status_panel_v2_enabled {
-        return "⏳ 응답 준비 중...".to_string();
+        return super::formatting::build_processing_status_block(indicator);
     }
     let status_block = super::formatting::build_placeholder_status_block(
         indicator,
