@@ -55,9 +55,13 @@ module.exports = function attachIdleKill(timeouts, helpers) {
 
       var now = Date.now();
       var processed = {};
+      var maxKillsPerTick = 50;
+      var killsThisTick = 0;
 
       function forceKillIdleSessions(sessions, minimumIdleMinutes, reasonLabel) {
         for (var i = 0; i < sessions.length; i++) {
+          if (killsThisTick >= maxKillsPerTick) break;
+
           var s = sessions[i];
           if (!s.session_key || processed[s.session_key]) continue;
           processed[s.session_key] = true;
@@ -66,6 +70,8 @@ module.exports = function attachIdleKill(timeouts, helpers) {
           var idleMin = isNaN(lastSeenMs)
             ? minimumIdleMinutes
             : Math.max(minimumIdleMinutes, Math.round((now - lastSeenMs) / 60000));
+
+          killsThisTick++;
 
           var forceKillResp = null;
           try {
