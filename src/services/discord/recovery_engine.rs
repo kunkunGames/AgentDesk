@@ -2722,6 +2722,7 @@ pub(super) async fn restore_inflight_turns(
                 tmux_last_offset: Some(state.last_offset),
                 new_session_id: state.session_id.clone(),
                 defer_watcher_resume: false,
+                reuse_status_panel_message: true,
                 completion_tx: None,
                 inflight_state: state,
             },

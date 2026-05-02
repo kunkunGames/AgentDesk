@@ -2054,6 +2054,25 @@ pub(super) fn notify_path_offset_advance_decision(
     OffsetAdvanceDecision::default()
 }
 
+#[inline]
+fn should_suppress_relay_before_emit(
+    paused: bool,
+    epoch_changed: bool,
+    turn_delivered: bool,
+    deferred_monitor_ready: bool,
+) -> bool {
+    (paused || epoch_changed || turn_delivered) && !deferred_monitor_ready
+}
+
+#[inline]
+fn should_stop_watcher_after_terminal_finalize(
+    terminal_output_committed: bool,
+    dispatch_ok: bool,
+    watcher_handled_mailbox_finish: bool,
+) -> bool {
+    terminal_output_committed && dispatch_ok && watcher_handled_mailbox_finish
+}
+
 /// #826: Build the dedupe session_key for a background-trigger outbox row.
 /// Includes the tmux output offset and a short content hash so distinct
 /// completions land as separate rows (different offsets ⇒ different keys)
@@ -2679,11 +2698,11 @@ pub(super) async fn tmux_output_watcher_with_restore(
         );
     }
     // Rolling-size-cap rotation state. The watcher loop spins predictably
-    // (~500ms sleeps) so a mod-N gate on an iteration counter gives a
+    // (~250ms sleeps) so a mod-N gate on an iteration counter gives a
     // regular-ish cadence for the size check without hitting the fs every
     // spin. See issue #892.
     let mut rotation_tick: u32 = 0;
-    const ROTATION_CHECK_EVERY: u32 = 60; // ~30s at 500ms base cadence
+    const ROTATION_CHECK_EVERY: u32 = 120; // ~30s at 250ms base cadence
 
     'watcher_loop: loop {
         last_heartbeat_ts_ms.store(
@@ -2854,7 +2873,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     probe_tmux_session_liveness(&tmux_session_name).await,
                 ) {
                     TmuxLivenessDecision::Continue => {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                         continue;
                     }
                     TmuxLivenessDecision::QuietStop => {
@@ -2898,7 +2917,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
         match poll_decision {
             WatcherOutputPollDecision::DrainOutput => {}
             WatcherOutputPollDecision::Continue => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                 continue;
             }
             WatcherOutputPollDecision::QuietStop => {
@@ -4054,7 +4073,12 @@ pub(super) async fn tmux_output_watcher_with_restore(
         let turn_delivered_now = turn_delivered.load(Ordering::Relaxed);
         let deferred_monitor_ready =
             monitor_auto_turn_claimed && monitor_auto_turn_deferred && !paused_now;
-        if (paused_now || epoch_changed_now || turn_delivered_now) && !deferred_monitor_ready {
+        if should_suppress_relay_before_emit(
+            paused_now,
+            epoch_changed_now,
+            turn_delivered_now,
+            deferred_monitor_ready,
+        ) {
             if let Some(msg_id) = placeholder_msg_id {
                 let _ = delete_nonterminal_placeholder(
                     &http,
@@ -4470,6 +4494,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         {
                             Ok(ReplaceLongMessageOutcome::EditedOriginal) => {
                                 direct_send_delivered = true;
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                tracing::info!(
+                                    "  [{ts}] 👁 ✓ relayed terminal response (edit) channel {} msg {} ({} chars)",
+                                    channel_id.get(),
+                                    msg_id.get(),
+                                    relay_text.len()
+                                );
                                 record_placeholder_cleanup(
                                     &shared,
                                     &watcher_provider,
@@ -4485,6 +4516,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                                 edit_error,
                             }) => {
                                 direct_send_delivered = true;
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                tracing::info!(
+                                    "  [{ts}] 👁 ✓ relayed terminal response (fallback send after edit failure) channel {} msg {} ({} chars, edit_error={edit_error})",
+                                    channel_id.get(),
+                                    msg_id.get(),
+                                    relay_text.len()
+                                );
                                 record_placeholder_cleanup(
                                     &shared,
                                     &watcher_provider,
@@ -4545,6 +4583,12 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         match send_long_message_raw(&http, channel_id, &relay_text, &shared).await {
                             Ok(_) => {
                                 direct_send_delivered = true;
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                tracing::info!(
+                                    "  [{ts}] 👁 ✓ relayed terminal response (new message) channel {} ({} chars)",
+                                    channel_id.get(),
+                                    relay_text.len()
+                                );
                             }
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -5093,6 +5137,19 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     channel_id,
                     "watcher completed with queued backlog",
                 );
+            }
+            if should_stop_watcher_after_terminal_finalize(
+                terminal_output_committed,
+                dispatch_ok,
+                watcher_handled_mailbox_finish,
+            ) {
+                turn_delivered.store(true, Ordering::Release);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 👁 watcher: terminal turn finalized; stopping watcher for {} to avoid duplicate relay",
+                    tmux_session_name
+                );
+                break 'watcher_loop;
             }
         } else if !relay_suppressed {
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -6092,6 +6149,7 @@ mod tests {
         reset_stale_relay_watermark_if_output_regressed, restored_watcher_turn_from_inflight,
         rollback_enqueued_offset_for_reconciled_failures,
         should_flush_post_terminal_success_continuation,
+        should_stop_watcher_after_terminal_finalize, should_suppress_relay_before_emit,
         should_suppress_streaming_placeholder_after_recent_stop,
         should_suppress_terminal_output_after_recent_stop, start_monitor_auto_turn_when_available,
         strip_inprogress_indicators, suppressed_placeholder_action, terminal_relay_decision,
@@ -6152,6 +6210,38 @@ mod tests {
         assert!(!tmux_death_is_normal_completion(
             None,
             Some("recent_output=completed_result_present")
+        ));
+    }
+
+    #[test]
+    fn turn_delivered_suppresses_relay_before_emit() {
+        assert!(should_suppress_relay_before_emit(false, false, true, false));
+        assert!(should_suppress_relay_before_emit(true, false, false, false));
+        assert!(should_suppress_relay_before_emit(false, true, false, false));
+
+        assert!(
+            !should_suppress_relay_before_emit(false, false, true, true),
+            "deferred monitor handoff keeps its relay path alive"
+        );
+        assert!(!should_suppress_relay_before_emit(
+            false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn watcher_stops_after_terminal_finalize_only_when_mailbox_finished() {
+        assert!(should_stop_watcher_after_terminal_finalize(
+            true, true, true
+        ));
+
+        assert!(!should_stop_watcher_after_terminal_finalize(
+            false, true, true
+        ));
+        assert!(!should_stop_watcher_after_terminal_finalize(
+            true, false, true
+        ));
+        assert!(!should_stop_watcher_after_terminal_finalize(
+            true, true, false
         ));
     }
 

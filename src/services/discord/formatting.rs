@@ -1,6 +1,6 @@
 use poise::serenity_prelude as serenity;
 use regex::Regex;
-use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId};
+use serenity::{ChannelId, CreateAttachment, MessageId};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -2079,7 +2079,7 @@ pub(super) fn format_for_discord_with_status_panel(
 
 #[cfg(test)]
 mod status_panel_v2_formatter_tests {
-    use super::format_for_discord_with_provider;
+    use super::{format_for_discord, format_for_discord_with_provider};
     use crate::services::provider::ProviderKind;
 
     #[test]
@@ -2087,6 +2087,30 @@ mod status_panel_v2_formatter_tests {
         let input = "[Bash] /bin/zsh -lc \"ls\"\nkeep";
         let output = format_for_discord_with_provider(input, &ProviderKind::Codex);
         assert_eq!(output, "⚙️ Bash\nkeep");
+    }
+
+    #[test]
+    fn format_for_discord_does_not_insert_blank_line_before_header() {
+        let input = "previous line\n## Heading\nfollowing line";
+        let output = format_for_discord(input);
+        assert_eq!(output, "previous line\n**Heading**\nfollowing line");
+    }
+
+    #[test]
+    fn format_for_discord_does_not_insert_blank_line_before_list() {
+        let input = "lead-in paragraph\n- first item\n- second item\ntrailing line";
+        let output = format_for_discord(input);
+        assert_eq!(
+            output,
+            "lead-in paragraph\n- first item\n- second item\ntrailing line"
+        );
+    }
+
+    #[test]
+    fn format_for_discord_preserves_explicit_blank_line_when_agent_provides_one() {
+        let input = "first paragraph\n\nsecond paragraph";
+        let output = format_for_discord(input);
+        assert_eq!(output, "first paragraph\n\nsecond paragraph");
     }
 }
 
@@ -2130,56 +2154,24 @@ pub(super) fn format_for_discord(s: &str) -> String {
 
         let trimmed = line.trim_start();
 
-        // Convert # headers to **bold** (Discord doesn't render headers in bot messages)
+        // Convert # headers to **bold** (Discord doesn't render headers in bot messages).
+        // Do not inject blank lines around headers; preserve the agent's spacing as-is so
+        // that mobile screens are not wasted by forced double line breaks.
         if let Some(rest) = trimmed.strip_prefix("### ") {
-            if let Some(prev) = lines.last() {
-                if !prev.trim().is_empty() {
-                    lines.push(String::new());
-                }
-            }
             lines.push(format!("**{}**", rest));
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("## ") {
-            if let Some(prev) = lines.last() {
-                if !prev.trim().is_empty() {
-                    lines.push(String::new());
-                }
-            }
             lines.push(format!("**{}**", rest));
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("# ") {
-            if let Some(prev) = lines.last() {
-                if !prev.trim().is_empty() {
-                    lines.push(String::new());
-                }
-            }
             lines.push(format!("**{}**", rest));
             continue;
         }
 
-        // Ensure blank line before the first item of a list block
-        let is_list_item = trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || (trimmed.len() > 2
-                && trimmed.as_bytes()[0].is_ascii_digit()
-                && trimmed.contains(". "));
-
-        if is_list_item {
-            if let Some(prev) = lines.last() {
-                let prev_trimmed = prev.trim();
-                let prev_is_list = prev_trimmed.starts_with("- ")
-                    || prev_trimmed.starts_with("* ")
-                    || (prev_trimmed.len() > 2
-                        && prev_trimmed.as_bytes()[0].is_ascii_digit()
-                        && prev_trimmed.contains(". "));
-                if !prev_trimmed.is_empty() && !prev_is_list {
-                    lines.push(String::new());
-                }
-            }
-        }
-
+        // List items are passed through verbatim. Blank lines around them, if any,
+        // come from the agent and are preserved by the blank-line collapse below.
         lines.push(line.to_string());
     }
 
@@ -2262,10 +2254,7 @@ pub(super) async fn send_long_message_raw(
             "discord send single"
         );
         rate_limit_wait(shared, channel_id).await;
-        match channel_id
-            .send_message(http, CreateMessage::new().content(text))
-            .await
-        {
+        match super::http::send_channel_message(http, channel_id, text).await {
             Ok(_) => {
                 tracing::debug!(
                     target: "discord::chunker",
@@ -2317,9 +2306,7 @@ pub(super) async fn send_long_message_raw(
             "discord send chunk"
         );
         rate_limit_wait(shared, channel_id).await;
-        let send_result = channel_id
-            .send_message(http, CreateMessage::new().content(chunk))
-            .await;
+        let send_result = super::http::send_channel_message(http, channel_id, chunk).await;
         match send_result {
             Ok(_) => {
                 if is_last {
@@ -2422,9 +2409,8 @@ pub(super) async fn replace_long_message_raw_with_outcome(
         "discord edit first chunk"
     );
     rate_limit_wait(shared, channel_id).await;
-    let edit_result = channel_id
-        .edit_message(http, message_id, EditMessage::new().content(first_chunk))
-        .await;
+    let edit_result =
+        super::http::edit_channel_message(http, channel_id, message_id, first_chunk).await;
 
     if let Err(e) = edit_result {
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -2479,9 +2465,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
             "discord send continuation chunk"
         );
         rate_limit_wait(shared, channel_id).await;
-        let send_result = channel_id
-            .send_message(http, CreateMessage::new().content(chunk))
-            .await;
+        let send_result = super::http::send_channel_message(http, channel_id, chunk).await;
         match send_result {
             Ok(_) => {
                 if is_last {

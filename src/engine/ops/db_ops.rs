@@ -3,7 +3,11 @@ use crate::engine::sql_guard::detect_core_table_write;
 use crate::error::{AppError, ErrorCode};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rquickjs::{Ctx, Function, Object, Result as JsResult};
-use sqlx::{Column, PgPool, Row, TypeInfo};
+use sqlx::encode::IsNull;
+use sqlx::error::BoxDynError;
+use sqlx::postgres::{PgArgumentBuffer, PgArguments, PgPool, PgTypeInfo};
+use sqlx::{Column, Encode, Postgres, Row, Type, TypeInfo};
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -134,16 +138,17 @@ fn db_query_raw_pg(
     started: std::time::Instant,
 ) -> String {
     let prepared_sql = match prepare_policy_sql_for_pg(sql, params) {
-        Ok(sql) => sql,
+        Ok(prepared) => prepared,
         Err(error) => {
             return policy_db_bad_request_json("agentdesk.db.query.translate_pg", sql, error);
         }
     };
 
     let pool = pg_pool.clone();
-    let query_sql = prepared_sql.clone();
+    let query_sql = prepared_sql.sql.clone();
+    let bind_params = prepared_sql.params.clone();
     let rows = match run_async_bridge_pg(&pool, move |pool| async move {
-        sqlx::query(&query_sql)
+        bind_policy_sql_params(sqlx::query(&query_sql), bind_params)
             .fetch_all(&pool)
             .await
             .map_err(|error| format!("query: {error}"))
@@ -170,7 +175,7 @@ fn db_query_raw_pg(
             elapsed_ms = elapsed.as_millis(),
             row_count = result.len(),
             sql = %compact_sql(sql),
-            translated_sql = %compact_sql(&prepared_sql),
+            translated_sql = %compact_sql(&prepared_sql.sql),
             "policy db query slow"
         );
     }
@@ -362,7 +367,7 @@ pub(crate) fn execute_policy_sql(
     let prepared_sql = prepare_policy_sql_for_pg(sql, params)?;
     let pool = pg_pool.clone();
     run_async_bridge_pg(&pool, move |pool| async move {
-        sqlx::query(&prepared_sql)
+        bind_policy_sql_params(sqlx::query(&prepared_sql.sql), prepared_sql.params)
             .execute(&pool)
             .await
             .map(|result| result.rows_affected())
@@ -377,16 +382,17 @@ fn db_execute_raw_pg(
     started: std::time::Instant,
 ) -> String {
     let prepared_sql = match prepare_policy_sql_for_pg(sql, params) {
-        Ok(sql) => sql,
+        Ok(prepared) => prepared,
         Err(error) => {
             return policy_db_bad_request_json("agentdesk.db.execute.translate_pg", sql, error);
         }
     };
 
     let pool = pg_pool.clone();
-    let execute_sql = prepared_sql.clone();
+    let execute_sql = prepared_sql.sql.clone();
+    let bind_params = prepared_sql.params.clone();
     let changes = match run_async_bridge_pg(&pool, move |pool| async move {
-        sqlx::query(&execute_sql)
+        bind_policy_sql_params(sqlx::query(&execute_sql), bind_params)
             .execute(&pool)
             .await
             .map(|result| result.rows_affected())
@@ -404,7 +410,7 @@ fn db_execute_raw_pg(
             elapsed_ms = elapsed.as_millis(),
             changes,
             sql = %compact_sql(sql),
-            translated_sql = %compact_sql(&prepared_sql),
+            translated_sql = %compact_sql(&prepared_sql.sql),
             "policy db execute slow"
         );
     }
@@ -483,10 +489,19 @@ fn policy_db_bad_request_json(operation: &str, sql: &str, message: impl Into<Str
         .into_policy_json_string()
 }
 
-fn prepare_policy_sql_for_pg(sql: &str, params: &[serde_json::Value]) -> Result<String, String> {
+#[derive(Debug, Clone, PartialEq)]
+struct PreparedPolicySql {
+    sql: String,
+    params: Vec<serde_json::Value>,
+}
+
+fn prepare_policy_sql_for_pg(
+    sql: &str,
+    params: &[serde_json::Value],
+) -> Result<PreparedPolicySql, String> {
     let translated = translate_insert_with_conflict(sql)?;
     let translated = translate_sqlite_rowid(&translated);
-    interpolate_policy_sql_params(&translated, params)
+    translate_policy_sql_placeholders(&translated, params)
 }
 
 fn translate_insert_with_conflict(sql: &str) -> Result<String, String> {
@@ -698,96 +713,242 @@ fn find_matching_paren(value: &str, start: usize) -> Option<usize> {
     None
 }
 
-fn interpolate_policy_sql_params(
+fn translate_policy_sql_placeholders(
     sql: &str,
     params: &[serde_json::Value],
-) -> Result<String, String> {
-    let mut result = String::with_capacity(sql.len() + params.len() * 8);
-    let chars: Vec<char> = sql.chars().collect();
+) -> Result<PreparedPolicySql, String> {
+    let mut result = String::with_capacity(sql.len() + params.len() * 3);
+    let bytes = sql.as_bytes();
     let mut idx = 0usize;
     let mut next_unnumbered_param = 0usize;
-    let mut in_single_quote = false;
+    let mut bind_param_by_source = HashMap::<usize, usize>::new();
+    let mut bind_params = Vec::<serde_json::Value>::new();
 
-    while idx < chars.len() {
-        let ch = chars[idx];
-        if ch == '\'' {
-            result.push(ch);
-            if in_single_quote {
-                if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
+    #[derive(Debug)]
+    enum ScanState {
+        Normal,
+        SingleQuoted,
+        DoubleQuoted,
+        LineComment,
+        BlockComment { depth: usize },
+        DollarQuoted { delimiter: String },
+    }
+
+    let mut state = ScanState::Normal;
+
+    while idx < bytes.len() {
+        match &mut state {
+            ScanState::Normal => {
+                if bytes[idx] == b'\'' {
                     result.push('\'');
+                    state = ScanState::SingleQuoted;
+                    idx += 1;
+                    continue;
+                }
+                if bytes[idx] == b'"' {
+                    result.push('"');
+                    state = ScanState::DoubleQuoted;
+                    idx += 1;
+                    continue;
+                }
+                if sql[idx..].starts_with("--") {
+                    result.push_str("--");
+                    state = ScanState::LineComment;
                     idx += 2;
                     continue;
                 }
-                in_single_quote = false;
-            } else {
-                in_single_quote = true;
-            }
-            idx += 1;
-            continue;
-        }
-
-        if !in_single_quote && ch == '?' {
-            let mut digit_idx = idx + 1;
-            let mut digits = String::new();
-            while digit_idx < chars.len() && chars[digit_idx].is_ascii_digit() {
-                digits.push(chars[digit_idx]);
-                digit_idx += 1;
-            }
-
-            let param_index = if digits.is_empty() {
-                let current = next_unnumbered_param;
-                next_unnumbered_param += 1;
-                current
-            } else {
-                digits
-                    .parse::<usize>()
-                    .map_err(|_| format!("invalid numbered placeholder '?{digits}'"))?
-                    .checked_sub(1)
-                    .ok_or_else(|| "placeholder index must start at 1".to_string())?
-            };
-
-            let param = params.get(param_index).ok_or_else(|| {
-                format!(
-                    "placeholder {} does not have a matching parameter",
-                    if digits.is_empty() {
-                        format!("?{}", next_unnumbered_param)
-                    } else {
-                        format!("?{digits}")
+                if sql[idx..].starts_with("/*") {
+                    result.push_str("/*");
+                    state = ScanState::BlockComment { depth: 1 };
+                    idx += 2;
+                    continue;
+                }
+                if let Some(delimiter) = dollar_quote_delimiter(sql, idx) {
+                    result.push_str(&delimiter);
+                    idx += delimiter.len();
+                    state = ScanState::DollarQuoted { delimiter };
+                    continue;
+                }
+                if bytes[idx] == b'?' {
+                    let mut digit_idx = idx + 1;
+                    while digit_idx < bytes.len() && bytes[digit_idx].is_ascii_digit() {
+                        digit_idx += 1;
                     }
-                )
-            })?;
-            result.push_str(&json_to_pg_literal(param));
-            idx = digit_idx;
-            continue;
-        }
+                    let digits = &sql[idx + 1..digit_idx];
 
-        result.push(ch);
-        idx += 1;
-    }
+                    let (param_index, placeholder_label) = if digits.is_empty() {
+                        let current = next_unnumbered_param;
+                        next_unnumbered_param += 1;
+                        (current, format!("?{}", current + 1))
+                    } else {
+                        let parsed = digits
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid numbered placeholder '?{digits}'"))?;
+                        let param_index = parsed
+                            .checked_sub(1)
+                            .ok_or_else(|| "placeholder index must start at 1".to_string())?;
+                        (param_index, format!("?{digits}"))
+                    };
 
-    Ok(result)
-}
-
-fn json_to_pg_literal(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "NULL".to_string(),
-        serde_json::Value::Bool(value) => {
-            if *value {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
+                    let bind_position = match bind_param_by_source.get(&param_index).copied() {
+                        Some(position) => position,
+                        None => {
+                            let param = params.get(param_index).ok_or_else(|| {
+                                format!(
+                                    "placeholder {placeholder_label} does not have a matching parameter"
+                                )
+                            })?;
+                            bind_params.push(param.clone());
+                            let position = bind_params.len();
+                            bind_param_by_source.insert(param_index, position);
+                            position
+                        }
+                    };
+                    result.push('$');
+                    result.push_str(&bind_position.to_string());
+                    idx = digit_idx;
+                    continue;
+                }
             }
-        }
-        serde_json::Value::Number(value) => value.to_string(),
-        serde_json::Value::String(value) => format!("'{}'", escape_pg_string(value)),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            format!("'{}'", escape_pg_string(&value.to_string()))
+            ScanState::SingleQuoted => {
+                if bytes[idx] == b'\'' {
+                    result.push('\'');
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                        result.push('\'');
+                        idx += 2;
+                    } else {
+                        state = ScanState::Normal;
+                        idx += 1;
+                    }
+                    continue;
+                }
+            }
+            ScanState::DoubleQuoted => {
+                if bytes[idx] == b'"' {
+                    result.push('"');
+                    if idx + 1 < bytes.len() && bytes[idx + 1] == b'"' {
+                        result.push('"');
+                        idx += 2;
+                    } else {
+                        state = ScanState::Normal;
+                        idx += 1;
+                    }
+                    continue;
+                }
+            }
+            ScanState::LineComment => {
+                if bytes[idx] == b'\n' {
+                    result.push('\n');
+                    state = ScanState::Normal;
+                    idx += 1;
+                    continue;
+                }
+            }
+            ScanState::BlockComment { depth } => {
+                if sql[idx..].starts_with("/*") {
+                    result.push_str("/*");
+                    *depth += 1;
+                    idx += 2;
+                    continue;
+                }
+                if sql[idx..].starts_with("*/") {
+                    result.push_str("*/");
+                    *depth = depth.saturating_sub(1);
+                    if *depth == 0 {
+                        state = ScanState::Normal;
+                    }
+                    idx += 2;
+                    continue;
+                }
+            }
+            ScanState::DollarQuoted { delimiter } => {
+                if sql[idx..].starts_with(delimiter.as_str()) {
+                    result.push_str(delimiter);
+                    idx += delimiter.len();
+                    state = ScanState::Normal;
+                    continue;
+                }
+            }
+        };
+
+        let ch = sql[idx..]
+            .chars()
+            .next()
+            .expect("idx is always within SQL bounds");
+        result.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    Ok(PreparedPolicySql {
+        sql: result,
+        params: bind_params,
+    })
+}
+
+fn dollar_quote_delimiter(sql: &str, idx: usize) -> Option<String> {
+    let bytes = sql.as_bytes();
+    if bytes.get(idx).copied() != Some(b'$') {
+        return None;
+    }
+
+    let mut end = idx + 1;
+    while end < bytes.len() && is_dollar_quote_tag_byte(bytes[end]) {
+        end += 1;
+    }
+    if bytes.get(end).copied() != Some(b'$') {
+        return None;
+    }
+
+    Some(sql[idx..=end].to_string())
+}
+
+fn is_dollar_quote_tag_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[derive(Debug, Clone)]
+struct PolicySqlParam(serde_json::Value);
+
+impl PolicySqlParam {
+    fn wire_text(&self) -> Option<String> {
+        match &self.0 {
+            serde_json::Value::Null => None,
+            serde_json::Value::Bool(value) => Some(value.to_string()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => Some(self.0.to_string()),
         }
     }
 }
 
-fn escape_pg_string(value: &str) -> String {
-    value.replace('\'', "''")
+impl Type<Postgres> for PolicySqlParam {
+    fn type_info() -> PgTypeInfo {
+        <String as Type<Postgres>>::type_info()
+    }
+}
+
+impl Encode<'_, Postgres> for PolicySqlParam {
+    fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+        let Some(value) = self.wire_text() else {
+            return Ok(IsNull::Yes);
+        };
+        buf.extend(value.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn size_hint(&self) -> usize {
+        self.wire_text().map(|value| value.len()).unwrap_or(0)
+    }
+}
+
+fn bind_policy_sql_params<'q>(
+    mut query: sqlx::query::Query<'q, Postgres, PgArguments>,
+    params: Vec<serde_json::Value>,
+) -> sqlx::query::Query<'q, Postgres, PgArguments> {
+    for param in params {
+        query = query.bind(PolicySqlParam(param));
+    }
+    query
 }
 
 fn pg_row_to_json(row: &sqlx::postgres::PgRow) -> Result<serde_json::Value, String> {
@@ -1099,46 +1260,97 @@ mod tests {
     #[test]
     fn prepare_policy_sql_for_pg_rewrites_insert_or_replace() {
         let sql = "INSERT OR REPLACE INTO kv_meta (key, value, expires_at) VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))";
-        let rendered = prepare_policy_sql_for_pg(sql, &[json!("k"), json!("v"), json!(600)])
+        let prepared = prepare_policy_sql_for_pg(sql, &[json!("k"), json!("v"), json!(600)])
             .expect("render insert or replace");
 
-        assert!(rendered.starts_with("INSERT INTO kv_meta (key, value, expires_at) VALUES ('k', 'v', datetime('now', '+' || 600 || ' seconds'))"));
-        assert!(rendered.contains("ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at"));
+        assert_eq!(
+            prepared.sql,
+            "INSERT INTO kv_meta (key, value, expires_at) VALUES ($1, $2, datetime('now', '+' || $3 || ' seconds')) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at"
+        );
+        assert_eq!(prepared.params, vec![json!("k"), json!("v"), json!(600)]);
     }
 
     #[test]
     fn prepare_policy_sql_for_pg_rewrites_insert_or_ignore() {
         let sql = "INSERT OR IGNORE INTO kanban_cards (id, title) VALUES (?1, ?2)";
-        let rendered = prepare_policy_sql_for_pg(sql, &[json!("card-1"), json!("Title")])
+        let prepared = prepare_policy_sql_for_pg(sql, &[json!("card-1"), json!("Title")])
             .expect("render insert or ignore");
 
         assert_eq!(
-            rendered,
-            "INSERT INTO kanban_cards (id, title) VALUES ('card-1', 'Title') ON CONFLICT DO NOTHING"
+            prepared.sql,
+            "INSERT INTO kanban_cards (id, title) VALUES ($1, $2) ON CONFLICT DO NOTHING"
         );
+        assert_eq!(prepared.params, vec![json!("card-1"), json!("Title")]);
     }
 
     #[test]
     fn prepare_policy_sql_for_pg_rewrites_rowid_tokens() {
         let sql = "SELECT rowid, td.rowid, 'rowid' AS literal FROM task_dispatches td ORDER BY td.rowid DESC, rowid DESC";
-        let rendered = prepare_policy_sql_for_pg(sql, &[]).expect("render rowid");
+        let prepared = prepare_policy_sql_for_pg(sql, &[]).expect("render rowid");
 
-        assert!(rendered.contains("SELECT ctid, td.ctid, 'rowid' AS literal"));
-        assert!(rendered.contains("ORDER BY td.ctid DESC, ctid DESC"));
+        assert!(
+            prepared
+                .sql
+                .contains("SELECT ctid, td.ctid, 'rowid' AS literal")
+        );
+        assert!(prepared.sql.contains("ORDER BY td.ctid DESC, ctid DESC"));
+        assert!(prepared.params.is_empty());
     }
 
     #[test]
-    fn interpolate_policy_sql_params_leaves_question_marks_inside_strings() {
+    fn prepare_policy_sql_for_pg_leaves_question_marks_inside_strings() {
         let sql = "SELECT '?' AS marker, ?1 AS value";
-        let rendered = interpolate_policy_sql_params(sql, &[json!("ok")]).expect("interpolate");
-        assert_eq!(rendered, "SELECT '?' AS marker, 'ok' AS value");
+        let prepared = prepare_policy_sql_for_pg(sql, &[json!("ok")]).expect("interpolate");
+        assert_eq!(prepared.sql, "SELECT '?' AS marker, $1 AS value");
+        assert_eq!(prepared.params, vec![json!("ok")]);
     }
 
     #[test]
-    fn interpolate_policy_sql_params_errors_when_parameter_is_missing() {
+    fn prepare_policy_sql_for_pg_leaves_question_marks_inside_comments() {
+        let sql = "SELECT ?1 AS value -- ?2 is a comment\n/* ?3 is also a comment */";
+        let prepared = prepare_policy_sql_for_pg(sql, &[json!("ok")]).expect("interpolate");
+        assert_eq!(
+            prepared.sql,
+            "SELECT $1 AS value -- ?2 is a comment\n/* ?3 is also a comment */"
+        );
+        assert_eq!(prepared.params, vec![json!("ok")]);
+    }
+
+    #[test]
+    fn prepare_policy_sql_for_pg_reuses_numbered_placeholders() {
+        let sql = "SELECT ?2 AS second, ?1 AS first, ?2 AS second_again";
+        let prepared =
+            prepare_policy_sql_for_pg(sql, &[json!("one"), json!("two")]).expect("interpolate");
+        assert_eq!(
+            prepared.sql,
+            "SELECT $1 AS second, $2 AS first, $1 AS second_again"
+        );
+        assert_eq!(prepared.params, vec![json!("two"), json!("one")]);
+    }
+
+    #[test]
+    fn prepare_policy_sql_for_pg_errors_when_parameter_is_missing() {
         let sql = "SELECT ?1, ?2";
-        let error = interpolate_policy_sql_params(sql, &[json!(1)]).expect_err("missing param");
+        let error = prepare_policy_sql_for_pg(sql, &[json!(1)]).expect_err("missing param");
         assert!(error.contains("?2"));
+    }
+
+    #[test]
+    fn policy_sql_param_wire_text_preserves_json_scalar_and_container_values() {
+        assert_eq!(
+            PolicySqlParam(json!(true)).wire_text().as_deref(),
+            Some("true")
+        );
+        assert_eq!(PolicySqlParam(json!(42)).wire_text().as_deref(), Some("42"));
+        assert_eq!(PolicySqlParam(json!(null)).wire_text().as_deref(), None);
+        assert_eq!(
+            PolicySqlParam(json!({"k": "v"})).wire_text().as_deref(),
+            Some(r#"{"k":"v"}"#)
+        );
+        assert_eq!(
+            PolicySqlParam(json!(["a", "b"])).wire_text().as_deref(),
+            Some(r#"["a","b"]"#)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1175,6 +1387,48 @@ mod tests {
         assert_eq!(result_rows[0]["value"], "hello-pg");
         assert_eq!(result_rows[0]["still_valid"], true);
         assert_eq!(result_rows[0]["extracted_answer"], "42");
+
+        let placeholder_rows = db_query_raw_pg(
+            &pool,
+            "SELECT ?1::text AS marker -- ?2 remains inside a line comment
+                    /* ?3 remains inside a block comment */",
+            &[json!("literal-ok")],
+            std::time::Instant::now(),
+        );
+        let placeholder_json: serde_json::Value =
+            serde_json::from_str(&placeholder_rows).expect("parse placeholder query json");
+        assert_eq!(placeholder_json[0]["marker"], "literal-ok");
+
+        let typed_rows = db_query_raw_pg(
+            &pool,
+            "SELECT
+                    json_extract(?1::jsonb, '$.kind') AS object_kind,
+                    jsonb_array_length(?2::jsonb) AS array_len,
+                    ?3::boolean AS bool_value,
+                    ?4::bigint AS numeric_value,
+                    ?5::double precision AS float_value,
+                    ?6::text IS NULL AS null_value",
+            &[
+                json!({"kind": "object"}),
+                json!(["a", "b"]),
+                json!(true),
+                json!(42),
+                json!(3.5),
+                serde_json::Value::Null,
+            ],
+            std::time::Instant::now(),
+        );
+        let typed_json: serde_json::Value =
+            serde_json::from_str(&typed_rows).expect("parse typed query json");
+        let typed_rows = typed_json.as_array().unwrap_or_else(|| {
+            panic!("typed query returned non-array response: {typed_json}");
+        });
+        assert_eq!(typed_rows[0]["object_kind"], "object");
+        assert_eq!(typed_rows[0]["array_len"], 2);
+        assert_eq!(typed_rows[0]["bool_value"], true);
+        assert_eq!(typed_rows[0]["numeric_value"], 42);
+        assert_eq!(typed_rows[0]["float_value"], 3.5);
+        assert_eq!(typed_rows[0]["null_value"], true);
 
         let expires_at: chrono::DateTime<chrono::Utc> = sqlx::query(
             "SELECT expires_at

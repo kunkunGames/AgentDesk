@@ -343,6 +343,10 @@ pub(super) struct TurnBridgeContext {
     pub(super) tmux_last_offset: Option<u64>,
     pub(super) new_session_id: Option<String>,
     pub(super) defer_watcher_resume: bool,
+    /// Reuse the persisted V2 status panel only when resuming the same
+    /// in-flight turn. Fresh turns must allocate a new panel near the new
+    /// response instead of editing an old panel buried in scrollback.
+    pub(super) reuse_status_panel_message: bool,
     pub(super) completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub(super) inflight_state: InflightTurnState,
 }
@@ -373,6 +377,16 @@ fn push_transcript_event(events: &mut Vec<SessionTranscriptEvent>, event: Sessio
 
 fn turn_duration_ms(started_at: std::time::Instant) -> i64 {
     i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn status_panel_message_id_for_turn(
+    inflight_state: &mut InflightTurnState,
+    reuse_status_panel_message: bool,
+) -> Option<MessageId> {
+    if !reuse_status_panel_message {
+        inflight_state.status_message_id = None;
+    }
+    inflight_state.status_message_id.map(MessageId::new)
 }
 
 fn response_portion_after_offset(full_response: &str, response_sent_offset: usize) -> &str {
@@ -1296,7 +1310,10 @@ pub(super) fn spawn_turn_bridge(
         let mut inflight_state = bridge.inflight_state.clone();
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
-        let mut status_panel_msg_id = inflight_state.status_message_id.map(MessageId::new);
+        let mut status_panel_msg_id = status_panel_message_id_for_turn(
+            &mut inflight_state,
+            bridge.reuse_status_panel_message,
+        );
         let mut last_status_panel_text = String::new();
         let mut status_panel_dirty = shared_owned.status_panel_v2_enabled;
         let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
@@ -4198,11 +4215,53 @@ pub(super) fn spawn_turn_bridge(
 
 #[cfg(test)]
 mod status_panel_v2_rework_tests {
-    use super::should_open_long_running_placeholder_controller;
+    use super::{
+        InflightTurnState, MessageId, ProviderKind,
+        should_open_long_running_placeholder_controller, status_panel_message_id_for_turn,
+    };
 
     #[test]
     fn status_panel_v2_disables_long_running_placeholder_controller() {
         assert!(!should_open_long_running_placeholder_controller(true));
         assert!(should_open_long_running_placeholder_controller(false));
+    }
+
+    fn test_inflight_state() -> InflightTurnState {
+        InflightTurnState::new(
+            ProviderKind::Codex,
+            1,
+            Some("adk-cdx-test".to_string()),
+            2,
+            3,
+            4,
+            "test turn".to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+    }
+
+    #[test]
+    fn fresh_turn_discards_stale_status_panel_message_id() {
+        let mut state = test_inflight_state();
+        state.status_message_id = Some(99);
+
+        let status_panel_msg_id = status_panel_message_id_for_turn(&mut state, false);
+
+        assert_eq!(status_panel_msg_id, None);
+        assert_eq!(state.status_message_id, None);
+    }
+
+    #[test]
+    fn resume_turn_preserves_status_panel_message_id() {
+        let mut state = test_inflight_state();
+        state.status_message_id = Some(99);
+
+        let status_panel_msg_id = status_panel_message_id_for_turn(&mut state, true);
+
+        assert_eq!(status_panel_msg_id, Some(MessageId::new(99)));
+        assert_eq!(state.status_message_id, Some(99));
     }
 }
