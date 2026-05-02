@@ -68,7 +68,7 @@
 | `compat::legacy_tmp_paths` | `src/compat/legacy_tmp_paths.rs` | 23 |  |
 | `config` | `src/config.rs` | 2601 | giant-file |
 | `crate` | `src/main.rs` | 45 |  |
-| `credential` | `src/credential.rs` | 24 |  |
+| `credential` | `src/credential.rs` | 107 |  |
 | `db` | `src/db/mod.rs` | 337 |  |
 | `db::agents` | `src/db/agents.rs` | 1125 | giant-file |
 | `db::auto_queue` | `src/db/auto_queue.rs` | 4533 | giant-file |
@@ -91,7 +91,7 @@
 | `engine` | `src/engine/mod.rs` | 2590 | giant-file |
 | `engine::hooks` | `src/engine/hooks.rs` | 84 |  |
 | `engine::intent` | `src/engine/intent.rs` | 873 |  |
-| `engine::loader` | `src/engine/loader.rs` | 731 |  |
+| `engine::loader` | `src/engine/loader.rs` | 760 |  |
 | `engine::ops` | `src/engine/ops.rs` | 242 |  |
 | `engine::ops::agent_ops` | `src/engine/ops/agent_ops.rs` | 362 |  |
 | `engine::ops::auto_queue_ops` | `src/engine/ops/auto_queue_ops.rs` | 862 |  |
