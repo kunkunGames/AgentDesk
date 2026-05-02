@@ -5,11 +5,15 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::{PgPool, Row};
 
 use super::AppState;
-use crate::db::table_metadata;
 use crate::services::pipeline_override::{PipelineOverrideError, PipelineOverrideService};
+pub use crate::services::pipeline_routes::PipelineStageInput as PutStageItem;
+use crate::services::pipeline_routes::{PipelineRouteError, PipelineRouteService};
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+pub use crate::services::pipeline_routes::{
+    STAGE_BACKOFF_VALUES, STAGE_ON_FAILURE_VALUES, validate_backoff, validate_on_failure,
+};
 
 fn pg_unavailable() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -35,22 +39,21 @@ fn pipeline_override_error_response(
     }
 }
 
-/// #1097 (910-3) — readonly guard.
-///
-/// Returns an HTTP 405 response when `db_source_of_truth(table) == 'file'`
-/// or `'file-canonical'`.  Call at the top of any mutating route that
-/// targets a table whose canonical source lives on disk.
-async fn reject_if_readonly(
-    state: &AppState,
-    table: &str,
-) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let source = match state.pg_pool_ref() {
-        Some(pool) => table_metadata::source_of_truth_pg(pool, table).await,
-        None => None,
-    };
-
-    match source {
-        Some(s) if s.is_readonly() => Some((
+fn pipeline_route_error_response(
+    error: PipelineRouteError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        PipelineRouteError::BadRequest { stage, error } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("stage '{stage}': {error}"),
+                "stage": stage,
+            })),
+        ),
+        PipelineRouteError::NotFound(error) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": error})))
+        }
+        PipelineRouteError::Readonly { table, source } => (
             StatusCode::METHOD_NOT_ALLOWED,
             Json(json!({
                 "error": format!(
@@ -59,53 +62,17 @@ async fn reject_if_readonly(
                     table
                 ),
                 "table": table,
-                "source_of_truth": match s {
-                    table_metadata::Source::File => "file",
-                    table_metadata::Source::FileCanonical => "file-canonical",
-                    table_metadata::Source::Db => "db",
-                },
+                "source_of_truth": source,
             })),
-        )),
-        _ => None,
+        ),
+        PipelineRouteError::Database(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        ),
     }
 }
 
 // ── Query / Body types ─────────────────────────────────────────
-
-/// #1082 — accepted `on_failure` policy values.
-/// Kept in sync with `crate::pipeline::OnFailurePolicy`.
-pub const STAGE_ON_FAILURE_VALUES: &[&str] =
-    &["escalate", "retry-with-backoff", "fallback-stage", "fail"];
-
-/// #1082 — accepted `backoff` policy values.
-pub const STAGE_BACKOFF_VALUES: &[&str] = &["exponential", "linear", "none"];
-
-/// Validate a stage's `on_failure` string. Returns `Err(value)` with the
-/// offending value when unknown, `Ok(())` otherwise (including None/empty).
-pub fn validate_on_failure(value: Option<&str>) -> Result<(), String> {
-    match value {
-        None => Ok(()),
-        Some(v) if v.is_empty() => Ok(()),
-        Some(v) if STAGE_ON_FAILURE_VALUES.iter().any(|a| *a == v) => Ok(()),
-        Some(v) => Err(format!(
-            "on_failure='{}' is invalid; expected one of {:?}",
-            v, STAGE_ON_FAILURE_VALUES
-        )),
-    }
-}
-
-/// Validate a stage's `backoff` string.
-pub fn validate_backoff(value: Option<&str>) -> Result<(), String> {
-    match value {
-        None => Ok(()),
-        Some(v) if v.is_empty() => Ok(()),
-        Some(v) if STAGE_BACKOFF_VALUES.iter().any(|a| *a == v) => Ok(()),
-        Some(v) => Err(format!(
-            "backoff='{}' is invalid; expected one of {:?}",
-            v, STAGE_BACKOFF_VALUES
-        )),
-    }
-}
 
 // ── Dashboard v2 types (/pipeline/...) ────────────────────────
 
@@ -127,25 +94,6 @@ pub struct PutStagesBody {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PutStageItem {
-    pub stage_name: String,
-    pub stage_order: Option<i64>,
-    pub trigger_after: Option<String>,
-    pub entry_skill: Option<String>,
-    pub provider: Option<String>,
-    pub agent_override_id: Option<String>,
-    pub timeout_minutes: Option<i64>,
-    pub on_failure: Option<String>,
-    pub on_failure_target: Option<String>,
-    pub max_retries: Option<i64>,
-    /// #1082 backoff policy. One of STAGE_BACKOFF_VALUES. Not persisted to DB
-    /// in this iteration; accepted for forward-compat in the API payload.
-    pub backoff: Option<String>,
-    pub skip_condition: Option<String>,
-    pub parallel_with: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct TranscriptQuery {
     pub limit: Option<usize>,
 }
@@ -160,18 +108,14 @@ pub async fn get_stages(
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable();
     };
-    let stages =
-        match list_pipeline_stages_pg(pool, params.repo.as_deref(), params.agent_id.as_deref())
-            .await
-        {
-            Ok(stages) => stages,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
-            }
-        };
+    let service = PipelineRouteService::new(pool);
+    let stages = match service
+        .list_stages(params.repo.as_deref(), params.agent_id.as_deref())
+        .await
+    {
+        Ok(stages) => stages,
+        Err(error) => return pipeline_route_error_response(error),
+    };
 
     (StatusCode::OK, Json(json!({ "stages": stages })))
 }
@@ -181,126 +125,13 @@ pub async fn put_stages(
     State(state): State<AppState>,
     Json(body): Json<PutStagesBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // #1097: reject when pipeline_stages is file-canonical.
-    if let Some(resp) = reject_if_readonly(&state, "pipeline_stages").await {
-        return resp;
-    }
-
-    // #1082: validate retry/backoff/on_failure before any DB writes.
-    for stage in &body.stages {
-        if let Err(msg) = validate_on_failure(stage.on_failure.as_deref()) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("stage '{}': {msg}", stage.stage_name),
-                    "stage": stage.stage_name,
-                })),
-            );
-        }
-        if let Err(msg) = validate_backoff(stage.backoff.as_deref()) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("stage '{}': {msg}", stage.stage_name),
-                    "stage": stage.stage_name,
-                })),
-            );
-        }
-        if let Some(mr) = stage.max_retries {
-            if mr < 0 {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": format!(
-                            "stage '{}': max_retries={mr} must be >= 0",
-                            stage.stage_name
-                        ),
-                        "stage": stage.stage_name,
-                    })),
-                );
-            }
-        }
-    }
-
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable();
     };
-    let stages = {
-        let mut tx = match pool.begin().await {
-            Ok(tx) => tx,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("begin tx: {error}")})),
-                );
-            }
-        };
-
-        if let Err(error) = sqlx::query("DELETE FROM pipeline_stages WHERE repo_id = $1")
-            .bind(&body.repo)
-            .execute(&mut *tx)
-            .await
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("delete: {error}")})),
-            );
-        }
-
-        for (idx, stage) in body.stages.iter().enumerate() {
-            let order = stage.stage_order.unwrap_or(idx as i64 + 1);
-            let timeout = stage.timeout_minutes.unwrap_or(60);
-            let on_failure = stage.on_failure.as_deref().unwrap_or("fail");
-            let max_retries = stage.max_retries.unwrap_or(0);
-
-            if let Err(error) = sqlx::query(
-                "INSERT INTO pipeline_stages (
-                    repo_id, stage_name, stage_order, trigger_after, entry_skill,
-                    timeout_minutes, on_failure, skip_condition, provider, agent_override_id,
-                    on_failure_target, max_retries, parallel_with
-                 ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
-                 )",
-            )
-            .bind(&body.repo)
-            .bind(&stage.stage_name)
-            .bind(order)
-            .bind(stage.trigger_after.as_deref())
-            .bind(stage.entry_skill.as_deref())
-            .bind(timeout)
-            .bind(on_failure)
-            .bind(stage.skip_condition.as_deref())
-            .bind(stage.provider.as_deref())
-            .bind(stage.agent_override_id.as_deref())
-            .bind(stage.on_failure_target.as_deref())
-            .bind(max_retries)
-            .bind(stage.parallel_with.as_deref())
-            .execute(&mut *tx)
-            .await
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("insert stage '{}': {error}", stage.stage_name)})),
-                );
-            }
-        }
-
-        if let Err(error) = tx.commit().await {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("commit: {error}")})),
-            );
-        }
-
-        match list_pipeline_stages_pg(pool, Some(&body.repo), None).await {
-            Ok(stages) => stages,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
-            }
-        }
+    let service = PipelineRouteService::new(pool);
+    let stages = match service.replace_stages(&body.repo, &body.stages).await {
+        Ok(stages) => stages,
+        Err(error) => return pipeline_route_error_response(error),
     };
 
     (StatusCode::OK, Json(json!({ "stages": stages })))
@@ -311,27 +142,16 @@ pub async fn delete_stages(
     State(state): State<AppState>,
     Query(params): Query<DeleteStagesQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // #1097: reject when pipeline_stages is file-canonical.
-    if let Some(resp) = reject_if_readonly(&state, "pipeline_stages").await {
-        return resp;
-    }
-
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable();
     };
-    match sqlx::query("DELETE FROM pipeline_stages WHERE repo_id = $1")
-        .bind(&params.repo)
-        .execute(pool)
-        .await
-    {
-        Ok(result) => (
+    let service = PipelineRouteService::new(pool);
+    match service.delete_stages(&params.repo).await {
+        Ok(count) => (
             StatusCode::OK,
-            Json(json!({"deleted": true, "count": result.rows_affected()})),
+            Json(json!({"deleted": true, "count": count})),
         ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{error}")})),
-        ),
+        Err(error) => pipeline_route_error_response(error),
     }
 }
 
@@ -344,61 +164,19 @@ pub async fn get_card_pipeline(
         return pg_unavailable();
     };
 
-    let repo_id = match sqlx::query_scalar::<_, Option<String>>(
-        "SELECT repo_id FROM kanban_cards WHERE id = $1",
-    )
-    .bind(&card_id)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(repo_id)) => repo_id,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "card not found"})),
-            );
-        }
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("{error}")})),
-            );
-        }
+    let service = PipelineRouteService::new(pool);
+    let card_pipeline = match service.card_pipeline(&card_id).await {
+        Ok(card_pipeline) => card_pipeline,
+        Err(error) => return pipeline_route_error_response(error),
     };
-
-    let stages = if let Some(repo_id) = repo_id.as_deref() {
-        match list_pipeline_stages_pg(pool, Some(repo_id), None).await {
-            Ok(stages) => stages,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let history = match list_card_pipeline_history_pg(pool, &card_id).await {
-        Ok(history) => history,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            );
-        }
-    };
-
-    let current_stage = find_current_stage(&stages, &history);
 
     (
         StatusCode::OK,
         Json(json!({
-            "repo_id": repo_id,
-            "stages": stages,
-            "history": history,
-            "current_stage": current_stage,
+            "repo_id": card_pipeline.repo_id,
+            "stages": card_pipeline.stages,
+            "history": card_pipeline.history,
+            "current_stage": card_pipeline.current_stage,
         })),
     )
 }
@@ -411,14 +189,10 @@ pub async fn get_card_history(
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable();
     };
-    let history = match list_card_history_pg(pool, &card_id).await {
+    let service = PipelineRouteService::new(pool);
+    let history = match service.card_history(&card_id).await {
         Ok(history) => history,
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": error})),
-            );
-        }
+        Err(error) => return pipeline_route_error_response(error),
     };
 
     (StatusCode::OK, Json(json!({"history": history})))
@@ -434,28 +208,11 @@ pub async fn get_card_transcripts(
         return pg_unavailable();
     };
 
-    let card_exists =
-        match sqlx::query("SELECT COUNT(*)::BIGINT AS count FROM kanban_cards WHERE id = $1")
-            .bind(&card_id)
-            .fetch_one(pool)
-            .await
-        {
-            Ok(row) => row.try_get::<i64, _>("count").unwrap_or(0) > 0,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("query: {e}")})),
-                );
-            }
-        };
-    if !card_exists {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "card not found"})),
-        );
-    }
-
-    match list_card_transcripts_pg(pool, &card_id, params.limit.unwrap_or(10)).await {
+    let service = PipelineRouteService::new(pool);
+    match service
+        .card_transcripts(&card_id, params.limit.unwrap_or(10))
+        .await
+    {
         Ok(transcripts) => (
             StatusCode::OK,
             Json(json!({
@@ -463,10 +220,7 @@ pub async fn get_card_transcripts(
                 "transcripts": transcripts,
             })),
         ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("transcripts: {e}")})),
-        ),
+        Err(error) => pipeline_route_error_response(error),
     }
 }
 
@@ -496,80 +250,17 @@ pub async fn get_effective_pipeline(
     State(state): State<AppState>,
     Query(params): Query<EffectivePipelineQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if crate::pipeline::try_get().is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "default pipeline not loaded"})),
-        );
-    }
-
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable();
     };
-    let effective = crate::pipeline::resolve_for_card_pg(
-        pool,
-        params.repo.as_deref(),
-        params.agent_id.as_deref(),
-    )
-    .await;
-
-    let repo_has_override = if let Some(repo_id) = params.repo.as_deref() {
-        match sqlx::query_scalar::<_, bool>(
-            "SELECT pipeline_config IS NOT NULL AND TRIM(pipeline_config::text) != ''
-             FROM github_repos
-             WHERE id = $1",
-        )
-        .bind(repo_id)
-        .fetch_optional(pool)
+    let service = PipelineRouteService::new(pool);
+    match service
+        .effective_pipeline(params.repo.as_deref(), params.agent_id.as_deref())
         .await
-        {
-            Ok(Some(value)) => value,
-            Ok(None) => false,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{error}")})),
-                );
-            }
-        }
-    } else {
-        false
-    };
-
-    let agent_has_override = if let Some(agent_id) = params.agent_id.as_deref() {
-        match sqlx::query_scalar::<_, bool>(
-            "SELECT pipeline_config IS NOT NULL AND TRIM(pipeline_config::text) != ''
-             FROM agents
-             WHERE id = $1",
-        )
-        .bind(agent_id)
-        .fetch_optional(pool)
-        .await
-        {
-            Ok(Some(value)) => value,
-            Ok(None) => false,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("{error}")})),
-                );
-            }
-        }
-    } else {
-        false
-    };
-
-    (
-        StatusCode::OK,
-        Json(json!({
-            "pipeline": effective.to_json(),
-            "layers": {
-                "default": true,
-                "repo": repo_has_override,
-                "agent": agent_has_override,
-            },
-        })),
-    )
+    {
+        Ok(effective) => (StatusCode::OK, Json(effective)),
+        Err(error) => pipeline_route_error_response(error),
+    }
 }
 
 /// Body for setting pipeline override
@@ -664,329 +355,17 @@ pub async fn get_pipeline_graph(
     State(state): State<AppState>,
     Query(params): Query<EffectivePipelineQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if crate::pipeline::try_get().is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "default pipeline not loaded"})),
-        );
-    }
-
     let Some(pool) = state.pg_pool_ref() else {
         return pg_unavailable();
     };
-    let effective = crate::pipeline::resolve_for_card_pg(
-        pool,
-        params.repo.as_deref(),
-        params.agent_id.as_deref(),
-    )
-    .await;
-
-    (StatusCode::OK, Json(effective.to_graph()))
-}
-
-fn stage_json(
-    id: i64,
-    repo_id: Option<String>,
-    stage_name: Option<String>,
-    stage_order: i64,
-    trigger_after: Option<String>,
-    entry_skill: Option<String>,
-    timeout_minutes: i64,
-    on_failure: Option<String>,
-    skip_condition: Option<String>,
-    provider: Option<String>,
-    agent_override_id: Option<String>,
-    on_failure_target: Option<String>,
-    max_retries: Option<i64>,
-    parallel_with: Option<String>,
-) -> serde_json::Value {
-    json!({
-        "id": id,
-        "repo_id": repo_id,
-        "repo": repo_id,
-        "stage_name": stage_name,
-        "stage_order": stage_order,
-        "trigger_after": trigger_after,
-        "entry_skill": entry_skill,
-        "timeout_minutes": timeout_minutes,
-        "on_failure": on_failure,
-        "skip_condition": skip_condition,
-        "provider": provider,
-        "agent_override_id": agent_override_id,
-        "on_failure_target": on_failure_target,
-        "max_retries": max_retries,
-        "parallel_with": parallel_with,
-    })
-}
-
-fn pg_stage_row_to_json(row: &sqlx::postgres::PgRow) -> Result<serde_json::Value, sqlx::Error> {
-    let stage_order = row.try_get::<i64, _>("stage_order")?;
-    let timeout_minutes = row.try_get::<i64, _>("timeout_minutes")?;
-    let max_retries = row.try_get::<Option<i64>, _>("max_retries")?;
-
-    Ok(stage_json(
-        row.try_get::<i64, _>("id")?,
-        row.try_get::<Option<String>, _>("repo_id")?,
-        row.try_get::<Option<String>, _>("stage_name")?,
-        stage_order,
-        row.try_get::<Option<String>, _>("trigger_after")?,
-        row.try_get::<Option<String>, _>("entry_skill")?,
-        timeout_minutes,
-        row.try_get::<Option<String>, _>("on_failure")?,
-        row.try_get::<Option<String>, _>("skip_condition")?,
-        row.try_get::<Option<String>, _>("provider")?,
-        row.try_get::<Option<String>, _>("agent_override_id")?,
-        row.try_get::<Option<String>, _>("on_failure_target")?,
-        max_retries,
-        row.try_get::<Option<String>, _>("parallel_with")?,
-    ))
-}
-
-async fn list_pipeline_stages_pg(
-    pool: &PgPool,
-    repo: Option<&str>,
-    agent_id: Option<&str>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let rows = sqlx::query(
-        "SELECT id, repo_id, stage_name, stage_order, trigger_after, entry_skill,
-                timeout_minutes, on_failure, skip_condition, provider,
-                agent_override_id, on_failure_target, max_retries, parallel_with
-         FROM pipeline_stages
-         WHERE ($1::text IS NULL OR repo_id = $1)
-           AND ($2::text IS NULL OR agent_override_id = $2)
-         ORDER BY stage_order ASC",
-    )
-    .bind(repo)
-    .bind(agent_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("query postgres stages: {error}"))?;
-
-    rows.into_iter()
-        .map(|row| {
-            pg_stage_row_to_json(&row).map_err(|error| format!("decode postgres stage: {error}"))
-        })
-        .collect()
-}
-
-fn dispatch_pipeline_history_json(
-    id: String,
-    kanban_card_id: Option<String>,
-    from_agent_id: Option<String>,
-    to_agent_id: Option<String>,
-    dispatch_type: Option<String>,
-    status: Option<String>,
-    title: Option<String>,
-    context: Option<String>,
-    result: Option<String>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-) -> serde_json::Value {
-    json!({
-        "id": id,
-        "kanban_card_id": kanban_card_id,
-        "from_agent_id": from_agent_id,
-        "to_agent_id": to_agent_id,
-        "dispatch_type": dispatch_type,
-        "status": status,
-        "title": title,
-        "context": context,
-        "result": result,
-        "created_at": created_at,
-        "updated_at": updated_at,
-    })
-}
-
-fn dispatch_history_json(
-    id: String,
-    dispatch_type: Option<String>,
-    status: Option<String>,
-    from_agent_id: Option<String>,
-    to_agent_id: Option<String>,
-    title: Option<String>,
-    result: Option<String>,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-) -> serde_json::Value {
-    json!({
-        "id": id,
-        "dispatch_type": dispatch_type,
-        "status": status,
-        "from_agent_id": from_agent_id,
-        "to_agent_id": to_agent_id,
-        "title": title,
-        "result": result,
-        "created_at": created_at,
-        "updated_at": updated_at,
-    })
-}
-
-async fn list_card_pipeline_history_pg(
-    pool: &PgPool,
-    card_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
-    let rows = sqlx::query(
-        "SELECT id, kanban_card_id, from_agent_id, to_agent_id, dispatch_type,
-                status, title, context, result, created_at::text AS created_at, updated_at::text AS updated_at
-         FROM task_dispatches
-         WHERE kanban_card_id = $1
-         ORDER BY created_at ASC",
-    )
-    .bind(card_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("history query: {error}"))?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(dispatch_pipeline_history_json(
-                row.try_get::<String, _>("id")?,
-                row.try_get::<Option<String>, _>("kanban_card_id")?,
-                row.try_get::<Option<String>, _>("from_agent_id")?,
-                row.try_get::<Option<String>, _>("to_agent_id")?,
-                row.try_get::<Option<String>, _>("dispatch_type")?,
-                row.try_get::<Option<String>, _>("status")?,
-                row.try_get::<Option<String>, _>("title")?,
-                row.try_get::<Option<String>, _>("context")?,
-                row.try_get::<Option<String>, _>("result")?,
-                row.try_get::<Option<String>, _>("created_at")?,
-                row.try_get::<Option<String>, _>("updated_at")?,
-            ))
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(|error| format!("decode history row: {error}"))
-}
-
-async fn list_card_history_pg(
-    pool: &PgPool,
-    card_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
-    let rows = sqlx::query(
-        "SELECT id, dispatch_type, status, from_agent_id, to_agent_id, title, result,
-                created_at::text AS created_at, updated_at::text AS updated_at
-         FROM task_dispatches
-         WHERE kanban_card_id = $1
-         ORDER BY created_at ASC",
-    )
-    .bind(card_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("prepare: {error}"))?;
-    rows.into_iter()
-        .map(|row| {
-            Ok(dispatch_history_json(
-                row.try_get::<String, _>("id")?,
-                row.try_get::<Option<String>, _>("dispatch_type")?,
-                row.try_get::<Option<String>, _>("status")?,
-                row.try_get::<Option<String>, _>("from_agent_id")?,
-                row.try_get::<Option<String>, _>("to_agent_id")?,
-                row.try_get::<Option<String>, _>("title")?,
-                row.try_get::<Option<String>, _>("result")?,
-                row.try_get::<Option<String>, _>("created_at")?,
-                row.try_get::<Option<String>, _>("updated_at")?,
-            ))
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(|error| format!("decode history row: {error}"))
-}
-
-async fn list_card_transcripts_pg(
-    pool: &PgPool,
-    card_id: &str,
-    limit: usize,
-) -> Result<Vec<serde_json::Value>, String> {
-    let limit = limit.clamp(1, 100) as i64;
-    let rows = sqlx::query(
-        "SELECT st.id::BIGINT AS id,
-                st.turn_id,
-                st.session_key,
-                st.channel_id,
-                st.agent_id,
-                st.provider,
-                st.dispatch_id,
-                td.kanban_card_id,
-                td.title,
-                kc.title AS card_title,
-                kc.github_issue_number::BIGINT AS github_issue_number,
-                st.user_message,
-                st.assistant_message,
-                st.events_json::TEXT AS events_json,
-                st.duration_ms::BIGINT AS duration_ms,
-                to_char(st.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at
-         FROM session_transcripts st
-         JOIN task_dispatches td
-           ON td.id = st.dispatch_id
-         LEFT JOIN kanban_cards kc
-           ON kc.id = td.kanban_card_id
-         WHERE td.kanban_card_id = $1
-         ORDER BY st.created_at DESC, st.id DESC
-         LIMIT $2",
-    )
-    .bind(card_id)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("query card transcripts failed: {error}"))?;
-
-    rows.into_iter()
-        .map(|row| {
-            let events_json = row.try_get::<Option<String>, _>("events_json")?;
-            let events = events_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default();
-            Ok(json!({
-                "id": row.try_get::<i64, _>("id")?,
-                "turn_id": row.try_get::<String, _>("turn_id")?,
-                "session_key": row.try_get::<Option<String>, _>("session_key")?,
-                "channel_id": row.try_get::<Option<String>, _>("channel_id")?,
-                "agent_id": row.try_get::<Option<String>, _>("agent_id")?,
-                "provider": row.try_get::<Option<String>, _>("provider")?,
-                "dispatch_id": row.try_get::<Option<String>, _>("dispatch_id")?,
-                "kanban_card_id": row.try_get::<Option<String>, _>("kanban_card_id")?,
-                "dispatch_title": row.try_get::<Option<String>, _>("title")?,
-                "card_title": row.try_get::<Option<String>, _>("card_title")?,
-                "github_issue_number": row.try_get::<Option<i64>, _>("github_issue_number")?,
-                "user_message": row.try_get::<String, _>("user_message")?,
-                "assistant_message": row.try_get::<String, _>("assistant_message")?,
-                "events": events,
-                "duration_ms": row.try_get::<Option<i64>, _>("duration_ms")?,
-                "created_at": row.try_get::<String, _>("created_at")?,
-            }))
-        })
-        .collect::<Result<Vec<_>, sqlx::Error>>()
-        .map_err(|error| format!("decode transcript row: {error}"))
-}
-
-fn find_current_stage(
-    stages: &[serde_json::Value],
-    history: &[serde_json::Value],
-) -> serde_json::Value {
-    if history.is_empty() || stages.is_empty() {
-        return serde_json::Value::Null;
+    let service = PipelineRouteService::new(pool);
+    match service
+        .pipeline_graph(params.repo.as_deref(), params.agent_id.as_deref())
+        .await
+    {
+        Ok(graph) => (StatusCode::OK, Json(graph)),
+        Err(error) => pipeline_route_error_response(error),
     }
-
-    let active_dispatch = history.iter().rev().find(|dispatch| {
-        let status = dispatch["status"].as_str().unwrap_or("");
-        status == "pending" || status == "running" || status == "in_progress"
-    });
-
-    let Some(dispatch) = active_dispatch else {
-        return serde_json::Value::Null;
-    };
-
-    let dispatch_type = dispatch["dispatch_type"].as_str().unwrap_or("");
-    let title = dispatch["title"].as_str().unwrap_or("");
-    stages
-        .iter()
-        .find(|stage| {
-            let skill = stage["entry_skill"].as_str().unwrap_or("");
-            let name = stage["stage_name"].as_str().unwrap_or("");
-            (!skill.is_empty() && (skill == dispatch_type || skill == title))
-                || (!name.is_empty() && (name == dispatch_type || name == title))
-        })
-        .cloned()
-        .unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
