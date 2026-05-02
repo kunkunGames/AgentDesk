@@ -7,8 +7,9 @@ use crate::services::memory::{
     UNBOUND_MEMORY_ROLE_ID, resolve_memento_agent_id, resolve_memento_workspace,
     sanitize_memento_workspace_segment,
 };
+use regex::Regex;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 const CONTEXT_COMPRESSION_SECTION_ORDER: &str = "`Goal`, `Progress`, `Decisions`, `Files`, `Next`";
 const STALE_TOOL_RESULT_PLACEHOLDER_EXAMPLE: &str =
@@ -29,6 +30,35 @@ const PR_ALWAYS_COMPLETION_CONTRACT: &str = "- `merge_strategy_mode=pr-always` �
      - 구현/검증 후 브랜치를 push 하고 PR 을 연다.\n\
      - PR 생성 후 review 요청과 auto-merge enable 까지 수행한다.\n\
      - 이 모드의 완료 조건은 direct push 가 아니라 `PR open + auto-merge enabled` 이다.";
+const CURRENT_TASK_LAYER_NAME: &str = "current_task";
+const CURRENT_TASK_REDACTED_PREVIEW_MAX_BYTES: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BuiltSystemPrompt {
+    pub(super) system_prompt: String,
+    pub(super) manifest: PromptManifest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(super) struct PromptManifest {
+    pub(super) layers: Vec<PromptManifestLayer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(super) struct PromptManifestLayer {
+    pub(super) layer: String,
+    pub(super) source: String,
+    pub(super) reason: String,
+    pub(super) content_visibility: PromptContentVisibility,
+    pub(super) redacted_preview: Option<String>,
+    pub(super) full_content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PromptContentVisibility {
+    UserDerived,
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CurrentTaskContext<'a> {
@@ -525,6 +555,58 @@ fn render_current_task_section(
     (!sections.is_empty()).then(|| format!("[Current Task]\n{}", sections.join("\n\n")))
 }
 
+fn current_task_manifest_layer(
+    current_task: &CurrentTaskContext<'_>,
+    rendered_section: &str,
+) -> PromptManifestLayer {
+    let dispatch_id = current_task
+        .dispatch_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (source, reason) = match dispatch_id {
+        Some(dispatch_id) => (
+            "task_dispatches.context".to_string(),
+            format!("dispatch_id={dispatch_id}"),
+        ),
+        None => ("discord_message".to_string(), "freeform".to_string()),
+    };
+
+    PromptManifestLayer {
+        layer: CURRENT_TASK_LAYER_NAME.to_string(),
+        source,
+        reason,
+        content_visibility: PromptContentVisibility::UserDerived,
+        redacted_preview: Some(redacted_prompt_manifest_preview(rendered_section)),
+        full_content: None,
+    }
+}
+
+fn redacted_prompt_manifest_preview(input: &str) -> String {
+    static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("valid email regex")
+    });
+
+    let redacted = super::formatting::redact_sensitive_for_placeholder(input);
+    let redacted = EMAIL_RE
+        .replace_all(&redacted, "[redacted-email]")
+        .into_owned();
+    truncate_prompt_manifest_preview(&redacted, CURRENT_TASK_REDACTED_PREVIEW_MAX_BYTES)
+}
+
+fn truncate_prompt_manifest_preview(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+
+    let mut boundary = max_bytes;
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let mut truncated = input[..boundary].trim_end().to_string();
+    truncated.push_str("\n[... truncated]");
+    truncated
+}
+
 fn proactive_memory_guidance(
     memory_settings: Option<&ResolvedMemorySettings>,
     current_path: &str,
@@ -777,6 +859,42 @@ pub(super) fn build_system_prompt(
     memory_settings: Option<&ResolvedMemorySettings>,
     memento_mcp_available: bool,
 ) -> String {
+    build_system_prompt_with_manifest(
+        discord_context,
+        channel_participants,
+        current_path,
+        channel_id,
+        token,
+        role_binding,
+        queued_turn,
+        profile,
+        dispatch_type,
+        current_task,
+        shared_knowledge,
+        longterm_catalog,
+        memory_settings,
+        memento_mcp_available,
+    )
+    .system_prompt
+}
+
+pub(super) fn build_system_prompt_with_manifest(
+    discord_context: &str,
+    channel_participants: &[UserRecord],
+    current_path: &str,
+    channel_id: ChannelId,
+    token: &str,
+    role_binding: Option<&RoleBinding>,
+    queued_turn: bool,
+    profile: DispatchProfile,
+    dispatch_type: Option<&str>,
+    current_task: Option<&CurrentTaskContext<'_>>,
+    shared_knowledge: Option<&str>,
+    longterm_catalog: Option<&str>,
+    memory_settings: Option<&ResolvedMemorySettings>,
+    memento_mcp_available: bool,
+) -> BuiltSystemPrompt {
+    let mut prompt_manifest = PromptManifest::default();
     let mut system_prompt_owned = format!(
         "You are chatting with a user through Discord.\n\
          {}\n\
@@ -947,11 +1065,24 @@ pub(super) fn build_system_prompt(
              If the latest user message asks for an exact literal output, return exactly that literal output and nothing else.",
         );
     }
-    if let Some(current_task_section) =
-        current_task.and_then(|task| render_current_task_section(task, dispatch_type))
-    {
+    if let Some((task, current_task_section)) = current_task.and_then(|task| {
+        render_current_task_section(task, dispatch_type).map(|section| (task, section))
+    }) {
+        prompt_manifest
+            .layers
+            .push(current_task_manifest_layer(task, &current_task_section));
         system_prompt_owned.push_str("\n\n");
         system_prompt_owned.push_str(&current_task_section);
+    }
+
+    if !prompt_manifest.layers.is_empty() {
+        if let Ok(manifest_json) = serde_json::to_string(&prompt_manifest) {
+            tracing::info!(
+                target: "agentdesk.prompt_manifest",
+                prompt_manifest = %manifest_json,
+                "recorded prompt manifest"
+            );
+        }
     }
 
     if profile != DispatchProfile::Full {
@@ -964,12 +1095,95 @@ pub(super) fn build_system_prompt(
         );
     }
 
-    system_prompt_owned
+    BuiltSystemPrompt {
+        system_prompt: system_prompt_owned,
+        manifest: prompt_manifest,
+    }
 }
 
 #[cfg(test)]
 mod dispatch_contract_tests {
     use super::*;
+
+    fn build_prompt_with_manifest_for(
+        current_task: &CurrentTaskContext<'_>,
+        dispatch_type: Option<&str>,
+    ) -> BuiltSystemPrompt {
+        build_system_prompt_with_manifest(
+            "ctx",
+            &[],
+            "/tmp",
+            ChannelId::new(1),
+            "tok",
+            None,
+            false,
+            DispatchProfile::Full,
+            dispatch_type,
+            Some(current_task),
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn current_task_dispatch_layer_is_recorded_with_redacted_preview_only() {
+        let current_task = CurrentTaskContext {
+            dispatch_id: Some("dispatch-1534"),
+            card_id: Some("card-1534"),
+            dispatch_title: Some("Follow up with user@example.com token=super-secret-123"),
+            card_title: Some("Instrument current task layer"),
+            github_issue_url: Some("https://github.com/itismyfield/AgentDesk/issues/1534"),
+            ..CurrentTaskContext::default()
+        };
+
+        let built = build_prompt_with_manifest_for(&current_task, Some("implementation"));
+
+        assert!(built.system_prompt.contains("[Current Task]"));
+        assert_eq!(built.manifest.layers.len(), 1);
+        let layer = &built.manifest.layers[0];
+        assert_eq!(layer.layer, "current_task");
+        assert_eq!(layer.source, "task_dispatches.context");
+        assert_eq!(layer.reason, "dispatch_id=dispatch-1534");
+        assert_eq!(
+            layer.content_visibility,
+            PromptContentVisibility::UserDerived
+        );
+        assert!(layer.full_content.is_none());
+
+        let preview = layer.redacted_preview.as_deref().unwrap();
+        assert!(preview.contains("[redacted-email]"));
+        assert!(preview.contains("token=***"));
+        assert!(!preview.contains("user@example.com"));
+        assert!(!preview.contains("super-secret-123"));
+
+        let serialized = serde_json::to_value(layer).unwrap();
+        assert_eq!(serialized["full_content"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn current_task_freeform_layer_uses_discord_message_source() {
+        let current_task = CurrentTaskContext {
+            dispatch_title: Some("Manual request from owner@example.com"),
+            ..CurrentTaskContext::default()
+        };
+
+        let built = build_prompt_with_manifest_for(&current_task, None);
+
+        assert_eq!(built.manifest.layers.len(), 1);
+        let layer = &built.manifest.layers[0];
+        assert_eq!(layer.source, "discord_message");
+        assert_eq!(layer.reason, "freeform");
+        assert!(layer.full_content.is_none());
+        assert!(
+            layer
+                .redacted_preview
+                .as_deref()
+                .unwrap()
+                .contains("[redacted-email]")
+        );
+    }
 
     #[test]
     fn phase_gate_contract_requires_verdict_and_checks() {
