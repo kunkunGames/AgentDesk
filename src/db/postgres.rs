@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::Connection;
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{Migration, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
@@ -16,6 +16,18 @@ const POSTGRES_MIGRATION_ROUTINES_REVISION: &str = "routines revision";
 const POSTGRES_MIGRATION_WORKER_NODES: &str = "worker nodes";
 const POSTGRES_MIGRATION_DISPATCH_OUTBOX_CLAIMS: &str = "dispatch outbox claims";
 const POSTGRES_MIGRATION_SESSIONS_STATUS_4STATE: &str = "sessions status 4state";
+const POSTGRES_MIGRATION_WORKER_CAPABILITY_ROUTING: &str = "worker capability routing";
+const POSTGRES_MIGRATION_RESOURCE_LOCKS: &str = "resource locks";
+const POSTGRES_MIGRATION_TEST_PHASE_RUNS: &str = "test phase runs";
+const POSTGRES_MIGRATION_MULTINODE_PHASE_GATE_CONTRACT: &str = "multinode phase gate contract";
+const POSTGRES_LEGACY_RENUMBERED_MIGRATIONS: &[(i64, i64, &str)] = &[
+    (31, 29, POSTGRES_MIGRATION_WORKER_NODES),
+    (32, 30, POSTGRES_MIGRATION_DISPATCH_OUTBOX_CLAIMS),
+    (33, 31, POSTGRES_MIGRATION_WORKER_CAPABILITY_ROUTING),
+    (34, 32, POSTGRES_MIGRATION_RESOURCE_LOCKS),
+    (35, 33, POSTGRES_MIGRATION_TEST_PHASE_RUNS),
+    (36, 34, POSTGRES_MIGRATION_MULTINODE_PHASE_GATE_CONTRACT),
+];
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 3;
 const STARTUP_PG_ACQUIRE_TIMEOUT_SECS: u64 = 60;
@@ -218,11 +230,23 @@ fn postgres_migrator() -> Migrator {
 fn postgres_migrator_for_applied(applied: &[AppliedMigrationInfo]) -> Migrator {
     let version_29_choice = select_postgres_version_29_choice(applied);
     let version_30_choice = select_postgres_version_30_choice(applied);
+    let uses_legacy_renumbered_profile = uses_legacy_postgres_renumbered_profile(applied);
     let mut migrations = Vec::new();
     let mut pre_worker_capability_migrations = Vec::new();
+    let mut inserted_legacy_renumbered_migrations = false;
 
     for migration in POSTGRES_MIGRATOR.iter() {
         let description = migration.description.as_ref();
+        if uses_legacy_renumbered_profile
+            && is_current_postgres_renumbered_migration_version(migration.version)
+        {
+            if !inserted_legacy_renumbered_migrations {
+                migrations.extend(postgres_legacy_renumbered_migrations());
+                inserted_legacy_renumbered_migrations = true;
+            }
+            continue;
+        }
+
         if should_skip_postgres_migration(
             migration.version,
             description,
@@ -268,6 +292,39 @@ fn select_postgres_version_30_choice(applied: &[AppliedMigrationInfo]) -> Postgr
         }
         _ => PostgresVersion30Choice::SessionsStatus4State,
     }
+}
+
+fn uses_legacy_postgres_renumbered_profile(applied: &[AppliedMigrationInfo]) -> bool {
+    matches!(
+        successful_applied_postgres_migration_description(applied, 31),
+        Some(POSTGRES_MIGRATION_WORKER_NODES)
+    )
+}
+
+fn is_current_postgres_renumbered_migration_version(version: i64) -> bool {
+    (31..=36).contains(&version)
+}
+
+fn postgres_legacy_renumbered_migrations() -> Vec<Migration> {
+    POSTGRES_LEGACY_RENUMBERED_MIGRATIONS
+        .iter()
+        .map(|(target_version, source_version, description)| {
+            let mut migration = POSTGRES_MIGRATOR
+                .iter()
+                .find(|migration| {
+                    migration.version == *source_version
+                        && migration.description.as_ref() == *description
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing postgres migration source {source_version} {description:?} for legacy version {target_version}"
+                    )
+                })
+                .clone();
+            migration.version = *target_version;
+            migration
+        })
+        .collect()
 }
 
 fn successful_applied_postgres_migration_description(
@@ -1271,6 +1328,66 @@ mod tests {
             && migration.description.as_ref() == "dispatch outbox claims"));
         assert!(migrator.iter().any(|migration| migration.version == 39
             && migration.description.as_ref() == "sessions status 4state"));
+    }
+
+    #[test]
+    fn postgres_migrator_preserves_legacy_renumbered_versions() {
+        let applied = [
+            successful_applied_postgres_migration(31, "worker nodes"),
+            successful_applied_postgres_migration(32, "dispatch outbox claims"),
+            successful_applied_postgres_migration(33, "worker capability routing"),
+            successful_applied_postgres_migration(34, "resource locks"),
+            successful_applied_postgres_migration(35, "test phase runs"),
+            successful_applied_postgres_migration(36, "multinode phase gate contract"),
+        ];
+        let migrator = super::postgres_migrator_for_applied(&applied);
+        assert_postgres_migrator_has_no_duplicate_versions(&migrator);
+
+        for (version, description) in [
+            (31, "worker nodes"),
+            (32, "dispatch outbox claims"),
+            (33, "worker capability routing"),
+            (34, "resource locks"),
+            (35, "test phase runs"),
+            (36, "multinode phase gate contract"),
+        ] {
+            assert!(
+                migrator.iter().any(|migration| {
+                    migration.version == version && migration.description.as_ref() == description
+                }),
+                "missing legacy migration {version} {description}"
+            );
+        }
+
+        for (version, description) in [
+            (31, "worker capability routing"),
+            (32, "resource locks"),
+            (33, "test phase runs"),
+            (34, "multinode phase gate contract"),
+            (35, "routines"),
+            (36, "routines revision"),
+        ] {
+            assert!(
+                !migrator.iter().any(|migration| {
+                    migration.version == version && migration.description.as_ref() == description
+                }),
+                "resolved conflicting current migration {version} {description}"
+            );
+        }
+
+        let legacy_worker_nodes = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 31 && migration.description.as_ref() == "worker nodes"
+            })
+            .expect("legacy worker nodes migration");
+        let source_worker_nodes = super::POSTGRES_MIGRATOR
+            .iter()
+            .find(|migration| {
+                migration.version == 29 && migration.description.as_ref() == "worker nodes"
+            })
+            .expect("source worker nodes migration");
+        assert_eq!(legacy_worker_nodes.checksum, source_worker_nodes.checksum);
     }
 
     #[tokio::test]
