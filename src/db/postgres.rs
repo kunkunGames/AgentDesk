@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::Duration;
@@ -11,9 +12,25 @@ use crate::config::{AgentChannel, AgentDef, Config};
 use crate::server::routes::settings::{KvSeedAction, config_default_seed_actions};
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
+const POSTGRES_MIGRATION_ROUTINES_REVISION: &str = "routines revision";
+const POSTGRES_MIGRATION_WORKER_NODES: &str = "worker nodes";
+const POSTGRES_MIGRATION_DISPATCH_OUTBOX_CLAIMS: &str = "dispatch outbox claims";
+const POSTGRES_MIGRATION_SESSIONS_STATUS_4STATE: &str = "sessions status 4state";
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 3;
 const STARTUP_PG_ACQUIRE_TIMEOUT_SECS: u64 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostgresVersion29Choice {
+    RoutinesRevision,
+    WorkerNodes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostgresVersion30Choice {
+    SessionsStatus4State,
+    DispatchOutboxClaims,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PoolConnectSettings {
@@ -186,11 +203,117 @@ pub async fn connect_and_migrate(config: &Config) -> Result<Option<PgPool>, Stri
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), String> {
-    POSTGRES_MIGRATOR
+    let applied = query_applied_migrations_if_present(pool).await?;
+    postgres_migrator_for_applied(&applied)
         .run(pool)
         .await
         .map_err(|error| format!("run postgres migrations: {error}"))?;
     Ok(())
+}
+
+fn postgres_migrator() -> Migrator {
+    postgres_migrator_for_applied(&[])
+}
+
+fn postgres_migrator_for_applied(applied: &[AppliedMigrationInfo]) -> Migrator {
+    let version_29_choice = select_postgres_version_29_choice(applied);
+    let version_30_choice = select_postgres_version_30_choice(applied);
+    let mut migrations = Vec::new();
+    let mut pre_worker_capability_migrations = Vec::new();
+
+    for migration in POSTGRES_MIGRATOR.iter() {
+        let description = migration.description.as_ref();
+        if should_skip_postgres_migration(
+            migration.version,
+            description,
+            version_29_choice,
+            version_30_choice,
+        ) {
+            continue;
+        }
+
+        if is_worker_nodes_forward_replay(migration.version, description) {
+            pre_worker_capability_migrations.push(migration.clone());
+            continue;
+        }
+
+        migrations.push(migration.clone());
+    }
+
+    let insert_at = migrations
+        .iter()
+        .position(|migration| migration.version == 31)
+        .unwrap_or(migrations.len());
+    migrations.splice(insert_at..insert_at, pre_worker_capability_migrations);
+
+    Migrator {
+        migrations: Cow::Owned(migrations),
+        ignore_missing: POSTGRES_MIGRATOR.ignore_missing,
+        locking: POSTGRES_MIGRATOR.locking,
+        no_tx: POSTGRES_MIGRATOR.no_tx,
+    }
+}
+
+fn select_postgres_version_29_choice(applied: &[AppliedMigrationInfo]) -> PostgresVersion29Choice {
+    match successful_applied_postgres_migration_description(applied, 29) {
+        Some(POSTGRES_MIGRATION_WORKER_NODES) => PostgresVersion29Choice::WorkerNodes,
+        _ => PostgresVersion29Choice::RoutinesRevision,
+    }
+}
+
+fn select_postgres_version_30_choice(applied: &[AppliedMigrationInfo]) -> PostgresVersion30Choice {
+    match successful_applied_postgres_migration_description(applied, 30) {
+        Some(POSTGRES_MIGRATION_DISPATCH_OUTBOX_CLAIMS) => {
+            PostgresVersion30Choice::DispatchOutboxClaims
+        }
+        _ => PostgresVersion30Choice::SessionsStatus4State,
+    }
+}
+
+fn successful_applied_postgres_migration_description(
+    applied: &[AppliedMigrationInfo],
+    version: i64,
+) -> Option<&str> {
+    applied
+        .iter()
+        .find(|migration| migration.version == version && migration.success)
+        .map(|migration| migration.description.as_str())
+}
+
+fn should_skip_postgres_migration(
+    version: i64,
+    description: &str,
+    version_29_choice: PostgresVersion29Choice,
+    version_30_choice: PostgresVersion30Choice,
+) -> bool {
+    match (version, description) {
+        (29, POSTGRES_MIGRATION_ROUTINES_REVISION) => {
+            version_29_choice == PostgresVersion29Choice::WorkerNodes
+        }
+        (29, POSTGRES_MIGRATION_WORKER_NODES) => {
+            version_29_choice == PostgresVersion29Choice::RoutinesRevision
+        }
+        (30, POSTGRES_MIGRATION_SESSIONS_STATUS_4STATE) => {
+            version_30_choice == PostgresVersion30Choice::DispatchOutboxClaims
+        }
+        (30, POSTGRES_MIGRATION_DISPATCH_OUTBOX_CLAIMS) => {
+            version_30_choice == PostgresVersion30Choice::SessionsStatus4State
+        }
+        (37, POSTGRES_MIGRATION_WORKER_NODES) => {
+            version_29_choice == PostgresVersion29Choice::WorkerNodes
+        }
+        (38, POSTGRES_MIGRATION_DISPATCH_OUTBOX_CLAIMS) => {
+            version_30_choice == PostgresVersion30Choice::DispatchOutboxClaims
+        }
+        (39, POSTGRES_MIGRATION_SESSIONS_STATUS_4STATE) => {
+            version_30_choice == PostgresVersion30Choice::SessionsStatus4State
+        }
+        _ => false,
+    }
+}
+
+fn is_worker_nodes_forward_replay(version: i64, description: &str) -> bool {
+    version == 37 && description == POSTGRES_MIGRATION_WORKER_NODES
 }
 
 pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String> {
@@ -258,9 +381,24 @@ pub async fn query_applied_migrations(pool: &PgPool) -> Result<Vec<AppliedMigrat
         .collect())
 }
 
+async fn query_applied_migrations_if_present(
+    pool: &PgPool,
+) -> Result<Vec<AppliedMigrationInfo>, String> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await
+        .map_err(|error| format!("check _sqlx_migrations existence: {error}"))?;
+
+    if !exists {
+        return Ok(Vec::new());
+    }
+
+    query_applied_migrations(pool).await
+}
+
 pub async fn migration_status(pool: &PgPool) -> Result<MigrationStatus, String> {
-    let applied = query_applied_migrations(pool).await?;
-    let resolved_versions = POSTGRES_MIGRATOR
+    let applied = query_applied_migrations_if_present(pool).await?;
+    let resolved_versions = postgres_migrator_for_applied(&applied)
         .iter()
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
@@ -875,18 +1013,46 @@ pub(crate) async fn close_test_pool(pool: PgPool, label: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvisoryLockLease, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, close_test_pool,
+        AdvisoryLockLease, AppliedMigrationInfo, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, close_test_pool,
         config_database_summary, connect_options, connect_test_pool_and_migrate_config,
         create_test_database, database_enabled, database_summary, health_check,
         run_test_postgres_sqlx_op_with_timeout, startup_pool_settings, startup_reseed,
     };
     use sqlx::Row;
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     struct TestDatabase {
         admin_url: String,
         database_name: String,
         database_url: String,
+    }
+
+    fn successful_applied_postgres_migration(
+        version: i64,
+        description: &str,
+    ) -> AppliedMigrationInfo {
+        AppliedMigrationInfo {
+            version,
+            description: description.to_string(),
+            success: true,
+        }
+    }
+
+    fn assert_postgres_migrator_has_no_duplicate_versions(migrator: &sqlx::migrate::Migrator) {
+        let mut seen_versions = BTreeSet::new();
+        let mut duplicate_versions = Vec::new();
+
+        for migration in migrator
+            .iter()
+            .filter(|migration| !migration.migration_type.is_down_migration())
+        {
+            if !seen_versions.insert(migration.version) {
+                duplicate_versions.push(migration.version);
+            }
+        }
+
+        assert!(duplicate_versions.is_empty(), "{duplicate_versions:?}");
     }
 
     impl TestDatabase {
@@ -1032,6 +1198,79 @@ mod tests {
             settings.acquire_timeout,
             Duration::from_secs(STARTUP_PG_ACQUIRE_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn postgres_migrator_filters_legacy_duplicate_versions() {
+        let migrator = super::postgres_migrator();
+        assert_postgres_migrator_has_no_duplicate_versions(&migrator);
+        assert!(
+            !migrator.iter().any(|migration| migration.version == 29
+                && migration.description.as_ref() == "worker nodes")
+        );
+        assert!(!migrator.iter().any(|migration| migration.version == 30
+            && migration.description.as_ref() == "dispatch outbox claims"));
+        assert!(
+            migrator.iter().any(|migration| migration.version == 37
+                && migration.description.as_ref() == "worker nodes")
+        );
+        assert!(migrator.iter().any(|migration| migration.version == 38
+            && migration.description.as_ref() == "dispatch outbox claims"));
+
+        let resolved = migrator
+            .iter()
+            .map(|migration| (migration.version, migration.description.as_ref()))
+            .collect::<Vec<_>>();
+        let worker_nodes_pos = resolved
+            .iter()
+            .position(|(version, description)| *version == 37 && *description == "worker nodes")
+            .expect("worker_nodes forward replay");
+        let worker_capability_pos = resolved
+            .iter()
+            .position(|(version, description)| {
+                *version == 31 && *description == "worker capability routing"
+            })
+            .expect("worker capability routing migration");
+        assert!(worker_nodes_pos < worker_capability_pos);
+    }
+
+    #[test]
+    fn postgres_migrator_preserves_legacy_worker_nodes_version() {
+        let applied = [successful_applied_postgres_migration(29, "worker nodes")];
+        let migrator = super::postgres_migrator_for_applied(&applied);
+        assert_postgres_migrator_has_no_duplicate_versions(&migrator);
+
+        assert!(
+            migrator.iter().any(|migration| migration.version == 29
+                && migration.description.as_ref() == "worker nodes")
+        );
+        assert!(!migrator.iter().any(|migration| migration.version == 29
+            && migration.description.as_ref() == "routines revision"));
+        assert!(
+            !migrator.iter().any(|migration| migration.version == 37
+                && migration.description.as_ref() == "worker nodes")
+        );
+        assert!(migrator.iter().any(|migration| migration.version == 36
+            && migration.description.as_ref() == "routines revision"));
+    }
+
+    #[test]
+    fn postgres_migrator_preserves_legacy_dispatch_version() {
+        let applied = [successful_applied_postgres_migration(
+            30,
+            "dispatch outbox claims",
+        )];
+        let migrator = super::postgres_migrator_for_applied(&applied);
+        assert_postgres_migrator_has_no_duplicate_versions(&migrator);
+
+        assert!(migrator.iter().any(|migration| migration.version == 30
+            && migration.description.as_ref() == "dispatch outbox claims"));
+        assert!(!migrator.iter().any(|migration| migration.version == 30
+            && migration.description.as_ref() == "sessions status 4state"));
+        assert!(!migrator.iter().any(|migration| migration.version == 38
+            && migration.description.as_ref() == "dispatch outbox claims"));
+        assert!(migrator.iter().any(|migration| migration.version == 39
+            && migration.description.as_ref() == "sessions status 4state"));
     }
 
     #[tokio::test]
