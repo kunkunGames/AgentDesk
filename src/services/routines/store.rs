@@ -857,7 +857,8 @@ impl RoutineStore {
                        rr.status,
                        COUNT(*)::BIGINT AS occurrence_count,
                        MAX(rr.started_at) AS latest_at,
-                       MAX(rr.error) FILTER (WHERE rr.error IS NOT NULL) AS last_error
+                       (ARRAY_AGG(rr.error ORDER BY rr.started_at DESC, rr.id DESC)
+                           FILTER (WHERE rr.error IS NOT NULL))[1] AS last_error
                 FROM routine_runs rr
                 JOIN routines r ON r.id = rr.routine_id
                 WHERE rr.status IN ('succeeded', 'failed', 'skipped', 'error')
