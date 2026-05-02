@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::Duration;
@@ -11,6 +12,8 @@ use crate::config::{AgentChannel, AgentDef, Config};
 use crate::server::routes::settings::{KvSeedAction, config_default_seed_actions};
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
+const LEGACY_DUPLICATE_POSTGRES_MIGRATIONS: &[(i64, &str)] =
+    &[(29, "worker nodes"), (30, "dispatch outbox claims")];
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 3;
 const STARTUP_PG_ACQUIRE_TIMEOUT_SECS: u64 = 60;
@@ -186,11 +189,55 @@ pub async fn connect_and_migrate(config: &Config) -> Result<Option<PgPool>, Stri
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), String> {
-    POSTGRES_MIGRATOR
+    postgres_migrator()
         .run(pool)
         .await
         .map_err(|error| format!("run postgres migrations: {error}"))?;
     Ok(())
+}
+
+fn postgres_migrator() -> Migrator {
+    let mut migrations = Vec::new();
+    let mut pre_worker_capability_migrations = Vec::new();
+
+    for migration in POSTGRES_MIGRATOR.iter() {
+        if is_legacy_duplicate_postgres_migration(migration.version, migration.description.as_ref())
+        {
+            continue;
+        }
+
+        if is_worker_nodes_forward_replay(migration.version, migration.description.as_ref()) {
+            pre_worker_capability_migrations.push(migration.clone());
+            continue;
+        }
+
+        migrations.push(migration.clone());
+    }
+
+    let insert_at = migrations
+        .iter()
+        .position(|migration| migration.version == 31)
+        .unwrap_or(migrations.len());
+    migrations.splice(insert_at..insert_at, pre_worker_capability_migrations);
+
+    Migrator {
+        migrations: Cow::Owned(migrations),
+        ignore_missing: POSTGRES_MIGRATOR.ignore_missing,
+        locking: POSTGRES_MIGRATOR.locking,
+        no_tx: POSTGRES_MIGRATOR.no_tx,
+    }
+}
+
+fn is_legacy_duplicate_postgres_migration(version: i64, description: &str) -> bool {
+    LEGACY_DUPLICATE_POSTGRES_MIGRATIONS
+        .iter()
+        .any(|(legacy_version, legacy_description)| {
+            version == *legacy_version && description == *legacy_description
+        })
+}
+
+fn is_worker_nodes_forward_replay(version: i64, description: &str) -> bool {
+    version == 37 && description == "worker nodes"
 }
 
 pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String> {
@@ -260,7 +307,7 @@ pub async fn query_applied_migrations(pool: &PgPool) -> Result<Vec<AppliedMigrat
 
 pub async fn migration_status(pool: &PgPool) -> Result<MigrationStatus, String> {
     let applied = query_applied_migrations(pool).await?;
-    let resolved_versions = POSTGRES_MIGRATOR
+    let resolved_versions = postgres_migrator()
         .iter()
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
@@ -881,6 +928,7 @@ mod tests {
         run_test_postgres_sqlx_op_with_timeout, startup_pool_settings, startup_reseed,
     };
     use sqlx::Row;
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     struct TestDatabase {
@@ -1032,6 +1080,52 @@ mod tests {
             settings.acquire_timeout,
             Duration::from_secs(STARTUP_PG_ACQUIRE_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn postgres_migrator_filters_legacy_duplicate_versions() {
+        let migrator = super::postgres_migrator();
+        let mut seen_versions = BTreeSet::new();
+        let mut duplicate_versions = Vec::new();
+
+        for migration in migrator
+            .iter()
+            .filter(|migration| !migration.migration_type.is_down_migration())
+        {
+            if !seen_versions.insert(migration.version) {
+                duplicate_versions.push(migration.version);
+            }
+        }
+
+        assert!(duplicate_versions.is_empty(), "{duplicate_versions:?}");
+        assert!(
+            !migrator.iter().any(|migration| migration.version == 29
+                && migration.description.as_ref() == "worker nodes")
+        );
+        assert!(!migrator.iter().any(|migration| migration.version == 30
+            && migration.description.as_ref() == "dispatch outbox claims"));
+        assert!(
+            migrator.iter().any(|migration| migration.version == 37
+                && migration.description.as_ref() == "worker nodes")
+        );
+        assert!(migrator.iter().any(|migration| migration.version == 38
+            && migration.description.as_ref() == "dispatch outbox claims"));
+
+        let resolved = migrator
+            .iter()
+            .map(|migration| (migration.version, migration.description.as_ref()))
+            .collect::<Vec<_>>();
+        let worker_nodes_pos = resolved
+            .iter()
+            .position(|(version, description)| *version == 37 && *description == "worker nodes")
+            .expect("worker_nodes forward replay");
+        let worker_capability_pos = resolved
+            .iter()
+            .position(|(version, description)| {
+                *version == 31 && *description == "worker capability routing"
+            })
+            .expect("worker capability routing migration");
+        assert!(worker_nodes_pos < worker_capability_pos);
     }
 
     #[tokio::test]
