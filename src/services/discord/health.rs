@@ -2777,11 +2777,26 @@ fn is_allowed_send_source(source: &str) -> bool {
         "timeouts",
         "merge-automation",
         "dashboard",
+        "lifecycle_notifier",
         "routine-runtime",
         "headless_turn",
         "slo_alerter",
     ];
     INTERNAL_SOURCES.contains(&source) || super::settings::is_known_agent(source)
+}
+
+#[cfg(test)]
+mod send_source_tests {
+    use super::is_allowed_send_source;
+
+    #[test]
+    fn headless_turn_is_allowed_internal_send_source() {
+        assert!(is_allowed_send_source("headless_turn"));
+        assert!(is_allowed_send_source("lifecycle_notifier"));
+        assert!(is_allowed_send_source("routine-runtime"));
+        assert!(is_allowed_send_source("slo_alerter"));
+        assert!(!is_allowed_send_source("not-a-real-source"));
+    }
 }
 
 async fn send_resolved_manual_message_with_client<C: ManualOutboundClient>(
@@ -4299,6 +4314,7 @@ mod tests {
     #[test]
     fn headless_turn_is_allowed_internal_send_source() {
         assert!(is_allowed_send_source("headless_turn"));
+        assert!(is_allowed_send_source("lifecycle_notifier"));
         assert!(is_allowed_send_source("routine-runtime"));
         assert!(is_allowed_send_source("slo_alerter"));
         assert!(!is_allowed_send_source("not-a-real-source"));

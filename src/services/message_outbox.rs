@@ -2,7 +2,8 @@ use sqlx::PgPool;
 
 use crate::db::Db;
 
-pub(crate) const LIFECYCLE_NOTIFY_DEDUPE_TTL_SECS: i64 = 45;
+pub(crate) const LIFECYCLE_NOTIFY_DEDUPE_TTL_SECS: i64 = 5 * 60;
+pub(crate) const LIFECYCLE_NOTIFIER_SOURCE: &str = "lifecycle_notifier";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OutboxMessage<'a> {
@@ -241,7 +242,7 @@ pub(crate) async fn enqueue_lifecycle_notification_pg(
     .bind(target)
     .bind(content)
     .bind("notify")
-    .bind("system")
+    .bind(LIFECYCLE_NOTIFIER_SOURCE)
     .bind(reason_code)
     .bind(session_key.as_deref())
     .execute(pool)

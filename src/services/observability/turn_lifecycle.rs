@@ -37,19 +37,26 @@ pub struct RecoveryDetails {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCompactionDetails {
+    pub before_pct: u64,
+    pub after_pct: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnEvent {
     SessionFresh,
     SessionResumed,
     SessionResumeFailedWithRecovery(RecoveryDetails),
-    ContextCompacted,
+    ContextCompacted(ContextCompactionDetails),
 }
 
 impl TurnEvent {
     pub const SESSION_FRESH_PERSIST: bool = true;
-    pub const SESSION_FRESH_NOTIFY_USER: bool = false;
+    pub const SESSION_FRESH_NOTIFY_USER: bool = true;
     pub const SESSION_RESUMED_PERSIST: bool = true;
-    pub const SESSION_RESUMED_NOTIFY_USER: bool = true;
+    pub const SESSION_RESUMED_NOTIFY_USER: bool = false;
     pub const SESSION_RESUME_FAILED_WITH_RECOVERY_PERSIST: bool = true;
     pub const SESSION_RESUME_FAILED_WITH_RECOVERY_NOTIFY_USER: bool = true;
     pub const CONTEXT_COMPACTED_PERSIST: bool = true;
@@ -87,7 +94,7 @@ impl TurnEvent {
             Self::SessionResumeFailedWithRecovery(_) => {
                 Self::SESSION_RESUME_FAILED_WITH_RECOVERY_META
             }
-            Self::ContextCompacted => Self::CONTEXT_COMPACTED_META,
+            Self::ContextCompacted(_) => Self::CONTEXT_COMPACTED_META,
         }
     }
 
@@ -104,8 +111,50 @@ impl TurnEvent {
             Self::SessionResumeFailedWithRecovery(details) => {
                 serde_json::to_value(details).unwrap_or_else(|_| json!({}))
             }
-            Self::SessionFresh | Self::SessionResumed | Self::ContextCompacted => json!({}),
+            Self::ContextCompacted(details) => {
+                serde_json::to_value(details).unwrap_or_else(|_| json!({}))
+            }
+            Self::SessionFresh | Self::SessionResumed => json!({}),
         }
+    }
+
+    pub const fn notification_reason_code(&self) -> Option<&'static str> {
+        match self {
+            Self::SessionFresh => Some("lifecycle.session_fresh"),
+            Self::SessionResumed => None,
+            Self::SessionResumeFailedWithRecovery(_) => Some("lifecycle.session_resume_failed"),
+            Self::ContextCompacted(_) => Some("lifecycle.context_compacted"),
+        }
+    }
+
+    pub fn notification_content(&self) -> Option<String> {
+        match self {
+            Self::SessionFresh => Some(
+                "🆕 새 세션 시작\n이전 대화 컨텍스트 없음. 필요한 정보는 다시 알려주세요."
+                    .to_string(),
+            ),
+            Self::SessionResumed => None,
+            Self::SessionResumeFailedWithRecovery(details) => {
+                let reason = non_empty_or(&details.reason, "provider 응답 요약 없음");
+                let recovery = non_empty_or(&details.recovery_action, "복구 없음");
+                Some(format!(
+                    "♻️ 이전 대화 이어가기 실패\n사유: {reason}\n복구: {recovery}"
+                ))
+            }
+            Self::ContextCompacted(details) => Some(format!(
+                "📦 컨텍스트 자동 압축\n이전 {}% → 이후 {}%\n보존: Goal / Progress / Decisions / Files / Next",
+                details.before_pct, details.after_pct
+            )),
+        }
+    }
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
     }
 }
 
@@ -153,6 +202,13 @@ pub struct TurnLifecyclePersistedEvent {
     pub kind: String,
     pub severity: String,
     pub notify_user: bool,
+    pub notification_enqueued: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatestSessionLifecycleEvent {
+    pub kind: String,
+    pub details_json: Value,
 }
 
 pub async fn emit_turn_lifecycle(
@@ -193,6 +249,30 @@ pub async fn emit_turn_lifecycle(
     .await
     .map_err(|error| anyhow!("insert turn_lifecycle_events: {error}"))?;
 
+    let notification_enqueued = if meta.notify_user {
+        let reason_code = event.event.notification_reason_code().ok_or_else(|| {
+            anyhow!("turn lifecycle event marked notify_user without reason_code")
+        })?;
+        let content = event
+            .event
+            .notification_content()
+            .ok_or_else(|| anyhow!("turn lifecycle event marked notify_user without content"))?;
+        let target = notification_target(&event.channel_id);
+        Some(
+            crate::services::message_outbox::enqueue_lifecycle_notification_pg(
+                pool,
+                &target,
+                None,
+                reason_code,
+                &content,
+            )
+            .await
+            .map_err(|error| anyhow!("enqueue turn lifecycle notification: {error}"))?,
+        )
+    } else {
+        None
+    };
+
     Ok(Some(TurnLifecyclePersistedEvent {
         id: row
             .try_get::<i64, _>("id")
@@ -204,7 +284,55 @@ pub async fn emit_turn_lifecycle(
             .try_get::<String, _>("severity")
             .map_err(|error| anyhow!("decode turn lifecycle severity: {error}"))?,
         notify_user: meta.notify_user,
+        notification_enqueued,
     }))
+}
+
+pub async fn load_latest_session_lifecycle_event(
+    pool: &PgPool,
+    channel_id: &str,
+    turn_id: &str,
+) -> Result<Option<LatestSessionLifecycleEvent>> {
+    let row = sqlx::query(
+        "SELECT kind, details_json
+         FROM turn_lifecycle_events
+         WHERE channel_id = $1
+           AND turn_id = $2
+           AND kind IN (
+               'session_fresh',
+               'session_resumed',
+               'session_resume_failed_with_recovery'
+           )
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(channel_id)
+    .bind(turn_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| anyhow!("load latest session lifecycle event: {error}"))?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(LatestSessionLifecycleEvent {
+        kind: row
+            .try_get::<String, _>("kind")
+            .map_err(|error| anyhow!("decode session lifecycle kind: {error}"))?,
+        details_json: row
+            .try_get::<Value, _>("details_json")
+            .map_err(|error| anyhow!("decode session lifecycle details_json: {error}"))?,
+    }))
+}
+
+fn notification_target(channel_id: &str) -> String {
+    let channel_id = channel_id.trim();
+    if channel_id.starts_with("channel:") {
+        channel_id.to_string()
+    } else {
+        format!("channel:{channel_id}")
+    }
 }
 
 #[cfg(test)]
@@ -312,8 +440,8 @@ mod tests {
     #[test]
     fn turn_event_metadata_is_compile_time_constant_backed() {
         assert!(TurnEvent::SESSION_FRESH_PERSIST);
-        assert!(!TurnEvent::SESSION_FRESH_NOTIFY_USER);
-        assert!(TurnEvent::SESSION_RESUMED_NOTIFY_USER);
+        assert!(TurnEvent::SESSION_FRESH_NOTIFY_USER);
+        assert!(!TurnEvent::SESSION_RESUMED_NOTIFY_USER);
         assert!(TurnEvent::SESSION_RESUME_FAILED_WITH_RECOVERY_NOTIFY_USER);
         assert!(TurnEvent::CONTEXT_COMPACTED_NOTIFY_USER);
 
@@ -328,6 +456,55 @@ mod tests {
             TurnEvent::SESSION_RESUME_FAILED_WITH_RECOVERY_META
         );
         assert_eq!(recovery.meta().severity, TurnEventSeverity::Warn);
+    }
+
+    #[test]
+    fn turn_event_notification_policy_and_copy_match_lifecycle_contract() {
+        let fresh = TurnEvent::SessionFresh;
+        assert_eq!(
+            fresh.notification_reason_code(),
+            Some("lifecycle.session_fresh")
+        );
+        assert_eq!(
+            fresh.notification_content().as_deref(),
+            Some("🆕 새 세션 시작\n이전 대화 컨텍스트 없음. 필요한 정보는 다시 알려주세요.")
+        );
+
+        let resumed = TurnEvent::SessionResumed;
+        assert_eq!(resumed.notification_reason_code(), None);
+        assert_eq!(resumed.notification_content(), None);
+
+        let recovery = TurnEvent::SessionResumeFailedWithRecovery(RecoveryDetails {
+            reason: "provider rejected resume token".to_string(),
+            recovery_action: "최근 디스코드 메시지 10건을 다음 턴에 자동 주입".to_string(),
+            previous_session_key: None,
+            recovered_session_key: Some("agentdesk-new".to_string()),
+        });
+        assert_eq!(
+            recovery.notification_reason_code(),
+            Some("lifecycle.session_resume_failed")
+        );
+        assert_eq!(
+            recovery.notification_content().as_deref(),
+            Some(
+                "♻️ 이전 대화 이어가기 실패\n사유: provider rejected resume token\n복구: 최근 디스코드 메시지 10건을 다음 턴에 자동 주입"
+            )
+        );
+
+        let compacted = TurnEvent::ContextCompacted(ContextCompactionDetails {
+            before_pct: 91,
+            after_pct: 37,
+        });
+        assert_eq!(
+            compacted.notification_reason_code(),
+            Some("lifecycle.context_compacted")
+        );
+        assert_eq!(
+            compacted.notification_content().as_deref(),
+            Some(
+                "📦 컨텍스트 자동 압축\n이전 91% → 이후 37%\n보존: Goal / Progress / Decisions / Files / Next"
+            )
+        );
     }
 
     #[tokio::test]
@@ -359,6 +536,7 @@ mod tests {
         assert_eq!(persisted.kind, "session_resume_failed_with_recovery");
         assert_eq!(persisted.severity, "warn");
         assert!(persisted.notify_user);
+        assert_eq!(persisted.notification_enqueued, Some(true));
 
         let row = sqlx::query(
             "SELECT turn_id, channel_id, session_key, dispatch_id, kind, severity, summary, details_json
@@ -393,6 +571,144 @@ mod tests {
         assert_eq!(details["recoveryAction"], "start fresh session");
         assert_eq!(details["previousSessionKey"], "agentdesk-old");
         assert_eq!(details["recoveredSessionKey"], "agentdesk-new");
+
+        let outbox = sqlx::query(
+            "SELECT target, content, bot, source, reason_code, session_key
+             FROM message_outbox
+             ORDER BY id ASC",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(outbox.try_get::<String, _>("target")?, "channel:42");
+        assert_eq!(outbox.try_get::<String, _>("bot")?, "notify");
+        assert_eq!(
+            outbox.try_get::<String, _>("source")?,
+            crate::services::message_outbox::LIFECYCLE_NOTIFIER_SOURCE
+        );
+        assert_eq!(
+            outbox.try_get::<Option<String>, _>("reason_code")?,
+            Some("lifecycle.session_resume_failed".to_string())
+        );
+        assert_eq!(
+            outbox.try_get::<Option<String>, _>("session_key")?,
+            Some("channel:42".to_string())
+        );
+        let content = outbox.try_get::<String, _>("content")?;
+        assert!(content.contains("♻️ 이전 대화 이어가기 실패"));
+        assert!(content.contains("사유: session transcript missing"));
+        assert!(content.contains("복구: start fresh session"));
+
+        pool.close().await;
+        pg_db.drop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn emit_turn_lifecycle_enqueues_expected_notifications_and_dedupes() -> Result<()> {
+        let Some(pg_db) = TestPostgresDb::try_create().await else {
+            return Ok(());
+        };
+        let pool = pg_db.connect_and_migrate().await?;
+
+        let fresh_first = emit_turn_lifecycle(
+            &pool,
+            TurnLifecycleEmit::new(
+                "discord:77:1",
+                "77",
+                TurnEvent::SessionFresh,
+                "fresh session",
+            )
+            .session_key("session-a"),
+        )
+        .await?
+        .expect("fresh event persists");
+        assert_eq!(fresh_first.notification_enqueued, Some(true));
+
+        let fresh_duplicate = emit_turn_lifecycle(
+            &pool,
+            TurnLifecycleEmit::new(
+                "discord:77:2",
+                "77",
+                TurnEvent::SessionFresh,
+                "fresh session again",
+            )
+            .session_key("session-b"),
+        )
+        .await?
+        .expect("duplicate fresh event still persists");
+        assert_eq!(fresh_duplicate.notification_enqueued, Some(false));
+
+        let resumed = emit_turn_lifecycle(
+            &pool,
+            TurnLifecycleEmit::new(
+                "discord:77:3",
+                "77",
+                TurnEvent::SessionResumed,
+                "session resumed",
+            )
+            .session_key("session-b"),
+        )
+        .await?
+        .expect("resumed event persists");
+        assert!(!resumed.notify_user);
+        assert_eq!(resumed.notification_enqueued, None);
+
+        let compacted = emit_turn_lifecycle(
+            &pool,
+            TurnLifecycleEmit::new(
+                "discord:77:4",
+                "77",
+                TurnEvent::ContextCompacted(ContextCompactionDetails {
+                    before_pct: 88,
+                    after_pct: 41,
+                }),
+                "context compacted",
+            )
+            .session_key("session-b"),
+        )
+        .await?
+        .expect("compacted event persists");
+        assert_eq!(compacted.notification_enqueued, Some(true));
+
+        let rows = sqlx::query(
+            "SELECT reason_code, content, source
+             FROM message_outbox
+             WHERE target = 'channel:77'
+             ORDER BY id ASC",
+        )
+        .fetch_all(&pool)
+        .await?;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].try_get::<Option<String>, _>("reason_code")?,
+            Some("lifecycle.session_fresh".to_string())
+        );
+        assert!(
+            rows[0]
+                .try_get::<String, _>("content")?
+                .contains("🆕 새 세션 시작")
+        );
+        assert_eq!(
+            rows[1].try_get::<Option<String>, _>("reason_code")?,
+            Some("lifecycle.context_compacted".to_string())
+        );
+        assert!(
+            rows[1]
+                .try_get::<String, _>("content")?
+                .contains("이전 88% → 이후 41%")
+        );
+        for row in rows {
+            assert_eq!(
+                row.try_get::<String, _>("source")?,
+                crate::services::message_outbox::LIFECYCLE_NOTIFIER_SOURCE
+            );
+        }
+
+        assert_eq!(
+            crate::services::message_outbox::LIFECYCLE_NOTIFY_DEDUPE_TTL_SECS,
+            5 * 60
+        );
 
         pool.close().await;
         pg_db.drop().await;
