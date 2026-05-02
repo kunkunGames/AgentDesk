@@ -164,6 +164,7 @@ agentdesk.routines.register({
 
     // Process each candidate_review observation
     const emitPrompts = [];
+    const queuedSignatures = new Set();
     for (const obs of reviewObs) {
       const signature = observationSignature(obs, reviewPrefix);
       const candidate = observationPayload(obs);
@@ -178,9 +179,9 @@ agentdesk.routines.register({
         continue;
       }
 
-      // Skip if we already emitted an approval prompt this cycle
+      // Skip if we already emitted an approval prompt for this candidate.
       const seen = cp.seen_candidates[signature];
-      if (seen && seen.status === "emitted") {
+      if ((seen && seen.status === "emitted") || queuedSignatures.has(signature)) {
         cp.stats.skipped_already_approved++;
         continue;
       }
@@ -194,8 +195,7 @@ agentdesk.routines.register({
       }
 
       emitPrompts.push({ signature, candidate });
-      cp.seen_candidates[signature] = { first_seen_at: nowStr, status: "emitted" };
-      cp.stats.approved_emitted++;
+      queuedSignatures.add(signature);
     }
 
     if (emitPrompts.length === 0) {
@@ -215,6 +215,8 @@ agentdesk.routines.register({
     // Emit one approval prompt (first candidate, others handled on next ticks)
     const { signature, candidate } = emitPrompts[0];
     const prompt = buildApprovalPrompt(signature, candidate);
+    cp.seen_candidates[signature] = { first_seen_at: nowStr, status: "emitted" };
+    cp.stats.approved_emitted++;
 
     return {
       action: "agent",

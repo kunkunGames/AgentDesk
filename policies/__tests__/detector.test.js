@@ -100,3 +100,31 @@ test("previously emitted candidate is not re-emitted on second tick", () => {
   const r2 = tick({ now: nowT2, checkpoint: r1.checkpoint, observations: obs, automationInventory: [] });
   assert.equal(r2.action, "complete", "second tick should not re-emit");
 });
+
+test("multiple review observations only mark the emitted candidate", () => {
+  const { tick } = loadRoutine(ROUTINE_PATH);
+  const obs = [
+    makeReviewObs("first-sig"),
+    makeReviewObs("second-sig"),
+  ];
+
+  const r1 = tick({ now: BASE_NOW, checkpoint: null, observations: obs, automationInventory: [] });
+  assert.equal(r1.action, "agent", "first tick should emit one agent action");
+  assert.ok(r1.prompt.includes("first-sig"), "first candidate should be emitted first");
+  assert.equal(r1.checkpoint.seen_candidates["first-sig"].status, "emitted");
+  assert.equal(
+    r1.checkpoint.seen_candidates["second-sig"],
+    undefined,
+    "non-emitted candidates must remain available for later ticks"
+  );
+
+  const r2 = tick({
+    now: new Date(BASE_NOW.getTime() + 60_000),
+    checkpoint: r1.checkpoint,
+    observations: obs,
+    automationInventory: [],
+  });
+  assert.equal(r2.action, "agent", "second tick should emit the remaining candidate");
+  assert.ok(r2.prompt.includes("second-sig"), "second candidate should be emitted on the next tick");
+  assert.equal(r2.checkpoint.seen_candidates["second-sig"].status, "emitted");
+});
