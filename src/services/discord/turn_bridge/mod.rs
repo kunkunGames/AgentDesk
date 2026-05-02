@@ -80,6 +80,7 @@ use tmux_runtime::is_dcserver_restart_command;
 use super::formatting::ReplaceLongMessageOutcome;
 use super::watcher_lifecycle_decision::should_resume_watcher_after_turn;
 use crate::db::session_status::{AWAITING_BG, AWAITING_USER, IDLE};
+use sqlx::Row;
 
 #[cfg(unix)]
 fn tmux_generation_file_mtime_ns(tmux_session_name: &str) -> i64 {
@@ -251,6 +252,74 @@ async fn refresh_prompt_panel_line_from_manifest(
             false
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskPanelDispatchMetadata {
+    card_id: Option<String>,
+    dispatch_type: Option<String>,
+}
+
+async fn load_task_panel_dispatch_metadata(
+    pg_pool: Option<&sqlx::PgPool>,
+    dispatch_id: &str,
+) -> Result<Option<TaskPanelDispatchMetadata>, String> {
+    let Some(pg_pool) = pg_pool else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT kanban_card_id, dispatch_type
+         FROM task_dispatches
+         WHERE id = $1",
+    )
+    .bind(dispatch_id)
+    .fetch_optional(pg_pool)
+    .await
+    .map_err(|error| format!("load task panel dispatch metadata for {dispatch_id}: {error}"))?;
+
+    row.map(|row| {
+        Ok::<TaskPanelDispatchMetadata, String>(TaskPanelDispatchMetadata {
+            card_id: row
+                .try_get("kanban_card_id")
+                .map_err(|error| format!("decode task panel card_id for {dispatch_id}: {error}"))?,
+            dispatch_type: row.try_get("dispatch_type").map_err(|error| {
+                format!("decode task panel dispatch_type for {dispatch_id}: {error}")
+            })?,
+        })
+    })
+    .transpose()
+}
+
+async fn refresh_task_panel_line_from_dispatch(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    dispatch_id: &str,
+) -> bool {
+    let dispatch_id = dispatch_id.trim();
+    if dispatch_id.is_empty() {
+        return false;
+    }
+    let metadata =
+        match load_task_panel_dispatch_metadata(shared.pg_pool.as_ref(), dispatch_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(
+                    "[turn_bridge] failed to load task line for dispatch {} in channel {}: {}",
+                    dispatch_id,
+                    channel_id,
+                    error
+                );
+                None
+            }
+        };
+    shared.placeholder_live_events.set_task_panel_info(
+        channel_id,
+        dispatch_id,
+        metadata.as_ref().and_then(|value| value.card_id.as_deref()),
+        metadata
+            .as_ref()
+            .and_then(|value| value.dispatch_type.as_deref()),
+    )
 }
 
 async fn close_all_tracked_background_children(
@@ -1407,6 +1476,17 @@ pub(super) fn spawn_turn_bridge(
                     status_panel_dirty = false;
                 }
             }
+        }
+
+        if shared_owned.status_panel_v2_enabled
+            && let Some(dispatch_id) = dispatch_id.as_deref()
+        {
+            status_panel_dirty |= refresh_task_panel_line_from_dispatch(
+                shared_owned.as_ref(),
+                channel_id,
+                dispatch_id,
+            )
+            .await;
         }
 
         // codex round-5 P2 on PR #1308: a dcserver restart resumed an inflight

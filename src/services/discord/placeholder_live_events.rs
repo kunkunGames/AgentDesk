@@ -17,6 +17,7 @@ const STATUS_PANEL_MAX_CHARS: usize = 4096;
 const STATUS_PANEL_TODO_LIMIT: usize = 8;
 const STATUS_PANEL_SUBAGENT_LIMIT: usize = 6;
 const SESSION_PANEL_LINE_MAX_CHARS: usize = 100;
+const TASK_PANEL_LINE_MAX_CHARS: usize = 140;
 const CONTEXT_PANEL_LINE_MAX_CHARS: usize = 120;
 const PROMPT_PANEL_LINE_MAX_CHARS: usize = 120;
 
@@ -171,6 +172,51 @@ impl PlaceholderLiveEvents {
             return false;
         }
         guard.session = snapshot;
+        true
+    }
+
+    pub(super) fn set_task_panel_info(
+        &self,
+        channel_id: ChannelId,
+        dispatch_id: &str,
+        card_id: Option<&str>,
+        dispatch_type: Option<&str>,
+    ) -> bool {
+        let dispatch_id = clean_task_panel_value(dispatch_id);
+        if dispatch_id.is_empty() {
+            return self.set_task_panel_snapshot(channel_id, None);
+        }
+        let clean_optional = |value: Option<&str>| {
+            value
+                .map(clean_task_panel_value)
+                .filter(|value| !value.is_empty())
+        };
+        self.set_task_panel_snapshot(
+            channel_id,
+            Some(TaskPanelSnapshot {
+                dispatch_id,
+                card_id: clean_optional(card_id),
+                dispatch_type: clean_optional(dispatch_type),
+            }),
+        )
+    }
+
+    fn set_task_panel_snapshot(
+        &self,
+        channel_id: ChannelId,
+        snapshot: Option<TaskPanelSnapshot>,
+    ) -> bool {
+        let entry = self
+            .status_by_channel
+            .entry(channel_id)
+            .or_insert_with(|| Mutex::new(StatusPanelState::default()));
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.task == snapshot {
+            return false;
+        }
+        guard.task = snapshot;
         true
     }
 
@@ -349,6 +395,13 @@ impl SessionPanelSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskPanelSnapshot {
+    dispatch_id: String,
+    card_id: Option<String>,
+    dispatch_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextPanelSnapshot {
     input_tokens: u64,
     cache_create_tokens: u64,
@@ -431,6 +484,7 @@ impl Default for DerivedStatus {
 struct StatusPanelState {
     status: DerivedStatus,
     session: Option<SessionPanelSnapshot>,
+    task: Option<TaskPanelSnapshot>,
     context: Option<ContextPanelSnapshot>,
     prompt: Option<PromptPanelSnapshot>,
     todos: Vec<StatusTodoItem>,
@@ -550,6 +604,10 @@ fn render_status_panel(
         sections.push(render_session_panel_line(session, provider));
     }
 
+    if let Some(task) = snapshot.task.as_ref() {
+        sections.push(render_task_panel_line(task));
+    }
+
     if let Some(context_line) = snapshot
         .context
         .as_ref()
@@ -621,6 +679,17 @@ fn render_session_panel_line(session: &SessionPanelSnapshot, provider: &Provider
         parts.push(format!("tmux {}", tmux.as_str()));
     }
     truncate_chars(&parts.join(" · "), SESSION_PANEL_LINE_MAX_CHARS)
+}
+
+fn render_task_panel_line(task: &TaskPanelSnapshot) -> String {
+    let mut parts = vec![format!("Task     dispatch #{}", task.dispatch_id)];
+    if let Some(card_id) = task.card_id.as_deref() {
+        parts.push(format!("card #{card_id}"));
+    }
+    if let Some(dispatch_type) = task.dispatch_type.as_deref() {
+        parts.push(dispatch_type.to_string());
+    }
+    truncate_chars(&parts.join(" · "), TASK_PANEL_LINE_MAX_CHARS)
 }
 
 fn render_context_panel_line(context: &ContextPanelSnapshot) -> Option<String> {
@@ -797,6 +866,10 @@ fn first_json_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
 fn first_json_bool(value: &Value, keys: &[&str]) -> Option<bool> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
+fn clean_task_panel_value(raw: &str) -> String {
+    first_content_line(raw)
 }
 
 fn render_derived_status(status: &DerivedStatus) -> String {
@@ -1642,6 +1715,44 @@ mod tests {
         let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
 
         assert!(!rendered.contains("Context  "));
+    }
+
+    #[test]
+    fn status_panel_renders_task_line_from_dispatch_metadata() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(185);
+        assert!(events.set_task_panel_info(
+            channel_id,
+            "dsp_123",
+            Some("42"),
+            Some("implementation"),
+        ));
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Codex, 1_700_000_000);
+
+        assert!(rendered.contains("Task     dispatch #dsp_123 · card #42 · implementation"));
+    }
+
+    #[test]
+    fn status_panel_omits_task_line_without_dispatch_id() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(186);
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+        assert!(!rendered.contains("Task     "));
+    }
+
+    #[test]
+    fn status_panel_renders_task_line_with_dispatch_fallback() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(187);
+        assert!(events.set_task_panel_info(channel_id, "dsp_404", None, None));
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+        assert!(rendered.contains("Task     dispatch #dsp_404"));
+        assert!(!rendered.contains("card #"));
     }
 
     #[test]
