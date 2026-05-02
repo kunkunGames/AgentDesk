@@ -14,9 +14,11 @@ use tokio::sync::{mpsc, oneshot};
 // `metrics` → lightweight channel/provider atomic counters for hot paths.
 // `events`  → bounded in-memory structured event log + periodic JSONL flush.
 // `watcher_latency` → #1134 attach→first-relay latency histogram + counters.
+// `turn_lifecycle` → durable turn lifecycle event model for session/context transitions.
 pub mod events;
 pub mod metrics;
 pub mod session_inventory;
+pub mod turn_lifecycle;
 pub mod watcher_latency;
 
 const EVENT_BATCH_SIZE: usize = 64;
