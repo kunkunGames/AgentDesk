@@ -225,6 +225,7 @@
   - `src/db/schema.rs` (3194 lines).
   - `src/db/postgres.rs` (1536 lines).
   - `src/db/dispatched_sessions.rs` (1200 lines).
+  - `src/db/kanban_cards.rs` (1903 lines).
   - `src/db/session_transcripts.rs` (877 lines, retained PG-cleanup surface).
   - `src/db/agents.rs` (1125 lines).
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
