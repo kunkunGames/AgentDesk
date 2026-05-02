@@ -1055,6 +1055,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         commands::cmd_model(),
         commands::cmd_fast(),
         commands::cmd_goals(),
+        commands::cmd_adk(),
     ];
     slash_commands.extend([
         commands::cmd_queue(),

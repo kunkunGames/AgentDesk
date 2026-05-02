@@ -4,6 +4,7 @@ mod control;
 mod diagnostics;
 mod fast_mode;
 mod help;
+mod inspect;
 mod meeting_cmd;
 mod model_picker;
 mod model_ui;
@@ -45,6 +46,7 @@ pub(super) use diagnostics::{
 };
 pub(super) use fast_mode::{cmd_fast, cmd_goals};
 pub(super) use help::cmd_help;
+pub(super) use inspect::cmd_adk;
 pub(super) use meeting_cmd::cmd_meeting;
 pub(super) use model_picker::cmd_model;
 pub(super) use receipt::cmd_receipt;
