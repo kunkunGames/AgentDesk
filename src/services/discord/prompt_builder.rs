@@ -35,6 +35,8 @@ const PR_ALWAYS_COMPLETION_CONTRACT: &str = "- `merge_strategy_mode=pr-always` �
      - 구현/검증 후 브랜치를 push 하고 PR 을 연다.\n\
      - PR 생성 후 review 요청과 auto-merge enable 까지 수행한다.\n\
      - 이 모드의 완료 조건은 direct push 가 아니라 `PR open + auto-merge enabled` 이다.";
+const DISPATCH_CONTRACT_LAYER_NAME: &str = "dispatch_contract";
+const DISPATCH_CONTRACT_LAYER_SOURCE: &str = "prompt_builder.render_dispatch_contract";
 const CURRENT_TASK_LAYER_NAME: &str = "current_task";
 const CURRENT_TASK_REDACTED_PREVIEW_MAX_BYTES: usize = 2_000;
 const RECOVERY_CONTEXT_LAYER_NAME: &str = "recovery_context";
@@ -102,6 +104,9 @@ impl PromptManifestLayer {
             tokens_est: self.tokens_est,
             content_sha256: self.content_sha256.clone(),
             content_visibility: match self.content_visibility {
+                PromptContentVisibility::AdkProvided => {
+                    db_prompt_manifests::PromptContentVisibility::AdkProvided
+                }
                 PromptContentVisibility::UserDerived => {
                     db_prompt_manifests::PromptContentVisibility::UserDerived
                 }
@@ -115,6 +120,7 @@ impl PromptManifestLayer {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum PromptContentVisibility {
+    AdkProvided,
     UserDerived,
 }
 
@@ -647,6 +653,32 @@ fn current_task_manifest_layer(
         content_sha256,
         redacted_preview: Some(redacted_prompt_manifest_preview(rendered_section)),
         full_content: None,
+    }
+}
+
+fn dispatch_contract_manifest_layer(
+    dispatch_type: Option<&str>,
+    current_task: Option<&CurrentTaskContext<'_>>,
+) -> PromptManifestLayer {
+    let dispatch_type_reason = dispatch_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none");
+    let full_content = current_task.and_then(|task| render_dispatch_contract(dispatch_type, task));
+    let (chars, tokens_est, content_sha256) =
+        prompt_manifest_content_stats(full_content.as_deref().unwrap_or(""));
+
+    PromptManifestLayer {
+        layer: DISPATCH_CONTRACT_LAYER_NAME.to_string(),
+        enabled: full_content.is_some(),
+        source: DISPATCH_CONTRACT_LAYER_SOURCE.to_string(),
+        reason: format!("dispatch_type={dispatch_type_reason}"),
+        chars,
+        tokens_est,
+        content_visibility: PromptContentVisibility::AdkProvided,
+        content_sha256,
+        redacted_preview: None,
+        full_content,
     }
 }
 
@@ -1219,6 +1251,12 @@ pub(super) fn build_system_prompt_with_manifest(
         system_prompt_owned.push_str("\n\n");
         system_prompt_owned.push_str(&current_task_section);
     }
+    prompt_manifest
+        .layers
+        .push(dispatch_contract_manifest_layer(
+            dispatch_type,
+            current_task,
+        ));
     match recovery_context_manifest_layer(recovery_context) {
         Ok(layer) => prompt_manifest.layers.push(layer),
         Err(error) => {
@@ -1266,6 +1304,13 @@ mod dispatch_contract_tests {
         current_task: &CurrentTaskContext<'_>,
         dispatch_type: Option<&str>,
     ) -> BuiltSystemPrompt {
+        build_prompt_with_optional_manifest_for(Some(current_task), dispatch_type)
+    }
+
+    fn build_prompt_with_optional_manifest_for(
+        current_task: Option<&CurrentTaskContext<'_>>,
+        dispatch_type: Option<&str>,
+    ) -> BuiltSystemPrompt {
         build_system_prompt_with_manifest(
             "ctx",
             &[],
@@ -1276,7 +1321,7 @@ mod dispatch_contract_tests {
             false,
             DispatchProfile::Full,
             dispatch_type,
-            Some(current_task),
+            current_task,
             None,
             None,
             None,
@@ -1299,7 +1344,7 @@ mod dispatch_contract_tests {
         let built = build_prompt_with_manifest_for(&current_task, Some("implementation"));
 
         assert!(built.system_prompt.contains("[Current Task]"));
-        assert_eq!(built.manifest.layers.len(), 2);
+        assert_eq!(built.manifest.layers.len(), 3);
         let layer = &built.manifest.layers[0];
         assert_eq!(layer.layer, "current_task");
         assert!(layer.enabled);
@@ -1318,6 +1363,7 @@ mod dispatch_contract_tests {
         assert!(!preview.contains("super-secret-123"));
 
         let serialized = serde_json::to_value(layer).unwrap();
+        assert_eq!(serialized["enabled"], true);
         assert_eq!(serialized["full_content"], serde_json::Value::Null);
     }
 
@@ -1330,7 +1376,7 @@ mod dispatch_contract_tests {
 
         let built = build_prompt_with_manifest_for(&current_task, None);
 
-        assert_eq!(built.manifest.layers.len(), 2);
+        assert_eq!(built.manifest.layers.len(), 3);
         let layer = &built.manifest.layers[0];
         assert!(layer.enabled);
         assert_eq!(layer.source, "discord_message");
@@ -1343,6 +1389,92 @@ mod dispatch_contract_tests {
                 .unwrap()
                 .contains("[redacted-email]")
         );
+    }
+
+    #[test]
+    fn dispatch_contract_layer_records_adk_full_content() {
+        let current_task = CurrentTaskContext {
+            dispatch_id: Some("dispatch-1537"),
+            card_title: Some("Instrument dispatch contract layer"),
+            ..CurrentTaskContext::default()
+        };
+
+        let built = build_prompt_with_manifest_for(&current_task, Some("implementation"));
+        let layer = built
+            .manifest
+            .layers
+            .iter()
+            .find(|layer| layer.layer == "dispatch_contract")
+            .expect("dispatch_contract manifest layer");
+
+        assert!(layer.enabled);
+        assert_eq!(layer.source, "prompt_builder.render_dispatch_contract");
+        assert_eq!(layer.reason, "dispatch_type=implementation");
+        assert!(layer.chars > 0);
+        assert!(layer.tokens_est > 0);
+        assert_eq!(
+            layer.content_visibility,
+            PromptContentVisibility::AdkProvided
+        );
+        assert!(layer.redacted_preview.is_none());
+        assert_eq!(
+            layer.full_content.as_deref(),
+            render_dispatch_contract(Some("implementation"), &current_task).as_deref()
+        );
+        let full_content = layer.full_content.as_deref().unwrap();
+        assert_eq!(
+            layer.content_sha256,
+            prompt_manifest_content_sha256(full_content)
+        );
+        assert!(full_content.contains("[Dispatch Contract]"));
+        assert!(full_content.contains("`OUTCOME: noop`"));
+        assert!(full_content.contains("PATCH /api/dispatches/dispatch-1537"));
+
+        let db_manifest = built
+            .manifest
+            .to_db_prompt_manifest(
+                "discord:1:2",
+                ChannelId::new(1),
+                Some("dispatch-1537"),
+                Some("full"),
+            )
+            .expect("db prompt manifest");
+        let db_layer = db_manifest
+            .layers
+            .iter()
+            .find(|layer| layer.layer_name == "dispatch_contract")
+            .expect("db dispatch_contract layer");
+        assert_eq!(
+            db_layer.content_visibility,
+            db_prompt_manifests::PromptContentVisibility::AdkProvided
+        );
+        assert_eq!(db_layer.full_content.as_deref(), Some(full_content));
+        assert!(db_layer.redacted_preview.is_none());
+    }
+
+    #[test]
+    fn dispatch_contract_layer_disabled_for_freeform_without_dispatch() {
+        let built = build_prompt_with_optional_manifest_for(None, None);
+
+        assert!(!built.system_prompt.contains("[Dispatch Contract]"));
+        let layer = built
+            .manifest
+            .layers
+            .iter()
+            .find(|layer| layer.layer == "dispatch_contract")
+            .expect("dispatch_contract manifest layer");
+        assert!(!layer.enabled);
+        assert_eq!(layer.source, "prompt_builder.render_dispatch_contract");
+        assert_eq!(layer.reason, "dispatch_type=none");
+        assert_eq!(layer.chars, 0);
+        assert_eq!(layer.tokens_est, 0);
+        assert_eq!(layer.content_sha256, prompt_manifest_content_sha256(""));
+        assert_eq!(
+            layer.content_visibility,
+            PromptContentVisibility::AdkProvided
+        );
+        assert!(layer.redacted_preview.is_none());
+        assert!(layer.full_content.is_none());
     }
 
     #[test]
