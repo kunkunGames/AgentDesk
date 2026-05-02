@@ -5684,6 +5684,73 @@ async fn kanban_update_card_rejects_manual_non_backlog_transition_pg() {
 }
 
 #[tokio::test]
+async fn kanban_update_card_rejects_mixed_status_and_metadata_without_transition_pg() {
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let db = test_db();
+    let engine = test_engine_with_pg(&db, pool.clone());
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (id, title, status, priority, metadata, created_at, updated_at)
+         VALUES ('c-mixed-status-metadata', 'Mixed update', 'backlog', 'medium', $1::jsonb, NOW(), NOW())",
+    )
+    .bind(r#"{"existing":true}"#)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/kanban-cards/c-mixed-status-metadata")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"status":"ready","metadata_json":"not-json"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("cannot combine status changes with metadata or other field updates"),
+        "error must explain mixed status/metadata updates are split: {error}"
+    );
+
+    let row = sqlx::query(
+        "SELECT status, metadata::text AS metadata
+         FROM kanban_cards
+         WHERE id = 'c-mixed-status-metadata'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let status: String = row.try_get("status").unwrap();
+    let metadata_raw: Option<String> = row.try_get("metadata").unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(metadata_raw.as_deref().expect("metadata should remain")).unwrap();
+    assert_eq!(status, "backlog");
+    assert_eq!(metadata, json!({"existing": true}));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
 #[ignore = "obsolete SQLite kanban backlog cleanup fixture; route is PG-only after #843/#868"]
 async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns() {
     let db = test_db();

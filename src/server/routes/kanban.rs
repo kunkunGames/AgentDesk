@@ -68,6 +68,31 @@ pub struct UpdateCardBody {
     pub review_notes: Option<String>,
 }
 
+const MIXED_STATUS_FIELD_UPDATE_ERROR: &str = "PATCH /api/kanban-cards/{id} cannot combine status changes with metadata or other field updates. Send metadata/field updates in one request, then send a status-only PATCH request, or use POST /api/kanban-cards/{id}/transition for administrative force transitions.";
+
+fn validate_update_card_fields(body: &UpdateCardBody) -> Result<bool, &'static str> {
+    let has_non_status_updates = body.title.is_some()
+        || body.priority.is_some()
+        || body.assignee_agent_id.is_some()
+        || body.repo_id.is_some()
+        || body.github_issue_url.is_some()
+        || body.description.is_some()
+        || body.metadata.is_some()
+        || body.metadata_json.is_some()
+        || body.review_status.is_some()
+        || body.review_notes.is_some();
+
+    if !has_non_status_updates && body.status.is_none() {
+        return Err("no fields to update");
+    }
+
+    if body.status.is_some() && has_non_status_updates {
+        return Err(MIXED_STATUS_FIELD_UPDATE_ERROR);
+    }
+
+    Ok(has_non_status_updates)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AssignCardBody {
     pub agent_id: String,
@@ -570,23 +595,12 @@ pub async fn update_card(
         }
     };
 
-    let has_non_status_updates = body.title.is_some()
-        || body.priority.is_some()
-        || body.assignee_agent_id.is_some()
-        || body.repo_id.is_some()
-        || body.github_issue_url.is_some()
-        || body.description.is_some()
-        || body.metadata.is_some()
-        || body.metadata_json.is_some()
-        || body.review_status.is_some()
-        || body.review_notes.is_some();
-
-    if !has_non_status_updates && body.status.is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "no fields to update"})),
-        );
-    }
+    let has_non_status_updates = match validate_update_card_fields(&body) {
+        Ok(has_non_status_updates) => has_non_status_updates,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": error})));
+        }
+    };
 
     let new_status = body.status.clone();
 
@@ -4348,6 +4362,33 @@ pub async fn force_transition(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("{e}")})),
         ),
+    }
+}
+
+#[cfg(test)]
+mod update_card_validation_tests {
+    use super::{MIXED_STATUS_FIELD_UPDATE_ERROR, UpdateCardBody, validate_update_card_fields};
+
+    #[test]
+    fn update_card_validation_rejects_status_with_metadata_json() {
+        let body: UpdateCardBody =
+            serde_json::from_str(r#"{"status":"ready","metadata_json":"not-json"}"#)
+                .expect("payload should deserialize");
+
+        let error = validate_update_card_fields(&body).expect_err("mixed update must be rejected");
+
+        assert_eq!(error, MIXED_STATUS_FIELD_UPDATE_ERROR);
+    }
+
+    #[test]
+    fn update_card_validation_allows_status_only_or_metadata_only() {
+        let status_only: UpdateCardBody =
+            serde_json::from_str(r#"{"status":"ready"}"#).expect("payload should deserialize");
+        assert_eq!(validate_update_card_fields(&status_only), Ok(false));
+
+        let metadata_only: UpdateCardBody = serde_json::from_str(r#"{"metadata_json":"not-json"}"#)
+            .expect("payload should deserialize");
+        assert_eq!(validate_update_card_fields(&metadata_only), Ok(true));
     }
 }
 

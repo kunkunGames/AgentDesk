@@ -1706,7 +1706,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "PATCH",
             "/api/kanban-cards/{id}",
             "kanban",
-            "Update card fields. Status edits are limited to backlog -> ready and any -> backlog; use /transition for administrative force transitions and /rereview for review reruns.",
+            "Update card fields, or perform one manual status edit. Status edits cannot be combined with metadata or other field updates. Status edits are limited to backlog -> ready and any -> backlog; use /transition for administrative force transitions and /rereview for review reruns.",
         )
             .with_params([
                 ("id", path_param("Kanban card ID")),
@@ -1716,7 +1716,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                     body_param(
                         "string",
                         false,
-                        "Limited manual status edit: backlog -> ready or any -> backlog only",
+                        "Limited manual status edit: backlog -> ready or any -> backlog only; do not combine with other fields",
                     ),
                 ),
                 (
@@ -1761,13 +1761,18 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 ),
             ])
             .with_example(
-                json!({"path": {"id": "card-1"}, "body": {"status": "ready", "priority": "high"}}),
-                json!({"card": {"id": "card-1", "status": "ready", "priority": "high"}}),
+                json!({"path": {"id": "card-1"}, "body": {"priority": "high"}}),
+                json!({"card": {"id": "card-1", "status": "backlog", "priority": "high"}}),
             )
             .with_error_example(
                 400,
                 json!({"path": {"id": "card-1"}, "body": {"status": "done"}}),
                 json!({"error": "PATCH /api/kanban-cards/{id} only allows manual status transitions backlog -> ready and any -> backlog (requested: review -> done). Use POST /api/kanban-cards/{id}/transition for administrative force transitions, or POST /api/kanban-cards/{id}/rereview for review reruns."}),
+            )
+            .with_error_example(
+                400,
+                json!({"path": {"id": "card-1"}, "body": {"status": "ready", "metadata_json": "{\"x\":true}"}}),
+                json!({"error": "PATCH /api/kanban-cards/{id} cannot combine status changes with metadata or other field updates. Send metadata/field updates in one request, then send a status-only PATCH request, or use POST /api/kanban-cards/{id}/transition for administrative force transitions."}),
             )
             .with_curl("curl -X PATCH http://localhost:8787/api/kanban-cards/card-1 -H 'Content-Type: application/json' -d '{\"priority\":\"high\"}'"),
         ep(
