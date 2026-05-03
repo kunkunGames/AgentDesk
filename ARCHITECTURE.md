@@ -53,10 +53,13 @@ src/
 │   ├── agents.rs
 │   ├── auto_queue.rs
 │   ├── cancel_tombstones.rs
+│   ├── dispatched_sessions.rs
 │   ├── kanban.rs
+│   ├── kanban_cards.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
+│   ├── prompt_manifests.rs
 │   ├── schema.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
@@ -122,6 +125,9 @@ src/
 │   ├── paths.rs
 │   └── skill_sync.rs
 ├── server/
+│   ├── dto/
+│   │   ├── kanban.rs
+│   │   └── mod.rs
 │   ├── routes/
 │   │   ├── dispatches/
 │   │   │   ├── crud.rs
@@ -238,6 +244,7 @@ src/
 │   │   │   ├── diagnostics.rs
 │   │   │   ├── fast_mode.rs
 │   │   │   ├── help.rs
+│   │   │   ├── inspect.rs
 │   │   │   ├── meeting_cmd.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── model_picker.rs
@@ -294,6 +301,7 @@ src/
 │   │   ├── gateway.rs
 │   │   ├── handoff.rs
 │   │   ├── health.rs
+│   │   ├── http.rs
 │   │   ├── idle_detector.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
@@ -335,13 +343,15 @@ src/
 │   │   ├── tmux_lifecycle.rs
 │   │   ├── tmux_overload_retry.rs
 │   │   ├── tmux_reaper.rs
-│   │   └── tmux_restart_handoff.rs
+│   │   ├── tmux_restart_handoff.rs
+│   │   └── tmux_session_files.rs
 │   ├── git/
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
 │   │   ├── mod.rs
 │   │   ├── remote.rs
 │   │   ├── repo_resolver.rs
+│   │   ├── runner.rs
 │   │   └── worktree_resolver.rs
 │   ├── maintenance/
 │   │   ├── jobs/
@@ -362,7 +372,9 @@ src/
 │   │   ├── events.rs
 │   │   ├── metrics.rs
 │   │   ├── mod.rs
+│   │   ├── recovery_audit.rs
 │   │   ├── session_inventory.rs
+│   │   ├── turn_lifecycle.rs
 │   │   └── watcher_latency.rs
 │   ├── platform/
 │   │   ├── binary_resolver.rs
@@ -403,17 +415,24 @@ src/
 │   ├── codex.rs
 │   ├── codex_tmux_wrapper.rs
 │   ├── discord_config_audit.rs
+│   ├── discord_delivery.rs
 │   ├── discord_dm_reply_store.rs
 │   ├── disk_monitor.rs
+│   ├── dispatch_watchdog.rs
+│   ├── dispatched_sessions.rs
 │   ├── dispatches.rs
 │   ├── dispatches_followup.rs
 │   ├── gemini.rs
 │   ├── issue_announcements.rs
 │   ├── kanban.rs
+│   ├── kanban_cards.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
 │   ├── mod.rs
+│   ├── onboarding.rs
 │   ├── opencode.rs
+│   ├── pipeline_override.rs
+│   ├── pipeline_routes.rs
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_exec.rs
@@ -440,8 +459,10 @@ src/
 │   ├── ai_screen.rs
 │   └── mod.rs
 ├── utils/
+│   ├── api.rs
 │   ├── async_bridge.rs
 │   ├── format.rs
+│   ├── loopback_url.rs
 │   ├── mod.rs
 │   └── wip_detect.rs
 ├── bootstrap.rs

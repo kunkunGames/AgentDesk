@@ -5,6 +5,7 @@ use poise::serenity_prelude::ChannelId;
 use serde_json::Value;
 
 use super::formatting::{canonical_tool_name, format_tool_input, redact_sensitive_for_placeholder};
+use crate::db::prompt_manifests::PromptManifest;
 use crate::services::agent_protocol::{StatusEvent, StatusTodoItem, StatusTodoStatus};
 use crate::services::provider::ProviderKind;
 
@@ -15,6 +16,11 @@ const EVENT_BLOCK_MAX_CHARS: usize = 1500;
 const STATUS_PANEL_MAX_CHARS: usize = 4096;
 const STATUS_PANEL_TODO_LIMIT: usize = 8;
 const STATUS_PANEL_SUBAGENT_LIMIT: usize = 6;
+const SESSION_PANEL_LINE_MAX_CHARS: usize = 100;
+const TASK_PANEL_LINE_MAX_CHARS: usize = 140;
+const CONTEXT_PANEL_LINE_MAX_CHARS: usize = 120;
+const PROMPT_PANEL_LINE_MAX_CHARS: usize = 120;
+const PROMPT_PANEL_SKIPPED_REASON_MAX_CHARS: usize = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RecentPlaceholderEvent {
@@ -68,11 +74,14 @@ impl RecentPlaceholderEvent {
     }
 
     fn render_line(&self) -> String {
-        truncate_chars(
-            format!("{} {}", self.prefix, self.summary).trim(),
-            EVENT_LINE_MAX_CHARS,
-        )
+        let raw = format!("{} {}", self.prefix, self.summary);
+        let sanitized = sanitize_for_code_fence(raw.trim());
+        truncate_chars(&sanitized, EVENT_LINE_MAX_CHARS)
     }
+}
+
+fn sanitize_for_code_fence(raw: &str) -> String {
+    raw.replace('`', "")
 }
 
 #[derive(Debug, Default)]
@@ -138,6 +147,151 @@ impl PlaceholderLiveEvents {
         }
     }
 
+    pub(super) fn set_session_panel_lifecycle_event(
+        &self,
+        channel_id: ChannelId,
+        kind: &str,
+        details: &Value,
+    ) -> bool {
+        let snapshot = SessionPanelSnapshot::from_lifecycle_event(kind, details);
+        self.set_session_panel_snapshot(channel_id, snapshot)
+    }
+
+    fn set_session_panel_snapshot(
+        &self,
+        channel_id: ChannelId,
+        snapshot: Option<SessionPanelSnapshot>,
+    ) -> bool {
+        let entry = self
+            .status_by_channel
+            .entry(channel_id)
+            .or_insert_with(|| Mutex::new(StatusPanelState::default()));
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.session == snapshot {
+            return false;
+        }
+        guard.session = snapshot;
+        true
+    }
+
+    pub(super) fn set_task_panel_info(
+        &self,
+        channel_id: ChannelId,
+        dispatch_id: &str,
+        card_id: Option<&str>,
+        dispatch_type: Option<&str>,
+    ) -> bool {
+        let dispatch_id = clean_task_panel_value(dispatch_id);
+        if dispatch_id.is_empty() {
+            return self.set_task_panel_snapshot(channel_id, None);
+        }
+        let clean_optional = |value: Option<&str>| {
+            value
+                .map(clean_task_panel_value)
+                .filter(|value| !value.is_empty())
+        };
+        self.set_task_panel_snapshot(
+            channel_id,
+            Some(TaskPanelSnapshot {
+                dispatch_id,
+                card_id: clean_optional(card_id),
+                dispatch_type: clean_optional(dispatch_type),
+            }),
+        )
+    }
+
+    fn set_task_panel_snapshot(
+        &self,
+        channel_id: ChannelId,
+        snapshot: Option<TaskPanelSnapshot>,
+    ) -> bool {
+        let entry = self
+            .status_by_channel
+            .entry(channel_id)
+            .or_insert_with(|| Mutex::new(StatusPanelState::default()));
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.task == snapshot {
+            return false;
+        }
+        guard.task = snapshot;
+        true
+    }
+
+    pub(super) fn set_context_panel_usage(
+        &self,
+        channel_id: ChannelId,
+        input_tokens: u64,
+        cache_create_tokens: u64,
+        cache_read_tokens: u64,
+        context_window_tokens: u64,
+        compact_percent: u64,
+    ) -> bool {
+        if context_window_tokens == 0 {
+            return false;
+        }
+        self.set_context_panel_snapshot(
+            channel_id,
+            Some(ContextPanelSnapshot {
+                input_tokens,
+                cache_create_tokens,
+                cache_read_tokens,
+                context_window_tokens,
+                compact_percent,
+            }),
+        )
+    }
+
+    fn set_context_panel_snapshot(
+        &self,
+        channel_id: ChannelId,
+        snapshot: Option<ContextPanelSnapshot>,
+    ) -> bool {
+        let entry = self
+            .status_by_channel
+            .entry(channel_id)
+            .or_insert_with(|| Mutex::new(StatusPanelState::default()));
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.context == snapshot {
+            return false;
+        }
+        guard.context = snapshot;
+        true
+    }
+
+    pub(super) fn set_prompt_manifest(
+        &self,
+        channel_id: ChannelId,
+        manifest: &PromptManifest,
+    ) -> bool {
+        let snapshot = PromptPanelSnapshot::from_manifest(manifest);
+        self.set_prompt_panel_snapshot(channel_id, Some(snapshot))
+    }
+
+    fn set_prompt_panel_snapshot(
+        &self,
+        channel_id: ChannelId,
+        snapshot: Option<PromptPanelSnapshot>,
+    ) -> bool {
+        let entry = self
+            .status_by_channel
+            .entry(channel_id)
+            .or_insert_with(|| Mutex::new(StatusPanelState::default()));
+        let mut guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.prompt == snapshot {
+            return false;
+        }
+        guard.prompt = snapshot;
+        true
+    }
+
     pub(super) fn render_status_panel(
         &self,
         channel_id: ChannelId,
@@ -171,6 +325,154 @@ struct SubagentSlot {
     finished: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPanelKind {
+    Fresh,
+    Resumed,
+    Fallback,
+}
+
+impl SessionPanelKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Resumed => "resumed",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxPanelState {
+    Kept,
+    New,
+}
+
+impl TmuxPanelState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::New => "new",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionPanelSnapshot {
+    kind: SessionPanelKind,
+    provider_session_id: Option<String>,
+    tmux: Option<TmuxPanelState>,
+}
+
+impl SessionPanelSnapshot {
+    fn from_lifecycle_event(kind: &str, details: &Value) -> Option<Self> {
+        if !details.as_object().is_some_and(|object| !object.is_empty()) {
+            return None;
+        }
+
+        let kind = session_panel_kind(kind, details)?;
+        let provider_session_id = first_json_string(
+            details,
+            &[
+                "provider_session_id",
+                "providerSessionId",
+                "raw_provider_session_id",
+                "rawProviderSessionId",
+                "session_id",
+                "sessionId",
+                "claude_session_id",
+                "claudeSessionId",
+            ],
+        )
+        .map(str::to_string);
+        let tmux = parse_tmux_panel_state(details);
+
+        Some(Self {
+            kind,
+            provider_session_id,
+            tmux,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskPanelSnapshot {
+    dispatch_id: String,
+    card_id: Option<String>,
+    dispatch_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextPanelSnapshot {
+    input_tokens: u64,
+    cache_create_tokens: u64,
+    cache_read_tokens: u64,
+    context_window_tokens: u64,
+    compact_percent: u64,
+}
+
+impl ContextPanelSnapshot {
+    fn usage_percent(&self) -> Option<u64> {
+        if self.context_window_tokens == 0 {
+            return None;
+        }
+        let used_tokens = self
+            .input_tokens
+            .saturating_add(self.cache_create_tokens)
+            .saturating_add(self.cache_read_tokens);
+        let percent = (u128::from(used_tokens) * 100) / u128::from(self.context_window_tokens);
+        Some(percent.min(u128::from(u64::MAX)) as u64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptPanelSnapshot {
+    profile: Option<String>,
+    enabled_layers: Vec<String>,
+    skipped_layers: Vec<SkippedLayerEntry>,
+    total_input_tokens_est: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkippedLayerEntry {
+    name: String,
+    reason: Option<String>,
+}
+
+impl PromptPanelSnapshot {
+    fn from_manifest(manifest: &PromptManifest) -> Self {
+        let mut enabled_layers = Vec::new();
+        let mut skipped_layers = Vec::new();
+        for layer in &manifest.layers {
+            if layer.enabled {
+                enabled_layers.push(layer.layer_name.clone());
+            } else {
+                let reason = layer
+                    .reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                skipped_layers.push(SkippedLayerEntry {
+                    name: layer.layer_name.clone(),
+                    reason,
+                });
+            }
+        }
+        Self {
+            profile: manifest
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            enabled_layers,
+            skipped_layers,
+            total_input_tokens_est: manifest.total_input_tokens_est.max(0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DerivedStatus {
     Running,
@@ -194,6 +496,10 @@ impl Default for DerivedStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StatusPanelState {
     status: DerivedStatus,
+    session: Option<SessionPanelSnapshot>,
+    task: Option<TaskPanelSnapshot>,
+    context: Option<ContextPanelSnapshot>,
+    prompt: Option<PromptPanelSnapshot>,
     todos: Vec<StatusTodoItem>,
     subagents: Vec<SubagentSlot>,
 }
@@ -307,16 +613,37 @@ fn render_status_panel(
         provider.as_str()
     )];
 
+    if let Some(session) = snapshot.session.as_ref() {
+        sections.push(render_session_panel_line(session, provider));
+    }
+
+    if let Some(task) = snapshot.task.as_ref() {
+        sections.push(render_task_panel_line(task));
+    }
+
+    if let Some(context_line) = snapshot
+        .context
+        .as_ref()
+        .and_then(render_context_panel_line)
+    {
+        sections.push(context_line);
+    }
+
+    if let Some(prompt) = snapshot.prompt.as_ref() {
+        sections.push(render_prompt_panel_block(prompt));
+    }
+
     if !matches!(provider, ProviderKind::Codex) && !snapshot.todos.is_empty() {
         let lines = snapshot
             .todos
             .iter()
             .take(STATUS_PANEL_TODO_LIMIT)
             .map(|item| {
+                let content = escape_status_panel_markdown(&normalize_summary(&item.content));
                 format!(
                     "- {} {}",
                     item.status.checkbox_marker(),
-                    truncate_chars(&normalize_summary(&item.content), 110)
+                    truncate_chars(&content, 110)
                 )
             })
             .collect::<Vec<_>>();
@@ -334,11 +661,263 @@ fn render_status_panel(
         sections.push(format!("Subagents\n{}", lines.join("\n")));
     }
 
-    if let Some(block) = live_block.filter(|block| !block.trim().is_empty()) {
-        sections.push(format!("Recent\n{block}"));
+    let recent_section = live_block
+        .filter(|block| !block.trim().is_empty())
+        .map(|block| format!("Recent\n{block}"));
+
+    if let Some(recent) = recent_section.as_ref() {
+        let mut with_recent = sections.clone();
+        with_recent.push(recent.clone());
+        let joined = with_recent.join("\n\n");
+        if joined.chars().count() <= STATUS_PANEL_MAX_CHARS {
+            return joined;
+        }
     }
 
     truncate_chars(&sections.join("\n\n"), STATUS_PANEL_MAX_CHARS)
+}
+
+fn render_session_panel_line(session: &SessionPanelSnapshot, provider: &ProviderKind) -> String {
+    let mut parts = vec![format!("Lifecycle {}", session.kind.as_str())];
+    if let Some(provider_session_id) = session
+        .provider_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        parts.push(format!(
+            "provider session {}",
+            render_provider_session_label(provider, provider_session_id)
+        ));
+    }
+    if let Some(tmux) = session.tmux {
+        parts.push(format!("tmux {}", tmux.as_str()));
+    }
+    truncate_chars(&parts.join(" · "), SESSION_PANEL_LINE_MAX_CHARS)
+}
+
+fn render_task_panel_line(task: &TaskPanelSnapshot) -> String {
+    let mut parts = vec![format!(
+        "Task      dispatch #{}",
+        escape_status_panel_markdown(&task.dispatch_id)
+    )];
+    if let Some(card_id) = task.card_id.as_deref() {
+        parts.push(format!("card #{}", escape_status_panel_markdown(card_id)));
+    }
+    if let Some(dispatch_type) = task.dispatch_type.as_deref() {
+        parts.push(escape_status_panel_markdown(dispatch_type));
+    }
+    truncate_chars(&parts.join(" · "), TASK_PANEL_LINE_MAX_CHARS)
+}
+
+fn render_context_panel_line(context: &ContextPanelSnapshot) -> Option<String> {
+    let usage_percent = context.usage_percent()?;
+    let icon = if usage_percent >= 85 {
+        "⚠️"
+    } else {
+        "📦"
+    };
+    let mut line = format!(
+        "Context   {icon} {usage_percent}% used · auto-compact {}%",
+        context.compact_percent
+    );
+    if usage_percent >= 85 {
+        line.push_str(" — 자동 압축 직전");
+    } else if usage_percent >= 75 {
+        line.push_str(" (임박)");
+    }
+    Some(truncate_chars(&line, CONTEXT_PANEL_LINE_MAX_CHARS))
+}
+
+fn render_prompt_panel_block(prompt: &PromptPanelSnapshot) -> String {
+    let header_parts = [
+        render_prompt_profile_label(prompt.profile.as_deref()),
+        render_prompt_tokens(prompt.total_input_tokens_est),
+    ];
+    let header = truncate_chars(
+        &format!("Prompt    {}", header_parts.join(" · ")),
+        PROMPT_PANEL_LINE_MAX_CHARS,
+    );
+
+    let mut lines = vec![header];
+
+    if !prompt.enabled_layers.is_empty() {
+        let names = prompt
+            .enabled_layers
+            .iter()
+            .map(|name| escape_status_panel_markdown(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(truncate_chars(
+            &format!("- 활성 ({}): {}", prompt.enabled_layers.len(), names),
+            PROMPT_PANEL_LINE_MAX_CHARS,
+        ));
+    }
+
+    if !prompt.skipped_layers.is_empty() {
+        let parts: Vec<String> = prompt
+            .skipped_layers
+            .iter()
+            .map(|entry| match entry.reason.as_deref() {
+                Some(reason) => format!(
+                    "{} ({})",
+                    escape_status_panel_markdown(&entry.name),
+                    truncate_chars(
+                        &escape_status_panel_markdown(reason),
+                        PROMPT_PANEL_SKIPPED_REASON_MAX_CHARS
+                    )
+                ),
+                None => escape_status_panel_markdown(&entry.name),
+            })
+            .collect();
+        lines.push(truncate_chars(
+            &format!(
+                "- 스킵 ({}): {}",
+                prompt.skipped_layers.len(),
+                parts.join(", ")
+            ),
+            PROMPT_PANEL_LINE_MAX_CHARS,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn render_prompt_profile_label(profile: Option<&str>) -> String {
+    let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "Unknown profile".to_string();
+    };
+    match profile.to_ascii_lowercase().as_str() {
+        "full" => "Full profile".to_string(),
+        "lite" => "Lite profile".to_string(),
+        "review_lite" | "review-lite" => "Review lite profile".to_string(),
+        other => {
+            let label = other.replace(['_', '-'], " ");
+            let mut chars = label.chars();
+            let mut rendered = match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Unknown".to_string(),
+            };
+            if !rendered.to_ascii_lowercase().ends_with(" profile") {
+                rendered.push_str(" profile");
+            }
+            rendered
+        }
+    }
+}
+
+fn render_prompt_tokens(total_input_tokens_est: i64) -> String {
+    format!(
+        "~{:.1}k input tokens",
+        (total_input_tokens_est.max(0) as f64) / 1000.0
+    )
+}
+
+fn render_provider_session_label(provider: &ProviderKind, session_id: &str) -> String {
+    let abbreviated = abbreviate_provider_session_id(session_id);
+    if abbreviated.contains('#') {
+        abbreviated
+    } else {
+        format!("{}#{}", provider.as_str(), abbreviated)
+    }
+}
+
+fn abbreviate_provider_session_id(session_id: &str) -> String {
+    let trimmed = session_id.trim();
+    let prefix: String = trimmed.chars().take(8).collect();
+    if trimmed.chars().count() > 8 {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn session_panel_kind(kind: &str, details: &Value) -> Option<SessionPanelKind> {
+    if is_fallback_session_details(details) {
+        return Some(SessionPanelKind::Fallback);
+    }
+    match kind {
+        "session_fresh" => Some(SessionPanelKind::Fresh),
+        "session_resumed" => Some(SessionPanelKind::Resumed),
+        "session_resume_failed_with_recovery" => Some(SessionPanelKind::Fallback),
+        _ => None,
+    }
+}
+
+fn is_fallback_session_details(details: &Value) -> bool {
+    if first_json_bool(
+        details,
+        &[
+            "fallback",
+            "recovery",
+            "recovery_injected",
+            "recoveryInjected",
+            "resume_failed",
+            "resumeFailed",
+        ],
+    )
+    .unwrap_or(false)
+    {
+        return true;
+    }
+
+    first_json_string(
+        details,
+        &[
+            "strategy",
+            "status",
+            "reason",
+            "recovery_action",
+            "recoveryAction",
+        ],
+    )
+    .is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("fallback") || value.contains("recovery") || value.contains("resume_failed")
+    })
+}
+
+fn parse_tmux_panel_state(details: &Value) -> Option<TmuxPanelState> {
+    if let Some(reused) = first_json_bool(
+        details,
+        &[
+            "tmux_reused",
+            "tmuxReused",
+            "tmux_kept",
+            "tmuxKept",
+            "tmux_session_reused",
+            "tmuxSessionReused",
+        ],
+    ) {
+        return Some(if reused {
+            TmuxPanelState::Kept
+        } else {
+            TmuxPanelState::New
+        });
+    }
+
+    let status = first_json_string(details, &["tmux_status", "tmuxStatus", "tmux"])?;
+    let status = status.trim().to_ascii_lowercase();
+    match status.as_str() {
+        "kept" | "keep" | "reused" | "reuse" | "existing" => Some(TmuxPanelState::Kept),
+        "new" | "fresh" | "created" | "recreated" => Some(TmuxPanelState::New),
+        _ => None,
+    }
+}
+
+fn first_json_string<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn first_json_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
+fn clean_task_panel_value(raw: &str) -> String {
+    first_content_line(raw)
 }
 
 fn render_derived_status(status: &DerivedStatus) -> String {
@@ -353,12 +932,13 @@ fn render_derived_status(status: &DerivedStatus) -> String {
             let mut rendered = tool_prefix(name);
             if let Some(summary) = summary.as_deref().filter(|value| !value.trim().is_empty()) {
                 rendered.push(' ');
-                rendered.push_str(&normalize_summary(summary));
+                rendered.push_str(&escape_status_panel_markdown(&normalize_summary(summary)));
             }
             format!("🔧 도구 실행 중 ({})", truncate_chars(&rendered, 140))
         }
         DerivedStatus::SubagentRunning { desc } => {
-            format!("🧵 subagent 실행 중 ({})", truncate_chars(desc, 120))
+            let desc = escape_status_panel_markdown(desc);
+            format!("🧵 subagent 실행 중 ({})", truncate_chars(&desc, 120))
         }
     }
 }
@@ -372,7 +952,7 @@ fn render_subagent_slot(slot: &SubagentSlot) -> String {
     let mut line = format!(
         "└ {} {}",
         sanitize_label(&slot.subagent_type),
-        normalize_summary(&slot.desc)
+        escape_status_panel_markdown(&normalize_summary(&slot.desc))
     );
     if let Some(recent) = slot
         .recent
@@ -380,7 +960,7 @@ fn render_subagent_slot(slot: &SubagentSlot) -> String {
         .filter(|value| !value.trim().is_empty())
     {
         line.push_str(" — ");
-        line.push_str(&normalize_summary(recent));
+        line.push_str(&escape_status_panel_markdown(&normalize_summary(recent)));
     }
     if !marker.is_empty() {
         line.push(' ');
@@ -845,6 +1425,10 @@ fn render_events<'a>(
 ) -> Option<String> {
     let mut lines = Vec::new();
     let mut used = 0usize;
+    // Reserve room for the surrounding ```text``` fence so the total block
+    // (fence + content) stays under EVENT_BLOCK_MAX_CHARS. Inner backticks
+    // are already stripped by `sanitize_for_code_fence` so the fence is
+    // safe to apply.
     let inner_limit = EVENT_BLOCK_MAX_CHARS.saturating_sub("```text\n\n```".len());
     for line in events
         .rev()
@@ -864,6 +1448,16 @@ fn render_events<'a>(
     }
     lines.reverse();
     Some(format!("```text\n{}\n```", lines.join("\n")))
+}
+
+fn escape_status_panel_markdown(raw: &str) -> String {
+    raw.chars()
+        .flat_map(|ch| match ch {
+            '\\' | '`' | '*' | '_' | '~' | '|' => ['\\', ch],
+            _ => ['\0', ch],
+        })
+        .filter(|ch| *ch != '\0')
+        .collect()
 }
 
 fn tool_prefix(name: &str) -> String {
@@ -959,6 +1553,7 @@ mod tests {
 
         let block = events.render_block(channel_id).unwrap();
         assert!(block.starts_with("```text\n"));
+        assert!(block.ends_with("\n```"));
         assert!(block.chars().count() <= EVENT_BLOCK_MAX_CHARS);
         let live_lines = block
             .lines()
@@ -996,7 +1591,8 @@ mod tests {
         let redacted = redact_sensitive_for_placeholder(
             "sk-abcdefghijklmnopqrstuvwxyz \
              Authorization: Bearer live-token \
-             password=hunter2 token=secret api_key=key1 api-key=key2",
+             password=hunter2 token=secret api_key=key1 api-key=key2 \
+             alice@example.com",
         );
 
         assert!(redacted.contains("***"));
@@ -1005,9 +1601,11 @@ mod tests {
         assert!(redacted.contains("token=***"));
         assert!(redacted.contains("api_key=***"));
         assert!(redacted.contains("api-key=***"));
+        assert!(redacted.contains("***@***"));
         assert!(!redacted.contains("sk-abcdefghijklmnopqrstuvwxyz"));
         assert!(!redacted.contains("live-token"));
         assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("alice@example.com"));
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("key1"));
         assert!(!redacted.contains("key2"));
@@ -1065,7 +1663,8 @@ mod tests {
             "monitor handoff placeholder exceeded embed description limit: {}",
             rendered.len()
         );
-        assert!(rendered.contains("```text\n"));
+        assert!(rendered.contains("[Bash]"));
+        assert!(rendered.contains("```text"));
     }
 
     #[test]
@@ -1100,6 +1699,220 @@ mod tests {
         assert!(rendered.contains("도구 실행 중"));
         assert!(rendered.contains("[Bash]"));
         assert!(rendered.chars().count() <= STATUS_PANEL_MAX_CHARS);
+    }
+
+    #[test]
+    fn status_panel_renders_session_resumed_line_from_lifecycle_details() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(177);
+        assert!(events.set_session_panel_lifecycle_event(
+            channel_id,
+            "session_resumed",
+            &json!({
+                "provider_session_id": "8f21abcd12345678",
+                "tmux_reused": true
+            }),
+        ));
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(rendered.contains("Lifecycle resumed"));
+        assert!(rendered.contains("provider session claude#8f21abcd…"));
+        assert!(rendered.contains("tmux kept"));
+    }
+
+    #[test]
+    fn status_panel_renders_session_fresh_and_fallback_distinctly() {
+        let events = PlaceholderLiveEvents::default();
+        let fresh_channel_id = ChannelId::new(178);
+        events.set_session_panel_lifecycle_event(
+            fresh_channel_id,
+            "session_fresh",
+            &json!({
+                "reason": "first_turn",
+                "provider_session_id": "fresh-session-id",
+                "tmux_reused": false
+            }),
+        );
+
+        let fresh =
+            events.render_status_panel(fresh_channel_id, &ProviderKind::Codex, 1_700_000_000);
+        assert!(fresh.contains("Lifecycle fresh"));
+        assert!(fresh.contains("provider session codex#fresh-se…"));
+        assert!(fresh.contains("tmux new"));
+
+        let fallback_channel_id = ChannelId::new(179);
+        events.set_session_panel_lifecycle_event(
+            fallback_channel_id,
+            "session_resume_failed_with_recovery",
+            &json!({
+                "reason": "resume_failed",
+                "providerSessionId": "fallback-session-id",
+                "tmuxStatus": "kept"
+            }),
+        );
+
+        let fallback =
+            events.render_status_panel(fallback_channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(fallback.contains("Lifecycle fallback"));
+        assert!(fallback.contains("provider session claude#fallback…"));
+        assert!(fallback.contains("tmux kept"));
+    }
+
+    #[test]
+    fn status_panel_omits_session_line_when_lifecycle_details_are_absent() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(180);
+        assert!(!events.set_session_panel_lifecycle_event(
+            channel_id,
+            "session_resumed",
+            &json!({}),
+        ));
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(!rendered.contains("Lifecycle "));
+    }
+
+    #[test]
+    fn status_panel_omits_context_line_when_token_data_is_absent() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(181);
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+        assert!(!rendered.contains("Context   "));
+    }
+
+    #[test]
+    fn status_panel_renders_task_line_from_dispatch_metadata() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(185);
+        assert!(events.set_task_panel_info(
+            channel_id,
+            "dsp_123",
+            Some("42"),
+            Some("implementation"),
+        ));
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Codex, 1_700_000_000);
+
+        assert!(rendered.contains("Task      dispatch #dsp\\_123 · card #42 · implementation"));
+    }
+
+    #[test]
+    fn status_panel_omits_task_line_without_dispatch_id() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(186);
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+        assert!(!rendered.contains("Task      "));
+    }
+
+    #[test]
+    fn status_panel_renders_task_line_with_dispatch_fallback() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(187);
+        assert!(events.set_task_panel_info(channel_id, "dsp_404", None, None));
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+        assert!(rendered.contains("Task      dispatch #dsp\\_404"));
+        assert!(!rendered.contains("card #"));
+    }
+
+    #[test]
+    fn status_panel_renders_context_usage_severity_levels() {
+        let events = PlaceholderLiveEvents::default();
+        let normal_channel_id = ChannelId::new(182);
+        assert!(events.set_context_panel_usage(normal_channel_id, 740, 0, 0, 1000, 90));
+        let normal =
+            events.render_status_panel(normal_channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(normal.contains("Context   📦 74% used · auto-compact 90%"));
+        assert!(!normal.contains("임박"));
+        assert!(!normal.contains("자동 압축 직전"));
+
+        let approaching_channel_id = ChannelId::new(183);
+        events.set_context_panel_usage(approaching_channel_id, 700, 40, 10, 1000, 90);
+        let approaching = events.render_status_panel(
+            approaching_channel_id,
+            &ProviderKind::Claude,
+            1_700_000_000,
+        );
+        assert!(approaching.contains("Context   📦 75% used · auto-compact 90% (임박)"));
+
+        let critical_channel_id = ChannelId::new(184);
+        events.set_context_panel_usage(critical_channel_id, 700, 100, 50, 1000, 90);
+        let critical =
+            events.render_status_panel(critical_channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(critical.contains("Context   ⚠️ 85% used · auto-compact 90% — 자동 압축 직전"));
+    }
+
+    #[test]
+    fn status_panel_renders_prompt_manifest_block() {
+        fn layer(
+            name: &str,
+            enabled: bool,
+            reason: Option<&str>,
+        ) -> crate::db::prompt_manifests::PromptManifestLayer {
+            crate::db::prompt_manifests::PromptManifestLayer {
+                id: None,
+                manifest_id: None,
+                layer_name: name.to_string(),
+                enabled,
+                source: Some("test".to_string()),
+                reason: reason.map(str::to_string),
+                chars: 0,
+                tokens_est: 0,
+                content_sha256: "0".repeat(64),
+                content_visibility:
+                    crate::db::prompt_manifests::PromptContentVisibility::AdkProvided,
+                full_content: Some(String::new()),
+                redacted_preview: None,
+            }
+        }
+
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(185);
+        let manifest = PromptManifest {
+            id: None,
+            created_at: None,
+            turn_id: "turn-185".to_string(),
+            channel_id: channel_id.get().to_string(),
+            dispatch_id: None,
+            profile: Some("full".to_string()),
+            total_input_tokens_est: 21_400,
+            layer_count: 5,
+            layers: vec![
+                layer("role_prompt", true, None),
+                layer("dispatch_contract", true, None),
+                layer("current_task", true, None),
+                layer("recovery_context", false, Some("no_recovery")),
+                layer(
+                    "memory_recall",
+                    false,
+                    Some("memory_backend=memento;mcp_unavailable"),
+                ),
+            ],
+        };
+
+        assert!(events.set_prompt_manifest(channel_id, &manifest));
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(rendered.contains("Prompt    Full profile · ~21.4k input tokens"));
+        assert!(
+            rendered.contains("- 활성 (3): role\\_prompt, dispatch\\_contract, current\\_task")
+        );
+        assert!(rendered.contains(
+            "- 스킵 (2): recovery\\_context (no\\_recovery), memory\\_recall (memory\\_backend=memento;mcp\\_unavailable)"
+        ));
+    }
+
+    #[test]
+    fn status_panel_omits_prompt_line_when_manifest_is_absent() {
+        let events = PlaceholderLiveEvents::default();
+        let channel_id = ChannelId::new(186);
+
+        let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+        assert!(!rendered.contains("Prompt    "));
     }
 
     #[test]

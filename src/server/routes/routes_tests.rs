@@ -925,6 +925,77 @@ async fn protected_domain_router_only_keeps_expected_auth_exemptions() {
 }
 
 #[tokio::test]
+async fn auth_middleware_same_origin_uses_parsed_loopback_host_and_port() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let mut config = crate::config::Config::default();
+    config.server.port = 8791;
+    config.server.auth_token = Some("secret-token".to_string());
+    let state = AppState::test_state_with_config(db, engine, config);
+    let app = protected_api_domain(
+        axum::Router::new().route("/settings", axum::routing::get(|| async { StatusCode::OK })),
+        state.clone(),
+    )
+    .with_state(state);
+
+    for origin in [
+        "http://localhost:8791",
+        "http://127.0.0.1:8791",
+        "http://[::1]:8791",
+        "https://localhost:8791",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/settings")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "origin {origin}");
+    }
+
+    let referer_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/settings")
+                .header("referer", "http://localhost:8791/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(referer_response.status(), StatusCode::OK);
+
+    for origin in [
+        "http://localhost.evil.example:8791",
+        "http://127.0.0.1.evil.example:8791",
+        "http://localhost:8792",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/settings")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "origin {origin}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn health_detail_and_stale_mailbox_repair_pg_require_bearer_when_auth_enabled() {
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -4330,6 +4401,172 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
     pg_db.drop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_cancel_dispatch_cancels_matching_active_turn_pg() {
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+    let harness = crate::services::discord::health::TestHealthHarness::new_with_provider(
+        crate::services::provider::ProviderKind::Codex,
+    )
+    .await;
+    let channel_id = "1485506232256168022";
+    let channel_num = channel_id.parse::<u64>().unwrap();
+    let tmux_name = "AgentDesk-codex-dispatch-cancel-1552";
+    let session_key = format!("mac-mini:{tmux_name}");
+
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, provider, discord_channel_cdx, created_at, updated_at
+         ) VALUES (
+            $1, $2, 'codex', $3, NOW(), NOW()
+         )",
+    )
+    .bind("agent-dispatch-cancel-turn")
+    .bind("Agent Dispatch Cancel Turn")
+    .bind(channel_id)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, assigned_agent_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, 'in_progress', $3, NOW(), NOW()
+         )",
+    )
+    .bind("card-dispatch-cancel-turn")
+    .bind("Dispatch Cancel Turn")
+    .bind("agent-dispatch-cancel-turn")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, 'implementation', 'dispatched', $4, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-cancel-turn-1552")
+    .bind("card-dispatch-cancel-turn")
+    .bind("agent-dispatch-cancel-turn")
+    .bind("Cancel active turn too")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO sessions (
+            session_key, agent_id, provider, status, active_dispatch_id,
+            thread_channel_id, last_heartbeat, created_at
+         ) VALUES (
+            $1, $2, 'codex', 'turn_active', $3, $4, NOW(), NOW()
+         )",
+    )
+    .bind(&session_key)
+    .bind("agent-dispatch-cancel-turn")
+    .bind("dispatch-cancel-turn-1552")
+    .bind(channel_id)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    harness
+        .seed_channel_session(
+            channel_num,
+            "dispatch-cancel-1552",
+            Some("session-dispatch-cancel-1552"),
+        )
+        .await;
+    let token = harness
+        .start_active_turn(channel_num, 15, 1552, Some(tmux_name))
+        .await;
+    harness
+        .seed_queue(channel_num, &[(2_552, "preserve dispatch cancel queue")])
+        .await;
+
+    let app = test_api_router_with_pg(
+        db.clone(),
+        engine,
+        crate::config::Config::default(),
+        Some(harness.registry()),
+        pg_pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches/dispatch-cancel-turn-1552/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "queue_cancel_dispatch_cancels_matching_active_turn_pg status={} body={}",
+        status,
+        body_text
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["dispatch_id"], "dispatch-cancel-turn-1552");
+    assert_eq!(json["active_turn_cancelled"], true);
+    assert_eq!(json["turn_session_key"], session_key);
+    assert_eq!(json["turn_tmux_session"], tmux_name);
+    assert_eq!(json["turn_channel_id"], channel_id);
+    assert_eq!(json["turn_agent_id"], "agent-dispatch-cancel-turn");
+    assert_eq!(json["turn_lifecycle_path"], "runtime-fallback");
+    assert_eq!(json["turn_tmux_killed"], false);
+    assert_eq!(json["turn_queue_preserved"], true);
+    assert_eq!(json["turn_inflight_cleared"], false);
+    assert_eq!(json["turn_queued_remaining"], 1);
+
+    assert!(
+        token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        "dispatch cancel must signal the active turn token"
+    );
+    let (has_active_turn, queue_depth, session_id) = harness.mailbox_state(channel_num).await;
+    assert!(!has_active_turn);
+    assert_eq!(queue_depth, 1);
+    assert_eq!(session_id, None);
+
+    let dispatch_status: String =
+        sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+            .bind("dispatch-cancel-turn-1552")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(dispatch_status, "cancelled");
+
+    let (session_status, active_dispatch_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, active_dispatch_id
+         FROM sessions
+         WHERE session_key = $1",
+    )
+    .bind(&session_key)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(session_status, "disconnected");
+    assert_eq!(active_dispatch_id, None);
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn link_dispatch_thread_pg_preserves_concurrent_channel_thread_updates() {
     let db = test_db();
@@ -5613,6 +5850,73 @@ async fn kanban_update_card_rejects_manual_non_backlog_transition_pg() {
 }
 
 #[tokio::test]
+async fn kanban_update_card_rejects_mixed_status_and_metadata_without_transition_pg() {
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let db = test_db();
+    let engine = test_engine_with_pg(&db, pool.clone());
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (id, title, status, priority, metadata, created_at, updated_at)
+         VALUES ('c-mixed-status-metadata', 'Mixed update', 'backlog', 'medium', $1::jsonb, NOW(), NOW())",
+    )
+    .bind(r#"{"existing":true}"#)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/kanban-cards/c-mixed-status-metadata")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"status":"ready","metadata_json":"not-json"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("cannot combine status changes with metadata or other field updates"),
+        "error must explain mixed status/metadata updates are split: {error}"
+    );
+
+    let row = sqlx::query(
+        "SELECT status, metadata::text AS metadata
+         FROM kanban_cards
+         WHERE id = 'c-mixed-status-metadata'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let status: String = row.try_get("status").unwrap();
+    let metadata_raw: Option<String> = row.try_get("metadata").unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_str(metadata_raw.as_deref().expect("metadata should remain")).unwrap();
+    assert_eq!(status, "backlog");
+    assert_eq!(metadata, json!({"existing": true}));
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
 #[ignore = "obsolete SQLite kanban backlog cleanup fixture; route is PG-only after #843/#868"]
 async fn kanban_update_card_to_backlog_cleans_up_dispatches_auto_queue_and_turns() {
     let db = test_db();
@@ -6189,6 +6493,13 @@ async fn kanban_assign_card_pg_only_without_sqlite_mirror() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["card"]["status"], "requested");
     assert_eq!(json["card"]["assigned_agent_id"], "ch-td");
+    assert_eq!(json["assignment"]["ok"], true);
+    assert_eq!(json["assignment"]["agent_id"], "ch-td");
+    assert_eq!(json["transition"]["attempted"], true);
+    assert_eq!(json["transition"]["ok"], true);
+    assert_eq!(json["transition"]["from"], "backlog");
+    assert_eq!(json["transition"]["to"], "requested");
+    assert_eq!(json["transition"]["target"], "requested");
 
     let sqlite_card_count: i64 = db
         .lock()
@@ -6214,6 +6525,101 @@ async fn kanban_assign_card_pg_only_without_sqlite_mirror() {
     .await
     .unwrap();
     assert_eq!(row.try_get::<String, _>("status").unwrap(), "requested");
+    assert_eq!(
+        row.try_get::<Option<String>, _>("assigned_agent_id")
+            .unwrap(),
+        Some("ch-td".to_string())
+    );
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kanban_assign_card_reports_transition_failure_in_response() {
+    crate::pipeline::ensure_loaded();
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, provider, discord_channel_id, discord_channel_alt)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind("ch-td")
+    .bind("Agent TD")
+    .bind("claude")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (id, title, status, priority, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    )
+    .bind("c1-pg-transition-fail")
+    .bind("Card with terminal status")
+    .bind("done")
+    .bind("medium")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/kanban-cards/c1-pg-transition-fail/assign")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"agent_id":"ch-td"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["card"]["status"], "done");
+    assert_eq!(json["card"]["assigned_agent_id"], "ch-td");
+    assert_eq!(json["assignment"]["ok"], true);
+    assert_eq!(json["transition"]["attempted"], true);
+    assert_eq!(json["transition"]["ok"], false);
+    assert_eq!(json["transition"]["from"], "done");
+    assert_eq!(json["transition"]["to"], "done");
+    assert_eq!(json["transition"]["target"], "requested");
+    assert_eq!(json["transition"]["steps"], json!(["requested"]));
+    assert_eq!(json["transition"]["failed_step"], "requested");
+    assert!(
+        json["transition"]["error"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "transition failure must be visible in the response body"
+    );
+
+    let row = sqlx::query(
+        "SELECT status, assigned_agent_id
+         FROM kanban_cards
+         WHERE id = $1",
+    )
+    .bind("c1-pg-transition-fail")
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(row.try_get::<String, _>("status").unwrap(), "done");
     assert_eq!(
         row.try_get::<Option<String>, _>("assigned_agent_id")
             .unwrap(),
@@ -6279,6 +6685,10 @@ async fn kanban_assign_issue_pg_upserts_without_duplicates() {
     assert_eq!(first_json["card"]["assigned_agent_id"], "agent-issue");
     assert_eq!(first_json["card"]["github_issue_number"], 77);
     assert_eq!(first_json["card"]["status"], "requested");
+    assert_eq!(first_json["assignment"]["ok"], true);
+    assert_eq!(first_json["assignment"]["agent_id"], "agent-issue");
+    assert_eq!(first_json["transition"]["attempted"], true);
+    assert_eq!(first_json["transition"]["ok"], true);
     let first_card_id = first_json["card"]["id"].as_str().unwrap().to_string();
 
     let second_response = app
@@ -6299,6 +6709,9 @@ async fn kanban_assign_issue_pg_upserts_without_duplicates() {
     let second_json: serde_json::Value = serde_json::from_slice(&second_body).unwrap();
     assert_eq!(second_json["deduplicated"], true);
     assert_eq!(second_json["card"]["id"], first_card_id);
+    assert_eq!(second_json["assignment"]["ok"], true);
+    assert_eq!(second_json["transition"]["attempted"], false);
+    assert_eq!(second_json["transition"]["ok"], true);
 
     let row = sqlx::query(
         "SELECT COUNT(*)::BIGINT AS card_count, MIN(id) AS card_id, MIN(status) AS status
@@ -7705,6 +8118,58 @@ async fn api_docs_category_exposes_dispatch_params_and_examples() {
         dispatch_post["example"]["response"]["dispatch"]["status"],
         "pending"
     );
+
+    let dispatch_patch = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "PATCH" && ep["path"] == "/api/dispatches/{id}")
+        .expect("dispatch update endpoint must be present in detail view");
+    let patch_description = dispatch_patch["description"]
+        .as_str()
+        .expect("PATCH dispatch docs description must be a string");
+    assert!(
+        patch_description.contains("Allowed status values")
+            && patch_description.contains("result_summary")
+            && patch_description.contains("completed_at"),
+        "PATCH dispatch docs must spell out status/result lifecycle semantics: {patch_description}"
+    );
+    let status_enum = dispatch_patch["params"]["status"]["enum"]
+        .as_array()
+        .expect("PATCH dispatch status param must expose allowed enum values");
+    for expected in ["pending", "dispatched", "completed", "cancelled", "failed"] {
+        assert!(
+            status_enum.iter().any(|value| value == expected),
+            "PATCH dispatch docs must include allowed status {expected}"
+        );
+    }
+    assert_eq!(
+        dispatch_patch["example"]["response"]["dispatch"]["result_summary"],
+        "done"
+    );
+    assert!(
+        dispatch_patch["example"]["response"]["dispatch"]["updated_at"].is_string(),
+        "PATCH dispatch example must expose updated_at"
+    );
+    assert!(
+        dispatch_patch["example"]["response"]["dispatch"]["completed_at"].is_string(),
+        "PATCH dispatch example must expose completed_at"
+    );
+    assert_eq!(dispatch_patch["error_example"]["status"], 400);
+
+    let dispatch_cancel = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/dispatches/{id}/cancel")
+        .expect("dispatch cancel endpoint must be present in dispatches detail view");
+    assert_eq!(dispatch_cancel["params"]["id"]["location"], "path");
+    let cancel_description = dispatch_cancel["description"]
+        .as_str()
+        .expect("cancel dispatch docs description must be a string");
+    assert!(
+        cancel_description.contains("pending or dispatched")
+            && cancel_description.contains("Terminal dispatches return 409"),
+        "cancel dispatch docs must describe lifecycle scope and terminal conflict: {cancel_description}"
+    );
+    assert_eq!(dispatch_cancel["example"]["response"]["ok"], true);
+    assert_eq!(dispatch_cancel["error_example"]["status"], 409);
 }
 
 #[tokio::test]
@@ -10000,6 +10465,65 @@ async fn api_docs_card_lifecycle_ops_guide_is_reachable_and_complete() {
             && guide_text.contains("/api/kanban-cards/{id}/redispatch")
             && guide_text.contains("/api/kanban-cards/{id}/transition"),
         "guide must enumerate the five lifecycle endpoints by exact path"
+    );
+}
+
+#[tokio::test]
+async fn api_docs_api_friction_markers_guide_is_reachable_and_complete() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let index_response = app
+        .clone()
+        .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(index_response.status(), StatusCode::OK);
+    let index_bytes = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let index_json: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    let guides = index_json["guides"]
+        .as_array()
+        .expect("/docs index must list long-form guides under 'guides'");
+    let friction_entry = guides
+        .iter()
+        .find(|guide| guide["name"] == "api-friction-markers")
+        .expect("/docs index must surface the API friction marker guide");
+    assert_eq!(
+        friction_entry["path"], "/api/docs/api-friction-markers",
+        "API friction marker guide path must be /api/docs/api-friction-markers"
+    );
+
+    let guide_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/api-friction-markers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guide_response.status(), StatusCode::OK);
+    let guide_bytes = axum::body::to_bytes(guide_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let guide_text = String::from_utf8(guide_bytes.to_vec()).unwrap();
+    let guide_json: serde_json::Value = serde_json::from_str(&guide_text).unwrap();
+
+    assert_eq!(guide_json["title"], "API Friction Marker Guide");
+    assert_eq!(guide_json["marker_prefix"], "API_FRICTION:");
+    assert_eq!(
+        guide_json["schema"]["required"]["endpoint"],
+        "HTTP endpoint or API surface, for example PATCH /api/dispatches/{id}"
+    );
+    assert!(
+        guide_text.contains("api_friction_events")
+            && guide_text.contains("api_friction_issues")
+            && guide_text.contains("Memento")
+            && guide_text.contains("API_FRICTION:"),
+        "API friction guide must describe marker collection, persistence, and example"
     );
 }
 
@@ -12436,7 +12960,7 @@ async fn pipeline_config_repo_invalid_override_rejected() {
 }
 
 #[tokio::test]
-async fn pipeline_config_pg_repo_broken_merge_rejected() {
+async fn pipeline_config_pg_invalid_merge_without_override_keeps_null() {
     crate::pipeline::ensure_loaded();
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
@@ -12485,6 +13009,139 @@ async fn pipeline_config_pg_repo_broken_merge_rejected() {
         "expected merged validation error, got: {}",
         body
     );
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT pipeline_config::text AS pipeline_config FROM github_repos WHERE id = $1",
+    )
+    .bind("owner/repo-merge")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        stored.is_none(),
+        "invalid override without existing config must keep NULL, got: {stored:?}"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn pipeline_config_pg_repo_invalid_merge_preserves_existing_override() {
+    crate::pipeline::ensure_loaded();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let db = test_db();
+    let engine = test_engine_with_pg(&db, pool.clone());
+    let valid_override = json!({
+        "hooks": {
+            "review": {
+                "on_enter": ["ExistingRepoHook"],
+                "on_exit": []
+            }
+        }
+    });
+    sqlx::query(
+        "INSERT INTO github_repos (id, display_name, pipeline_config)
+         VALUES ($1, $1, $2::jsonb)",
+    )
+    .bind("owner/repo-preserve")
+    .bind(valid_override.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/pipeline/config/repo/owner/repo-preserve")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config":{"timeouts":{"nonexistent_state":{"duration":"1h","clock":"no_such_clock"}}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT pipeline_config::text AS pipeline_config FROM github_repos WHERE id = $1",
+    )
+    .bind("owner/repo-preserve")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let stored_json: serde_json::Value = serde_json::from_str(stored.as_deref().unwrap()).unwrap();
+    assert_eq!(stored_json, valid_override);
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn pipeline_config_pg_agent_invalid_merge_preserves_existing_override() {
+    crate::pipeline::ensure_loaded();
+    let pg_db = TestPostgresDb::create().await;
+    let pool = pg_db.connect_and_migrate().await;
+    let db = test_db();
+    let engine = test_engine_with_pg(&db, pool.clone());
+    let valid_override = json!({
+        "timeouts": {
+            "in_progress": {
+                "duration": "4h",
+                "clock": "started_at"
+            }
+        }
+    });
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt, pipeline_config)
+         VALUES ($1, $1, '111', '222', $2::jsonb)",
+    )
+    .bind("agent-preserve")
+    .bind(valid_override.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pool.clone(),
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/pipeline/config/agent/agent-preserve")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"config":{"timeouts":{"nonexistent_state":{"duration":"1h","clock":"no_such_clock"}}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT pipeline_config::text AS pipeline_config FROM agents WHERE id = $1",
+    )
+    .bind("agent-preserve")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let stored_json: serde_json::Value = serde_json::from_str(stored.as_deref().unwrap()).unwrap();
+    assert_eq!(stored_json, valid_override);
 
     pool.close().await;
     pg_db.drop().await;

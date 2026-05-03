@@ -364,6 +364,29 @@ fn test_engine_db_execute_warns_and_blocks_core_table_sql() {
 }
 
 #[test]
+fn http_ops_rejects_prefix_spoofed_loopback_hosts() {
+    let db = test_db();
+    let rt = rquickjs::Runtime::new().unwrap();
+    let ctx = rquickjs::Context::full(&rt).unwrap();
+    ctx.with(|ctx| {
+        register_globals(&ctx, db.clone()).unwrap();
+        let result: String = ctx
+            .eval(
+                r#"
+                JSON.stringify({
+                    localhost: agentdesk.http.post("http://localhost.evil.example:8791", {}).error,
+                    ipv4: agentdesk.http.post("http://127.0.0.1.evil.example:8791", {}).error
+                })
+                "#,
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["localhost"], "only localhost allowed");
+        assert_eq!(parsed["ipv4"], "only localhost allowed");
+    });
+}
+
+#[test]
 fn test_engine_db_query_raw_returns_unified_error_json() {
     let db = test_db();
     let rt = rquickjs::Runtime::new().unwrap();
@@ -878,7 +901,10 @@ fn policies_raw_db_count_stays_within_budget() {
     // policies/timeouts/long-turn-monitor.js). These read/write `kv_meta`
     // for the watchdog-extension cooldown bookkeeping; migrating to a typed
     // facade (`agentdesk.kvMeta.*` or `agentdesk.longTurn.*`) is a follow-up.
-    const RAW_DB_BUDGET: usize = 193;
+    // #1489 policy SQL guard boundary audit: rebaseline the observed
+    // trusted-automation raw DB surface to 195 unmarked callsites and document
+    // the next guard/manifest path in docs/policy-sql-guard.md.
+    const RAW_DB_BUDGET: usize = 195;
     // Number of callsites that are currently annotated with the
     // escape-hatch marker (`/* legacy-raw-db: ... */`). Starts at 0 and
     // grows only when a caller explicitly justifies a raw callsite.

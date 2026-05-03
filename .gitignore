@@ -14,6 +14,7 @@ agentdesk.yaml
 
 # Generated/temp files
 agentdesk.db
+data.db
 .playwright-cli/
 dist/
 output/
