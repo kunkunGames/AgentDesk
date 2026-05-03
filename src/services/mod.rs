@@ -9,6 +9,7 @@ pub mod codex_tmux_wrapper;
 pub mod discord;
 pub mod discord_config_audit;
 pub mod discord_delivery;
+pub mod discord_delivery_metadata;
 pub mod discord_dm_reply_store;
 pub mod disk_monitor;
 pub mod dispatch_watchdog;
@@ -53,6 +54,7 @@ pub mod tmux_diagnostics;
 #[cfg(unix)]
 pub mod tmux_wrapper;
 pub mod tool_output_guard;
+pub mod turn_cancel_finalizer;
 pub mod turn_lifecycle;
 pub mod turn_orchestrator;
 

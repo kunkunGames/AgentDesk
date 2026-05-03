@@ -109,6 +109,11 @@ pub(super) struct InflightTurnState {
     /// Preferred Discord bot key for terminal headless delivery.
     #[serde(default)]
     pub delivery_bot: Option<String>,
+    /// Suppress assistant-text relay to the Discord channel for the turn.
+    /// Set from `metadata.silent` on a headless trigger (e.g. family-profile-probe);
+    /// lifecycle/error/cancel notifications still post.
+    #[serde(default)]
+    pub silent_turn: bool,
     /// Active dispatch ID for long-turn diagnostics.
     #[serde(default)]
     pub dispatch_id: Option<String>,
@@ -216,6 +221,7 @@ impl InflightTurnState {
             has_post_tool_text: false,
             session_key: None,
             delivery_bot: None,
+            silent_turn: false,
             dispatch_id: None,
             last_watcher_relayed_offset: None,
             last_watcher_relayed_generation_mtime_ns: None,

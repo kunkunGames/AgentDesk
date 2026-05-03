@@ -54,6 +54,7 @@ src/
 │   ├── auto_queue.rs
 │   ├── cancel_tombstones.rs
 │   ├── dispatched_sessions.rs
+│   ├── dispatches.rs
 │   ├── kanban.rs
 │   ├── kanban_cards.rs
 │   ├── memento_feedback_stats.rs
@@ -266,12 +267,16 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
+│   │   │   ├── authorization.rs
 │   │   │   ├── control_intent.rs
+│   │   │   ├── dispatch_trigger.rs
 │   │   │   ├── intake_gate.rs
 │   │   │   ├── message_handler.rs
 │   │   │   ├── mod.rs
+│   │   │   ├── response_format.rs
 │   │   │   ├── tests.rs
-│   │   │   └── thread_binding.rs
+│   │   │   ├── thread_binding.rs
+│   │   │   └── turn_start.rs
 │   │   ├── settings/
 │   │   │   ├── content.rs
 │   │   │   ├── memory.rs
@@ -288,8 +293,10 @@ src/
 │   │   │   ├── retry_state.rs
 │   │   │   ├── skill_usage.rs
 │   │   │   ├── stale_resume.rs
+│   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tests.rs
-│   │   │   └── tmux_runtime.rs
+│   │   │   ├── tmux_runtime.rs
+│   │   │   └── turn_analytics.rs
 │   │   ├── watchers/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
@@ -340,11 +347,15 @@ src/
 │   │   ├── stall_recovery.rs
 │   │   ├── tmux.rs
 │   │   ├── tmux_error_detect.rs
+│   │   ├── tmux_kill_policy.rs
 │   │   ├── tmux_lifecycle.rs
+│   │   ├── tmux_output_stream.rs
 │   │   ├── tmux_overload_retry.rs
 │   │   ├── tmux_reaper.rs
+│   │   ├── tmux_reattach_offsets.rs
 │   │   ├── tmux_restart_handoff.rs
-│   │   └── tmux_session_files.rs
+│   │   ├── tmux_session_files.rs
+│   │   └── tmux_watcher.rs
 │   ├── git/
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
@@ -416,6 +427,7 @@ src/
 │   ├── codex_tmux_wrapper.rs
 │   ├── discord_config_audit.rs
 │   ├── discord_delivery.rs
+│   ├── discord_delivery_metadata.rs
 │   ├── discord_dm_reply_store.rs
 │   ├── disk_monitor.rs
 │   ├── dispatch_watchdog.rs
@@ -451,6 +463,7 @@ src/
 │   ├── tmux_diagnostics.rs
 │   ├── tmux_wrapper.rs
 │   ├── tool_output_guard.rs
+│   ├── turn_cancel_finalizer.rs
 │   ├── turn_lifecycle.rs
 │   └── turn_orchestrator.rs
 ├── supervisor/
