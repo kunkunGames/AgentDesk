@@ -1,8 +1,0 @@
-Bolt: [policy engine] bound unbounded sweeps to prevent tick bottlenecks
-
-💡 What: Added LIMIT and ORDER BY clauses to periodic sweeps in `policies/auto-queue.js` and `policies/timeouts/idle-kill.js` (along with a filtering condition to the terminal Pending query).
-🎯 Why: `onTick1min` and `onTick5min` were spending excess wall clock time sweeping unbounded DB queries and repeating synchronous HTTP local fan-outs, blocking tick threads as queue and session volumes grow.
-📊 Impact: Tick sweeps are now deterministically bounded to maximum DB loads (10 for sessions, 50-100 for auto queue runs/entries) and HTTP fan-out is strictly limited per cycle. This effectively caps peak memory usage and tick execution latency.
-🔬 Measurement: The local `npm run test:policies` confirms logic holds, and the `docs/policy-tick-bottleneck-735.md` evidence indicated unbounded DB sweeps as the root cause of 8-10s spikes.
-✅ Verification: Ran `npm run test:policies` (all 40 tests passed), `RUSTC_WRAPPER="" cargo check --all-targets`, `RUSTC_WRAPPER="" cargo clippy --all-targets -- -W clippy::all`, and verified JS changes via `git diff`.
-⚠️ Limits: Limits introduce a theoretical delay in processing massive backlogs since it caps the max items processed per minute, but this is an intended trade-off to ensure stability.
