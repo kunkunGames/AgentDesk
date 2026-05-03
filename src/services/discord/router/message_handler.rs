@@ -118,6 +118,13 @@ fn metadata_delivery_bot(metadata: Option<&serde_json::Value>) -> Option<String>
         .and_then(normalize_delivery_bot_name)
 }
 
+fn metadata_silent_flag(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|value| value.get("silent"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn normalize_delivery_bot_name(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty()
@@ -1620,6 +1627,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     inflight_state.logical_channel_id = Some(channel_id.get());
     inflight_state.session_key = adk_session_key.clone();
     inflight_state.delivery_bot = metadata_delivery_bot(metadata.as_ref());
+    inflight_state.silent_turn = metadata_silent_flag(metadata.as_ref());
     if let Err(error) = save_inflight_state(&inflight_state) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!("  [{ts}]   ⚠ inflight state save failed: {error}");

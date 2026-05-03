@@ -3775,9 +3775,24 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
-            // If response is empty (e.g. auto-retry on stale session), show
-            // recovery notice instead of deleting — avoids visual gap.
-            if delivery_response.trim().is_empty() {
+            // Headless silent trigger (metadata.silent=true): suppress assistant
+            // text delivery entirely. Lifecycle/error/cancel notifications still
+            // flow through their own paths.
+            if inflight_state.silent_turn {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🤫 turn_bridge: silent_turn suppressed terminal delivery for channel {} ({} chars)",
+                    channel_id,
+                    delivery_response.len()
+                );
+                terminal_delivery_committed = true;
+                advance_tmux_relay_confirmed_end(
+                    shared_owned.as_ref(),
+                    watcher_owner_channel_id,
+                    tmux_last_offset,
+                    inflight_state.tmux_session_name.as_deref(),
+                );
+            } else if delivery_response.trim().is_empty() {
                 if gateway
                     .edit_message(
                         channel_id,

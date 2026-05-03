@@ -3264,6 +3264,17 @@ pub(super) async fn tmux_output_watcher_with_restore(
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
 
+                    // Headless silent trigger (metadata.silent=true): skip both
+                    // status-panel and streaming-chunk edits to keep the channel
+                    // at zero bytes for the assistant turn.
+                    let streaming_silent_turn =
+                        super::inflight::load_inflight_state(&watcher_provider, channel_id.get())
+                            .map(|state| state.silent_turn)
+                            .unwrap_or(false);
+                    if streaming_silent_turn {
+                        continue;
+                    }
+
                     if shared.status_panel_v2_enabled
                         && let Some(status_msg_id) = status_panel_msg_id
                     {
@@ -4261,8 +4272,64 @@ pub(super) async fn tmux_output_watcher_with_restore(
 
         let recent_stop_for_output =
             recent_turn_stop_for_watcher_range(channel_id, &tmux_session_name, data_start_offset);
-        let inflight_missing_before_relay =
-            super::inflight::load_inflight_state(&watcher_provider, channel_id.get()).is_none();
+        let inflight_before_relay =
+            super::inflight::load_inflight_state(&watcher_provider, channel_id.get());
+        let inflight_missing_before_relay = inflight_before_relay.is_none();
+        let inflight_silent_turn = inflight_before_relay
+            .as_ref()
+            .map(|state| state.silent_turn)
+            .unwrap_or(false);
+        if inflight_silent_turn && has_assistant_response {
+            // Headless silent trigger (metadata.silent=true) — suppress assistant
+            // text relay to the channel entirely, but keep the watcher state
+            // machine advancing so the turn finalizes normally. Lifecycle/error/
+            // cancel notifications continue to post via their own paths.
+            let cleanup_committed = if let Some(msg_id) = placeholder_msg_id {
+                delete_nonterminal_placeholder(
+                    &http,
+                    channel_id,
+                    &shared,
+                    &watcher_provider,
+                    &tmux_session_name,
+                    msg_id,
+                    "watcher_silent_turn_suppress_cleanup",
+                )
+                .await
+                .is_committed()
+            } else {
+                true
+            };
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 🤫 watcher: silent_turn suppressed terminal output for channel {} (tmux={}, range {}..{})",
+                channel_id.get(),
+                tmux_session_name,
+                data_start_offset,
+                current_offset
+            );
+            if cleanup_committed {
+                last_relayed_offset = Some(current_offset);
+                last_observed_generation_mtime_ns =
+                    Some(read_generation_file_mtime_ns(&tmux_session_name));
+                advance_watcher_confirmed_end(
+                    &shared,
+                    &watcher_provider,
+                    channel_id,
+                    &tmux_session_name,
+                    current_offset,
+                    "src/services/discord/tmux.rs:silent_turn_suppressed_terminal_output",
+                );
+            }
+            finish_monitor_auto_turn_if_claimed(
+                &shared,
+                &watcher_provider,
+                channel_id,
+                &mut monitor_auto_turn_claimed,
+                &mut monitor_auto_turn_finished,
+            )
+            .await;
+            continue;
+        }
         if should_suppress_terminal_output_after_recent_stop(
             has_assistant_response,
             inflight_missing_before_relay,
