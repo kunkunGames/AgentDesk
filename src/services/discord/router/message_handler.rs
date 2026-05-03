@@ -11,6 +11,7 @@ use crate::services::memory::{
 use crate::services::observability::recovery_audit::RecoveryAuditRecord;
 use crate::services::observability::turn_lifecycle::{
     SessionStrategyDetails, TurnEvent, TurnLifecycleEmit, emit_turn_lifecycle,
+    provider_session_fingerprint,
 };
 use crate::services::provider::{CancelToken, cancel_requested};
 use std::sync::Arc;
@@ -776,6 +777,59 @@ fn session_strategy_lifecycle_event(
     }
 }
 
+async fn log_session_strategy_diagnostic(
+    channel_id: ChannelId,
+    provider: &ProviderKind,
+    dispatch_profile: DispatchProfile,
+    session_strategy_reason: &str,
+    provider_session_id: Option<&str>,
+    adk_session_key: Option<&str>,
+    tmux_session_name: Option<&str>,
+    recovery_context_present: bool,
+    memento_context_loaded: bool,
+) {
+    let tmux_alive = if let Some(tmux_name) = tmux_session_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let tmux_name = tmux_name.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::services::platform::tmux::has_session(&tmux_name)
+        })
+        .await
+        .ok()
+    } else {
+        None
+    };
+    let provider_session = provider_session_id
+        .map(provider_session_fingerprint)
+        .unwrap_or_else(|| "none".to_string());
+    let tmux_alive_label = match tmux_alive {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    let tmux_label = tmux_session_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] [session-strategy] channel={} provider={} dispatch={} reason={} resumed={} provider_session_fp={} adk_key_present={} tmux={} tmux_alive={} recovery_context_present={} memento_context_loaded={}",
+        channel_id.get(),
+        provider.as_str(),
+        dispatch_profile_label(dispatch_profile),
+        session_strategy_reason,
+        provider_session_id.is_some(),
+        provider_session,
+        adk_session_key.is_some(),
+        tmux_label,
+        tmux_alive_label,
+        recovery_context_present,
+        memento_context_loaded
+    );
+}
+
 async fn refresh_session_strategy_after_pending_reset(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -1243,6 +1297,18 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
+    log_session_strategy_diagnostic(
+        channel_id,
+        &provider,
+        dispatch_profile,
+        session_strategy_reason,
+        session_id.as_deref(),
+        adk_session_key.as_deref(),
+        tmux_session_name.as_deref(),
+        session_retry_context.is_some(),
+        memento_context_loaded,
+    )
+    .await;
     emit_session_strategy_lifecycle(
         shared,
         channel_id,
@@ -3657,6 +3723,18 @@ pub(in crate::services::discord) async fn handle_text_message(
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
+    log_session_strategy_diagnostic(
+        channel_id,
+        &provider,
+        dispatch_profile,
+        session_strategy_reason,
+        session_id.as_deref(),
+        adk_session_key.as_deref(),
+        tmux_session_name.as_deref(),
+        session_retry_context.is_some(),
+        memento_context_loaded,
+    )
+    .await;
     emit_session_strategy_lifecycle(
         shared,
         channel_id,

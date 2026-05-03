@@ -6,6 +6,7 @@ use poise::serenity_prelude as serenity;
 use super::SharedData;
 use crate::services::observability::turn_lifecycle::{
     ContextCompactionDetails, TurnEvent, TurnLifecycleEmit, emit_turn_lifecycle,
+    provider_session_fingerprint,
 };
 use crate::services::provider::ProviderKind;
 
@@ -341,8 +342,26 @@ pub(super) async fn fetch_provider_session_id(
         return Some(found);
     }
 
-    let legacy_key = legacy_session_key_from_namespaced(session_key)?;
-    fetch_provider_session_id_once(&legacy_key, provider, api_port).await
+    let Some(legacy_key) = legacy_session_key_from_namespaced(session_key) else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] [session-restore] no provider session selector for key={} provider={} legacy_key_present=false",
+            session_key,
+            provider.as_str()
+        );
+        return None;
+    };
+
+    let restored = fetch_provider_session_id_once(&legacy_key, provider, api_port).await;
+    if restored.is_none() {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] [session-restore] no provider session selector for key={} provider={} legacy_key_present=true",
+            session_key,
+            provider.as_str()
+        );
+    }
+    restored
 }
 
 async fn fetch_provider_session_id_once(
@@ -350,17 +369,61 @@ async fn fetch_provider_session_id_once(
     provider: &ProviderKind,
     _api_port: u16,
 ) -> Option<String> {
-    let json = super::internal_api::get_provider_session_id(session_key, Some(provider.as_str()))
-        .await
-        .ok()?;
+    let json = match super::internal_api::get_provider_session_id(
+        session_key,
+        Some(provider.as_str()),
+    )
+    .await
+    {
+        Ok(json) => json,
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ [session-restore] provider session lookup failed: key={} provider={} error={}",
+                session_key,
+                provider.as_str(),
+                error
+            );
+            return None;
+        }
+    };
     // #107: Filter empty strings — a stale clear path may have stored ""
     // instead of NULL; treat it as no session ID.
     // Also try session_id field as fallback for provider-agnostic lookup.
-    json.get("claude_session_id")
+    let selector = json
+        .get("claude_session_id")
         .and_then(|v| v.as_str())
         .or_else(|| json.get("session_id").and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    if let Some(ref selector) = selector {
+        tracing::info!(
+            "  [{ts}] [session-restore] provider session selector found: key={} provider={} selector_fp={}",
+            session_key,
+            provider.as_str(),
+            provider_session_fingerprint(selector)
+        );
+    } else {
+        let has_claude_selector = json
+            .get("claude_session_id")
+            .and_then(|v| v.as_str())
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+        let has_raw_session_id = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+        tracing::info!(
+            "  [{ts}] [session-restore] provider session lookup returned no usable selector: key={} provider={} has_claude_selector={} has_session_id={}",
+            session_key,
+            provider.as_str(),
+            has_claude_selector,
+            has_raw_session_id
+        );
+    }
+    selector
 }
 
 fn build_provider_session_payload(
