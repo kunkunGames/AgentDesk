@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 
 use super::AppState;
@@ -93,20 +93,29 @@ pub async fn update_dispatched_session(
 /// GET /api/sessions/{id}/tmux-output?lines=N
 pub async fn tmux_output(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Query(params): Query<TmuxOutputQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    crate::services::dispatched_sessions::tmux_output(State(state), Path(id), Query(params)).await
+    crate::services::dispatched_sessions::tmux_output(
+        State(state),
+        headers,
+        Path(id),
+        Query(params),
+    )
+    .await
 }
 
 /// POST /api/sessions/{session_key}/force-kill
 pub async fn force_kill_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(session_key): Path<String>,
     Json(body): Json<ForceKillOptions>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     crate::services::dispatched_sessions::force_kill_session(
         State(state),
+        headers,
         Path(session_key),
         Json(body),
     )

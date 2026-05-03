@@ -14,7 +14,7 @@ use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -721,6 +721,23 @@ pub(crate) async fn force_kill_session_impl_with_reason(
     retry: bool,
     reason: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    force_kill_session_impl_with_reason_and_forwarding(
+        state,
+        &HeaderMap::new(),
+        session_key,
+        retry,
+        reason,
+    )
+    .await
+}
+
+async fn force_kill_session_impl_with_reason_and_forwarding(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_key: &str,
+    retry: bool,
+    reason: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
     let session_key = session_key;
 
     // Parse tmux session name from session_key (format: "hostname:tmux_name")
@@ -748,7 +765,7 @@ pub(crate) async fn force_kill_session_impl_with_reason(
             Json(json!({"error": "postgres pool unavailable"})),
         );
     };
-    let (active_dispatch_id, agent_id, runtime_channel_id, session_provider) =
+    let (active_dispatch_id, agent_id, runtime_channel_id, session_provider, owner_instance_id) =
         match dispatched_sessions_db::load_force_kill_session_pg(pool, session_key, provider_name)
             .await
         {
@@ -766,6 +783,34 @@ pub(crate) async fn force_kill_session_impl_with_reason(
                 );
             }
         };
+
+    if !crate::services::session_forwarding::is_forwarded_request(headers) {
+        match crate::services::session_forwarding::resolve_forward_target(
+            state,
+            owner_instance_id.as_deref(),
+            pool,
+        )
+        .await
+        {
+            crate::services::session_forwarding::ForwardResolution::Local => {}
+            crate::services::session_forwarding::ForwardResolution::Forward(target) => {
+                return crate::services::session_forwarding::forward_force_kill(
+                    state,
+                    &target,
+                    session_key,
+                    retry,
+                    reason,
+                )
+                .await;
+            }
+            crate::services::session_forwarding::ForwardResolution::Unavailable {
+                status,
+                body,
+            } => {
+                return (status, Json(body));
+            }
+        }
+    }
 
     let termination_reason_code = classify_session_termination_reason(reason);
 
@@ -824,43 +869,55 @@ pub(crate) async fn force_kill_session_impl_with_reason(
     };
 
     // Create retry dispatch via central authoritative path (#108)
+    let mut retry_skipped_reason: Option<&'static str> = None;
     if let Some((card_id, to_agent_id, dispatch_type, title, context, retry_count)) = retry_meta {
-        let ctx: serde_json::Value = context
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_else(|| json!({}));
+        if retry_count >= FORCE_KILL_RETRY_LIMIT {
+            retry_skipped_reason = Some("retry_limit_reached");
+            tracing::warn!(
+                "[force-kill] retry dispatch skipped for card {}: retry_count={} limit={}",
+                card_id,
+                retry_count,
+                FORCE_KILL_RETRY_LIMIT
+            );
+        } else {
+            let ctx: serde_json::Value = context
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| json!({}));
 
-        let meta = dispatched_sessions_db::RetryDispatchMeta {
-            card_id,
-            to_agent_id,
-            dispatch_type,
-            title,
-            context: Some(ctx.to_string()),
-            retry_count,
-        };
-        match dispatched_sessions_db::create_retry_dispatch_pg(pool, &meta).await {
-            Ok(new_id) => {
-                retry_dispatch_id = Some(new_id);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[force-kill] retry dispatch creation via postgres path failed for card {}: {e}",
-                    meta.card_id
-                );
+            let meta = dispatched_sessions_db::RetryDispatchMeta {
+                card_id,
+                to_agent_id,
+                dispatch_type,
+                title,
+                context: Some(ctx.to_string()),
+                retry_count,
+            };
+            match dispatched_sessions_db::create_retry_dispatch_pg(pool, &meta).await {
+                Ok(new_id) => {
+                    retry_dispatch_id = Some(new_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[force-kill] retry dispatch creation via postgres path failed for card {}: {e}",
+                        meta.card_id
+                    );
+                }
             }
         }
     }
 
-    let queue_activation_requested = if retry_dispatch_id.is_none() {
-        if let Some(ref aid) = agent_id {
-            spawn_auto_queue_activate_for_agent(state.clone(), aid.clone());
-            true
+    let queue_activation_requested =
+        if retry_dispatch_id.is_none() && retry_skipped_reason.is_none() {
+            if let Some(ref aid) = agent_id {
+                spawn_auto_queue_activate_for_agent(state.clone(), aid.clone());
+                true
+            } else {
+                false
+            }
         } else {
             false
-        }
-    } else {
-        false
-    };
+        };
 
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::warn!(
@@ -898,6 +955,8 @@ pub(crate) async fn force_kill_session_impl_with_reason(
             "queue_preserved": lifecycle.queue_preserved,
             "dispatch_failed": active_dispatch_id,
             "retry_dispatch_id": retry_dispatch_id,
+            "retry_limit": FORCE_KILL_RETRY_LIMIT,
+            "retry_skipped_reason": retry_skipped_reason,
             "queue_activation_requested": queue_activation_requested,
         })),
     )
@@ -927,6 +986,7 @@ pub struct TmuxOutputQuery {
 
 const TMUX_OUTPUT_DEFAULT_LINES: i32 = 80;
 const TMUX_OUTPUT_MAX_LINES: i32 = 2000;
+const FORCE_KILL_RETRY_LIMIT: i64 = 5;
 
 /// GET /api/sessions/{id}/tmux-output?lines=N
 ///
@@ -936,31 +996,32 @@ const TMUX_OUTPUT_MAX_LINES: i32 = 2000;
 /// `session_key`, then shells out via [`crate::services::platform::tmux::capture_pane`].
 pub async fn tmux_output(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Query(params): Query<TmuxOutputQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let requested_lines = params.lines.unwrap_or(TMUX_OUTPUT_DEFAULT_LINES);
     let effective_lines = requested_lines.max(1).min(TMUX_OUTPUT_MAX_LINES);
 
-    // Lookup session row. Prefer Postgres (authoritative) when available.
-    let session_row = if let Some(pool) = state.pg_pool_ref() {
-        match dispatched_sessions_db::load_session_by_id_pg(pool, id).await {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
-            }
-        }
-    } else {
+    let Some(pool) = state.pg_pool_ref() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "postgres pool unavailable"})),
         );
     };
 
-    let Some((session_key, agent_id, provider, status)) = session_row else {
+    // Lookup session row. Prefer Postgres (authoritative) when available.
+    let session_row = match dispatched_sessions_db::load_session_by_id_pg(pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            );
+        }
+    };
+
+    let Some((session_key, agent_id, provider, status, owner_instance_id)) = session_row else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -969,6 +1030,33 @@ pub async fn tmux_output(
             })),
         );
     };
+
+    if !crate::services::session_forwarding::is_forwarded_request(&headers) {
+        match crate::services::session_forwarding::resolve_forward_target(
+            &state,
+            owner_instance_id.as_deref(),
+            pool,
+        )
+        .await
+        {
+            crate::services::session_forwarding::ForwardResolution::Local => {}
+            crate::services::session_forwarding::ForwardResolution::Forward(target) => {
+                return crate::services::session_forwarding::forward_tmux_output(
+                    &state,
+                    &target,
+                    id,
+                    effective_lines,
+                )
+                .await;
+            }
+            crate::services::session_forwarding::ForwardResolution::Unavailable {
+                status,
+                body,
+            } => {
+                return (status, Json(body));
+            }
+        }
+    }
 
     // session_key format: "hostname:tmux_name"
     let tmux_name = match session_key.split_once(':') {
@@ -1020,11 +1108,19 @@ pub async fn tmux_output(
 /// + mark active dispatch failed. Optionally creates a retry dispatch.
 pub async fn force_kill_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(session_key): Path<String>,
     Json(body): Json<ForceKillOptions>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let reason = body.reason.as_deref().unwrap_or("force-kill API invoked");
-    force_kill_session_impl_with_reason(&state, &session_key, body.retry, reason).await
+    force_kill_session_impl_with_reason_and_forwarding(
+        &state,
+        &headers,
+        &session_key,
+        body.retry,
+        reason,
+    )
+    .await
 }
 
 /// Legacy body-based wrapper retained for compatibility tests and direct callers.
@@ -1349,6 +1445,7 @@ mod tests {
 
         let (status, body) = force_kill_session(
             State(state),
+            HeaderMap::new(),
             Path("host:codex-agent-force-pg".to_string()),
             Json(ForceKillOptions {
                 retry: true,
@@ -1531,6 +1628,7 @@ mod tests {
 
         let (status, body) = force_kill_session(
             State(state),
+            HeaderMap::new(),
             Path(session_key.clone()),
             Json(ForceKillOptions {
                 retry: false,
@@ -1600,6 +1698,7 @@ mod tests {
 
         let (status, body) = force_kill_session(
             State(state),
+            HeaderMap::new(),
             Path(session_key.clone()),
             Json(ForceKillOptions {
                 retry: false,
@@ -2811,6 +2910,7 @@ mod tests {
 
         let (status, body) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(999_999),
             Query(TmuxOutputQuery { lines: None }),
         )
@@ -2859,6 +2959,7 @@ mod tests {
 
         let (status, body) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: Some(20) }),
         )
@@ -2911,6 +3012,7 @@ mod tests {
 
         let (status_hi, body_hi) = tmux_output(
             State(state.clone()),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: Some(9_999) }),
         )
@@ -2922,6 +3024,7 @@ mod tests {
 
         let (status_lo, body_lo) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: Some(-42) }),
         )
@@ -2964,6 +3067,7 @@ mod tests {
 
         let (status, body) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: None }),
         )
