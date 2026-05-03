@@ -732,6 +732,7 @@ async fn emit_session_strategy_lifecycle(
     dispatch_id: Option<&str>,
     provider_session_id: Option<&str>,
     reason: &'static str,
+    cli_was_just_spawned: bool,
 ) {
     let Some(pool) = shared.pg_pool.as_ref() else {
         return;
@@ -740,6 +741,18 @@ async fn emit_session_strategy_lifecycle(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let resumed = provider_session_id.is_some();
+    // The CLI process for managed_tmux_backend providers stays alive across
+    // turns; the SDK's `provider_session_id` is reused via stdin stream-json,
+    // not via a fresh `claude --resume` invocation. Surfacing those turns as
+    // "Lifecycle resumed" in the status panel was misleading because the
+    // word implied a CLI restart that did not happen. Reserve the
+    // `session_resumed` lifecycle event (and the panel line it drives) for
+    // the actual `--resume` cases — first turn after dcserver restart with a
+    // dead tmux pane, or a tmux respawn — and stay silent for the steady-
+    // state warm-continuation that is the default every other turn.
+    if resumed && !cli_was_just_spawned {
+        return;
+    }
     let event = session_strategy_lifecycle_event(provider_session_id, reason);
     let summary = if resumed {
         format!("selected resumed provider session strategy: {reason}")
@@ -774,6 +787,25 @@ fn session_strategy_lifecycle_event(
         TurnEvent::SessionResumed(SessionStrategyDetails::resumed(reason, provider_session_id))
     } else {
         TurnEvent::SessionFresh(SessionStrategyDetails::fresh(reason))
+    }
+}
+
+/// Decide whether the CLI process is being newly spawned for this turn.
+///
+/// For managed_tmux_backend providers (Claude / Codex with tmux) the CLI is
+/// kept alive across turns and addressed via stdin stream-json, so the SDK's
+/// `provider_session_id` is reused without an actual `claude --resume`
+/// invocation. We treat the CLI as "just spawned" only when the tmux session
+/// is missing — which forces a fresh tmux + CLI launch (and therefore a
+/// genuine `--resume` if a session_id was carried forward). For non-tmux
+/// modes (no `tmux_session_name`) every turn re-spawns the CLI, so we always
+/// report "just spawned".
+fn cli_just_spawned_for_emit(tmux_session_name: Option<&str>) -> bool {
+    match tmux_session_name {
+        Some(name) if !name.trim().is_empty() => {
+            !crate::services::platform::tmux::has_session(name)
+        }
+        _ => true,
     }
 }
 
@@ -1309,6 +1341,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         memento_context_loaded,
     )
     .await;
+    let cli_was_just_spawned = cli_just_spawned_for_emit(tmux_session_name.as_deref());
     emit_session_strategy_lifecycle(
         shared,
         channel_id,
@@ -1317,6 +1350,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         None,
         session_id.as_deref(),
         session_strategy_reason,
+        cli_was_just_spawned,
     )
     .await;
 
@@ -3735,6 +3769,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         memento_context_loaded,
     )
     .await;
+    let cli_was_just_spawned = cli_just_spawned_for_emit(tmux_session_name.as_deref());
     emit_session_strategy_lifecycle(
         shared,
         channel_id,
@@ -3743,6 +3778,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         active_dispatch_id_for_prompt.as_deref(),
         session_id.as_deref(),
         session_strategy_reason,
+        cli_was_just_spawned,
     )
     .await;
 
@@ -5996,6 +6032,16 @@ mod session_strategy_lifecycle_tests {
             }
             other => panic!("expected session_resumed event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_just_spawned_for_emit_handles_none_and_blank_session_names() {
+        // Non-tmux mode (ProcessBackend / no managed session) always
+        // re-spawns the CLI per turn, so the helper must report "just
+        // spawned" for None / blank tmux session names.
+        assert!(cli_just_spawned_for_emit(None));
+        assert!(cli_just_spawned_for_emit(Some("")));
+        assert!(cli_just_spawned_for_emit(Some("   ")));
     }
 }
 
