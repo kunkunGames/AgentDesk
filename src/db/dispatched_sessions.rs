@@ -56,11 +56,12 @@ pub(crate) async fn load_force_kill_session_pg(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     )>,
     String,
 > {
     let row = sqlx::query(
-        "SELECT active_dispatch_id, agent_id, thread_channel_id, provider
+        "SELECT active_dispatch_id, agent_id, thread_channel_id, provider, instance_id
          FROM sessions
          WHERE session_key = $1",
     )
@@ -85,6 +86,9 @@ pub(crate) async fn load_force_kill_session_pg(
     let session_provider: Option<String> = row
         .try_get("provider")
         .map_err(|error| format!("decode provider for {session_key}: {error}"))?;
+    let instance_id: Option<String> = row
+        .try_get("instance_id")
+        .map_err(|error| format!("decode instance_id for {session_key}: {error}"))?;
 
     let effective_provider = provider_name.or(session_provider.as_deref());
     let runtime_channel_id =
@@ -108,6 +112,7 @@ pub(crate) async fn load_force_kill_session_pg(
         agent_id,
         runtime_channel_id,
         session_provider,
+        instance_id,
     )))
 }
 
@@ -889,9 +894,18 @@ pub(crate) async fn disconnect_stale_fixed_session_by_key_pg(
 pub(crate) async fn load_session_by_id_pg(
     pool: &PgPool,
     id: i64,
-) -> Result<Option<(String, Option<String>, Option<String>, Option<String>)>, String> {
+) -> Result<
+    Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>,
+    String,
+> {
     let row = sqlx::query(
-        "SELECT session_key, agent_id, provider, status
+        "SELECT session_key, agent_id, provider, status, instance_id
          FROM sessions
          WHERE id = $1",
     )
@@ -914,10 +928,13 @@ pub(crate) async fn load_session_by_id_pg(
     let status: Option<String> = row
         .try_get("status")
         .map_err(|error| format!("decode status for #{id}: {error}"))?;
+    let instance_id: Option<String> = row
+        .try_get("instance_id")
+        .map_err(|error| format!("decode instance_id for #{id}: {error}"))?;
     let Some(session_key) = session_key else {
         return Ok(None);
     };
-    Ok(Some((session_key, agent_id, provider, status)))
+    Ok(Some((session_key, agent_id, provider, status, instance_id)))
 }
 
 pub(crate) struct HookSessionUpsert<'a> {

@@ -229,7 +229,7 @@
 | `GET` | `/api/session-termination-events` | `termination_events::list_termination_events` | `src/server/routes/termination_events.rs:23` | `src/server/routes/domains/ops.rs:187` |
 | `GET` | `/api/sessions` | `agents_crud::list_sessions` | `src/server/routes/agents_crud.rs:1799` | `src/server/routes/domains/agents.rs:49` |
 | `GET` | `/api/sessions/{id}/tmux-output` | `dispatched_sessions::tmux_output` | `src/server/routes/dispatched_sessions.rs:94` | `src/server/routes/domains/ops.rs:183` |
-| `POST` | `/api/sessions/{session_key}/force-kill` | `dispatched_sessions::force_kill_session` | `src/server/routes/dispatched_sessions.rs:103` | `src/server/routes/domains/ops.rs:177` |
+| `POST` | `/api/sessions/{session_key}/force-kill` | `dispatched_sessions::force_kill_session` | `src/server/routes/dispatched_sessions.rs:110` | `src/server/routes/domains/ops.rs:177` |
 | `GET` | `/api/settings` | `settings::get_settings` | `src/server/routes/settings.rs:12` | `src/server/routes/domains/admin.rs:48` |
 | `PUT` | `/api/settings` | `settings::put_settings` | `src/server/routes/settings.rs:22` | `src/server/routes/domains/admin.rs:48` |
 | `GET` | `/api/settings/config` | `settings::get_config_entries` | `src/server/routes/settings.rs:35` | `src/server/routes/domains/admin.rs:52` |
