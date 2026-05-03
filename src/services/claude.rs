@@ -1270,6 +1270,37 @@ pub fn is_tmux_available() -> bool {
     crate::services::platform::tmux::is_available()
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalTmuxStartupPlan {
+    /// Existing tmux pane plus both runtime paths are present. The provider
+    /// writes the prompt to FIFO, reads this turn from the current JSONL
+    /// offset, then emits `TmuxReady` for watcher handoff.
+    WarmFollowup,
+    /// A tmux session name exists, but the pane or runtime paths are stale.
+    /// The provider kills it and recreates it through the cold-start path.
+    RecreateStaleSession,
+    /// No usable existing session exists. The provider starts a new wrapper
+    /// and owns JSONL reads until the turn reaches a result/cancel/death edge.
+    ColdStart,
+}
+
+#[cfg(unix)]
+fn classify_local_tmux_startup_plan(
+    session_exists: bool,
+    has_live_pane: bool,
+    has_output_path: bool,
+    has_input_fifo_path: bool,
+) -> LocalTmuxStartupPlan {
+    if session_exists && has_live_pane && has_output_path && has_input_fifo_path {
+        LocalTmuxStartupPlan::WarmFollowup
+    } else if session_exists {
+        LocalTmuxStartupPlan::RecreateStaleSession
+    } else {
+        LocalTmuxStartupPlan::ColdStart
+    }
+}
+
 /// Execute Claude inside a local tmux session with bidirectional input.
 ///
 /// If a tmux session with this name already exists, sends the prompt as a
@@ -1313,11 +1344,14 @@ fn execute_streaming_local_tmux(
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
-    let session_usable = tmux_session_has_live_pane(tmux_session_name)
-        && resolved_output.is_some()
-        && resolved_input.is_some();
+    let startup_plan = classify_local_tmux_startup_plan(
+        session_exists,
+        tmux_session_has_live_pane(tmux_session_name),
+        resolved_output.is_some(),
+        resolved_input.is_some(),
+    );
 
-    if session_usable {
+    if startup_plan == LocalTmuxStartupPlan::WarmFollowup {
         // Use the resolved paths (which may be the legacy /tmp path) for the
         // follow-up so we read the jsonl the live wrapper actually writes.
         let output_path = resolved_output
@@ -1432,7 +1466,7 @@ fn execute_streaming_local_tmux(
                 return Ok(());
             }
         }
-    } else if session_exists {
+    } else if startup_plan == LocalTmuxStartupPlan::RecreateStaleSession {
         debug_log("Stale tmux session found — recreating");
         crate::services::termination_audit::record_termination_for_tmux(
             tmux_session_name,
@@ -2069,6 +2103,51 @@ fn execute_streaming_remote_tmux(
     _tmux_session_name: &str,
 ) -> Result<(), String> {
     Err("Remote SSH tmux execution is not available in AgentDesk".to_string())
+}
+
+#[cfg(all(test, unix))]
+mod local_tmux_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn local_tmux_plan_uses_warm_followup_only_with_live_pane_and_runtime_paths() {
+        assert_eq!(
+            classify_local_tmux_startup_plan(true, true, true, true),
+            LocalTmuxStartupPlan::WarmFollowup,
+            "warm follow-up is the only path where an existing wrapper is usable"
+        );
+
+        for (has_live_pane, has_output_path, has_input_fifo_path) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                classify_local_tmux_startup_plan(
+                    true,
+                    has_live_pane,
+                    has_output_path,
+                    has_input_fifo_path,
+                ),
+                LocalTmuxStartupPlan::RecreateStaleSession,
+                "existing tmux sessions missing live ownership evidence must be killed and recreated"
+            );
+        }
+    }
+
+    #[test]
+    fn local_tmux_plan_keeps_cold_start_as_bridge_owned_jsonl_reader() {
+        assert_eq!(
+            classify_local_tmux_startup_plan(false, false, false, false),
+            LocalTmuxStartupPlan::ColdStart
+        );
+        assert_eq!(
+            classify_local_tmux_startup_plan(false, true, true, true),
+            LocalTmuxStartupPlan::ColdStart,
+            "impossible live-pane evidence without session_exists stays on the safe cold path"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]

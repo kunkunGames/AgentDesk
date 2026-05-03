@@ -289,6 +289,7 @@ src/
 │   │   │   ├── context_window.rs
 │   │   │   ├── memory_lifecycle.rs
 │   │   │   ├── mod.rs
+│   │   │   ├── output_lifecycle.rs
 │   │   │   ├── recall_feedback.rs
 │   │   │   ├── recovery_text.rs
 │   │   │   ├── retry_state.rs
