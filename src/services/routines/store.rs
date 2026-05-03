@@ -1079,7 +1079,11 @@ impl RoutineStore {
             let weight: u8 = if blocked_reason.is_some() { 2 } else { 1 };
             // Group by status so multiple stale cards accumulate under one candidate
             // (per-card signature would never reach evidence_count >= 5 gate)
-            let sig_group = if blocked_reason.is_some() { "blocked" } else { &status };
+            let sig_group = if blocked_reason.is_some() {
+                "blocked"
+            } else {
+                &status
+            };
             kanban_obs.push(serde_json::json!({
                 "timestamp": last_seen_at.to_rfc3339(),
                 "source": "kanban_stale",
