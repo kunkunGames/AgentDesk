@@ -147,7 +147,7 @@
 | `runtime_layout::skill_sync` | `src/runtime_layout/skill_sync.rs` | 685 |  |
 | `server` | `src/server/mod.rs` | 3397 | giant-file |
 | `server::cluster` | `src/server/cluster.rs` | 908 |  |
-| `server::cluster_session_routing` | `src/server/cluster_session_routing.rs` | 291 |  |
+| `server::cluster_session_routing` | `src/server/cluster_session_routing.rs` | 416 |  |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 92 |  |
 | `server::dto` | `src/server/dto/mod.rs` | 1 |  |
 | `server::dto::kanban` | `src/server/dto/kanban.rs` | 219 |  |
@@ -162,7 +162,7 @@
 | `server::routes::analytics` | `src/server/routes/analytics.rs` | 1973 | giant-file |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 89 |  |
 | `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 151 |  |
-| `server::routes::cluster` | `src/server/routes/cluster.rs` | 352 |  |
+| `server::routes::cluster` | `src/server/routes/cluster.rs` | 391 |  |
 | `server::routes::cron_api` | `src/server/routes/cron_api.rs` | 180 |  |
 | `server::routes::departments` | `src/server/routes/departments.rs` | 300 |  |
 | `server::routes::discord` | `src/server/routes/discord.rs` | 151 |  |

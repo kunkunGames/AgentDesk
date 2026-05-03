@@ -135,12 +135,96 @@ pub(crate) fn enrich_session_owner_routing(
     }
 }
 
+pub(crate) fn attach_active_session_counts_to_worker_nodes(
+    worker_nodes: &mut [Value],
+    sessions: &[Value],
+) {
+    let mut counts = std::collections::BTreeMap::<String, i64>::new();
+    for session in sessions {
+        if let Some(instance_id) = session
+            .get("instance_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            *counts.entry(instance_id.to_string()).or_default() += 1;
+        }
+    }
+
+    for node in worker_nodes {
+        let instance_id = node
+            .get("instance_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        let active_session_count = instance_id
+            .as_deref()
+            .and_then(|instance_id| counts.get(instance_id))
+            .copied()
+            .unwrap_or(0);
+        if let Some(obj) = node.as_object_mut() {
+            obj.insert(
+                "active_session_count".to_string(),
+                serde_json::json!(active_session_count),
+            );
+        }
+    }
+}
+
+pub(crate) fn summarize_session_owner_routing(sessions: &[Value]) -> Value {
+    let mut local = 0_i64;
+    let mut foreign = 0_i64;
+    let mut unknown_owner = 0_i64;
+    let mut orphaned = 0_i64;
+    let mut routable = 0_i64;
+    let mut unroutable = 0_i64;
+    let mut reasons = std::collections::BTreeMap::<String, i64>::new();
+
+    for session in sessions {
+        let Some(owner) = session.get("owner") else {
+            continue;
+        };
+        match owner.get("scope").and_then(|value| value.as_str()) {
+            Some("local") => local += 1,
+            Some("foreign") => foreign += 1,
+            Some("unknown_owner") => unknown_owner += 1,
+            _ => {}
+        }
+        if owner.get("routable").and_then(|value| value.as_bool()) == Some(true) {
+            routable += 1;
+        } else if owner.get("is_local").and_then(|value| value.as_bool()) != Some(true) {
+            unroutable += 1;
+        }
+        if let Some(reason) = owner
+            .get("reason")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        {
+            if matches!(reason, "session_owner_missing" | "worker_node_missing") {
+                orphaned += 1;
+            }
+            *reasons.entry(reason.to_string()).or_default() += 1;
+        }
+    }
+
+    serde_json::json!({
+        "total_active_sessions": sessions.len(),
+        "local": local,
+        "foreign": foreign,
+        "unknown_owner": unknown_owner,
+        "orphaned": orphaned,
+        "routable": routable,
+        "unroutable": unroutable,
+        "reasons": reasons,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use super::{
-        cluster_capabilities_with_worker_api, session_owner_routing_status,
+        attach_active_session_counts_to_worker_nodes, cluster_capabilities_with_worker_api,
+        session_owner_routing_status, summarize_session_owner_routing,
         worker_api_base_url_from_capabilities,
     };
     use crate::config::ClusterConfig;
@@ -233,6 +317,47 @@ mod tests {
         assert_eq!(
             sessions[2]["owner"]["reason"].as_str(),
             Some("worker_node_missing")
+        );
+    }
+
+    #[test]
+    fn session_owner_summary_counts_stale_and_missing_owners() {
+        let mut nodes = vec![
+            json!({
+                "instance_id": "mac-mini-release",
+                "status": "online",
+                "api_base_url": "http://mac-mini.local:8791"
+            }),
+            json!({
+                "instance_id": "old-worker",
+                "status": "offline",
+                "api_base_url": "http://old-worker.local:8791"
+            }),
+        ];
+        let mut sessions = vec![
+            json!({"id": 1, "instance_id": "mac-mini-release"}),
+            json!({"id": 2, "instance_id": "old-worker"}),
+            json!({"id": 3, "instance_id": "missing-worker"}),
+            json!({"id": 4, "instance_id": null}),
+        ];
+
+        super::enrich_session_owner_routing(&mut sessions, Some("mac-mini-release"), &nodes);
+        attach_active_session_counts_to_worker_nodes(&mut nodes, &sessions);
+        let summary = summarize_session_owner_routing(&sessions);
+
+        assert_eq!(nodes[0]["active_session_count"].as_i64(), Some(1));
+        assert_eq!(nodes[1]["active_session_count"].as_i64(), Some(1));
+        assert_eq!(summary["total_active_sessions"].as_u64(), Some(4));
+        assert_eq!(summary["local"].as_i64(), Some(1));
+        assert_eq!(summary["foreign"].as_i64(), Some(2));
+        assert_eq!(summary["unknown_owner"].as_i64(), Some(1));
+        assert_eq!(summary["orphaned"].as_i64(), Some(2));
+        assert_eq!(summary["unroutable"].as_i64(), Some(3));
+        assert_eq!(summary["reasons"]["worker_node_stale"].as_i64(), Some(1));
+        assert_eq!(summary["reasons"]["worker_node_missing"].as_i64(), Some(1));
+        assert_eq!(
+            summary["reasons"]["session_owner_missing"].as_i64(),
+            Some(1)
         );
     }
 
