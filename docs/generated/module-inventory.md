@@ -77,7 +77,7 @@
 | `db::kanban` | `src/db/kanban.rs` | 1 |  |
 | `db::kanban_cards` | `src/db/kanban_cards.rs` | 1903 | giant-file |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 265 |  |
-| `db::postgres` | `src/db/postgres.rs` | 1926 | giant-file |
+| `db::postgres` | `src/db/postgres.rs` | 1942 | giant-file |
 | `db::prompt_manifests` | `src/db/prompt_manifests.rs` | 642 |  |
 | `db::schema` | `src/db/schema.rs` | 3194 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 492 |  |

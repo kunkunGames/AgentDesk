@@ -228,6 +228,7 @@ fn postgres_migrator() -> Migrator {
 }
 
 fn postgres_migrator_for_applied(applied: &[AppliedMigrationInfo]) -> Migrator {
+    let version_28_choice = select_postgres_version_28_choice(applied);
     let version_29_choice = select_postgres_version_29_choice(applied);
     let version_30_choice = select_postgres_version_30_choice(applied);
     let uses_legacy_renumbered_profile = uses_legacy_postgres_renumbered_profile(applied);
@@ -250,6 +251,7 @@ fn postgres_migrator_for_applied(applied: &[AppliedMigrationInfo]) -> Migrator {
         if should_skip_postgres_migration(
             migration.version,
             description,
+            version_28_choice,
             version_29_choice,
             version_30_choice,
         ) {
@@ -275,6 +277,13 @@ fn postgres_migrator_for_applied(applied: &[AppliedMigrationInfo]) -> Migrator {
         ignore_missing: POSTGRES_MIGRATOR.ignore_missing,
         locking: POSTGRES_MIGRATOR.locking,
         no_tx: POSTGRES_MIGRATOR.no_tx,
+    }
+}
+
+fn select_postgres_version_28_choice(applied: &[AppliedMigrationInfo]) -> PostgresVersion28Choice {
+    match successful_applied_postgres_migration_description(applied, 28) {
+        Some(POSTGRES_MIGRATION_SESSIONS_STATUS_4STATE) => PostgresVersion28Choice::SessionsStatus4State,
+        _ => PostgresVersion28Choice::Routines,
     }
 }
 
@@ -340,10 +349,17 @@ fn successful_applied_postgres_migration_description(
 fn should_skip_postgres_migration(
     version: i64,
     description: &str,
+    version_28_choice: PostgresVersion28Choice,
     version_29_choice: PostgresVersion29Choice,
     version_30_choice: PostgresVersion30Choice,
 ) -> bool {
     match (version, description) {
+        (28, POSTGRES_MIGRATION_ROUTINES) => {
+            version_28_choice == PostgresVersion28Choice::SessionsStatus4State
+        }
+        (28, POSTGRES_MIGRATION_SESSIONS_STATUS_4STATE) => {
+            version_28_choice == PostgresVersion28Choice::Routines
+        }
         (29, POSTGRES_MIGRATION_ROUTINES_REVISION) => {
             version_29_choice == PostgresVersion29Choice::WorkerNodes
         }
