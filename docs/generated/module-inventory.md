@@ -71,7 +71,7 @@
 | `credential` | `src/credential.rs` | 106 |  |
 | `db` | `src/db/mod.rs` | 341 |  |
 | `db::agents` | `src/db/agents.rs` | 1125 | giant-file |
-| `db::auto_queue` | `src/db/auto_queue.rs` | 4770 | giant-file |
+| `db::auto_queue` | `src/db/auto_queue.rs` | 5094 | giant-file |
 | `db::cancel_tombstones` | `src/db/cancel_tombstones.rs` | 489 |  |
 | `db::dispatched_sessions` | `src/db/dispatched_sessions.rs` | 1217 | giant-file |
 | `db::dispatches` | `src/db/dispatches.rs` | 942 |  |
@@ -349,7 +349,7 @@
 | `services::discord::tmux_session_files` | `src/services/discord/tmux_session_files.rs` | 329 |  |
 | `services::discord::tmux_watcher` | `src/services/discord/tmux_watcher.rs` | 3096 | giant-file |
 | `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 4245 | giant-file |
-| `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2216 | giant-file |
+| `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2325 | giant-file |
 | `services::discord::turn_bridge::context_window` | `src/services/discord/turn_bridge/context_window.rs` | 36 |  |
 | `services::discord::turn_bridge::memory_lifecycle` | `src/services/discord/turn_bridge/memory_lifecycle.rs` | 193 |  |
 | `services::discord::turn_bridge::recall_feedback` | `src/services/discord/turn_bridge/recall_feedback.rs` | 799 |  |
