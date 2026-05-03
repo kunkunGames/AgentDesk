@@ -75,7 +75,7 @@
 | `db::cancel_tombstones` | `src/db/cancel_tombstones.rs` | 489 |  |
 | `db::kanban` | `src/db/kanban.rs` | 364 |  |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 265 |  |
-| `db::postgres` | `src/db/postgres.rs` | 1775 | giant-file |
+| `db::postgres` | `src/db/postgres.rs` | 1892 | giant-file |
 | `db::schema` | `src/db/schema.rs` | 3194 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 492 |  |
 | `db::session_observability` | `src/db/session_observability.rs` | 459 |  |
