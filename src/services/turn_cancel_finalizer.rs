@@ -231,7 +231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn four_cancel_surfaces_share_canonical_finalizer_contract() {
+    async fn cancel_surface_payload_matrix_preserves_surface_specific_contract() {
         let _guard = crate::services::observability::test_runtime_lock();
         crate::services::observability::reset_for_tests();
         crate::services::observability::init_observability(None);
@@ -250,6 +250,8 @@ mod tests {
             (
                 "!stop",
                 "text_stop",
+                true,
+                None,
                 None,
                 None,
                 FinalizeTurnCancelRequest::from_text_stop(
@@ -263,19 +265,23 @@ mod tests {
             (
                 "!cc stop",
                 "text_cc_stop",
+                false,
+                None,
                 None,
                 None,
                 FinalizeTurnCancelRequest::from_text_stop(
                     ProviderKind::Codex,
                     channel_id,
                     "!cc stop",
-                    true,
+                    false,
                 )
                 .with_completed_at(completed_at),
             ),
             (
                 "queue-api cancel_turn (preserve)",
                 "queue_cancel_preserve",
+                true,
+                Some(1),
                 None,
                 Some("mac-mini:AgentDesk-codex-adk-cdx"),
                 FinalizeTurnCancelRequest::from_lifecycle_result(
@@ -295,6 +301,8 @@ mod tests {
             (
                 "queue-api cancel_dispatch (preserve)",
                 "queue_cancel_preserve",
+                true,
+                Some(1),
                 Some("dispatch-1636"),
                 Some("mac-mini:AgentDesk-codex-dispatch-1636"),
                 FinalizeTurnCancelRequest::from_lifecycle_result(
@@ -313,19 +321,29 @@ mod tests {
             ),
         ];
 
-        for (reason, surface, dispatch_id, session_key, request) in cases {
+        for (
+            reason,
+            surface,
+            expected_termination_recorded,
+            expected_queue_depth,
+            dispatch_id,
+            session_key,
+            request,
+        ) in cases
+        {
             let finalized = finalize_turn_cancel(request);
             assert_eq!(finalized.status, CANCELLED_TURN_STATUS, "{reason}");
             assert_eq!(finalized.completed_at, completed_at, "{reason}");
             assert_eq!(finalized.details.reason, reason, "{reason}");
             assert_eq!(finalized.details.surface, surface, "{reason}");
-            assert!(
-                finalized.details.queue_preserved,
-                "{reason} must preserve queued follow-up work"
+            assert_eq!(
+                finalized.details.queue_depth, expected_queue_depth,
+                "{reason}"
             );
-            assert!(
-                finalized.details.termination_recorded,
-                "{reason} must record a terminal cancellation"
+            assert!(finalized.details.queue_preserved, "{reason}");
+            assert_eq!(
+                finalized.details.termination_recorded, expected_termination_recorded,
+                "{reason}"
             );
             assert_eq!(
                 finalized.correlation.dispatch_id.as_deref(),
@@ -354,11 +372,28 @@ mod tests {
             assert!(
                 events
                     .iter()
-                    .any(|event| event.payload["reason"] == expected_reason
-                        && event.payload["queuePreserved"] == true
-                        && event.payload["terminationRecorded"] == true),
+                    .any(|event| event.payload["reason"] == expected_reason),
                 "{expected_reason} must emit the canonical turn_cancelled payload"
             );
+        }
+        let cc_stop_event = events
+            .iter()
+            .find(|event| event.payload["reason"] == "!cc stop")
+            .expect("!cc stop event should be recorded");
+        assert_eq!(cc_stop_event.payload["terminationRecorded"], false);
+        assert_eq!(cc_stop_event.payload["queuePreserved"], true);
+
+        for expected_reason in [
+            "queue-api cancel_turn (preserve)",
+            "queue-api cancel_dispatch (preserve)",
+        ] {
+            let event = events
+                .iter()
+                .find(|event| event.payload["reason"] == expected_reason)
+                .expect("queue API event should be recorded");
+            assert_eq!(event.payload["queueDepth"], 1);
+            assert_eq!(event.payload["queuePreserved"], true);
+            assert_eq!(event.payload["terminationRecorded"], true);
         }
     }
 }
