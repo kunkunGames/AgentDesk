@@ -30,6 +30,7 @@ jobs:
           REPO: ${{ github.repository }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           WORKFLOW_RUN_URL: ${{ github.event.workflow_run.html_url }}
           JULES_MENTION: ${{ vars.JULES_MENTION || 'Jules' }}
           JULES_ASSIGNEE: ${{ vars.JULES_ASSIGNEE || vars.JULES_BOT_USERNAME || '' }}
@@ -41,9 +42,12 @@ jobs:
           PR_NUMBER=$(echo "$RUN_JSON" | jq -r '.pull_requests[0].number // empty')
 
           if [ -z "$PR_NUMBER" ]; then
-            echo "pull_requests[] empty; falling back to commit search"
-            PR_NUMBER=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
-              --jq '[.[] | select(.state=="open")] | .[0].number // empty' 2>/dev/null || true)
+            echo "pull_requests[] empty; falling back to commit+repo search"
+            # Filter by head repo to avoid ambiguity when multiple PRs share the same SHA
+            PR_NUMBER=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
+              | jq -r --arg hr "$HEAD_REPO" \
+                  '[.[] | select(.state=="open" and .head.repo.full_name==$hr)] | .[0].number // empty' \
+              || true)
           fi
 
           if [ -z "$PR_NUMBER" ]; then
@@ -61,10 +65,10 @@ jobs:
             exit 0
           fi
 
-          # --- Idempotency: skip if same HEAD_SHA already commented ---
+          # --- Idempotency: skip if same HEAD_SHA already commented (paginated scan) ---
           MARKER="<!-- ci-auto-fixer:$HEAD_SHA -->"
-          ALREADY=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-            | jq --arg m "$MARKER" '[.[].body | select(contains($m))] | length')
+          ALREADY=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            | jq -s --arg m "$MARKER" '[.[][][].body | select(contains($m))] | length')
           if [ "$ALREADY" -gt 0 ]; then
             echo "Marker already present for sha=$HEAD_SHA — skipping duplicate comment."
             exit 0
@@ -145,6 +149,7 @@ jobs:
           REPO: ${{ github.repository }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           JULES_ASSIGNEE: ${{ vars.JULES_ASSIGNEE || vars.JULES_BOT_USERNAME || '' }}
         run: |
           set -euo pipefail
@@ -154,9 +159,11 @@ jobs:
           PR_NUMBER=$(echo "$RUN_JSON" | jq -r '.pull_requests[0].number // empty')
 
           if [ -z "$PR_NUMBER" ]; then
-            echo "pull_requests[] empty; falling back to commit search"
-            PR_NUMBER=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
-              --jq '[.[] | select(.state=="open")] | .[0].number // empty' 2>/dev/null || true)
+            echo "pull_requests[] empty; falling back to commit+repo search"
+            PR_NUMBER=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" 2>/dev/null \
+              | jq -r --arg hr "$HEAD_REPO" \
+                  '[.[] | select(.state=="open" and .head.repo.full_name==$hr)] | .[0].number // empty' \
+              || true)
           fi
 
           if [ -z "$PR_NUMBER" ]; then
