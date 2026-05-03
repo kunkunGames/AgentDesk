@@ -23,9 +23,10 @@ route_srp_violations = [
 # extraction. Entries are path:line so new callsites in the same file still
 # fail the hard gate. Line numbers for tmux.rs / turn_bridge / mod.rs /
 # health.rs were refreshed in #1440 after the #1435 tmux watcher-lifecycle
-# extraction shifted callsites; #1450/#1472/#1467/#1476/#1477/#1480 refresh
-# the remaining drift detected by CI with no logical regressions. The upstream
-# routine port refreshes line-only drift after the durable routine modules land.
+# extraction shifted callsites; #1450/#1472/#1467/#1476/#1477/#1480/#1560
+# refresh the remaining drift detected by CI with no logical regressions. The
+# upstream routine port refreshes line-only drift after the durable routine
+# modules land.
 direct_discord_sends = [
   "src/services/discord/commands/model_picker.rs:60",
   "src/services/discord/commands/skill.rs:278",

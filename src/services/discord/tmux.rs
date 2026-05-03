@@ -9,8 +9,10 @@ use crate::db::session_transcripts::{SessionTranscriptEvent, SessionTranscriptEv
 use crate::db::turns::TurnTokenUsage;
 use crate::services::agent_protocol::{StatusEvent, TaskNotificationKind};
 use crate::services::message_outbox::{
-    OutboxMessage, enqueue_lifecycle_notification_best_effort, enqueue_outbox_best_effort,
+    LIFECYCLE_NOTIFIER_SOURCE, OutboxMessage, enqueue_lifecycle_notification_best_effort,
+    enqueue_outbox_best_effort,
 };
+use crate::services::observability::turn_lifecycle::TurnEvent;
 use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
 use crate::services::session_backend::{
     StreamLineState, classify_task_notification_kind, observe_stream_context,
@@ -51,9 +53,18 @@ use super::{
 };
 // Keep the extracted lifecycle code as a tmux child module until the remaining
 // watcher helpers it calls are split out of this file.
+#[path = "tmux_session_files.rs"]
+mod tmux_session_files;
 #[path = "watchers/lifecycle.rs"]
 mod watcher_lifecycle;
 
+pub(super) use self::tmux_session_files::read_generation_file_mtime_ns;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use self::tmux_session_files::watermark_after_output_regression;
+use self::tmux_session_files::{
+    preserve_mtime_after_write, reset_stale_local_relay_offset_if_output_regressed,
+    reset_stale_relay_watermark_if_output_regressed, sweep_orphan_session_files,
+};
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 pub(crate) use self::watcher_lifecycle::WatcherClaimOutcome;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -735,6 +746,54 @@ fn stream_line_state_token_usage(state: &StreamLineState) -> Option<TurnTokenUsa
         .then_some(usage)
 }
 
+async fn emit_context_compacted_lifecycle_from_watcher(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    provider: &ProviderKind,
+    model: Option<&str>,
+    usage: Option<TurnTokenUsage>,
+) -> bool {
+    let ctx_cfg = super::adk_session::fetch_context_thresholds(shared.api_port).await;
+    // Provider auto-compaction output does not expose the exact pre-compaction
+    // token total, so record the configured trigger threshold as the lower-bound
+    // before percentage.
+    let before_pct = ctx_cfg.compact_pct_for(provider);
+    let context_window = provider.resolve_context_window(model);
+    let after_pct = usage.and_then(|usage| {
+        let pct =
+            super::adk_session::context_usage_percent(usage.total_input_tokens(), context_window)
+                .min(before_pct);
+        (pct > 0).then_some(pct)
+    });
+    let emitted = super::adk_session::emit_context_compacted_lifecycle_for_inflight(
+        shared, channel_id, provider, before_pct, after_pct,
+    )
+    .await;
+
+    if !emitted {
+        let target = format!("channel:{}", channel_id.get());
+        let details = super::adk_session::context_compaction_details(before_pct, after_pct);
+        let content = TurnEvent::ContextCompacted(details)
+            .notification_content()
+            .unwrap_or_else(|| "📦 컨텍스트 자동 압축".to_string());
+        enqueue_lifecycle_notification_best_effort(
+            sqlite_runtime_db(shared.as_ref()),
+            shared.pg_pool.as_ref(),
+            target.as_str(),
+            None,
+            "lifecycle.context_compacted",
+            content.as_str(),
+        );
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            source = LIFECYCLE_NOTIFIER_SOURCE,
+            "context compacted lifecycle emit skipped; enqueued fallback notification"
+        );
+    }
+
+    true
+}
+
 fn watcher_ready_for_input_turn_completed(
     tracker: &mut crate::services::provider::ReadyForInputIdleTracker,
     data_start_offset: u64,
@@ -1280,17 +1339,11 @@ async fn edit_placeholder_with_operation(
     source: &'static str,
 ) -> PlaceholderCleanupOutcome {
     rate_limit_wait(shared, channel_id).await;
-    let outcome = match channel_id
-        .edit_message(
-            http,
-            message_id,
-            serenity::EditMessage::new().content(content),
-        )
-        .await
-    {
-        Ok(_) => PlaceholderCleanupOutcome::Succeeded,
-        Err(error) => PlaceholderCleanupOutcome::failed(error.to_string()),
-    };
+    let outcome =
+        match super::http::edit_channel_message(http, channel_id, message_id, content).await {
+            Ok(_) => PlaceholderCleanupOutcome::Succeeded,
+            Err(error) => PlaceholderCleanupOutcome::failed(error.to_string()),
+        };
     record_placeholder_cleanup(
         shared,
         provider,
@@ -1627,218 +1680,6 @@ fn ensure_monitor_auto_turn_inflight(
             );
         }
     }
-}
-
-/// Read the `.generation` marker file mtime in nanoseconds since the unix
-/// epoch. Returns 0 when the marker is missing in BOTH the canonical
-/// persistent location (`runtime_root()/runtime/sessions/`) and the legacy
-/// `/tmp/` fallback supported by `resolve_session_temp_path` (#892
-/// migration window). All of those conditions are treated by callers as
-/// "fresh wrapper".
-///
-/// `.generation` is written exactly once per spawn by `claude.rs` after
-/// `tmux::create_session` and never touched by the live wrapper, so its
-/// mtime uniquely identifies the wrapper instance even when jsonl
-/// rotation changes the jsonl inode (#1270).
-pub(super) fn read_generation_file_mtime_ns(tmux_session_name: &str) -> i64 {
-    let Some(path) =
-        crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "generation")
-    else {
-        return 0;
-    };
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return 0;
-    };
-    let Ok(modified) = meta.modified() else {
-        return 0;
-    };
-    modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_nanos()).ok())
-        .unwrap_or(0)
-}
-
-/// Rewrite a file's contents while preserving its prior modified time. Used
-/// by the adoption path to refresh the `.generation` marker payload (so the
-/// generation number on disk matches the current dcserver runtime) without
-/// changing the file's mtime — the mtime is the wrapper-identity signal that
-/// the regression resolver uses to distinguish "same wrapper, mid-flight
-/// rotation" from "fresh wrapper after cancel→respawn" (see
-/// `watermark_after_output_regression`). Adoption changes the runtime that
-/// owns the wrapper, but it does NOT respawn the wrapper itself, so the
-/// identity signal must stay pinned.
-///
-/// Failures are logged and swallowed: the worst case is a redundant fresh-
-/// wrapper reset on a restored offset, which is the same behaviour the
-/// codebase had before #1271. Returning an error would not unblock the
-/// adoption.
-pub(super) fn preserve_mtime_after_write(path: &str, content: &[u8], context: &str) {
-    let prior_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
-    if let Err(e) = std::fs::write(path, content) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            "  [{ts}] ⚠ preserve_mtime_after_write: failed to write {} (context={}, error={})",
-            path,
-            context,
-            e
-        );
-        return;
-    }
-    let Some(prior) = prior_mtime else {
-        // No prior mtime to preserve (file did not exist or metadata unavailable).
-        // The post-write mtime is the only baseline we have, which is the same
-        // outcome as before this helper existed.
-        return;
-    };
-    let times = std::fs::FileTimes::new().set_modified(prior);
-    let file = match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                "  [{ts}] ⚠ preserve_mtime_after_write: failed to reopen {} for set_times (context={}, error={})",
-                path,
-                context,
-                e
-            );
-            return;
-        }
-    };
-    if let Err(e) = file.set_times(times) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            "  [{ts}] ⚠ preserve_mtime_after_write: set_times failed for {} (context={}, error={})",
-            path,
-            context,
-            e
-        );
-    }
-}
-
-/// Decide what watermark a stale-output regression (current EOF lower than
-/// `confirmed`) should land on, based on whether the wrapper instance is
-/// the same one that advanced the watermark in the first place.
-///
-/// - Same wrapper (`.generation` mtime unchanged): mid-flight rotation
-///   (`truncate_jsonl_head_safe` rename). The byte stream beyond the
-///   surviving content is genuinely new, so we pin to `observed_output_end`
-///   to avoid re-relaying surviving content (PR #1256 intent).
-/// - Different wrapper (mtime changed, mtime missing, or first observation
-///   with stored mtime == 0): cancel→respawn or any fresh spawn. The
-///   current file is fully new content — reset to 0 so the watcher walks
-///   it from the beginning (#1270 regression fix).
-fn watermark_after_output_regression(
-    stored_generation_mtime_ns: i64,
-    current_generation_mtime_ns: i64,
-    observed_output_end: u64,
-) -> u64 {
-    let same_wrapper = stored_generation_mtime_ns != 0
-        && stored_generation_mtime_ns == current_generation_mtime_ns;
-    if same_wrapper { observed_output_end } else { 0 }
-}
-
-fn reset_stale_relay_watermark_if_output_regressed(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    tmux_session_name: &str,
-    observed_output_end: u64,
-    context: &str,
-) -> bool {
-    let relay_coord = shared.tmux_relay_coord(channel_id);
-    let mut confirmed = relay_coord
-        .confirmed_end_offset
-        .load(std::sync::atomic::Ordering::Acquire);
-
-    while confirmed != 0 && observed_output_end < confirmed {
-        let stored_gen_mtime_ns = relay_coord
-            .confirmed_end_generation_mtime_ns
-            .load(std::sync::atomic::Ordering::Acquire);
-        let current_gen_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
-        let new_watermark = watermark_after_output_regression(
-            stored_gen_mtime_ns,
-            current_gen_mtime_ns,
-            observed_output_end,
-        );
-
-        match relay_coord.confirmed_end_offset.compare_exchange(
-            confirmed,
-            new_watermark,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                relay_coord
-                    .last_relay_ts_ms
-                    .store(0, std::sync::atomic::Ordering::Release);
-                relay_coord
-                    .confirmed_end_generation_mtime_ns
-                    .store(current_gen_mtime_ns, std::sync::atomic::Ordering::Release);
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!(
-                    "  [{ts}] 👁 Reset stale tmux relay watermark for {} (channel {}, context={}, observed_output_end={}, stale_confirmed_end={}, new_watermark={}, generation_mtime_changed={})",
-                    tmux_session_name,
-                    channel_id.get(),
-                    context,
-                    observed_output_end,
-                    confirmed,
-                    new_watermark,
-                    stored_gen_mtime_ns != current_gen_mtime_ns
-                );
-                return true;
-            }
-            Err(observed) => confirmed = observed,
-        }
-    }
-
-    false
-}
-
-fn reset_stale_local_relay_offset_if_output_regressed(
-    last_relayed_offset: &mut Option<u64>,
-    last_observed_generation_mtime_ns: &mut Option<i64>,
-    channel_id: ChannelId,
-    tmux_session_name: &str,
-    observed_output_end: u64,
-    context: &str,
-) -> bool {
-    let Some(prev_offset) = *last_relayed_offset else {
-        return false;
-    };
-    if observed_output_end >= prev_offset {
-        return false;
-    }
-
-    let stored_gen_mtime_ns = last_observed_generation_mtime_ns.unwrap_or(0);
-    let current_gen_mtime_ns = read_generation_file_mtime_ns(tmux_session_name);
-    let new_offset = watermark_after_output_regression(
-        stored_gen_mtime_ns,
-        current_gen_mtime_ns,
-        observed_output_end,
-    );
-    let new_local = if new_offset == 0 {
-        // Fresh wrapper — clear the local watermark entirely so the next
-        // tick walks the file from offset 0 (matches the global reset
-        // semantics for cancel→respawn).
-        None
-    } else {
-        Some(new_offset)
-    };
-    *last_relayed_offset = new_local;
-    *last_observed_generation_mtime_ns = Some(current_gen_mtime_ns);
-
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::warn!(
-        "  [{ts}] 👁 Reset stale tmux local relay offset for {} (channel {}, context={}, observed_output_end={}, stale_last_relayed={}, new_local_offset={:?}, generation_mtime_changed={})",
-        tmux_session_name,
-        channel_id.get(),
-        context,
-        observed_output_end,
-        prev_offset,
-        new_local,
-        stored_gen_mtime_ns != current_gen_mtime_ns
-    );
-    true
 }
 
 fn advance_watcher_confirmed_end(
@@ -3009,9 +2850,20 @@ pub(super) async fn tmux_output_watcher_with_restore(
         let mut is_provider_overloaded = initial_outcome.is_provider_overloaded;
         let mut provider_overload_message = initial_outcome.provider_overload_message;
         let mut stale_resume_detected = initial_outcome.stale_resume_detected;
+        let mut auto_compaction_lifecycle_attempted = false;
         let mut task_notification_kind = stream_seed.task_notification_kind;
         if let Some(kind) = initial_outcome.task_notification_kind {
             task_notification_kind = merge_task_notification_kind(task_notification_kind, kind);
+        }
+        if initial_outcome.auto_compacted {
+            auto_compaction_lifecycle_attempted = emit_context_compacted_lifecycle_from_watcher(
+                &shared,
+                channel_id,
+                &watcher_provider,
+                state.last_model.as_deref(),
+                stream_line_state_token_usage(&state),
+            )
+            .await;
         }
         let post_terminal_success_continuation_flush =
             should_flush_post_terminal_success_continuation(
@@ -3201,22 +3053,16 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         if provider_overload_message.is_none() {
                             provider_overload_message = outcome.provider_overload_message;
                         }
-                        // Notify when auto-compaction is detected in output
-                        if outcome.auto_compacted {
-                            let target = format!("channel:{}", channel_id.get());
-                            let _ = enqueue_outbox_best_effort(
-                                shared.pg_pool.as_ref(),
-                                sqlite_runtime_db(shared.as_ref()),
-                                OutboxMessage {
-                                    target: target.as_str(),
-                                    content: "🗜️ 자동 컨텍스트 압축 감지",
-                                    bot: "notify",
-                                    source: "system",
-                                    reason_code: None,
-                                    session_key: None,
-                                },
-                            )
-                            .await;
+                        if outcome.auto_compacted && !auto_compaction_lifecycle_attempted {
+                            auto_compaction_lifecycle_attempted =
+                                emit_context_compacted_lifecycle_from_watcher(
+                                    &shared,
+                                    channel_id,
+                                    &watcher_provider,
+                                    state.last_model.as_deref(),
+                                    stream_line_state_token_usage(&state),
+                                )
+                                .await;
                         }
                     }
                     Ok(Ok(Ok((_, off)))) => {
@@ -3344,13 +3190,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         );
                         if panel_text != last_status_panel_text {
                             rate_limit_wait(&shared, channel_id).await;
-                            match channel_id
-                                .edit_message(
-                                    &http,
-                                    status_msg_id,
-                                    serenity::EditMessage::new().content(&panel_text),
-                                )
-                                .await
+                            match super::http::edit_channel_message(
+                                &http,
+                                channel_id,
+                                status_msg_id,
+                                &panel_text,
+                            )
+                            .await
                             {
                                 Ok(_) => {
                                     last_status_panel_text = panel_text;
@@ -3443,22 +3289,22 @@ pub(super) async fn tmux_output_watcher_with_restore(
                         };
 
                         rate_limit_wait(&shared, channel_id).await;
-                        match channel_id
-                            .edit_message(
-                                &http,
-                                msg_id,
-                                serenity::EditMessage::new().content(&plan.frozen_chunk),
-                            )
-                            .await
+                        match super::http::edit_channel_message(
+                            &http,
+                            channel_id,
+                            msg_id,
+                            &plan.frozen_chunk,
+                        )
+                        .await
                         {
                             Ok(_) => {
                                 rate_limit_wait(&shared, channel_id).await;
-                                match channel_id
-                                    .send_message(
-                                        &http,
-                                        serenity::CreateMessage::new().content(&status_block),
-                                    )
-                                    .await
+                                match super::http::send_channel_message(
+                                    &http,
+                                    channel_id,
+                                    &status_block,
+                                )
+                                .await
                                 {
                                     Ok(message) => {
                                         placeholder_msg_id = Some(message.id);
@@ -3484,14 +3330,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                                             error
                                         );
                                         rate_limit_wait(&shared, channel_id).await;
-                                        let _ = channel_id
-                                            .edit_message(
-                                                &http,
-                                                msg_id,
-                                                serenity::EditMessage::new()
-                                                    .content(&plan.display_snapshot),
-                                            )
-                                            .await;
+                                        let _ = super::http::edit_channel_message(
+                                            &http,
+                                            channel_id,
+                                            msg_id,
+                                            &plan.display_snapshot,
+                                        )
+                                        .await;
                                         last_edit_text = plan.display_snapshot;
                                         break;
                                     }
@@ -3527,17 +3372,23 @@ pub(super) async fn tmux_output_watcher_with_restore(
                             Some(msg_id) => {
                                 // Edit existing placeholder
                                 rate_limit_wait(&shared, channel_id).await;
-                                let _ = channel_id
-                                    .edit_message(
-                                        &http,
-                                        msg_id,
-                                        serenity::EditMessage::new().content(&display_text),
-                                    )
-                                    .await;
+                                let _ = super::http::edit_channel_message(
+                                    &http,
+                                    channel_id,
+                                    msg_id,
+                                    &display_text,
+                                )
+                                .await;
                             }
                             None => {
                                 // Create new placeholder
-                                if let Ok(msg) = channel_id.say(&http, &display_text).await {
+                                if let Ok(msg) = super::http::send_channel_message(
+                                    &http,
+                                    channel_id,
+                                    &display_text,
+                                )
+                                .await
+                                {
                                     placeholder_msg_id = Some(msg.id);
                                 }
                             }
@@ -3581,16 +3432,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
                 let notice_ok = match placeholder_msg_id {
                     Some(msg_id) => {
                         rate_limit_wait(&shared, channel_id).await;
-                        channel_id
-                            .edit_message(
-                                &http,
-                                msg_id,
-                                serenity::EditMessage::new().content(&notice),
-                            )
+                        super::http::edit_channel_message(&http, channel_id, msg_id, &notice)
                             .await
                             .is_ok()
                     }
-                    None => channel_id.say(&http, &notice).await.is_ok(),
+                    None => super::http::send_channel_message(&http, channel_id, &notice)
+                        .await
+                        .is_ok(),
                 };
                 if !notice_ok {
                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3668,16 +3516,21 @@ pub(super) async fn tmux_output_watcher_with_restore(
                             match placeholder_msg_id {
                                 Some(msg_id) => {
                                     rate_limit_wait(&shared, channel_id).await;
-                                    let _ = channel_id
-                                        .edit_message(
-                                            &http,
-                                            msg_id,
-                                            serenity::EditMessage::new().content(&failure_notice),
-                                        )
-                                        .await;
+                                    let _ = super::http::edit_channel_message(
+                                        &http,
+                                        channel_id,
+                                        msg_id,
+                                        &failure_notice,
+                                    )
+                                    .await;
                                 }
                                 None => {
-                                    let _ = channel_id.say(&http, &failure_notice).await;
+                                    let _ = super::http::send_channel_message(
+                                        &http,
+                                        channel_id,
+                                        &failure_notice,
+                                    )
+                                    .await;
                                 }
                             }
                         }
@@ -3762,12 +3615,11 @@ pub(super) async fn tmux_output_watcher_with_restore(
             match placeholder_msg_id {
                 Some(msg_id) => {
                     rate_limit_wait(&shared, channel_id).await;
-                    let _ = channel_id
-                        .edit_message(&http, msg_id, serenity::EditMessage::new().content(notice))
-                        .await;
+                    let _ =
+                        super::http::edit_channel_message(&http, channel_id, msg_id, notice).await;
                 }
                 None => {
-                    let _ = channel_id.say(&http, notice).await;
+                    let _ = super::http::send_channel_message(&http, channel_id, notice).await;
                 }
             }
             // Don't break — let the watcher exit naturally when session-alive check fails
@@ -3840,12 +3692,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
             let notice_ok = match placeholder_msg_id {
                 Some(msg_id) => {
                     rate_limit_wait(&shared, channel_id).await;
-                    channel_id
-                        .edit_message(&http, msg_id, serenity::EditMessage::new().content(&notice))
+                    super::http::edit_channel_message(&http, channel_id, msg_id, &notice)
                         .await
                         .is_ok()
                 }
-                None => channel_id.say(&http, &notice).await.is_ok(),
+                None => super::http::send_channel_message(&http, channel_id, &notice)
+                    .await
+                    .is_ok(),
             };
             if !notice_ok {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3877,7 +3730,7 @@ pub(super) async fn tmux_output_watcher_with_restore(
                 "authentication expired; re-authentication required: {}",
                 truncate_str(auth_detail, 300)
             );
-            super::turn_bridge::fail_dispatch_with_retry(
+            super::turn_bridge::fail_dispatch_auth_expired(
                 shared.api_port,
                 dispatch_id.as_deref(),
                 &failure_text,
@@ -3974,16 +3827,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
             let notice_ok = match placeholder_msg_id {
                 Some(msg_id) => {
                     rate_limit_wait(&shared, channel_id).await;
-                    channel_id
-                        .edit_message(
-                            &http,
-                            msg_id,
-                            serenity::EditMessage::new().content(&retry_notice),
-                        )
+                    super::http::edit_channel_message(&http, channel_id, msg_id, &retry_notice)
                         .await
                         .is_ok()
                 }
-                None => channel_id.say(&http, &retry_notice).await.is_ok(),
+                None => super::http::send_channel_message(&http, channel_id, &retry_notice)
+                    .await
+                    .is_ok(),
             };
             if !notice_ok {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4267,14 +4117,13 @@ pub(super) async fn tmux_output_watcher_with_restore(
             );
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
             if let Some(msg_id) = placeholder_msg_id {
-                let _ = channel_id
-                    .edit_message(
-                        &http,
-                        msg_id,
-                        serenity::EditMessage::new()
-                            .content("↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다."),
-                    )
-                    .await;
+                let _ = super::http::edit_channel_message(
+                    &http,
+                    channel_id,
+                    msg_id,
+                    "↻ 세션 복구 중... 잠시 후 자동으로 이어갑니다.",
+                )
+                .await;
             }
             // Auto-retry: persist Discord history for LLM injection, then queue the
             // original user message as an internal follow-up instead of self-routing
@@ -5098,6 +4947,28 @@ pub(super) async fn tmux_output_watcher_with_restore(
             let delegated_finalize_owed = if dispatch_ok {
                 let owed = mailbox_finalize_owed.swap(false, std::sync::atomic::Ordering::AcqRel);
                 super::inflight::clear_inflight_state(&provider_kind, channel_id.get());
+                let watcher_turn_id = inflight_state
+                    .as_ref()
+                    .filter(|s| s.user_msg_id != 0)
+                    .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
+                let watcher_session_key_owned =
+                    inflight_state.as_ref().and_then(|s| s.session_key.clone());
+                let watcher_dispatch_id_owned = resolved_did
+                    .clone()
+                    .or_else(|| inflight_state.as_ref().and_then(|s| s.dispatch_id.clone()));
+                crate::services::observability::emit_inflight_lifecycle_event(
+                    provider_kind.as_str(),
+                    channel_id.get(),
+                    watcher_dispatch_id_owned.as_deref(),
+                    watcher_session_key_owned.as_deref(),
+                    watcher_turn_id.as_deref(),
+                    "cleared_by_watcher",
+                    serde_json::json!({
+                        "owed_finalize": owed,
+                        "has_assistant_response": has_assistant_response,
+                        "full_response_len": full_response.len(),
+                    }),
+                );
                 finish_restored_watcher_active_turn(
                     &shared,
                     &provider_kind,
@@ -6004,120 +5875,6 @@ pub(super) fn process_watcher_lines(
     }
 
     outcome
-}
-
-/// Remove jsonl/input/prompt/owner/etc files in the persistent sessions
-/// directory that no longer belong to a running tmux session. Conservative:
-/// require an owner marker (or the jsonl) to be older than
-/// `ORPHAN_MIN_AGE_SECS` and require the session to be absent from tmux
-/// before deleting. Legacy `/tmp/` files are *never* swept at startup —
-/// pre-migration wrappers may still be writing into them.
-async fn sweep_orphan_session_files() {
-    const ORPHAN_MIN_AGE_SECS: u64 = 10 * 60; // 10 minutes
-
-    let Some(dir) = crate::services::tmux_common::persistent_sessions_dir() else {
-        return;
-    };
-    if !dir.exists() {
-        return;
-    }
-
-    // List live tmux sessions.
-    let live: std::collections::HashSet<String> = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(crate::services::platform::tmux::list_session_names),
-    )
-    .await
-    {
-        Ok(Ok(Ok(names))) => names.into_iter().collect(),
-        _ => return, // tmux unavailable — skip sweep rather than risk false positives
-    };
-
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
-
-    // Group files under the sessions dir by the `agentdesk-<hash>-<host>-<session>`
-    // prefix. Any prefix whose session name is not in `live` *and* whose
-    // oldest file mtime is older than ORPHAN_MIN_AGE_SECS is swept.
-    let mut groups: std::collections::HashMap<String, (String, std::time::SystemTime)> =
-        std::collections::HashMap::new();
-    for entry in entries.flatten() {
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        if !name.starts_with("agentdesk-") {
-            continue;
-        }
-        // Strip extension.
-        let stem = match name.rsplit_once('.') {
-            Some((s, _)) => s.to_string(),
-            None => name.clone(),
-        };
-        // Session name is the last token after the fourth dash — but our
-        // prefix format is `agentdesk-<12hex>-<host>-<session>` and host
-        // may contain dashes. The simplest robust approach: split_once on
-        // `agentdesk-<hash>-<host>-` is hard to reverse, so instead we use
-        // the owner file's prefix as the grouping key directly — any file
-        // whose stem matches some live session (ends with `-<live>`) is kept.
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| std::time::SystemTime::now());
-        groups
-            .entry(stem.clone())
-            .and_modify(|slot| {
-                if mtime < slot.1 {
-                    *slot = (stem.clone(), mtime);
-                }
-            })
-            .or_insert((stem, mtime));
-    }
-
-    let now = std::time::SystemTime::now();
-    let mut swept = 0usize;
-    for (stem, (_, oldest_mtime)) in groups {
-        // Is this stem associated with any live tmux session? We check
-        // whether ANY live session name appears as a suffix of the stem.
-        // Since session names are distinctive (provider:channel shape), a
-        // conservative suffix match keeps ambiguity low; we also require
-        // that the match is preceded by a dash so we don't match e.g.
-        // "claude:foo" against a stem ending with "-thisisnotclaude:foo".
-        let is_live = live.iter().any(|live_name| {
-            let needle = format!("-{}", live_name);
-            stem.ends_with(&needle) || stem == *live_name
-        });
-        if is_live {
-            continue;
-        }
-        // Conservative: require age threshold.
-        let age = now
-            .duration_since(oldest_mtime)
-            .unwrap_or(std::time::Duration::ZERO);
-        if age.as_secs() < ORPHAN_MIN_AGE_SECS {
-            continue;
-        }
-        // Delete every file under this stem.
-        let Ok(iter) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in iter.flatten() {
-            if let Ok(fname) = entry.file_name().into_string() {
-                if fname.starts_with(&format!("{}.", stem)) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-        swept += 1;
-    }
-    if swept > 0 {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] 🧹 Swept {} orphan session file group(s) from {}",
-            swept,
-            dir.display()
-        );
-    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]

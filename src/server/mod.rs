@@ -1,5 +1,6 @@
 pub(crate) mod cluster;
 pub(crate) mod cron_catalog;
+pub mod dto;
 pub(crate) mod issue_specs;
 pub(crate) mod maintenance;
 pub(crate) mod multinode_regression;
@@ -187,6 +188,9 @@ pub(crate) async fn run(
     }
     crate::services::observability::init_observability(pg_pool.clone());
     let cluster_runtime = cluster::bootstrap(&config, pg_pool.clone()).await;
+    if let Some(pool) = pg_pool.clone() {
+        crate::services::dispatch_watchdog::spawn(pool);
+    }
     crate::pipeline::refresh_override_health_report(pg_pool.as_ref()).await;
     let boot_reconcile_engine = match startup_pg_pool.as_ref() {
         Some(pool) => Some(crate::engine::PolicyEngine::new_with_pg(
@@ -360,6 +364,26 @@ async fn policy_tick_loop(
             let slo_pool = pg_pool.as_deref().or_else(|| engine.pg_pool());
             let now_ms = chrono::Utc::now().timestamp_millis();
             let _ = crate::services::slo::run_aggregation_tick(None, slo_pool, now_ms).await;
+            if let Some(pool) = slo_pool {
+                match crate::reconcile::reconcile_completed_queue_review_drift_pg(
+                    pool, None, &engine,
+                )
+                .await
+                {
+                    Ok(recovered) if recovered > 0 => {
+                        tracing::info!(
+                            recovered,
+                            "[policy-tick] completed queue review drift recovered cards"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "[policy-tick] completed queue review drift reconcile failed: {error}"
+                        );
+                    }
+                }
+            }
 
             // Also fire legacy OnTick for backward compat
             fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick", "legacy").await;

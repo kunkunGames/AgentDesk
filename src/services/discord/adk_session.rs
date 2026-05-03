@@ -4,9 +4,15 @@ use std::sync::Arc;
 use poise::serenity_prelude as serenity;
 
 use super::SharedData;
+use crate::services::observability::turn_lifecycle::{
+    ContextCompactionDetails, TurnEvent, TurnLifecycleEmit, emit_turn_lifecycle,
+    provider_session_fingerprint,
+};
 use crate::services::provider::ProviderKind;
 
 const SESSION_INFO_MAX_CHARS: usize = 60;
+pub(super) const CONTEXT_COMPACTION_PRESERVED_SECTIONS: [&str; 5] =
+    ["Goal", "Progress", "Decisions", "Files", "Next"];
 
 /// Parse `DISPATCH:<uuid> - <title>` format and return the dispatch_id (uuid part).
 pub(super) fn parse_dispatch_id(text: &str) -> Option<String> {
@@ -249,6 +255,82 @@ pub(super) async fn save_provider_session_id(
     }
 }
 
+pub(super) fn context_usage_percent(tokens: u64, context_window: u64) -> u64 {
+    if context_window == 0 {
+        return 0;
+    }
+    let percent = ((u128::from(tokens) * 100) / u128::from(context_window)) as u64;
+    percent.min(100)
+}
+
+pub(super) fn context_compaction_details(
+    before_pct: u64,
+    after_pct: Option<u64>,
+) -> ContextCompactionDetails {
+    ContextCompactionDetails {
+        before_pct,
+        after_pct,
+        preserved_sections: CONTEXT_COMPACTION_PRESERVED_SECTIONS
+            .iter()
+            .map(|section| (*section).to_string())
+            .collect(),
+    }
+}
+
+pub(super) async fn emit_context_compacted_lifecycle_for_inflight(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+    before_pct: u64,
+    after_pct: Option<u64>,
+) -> bool {
+    let Some(pool) = shared.pg_pool.as_ref() else {
+        return false;
+    };
+    let Some(inflight) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
+        return false;
+    };
+    if inflight.rebind_origin || inflight.user_msg_id == 0 {
+        return false;
+    }
+
+    let turn_id = format!("discord:{}:{}", channel_id.get(), inflight.user_msg_id);
+    let mut emit = TurnLifecycleEmit::new(
+        turn_id.clone(),
+        channel_id.get().to_string(),
+        TurnEvent::ContextCompacted(context_compaction_details(before_pct, after_pct)),
+        "automatic context compaction completed",
+    );
+    if let Some(session_key) = inflight
+        .session_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        emit = emit.session_key(session_key.to_string());
+    }
+    if let Some(dispatch_id) = inflight
+        .dispatch_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        emit = emit.dispatch_id(dispatch_id.to_string());
+    }
+
+    match emit_turn_lifecycle(pool, emit).await {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(
+                "failed to emit context compacted lifecycle event for turn {}: {error}",
+                turn_id
+            );
+            false
+        }
+    }
+}
+
 /// Fetch the stored executable provider session selector from DB for a given session_key.
 /// Prefer the legacy `claude_session_id` field and fall back to `session_id`
 /// only for older rows that never populated the dedicated selector slot.
@@ -261,8 +343,26 @@ pub(super) async fn fetch_provider_session_id(
         return Some(found);
     }
 
-    let legacy_key = legacy_session_key_from_namespaced(session_key)?;
-    fetch_provider_session_id_once(&legacy_key, provider, api_port).await
+    let Some(legacy_key) = legacy_session_key_from_namespaced(session_key) else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] [session-restore] no provider session selector for key={} provider={} legacy_key_present=false",
+            session_key,
+            provider.as_str()
+        );
+        return None;
+    };
+
+    let restored = fetch_provider_session_id_once(&legacy_key, provider, api_port).await;
+    if restored.is_none() {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] [session-restore] no provider session selector for key={} provider={} legacy_key_present=true",
+            session_key,
+            provider.as_str()
+        );
+    }
+    restored
 }
 
 async fn fetch_provider_session_id_once(
@@ -270,17 +370,61 @@ async fn fetch_provider_session_id_once(
     provider: &ProviderKind,
     _api_port: u16,
 ) -> Option<String> {
-    let json = super::internal_api::get_provider_session_id(session_key, Some(provider.as_str()))
-        .await
-        .ok()?;
+    let json = match super::internal_api::get_provider_session_id(
+        session_key,
+        Some(provider.as_str()),
+    )
+    .await
+    {
+        Ok(json) => json,
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ [session-restore] provider session lookup failed: key={} provider={} error={}",
+                session_key,
+                provider.as_str(),
+                error
+            );
+            return None;
+        }
+    };
     // #107: Filter empty strings — a stale clear path may have stored ""
     // instead of NULL; treat it as no session ID.
     // Also try session_id field as fallback for provider-agnostic lookup.
-    json.get("claude_session_id")
+    let selector = json
+        .get("claude_session_id")
         .and_then(|v| v.as_str())
         .or_else(|| json.get("session_id").and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    if let Some(ref selector) = selector {
+        tracing::info!(
+            "  [{ts}] [session-restore] provider session selector found: key={} provider={} selector_fp={}",
+            session_key,
+            provider.as_str(),
+            provider_session_fingerprint(selector)
+        );
+    } else {
+        let has_claude_selector = json
+            .get("claude_session_id")
+            .and_then(|v| v.as_str())
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+        let has_raw_session_id = json
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+        tracing::info!(
+            "  [{ts}] [session-restore] provider session lookup returned no usable selector: key={} provider={} has_claude_selector={} has_session_id={}",
+            session_key,
+            provider.as_str(),
+            has_claude_selector,
+            has_raw_session_id
+        );
+    }
+    selector
 }
 
 fn build_provider_session_payload(
@@ -511,7 +655,10 @@ fn clean_nonempty(value: &str) -> Option<&str> {
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
-    use super::{derive_adk_session_info, parse_thread_channel_id_from_name};
+    use super::{
+        CONTEXT_COMPACTION_PRESERVED_SECTIONS, context_compaction_details, context_usage_percent,
+        derive_adk_session_info, parse_thread_channel_id_from_name,
+    };
 
     #[test]
     fn derive_uses_user_text_when_human_readable() {
@@ -656,6 +803,40 @@ mod tests {
         assert_eq!(payload["session_id"], "raw-session-123");
         assert_eq!(payload["claude_session_id"], "session-123");
         assert_eq!(payload["provider"], "codex");
+    }
+
+    #[test]
+    fn test_context_usage_percent_uses_context_window() {
+        assert_eq!(context_usage_percent(850, 1_000), 85);
+        assert_eq!(context_usage_percent(1_780, 1_000), 100);
+        assert_eq!(context_usage_percent(1, 0), 0);
+    }
+
+    #[test]
+    fn test_context_compaction_details_include_preserved_sections() {
+        let details = context_compaction_details(91, Some(37));
+
+        assert_eq!(details.before_pct, 91);
+        assert_eq!(details.after_pct, Some(37));
+        assert_eq!(
+            details.preserved_sections,
+            CONTEXT_COMPACTION_PRESERVED_SECTIONS
+                .iter()
+                .map(|section| (*section).to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_usage_tests {
+    use super::context_usage_percent;
+
+    #[test]
+    fn context_usage_percent_is_bounded_to_window() {
+        assert_eq!(context_usage_percent(850, 1_000), 85);
+        assert_eq!(context_usage_percent(1_780, 1_000), 100);
+        assert_eq!(context_usage_percent(1, 0), 0);
     }
 }
 

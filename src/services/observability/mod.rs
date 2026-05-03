@@ -14,9 +14,12 @@ use tokio::sync::{mpsc, oneshot};
 // `metrics` → lightweight channel/provider atomic counters for hot paths.
 // `events`  → bounded in-memory structured event log + periodic JSONL flush.
 // `watcher_latency` → #1134 attach→first-relay latency histogram + counters.
+// `turn_lifecycle` → durable turn lifecycle event model for session/context transitions.
 pub mod events;
 pub mod metrics;
+pub mod recovery_audit;
 pub mod session_inventory;
+pub mod turn_lifecycle;
 pub mod watcher_latency;
 
 const EVENT_BATCH_SIZE: usize = 64;
@@ -520,7 +523,33 @@ pub fn emit_turn_finished(
     duration_ms: i64,
     tmux_handoff: bool,
 ) {
+    emit_turn_finished_with_dispatch_kind(
+        provider,
+        channel_id,
+        dispatch_id,
+        session_key,
+        turn_id,
+        outcome,
+        duration_ms,
+        tmux_handoff,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_turn_finished_with_dispatch_kind(
+    provider: &str,
+    channel_id: u64,
+    dispatch_id: Option<&str>,
+    session_key: Option<&str>,
+    turn_id: Option<&str>,
+    outcome: &str,
+    duration_ms: i64,
+    tmux_handoff: bool,
+    dispatch_kind: Option<&str>,
+) {
     let normalized_outcome = normalize_string(outcome);
+    let dispatch_kind = dispatch_kind.and_then(normalize_string);
     let is_success = matches!(
         normalized_outcome.as_deref(),
         Some("completed") | Some("tmux_handoff")
@@ -542,6 +571,7 @@ pub fn emit_turn_finished(
             "outcome": normalized_outcome,
             "duration_ms": duration_ms.max(0),
             "tmux_handoff": tmux_handoff,
+            "dispatch_kind": dispatch_kind.as_deref(),
         }),
     ));
     emit_event(
@@ -560,6 +590,7 @@ pub fn emit_turn_finished(
         json!({
             "duration_ms": duration_ms.max(0),
             "tmux_handoff": tmux_handoff,
+            "dispatch_kind": dispatch_kind.as_deref(),
         }),
     );
 }
@@ -651,6 +682,40 @@ pub fn emit_recovery_fired(
         },
         json!({
             "reason": normalize_string(reason),
+        }),
+    );
+}
+
+/// Inflight lifecycle observability: pair-tracking events so external monitors
+/// can detect cleanup leaks. `kind` is the lifecycle phase identifier:
+/// `"delegated_to_watcher"`, `"cleared_by_bridge"`, `"cleared_by_watcher"`,
+/// `"leak_detected_completed_stale"`. `delegated_to_watcher` and
+/// `cleared_by_watcher` should pair 1:1; a sustained drift between counters
+/// indicates the bridge handed off cleanup but the watcher never executed it.
+/// `leak_detected_completed_stale` fires from the stall-watchdog when an
+/// inflight is healthy/synced but the mailbox is idle past the staleness
+/// threshold — the smoking-gun signal for the deadlock-manager alarm pattern.
+pub fn emit_inflight_lifecycle_event(
+    provider: &str,
+    channel_id: u64,
+    dispatch_id: Option<&str>,
+    session_key: Option<&str>,
+    turn_id: Option<&str>,
+    kind: &str,
+    extra: Value,
+) {
+    emit_event(
+        "inflight_lifecycle",
+        Some(provider),
+        Some(channel_id),
+        dispatch_id,
+        session_key,
+        turn_id,
+        normalize_string(kind).as_deref(),
+        CounterDelta::default(),
+        json!({
+            "kind": normalize_string(kind),
+            "extra": extra,
         }),
     );
 }
