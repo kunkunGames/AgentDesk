@@ -68,7 +68,7 @@ jobs:
           # --- Idempotency: skip if same HEAD_SHA already commented (paginated scan) ---
           MARKER="<!-- ci-auto-fixer:$HEAD_SHA -->"
           ALREADY=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
-            | jq -s --arg m "$MARKER" '[.[][][].body | select(contains($m))] | length')
+            | jq -s --arg m "$MARKER" '[.[][].body | select(contains($m))] | length')
           if [ "$ALREADY" -gt 0 ]; then
             echo "Marker already present for sha=$HEAD_SHA — skipping duplicate comment."
             exit 0
