@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 ADK_REL="$HOME/.adk/release"
 PLIST_REL="com.agentdesk.release"
+REL_LAUNCHD_ENV_FILE="$ADK_REL/config/launchd.env"
 REPO="${AGENTDESK_REPO_DIR:-}"
 if [ -z "$REPO" ]; then
     REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -551,6 +552,54 @@ fi
 
 _assert_release_binary_runtime_surface
 
+if [ -f "$REL_LAUNCHD_ENV_FILE" ]; then
+    echo "▸ Applying release launchd env for doctor preflight..."
+    _apply_launchd_env_file_to_shell "$REL_LAUNCHD_ENV_FILE"
+fi
+
+echo "▸ Preflight PostgreSQL migration integrity via doctor..."
+DOCTOR_JSON_TMP=$(mktemp "${TMPDIR:-/tmp}/agentdesk-doctor.XXXXXX.json")
+set +e
+"$SOURCE_BINARY" doctor --json >"$DOCTOR_JSON_TMP" 2>/dev/null
+DOCTOR_RC=$?
+set -e
+if [ ! -s "$DOCTOR_JSON_TMP" ]; then
+    echo "✗ Doctor preflight did not return JSON output."
+    rm -f "$DOCTOR_JSON_TMP"
+    exit 1
+fi
+if ! python3 - "$DOCTOR_JSON_TMP" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+checks = data.get("checks", [])
+postgres = next((c for c in checks if c.get("id") == "postgres_connection"), None)
+if not postgres:
+    print("✗ Doctor preflight missing postgres_connection check.")
+    raise SystemExit(1)
+
+status = str(postgres.get("status", "")).lower()
+if status in {"pass", "ok", "info"}:
+    raise SystemExit(0)
+
+detail = postgres.get("detail") or "no detail"
+actual = postgres.get("actual") or "unknown"
+print(f"✗ Doctor postgres preflight failed: status={status}, detail={detail}, actual={actual}")
+raise SystemExit(1)
+PY
+then
+    rm -f "$DOCTOR_JSON_TMP"
+    exit 1
+fi
+if [ "$DOCTOR_RC" -ne 0 ]; then
+    echo "⚠ doctor command returned non-zero ($DOCTOR_RC), but postgres preflight check passed."
+fi
+rm -f "$DOCTOR_JSON_TMP"
+
 # Copy and sign the binary before stopping release. This keeps a missing
 # certificate or failed codesign from taking down a healthy dcserver.
 echo "▸ Staging signed binary from $SOURCE_BINARY..."
@@ -642,7 +691,6 @@ echo "▸ Ensuring global agentdesk CLI..."
 
 # Postgres database is operator-managed; SQLite copy removed after #461 cutover.
 
-REL_LAUNCHD_ENV_FILE="$ADK_REL/config/launchd.env"
 if [ -f "$REL_LAUNCHD_ENV_FILE" ]; then
     echo "▸ Syncing release launchd env..."
     sync_launchd_plist_environment_from_file "$HOME/Library/LaunchAgents/$PLIST_REL.plist" "$REL_LAUNCHD_ENV_FILE"
