@@ -1,6 +1,7 @@
 mod completion_guard;
 mod context_window;
 mod memory_lifecycle;
+mod output_lifecycle;
 mod recall_feedback;
 mod recovery_text;
 mod retry_state;
@@ -30,6 +31,7 @@ use crate::services::observability::session_inventory::{
     format_child_inventory_progress, load_child_inventory_by_parent_key_pg,
 };
 use crate::services::provider::cancel_requested;
+use output_lifecycle::{BridgeOutputOwner, classify_bridge_output_owner};
 use std::collections::VecDeque;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
@@ -2887,9 +2889,13 @@ pub(super) fn spawn_turn_bridge(
 
         // Remove ⏳ only if NOT handing off to tmux watcher.
         // When tmux watcher is handling the response, it will do ⏳→✅ after delivery.
-        let tmux_handoff_path = (rx_disconnected && tmux_handed_off && full_response.is_empty())
-            || bridge_relay_delegated_to_watcher;
-        if !tmux_handoff_path {
+        let bridge_output_owner = classify_bridge_output_owner(
+            rx_disconnected,
+            tmux_handed_off,
+            full_response.is_empty(),
+            bridge_relay_delegated_to_watcher,
+        );
+        if !bridge_output_owner.skips_bridge_spinner_cleanup() {
             gateway.remove_reaction(channel_id, user_msg_id, '⏳').await;
         }
 
@@ -2929,6 +2935,13 @@ pub(super) fn spawn_turn_bridge(
                 .await;
             full_response = String::new();
         }
+
+        let bridge_output_owner_for_delivery = classify_bridge_output_owner(
+            rx_disconnected,
+            tmux_handed_off,
+            full_response.is_empty(),
+            bridge_relay_delegated_to_watcher,
+        );
 
         if cancelled {
             close_all_tracked_background_children(
@@ -3095,7 +3108,7 @@ pub(super) fn spawn_turn_bridge(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
-        } else if rx_disconnected && tmux_handed_off && full_response.is_empty() {
+        } else if bridge_output_owner_for_delivery == BridgeOutputOwner::LegacyTmuxHandoff {
             // Tmux watcher is handling response delivery — this is normal.
             // Don't delete placeholder — update it so the user sees the turn is still active.
             // The tmux watcher will replace this content when output arrives.
@@ -3214,7 +3227,7 @@ pub(super) fn spawn_turn_bridge(
                     channel_id
                 );
             }
-        } else if bridge_relay_delegated_to_watcher {
+        } else if bridge_output_owner_for_delivery == BridgeOutputOwner::WatcherRelay {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] 👁 tmux watcher owns assistant relay; bridge skipped direct response delivery (channel {})",
