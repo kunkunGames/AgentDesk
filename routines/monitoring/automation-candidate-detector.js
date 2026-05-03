@@ -90,7 +90,11 @@ function passesQualityGate(candidate, nowStr) {
       return { pass: false, reason: `evidence_age=${candidate.evidence_age_ms}ms > ${EVIDENCE_AGE_MAX_MS}ms` };
     }
   } else if (candidate.last_seen_at) {
-    const ageMs = new Date(nowStr).getTime() - new Date(candidate.last_seen_at).getTime();
+    const seenAtMs = new Date(candidate.last_seen_at).getTime();
+    if (!Number.isFinite(seenAtMs)) {
+      return { pass: false, reason: `invalid_last_seen_at=${candidate.last_seen_at}` };
+    }
+    const ageMs = new Date(nowStr).getTime() - seenAtMs;
     if (ageMs > EVIDENCE_AGE_MAX_MS) {
       return { pass: false, reason: `evidence_age=${ageMs}ms > ${EVIDENCE_AGE_MAX_MS}ms` };
     }

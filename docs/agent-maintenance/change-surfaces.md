@@ -267,7 +267,7 @@ The remaining giant-file modules under `src/services/` not covered above:
   the route layer in #1519. Keep follow-up changes bugfix-only unless the file
   is split further.
 - `src/services/routines/loader.rs` (1753),
-  `src/services/routines/store.rs` (2178), and
+  `src/services/routines/store.rs` (2755), and
   `src/services/routines/discord_log.rs` (1056); routine loader/store and
   Discord logging are the canonical scheduled JS routine surfaces. Further
   feature work should split focused helper modules before growing these files
@@ -276,7 +276,7 @@ The remaining giant-file modules under `src/services/` not covered above:
   (GitClient extraction).
 - `src/services/platform/binary_resolver.rs` (1377).
 - `src/services/mcp_config.rs` (1072).
-- `src/services/routines/{store.rs (2178), loader.rs (2013),
+- `src/services/routines/{store.rs (2755), loader.rs (2013),
   discord_log.rs (1056)}` — durable routine storage, script loading, and
   Discord notification plumbing. Split before broadening behavior outside the
   current routine API/runtime contract.

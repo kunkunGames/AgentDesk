@@ -1165,10 +1165,7 @@ impl RoutineStore {
                           OR user_message ILIKE '%안 됨%'
                    )::BIGINT AS error_mention_count,
                    COUNT(*)::BIGINT AS total_turns,
-                   MAX(created_at) AS last_seen_at,
-                   (ARRAY_AGG(user_message ORDER BY created_at DESC)
-                    FILTER (WHERE user_message IS NOT NULL AND LENGTH(TRIM(user_message)) > 0)
-                   )[1] AS latest_message
+                   MAX(created_at) AS last_seen_at
             FROM session_transcripts
             WHERE created_at > NOW() - INTERVAL '24 hours'
             GROUP BY agent_id
@@ -1203,17 +1200,9 @@ impl RoutineStore {
             let total_turns: i64 = row.try_get("total_turns").unwrap_or(0);
             let last_seen_at: DateTime<Utc> =
                 row.try_get("last_seen_at").unwrap_or_else(|_| Utc::now());
-            let latest_msg: Option<String> = row.try_get("latest_message").ok().flatten();
-            let summary = if let Some(ref msg) = latest_msg {
-                format!(
-                    "session error pattern: agent={agent_id} error_mentions={error_count}/{total_turns} turns; latest: {}",
-                    truncate_chars(msg, 120)
-                )
-            } else {
-                format!(
-                    "session error pattern: agent={agent_id} error_mentions={error_count}/{total_turns} turns"
-                )
-            };
+            let summary = format!(
+                "session error pattern: agent={agent_id} error_mentions={error_count}/{total_turns} turns"
+            );
             session_obs.push(serde_json::json!({
                 "timestamp": last_seen_at.to_rfc3339(),
                 "source": "session_pattern",

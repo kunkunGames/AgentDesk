@@ -207,7 +207,7 @@ p0_pr: "https://github.com/itismyfield/AgentDesk/pull/1497"
   "caps": {
     "ctx_observations_max_items": 100,
     "ctx_observations_max_bytes": 65536,
-    "source_merge_policy": "fair merge: kv_meta 20, api_friction_issues 20, message_outbox 20, routine_runs 40"
+    "source_merge_policy": "fair merge: kv_meta 20, api_friction_issues 15, message_outbox 10, routine_runs 25, kanban_stale 10, dispatch_retry 10, session_pattern 10"
   },
   "kv_meta_digest_surface": {
     "key_prefix": "routine_observation:",
