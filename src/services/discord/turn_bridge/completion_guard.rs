@@ -364,9 +364,55 @@ fn runtime_postgres_reconcile_key(dispatch_id: &str) -> String {
     format!("reconcile_dispatch:{dispatch_id}")
 }
 
+fn is_noop_runtime_completion_result(result: &serde_json::Value) -> bool {
+    result.get("work_outcome").and_then(|entry| entry.as_str()) == Some("noop")
+        || result
+            .get("completed_without_changes")
+            .and_then(|entry| entry.as_bool())
+            == Some(true)
+}
+
+fn should_sync_runtime_auto_queue_terminal_entry(
+    dispatch_type: Option<&str>,
+    result: &serde_json::Value,
+    auto_queue_review_disabled: bool,
+) -> bool {
+    match dispatch_type {
+        Some("consultation") => false,
+        Some("implementation" | "rework") => {
+            !is_noop_runtime_completion_result(result) && !auto_queue_review_disabled
+        }
+        _ => true,
+    }
+}
+
+async fn auto_queue_review_disabled_for_runtime_dispatch_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch_id: &str,
+) -> Result<bool, String> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM auto_queue_entries e
+            JOIN auto_queue_runs r ON r.id = e.run_id
+            WHERE e.dispatch_id = $1
+              AND e.status = 'dispatched'
+              AND r.status IN ('active', 'paused')
+              AND COALESCE(r.review_mode, 'enabled') = 'disabled'
+        )",
+    )
+    .bind(dispatch_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| {
+        format!("load auto-queue review_mode for runtime dispatch {dispatch_id}: {error}")
+    })
+}
+
 fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_json::Value) -> bool {
     let dispatch_id = dispatch_id.to_string();
     let result_json = result.to_string();
+    let result_value = result.clone();
     with_runtime_postgres_result(move |pool| {
         Box::pin(async move {
             let mut tx = pool
@@ -424,6 +470,13 @@ fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_js
                 .try_get::<Option<String>, _>("dispatch_type")
                 .ok()
                 .flatten();
+            let auto_queue_review_disabled =
+                if matches!(dispatch_type.as_deref(), Some("implementation" | "rework")) {
+                    auto_queue_review_disabled_for_runtime_dispatch_pg(&mut tx, &dispatch_id)
+                        .await?
+                } else {
+                    false
+                };
 
             sqlx::query(
                 "INSERT INTO dispatch_events (
@@ -438,12 +491,32 @@ fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_js
             )
             .bind(&dispatch_id)
             .bind(kanban_card_id)
-            .bind(dispatch_type)
+            .bind(dispatch_type.clone())
             .bind(&current_status)
             .bind(&result_json)
             .execute(&mut *tx)
             .await
             .map_err(|error| format!("record postgres dispatch event for {dispatch_id}: {error}"))?;
+
+            if should_sync_runtime_auto_queue_terminal_entry(
+                dispatch_type.as_deref(),
+                &result_value,
+                auto_queue_review_disabled,
+            ) {
+                crate::db::auto_queue::sync_dispatch_terminal_entries_on_pg_tx(
+                    &mut tx,
+                    &dispatch_id,
+                    crate::db::auto_queue::ENTRY_STATUS_DONE,
+                    "turn_bridge_runtime_db_fallback",
+                    true,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "sync auto_queue_entries on runtime dispatch completion {dispatch_id}: {error}"
+                    )
+                })?;
+            }
 
             sqlx::query(
                 "INSERT INTO kv_meta (key, value)
@@ -1682,6 +1755,42 @@ mod failure_result_tests {
             result["message"],
             "authentication expired; re-authentication required"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_completion_policy_tests {
+    use super::should_sync_runtime_auto_queue_terminal_entry;
+
+    #[test]
+    fn runtime_auto_queue_terminal_sync_matches_dispatch_completion_policy() {
+        let normal_result = serde_json::json!({"completion_source": "watcher_db_fallback"});
+        let noop_result = serde_json::json!({
+            "completion_source": "watcher_db_fallback",
+            "work_outcome": "noop",
+            "completed_without_changes": true
+        });
+
+        assert!(should_sync_runtime_auto_queue_terminal_entry(
+            Some("implementation"),
+            &normal_result,
+            false
+        ));
+        assert!(!should_sync_runtime_auto_queue_terminal_entry(
+            Some("implementation"),
+            &noop_result,
+            false
+        ));
+        assert!(!should_sync_runtime_auto_queue_terminal_entry(
+            Some("rework"),
+            &normal_result,
+            true
+        ));
+        assert!(!should_sync_runtime_auto_queue_terminal_entry(
+            Some("consultation"),
+            &normal_result,
+            false
+        ));
     }
 }
 

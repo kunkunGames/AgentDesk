@@ -821,7 +821,6 @@ pub async fn update_entry_status_on_pg_tx(
 }
 
 /// Route dispatch-linked terminal transitions through the canonical entry
-/// Route dispatch-linked terminal transitions through the canonical entry
 /// helper so PG transition bookkeeping and run finalization stay consistent.
 pub async fn sync_dispatch_terminal_entries_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -2969,6 +2968,331 @@ mod resume_session_context_tests {
             resume_session_id_from_context(Some(r#"{"auto_queue_retry_resume_session_id":"   "}"#)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_terminal_sync_pg_tests {
+    use super::{ENTRY_STATUS_DONE, ENTRY_STATUS_SKIPPED, sync_dispatch_terminal_entries_on_pg_tx};
+    use chrono::{DateTime, Utc};
+    use sqlx::{PgPool, Row};
+
+    struct TestPostgresDb {
+        _lock: crate::db::postgres::PostgresTestLifecycleGuard,
+        admin_url: String,
+        database_name: String,
+        database_url: String,
+        cleanup_armed: bool,
+    }
+
+    impl TestPostgresDb {
+        async fn create() -> Self {
+            let lock = crate::db::postgres::lock_test_lifecycle();
+            let admin_url = postgres_admin_database_url();
+            let database_name = format!(
+                "agentdesk_dispatch_terminal_sync_{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "dispatch terminal sync pg tests",
+            )
+            .await
+            .expect("create dispatch terminal sync test db");
+
+            Self {
+                _lock: lock,
+                admin_url,
+                database_name,
+                database_url,
+                cleanup_armed: true,
+            }
+        }
+
+        async fn connect_and_migrate(&self) -> PgPool {
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "dispatch terminal sync pg tests",
+            )
+            .await
+            .expect("connect + migrate dispatch terminal sync test db")
+        }
+
+        async fn drop(mut self) {
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "dispatch terminal sync pg tests",
+            )
+            .await
+            .expect("drop dispatch terminal sync test db");
+            self.cleanup_armed = false;
+        }
+    }
+
+    impl Drop for TestPostgresDb {
+        fn drop(&mut self) {
+            if !self.cleanup_armed {
+                return;
+            }
+            let admin_url = self.admin_url.clone();
+            let database_name = self.database_name.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("dispatch terminal sync pg cleanup {database_name}"))
+                .spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    let _ = runtime.block_on(crate::db::postgres::drop_test_database(
+                        &admin_url,
+                        &database_name,
+                        "dispatch terminal sync pg tests cleanup",
+                    ));
+                })
+                .map(|handle| handle.join());
+        }
+    }
+
+    fn postgres_base_database_url() -> String {
+        if let Ok(base) = std::env::var("POSTGRES_TEST_DATABASE_URL_BASE") {
+            let trimmed = base.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+        let user = std::env::var("PGUSER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| std::env::var("USER").ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgres".to_string());
+        let password = std::env::var("PGPASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let host = std::env::var("PGHOST")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        let port = std::env::var("PGPORT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "5432".to_string());
+        match password {
+            Some(password) => format!("postgresql://{user}:{password}@{host}:{port}"),
+            None => format!("postgresql://{user}@{host}:{port}"),
+        }
+    }
+
+    fn postgres_admin_database_url() -> String {
+        let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgres".to_string());
+        format!("{}/{}", postgres_base_database_url(), admin_db)
+    }
+
+    async fn setup_pool(pg_db: &TestPostgresDb) -> PgPool {
+        let pool = pg_db.connect_and_migrate().await;
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-1', 'repo-1', 'agent-1', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed run");
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, discord_channel_id)
+             VALUES ('agent-1', 'Agent 1', 'claude', '123')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+        sqlx::query(
+            "INSERT INTO auto_queue_slots
+                (agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map)
+             VALUES ('agent-1', 0, 'run-1', 0, CAST('{}' AS jsonb))",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed slot");
+        pool
+    }
+
+    async fn entry_row_status_dispatch_completed(
+        pool: &PgPool,
+        entry_id: &str,
+    ) -> (String, Option<String>, Option<DateTime<Utc>>) {
+        let row = sqlx::query(
+            "SELECT status, dispatch_id, completed_at
+             FROM auto_queue_entries
+             WHERE id = $1",
+        )
+        .bind(entry_id)
+        .fetch_one(pool)
+        .await
+        .expect("entry row");
+        (
+            row.try_get::<String, _>("status").expect("status"),
+            row.try_get::<Option<String>, _>("dispatch_id")
+                .expect("dispatch_id"),
+            row.try_get::<Option<DateTime<Utc>>, _>("completed_at")
+                .expect("completed_at"),
+        )
+    }
+
+    async fn run_status(pool: &PgPool, run_id: &str) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM auto_queue_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("run row")
+    }
+
+    async fn slot_run(pool: &PgPool, agent_id: &str, slot_index: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT assigned_run_id
+             FROM auto_queue_slots
+             WHERE agent_id = $1 AND slot_index = $2",
+        )
+        .bind(agent_id)
+        .bind(slot_index)
+        .fetch_one(pool)
+        .await
+        .expect("slot row")
+    }
+
+    #[tokio::test]
+    async fn dispatch_terminal_sync_marks_entry_done_without_finalizing_active_run_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id)
+             VALUES ('card-sync-done', 'Card Sync Done', 'in_progress', 'agent-1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed card");
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, dispatch_type, status, context)
+             VALUES ('dispatch-sync-done', 'card-sync-done', 'agent-1',
+                     'implementation', 'completed', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dispatch");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index,
+                 thread_group, batch_phase)
+             VALUES ('entry-sync-done', 'run-1', 'card-sync-done', 'agent-1',
+                     'dispatched', 'dispatch-sync-done', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed entry");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let changed = sync_dispatch_terminal_entries_on_pg_tx(
+            &mut tx,
+            "dispatch-sync-done",
+            ENTRY_STATUS_DONE,
+            "test_runtime_finalizer",
+            true,
+        )
+        .await
+        .expect("sync dispatch terminal");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(changed, 1);
+        let (status, dispatch_id, completed_at) =
+            entry_row_status_dispatch_completed(&pool, "entry-sync-done").await;
+        assert_eq!(status, ENTRY_STATUS_DONE);
+        assert_eq!(dispatch_id.as_deref(), Some("dispatch-sync-done"));
+        assert!(completed_at.is_some());
+        assert_eq!(run_status(&pool, "run-1").await, "active");
+        assert_eq!(
+            slot_run(&pool, "agent-1", 0).await.as_deref(),
+            Some("run-1")
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_terminal_sync_respects_blocking_phase_gate_on_paused_run_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET status = 'paused' WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("pause run");
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id)
+             VALUES ('card-sync-skip', 'Card Sync Skip', 'in_progress', 'agent-1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed card");
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, dispatch_type, status, context)
+             VALUES ('dispatch-sync-skip', 'card-sync-skip', 'agent-1',
+                     'implementation', 'cancelled', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dispatch");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index,
+                 thread_group, batch_phase)
+             VALUES ('entry-sync-skip', 'run-1', 'card-sync-skip', 'agent-1',
+                     'dispatched', 'dispatch-sync-skip', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed entry");
+        sqlx::query(
+            "INSERT INTO auto_queue_phase_gates
+                (run_id, phase, status, verdict, pass_verdict, next_phase,
+                 final_phase, anchor_card_id)
+             VALUES ('run-1', 0, 'pending', NULL, 'phase_gate_passed',
+                     NULL, TRUE, 'card-sync-skip')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed blocking phase gate");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let changed = sync_dispatch_terminal_entries_on_pg_tx(
+            &mut tx,
+            "dispatch-sync-skip",
+            ENTRY_STATUS_SKIPPED,
+            "test_phase_gate_finalizer",
+            true,
+        )
+        .await
+        .expect("sync dispatch terminal");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(changed, 1);
+        assert_eq!(
+            entry_row_status_dispatch_completed(&pool, "entry-sync-skip")
+                .await
+                .0,
+            ENTRY_STATUS_SKIPPED
+        );
+        assert_eq!(run_status(&pool, "run-1").await, "paused");
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 }
 
