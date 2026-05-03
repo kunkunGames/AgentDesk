@@ -42,8 +42,7 @@ module.exports = function attachIdleKill(timeouts, helpers) {
         "WHERE status = 'idle' " +
         "AND provider IN ('claude', 'codex', 'qwen') " +
         "AND active_dispatch_id IS NULL " +
-        "AND COALESCE(last_heartbeat, created_at) < datetime('now', '-60 minutes') " +
-        "ORDER BY last_seen_at ASC LIMIT 50"
+        "AND COALESCE(last_heartbeat, created_at) < datetime('now', '-60 minutes')"
       );
       var safetySessions = agentdesk.db.query(
         "SELECT session_key, agent_id, provider, active_dispatch_id, thread_channel_id, " +
@@ -51,8 +50,7 @@ module.exports = function attachIdleKill(timeouts, helpers) {
         "FROM sessions " +
         "WHERE status = 'idle' " +
         "AND provider IN ('claude', 'codex', 'qwen') " +
-        "AND COALESCE(last_heartbeat, created_at) < datetime('now', '-180 minutes') " +
-        "ORDER BY last_seen_at ASC LIMIT 50"
+        "AND COALESCE(last_heartbeat, created_at) < datetime('now', '-180 minutes')"
       );
 
       var now = Date.now();
