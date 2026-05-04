@@ -1,0 +1,28 @@
+## Summary
+Added `aria-label` and `aria-pressed` attributes to the color picker buttons in `OfficeManagerModal` and `OfficeManagerView` to improve accessibility for screen readers.
+
+## Accessibility/UX invariant
+Ensures icon-only or color-only interactive elements have an accessible name and their state is clearly communicated to assistive technologies.
+
+## User impact
+Screen reader users will now know which color they are selecting when managing offices.
+
+## What changed
+- Added `aria-label` to the color `<button>` elements in `dashboard/src/components/OfficeManagerModal.tsx`.
+- Added `aria-pressed` to reflect selection state in `dashboard/src/components/OfficeManagerModal.tsx`.
+- Applied the exact same fixes to the color picker buttons in `dashboard/src/components/OfficeManagerView.tsx`.
+- Added `type="button"` to ensure these buttons don't submit forms accidentally.
+
+## Tests or verification
+- `verify-dashboard.sh` passes
+
+## Blocked verification, if any
+None
+
+## Boundary fingerprint
+- Agent: Accessor
+- Boundary: Office Manager
+- Primary files: `dashboard/src/components/OfficeManagerModal.tsx`, `dashboard/src/components/OfficeManagerView.tsx`
+- Accessibility/UX invariant: Add accessible names and state to color pickers
+- Related PRs/issues checked: No overlapping PRs found touching these components
+- Why this is non-overlapping: The issue targets a specific missing `aria-label` on color pickers in the dashboard.
