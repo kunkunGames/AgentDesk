@@ -1,0 +1,18 @@
+🩺 Doctor: translate diagnostic messages in orchestrator to English
+
+Summary:
+Translated all Korean diagnostic messages and guidance strings in `src/cli/doctor/orchestrator.rs` to English to adhere to the rule "When adding new error or diagnostic messages (e.g., in the CLI doctor checks), they must be written in English to maintain consistency, avoiding hardcoded non-English localizations."
+
+Runtime/config/install invariant:
+Maintains the exact same behavior, checks, and structure of `agentdesk doctor`, only updating strings.
+
+User-facing failure avoided:
+Avoids mixing Korean and English diagnostic output for users using `agentdesk doctor`.
+
+Fix or coverage added:
+Fixes localization inconsistency in CLI doctor output. Replaces all Korean hardcoded strings.
+
+Verification commands and results:
+- `cargo clippy --all-targets -- -W clippy::all` - 422 warnings, mostly unrelated to this PR. No errors.
+- `RUSTC_WRAPPER="" cargo test --bin agentdesk doctor::` - 0 passed, 285 filtered out, OK.
+- Verified absence of `[가-힣]` regex match in `src/cli/doctor/orchestrator.rs`.
