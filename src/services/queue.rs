@@ -12,6 +12,43 @@ use crate::services::turn_lifecycle::{
 };
 use poise::serenity_prelude::ChannelId;
 
+/// #1672 P2: shared post-cancel drain helper used by both the
+/// `/turns/{channel_id}/cancel` and `/dispatches/{id}/cancel` queue-api
+/// surfaces. Whenever a cancel goes through the *preserve* path (queue
+/// stays put, watcher stays alive) the channel becomes idle while
+/// `pending_queue` items are still on disk — without an explicit drain
+/// kick the next intervention only runs after a fresh user message
+/// arrives. This helper centralises the call so the two cancel
+/// entry-points cannot drift apart.
+///
+/// codex review round-4 P2-2 (#1672): returns the post-hydrate queue
+/// depth so the cancel response builders can publish a
+/// `queued_remaining` value that reflects the post-drain state. The
+/// `cancel_turn` flow runs the lifecycle finalizer *before* this
+/// helper, so the lifecycle's `queue_depth_after` is taken at a
+/// moment when the in-memory mailbox is intentionally empty
+/// (queue lives only on disk while the cancel preserves it). Without
+/// this re-measurement the API surface reports `queued_remaining: 0`
+/// even though the mailbox is repopulated within a tick of the
+/// response being built.
+async fn schedule_post_cancel_queue_drain(
+    health_registry: Option<&Arc<HealthRegistry>>,
+    target: &TurnLifecycleTarget,
+    reason: &'static str,
+) -> Option<usize> {
+    let registry = health_registry?;
+    let provider = target.provider.as_ref()?;
+    let channel_id = target.channel_id?;
+    let outcome = crate::services::discord::health::schedule_pending_queue_drain_after_cancel(
+        registry.as_ref(),
+        provider.as_str(),
+        channel_id,
+        reason,
+    )
+    .await;
+    Some(outcome.queue_depth_after)
+}
+
 #[derive(Clone)]
 pub struct QueueService {
     pg_pool: Option<PgPool>,
@@ -109,6 +146,11 @@ impl QueueService {
                 let mut turn_queue_preserved = None;
                 let mut turn_inflight_cleared = None;
                 let mut turn_queued_remaining = None;
+                // #1672 P2: capture the lifecycle target so we can kick a
+                // post-cancel queue drain after the dispatch row is
+                // updated — same semantics the `/turns/{id}/cancel`
+                // surface already provides.
+                let mut drain_target: Option<TurnLifecycleTarget> = None;
 
                 if let Some(active_turn) = active_turn.as_ref() {
                     let provider_kind = active_turn
@@ -186,6 +228,7 @@ impl QueueService {
                     turn_queue_preserved = Some(lifecycle.queue_preserved);
                     turn_inflight_cleared = Some(lifecycle.inflight_cleared);
                     turn_queued_remaining = lifecycle.queue_depth;
+                    drain_target = Some(target);
                 }
 
                 crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_pg(
@@ -213,6 +256,29 @@ impl QueueService {
                         .with_operation("cancel_dispatch.clear_guard_pg")
                         .with_context("dispatch_id", dispatch_id)
                     })?;
+
+                // #1672 P2: with the active turn cancelled and the
+                // dispatch row finalized, kick the deferred idle-queue
+                // drain so any preserved pending_queue items resume
+                // without waiting for the next user message — mirrors
+                // the `/turns/{channel_id}/cancel` (preserve) surface.
+                //
+                // codex review round-4 P2-2 (#1672): also fold the
+                // post-hydrate depth back into `turn_queued_remaining`
+                // so the response advertises the mailbox state that
+                // the channel is actually in once the deferred drain
+                // is queued.
+                if let Some(target) = drain_target.as_ref() {
+                    if let Some(post_depth) = schedule_post_cancel_queue_drain(
+                        health_registry,
+                        target,
+                        "queue_api_cancel_dispatch",
+                    )
+                    .await
+                    {
+                        turn_queued_remaining = Some(post_depth);
+                    }
+                }
 
                 tracing::info!("[queue-api] Cancelled dispatch {dispatch_id}");
                 Ok(json!({
@@ -455,17 +521,57 @@ impl QueueService {
         }
 
         let exact_channel_match = match_rank.is_none_or(|rank| rank <= 2);
+
+        // #1672: prefer the *observed* tmux session name over the
+        // session-key-derived one. The latter is empty whenever the
+        // session row is missing (cancel-via-watcher fallback) but the
+        // runtime still knows the tmux name from the watcher binding /
+        // inflight state — those are exactly the incidents where the
+        // operator most needs to see the real session name.
+        let reported_tmux_session = lifecycle
+            .tmux_session_observed
+            .clone()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| tmux_name.clone());
+        let lifecycle_queued_remaining = lifecycle.queue_depth_after.or(lifecycle.queue_depth);
+
+        // #1672: with the cancel completed and the channel idle, kick
+        // any survived pending_queue items so the next intervention is
+        // picked up without needing a fresh user message to drive the
+        // mailbox poll.
+        //
+        // codex review round-4 P2-2 (#1672): the lifecycle's
+        // `queue_depth_after` is captured *before* the disk-backed
+        // queue gets re-hydrated into the in-memory mailbox, so for
+        // the preserve path it is typically `0` even when the cancel
+        // response is about to deliver a non-empty queue back to the
+        // channel. Use the post-hydrate depth from the drain helper
+        // instead so `queued_remaining` matches what the next
+        // intervention sees.
+        let queued_remaining = if !force {
+            schedule_post_cancel_queue_drain(health_registry, &target, "queue_api_cancel_turn")
+                .await
+                .or(lifecycle_queued_remaining)
+        } else {
+            lifecycle_queued_remaining
+        };
+
         tracing::info!(
-            "[queue-api] Cancelled turn: channel={}, session={:?}, tmux={}, killed={}, dispatch={:?}, lifecycle={}, agent={:?}, requested_provider={:?}, exact_match={}",
+            "[queue-api] Cancelled turn: channel={}, session={:?}, tmux={}, killed={}, dispatch={:?}, lifecycle={}, agent={:?}, requested_provider={:?}, exact_match={}, queue_preserved={}, queued_before={:?}, queued_after={:?}, queue_disk_before={}, queue_disk_after={}",
             channel_id,
             session_key,
-            tmux_name,
+            reported_tmux_session,
             lifecycle.tmux_killed,
             dispatch_id,
             lifecycle.lifecycle_path,
             agent_id,
             requested_provider,
             exact_channel_match,
+            lifecycle.queue_preserved,
+            lifecycle.queue_depth_before,
+            lifecycle.queue_depth_after,
+            lifecycle.queue_disk_present_before,
+            lifecycle.queue_disk_present_after,
         );
 
         Ok(json!({
@@ -475,11 +581,14 @@ impl QueueService {
             "requested_provider": requested_provider,
             "exact_channel_match": exact_channel_match,
             "session_key": session_key,
-            "tmux_session": tmux_name,
+            "tmux_session": reported_tmux_session,
             "tmux_killed": lifecycle.tmux_killed,
             "lifecycle_path": lifecycle.lifecycle_path,
-            "queued_remaining": lifecycle.queue_depth,
+            "queued_remaining": queued_remaining,
+            "queued_before": lifecycle.queue_depth_before,
             "queue_preserved": lifecycle.queue_preserved,
+            "queue_disk_present_before": lifecycle.queue_disk_present_before,
+            "queue_disk_present_after": lifecycle.queue_disk_present_after,
             "inflight_cleared": lifecycle.inflight_cleared,
             "dispatch_cancelled": dispatch_id,
             "turn_status": finalizer.status,
