@@ -53,6 +53,7 @@ mod session_runtime;
 pub(crate) mod settings;
 pub(crate) mod shared_memory;
 mod stall_recovery;
+pub(in crate::services::discord) mod streaming_finalizer;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]
@@ -114,7 +115,7 @@ use formatting::{
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 pub(crate) use inflight::clear_inflight_state;
 use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
-use prompt_builder::build_system_prompt;
+use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
 use recovery_engine::restore_inflight_turns;
 use restart_report::flush_restart_reports;
 use router::handle_event;
@@ -2630,6 +2631,24 @@ async fn mailbox_replace_queue(
             queue_persistence_context(shared, provider, channel_id),
         )
         .await;
+}
+
+/// codex review round-4 P2-1 (#1672): atomic disk → in-memory hydration
+/// helper. See `ChannelMailboxHandle::hydrate_pending_queue` for the
+/// race-free merge contract.
+async fn mailbox_hydrate_pending_queue(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    disk_items: Vec<Intervention>,
+) -> usize {
+    shared
+        .mailbox(channel_id)
+        .hydrate_pending_queue(
+            disk_items,
+            queue_persistence_context(shared, provider, channel_id),
+        )
+        .await
 }
 
 async fn mailbox_restart_drain_all(shared: &SharedData, provider: &ProviderKind) -> usize {

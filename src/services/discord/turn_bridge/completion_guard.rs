@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::services::git::GitCommand;
 use crate::utils::format::safe_suffix;
 use sqlx::Row;
 
@@ -363,15 +364,66 @@ fn runtime_postgres_reconcile_key(dispatch_id: &str) -> String {
     format!("reconcile_dispatch:{dispatch_id}")
 }
 
-fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_json::Value) -> bool {
+fn is_noop_runtime_completion_result(result: &serde_json::Value) -> bool {
+    result.get("work_outcome").and_then(|entry| entry.as_str()) == Some("noop")
+        || result
+            .get("completed_without_changes")
+            .and_then(|entry| entry.as_bool())
+            == Some(true)
+}
+
+fn should_sync_runtime_auto_queue_terminal_entry(
+    dispatch_type: Option<&str>,
+    result: &serde_json::Value,
+    auto_queue_review_disabled: bool,
+) -> bool {
+    match dispatch_type {
+        Some("consultation") => false,
+        Some("implementation" | "rework") => {
+            !is_noop_runtime_completion_result(result) && !auto_queue_review_disabled
+        }
+        _ => true,
+    }
+}
+
+async fn auto_queue_review_disabled_for_runtime_dispatch_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch_id: &str,
+) -> Result<bool, String> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1
+            FROM auto_queue_entries e
+            JOIN auto_queue_runs r ON r.id = e.run_id
+            WHERE e.dispatch_id = $1
+              AND e.status = 'dispatched'
+              AND r.status IN ('active', 'paused')
+              AND COALESCE(r.review_mode, 'enabled') = 'disabled'
+        )",
+    )
+    .bind(dispatch_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| {
+        format!("load auto-queue review_mode for runtime dispatch {dispatch_id}: {error}")
+    })
+}
+
+fn runtime_pg_complete_dispatch_with_result(
+    dispatch_id: &str,
+    result: &serde_json::Value,
+    transition_source: &str,
+) -> bool {
     let dispatch_id = dispatch_id.to_string();
     let result_json = result.to_string();
+    let result_value = result.clone();
+    let transition_source = transition_source.to_string();
     with_runtime_postgres_result(move |pool| {
         Box::pin(async move {
             let mut tx = pool
                 .begin()
                 .await
-                .map_err(|error| format!("begin postgres completion fallback for {dispatch_id}: {error}"))?;
+                .map_err(|error| format!("begin postgres completion via {transition_source} for {dispatch_id}: {error}"))?;
 
             let current = sqlx::query(
                 "SELECT status, kanban_card_id, dispatch_type
@@ -423,6 +475,13 @@ fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_js
                 .try_get::<Option<String>, _>("dispatch_type")
                 .ok()
                 .flatten();
+            let auto_queue_review_disabled =
+                if matches!(dispatch_type.as_deref(), Some("implementation" | "rework")) {
+                    auto_queue_review_disabled_for_runtime_dispatch_pg(&mut tx, &dispatch_id)
+                        .await?
+                } else {
+                    false
+                };
 
             sqlx::query(
                 "INSERT INTO dispatch_events (
@@ -433,16 +492,37 @@ fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_js
                     to_status,
                     transition_source,
                     payload_json
-                ) VALUES ($1, $2, $3, $4, 'completed', 'turn_bridge_runtime_db_fallback', CAST($5 AS jsonb))",
+                ) VALUES ($1, $2, $3, $4, 'completed', $5, CAST($6 AS jsonb))",
             )
             .bind(&dispatch_id)
             .bind(kanban_card_id)
-            .bind(dispatch_type)
+            .bind(dispatch_type.clone())
             .bind(&current_status)
+            .bind(&transition_source)
             .bind(&result_json)
             .execute(&mut *tx)
             .await
             .map_err(|error| format!("record postgres dispatch event for {dispatch_id}: {error}"))?;
+
+            if should_sync_runtime_auto_queue_terminal_entry(
+                dispatch_type.as_deref(),
+                &result_value,
+                auto_queue_review_disabled,
+            ) {
+                crate::db::auto_queue::sync_dispatch_terminal_entries_on_pg_tx(
+                    &mut tx,
+                    &dispatch_id,
+                    crate::db::auto_queue::ENTRY_STATUS_DONE,
+                    &transition_source,
+                    true,
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "sync auto_queue_entries on runtime dispatch completion {dispatch_id}: {error}"
+                    )
+                })?;
+            }
 
             sqlx::query(
                 "INSERT INTO kv_meta (key, value)
@@ -456,7 +536,7 @@ fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_js
             .await
             .map_err(|error| format!("set postgres reconcile marker for {dispatch_id}: {error}"))?;
 
-            if !transition_source_uses_live_command_bot("turn_bridge_runtime_db_fallback") {
+            if !transition_source_uses_live_command_bot(&transition_source) {
                 sqlx::query(
                     "INSERT INTO dispatch_outbox (dispatch_id, action)
                      SELECT $1, 'status_reaction'
@@ -476,7 +556,7 @@ fn runtime_pg_complete_dispatch_with_result(dispatch_id: &str, result: &serde_js
 
             tx.commit()
                 .await
-                .map_err(|error| format!("commit postgres completion fallback for {dispatch_id}: {error}"))?;
+                .map_err(|error| format!("commit postgres completion via {transition_source} for {dispatch_id}: {error}"))?;
             Ok(true)
         })
     })
@@ -510,13 +590,56 @@ fn runtime_pg_reset_linked_auto_queue_entries(dispatch_id: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn runtime_pg_fail_dispatch_with_result(dispatch_id: &str, error_msg: &str) -> bool {
+fn runtime_pg_fail_linked_auto_queue_entries(dispatch_id: &str) -> bool {
     let dispatch_id = dispatch_id.to_string();
-    let fallback_result = serde_json::json!({
-        "error": error_msg.chars().take(500).collect::<String>(),
-        "fallback": true,
+    with_runtime_postgres_result(move |pool| {
+        Box::pin(async move {
+            let changed = sqlx::query(
+                "UPDATE auto_queue_entries
+                 SET status = 'failed',
+                     dispatch_id = NULL,
+                     slot_index = NULL,
+                     dispatched_at = NULL,
+                     completed_at = NOW()
+                 WHERE dispatch_id = $1
+                   AND status IN ('pending', 'dispatched')",
+            )
+            .bind(&dispatch_id)
+            .execute(&pool)
+            .await
+            .map_err(|error| {
+                format!("mark postgres auto_queue_entries failed for {dispatch_id}: {error}")
+            })?
+            .rows_affected();
+            Ok(changed > 0)
+        })
     })
-    .to_string();
+    .unwrap_or(false)
+}
+
+fn dispatch_failure_result(error_msg: &str, error_code: Option<&str>) -> serde_json::Value {
+    let message = error_msg.chars().take(500).collect::<String>();
+    match error_code {
+        Some(code) => serde_json::json!({
+            "error": code,
+            "message": message,
+        }),
+        None => serde_json::json!({
+            "error": message,
+        }),
+    }
+}
+
+fn runtime_pg_fail_dispatch_with_result(
+    dispatch_id: &str,
+    error_msg: &str,
+    error_code: Option<&str>,
+    reset_auto_queue_entries: bool,
+) -> bool {
+    let dispatch_id = dispatch_id.to_string();
+    let mut fallback_result = dispatch_failure_result(error_msg, error_code);
+    fallback_result["fallback"] = serde_json::json!(true);
+    let fallback_result = fallback_result.to_string();
     with_runtime_postgres_result(move |pool| {
         Box::pin(async move {
             let mut tx = pool
@@ -594,20 +717,37 @@ fn runtime_pg_fail_dispatch_with_result(dispatch_id: &str, error_msg: &str) -> b
             .await
             .map_err(|error| format!("record postgres dispatch failure event for {dispatch_id}: {error}"))?;
 
-            sqlx::query(
-                "UPDATE auto_queue_entries
-                 SET status = 'pending',
-                     dispatch_id = NULL,
-                     slot_index = NULL,
-                     dispatched_at = NULL,
-                     completed_at = NULL
-                 WHERE dispatch_id = $1
-                   AND status IN ('pending', 'dispatched')",
-            )
-            .bind(&dispatch_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| format!("reset postgres auto_queue_entries for failed dispatch {dispatch_id}: {error}"))?;
+            if reset_auto_queue_entries {
+                sqlx::query(
+                    "UPDATE auto_queue_entries
+                     SET status = 'pending',
+                         dispatch_id = NULL,
+                         slot_index = NULL,
+                         dispatched_at = NULL,
+                         completed_at = NULL
+                     WHERE dispatch_id = $1
+                       AND status IN ('pending', 'dispatched')",
+                )
+                .bind(&dispatch_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| format!("reset postgres auto_queue_entries for failed dispatch {dispatch_id}: {error}"))?;
+            } else {
+                sqlx::query(
+                    "UPDATE auto_queue_entries
+                     SET status = 'failed',
+                         dispatch_id = NULL,
+                         slot_index = NULL,
+                         dispatched_at = NULL,
+                         completed_at = NOW()
+                     WHERE dispatch_id = $1
+                       AND status IN ('pending', 'dispatched')",
+                )
+                .bind(&dispatch_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| format!("mark postgres auto_queue_entries failed for dispatch {dispatch_id}: {error}"))?;
+            }
 
             sqlx::query(
                 "INSERT INTO kv_meta (key, value)
@@ -652,7 +792,14 @@ pub(in crate::services::discord) fn runtime_db_fallback_complete_with_result(
     dispatch_id: &str,
     result: &serde_json::Value,
 ) -> bool {
-    runtime_pg_complete_dispatch_with_result(dispatch_id, result)
+    runtime_pg_complete_dispatch_with_result(dispatch_id, result, "turn_bridge_runtime_db_fallback")
+}
+
+pub(in crate::services::discord) fn streaming_final_complete_dispatch_with_result(
+    dispatch_id: &str,
+    result: &serde_json::Value,
+) -> bool {
+    runtime_pg_complete_dispatch_with_result(dispatch_id, result, "watcher_streaming_final")
 }
 
 pub(in crate::services::discord) async fn queue_dispatch_followup_with_handles(
@@ -805,12 +952,11 @@ fn extract_commit_sha_from_output(output: &str, cwd: &str) -> Option<String> {
     }
     let short_sha = last_short_sha?;
     // Resolve short SHA to full SHA
-    std::process::Command::new("git")
+    GitCommand::new()
         .args(["rev-parse", short_sha])
-        .current_dir(cwd)
-        .output()
+        .repo(cwd)
+        .run_output()
         .ok()
-        .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
@@ -1216,26 +1362,53 @@ pub(in crate::services::discord) async fn fail_dispatch_with_retry(
     dispatch_id: Option<&str>,
     error_msg: &str,
 ) {
+    fail_dispatch_with_policy(dispatch_id, error_msg, None, true).await;
+}
+
+pub(in crate::services::discord) async fn fail_dispatch_auth_expired(
+    _api_port: u16,
+    dispatch_id: Option<&str>,
+    error_msg: &str,
+) {
+    fail_dispatch_with_policy(dispatch_id, error_msg, Some("auth_token_expired"), false).await;
+}
+
+async fn fail_dispatch_with_policy(
+    dispatch_id: Option<&str>,
+    error_msg: &str,
+    error_code: Option<&str>,
+    reset_auto_queue_entries: bool,
+) {
     let Some(dispatch_id) = dispatch_id else {
         return;
     };
-    let dispatch_span =
-        crate::logging::dispatch_span("fail_dispatch_with_retry", Some(dispatch_id), None, None);
+    let span_name = if reset_auto_queue_entries {
+        "fail_dispatch_with_retry"
+    } else {
+        "fail_dispatch_terminal"
+    };
+    let dispatch_span = crate::logging::dispatch_span(span_name, Some(dispatch_id), None, None);
     let _guard = dispatch_span.enter();
     let payload = crate::server::routes::dispatches::UpdateDispatchBody {
         status: Some("failed".to_string()),
-        result: Some(serde_json::json!({
-            "error": error_msg.chars().take(500).collect::<String>()
-        })),
+        result: Some(dispatch_failure_result(error_msg, error_code)),
     };
     for attempt in 1..=3 {
         match crate::services::discord::internal_api::update_dispatch(dispatch_id, payload.clone())
             .await
         {
             Ok(_) => {
-                tracing::warn!("marked dispatch as failed after transport error");
-                if !runtime_pg_reset_linked_auto_queue_entries(dispatch_id) {
-                    tracing::warn!("failed dispatch auto-queue reset skipped or affected no rows");
+                tracing::warn!("marked dispatch as failed");
+                if reset_auto_queue_entries {
+                    if !runtime_pg_reset_linked_auto_queue_entries(dispatch_id) {
+                        tracing::warn!(
+                            "failed dispatch auto-queue retry reset skipped or affected no rows"
+                        );
+                    }
+                } else if !runtime_pg_fail_linked_auto_queue_entries(dispatch_id) {
+                    tracing::warn!(
+                        "failed dispatch auto-queue terminal update skipped or affected no rows"
+                    );
                 }
                 return;
             }
@@ -1249,7 +1422,12 @@ pub(in crate::services::discord) async fn fail_dispatch_with_retry(
     // Fallback: direct DB update to prevent orphan dispatch.
     // Also leave a reconciliation marker so onTick can run the hook chain later.
     tracing::error!("dispatch PATCH failed after retries; falling back to direct DB");
-    if !runtime_pg_fail_dispatch_with_result(dispatch_id, error_msg) {
+    if !runtime_pg_fail_dispatch_with_result(
+        dispatch_id,
+        error_msg,
+        error_code,
+        reset_auto_queue_entries,
+    ) {
         tracing::warn!("postgres failure fallback skipped or affected no rows");
     }
 }
@@ -1323,9 +1501,17 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
         );
         let repo_dirs = completion_repo_dirs(adk_cwd, &hints);
         if explicit_work_outcome != Some("noop") {
-            if let Some((repo_dir, output_commit)) = turn_output
-                .and_then(|output| extract_output_commit_from_repo_dirs(output, &repo_dirs))
-            {
+            let turn_output = turn_output.map(str::to_string);
+            let repo_dirs_for_lookup = repo_dirs.clone();
+            let output_commit = tokio::task::spawn_blocking(move || {
+                turn_output.as_deref().and_then(|output| {
+                    extract_output_commit_from_repo_dirs(output, &repo_dirs_for_lookup)
+                })
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((repo_dir, output_commit)) = output_commit {
                 hints.output_commit_repo_dir = Some(repo_dir);
                 hints.output_commit = Some(output_commit);
             }
@@ -1558,26 +1744,82 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
     }
 }
 
+#[cfg(test)]
+mod failure_result_tests {
+    use super::dispatch_failure_result;
+
+    #[test]
+    fn dispatch_failure_result_preserves_legacy_error_shape() {
+        let result = dispatch_failure_result("plain transport failure", None);
+
+        assert_eq!(result["error"], "plain transport failure");
+        assert!(result.get("message").is_none());
+    }
+
+    #[test]
+    fn dispatch_failure_result_uses_auth_token_expired_code() {
+        let result = dispatch_failure_result(
+            "authentication expired; re-authentication required",
+            Some("auth_token_expired"),
+        );
+
+        assert_eq!(result["error"], "auth_token_expired");
+        assert_eq!(
+            result["message"],
+            "authentication expired; re-authentication required"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_completion_policy_tests {
+    use super::should_sync_runtime_auto_queue_terminal_entry;
+
+    #[test]
+    fn runtime_auto_queue_terminal_sync_matches_dispatch_completion_policy() {
+        let normal_result = serde_json::json!({"completion_source": "watcher_streaming_final"});
+        let noop_result = serde_json::json!({
+            "completion_source": "watcher_streaming_final",
+            "work_outcome": "noop",
+            "completed_without_changes": true
+        });
+
+        assert!(should_sync_runtime_auto_queue_terminal_entry(
+            Some("implementation"),
+            &normal_result,
+            false
+        ));
+        assert!(!should_sync_runtime_auto_queue_terminal_entry(
+            Some("implementation"),
+            &noop_result,
+            false
+        ));
+        assert!(!should_sync_runtime_auto_queue_terminal_entry(
+            Some("rework"),
+            &normal_result,
+            true
+        ));
+        assert!(!should_sync_runtime_auto_queue_terminal_entry(
+            Some("consultation"),
+            &normal_result,
+            false
+        ));
+    }
+}
+
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
     use std::io::{self, Write};
     use std::path::Path;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     fn run_git(repo_dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = GitCommand::new()
             .args(args)
-            .current_dir(repo_dir)
-            .output()
+            .repo(repo_dir)
+            .run_output()
             .unwrap_or_else(|err| panic!("git {:?} failed to start: {err}", args));
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 

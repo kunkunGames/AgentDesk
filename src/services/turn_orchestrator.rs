@@ -897,6 +897,32 @@ impl ChannelMailboxHandle {
             .await;
     }
 
+    /// codex review round-4 P2-1 (#1672): atomically merge a disk-loaded
+    /// pending queue into the in-memory mailbox without clobbering items
+    /// that arrived concurrently. Disk items are inserted at the *front*
+    /// of the queue (they were enqueued earlier in wall-clock time than
+    /// any in-memory item that survived a cancel-induced empty window),
+    /// and any item whose `message_id` already lives in the mailbox is
+    /// skipped to keep the merge idempotent.
+    ///
+    /// Returns the number of disk items that were absorbed (0 if the
+    /// disk payload was empty, or every entry was already present).
+    pub(crate) async fn hydrate_pending_queue(
+        &self,
+        disk_items: Vec<Intervention>,
+        persistence: QueuePersistenceContext,
+    ) -> usize {
+        self.request(
+            |reply| ChannelMailboxMsg::HydratePendingQueue {
+                disk_items,
+                persistence,
+                reply,
+            },
+            0,
+        )
+        .await
+    }
+
     pub(crate) async fn restart_drain(
         &self,
         persistence: QueuePersistenceContext,
@@ -958,34 +984,6 @@ pub(crate) struct WatchdogDeadlineExtension {
 pub(crate) enum WatchdogDeadlineExtensionError {
     MailboxUnavailable,
     NoActiveTurn,
-    ExtensionLimitReached {
-        extension_count: u32,
-        extension_count_limit: u32,
-        extension_total_secs: u64,
-        extension_total_secs_limit: u64,
-    },
-}
-
-fn watchdog_extension_count_limit() -> u32 {
-    static CACHED: LazyLock<u32> = LazyLock::new(|| {
-        std::env::var("AGENTDESK_TURN_TIMEOUT_EXTEND_MAX_COUNT")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(6)
-    });
-    *CACHED
-}
-
-fn watchdog_extension_total_secs_limit() -> u64 {
-    static CACHED: LazyLock<u64> = LazyLock::new(|| {
-        std::env::var("AGENTDESK_TURN_TIMEOUT_EXTEND_MAX_TOTAL_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(3 * 3600)
-    });
-    *CACHED
 }
 
 #[derive(Clone, Default)]
@@ -1129,6 +1127,11 @@ enum ChannelMailboxMsg {
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<()>,
     },
+    HydratePendingQueue {
+        disk_items: Vec<Intervention>,
+        persistence: QueuePersistenceContext,
+        reply: oneshot::Sender<usize>,
+    },
     RestartDrain {
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<RestartDrainResult>,
@@ -1216,29 +1219,9 @@ fn extend_active_watchdog_deadline(
         return Err(WatchdogDeadlineExtensionError::NoActiveTurn);
     };
 
-    let count_limit = watchdog_extension_count_limit();
-    let total_secs_limit = watchdog_extension_total_secs_limit();
-    if state.watchdog_extension_count >= count_limit
-        || state.watchdog_extension_total_secs >= total_secs_limit
-    {
-        return Err(WatchdogDeadlineExtensionError::ExtensionLimitReached {
-            extension_count: state.watchdog_extension_count,
-            extension_count_limit: count_limit,
-            extension_total_secs: state.watchdog_extension_total_secs,
-            extension_total_secs_limit: total_secs_limit,
-        });
-    }
-
-    let remaining_total_secs = total_secs_limit.saturating_sub(state.watchdog_extension_total_secs);
-    let applied_extend_secs = requested_extend_secs.min(remaining_total_secs);
-    if applied_extend_secs == 0 {
-        return Err(WatchdogDeadlineExtensionError::ExtensionLimitReached {
-            extension_count: state.watchdog_extension_count,
-            extension_count_limit: count_limit,
-            extension_total_secs: state.watchdog_extension_total_secs,
-            extension_total_secs_limit: total_secs_limit,
-        });
-    }
+    let count_limit = u32::MAX;
+    let total_secs_limit = u64::MAX;
+    let applied_extend_secs = requested_extend_secs;
 
     let now_ms = Utc::now().timestamp_millis();
     let current_deadline = cancel_token.watchdog_deadline_ms.load(Ordering::Relaxed);
@@ -1268,8 +1251,10 @@ fn extend_active_watchdog_deadline(
         .watchdog_max_deadline_ms
         .store(max_deadline_ms, Ordering::Relaxed);
 
-    state.watchdog_extension_count += 1;
-    state.watchdog_extension_total_secs += applied_extend_secs;
+    state.watchdog_extension_count = state.watchdog_extension_count.saturating_add(1);
+    state.watchdog_extension_total_secs = state
+        .watchdog_extension_total_secs
+        .saturating_add(applied_extend_secs);
 
     let extension = WatchdogDeadlineExtension {
         requested_deadline_ms,
@@ -1281,7 +1266,7 @@ fn extend_active_watchdog_deadline(
         extension_count_limit: count_limit,
         extension_total_secs: state.watchdog_extension_total_secs,
         extension_total_secs_limit: total_secs_limit,
-        clamped: applied_extend_secs < requested_extend_secs,
+        clamped: false,
     };
     state.watchdog_deadline_override = Some(extension);
     Ok(extension)
@@ -1490,6 +1475,42 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     state.intervention_queue = queue;
                     persist_queue(channel_id, &state.intervention_queue, &persistence);
                     let _ = reply.send(());
+                }
+                ChannelMailboxMsg::HydratePendingQueue {
+                    disk_items,
+                    persistence,
+                    reply,
+                } => {
+                    // codex review round-4 P2-1 (#1672): merge disk
+                    // payload into the in-memory queue *atomically* —
+                    // running inside the mailbox actor means no other
+                    // ChannelMailboxMsg can interleave between the
+                    // dedup scan and the prepend, so a concurrent
+                    // `mailbox_enqueue_intervention` is serialised
+                    // either fully before (we'll see its message_id
+                    // and skip the dup) or fully after (it appends to
+                    // the end of the merged queue). Either way no
+                    // user message is lost.
+                    state.last_persistence = Some(persistence.clone());
+                    let existing_ids: std::collections::HashSet<MessageId> = state
+                        .intervention_queue
+                        .iter()
+                        .map(|item| item.message_id)
+                        .collect();
+                    let mut absorbed = 0usize;
+                    // Walk in reverse so repeated `insert(0, …)` ends
+                    // up with disk items in their original order.
+                    for item in disk_items.into_iter().rev() {
+                        if existing_ids.contains(&item.message_id) {
+                            continue;
+                        }
+                        state.intervention_queue.insert(0, item);
+                        absorbed += 1;
+                    }
+                    if absorbed > 0 {
+                        persist_queue(channel_id, &state.intervention_queue, &persistence);
+                    }
+                    let _ = reply.send(absorbed);
                 }
                 ChannelMailboxMsg::RestartDrain { persistence, reply } => {
                     state.last_persistence = Some(persistence.clone());
@@ -2221,6 +2242,8 @@ mod tests {
 
         let extended = handle.extend_timeout(30).await.unwrap();
         assert_eq!(extended.applied_extend_secs, 30);
+        assert_eq!(extended.extension_count_limit, u32::MAX);
+        assert_eq!(extended.extension_total_secs_limit, u64::MAX);
         assert!(!extended.clamped);
         assert!(extended.new_deadline_ms >= now_ms + 90_000);
         assert_eq!(

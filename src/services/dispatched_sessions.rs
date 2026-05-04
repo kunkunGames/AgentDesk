@@ -9,13 +9,12 @@ use crate::db::session_status::{
     is_live_status, is_user_wait_status, normalize_incoming_session_status,
 };
 use crate::server::routes::AppState;
-use crate::services::message_outbox::enqueue_lifecycle_notification_pg;
 use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -54,6 +53,12 @@ async fn hook_session_pg(
     let provider = body.provider.as_deref().unwrap_or("claude");
     let tokens = body.tokens.unwrap_or(0) as i64;
     let active_dispatch_id = normalize_hook_active_dispatch_id(status, body.dispatch_id.as_deref());
+    let instance_id = body
+        .instance_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(state.cluster_instance_id.as_deref());
     let claude_session_id = body.claude_session_id.as_deref().filter(|s| !s.is_empty());
     let raw_provider_session_id = body.session_id.as_deref().filter(|s| !s.is_empty());
 
@@ -72,6 +77,7 @@ async fn hook_session_pg(
         pool,
         dispatched_sessions_db::HookSessionUpsert {
             session_key: &body.session_key,
+            instance_id,
             agent_id: agent_id.as_deref(),
             provider,
             status,
@@ -98,6 +104,7 @@ async fn hook_session_pg(
                 "OnSessionStatusChange",
                 json!({
                     "session_key": body.session_key,
+                    "instance_id": instance_id,
                     "status": status,
                     "agent_id": agent_id,
                     "dispatch_id": dispatch_id,
@@ -225,6 +232,7 @@ pub struct UpdateDispatchedSessionBody {
 #[allow(dead_code)]
 pub struct HookSessionBody {
     pub session_key: String,
+    pub instance_id: Option<String>,
     pub agent_id: Option<String>,
     pub status: Option<String>,
     pub provider: Option<String>,
@@ -255,7 +263,28 @@ pub async fn list_dispatched_sessions(
     let include_all = params.include_merged.as_deref() == Some("1");
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::list_dispatched_sessions_pg(pool, include_all).await {
-            Ok(sessions) => (StatusCode::OK, Json(json!({"sessions": sessions}))),
+            Ok(mut sessions) => {
+                let worker_nodes = match crate::server::cluster::list_worker_nodes(
+                    pool,
+                    state.config.cluster.lease_ttl_secs.max(1),
+                )
+                .await
+                {
+                    Ok(nodes) => nodes,
+                    Err(error) => {
+                        tracing::warn!(
+                            "failed to list worker nodes for dispatched session owner routing: {error}"
+                        );
+                        Vec::new()
+                    }
+                };
+                crate::server::cluster_session_routing::enrich_session_owner_routing(
+                    &mut sessions,
+                    state.cluster_instance_id.as_deref(),
+                    &worker_nodes,
+                );
+                (StatusCode::OK, Json(json!({"sessions": sessions})))
+            }
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": error})),
@@ -332,6 +361,12 @@ async fn hook_session_sqlite_for_tests(
     let provider = body.provider.as_deref().unwrap_or("claude");
     let tokens = body.tokens.unwrap_or(0) as i64;
     let active_dispatch_id = normalize_hook_active_dispatch_id(status, body.dispatch_id.as_deref());
+    let instance_id = body
+        .instance_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(state.cluster_instance_id.as_deref());
     let claude_session_id = body.claude_session_id.as_deref().filter(|s| !s.is_empty());
     let raw_provider_session_id = body.session_id.as_deref().filter(|s| !s.is_empty());
 
@@ -339,6 +374,7 @@ async fn hook_session_sqlite_for_tests(
         &conn,
         dispatched_sessions_db::HookSessionUpsert {
             session_key: &body.session_key,
+            instance_id,
             agent_id: agent_id.as_deref(),
             provider,
             status,
@@ -365,6 +401,7 @@ async fn hook_session_sqlite_for_tests(
                 "OnSessionStatusChange",
                 json!({
                     "session_key": body.session_key,
+                    "instance_id": instance_id,
                     "status": status,
                     "agent_id": agent_id,
                     "dispatch_id": dispatch_id,
@@ -684,6 +721,23 @@ pub(crate) async fn force_kill_session_impl_with_reason(
     retry: bool,
     reason: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    force_kill_session_impl_with_reason_and_forwarding(
+        state,
+        &HeaderMap::new(),
+        session_key,
+        retry,
+        reason,
+    )
+    .await
+}
+
+async fn force_kill_session_impl_with_reason_and_forwarding(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_key: &str,
+    retry: bool,
+    reason: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
     let session_key = session_key;
 
     // Parse tmux session name from session_key (format: "hostname:tmux_name")
@@ -711,7 +765,7 @@ pub(crate) async fn force_kill_session_impl_with_reason(
             Json(json!({"error": "postgres pool unavailable"})),
         );
     };
-    let (active_dispatch_id, agent_id, runtime_channel_id, session_provider) =
+    let (active_dispatch_id, agent_id, runtime_channel_id, session_provider, owner_instance_id) =
         match dispatched_sessions_db::load_force_kill_session_pg(pool, session_key, provider_name)
             .await
         {
@@ -730,8 +784,35 @@ pub(crate) async fn force_kill_session_impl_with_reason(
             }
         };
 
-    let (termination_reason_code, lifecycle_reason_code) =
-        classify_session_termination_reason(reason);
+    if !crate::services::session_forwarding::is_forwarded_request(headers) {
+        match crate::services::session_forwarding::resolve_forward_target(
+            state,
+            owner_instance_id.as_deref(),
+            pool,
+        )
+        .await
+        {
+            crate::services::session_forwarding::ForwardResolution::Local => {}
+            crate::services::session_forwarding::ForwardResolution::Forward(target) => {
+                return crate::services::session_forwarding::forward_force_kill(
+                    state,
+                    &target,
+                    session_key,
+                    retry,
+                    reason,
+                )
+                .await;
+            }
+            crate::services::session_forwarding::ForwardResolution::Unavailable {
+                status,
+                body,
+            } => {
+                return (status, Json(body));
+            }
+        }
+    }
+
+    let termination_reason_code = classify_session_termination_reason(reason);
 
     let lifecycle = force_kill_turn(
         state.health_registry.as_deref(),
@@ -788,43 +869,55 @@ pub(crate) async fn force_kill_session_impl_with_reason(
     };
 
     // Create retry dispatch via central authoritative path (#108)
+    let mut retry_skipped_reason: Option<&'static str> = None;
     if let Some((card_id, to_agent_id, dispatch_type, title, context, retry_count)) = retry_meta {
-        let ctx: serde_json::Value = context
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_else(|| json!({}));
+        if retry_count >= FORCE_KILL_RETRY_LIMIT {
+            retry_skipped_reason = Some("retry_limit_reached");
+            tracing::warn!(
+                "[force-kill] retry dispatch skipped for card {}: retry_count={} limit={}",
+                card_id,
+                retry_count,
+                FORCE_KILL_RETRY_LIMIT
+            );
+        } else {
+            let ctx: serde_json::Value = context
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_else(|| json!({}));
 
-        let meta = dispatched_sessions_db::RetryDispatchMeta {
-            card_id,
-            to_agent_id,
-            dispatch_type,
-            title,
-            context: Some(ctx.to_string()),
-            retry_count,
-        };
-        match dispatched_sessions_db::create_retry_dispatch_pg(pool, &meta).await {
-            Ok(new_id) => {
-                retry_dispatch_id = Some(new_id);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "[force-kill] retry dispatch creation via postgres path failed for card {}: {e}",
-                    meta.card_id
-                );
+            let meta = dispatched_sessions_db::RetryDispatchMeta {
+                card_id,
+                to_agent_id,
+                dispatch_type,
+                title,
+                context: Some(ctx.to_string()),
+                retry_count,
+            };
+            match dispatched_sessions_db::create_retry_dispatch_pg(pool, &meta).await {
+                Ok(new_id) => {
+                    retry_dispatch_id = Some(new_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[force-kill] retry dispatch creation via postgres path failed for card {}: {e}",
+                        meta.card_id
+                    );
+                }
             }
         }
     }
 
-    let queue_activation_requested = if retry_dispatch_id.is_none() {
-        if let Some(ref aid) = agent_id {
-            spawn_auto_queue_activate_for_agent(state.clone(), aid.clone());
-            true
+    let queue_activation_requested =
+        if retry_dispatch_id.is_none() && retry_skipped_reason.is_none() {
+            if let Some(ref aid) = agent_id {
+                spawn_auto_queue_activate_for_agent(state.clone(), aid.clone());
+                true
+            } else {
+                false
+            }
         } else {
             false
-        }
-    } else {
-        false
-    };
+        };
 
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::warn!(
@@ -851,36 +944,6 @@ pub(crate) async fn force_kill_session_impl_with_reason(
         );
     }
 
-    // Notify bot message for force-kill visibility
-    if tmux_killed && let Some(ref channel_id_str) = runtime_channel_id {
-        // Build human-readable message: agent name + reason from tmux exit file
-        let agent_label = agent_id.as_deref().unwrap_or("unknown");
-        let exit_reason = crate::services::tmux_diagnostics::read_tmux_exit_reason(&tmux_name)
-            .map(|r| {
-                // Strip timestamp prefix "[2026-...] " if present
-                let trimmed = if let Some(idx) = r.find("] ") {
-                    &r[idx + 2..]
-                } else {
-                    &r
-                };
-                let s = trimmed.trim();
-                if s.len() > 80 {
-                    format!("{}…", &s[..80])
-                } else {
-                    s.to_string()
-                }
-            })
-            .unwrap_or_else(|| lifecycle.lifecycle_path.to_string());
-        let _ = enqueue_lifecycle_notification_pg(
-            pool,
-            &format!("channel:{channel_id_str}"),
-            Some(session_key),
-            lifecycle_reason_code,
-            &format!("🔴 세션 종료: {agent_label}\n사유: {exit_reason}"),
-        )
-        .await;
-    }
-
     (
         StatusCode::OK,
         Json(json!({
@@ -892,12 +955,14 @@ pub(crate) async fn force_kill_session_impl_with_reason(
             "queue_preserved": lifecycle.queue_preserved,
             "dispatch_failed": active_dispatch_id,
             "retry_dispatch_id": retry_dispatch_id,
+            "retry_limit": FORCE_KILL_RETRY_LIMIT,
+            "retry_skipped_reason": retry_skipped_reason,
             "queue_activation_requested": queue_activation_requested,
         })),
     )
 }
 
-fn classify_session_termination_reason(reason: &str) -> (&'static str, &'static str) {
+fn classify_session_termination_reason(reason: &str) -> &'static str {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("idle")
         || lower.contains("auto cleanup")
@@ -905,9 +970,9 @@ fn classify_session_termination_reason(reason: &str) -> (&'static str, &'static 
         || lower.contains("turn cap")
         || lower.contains("cleanup")
     {
-        ("auto_cleanup", "lifecycle.auto_cleanup")
+        "auto_cleanup"
     } else {
-        ("force_kill", "lifecycle.force_kill")
+        "force_kill"
     }
 }
 
@@ -921,6 +986,7 @@ pub struct TmuxOutputQuery {
 
 const TMUX_OUTPUT_DEFAULT_LINES: i32 = 80;
 const TMUX_OUTPUT_MAX_LINES: i32 = 2000;
+const FORCE_KILL_RETRY_LIMIT: i64 = 5;
 
 /// GET /api/sessions/{id}/tmux-output?lines=N
 ///
@@ -930,31 +996,32 @@ const TMUX_OUTPUT_MAX_LINES: i32 = 2000;
 /// `session_key`, then shells out via [`crate::services::platform::tmux::capture_pane`].
 pub async fn tmux_output(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
     Query(params): Query<TmuxOutputQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let requested_lines = params.lines.unwrap_or(TMUX_OUTPUT_DEFAULT_LINES);
     let effective_lines = requested_lines.max(1).min(TMUX_OUTPUT_MAX_LINES);
 
-    // Lookup session row. Prefer Postgres (authoritative) when available.
-    let session_row = if let Some(pool) = state.pg_pool_ref() {
-        match dispatched_sessions_db::load_session_by_id_pg(pool, id).await {
-            Ok(value) => value,
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": error})),
-                );
-            }
-        }
-    } else {
+    let Some(pool) = state.pg_pool_ref() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "postgres pool unavailable"})),
         );
     };
 
-    let Some((session_key, agent_id, provider, status)) = session_row else {
+    // Lookup session row. Prefer Postgres (authoritative) when available.
+    let session_row = match dispatched_sessions_db::load_session_by_id_pg(pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": error})),
+            );
+        }
+    };
+
+    let Some((session_key, agent_id, provider, status, owner_instance_id)) = session_row else {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -963,6 +1030,33 @@ pub async fn tmux_output(
             })),
         );
     };
+
+    if !crate::services::session_forwarding::is_forwarded_request(&headers) {
+        match crate::services::session_forwarding::resolve_forward_target(
+            &state,
+            owner_instance_id.as_deref(),
+            pool,
+        )
+        .await
+        {
+            crate::services::session_forwarding::ForwardResolution::Local => {}
+            crate::services::session_forwarding::ForwardResolution::Forward(target) => {
+                return crate::services::session_forwarding::forward_tmux_output(
+                    &state,
+                    &target,
+                    id,
+                    effective_lines,
+                )
+                .await;
+            }
+            crate::services::session_forwarding::ForwardResolution::Unavailable {
+                status,
+                body,
+            } => {
+                return (status, Json(body));
+            }
+        }
+    }
 
     // session_key format: "hostname:tmux_name"
     let tmux_name = match session_key.split_once(':') {
@@ -1014,11 +1108,19 @@ pub async fn tmux_output(
 /// + mark active dispatch failed. Optionally creates a retry dispatch.
 pub async fn force_kill_session(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(session_key): Path<String>,
     Json(body): Json<ForceKillOptions>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let reason = body.reason.as_deref().unwrap_or("force-kill API invoked");
-    force_kill_session_impl_with_reason(&state, &session_key, body.retry, reason).await
+    force_kill_session_impl_with_reason_and_forwarding(
+        &state,
+        &headers,
+        &session_key,
+        body.retry,
+        reason,
+    )
+    .await
 }
 
 /// Legacy body-based wrapper retained for compatibility tests and direct callers.
@@ -1343,6 +1445,7 @@ mod tests {
 
         let (status, body) = force_kill_session(
             State(state),
+            HeaderMap::new(),
             Path("host:codex-agent-force-pg".to_string()),
             Json(ForceKillOptions {
                 retry: true,
@@ -1525,6 +1628,7 @@ mod tests {
 
         let (status, body) = force_kill_session(
             State(state),
+            HeaderMap::new(),
             Path(session_key.clone()),
             Json(ForceKillOptions {
                 retry: false,
@@ -1594,6 +1698,7 @@ mod tests {
 
         let (status, body) = force_kill_session(
             State(state),
+            HeaderMap::new(),
             Path(session_key.clone()),
             Json(ForceKillOptions {
                 retry: false,
@@ -1655,6 +1760,7 @@ mod tests {
             State(state.clone()),
             Json(HookSessionBody {
                 session_key: "session-1".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("claude".to_string()),
@@ -1676,6 +1782,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "session-1".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("idle".to_string()),
                 provider: Some("claude".to_string()),
@@ -1767,6 +1874,7 @@ mod tests {
             State(state.clone()),
             Json(HookSessionBody {
                 session_key: "session-rework".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("claude".to_string()),
@@ -1788,6 +1896,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "session-rework".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("idle".to_string()),
                 provider: Some("claude".to_string()),
@@ -1876,6 +1985,7 @@ mod tests {
             State(state.clone()),
             Json(HookSessionBody {
                 session_key: "session-review".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -1897,6 +2007,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "session-review".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("idle".to_string()),
                 provider: Some("codex".to_string()),
@@ -1974,6 +2085,7 @@ mod tests {
             State(state.clone()),
             Json(HookSessionBody {
                 session_key: "session-sticky".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -1995,6 +2107,7 @@ mod tests {
             State(state.clone()),
             Json(HookSessionBody {
                 session_key: "session-sticky".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2015,6 +2128,7 @@ mod tests {
             State(state.clone()),
             Json(HookSessionBody {
                 session_key: "session-sticky".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("idle".to_string()),
                 provider: Some("codex".to_string()),
@@ -2036,6 +2150,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "session-sticky".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("idle".to_string()),
                 provider: Some("codex".to_string()),
@@ -2092,6 +2207,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "session-cleared".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2146,6 +2262,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "session-heartbeat".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2283,6 +2400,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: "mac-mini:AgentDesk-claude-adk-cc-t1485400795435372796".to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("claude".to_string()),
@@ -2335,6 +2453,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2405,6 +2524,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.clone(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2466,6 +2586,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.clone(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2519,6 +2640,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.clone(),
+                instance_id: None,
                 agent_id: Some("project-spoofed".to_string()),
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2591,6 +2713,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.clone(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2643,6 +2766,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2695,6 +2819,7 @@ mod tests {
             State(state),
             Json(HookSessionBody {
                 session_key: session_key.to_string(),
+                instance_id: None,
                 agent_id: None,
                 status: Some("working".to_string()),
                 provider: Some("codex".to_string()),
@@ -2785,6 +2910,7 @@ mod tests {
 
         let (status, body) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(999_999),
             Query(TmuxOutputQuery { lines: None }),
         )
@@ -2833,6 +2959,7 @@ mod tests {
 
         let (status, body) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: Some(20) }),
         )
@@ -2885,6 +3012,7 @@ mod tests {
 
         let (status_hi, body_hi) = tmux_output(
             State(state.clone()),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: Some(9_999) }),
         )
@@ -2896,6 +3024,7 @@ mod tests {
 
         let (status_lo, body_lo) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: Some(-42) }),
         )
@@ -2938,6 +3067,7 @@ mod tests {
 
         let (status, body) = tmux_output(
             State(state),
+            HeaderMap::new(),
             Path(session_id),
             Query(TmuxOutputQuery { lines: None }),
         )

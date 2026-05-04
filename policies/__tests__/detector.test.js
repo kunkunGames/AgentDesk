@@ -87,6 +87,15 @@ test("evidence_age reject: candidate older than 48h is rejected at quality gate"
   assert.equal(r.checkpoint.stats.skipped_quality_gate, 1, "skipped_quality_gate should be 1");
 });
 
+test("invalid last_seen_at is rejected at quality gate", () => {
+  const { tick } = loadRoutine(ROUTINE_PATH);
+  const obs = [makeReviewObs("invalid-ts-sig", { last_seen_at: "not-a-date" })];
+
+  const r = tick({ now: BASE_NOW, checkpoint: null, observations: obs, automationInventory: [] });
+  assert.equal(r.action, "complete", "invalid timestamp candidate should not produce agent action");
+  assert.equal(r.checkpoint.stats.skipped_quality_gate, 1, "skipped_quality_gate should be 1");
+});
+
 test("previously emitted candidate is not re-emitted on second tick", () => {
   const { tick } = loadRoutine(ROUTINE_PATH);
   const obs = [makeReviewObs("dup-emit-sig")];

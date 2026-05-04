@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{Postgres, QueryBuilder, Row};
 use std::path::{Path as FsPath, PathBuf};
-use tokio::process::Command;
 
 use super::{AppState, agents_setup};
+use crate::services::git::{GitCommand, GitCommandError};
 use crate::services::observability::session_inventory::derive_visual_status;
 
 // ── Query / Body structs ─────────────────────────────────────────
@@ -240,6 +240,15 @@ fn default_prompt_path(runtime_root: &FsPath, agent_id: &str) -> PathBuf {
         .join("IDENTITY.md")
 }
 
+fn git_command_error_detail(error: &GitCommandError) -> String {
+    let stderr = error.stderr_text();
+    if stderr.is_empty() {
+        error.to_string()
+    } else {
+        stderr
+    }
+}
+
 fn resolve_agent_prompt_path(agent_id: &str, provider: Option<&str>) -> Option<PathBuf> {
     let runtime_root = crate::config::runtime_root()?;
     let config = crate::services::discord::agentdesk_config::load_agent_setup_config(&runtime_root)
@@ -317,38 +326,45 @@ async fn run_prompt_auto_commit(
     let message = message
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("Update agent prompt from dashboard");
+        .unwrap_or("Update agent prompt from dashboard")
+        .to_string();
 
-    let add = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .arg("add")
-        .arg(prompt_path)
-        .output()
-        .await
-        .map_err(|error| format!("git add prompt: {error}"))?;
-    if !add.status.success() {
-        return Err(format!(
+    let add_repo = repo_dir.to_path_buf();
+    let add_path = prompt_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        GitCommand::new()
+            .repo(&add_repo)
+            .arg("add")
+            .arg(&add_path)
+            .run_output()
+    })
+    .await
+    .map_err(|error| format!("git add prompt join failed: {error}"))?
+    .map_err(|error| {
+        format!(
             "git add prompt failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        ));
-    }
+            git_command_error_detail(&error)
+        )
+    })?;
 
-    let commit = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .arg("commit")
-        .arg("-m")
-        .arg(message)
-        .output()
-        .await
-        .map_err(|error| format!("git commit prompt: {error}"))?;
-    if !commit.status.success() {
-        return Err(format!(
+    let commit_repo = repo_dir.to_path_buf();
+    let commit_message = message.clone();
+    let commit = tokio::task::spawn_blocking(move || {
+        GitCommand::new()
+            .repo(&commit_repo)
+            .arg("commit")
+            .arg("-m")
+            .arg(&commit_message)
+            .run_output()
+    })
+    .await
+    .map_err(|error| format!("git commit prompt join failed: {error}"))?
+    .map_err(|error| {
+        format!(
             "git commit prompt failed: {}",
-            String::from_utf8_lossy(&commit.stderr).trim()
-        ));
-    }
+            git_command_error_detail(&error)
+        )
+    })?;
 
     Ok(json!({
         "message": message,
@@ -1786,7 +1802,7 @@ pub(super) async fn list_sessions(State(state): State<AppState>) -> Json<serde_j
         return Json(json!({ "error": "postgres pool unavailable" }));
     };
     let rows = match sqlx::query(
-        "SELECT id, session_key, agent_id, provider, status, active_dispatch_id,
+        "SELECT id, session_key, instance_id, agent_id, provider, status, active_dispatch_id,
                 model, tokens, cwd, to_char(last_heartbeat, 'YYYY-MM-DD HH24:MI:SS') AS last_heartbeat
          FROM sessions
          WHERE status IN ('connected', 'turn_active', 'awaiting_bg', 'awaiting_user', 'idle', 'working')
@@ -1798,12 +1814,26 @@ pub(super) async fn list_sessions(State(state): State<AppState>) -> Json<serde_j
         Ok(rows) => rows,
         Err(error) => return Json(json!({ "error": format!("query failed: {error}") })),
     };
-    let sessions: Vec<_> = rows
+    let worker_nodes = match crate::server::cluster::list_worker_nodes(
+        pool,
+        state.config.cluster.lease_ttl_secs.max(1),
+    )
+    .await
+    {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::warn!("failed to list worker nodes for session owner routing: {error}");
+            Vec::new()
+        }
+    };
+    let local_instance_id = state.cluster_instance_id.as_deref();
+    let mut sessions: Vec<_> = rows
         .iter()
         .map(|row| {
             json!({
                 "id": row.try_get::<i64, _>("id").unwrap_or(0),
                 "session_key": row.try_get::<Option<String>, _>("session_key").ok().flatten(),
+                "instance_id": row.try_get::<Option<String>, _>("instance_id").ok().flatten(),
                 "agent_id": row.try_get::<Option<String>, _>("agent_id").ok().flatten(),
                 "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
                 "status": row.try_get::<Option<String>, _>("status").ok().flatten(),
@@ -1815,6 +1845,11 @@ pub(super) async fn list_sessions(State(state): State<AppState>) -> Json<serde_j
             })
         })
         .collect();
+    crate::server::cluster_session_routing::enrich_session_owner_routing(
+        &mut sessions,
+        local_instance_id,
+        &worker_nodes,
+    );
 
     Json(json!({ "sessions": sessions }))
 }

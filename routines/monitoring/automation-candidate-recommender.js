@@ -469,6 +469,7 @@ function buildSuppressedSet(cp, inventory, observations) {
     }
   }
 
+  // Contract: executor/dispatched markers must suffix the same signature used by obs.signature.
   // candidate_dispatched:* kv_meta observations → suppress re-recommendation (REQ-P1-004)
   for (const obs of observations || []) {
     const key = observationKey(obs);

@@ -7,6 +7,7 @@ use super::turn_bridge::stale_inflight_message;
 use super::*;
 use crate::db::turns::TurnTokenUsage;
 use crate::services::agent_protocol::StreamMessage;
+use crate::services::git::GitCommand;
 #[cfg(unix)]
 use crate::services::platform::binary_resolver;
 #[cfg(unix)]
@@ -314,14 +315,11 @@ fn recovery_requires_worktree_context(state: &inflight::InflightTurnState) -> bo
 }
 
 fn recovery_git_stdout(repo_path: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", repo_path])
+    let output = GitCommand::new()
+        .repo(repo_path)
         .args(args)
-        .output()
+        .run_output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
@@ -763,6 +761,19 @@ fn recovered_turn_duration_ms(started_at: Option<&str>) -> Option<i64> {
     let parsed = chrono::NaiveDateTime::parse_from_str(started_at, "%Y-%m-%d %H:%M:%S").ok()?;
     let elapsed = chrono::Local::now().naive_local() - parsed;
     Some(elapsed.num_milliseconds().max(0))
+}
+
+async fn lookup_turn_finished_dispatch_kind(dispatch_id: Option<&str>) -> Option<String> {
+    let dispatch_id = dispatch_id?;
+    let body = super::internal_api::lookup_dispatch_info(dispatch_id)
+        .await
+        .ok()?;
+    super::turn_bridge::classify_turn_finished_dispatch_kind(
+        body.get("dispatch_context")
+            .and_then(|value| value.as_str()),
+        body.get("dispatch_type").and_then(|value| value.as_str()),
+    )
+    .map(str::to_string)
 }
 
 async fn persist_recovered_transcript(
@@ -2689,6 +2700,8 @@ pub(super) async fn restore_inflight_turns(
 
         let recovery_dispatch_id = parse_dispatch_id(&state.user_text)
             .or(lookup_pending_dispatch_for_thread(shared.api_port, channel_id.get()).await);
+        let recovery_dispatch_kind =
+            lookup_turn_finished_dispatch_kind(recovery_dispatch_id.as_deref()).await;
         // Backfill session_key/dispatch_id on inflight state for long-turn detection ([L]).
         let mut state = state;
         state.session_key = state.session_key.or_else(|| adk_session_key.clone());
@@ -2715,7 +2728,11 @@ pub(super) async fn restore_inflight_turns(
                 adk_session_info: Some(adk_session_info),
                 adk_cwd: recovery_adk_cwd.clone(),
                 dispatch_id: recovery_dispatch_id,
+                dispatch_kind: recovery_dispatch_kind,
                 memory_recall_usage: crate::services::memory::TokenUsage::default(),
+                context_window_tokens: provider.default_context_window(),
+                context_compact_percent: super::adk_session::ContextThresholds::default()
+                    .compact_pct_for(&provider),
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),
@@ -4443,17 +4460,11 @@ mod tests {
     #[test]
     fn recovery_restores_worktree_identity_into_session_state() {
         fn run_git(repo_path: &std::path::Path, args: &[&str]) -> String {
-            let output = std::process::Command::new("git")
-                .args(["-C", repo_path.to_str().unwrap()])
+            let output = GitCommand::new()
+                .repo(repo_path)
                 .args(args)
-                .output()
+                .run_output()
                 .unwrap_or_else(|error| panic!("git {:?} failed to spawn: {error}", args));
-            assert!(
-                output.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&output.stderr)
-            );
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
 

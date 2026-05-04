@@ -3201,11 +3201,20 @@ async fn cancel_turn_preserves_pending_queue_via_mailbox_fallback_cleanup_pg() {
 
 #[tokio::test]
 async fn cancel_turn_targets_requested_provider_for_paired_agent_pg() {
+    let _obs_guard = crate::services::observability::test_runtime_lock();
+    crate::services::observability::reset_for_tests();
+    crate::services::observability::init_observability(None);
+
     let pg_db = TestPostgresDb::create().await;
     let pool = pg_db.connect_and_migrate().await;
     let db = test_db();
     let engine = test_engine_with_pg(&db, pool.clone());
+    let harness = crate::services::discord::health::TestHealthHarness::new_with_provider(
+        crate::services::provider::ProviderKind::Claude,
+    )
+    .await;
     let cc_channel_id = "1479671298497183835";
+    let cc_channel_num = cc_channel_id.parse::<u64>().unwrap();
     let cdx_channel_id = "1479671301387059200";
     let cc_session_key = "mac-mini:AgentDesk-claude-adk-cc";
     let cdx_session_key = "mac-mini:AgentDesk-codex-adk-cdx";
@@ -3243,12 +3252,21 @@ async fn cancel_turn_targets_requested_provider_for_paired_agent_pg() {
     .execute(&pool)
     .await
     .unwrap();
+    harness
+        .seed_channel_session(cc_channel_num, "adk-cc", Some("session-1636-turn-cancel"))
+        .await;
+    let token = harness
+        .start_active_turn(cc_channel_num, 16, 36, Some("AgentDesk-claude-adk-cc"))
+        .await;
+    harness
+        .seed_queue(cc_channel_num, &[(2_636, "preserve turn cancel follow-up")])
+        .await;
 
     let app = test_api_router_with_pg(
         db.clone(),
         engine,
         crate::config::Config::default(),
-        None,
+        Some(harness.registry()),
         pool.clone(),
     );
     let response = app
@@ -3275,6 +3293,68 @@ async fn cancel_turn_targets_requested_provider_for_paired_agent_pg() {
     assert_eq!(json["exact_channel_match"], true);
     assert_eq!(json["session_key"], cc_session_key);
     assert_eq!(json["tmux_session"], "AgentDesk-claude-adk-cc");
+    assert_eq!(json["lifecycle_path"], "mailbox_canonical");
+    assert_eq!(json["queued_remaining"], 1);
+    assert_eq!(json["queue_preserved"], true);
+    assert_eq!(json["inflight_cleared"], false);
+    assert_eq!(json["turn_status"], "cancelled");
+    assert!(json["turn_completed_at"].as_str().is_some());
+    // #1672: response must surface the *observed* pre/post queue depth
+    // and the disk-presence transition so operators can tell the
+    // difference between "queue preserved" and "queue silently
+    // dropped". The legacy contract reported `queue_preserved=true`
+    // unconditionally; this test pins the observability fields the
+    // queue-api cancel response now carries.
+    assert_eq!(json["queued_before"], 1);
+    assert_eq!(
+        json["queued_remaining"], 1,
+        "1 queued intervention must survive cancel — issue #1672"
+    );
+    assert!(
+        json["queue_disk_present_before"].is_boolean(),
+        "queue_disk_present_before must be reported"
+    );
+    assert!(
+        json["queue_disk_present_after"].is_boolean(),
+        "queue_disk_present_after must be reported"
+    );
+    assert!(
+        token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        "turn cancel must signal the active turn token"
+    );
+    let (has_active_turn, queue_depth, session_id) = harness.mailbox_state(cc_channel_num).await;
+    assert!(!has_active_turn);
+    assert_eq!(queue_depth, 1);
+    assert_eq!(session_id, None);
+
+    // #1672 P2: turn cancel must schedule the deferred idle-queue
+    // drain so preserved pending_queue items resume without waiting
+    // for the next user message. The dispatch-cancel sibling test
+    // pins the same invariant for `/dispatches/{id}/cancel`.
+    let backlog_after_cancel = harness.deferred_hook_backlog();
+    assert!(
+        backlog_after_cancel >= 1,
+        "turn cancel must schedule the post-cancel queue drain (backlog={backlog_after_cancel}) — issue #1672 P2"
+    );
+
+    let event = crate::services::observability::events::recent(10)
+        .into_iter()
+        .find(|event| event.event_type == "turn_cancelled")
+        .expect("turn_cancelled event should be recorded");
+    assert_eq!(
+        event.channel_id,
+        Some(cc_channel_id.parse::<u64>().unwrap())
+    );
+    assert_eq!(event.provider.as_deref(), Some("claude"));
+    assert_eq!(event.payload["reason"], "queue-api cancel_turn (preserve)");
+    assert_eq!(event.payload["surface"], "queue_cancel_preserve");
+    assert_eq!(event.payload["lifecyclePath"], "mailbox_canonical");
+    assert_eq!(event.payload["queueDepth"], 1);
+    assert_eq!(event.payload["queuePreserved"], true);
+    assert_eq!(event.payload["inflightCleared"], false);
+    assert_eq!(event.payload["terminationRecorded"], true);
+    assert_eq!(event.payload["session_key"], cc_session_key);
+    assert!(event.payload["dispatch_id"].is_null());
 
     let cc_status =
         sqlx::query_scalar::<_, String>("SELECT status FROM sessions WHERE session_key = $1")
@@ -4396,6 +4476,205 @@ async fn queue_cancel_dispatch_pg_only_without_sqlite_mirror() {
         )
         .unwrap();
     assert_eq!(sqlite_count, 0, "sqlite mirror should stay empty");
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_cancel_dispatch_cancels_matching_active_turn_pg() {
+    let _obs_guard = crate::services::observability::test_runtime_lock();
+    crate::services::observability::reset_for_tests();
+    crate::services::observability::init_observability(None);
+
+    let db = test_db();
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+    let engine = test_engine_with_pg(&db, pg_pool.clone());
+    let harness = crate::services::discord::health::TestHealthHarness::new_with_provider(
+        crate::services::provider::ProviderKind::Codex,
+    )
+    .await;
+    let channel_id = "1485506232256168022";
+    let channel_num = channel_id.parse::<u64>().unwrap();
+    let tmux_name = "AgentDesk-codex-dispatch-cancel-1552";
+    let session_key = format!("mac-mini:{tmux_name}");
+
+    sqlx::query(
+        "INSERT INTO agents (
+            id, name, provider, discord_channel_cdx, created_at, updated_at
+         ) VALUES (
+            $1, $2, 'codex', $3, NOW(), NOW()
+         )",
+    )
+    .bind("agent-dispatch-cancel-turn")
+    .bind("Agent Dispatch Cancel Turn")
+    .bind(channel_id)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, title, status, assigned_agent_id, created_at, updated_at
+         ) VALUES (
+            $1, $2, 'in_progress', $3, NOW(), NOW()
+         )",
+    )
+    .bind("card-dispatch-cancel-turn")
+    .bind("Dispatch Cancel Turn")
+    .bind("agent-dispatch-cancel-turn")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, created_at, updated_at
+         ) VALUES (
+            $1, $2, $3, 'implementation', 'dispatched', $4, NOW(), NOW()
+         )",
+    )
+    .bind("dispatch-cancel-turn-1552")
+    .bind("card-dispatch-cancel-turn")
+    .bind("agent-dispatch-cancel-turn")
+    .bind("Cancel active turn too")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO sessions (
+            session_key, agent_id, provider, status, active_dispatch_id,
+            thread_channel_id, last_heartbeat, created_at
+         ) VALUES (
+            $1, $2, 'codex', 'turn_active', $3, $4, NOW(), NOW()
+         )",
+    )
+    .bind(&session_key)
+    .bind("agent-dispatch-cancel-turn")
+    .bind("dispatch-cancel-turn-1552")
+    .bind(channel_id)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    harness
+        .seed_channel_session(
+            channel_num,
+            "dispatch-cancel-1552",
+            Some("session-dispatch-cancel-1552"),
+        )
+        .await;
+    let token = harness
+        .start_active_turn(channel_num, 15, 1552, Some(tmux_name))
+        .await;
+    harness
+        .seed_queue(channel_num, &[(2_552, "preserve dispatch cancel queue")])
+        .await;
+
+    let app = test_api_router_with_pg(
+        db.clone(),
+        engine,
+        crate::config::Config::default(),
+        Some(harness.registry()),
+        pg_pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dispatches/dispatch-cancel-turn-1552/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "queue_cancel_dispatch_cancels_matching_active_turn_pg status={} body={}",
+        status,
+        body_text
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["dispatch_id"], "dispatch-cancel-turn-1552");
+    assert_eq!(json["active_turn_cancelled"], true);
+    assert_eq!(json["turn_session_key"], session_key);
+    assert_eq!(json["turn_tmux_session"], tmux_name);
+    assert_eq!(json["turn_channel_id"], channel_id);
+    assert_eq!(json["turn_agent_id"], "agent-dispatch-cancel-turn");
+    assert_eq!(json["turn_status"], "cancelled");
+    assert!(json["turn_completed_at"].as_str().is_some());
+    assert_eq!(json["turn_lifecycle_path"], "runtime-fallback");
+    assert_eq!(json["turn_tmux_killed"], false);
+    assert_eq!(json["turn_queue_preserved"], true);
+    assert_eq!(json["turn_inflight_cleared"], false);
+    assert_eq!(json["turn_queued_remaining"], 1);
+
+    assert!(
+        token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+        "dispatch cancel must signal the active turn token"
+    );
+    let (has_active_turn, queue_depth, session_id) = harness.mailbox_state(channel_num).await;
+    assert!(!has_active_turn);
+    assert_eq!(queue_depth, 1);
+    assert_eq!(session_id, None);
+
+    // #1672 P2: dispatch cancel must mirror the `/turns/{id}/cancel`
+    // surface and schedule the deferred idle-queue drain so the
+    // preserved pending_queue item resumes without waiting for the
+    // next user message. We observe this through the harness'
+    // `deferred_hook_backlog()` getter, which surfaces the counter
+    // that `schedule_deferred_idle_queue_kickoff` increments
+    // *synchronously* before spawning the 2s-delayed drain task.
+    let backlog_after_cancel = harness.deferred_hook_backlog();
+    assert!(
+        backlog_after_cancel >= 1,
+        "dispatch cancel must schedule the post-cancel queue drain (backlog={backlog_after_cancel}) — issue #1672 P2"
+    );
+
+    let event = crate::services::observability::events::recent(10)
+        .into_iter()
+        .find(|event| event.event_type == "turn_cancelled")
+        .expect("turn_cancelled event should be recorded");
+    assert_eq!(event.channel_id, Some(channel_num));
+    assert_eq!(event.provider.as_deref(), Some("codex"));
+    assert_eq!(
+        event.payload["reason"],
+        "queue-api cancel_dispatch (preserve)"
+    );
+    assert_eq!(event.payload["surface"], "queue_cancel_preserve");
+    assert_eq!(event.payload["dispatch_id"], "dispatch-cancel-turn-1552");
+    assert_eq!(event.payload["session_key"], session_key);
+
+    let dispatch_status: String =
+        sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+            .bind("dispatch-cancel-turn-1552")
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap();
+    assert_eq!(dispatch_status, "cancelled");
+
+    let (session_status, active_dispatch_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, active_dispatch_id
+         FROM sessions
+         WHERE session_key = $1",
+    )
+    .bind(&session_key)
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(session_status, "disconnected");
+    assert_eq!(active_dispatch_id, None);
 
     pg_pool.close().await;
     pg_db.drop().await;
@@ -7952,6 +8231,58 @@ async fn api_docs_category_exposes_dispatch_params_and_examples() {
         dispatch_post["example"]["response"]["dispatch"]["status"],
         "pending"
     );
+
+    let dispatch_patch = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "PATCH" && ep["path"] == "/api/dispatches/{id}")
+        .expect("dispatch update endpoint must be present in detail view");
+    let patch_description = dispatch_patch["description"]
+        .as_str()
+        .expect("PATCH dispatch docs description must be a string");
+    assert!(
+        patch_description.contains("Allowed status values")
+            && patch_description.contains("result_summary")
+            && patch_description.contains("completed_at"),
+        "PATCH dispatch docs must spell out status/result lifecycle semantics: {patch_description}"
+    );
+    let status_enum = dispatch_patch["params"]["status"]["enum"]
+        .as_array()
+        .expect("PATCH dispatch status param must expose allowed enum values");
+    for expected in ["pending", "dispatched", "completed", "cancelled", "failed"] {
+        assert!(
+            status_enum.iter().any(|value| value == expected),
+            "PATCH dispatch docs must include allowed status {expected}"
+        );
+    }
+    assert_eq!(
+        dispatch_patch["example"]["response"]["dispatch"]["result_summary"],
+        "done"
+    );
+    assert!(
+        dispatch_patch["example"]["response"]["dispatch"]["updated_at"].is_string(),
+        "PATCH dispatch example must expose updated_at"
+    );
+    assert!(
+        dispatch_patch["example"]["response"]["dispatch"]["completed_at"].is_string(),
+        "PATCH dispatch example must expose completed_at"
+    );
+    assert_eq!(dispatch_patch["error_example"]["status"], 400);
+
+    let dispatch_cancel = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/dispatches/{id}/cancel")
+        .expect("dispatch cancel endpoint must be present in dispatches detail view");
+    assert_eq!(dispatch_cancel["params"]["id"]["location"], "path");
+    let cancel_description = dispatch_cancel["description"]
+        .as_str()
+        .expect("cancel dispatch docs description must be a string");
+    assert!(
+        cancel_description.contains("pending or dispatched")
+            && cancel_description.contains("Terminal dispatches return 409"),
+        "cancel dispatch docs must describe lifecycle scope and terminal conflict: {cancel_description}"
+    );
+    assert_eq!(dispatch_cancel["example"]["response"]["ok"], true);
+    assert_eq!(dispatch_cancel["error_example"]["status"], 409);
 }
 
 #[tokio::test]
@@ -8151,6 +8482,7 @@ async fn api_docs_category_exposes_agents_turn_start_contract() {
     assert_eq!(turn_start["params"]["prompt"]["required"], true);
     assert_eq!(turn_start["params"]["metadata"]["type"], "object");
     assert_eq!(turn_start["params"]["source"]["type"], "string");
+    assert_eq!(turn_start["params"]["dm_user_id"]["type"], "string");
     assert_eq!(
         turn_start["example"]["response"]["status"],
         serde_json::json!("started")
@@ -10247,6 +10579,65 @@ async fn api_docs_card_lifecycle_ops_guide_is_reachable_and_complete() {
             && guide_text.contains("/api/kanban-cards/{id}/redispatch")
             && guide_text.contains("/api/kanban-cards/{id}/transition"),
         "guide must enumerate the five lifecycle endpoints by exact path"
+    );
+}
+
+#[tokio::test]
+async fn api_docs_api_friction_markers_guide_is_reachable_and_complete() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let index_response = app
+        .clone()
+        .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(index_response.status(), StatusCode::OK);
+    let index_bytes = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let index_json: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+    let guides = index_json["guides"]
+        .as_array()
+        .expect("/docs index must list long-form guides under 'guides'");
+    let friction_entry = guides
+        .iter()
+        .find(|guide| guide["name"] == "api-friction-markers")
+        .expect("/docs index must surface the API friction marker guide");
+    assert_eq!(
+        friction_entry["path"], "/api/docs/api-friction-markers",
+        "API friction marker guide path must be /api/docs/api-friction-markers"
+    );
+
+    let guide_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/api-friction-markers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(guide_response.status(), StatusCode::OK);
+    let guide_bytes = axum::body::to_bytes(guide_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let guide_text = String::from_utf8(guide_bytes.to_vec()).unwrap();
+    let guide_json: serde_json::Value = serde_json::from_str(&guide_text).unwrap();
+
+    assert_eq!(guide_json["title"], "API Friction Marker Guide");
+    assert_eq!(guide_json["marker_prefix"], "API_FRICTION:");
+    assert_eq!(
+        guide_json["schema"]["required"]["endpoint"],
+        "HTTP endpoint or API surface, for example PATCH /api/dispatches/{id}"
+    );
+    assert!(
+        guide_text.contains("api_friction_events")
+            && guide_text.contains("api_friction_issues")
+            && guide_text.contains("Memento")
+            && guide_text.contains("API_FRICTION:"),
+        "API friction guide must describe marker collection, persistence, and example"
     );
 }
 

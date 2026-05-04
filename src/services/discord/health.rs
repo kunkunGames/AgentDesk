@@ -942,6 +942,216 @@ pub async fn force_kill_provider_channel_runtime(
     .await
 }
 
+/// #1672: Snapshot the per-channel pending-queue state from both the
+/// in-memory mailbox and the disk-backed `discord_pending_queue` file.
+///
+/// Used by the cancel API + text-stop helpers to verify their
+/// "pending_queue must be preserved across cancel" invariant *after*
+/// the cancel completes, instead of asserting it via a hardcoded
+/// `queue_preserved=true`.
+///
+/// Returns `None` only when the registered shared runtime cannot be
+/// resolved for `provider_name`. A missing channel mailbox or absent
+/// disk file are reported as `(0, false)` rather than `None`.
+pub async fn snapshot_pending_queue_state(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+) -> Option<PendingQueueSnapshot> {
+    let provider = ProviderKind::from_str(provider_name)?;
+    let shared = shared_for_provider(registry, &provider).await?;
+    Some(snapshot_pending_queue_state_for_shared(&shared, &provider, channel_id).await)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PendingQueueSnapshot {
+    pub queue_depth: usize,
+    pub disk_present: bool,
+    pub disk_path: Option<std::path::PathBuf>,
+}
+
+async fn snapshot_pending_queue_state_for_shared(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> PendingQueueSnapshot {
+    let queue_depth = shared
+        .mailbox(channel_id)
+        .snapshot()
+        .await
+        .intervention_queue
+        .len();
+    let disk_path = super::runtime_store::discord_pending_queue_root().map(|root| {
+        root.join(provider.as_str())
+            .join(&shared.token_hash)
+            .join(format!("{}.json", channel_id.get()))
+    });
+    let disk_present = disk_path
+        .as_ref()
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    PendingQueueSnapshot {
+        queue_depth,
+        disk_present,
+        disk_path,
+    }
+}
+
+/// #1672: After a cancel that left the channel idle, kick the deferred
+/// idle-queue drain so any survived `pending_queue` items are picked up
+/// without requiring the next user message to arrive first.
+///
+/// Returns `true` when the drain was scheduled (registered shared runtime
+/// found and at least one item is queued in memory or on disk), `false`
+/// otherwise.
+///
+/// codex review round-3 P2: when the in-memory mailbox is empty but the
+/// disk-backed `discord_pending_queue/<provider>/<token>/<channel>.json`
+/// file is still present, hydrate the mailbox from disk before
+/// scheduling the drain. Without this, the cancel response correctly
+/// reports `queue_disk_present_after=true` but the queued items remain
+/// stranded — the drain helper sees an empty mailbox and bails out, and
+/// the next `mailbox_enqueue_intervention` may overwrite the disk file
+/// before the items are ever absorbed.
+pub async fn schedule_pending_queue_drain_after_cancel(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+    reason: &'static str,
+) -> PostCancelDrainOutcome {
+    let Some(provider) = ProviderKind::from_str(provider_name) else {
+        return PostCancelDrainOutcome::skipped();
+    };
+    let Some(shared) = shared_for_provider(registry, &provider).await else {
+        return PostCancelDrainOutcome::skipped();
+    };
+    let snapshot = snapshot_pending_queue_state_for_shared(&shared, &provider, channel_id).await;
+    // codex review round-4 P2-1 (#1672): hydrate from disk *whenever*
+    // the disk file is present, not just when the in-memory queue is
+    // empty. If a concurrent `mailbox_enqueue_intervention` slipped a
+    // fresh message in between the cancel and this helper running, we
+    // still need to merge whatever the disk holds — `mailbox_hydrate_pending_queue`
+    // dedupes by `message_id` and prepends disk items so neither the
+    // surviving disk payload nor the live racer is dropped.
+    if snapshot.disk_present {
+        hydrate_pending_queue_from_disk(&shared, &provider, channel_id).await;
+    }
+    // Re-snapshot after the (possibly skipped) hydrate so the caller
+    // gets the post-merge depth — that is the value the cancel
+    // observability surface should report as `queued_remaining`.
+    let post_depth = shared
+        .mailbox(channel_id)
+        .snapshot()
+        .await
+        .intervention_queue
+        .len();
+    if post_depth == 0 {
+        return PostCancelDrainOutcome {
+            scheduled: false,
+            queue_depth_after: 0,
+        };
+    }
+    super::schedule_deferred_idle_queue_kickoff(shared.clone(), provider, channel_id, reason);
+    PostCancelDrainOutcome {
+        scheduled: true,
+        queue_depth_after: post_depth,
+    }
+}
+
+/// codex review round-4 P2-2 (#1672): return value of
+/// `schedule_pending_queue_drain_after_cancel`. The cancel response
+/// builders use `queue_depth_after` as the source of truth for
+/// `queued_remaining` so the API contract reflects the post-hydrate
+/// state, not the (typically zero) snapshot taken before disk
+/// hydration ran.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PostCancelDrainOutcome {
+    pub scheduled: bool,
+    pub queue_depth_after: usize,
+}
+
+impl PostCancelDrainOutcome {
+    fn skipped() -> Self {
+        Self::default()
+    }
+}
+
+/// codex review round-3 P2 (#1672): load the disk-backed pending queue
+/// for `channel_id` and merge it into the in-memory mailbox. Restores
+/// the matching `dispatch_role_override` alongside the queue so
+/// requeued items target the same destination channel as the original
+/// `mailbox_enqueue_intervention` call.
+///
+/// codex review round-4 P2-1 (#1672): the merge runs through the
+/// mailbox actor's atomic `HydratePendingQueue` message, so a
+/// concurrent `mailbox_enqueue_intervention` racing with this hydrate
+/// (e.g. user fires a fresh message between the cancel completing and
+/// the disk read finishing) is *preserved* rather than clobbered. Disk
+/// items are inserted at the head of the queue (they are chronologically
+/// earlier than any in-memory item that came in after the cancel) and
+/// any `message_id` already present is skipped to keep the merge
+/// idempotent on retry.
+///
+/// Returns `true` when at least one intervention was absorbed into the
+/// mailbox; `false` when the disk file is missing, empty, unparseable,
+/// or every entry was already present in memory.
+async fn hydrate_pending_queue_from_disk(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> bool {
+    let (queues, overrides) = super::load_pending_queues(provider, &shared.token_hash);
+    let Some(interventions) =
+        queues.into_iter().find_map(
+            |(cid, items)| {
+                if cid == channel_id { Some(items) } else { None }
+            },
+        )
+    else {
+        return false;
+    };
+    if interventions.is_empty() {
+        return false;
+    }
+    if let Some(alt_channel_id) = overrides.get(&channel_id).copied() {
+        shared
+            .dispatch_role_overrides
+            .insert(channel_id, alt_channel_id);
+    }
+    let absorbed =
+        super::mailbox_hydrate_pending_queue(shared, provider, channel_id, interventions).await;
+    absorbed > 0
+}
+
+/// #1672: Resolve a usable tmux session name for cancel observability.
+///
+/// Order: live tmux watcher binding → persistent inflight state file →
+/// `discord_session.channel_name` rendered through the provider's tmux
+/// naming convention. Returns `None` when none of those sources knows
+/// about the channel — at which point cancel observability falls back
+/// to whatever the caller passed in (typically empty).
+pub async fn resolve_tmux_session_for_cancel(
+    registry: &HealthRegistry,
+    provider_name: &str,
+    channel_id: ChannelId,
+) -> Option<String> {
+    let provider = ProviderKind::from_str(provider_name)?;
+    let shared = shared_for_provider(registry, &provider).await?;
+    if let Some(binding) = shared.tmux_watchers.channel_binding(&channel_id) {
+        return Some(binding.tmux_session_name);
+    }
+    if let Some(state) = super::inflight::load_inflight_state(&provider, channel_id.get())
+        && let Some(session) = state.tmux_session_name
+    {
+        return Some(session);
+    }
+    let data = shared.core.lock().await;
+    data.sessions
+        .get(&channel_id)
+        .and_then(|session| session.channel_name.as_ref())
+        .map(|channel_name| provider.build_tmux_session_name(channel_name))
+}
+
 pub async fn active_request_owner_for_channel(
     registry: &HealthRegistry,
     channel_id: u64,
@@ -1766,6 +1976,18 @@ impl TestHealthHarness {
             .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// #1672 P2: read-only view of `deferred_hook_backlog` so route
+    /// tests can verify that a cancel surface scheduled a deferred
+    /// idle-queue drain. The `SharedData` field is `pub(super)`, which
+    /// is invisible from `server::routes::routes_tests` — this getter
+    /// keeps that boundary intact while still letting tests assert on
+    /// the post-cancel drain contract.
+    pub(crate) fn deferred_hook_backlog(&self) -> usize {
+        self.shared
+            .deferred_hook_backlog
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn set_recovery_duration_ms(&self, duration_ms: u64) {
         self.shared
             .recovery_duration_ms
@@ -2361,6 +2583,87 @@ pub async fn start_reserved_headless_agent_turn(
         .await
         .map_err(super::router::HeadlessTurnStartError::Internal)?;
 
+    start_reserved_headless_agent_turn_with_shared(
+        shared,
+        channel_id,
+        owner_provider,
+        prompt,
+        source,
+        metadata,
+        channel_name_hint,
+        None,
+        reservation,
+        expected_turn_id,
+    )
+    .await
+}
+
+pub async fn start_headless_agent_turn_in_dm(
+    registry: &HealthRegistry,
+    owner_channel_id: ChannelId,
+    dm_user_id: u64,
+    owner_provider: ProviderKind,
+    prompt: String,
+    source: Option<String>,
+    metadata: Option<serde_json::Value>,
+) -> Result<super::router::HeadlessTurnStartOutcome, super::router::HeadlessTurnStartError> {
+    let (_, shared) = resolve_direct_meeting_runtime(registry, owner_channel_id, &owner_provider)
+        .await
+        .map_err(super::router::HeadlessTurnStartError::Internal)?;
+    let ctx = shared.cached_serenity_ctx.get().cloned().ok_or_else(|| {
+        super::router::HeadlessTurnStartError::Internal(format!(
+            "provider runtime is not ready for channel {}",
+            owner_channel_id.get()
+        ))
+    })?;
+    let dm_channel = serenity::UserId::new(dm_user_id)
+        .create_dm_channel(&ctx.http)
+        .await
+        .map_err(|error| {
+            super::router::HeadlessTurnStartError::Internal(format!(
+                "DM channel creation failed for user {dm_user_id}: {error}"
+            ))
+        })?;
+    let dm_channel_id = dm_channel.id;
+    let reservation = reserve_headless_agent_turn(dm_channel_id);
+    let expected_turn_id = reservation.turn_id.clone();
+    let channel_name_hint = Some(format!("dm-{dm_user_id}"));
+
+    start_reserved_headless_agent_turn_with_shared(
+        shared,
+        dm_channel_id,
+        owner_provider,
+        prompt,
+        source,
+        metadata,
+        channel_name_hint,
+        Some(true),
+        reservation,
+        expected_turn_id,
+    )
+    .await
+}
+
+async fn start_reserved_headless_agent_turn_with_shared(
+    shared: Arc<SharedData>,
+    channel_id: ChannelId,
+    _owner_provider: ProviderKind,
+    prompt: String,
+    source: Option<String>,
+    metadata: Option<serde_json::Value>,
+    channel_name_hint: Option<String>,
+    is_dm_hint: Option<bool>,
+    reservation: HeadlessAgentTurnReservation,
+    expected_turn_id: String,
+) -> Result<super::router::HeadlessTurnStartOutcome, super::router::HeadlessTurnStartError> {
+    if reservation.channel_id != channel_id {
+        return Err(super::router::HeadlessTurnStartError::Internal(format!(
+            "headless turn reservation channel mismatch: reserved {} but starting {}",
+            reservation.channel_id.get(),
+            channel_id.get()
+        )));
+    }
+
     if shared.mailbox(channel_id).has_active_turn().await {
         return Err(super::router::HeadlessTurnStartError::Conflict(format!(
             "agent mailbox is busy for channel {}",
@@ -2396,6 +2699,7 @@ pub async fn start_reserved_headless_agent_turn(
         source.as_deref(),
         metadata,
         channel_name_hint,
+        is_dm_hint,
         reservation.inner,
     )
     .await?;
@@ -2777,11 +3081,26 @@ fn is_allowed_send_source(source: &str) -> bool {
         "timeouts",
         "merge-automation",
         "dashboard",
+        "lifecycle_notifier",
         "routine-runtime",
         "headless_turn",
         "slo_alerter",
     ];
     INTERNAL_SOURCES.contains(&source) || super::settings::is_known_agent(source)
+}
+
+#[cfg(test)]
+mod send_source_tests {
+    use super::is_allowed_send_source;
+
+    #[test]
+    fn headless_turn_is_allowed_internal_send_source() {
+        assert!(is_allowed_send_source("headless_turn"));
+        assert!(is_allowed_send_source("lifecycle_notifier"));
+        assert!(is_allowed_send_source("routine-runtime"));
+        assert!(is_allowed_send_source("slo_alerter"));
+        assert!(!is_allowed_send_source("not-a-real-source"));
+    }
 }
 
 async fn send_resolved_manual_message_with_client<C: ManualOutboundClient>(
@@ -3849,6 +4168,51 @@ pub(super) fn stall_watchdog_should_force_clean(
     age_secs >= 0 && (age_secs as u64) >= threshold_secs
 }
 
+/// Detection-only counterpart to `stall_watchdog_should_force_clean`:
+/// returns `true` for the "completed-stale inflight on a healthy watcher"
+/// pattern that the deadlock-manager 30-min alarms keep flagging. All five
+/// signals must hold:
+/// - `attached == true` and `desynced == false` (relay is fine)
+/// - `inflight_state_present == true` (a stale file exists)
+/// - `mailbox_active_user_msg_id.is_none()` (no active turn anchor)
+/// - `tmux_session_alive == Some(true)` (session still waiting for input)
+/// - `inflight_updated_at` older than `threshold_secs`
+///
+/// Callers must NOT clean on this signal alone — the user may be reading the
+/// delivered response and about to send the next message. The helper exists
+/// so the watchdog can emit telemetry without altering recovery behaviour.
+pub(super) fn inflight_completed_stale_leak_detected(
+    attached: bool,
+    desynced: bool,
+    inflight_state_present: bool,
+    mailbox_active_user_msg_id: Option<u64>,
+    inflight_updated_at: Option<&str>,
+    tmux_session_alive: Option<bool>,
+    now_unix_secs: i64,
+    threshold_secs: u64,
+) -> bool {
+    if !attached || desynced {
+        return false;
+    }
+    if !inflight_state_present {
+        return false;
+    }
+    if mailbox_active_user_msg_id.is_some() {
+        return false;
+    }
+    if tmux_session_alive != Some(true) {
+        return false;
+    }
+    let Some(updated_at) = inflight_updated_at else {
+        return false;
+    };
+    let Some(updated_at_unix) = super::inflight::parse_updated_at_unix(updated_at) else {
+        return false;
+    };
+    let age_secs = now_unix_secs.saturating_sub(updated_at_unix);
+    age_secs >= 0 && (age_secs as u64) >= threshold_secs
+}
+
 /// Watchdog tick interval. Picked to converge inside ~1 cycle once the
 /// `2x` staleness window has elapsed, while staying well below the
 /// gateway-lease keepalive cadence so we never starve the gateway loop.
@@ -3914,6 +4278,69 @@ pub(super) async fn run_stall_watchdog_pass(
             STALL_WATCHDOG_THRESHOLD_SECS,
         );
         if !should_clean {
+            // Detection-only sibling probe for "completed-stale" inflight
+            // leaks: bridge handed off cleanup to the watcher (or the watcher
+            // delivered the response itself), but the inflight file persisted
+            // past the staleness threshold even though the relay is healthy
+            // and the mailbox has no active turn. This is the silent gap
+            // behind the deadlock-manager 30/45/60-min alarm pattern. We do
+            // NOT clean here — the live tmux session may be waiting for the
+            // user's next message. Emitting the structured event lets the
+            // external monitor and counters detect each occurrence so the
+            // root cause can be isolated.
+            if inflight_completed_stale_leak_detected(
+                snapshot.attached,
+                snapshot.desynced,
+                snapshot.inflight_state_present,
+                snapshot.mailbox_active_user_msg_id,
+                snapshot.inflight_updated_at.as_deref(),
+                snapshot.tmux_session_alive,
+                now_unix_secs,
+                STALL_WATCHDOG_THRESHOLD_SECS,
+            ) {
+                let leak_inflight =
+                    super::inflight::load_inflight_state(provider, channel_id.get());
+                let leak_turn_id = leak_inflight
+                    .as_ref()
+                    .filter(|s| s.user_msg_id != 0)
+                    .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
+                let leak_dispatch_id = leak_inflight.as_ref().and_then(|s| s.dispatch_id.clone());
+                let leak_session_key = leak_inflight.as_ref().and_then(|s| s.session_key.clone());
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] 🔎 inflight leak suspected on channel {} (provider={}): completed-stale + healthy watcher; emitting telemetry only",
+                    channel_id,
+                    provider.as_str()
+                );
+                crate::services::observability::emit_inflight_lifecycle_event(
+                    provider.as_str(),
+                    channel_id.get(),
+                    leak_dispatch_id.as_deref(),
+                    leak_session_key.as_deref(),
+                    leak_turn_id.as_deref(),
+                    "leak_detected_completed_stale",
+                    serde_json::json!({
+                        "inflight_started_at": snapshot.inflight_started_at,
+                        "inflight_updated_at": snapshot.inflight_updated_at,
+                        "tmux_session": snapshot.tmux_session,
+                        "tmux_session_alive": snapshot.tmux_session_alive,
+                        "watcher_attached": snapshot.attached,
+                        "has_pending_queue": snapshot.has_pending_queue,
+                        "full_response_len": leak_inflight
+                            .as_ref()
+                            .map(|s| s.full_response.len()),
+                        "response_sent_offset": leak_inflight
+                            .as_ref()
+                            .map(|s| s.response_sent_offset),
+                        "last_watcher_relayed_offset": leak_inflight
+                            .as_ref()
+                            .and_then(|s| s.last_watcher_relayed_offset),
+                        "watcher_owns_live_relay": leak_inflight
+                            .as_ref()
+                            .map(|s| s.watcher_owns_live_relay),
+                    }),
+                );
+            }
             continue;
         }
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3981,8 +4408,128 @@ pub fn spawn_stall_watchdog(registry: Arc<HealthRegistry>, provider: ProviderKin
 /// running in normal `cargo test --bin agentdesk` invocations.
 #[cfg(test)]
 mod stall_watchdog_pure_tests {
-    use super::{STALL_WATCHDOG_THRESHOLD_SECS, stall_watchdog_should_force_clean};
+    use super::{
+        STALL_WATCHDOG_THRESHOLD_SECS, inflight_completed_stale_leak_detected,
+        stall_watchdog_should_force_clean,
+    };
     use chrono::TimeZone;
+
+    fn local_string(unix: i64) -> String {
+        chrono::Local
+            .timestamp_opt(unix, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    /// `inflight_completed_stale_leak_detected` requires every signal of the
+    /// "completed-stale on healthy watcher" pattern. Each AND-clause is
+    /// inverted to lock the gate against accidental relaxation.
+    #[test]
+    fn inflight_completed_stale_leak_detected_requires_all_signals() {
+        let now_unix = chrono::Utc::now().timestamp();
+        let stale = local_string(now_unix - (STALL_WATCHDOG_THRESHOLD_SECS as i64) - 1);
+        let fresh = local_string(now_unix - 5);
+
+        // Happy path: attached + synced + inflight + idle mailbox + alive
+        // tmux + stale updated_at → leak.
+        assert!(inflight_completed_stale_leak_detected(
+            true,
+            false,
+            true,
+            None,
+            Some(stale.as_str()),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // Detached watcher → not this pattern (covered by other recovery).
+        assert!(!inflight_completed_stale_leak_detected(
+            false,
+            false,
+            true,
+            None,
+            Some(stale.as_str()),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // Desynced relay → handled by stall_watchdog_should_force_clean
+        // already; do not double-emit here.
+        assert!(!inflight_completed_stale_leak_detected(
+            true,
+            true,
+            true,
+            None,
+            Some(stale.as_str()),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // Mailbox still has an active turn anchor → live work, not a leak.
+        assert!(!inflight_completed_stale_leak_detected(
+            true,
+            false,
+            true,
+            Some(123),
+            Some(stale.as_str()),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // Tmux session gone → orphan path, not the completed-stale pattern.
+        assert!(!inflight_completed_stale_leak_detected(
+            true,
+            false,
+            true,
+            None,
+            Some(stale.as_str()),
+            Some(false),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // No inflight on disk → nothing to leak.
+        assert!(!inflight_completed_stale_leak_detected(
+            true,
+            false,
+            false,
+            None,
+            Some(stale.as_str()),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // Fresh updated_at → user may still be reading; do not flag yet.
+        assert!(!inflight_completed_stale_leak_detected(
+            true,
+            false,
+            true,
+            None,
+            Some(fresh.as_str()),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+
+        // Unparseable updated_at → never infer a leak from missing data.
+        assert!(!inflight_completed_stale_leak_detected(
+            true,
+            false,
+            true,
+            None,
+            Some("not-a-real-timestamp"),
+            Some(true),
+            now_unix,
+            STALL_WATCHDOG_THRESHOLD_SECS,
+        ));
+    }
 
     /// All three signals (`attached`, `desynced`, stale `updated_at`) must
     /// be present before the watchdog cleans. A regression that drops any
@@ -4299,6 +4846,7 @@ mod tests {
     #[test]
     fn headless_turn_is_allowed_internal_send_source() {
         assert!(is_allowed_send_source("headless_turn"));
+        assert!(is_allowed_send_source("lifecycle_notifier"));
         assert!(is_allowed_send_source("routine-runtime"));
         assert!(is_allowed_send_source("slo_alerter"));
         assert!(!is_allowed_send_source("not-a-real-source"));
@@ -5916,6 +6464,642 @@ mod tests {
         assert!(
             super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_some(),
             "fresh inflight must survive the watchdog"
+        );
+    }
+
+    /// codex review round-3 P2 (#1672): when the in-memory mailbox is
+    /// empty but the disk-backed `discord_pending_queue/<provider>/<token>/<channel>.json`
+    /// is still present, `schedule_pending_queue_drain_after_cancel` must
+    /// hydrate the mailbox from disk and schedule the deferred drain.
+    /// Otherwise the cancel response truthfully reports
+    /// `queue_disk_present_after=true` but the queued items remain
+    /// stranded — they only get absorbed when the next user message
+    /// arrives, and the next `mailbox_enqueue_intervention` may
+    /// overwrite the disk file before that happens.
+    #[tokio::test]
+    async fn schedule_pending_queue_drain_hydrates_mailbox_when_only_disk_queue_exists() {
+        use crate::services::discord::runtime_store::lock_test_env;
+        use crate::services::turn_orchestrator::save_channel_queue;
+
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(tmp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id_u64: u64 = 660_111_222_333_444_001;
+        let channel_id = ChannelId::new(channel_id_u64);
+
+        // Seed disk-only queue: write a pending queue file *without*
+        // touching the in-memory mailbox so we recreate the production
+        // failure mode where a previous restart left the file behind.
+        let intervention = super::super::Intervention {
+            author_id: UserId::new(123),
+            message_id: MessageId::new(987_654_321),
+            source_message_ids: vec![MessageId::new(987_654_321)],
+            text: "stranded-on-disk".to_string(),
+            mode: super::super::InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+        };
+        save_channel_queue(
+            &ProviderKind::Codex,
+            &harness.shared.token_hash,
+            channel_id,
+            &[intervention],
+            None,
+        );
+
+        // Pre-condition: mailbox is empty, disk file is present.
+        let pre_snapshot = snapshot_pending_queue_state(&harness.registry(), "codex", channel_id)
+            .await
+            .expect("snapshot must resolve registered runtime");
+        assert_eq!(
+            pre_snapshot.queue_depth, 0,
+            "in-memory mailbox must start empty"
+        );
+        assert!(
+            pre_snapshot.disk_present,
+            "disk-backed queue file must be seeded for the test"
+        );
+
+        // Drive the helper. With the round-3 P2 fix it must hydrate the
+        // mailbox from disk and schedule the deferred drain
+        // (`scheduled=true`, `queue_depth_after>0`); without the fix
+        // it short-circuits on the empty mailbox, leaving the disk
+        // queue stranded.
+        let outcome = schedule_pending_queue_drain_after_cancel(
+            &harness.registry(),
+            "codex",
+            channel_id,
+            "test-disk-only-hydrate",
+        )
+        .await;
+        assert!(
+            outcome.scheduled,
+            "drain must be scheduled when only the disk-backed queue is non-empty"
+        );
+        assert_eq!(
+            outcome.queue_depth_after, 1,
+            "post-hydrate depth must reflect the disk-backed item"
+        );
+
+        // Post-condition: mailbox is now hydrated from disk so the
+        // deferred drain (and any subsequent `mailbox_enqueue_intervention`)
+        // sees the surviving items.
+        let post_depth = harness.queue_depth_for_channel(channel_id_u64).await;
+        assert_eq!(
+            post_depth, 1,
+            "mailbox must be hydrated from disk after the drain helper runs"
+        );
+
+        // The deferred drain itself increments `deferred_hook_backlog`
+        // synchronously before spawning the delayed kickoff task.
+        assert!(
+            harness.deferred_hook_backlog() >= 1,
+            "post-cancel drain helper must register a deferred hook"
+        );
+    }
+
+    /// codex review round-4 P2-1 (#1672): when a fresh user message
+    /// races into the mailbox in between a cancel completing and the
+    /// disk-backed pending queue being hydrated, the merge must
+    /// preserve *both* the disk payload (chronologically older) and
+    /// the live racer (chronologically newer) — not clobber the
+    /// in-memory entry with the disk snapshot. The previous
+    /// implementation called `mailbox_replace_queue`, which performed
+    /// a wholesale overwrite and silently dropped the racer.
+    #[tokio::test]
+    async fn schedule_pending_queue_drain_merges_concurrent_enqueue_with_disk_payload() {
+        use crate::services::discord::runtime_store::lock_test_env;
+        use crate::services::turn_orchestrator::save_channel_queue;
+
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(tmp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id_u64: u64 = 660_111_222_333_444_002;
+        let channel_id = ChannelId::new(channel_id_u64);
+
+        // Seed disk with two surviving interventions (came in before the cancel).
+        let disk_items = vec![
+            super::super::Intervention {
+                author_id: UserId::new(7),
+                message_id: MessageId::new(1001),
+                source_message_ids: vec![MessageId::new(1001)],
+                text: "disk-1".to_string(),
+                mode: super::super::InterventionMode::Soft,
+                created_at: Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
+            },
+            super::super::Intervention {
+                author_id: UserId::new(7),
+                message_id: MessageId::new(1002),
+                source_message_ids: vec![MessageId::new(1002)],
+                text: "disk-2".to_string(),
+                mode: super::super::InterventionMode::Soft,
+                created_at: Instant::now(),
+                reply_context: None,
+                has_reply_boundary: false,
+                merge_consecutive: false,
+            },
+        ];
+        save_channel_queue(
+            &ProviderKind::Codex,
+            &harness.shared.token_hash,
+            channel_id,
+            &disk_items,
+            None,
+        );
+
+        // Simulate the racer: a brand-new user message that landed in
+        // the in-memory mailbox after the cancel emptied it but before
+        // the drain helper got to hydrate.
+        harness
+            .seed_queue(channel_id_u64, &[(2003, "concurrent-enqueue")])
+            .await;
+        assert_eq!(
+            harness.queue_depth_for_channel(channel_id_u64).await,
+            1,
+            "racer message must already be in the in-memory mailbox"
+        );
+
+        // Drive the post-cancel drain. The fix must merge disk+memory.
+        let outcome = schedule_pending_queue_drain_after_cancel(
+            &harness.registry(),
+            "codex",
+            channel_id,
+            "test-merge-with-racer",
+        )
+        .await;
+        assert!(
+            outcome.scheduled,
+            "drain must be scheduled when either source has items"
+        );
+        assert_eq!(
+            outcome.queue_depth_after, 3,
+            "post-hydrate depth must include both disk items and the racer"
+        );
+
+        // Verify ordering: disk items prepend (chronologically older),
+        // racer stays at the tail (newest).
+        let snapshot = harness
+            .shared
+            .mailbox(channel_id)
+            .snapshot()
+            .await
+            .intervention_queue;
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(snapshot[0].message_id, MessageId::new(1001));
+        assert_eq!(snapshot[1].message_id, MessageId::new(1002));
+        assert_eq!(snapshot[2].message_id, MessageId::new(2003));
+    }
+
+    /// codex review round-4 P2-1 (#1672): hydration must be idempotent
+    /// — if the same disk file is processed twice (e.g. retry after a
+    /// transient error) the duplicate `message_id`s are skipped, not
+    /// inserted twice.
+    #[tokio::test]
+    async fn hydrate_pending_queue_is_idempotent_on_repeated_disk_load() {
+        use crate::services::discord::runtime_store::lock_test_env;
+        use crate::services::turn_orchestrator::save_channel_queue;
+
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(tmp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id_u64: u64 = 660_111_222_333_444_003;
+        let channel_id = ChannelId::new(channel_id_u64);
+
+        let intervention = super::super::Intervention {
+            author_id: UserId::new(8),
+            message_id: MessageId::new(3001),
+            source_message_ids: vec![MessageId::new(3001)],
+            text: "only-once".to_string(),
+            mode: super::super::InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+        };
+        save_channel_queue(
+            &ProviderKind::Codex,
+            &harness.shared.token_hash,
+            channel_id,
+            &[intervention],
+            None,
+        );
+
+        let first = schedule_pending_queue_drain_after_cancel(
+            &harness.registry(),
+            "codex",
+            channel_id,
+            "test-idempotent-1",
+        )
+        .await;
+        assert_eq!(first.queue_depth_after, 1);
+
+        // Second invocation: the disk file is still present (the hydrate
+        // helper only writes through the mailbox actor which re-persists
+        // the same payload), but the in-memory entry already has
+        // `message_id=3001` so the merge must be a no-op on count.
+        let second = schedule_pending_queue_drain_after_cancel(
+            &harness.registry(),
+            "codex",
+            channel_id,
+            "test-idempotent-2",
+        )
+        .await;
+        assert_eq!(
+            second.queue_depth_after, 1,
+            "duplicate disk entry must not double-count"
+        );
+    }
+
+    /// #1671 — orphan ExplicitBackgroundWork safety net. The bridge left
+    /// behind an inflight whose `task_notification_kind` is set so the relay
+    /// classifier reports `ExplicitBackgroundWork`, the watcher view looks
+    /// healthy (`desynced=false`), and `unread_bytes=0` because the relay
+    /// caught up to the capture file. The classic desynced-only watchdog
+    /// path missed this case (issue #1670) — the new safety net must
+    /// recover it once the inflight has aged past the threshold.
+    #[tokio::test]
+    async fn stall_watchdog_force_cleans_orphan_explicit_background_work() {
+        let Some(tmux_guard) = start_test_tmux_session("watchdog-orphan-bg") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id: u64 = 700_111_222_333_777_001;
+        harness.seed_watcher_for_tmux(channel_id, &tmux_guard.name);
+
+        // Capture file with N bytes; relay-coord will be advanced to the
+        // SAME offset so unread_bytes == 0 (relay caught up).
+        let output_path = temp.path().join("watchdog-orphan-bg-output.jsonl");
+        let capture_bytes: u64 = 256;
+        std::fs::write(&output_path, vec![b'x'; capture_bytes as usize])
+            .expect("seed output capture");
+
+        let mut inflight = super::super::inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("watchdog-orphan-bg".to_string()),
+            42,
+            9_001,
+            9_002,
+            String::new(),
+            Some("session-watchdog-orphan-bg".to_string()),
+            Some(tmux_guard.name.clone()),
+            Some(output_path.to_string_lossy().into_owned()),
+            None,
+            0,
+        );
+        // Mark this as ExplicitBackground via `task_notification_kind` so
+        // `relay_active_turn_from_inflight` returns ExplicitBackground and
+        // the classifier emits `RelayStallState::ExplicitBackgroundWork`.
+        inflight.task_notification_kind =
+            Some(crate::services::agent_protocol::TaskNotificationKind::Background);
+        // Advance offset so unread_bytes == 0 against the seeded capture.
+        inflight.last_offset = capture_bytes;
+        // Backdate `updated_at` past the orphan threshold (10 min).
+        let stale_unix = chrono::Utc::now().timestamp()
+            - (super::STALL_WATCHDOG_EXPLICIT_BACKGROUND_INFLIGHT_THRESHOLD_SECS as i64)
+            - 60;
+        let stale_local = chrono::Local
+            .timestamp_opt(stale_unix, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        inflight.started_at = stale_local.clone();
+        inflight.updated_at = stale_local.clone();
+        super::super::inflight::save_inflight_state(&inflight)
+            .expect("write seeded stale inflight JSON");
+        // Re-stamp updated_at on disk (save_inflight_state rewrites it to
+        // now()) — write the JSON directly to bypass the auto-stamp.
+        let json = serde_json::to_string_pretty(&inflight).expect("serialize stale inflight");
+        let inflight_path = super::super::inflight::inflight_runtime_root()
+            .expect("inflight root override")
+            .join("codex")
+            .join(format!("{channel_id}.json"));
+        std::fs::write(&inflight_path, json).expect("rewrite stale inflight on disk");
+
+        // Match the relay-coord offset to capture so unread_bytes == 0.
+        // Backdate last_relay_ts_ms beyond the desync stale window AND
+        // beyond the 10-minute outbound threshold so the safety net's
+        // `last_outbound_activity_ms` gate also fires.
+        let coord = harness.shared.tmux_relay_coord(ChannelId::new(channel_id));
+        coord
+            .confirmed_end_offset
+            .store(capture_bytes, std::sync::atomic::Ordering::Release);
+        let stale_outbound_ms = chrono::Utc::now().timestamp_millis()
+            - ((super::STALL_WATCHDOG_EXPLICIT_BACKGROUND_OUTBOUND_THRESHOLD_SECS as i64) * 1000)
+            - 60_000;
+        coord
+            .last_relay_ts_ms
+            .store(stale_outbound_ms, std::sync::atomic::Ordering::Release);
+
+        // Sanity: snapshot must classify this as ExplicitBackgroundWork +
+        // unread_bytes == 0 + desynced == false before the run.
+        let pre_snapshot = harness
+            .registry()
+            .snapshot_watcher_state(channel_id)
+            .await
+            .expect("seeded inflight should surface a snapshot");
+        assert!(pre_snapshot.attached, "watcher binding implies attached");
+        assert_eq!(pre_snapshot.unread_bytes, Some(0));
+        assert_eq!(
+            pre_snapshot.relay_stall_state,
+            super::super::relay_health::RelayStallState::ExplicitBackgroundWork
+        );
+
+        // codex P1 — `reregister_active_turn_from_inflight` re-creates a
+        // mailbox cancel token after a dcserver restart WITHOUT touching
+        // `global_active` (the previous parent's counter died with that
+        // process). Mirror that here by leaving `global_active = 0` and
+        // proving the orphan-recovery decrement does not wrap to
+        // `usize::MAX`.
+        let global_active_before = harness
+            .shared
+            .global_active
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            global_active_before, 0,
+            "test setup: counter must start at 0 to exercise the wrap-protection branch",
+        );
+
+        // Run the watchdog pass — orphan ExplicitBackgroundWork must be
+        // recovered.
+        let cleaned =
+            super::run_stall_watchdog_pass(&harness.registry(), &ProviderKind::Codex).await;
+        assert_eq!(
+            cleaned, 1,
+            "watchdog must clean exactly 1 orphan ExplicitBackgroundWork channel"
+        );
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_none(),
+            "watchdog must delete the stale orphan inflight state file"
+        );
+        // codex P1 — saturating-decrement invariant: counter must remain
+        // 0 (never wrap to `usize::MAX`). A regression that re-introduces
+        // raw `fetch_sub(1)` here would surface as a wrapped value, which
+        // would convince health and deferred-restart logic that a phantom
+        // active turn lives forever.
+        let global_active_after = harness
+            .shared
+            .global_active
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(
+            global_active_after, 0,
+            "global_active must not wrap when the orphan-recovery branch decrements an already-zero counter",
+        );
+    }
+
+    /// #1671 — false-positive guard for the orphan ExplicitBackgroundWork
+    /// path: a real long-running background turn whose
+    /// `last_outbound_activity_ms` is fresh (the watcher is still streaming
+    /// tool output) MUST NOT be flagged even if `task_notification_kind`
+    /// has been set for hours.
+    #[tokio::test]
+    async fn stall_watchdog_skips_active_explicit_background_with_fresh_outbound() {
+        let Some(tmux_guard) = start_test_tmux_session("watchdog-active-bg") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id: u64 = 700_111_222_333_777_002;
+        harness.seed_watcher_for_tmux(channel_id, &tmux_guard.name);
+
+        let output_path = temp.path().join("watchdog-active-bg-output.jsonl");
+        let capture_bytes: u64 = 256;
+        std::fs::write(&output_path, vec![b'x'; capture_bytes as usize])
+            .expect("seed output capture");
+
+        let mut inflight = super::super::inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("watchdog-active-bg".to_string()),
+            42,
+            9_011,
+            9_012,
+            String::new(),
+            Some("session-watchdog-active-bg".to_string()),
+            Some(tmux_guard.name.clone()),
+            Some(output_path.to_string_lossy().into_owned()),
+            None,
+            0,
+        );
+        inflight.task_notification_kind =
+            Some(crate::services::agent_protocol::TaskNotificationKind::Background);
+        inflight.last_offset = capture_bytes;
+        // Stale inflight updated_at — but we'll keep last_relay_ts_ms FRESH
+        // to mimic an actively-streaming background turn.
+        let stale_unix = chrono::Utc::now().timestamp()
+            - (super::STALL_WATCHDOG_EXPLICIT_BACKGROUND_INFLIGHT_THRESHOLD_SECS as i64)
+            - 60;
+        let stale_local = chrono::Local
+            .timestamp_opt(stale_unix, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        inflight.started_at = stale_local.clone();
+        inflight.updated_at = stale_local.clone();
+        super::super::inflight::save_inflight_state(&inflight)
+            .expect("write seeded stale inflight JSON");
+        let json = serde_json::to_string_pretty(&inflight).expect("serialize stale inflight");
+        let inflight_path = super::super::inflight::inflight_runtime_root()
+            .expect("inflight root override")
+            .join("codex")
+            .join(format!("{channel_id}.json"));
+        std::fs::write(&inflight_path, json).expect("rewrite stale inflight on disk");
+
+        let coord = harness.shared.tmux_relay_coord(ChannelId::new(channel_id));
+        coord
+            .confirmed_end_offset
+            .store(capture_bytes, std::sync::atomic::Ordering::Release);
+        // FRESH last_relay_ts_ms — within the outbound threshold.
+        coord.last_relay_ts_ms.store(
+            chrono::Utc::now().timestamp_millis() - 30_000,
+            std::sync::atomic::Ordering::Release,
+        );
+
+        let cleaned =
+            super::run_stall_watchdog_pass(&harness.registry(), &ProviderKind::Codex).await;
+        assert_eq!(
+            cleaned, 0,
+            "watchdog must NOT clean an actively-streaming ExplicitBackgroundWork channel"
+        );
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_some(),
+            "active background inflight must survive the watchdog"
+        );
+    }
+
+    /// #1671 codex re-review P2 — the orphan ExplicitBackgroundWork
+    /// cleanup branch MUST preserve the channel's queued user
+    /// interventions. The legacy implementation routed cleanup through
+    /// `mailbox_clear_channel`, which drained `intervention_queue` as
+    /// `Superseded`; any user message queued behind the stalled turn was
+    /// silently dropped. The fix swaps to `mailbox_finish_turn`, which
+    /// only releases the active-turn anchor + cancel token while leaving
+    /// the queue intact, then schedules a deferred idle-queue kickoff so
+    /// the survived items drain without waiting for a fresh user message.
+    /// This test seeds the same orphan-recovery scenario as the parent
+    /// test plus a non-empty mailbox queue, runs the watchdog, and
+    /// asserts (1) the queue items survive in the mailbox snapshot and
+    /// (2) the inflight cleanup still happens.
+    #[tokio::test]
+    async fn stall_watchdog_orphan_explicit_background_preserves_pending_queue() {
+        let Some(tmux_guard) = start_test_tmux_session("watchdog-orphan-bg-queue") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("create temp runtime root");
+        let prev_override = crate::config::current_test_runtime_root_override();
+        crate::config::set_test_runtime_root_override(Some(temp.path().to_path_buf()));
+        struct OverrideGuard(Option<std::path::PathBuf>);
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                crate::config::set_test_runtime_root_override(self.0.clone());
+            }
+        }
+        let _guard = OverrideGuard(prev_override);
+
+        let harness = TestHealthHarness::new_with_provider(ProviderKind::Codex).await;
+        let channel_id: u64 = 700_111_222_333_777_777;
+        harness.seed_watcher_for_tmux(channel_id, &tmux_guard.name);
+
+        // Seed two queued interventions BEFORE the watchdog runs. These
+        // must survive the orphan-recovery cleanup; if the cleanup still
+        // routes through `mailbox_clear_channel` they will be drained.
+        harness
+            .set_queue_depth_for_channel(channel_id, ProviderKind::Codex, 2)
+            .await;
+        let pre_queue_depth = harness.queue_depth_for_channel(channel_id).await;
+        assert_eq!(
+            pre_queue_depth, 2,
+            "test setup must successfully seed 2 queued interventions"
+        );
+
+        let output_path = temp.path().join("watchdog-orphan-bg-queue-output.jsonl");
+        let capture_bytes: u64 = 256;
+        std::fs::write(&output_path, vec![b'x'; capture_bytes as usize])
+            .expect("seed output capture");
+
+        let mut inflight = super::super::inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("watchdog-orphan-bg-queue".to_string()),
+            42,
+            9_777,
+            9_778,
+            String::new(),
+            Some("session-watchdog-orphan-bg-queue".to_string()),
+            Some(tmux_guard.name.clone()),
+            Some(output_path.to_string_lossy().into_owned()),
+            None,
+            0,
+        );
+        inflight.task_notification_kind =
+            Some(crate::services::agent_protocol::TaskNotificationKind::Background);
+        inflight.last_offset = capture_bytes;
+        let stale_unix = chrono::Utc::now().timestamp()
+            - (super::STALL_WATCHDOG_EXPLICIT_BACKGROUND_INFLIGHT_THRESHOLD_SECS as i64)
+            - 60;
+        let stale_local = chrono::Local
+            .timestamp_opt(stale_unix, 0)
+            .single()
+            .expect("valid local time")
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        inflight.started_at = stale_local.clone();
+        inflight.updated_at = stale_local.clone();
+        super::super::inflight::save_inflight_state(&inflight)
+            .expect("write seeded stale inflight JSON");
+        let json = serde_json::to_string_pretty(&inflight).expect("serialize stale inflight");
+        let inflight_path = super::super::inflight::inflight_runtime_root()
+            .expect("inflight root override")
+            .join("codex")
+            .join(format!("{channel_id}.json"));
+        std::fs::write(&inflight_path, json).expect("rewrite stale inflight on disk");
+
+        let coord = harness.shared.tmux_relay_coord(ChannelId::new(channel_id));
+        coord
+            .confirmed_end_offset
+            .store(capture_bytes, std::sync::atomic::Ordering::Release);
+        let stale_outbound_ms = chrono::Utc::now().timestamp_millis()
+            - ((super::STALL_WATCHDOG_EXPLICIT_BACKGROUND_OUTBOUND_THRESHOLD_SECS as i64) * 1000)
+            - 60_000;
+        coord
+            .last_relay_ts_ms
+            .store(stale_outbound_ms, std::sync::atomic::Ordering::Release);
+
+        let cleaned =
+            super::run_stall_watchdog_pass(&harness.registry(), &ProviderKind::Codex).await;
+        assert_eq!(
+            cleaned, 1,
+            "watchdog must clean exactly 1 orphan ExplicitBackgroundWork channel"
+        );
+        assert!(
+            super::super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id).is_none(),
+            "watchdog must delete the stale orphan inflight state file"
+        );
+        // CORE invariant for codex P2 — queued interventions survive the
+        // watchdog cleanup. A regression that re-routes through
+        // `mailbox_clear_channel` would surface here as queue_depth == 0.
+        let post_queue_depth = harness.queue_depth_for_channel(channel_id).await;
+        assert_eq!(
+            post_queue_depth, 2,
+            "queued interventions must survive orphan ExplicitBackgroundWork cleanup",
         );
     }
 }
