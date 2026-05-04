@@ -166,6 +166,9 @@
 
 ## P1: Settings & Config
 
+### runtime-config / dashboard (Company Settings)
+- `put_settings_is_full_replace` — dashboard settings are full replace (no merging)
+
 ### bot_settings.json
 - `token_hash_sha256_correct` — SHA256 해시 계산 정확
 - `token_hash_reproducible` — 같은 토큰 → 같은 해시
