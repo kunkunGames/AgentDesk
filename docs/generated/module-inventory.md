@@ -53,7 +53,7 @@
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 |  |
 | `cli::doctor::health` | `src/cli/doctor/health.rs` | 164 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 256 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4324 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4367 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 357 |  |
 | `cli::init` | `src/cli/init.rs` | 1573 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 348 |  |
@@ -78,7 +78,7 @@
 | `db::kanban` | `src/db/kanban.rs` | 1 |  |
 | `db::kanban_cards` | `src/db/kanban_cards.rs` | 1903 | giant-file |
 | `db::memento_feedback_stats` | `src/db/memento_feedback_stats.rs` | 265 |  |
-| `db::postgres` | `src/db/postgres.rs` | 1536 | giant-file |
+| `db::postgres` | `src/db/postgres.rs` | 1570 | giant-file |
 | `db::prompt_manifests` | `src/db/prompt_manifests.rs` | 642 |  |
 | `db::schema` | `src/db/schema.rs` | 3195 | giant-file |
 | `db::session_agent_resolution` | `src/db/session_agent_resolution.rs` | 492 |  |
@@ -279,7 +279,7 @@
 | `services::discord::health` | `src/services/discord/health.rs` | 6247 | giant-file |
 | `services::discord::http` | `src/services/discord/http.rs` | 23 |  |
 | `services::discord::idle_detector` | `src/services/discord/idle_detector.rs` | 587 |  |
-| `services::discord::inflight` | `src/services/discord/inflight.rs` | 1287 | giant-file |
+| `services::discord::inflight` | `src/services/discord/inflight.rs` | 1330 | giant-file |
 | `services::discord::internal_api` | `src/services/discord/internal_api.rs` | 785 |  |
 | `services::discord::mcp_credential_watcher` | `src/services/discord/mcp_credential_watcher.rs` | 645 |  |
 | `services::discord::meeting_artifact_store` | `src/services/discord/meeting_artifact_store.rs` | 356 |  |
