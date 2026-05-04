@@ -103,32 +103,26 @@ function passesQualityGate(candidate, nowStr) {
   return { pass: true, reason: null };
 }
 
-// --- Build approval prompt ---
+// --- Direct approval write (Direction 1) ---
+// Quality gate passing IS the approval: write candidate_approved directly so
+// the executor can proceed without trusting the LLM to write the marker.
 
-function buildApprovalPrompt(signature, candidate) {
-  const lines = [
-    "자동화 후보 검토 요청입니다. 아래 후보를 검토하고 승인 여부를 결정해주세요.",
-    "",
-    `**후보 ID (signature)**: \`${signature}\``,
-    `**카테고리**: ${candidate.category || "routine-candidate"}`,
-    `**점수**: ${candidate.score}`,
-    `**증거 수**: ${candidate.evidence_count || 0}`,
-    `**제안된 자동화**: ${candidate.suggested_automation || "(없음)"}`,
-    `**결과 요약**: ${candidate.outcome_summary || "(없음)"}`,
-    "",
-    "---",
-    "## 승인 지침",
-    "",
-    "후보가 자동화 가치가 있다고 판단되면 다음 kv_meta를 기록해주세요:",
-    "```",
-    `routine_observation:candidate_approved:${signature}`,
-    "```",
-    "값(JSON): `{\"signature\":\"" + signature + "\",\"score\":" + candidate.score + ",\"approved_at\":\"<현재시각ISO>\",\"category\":\"" + (candidate.category || "routine-candidate") + "\"}`",
-    "TTL: 72h",
-    "",
-    "승인하지 않는다면 kv_meta를 기록하지 않아도 됩니다.",
-  ];
-  return lines.join("\n");
+function writeApprovalKv(signature, candidate, nowStr) {
+  const key = `routine_observation:candidate_approved:${signature}`;
+  const value = JSON.stringify({
+    signature,
+    score: candidate.score || 0,
+    approved_at: nowStr,
+    category: candidate.category || "routine-candidate",
+    suggested_automation: candidate.suggested_automation || "",
+    outcome_summary: candidate.outcome_summary || "",
+  });
+  try {
+    agentdesk.kv.set(key, value, 259200);  // 72h TTL
+    return true;
+  } catch (_e) {
+    return false;
+  }
 }
 
 // --- Main tick ---
@@ -242,22 +236,29 @@ agentdesk.routines.register({
       };
     }
 
-    // Emit one approval prompt (first candidate, others handled on next ticks)
+    // Direction 1: write candidate_approved directly for the first passing candidate.
+    // Quality gate (score >= 80, evidence age < 48h) is the approval mechanism.
+    // Remaining candidates handled on next ticks.
     const { signature, candidate } = emitPrompts[0];
-    const prompt = buildApprovalPrompt(signature, candidate);
+    writeApprovalKv(signature, candidate, nowStr);
     const previousSeen = cp.seen_candidates[signature];
-    const emitCount = (previousSeen?.emit_count || 0) + 1;
     cp.seen_candidates[signature] = {
       first_seen_at: previousSeen?.first_seen_at || nowStr,
       last_emitted_at: nowStr,
-      emit_count: emitCount,
-      status: "emitted",
+      emit_count: (previousSeen?.emit_count || 0) + 1,
+      status: "approved",
     };
     cp.stats.approved_emitted++;
 
     return {
-      action: "agent",
-      prompt,
+      action: "complete",
+      result: {
+        status: "ok",
+        summary: `후보 ${signature} 직접 승인 완료 (score=${candidate.score || 0})`,
+        approved_signature: signature,
+        approved_count: 1,
+        remaining_review_count: emitPrompts.length - 1,
+      },
       checkpoint: cp,
     };
   },

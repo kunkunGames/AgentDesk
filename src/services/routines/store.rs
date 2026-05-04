@@ -9,6 +9,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
+use reqwest;
 
 pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
 const RUN_LEASE_SECS: i64 = ROUTINE_RUN_LEASE_SECS as i64;
@@ -749,6 +750,7 @@ impl RoutineStore {
         const CAP_KANBAN: i64 = 10;
         const CAP_DISPATCHES: i64 = 10;
         const CAP_SESSION: i64 = 10;
+        const CAP_MEMENTO: usize = 6;
 
         let now = Utc::now();
 
@@ -1212,6 +1214,9 @@ impl RoutineStore {
             }));
         }
 
+        // --- Source 8: Memento MCP recall (cap 6) ---
+        let memento_obs = fetch_memento_recall_observations(CAP_MEMENTO, now).await;
+
         // --- Fair merge: round-robin across all sources so no single source starves others ---
         use std::collections::VecDeque;
         let mut sources: Vec<VecDeque<serde_json::Value>> = vec![
@@ -1222,6 +1227,7 @@ impl RoutineStore {
             kanban_obs.into(),
             dispatch_obs.into(),
             session_obs.into(),
+            memento_obs.into(),
         ];
         let mut observations = Vec::with_capacity(max_items.min(100));
         let mut total_bytes: usize = 0;
@@ -2121,6 +2127,169 @@ impl RoutineStore {
         tx.commit().await?;
         Ok(true)
     }
+}
+
+// --- Source 8: direct Memento MCP recall ---
+// Bypasses memento-digest-writer.js (LLM-dependent) by calling Memento HTTP API
+// directly. Returns at most `cap` observations tagged as routine-candidates.
+// Silently returns empty vec on any config or network error so callers are unaffected.
+async fn fetch_memento_recall_observations(
+    cap: usize,
+    now: DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    const MEMENTO_MCP_PATH: &str = "/mcp";
+    const MEMENTO_PROTOCOL_VERSION: &str = "2025-11-25";
+
+    let root = match crate::config::runtime_root() {
+        Some(r) => r,
+        None => return vec![],
+    };
+    let config = crate::runtime_layout::load_memory_backend(&root);
+    let endpoint = {
+        let raw = config.mcp.endpoint.trim().trim_end_matches('/');
+        let trimmed = raw.strip_suffix(MEMENTO_MCP_PATH).unwrap_or(raw);
+        if trimmed.is_empty() {
+            return vec![];
+        }
+        trimmed.to_string()
+    };
+    let access_key_env = config.mcp.access_key_env.trim().to_string();
+    if access_key_env.is_empty() {
+        return vec![];
+    }
+    let access_key = match std::env::var(&access_key_env) {
+        Ok(k) => k,
+        Err(_) => return vec![],
+    };
+
+    let mcp_url = format!("{}{}", endpoint, MEMENTO_MCP_PATH);
+    let client = reqwest::Client::new();
+
+    // Initialize session to obtain MCP-Session-Id
+    let init_response = match client
+        .post(&mcp_url)
+        .header("Authorization", format!("Bearer {access_key}"))
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MEMENTO_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "agentdesk-store", "version": env!("CARGO_PKG_VERSION") },
+                "accessKey": access_key,
+            }
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+    let session_id = match init_response
+        .headers()
+        .get("MCP-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+    {
+        Some(id) => id,
+        None => return vec![],
+    };
+
+    // 3 recall queries covering the most actionable routine-candidate signals
+    let queries: &[(&str, &str, &str)] = &[
+        ("routine-failures", "routine-candidate", "반복 루틴 실패 에러"),
+        ("agent-errors", "routine-candidate", "에이전트 반복 오류 실수"),
+        ("automation-opportunities", "routine-candidate", "반복 수동 작업 자동화"),
+    ];
+
+    let mut obs: Vec<serde_json::Value> = Vec::new();
+    let nowstr = now.to_rfc3339();
+
+    for (topic, category, query) in queries {
+        if obs.len() >= cap {
+            break;
+        }
+        let recall_result = client
+            .post(&mcp_url)
+            .header("Authorization", format!("Bearer {access_key}"))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("MCP-Session-Id", &session_id)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "recall",
+                    "arguments": {
+                        "query": query,
+                        "type": "error",
+                        "limit": 5,
+                    }
+                }
+            }))
+            .send()
+            .await;
+
+        let response = match recall_result {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let text = match response.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let payload: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Parse result.content[0].text as JSON, count fragments
+        let count = payload
+            .get("result")
+            .and_then(|r| r.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .and_then(|parsed| {
+                // Accept count field or length of fragments/results/items array
+                if let Some(n) = parsed.get("count").and_then(Value::as_u64) {
+                    return Some(n as usize);
+                }
+                for key in &["fragments", "results", "items"] {
+                    if let Some(n) = parsed.get(key).and_then(Value::as_array).map(|a| a.len()) {
+                        if n > 0 {
+                            return Some(n);
+                        }
+                    }
+                }
+                None
+            })
+            .unwrap_or(0);
+
+        if count == 0 {
+            continue;
+        }
+
+        obs.push(serde_json::json!({
+            "source": "memento_recall",
+            "category": category,
+            "signature": format!("routine-candidate:{topic}"),
+            "topic": topic,
+            "count": count,
+            "last_seen_at": nowstr,
+            "evidence_ref": format!("memento_recall:{topic}"),
+        }));
+    }
+
+    obs
 }
 
 fn validate_execution_strategy(strategy: &str) -> Result<()> {

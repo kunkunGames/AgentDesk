@@ -1127,6 +1127,25 @@ agentdesk.routines.register({
     const prompt = buildPrompt(escalation);
     markRecommended(cp, escalation, nowStr);
 
+    // Direction 1: write candidate_review kv_meta directly so the detector can
+    // pick it up without trusting the LLM to write the marker.
+    const { patternId, candidate } = escalation;
+    const reviewKey = `routine_observation:candidate_review:${patternId}`;
+    const reviewValue = JSON.stringify({
+      signature: patternId,
+      category: candidate.category || "routine-candidate",
+      score: candidate.score || 0,
+      evidence_count: candidate.evidence_count || 0,
+      suggested_automation: candidate.suggested_automation || "",
+      outcome_summary: candidate.outcome_summary || "",
+      last_seen_at: candidate.last_seen_at || nowStr,
+    });
+    try {
+      agentdesk.kv.set(reviewKey, reviewValue, 172800);  // 48h TTL
+    } catch (_e) {
+      // non-fatal: detector will retry on next tick if kv write fails
+    }
+
     return {
       action: "agent",
       prompt,

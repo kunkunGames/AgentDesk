@@ -123,15 +123,6 @@ function buildDispatchPrompt(signature, candidate) {
     "   - 본문: 위 후보 정보 포함",
     "",
     "2. **Kanban 카드 생성**: kanban-writer 스킬을 사용해 카드를 생성해주세요.",
-    "",
-    "3. **완료 후 kv_meta 기록**:",
-    "```",
-    `routine_observation:candidate_dispatched:${signature}`,
-    "```",
-    "값(JSON): `{\"signature\":\"" + signature + "\",\"dispatched_at\":\"<현재시각ISO>\",\"category\":\"" + (candidate.category || "routine-candidate") + "\"}`",
-    "TTL: 7d (604800초)",
-    "",
-    "이 kv_meta 기록은 executor 중복 방지 및 recommender 재추천 억제에 사용됩니다.",
   ];
   return lines.join("\n");
 }
@@ -230,6 +221,21 @@ agentdesk.routines.register({
       attempt_count: (prevPending?.attempt_count || 0) + 1,
     };
     cp.stats.dispatched++;
+
+    // Direction 1: write candidate_dispatched directly so the executor dedup check
+    // does not depend on the LLM writing the marker after a successful dispatch.
+    const dispatchedKey = `routine_observation:candidate_dispatched:${signature}`;
+    const dispatchedValue = JSON.stringify({
+      signature,
+      dispatched_at: nowStr,
+      category: candidate.category || "routine-candidate",
+    });
+    try {
+      agentdesk.kv.set(dispatchedKey, dispatchedValue, 604800);  // 7d TTL
+      cp.dispatched_signatures[signature] = nowStr;
+    } catch (_e) {
+      // non-fatal: dedup via pending_dispatches + MAX_DISPATCH_RETRIES on next tick
+    }
 
     const prompt = buildDispatchPrompt(signature, candidate);
 
