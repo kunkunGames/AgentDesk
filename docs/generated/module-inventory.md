@@ -280,7 +280,7 @@
 | `services::discord::health` | `src/services/discord/health.rs` | 6247 | giant-file |
 | `services::discord::http` | `src/services/discord/http.rs` | 23 |  |
 | `services::discord::idle_detector` | `src/services/discord/idle_detector.rs` | 587 |  |
-| `services::discord::inflight` | `src/services/discord/inflight.rs` | 1287 | giant-file |
+| `services::discord::inflight` | `src/services/discord/inflight.rs` | 1330 | giant-file |
 | `services::discord::internal_api` | `src/services/discord/internal_api.rs` | 785 |  |
 | `services::discord::mcp_credential_watcher` | `src/services/discord/mcp_credential_watcher.rs` | 645 |  |
 | `services::discord::meeting_artifact_store` | `src/services/discord/meeting_artifact_store.rs` | 356 |  |
