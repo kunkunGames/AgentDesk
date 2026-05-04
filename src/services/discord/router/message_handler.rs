@@ -2,57 +2,47 @@ use super::super::gateway::{
     DiscordGateway, HeadlessGateway, LiveDiscordTurnContext, send_intake_placeholder,
 };
 use super::super::*;
+pub(in crate::services::discord) use super::authorization::{
+    TurnKind, classify_turn_kind_from_author,
+};
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use super::dispatch_trigger::evaluate_dispatch_cwd_policy;
+use super::dispatch_trigger::{
+    dispatch_session_path_should_update, parse_dispatch_context_hints,
+    resolve_dispatch_target_repo_dir,
+};
+use super::response_format::{
+    build_headless_trigger_context, build_memory_injection_plan, build_race_requeued_intervention,
+    build_system_discord_context, dispatch_profile_label, memento_recall_gate_decision,
+    merge_reply_contexts, should_note_memento_context_loaded, wrap_user_prompt_with_author,
+};
+pub(in crate::services::discord) use super::turn_start::reserve_headless_turn;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use super::turn_start::resolve_session_id_for_current_turn;
+#[cfg(test)]
+use super::turn_start::session_strategy_lifecycle_event;
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use super::turn_start::{HEADLESS_TURN_MESSAGE_ID_BASE, headless_turn_message_id_seed};
+pub(crate) use super::turn_start::{
+    HeadlessTurnReservation, HeadlessTurnStartError, HeadlessTurnStartOutcome,
+};
+use super::turn_start::{
+    SessionResetReason, cli_just_spawned_for_emit, dispatch_reset_lifecycle_code,
+    emit_session_strategy_lifecycle, load_session_runtime_state, log_session_strategy_diagnostic,
+    refresh_session_strategy_after_pending_reset, release_mailbox_after_placeholder_post_failure,
+    session_reset_reason_for_turn, session_reset_reason_lifecycle_code,
+    session_runtime_state_after_redirect, take_session_retry_context,
+};
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+use crate::services::git::GitCommand;
 use crate::services::memory::{
     RecallMode, RecallRequest, RecallResponse, RecallSizeBucket, build_memory_backend,
     note_recall_context_size, resolve_memory_role_id, resolve_memory_session_id,
 };
+#[cfg(test)]
+use crate::services::observability::turn_lifecycle::TurnEvent;
 use crate::services::provider::{CancelToken, cancel_requested};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[derive(Debug, PartialEq, Eq)]
-struct MemoryInjectionPlan<'a> {
-    shared_knowledge_for_context: Option<&'a str>,
-    shared_knowledge_for_system_prompt: Option<&'a str>,
-    external_recall_for_context: Option<&'a str>,
-    longterm_catalog_for_system_prompt: Option<&'a str>,
-}
-
-/// #1083: Memento recall gate decision.
-///
-/// Trigger conditions for full memento context injection:
-/// 1. The user prompt contains a "previous-context" keyword
-///    (e.g. "이전에", "저번에", "전에").
-/// 2. The user prompt contains an "error/failure" keyword
-///    (e.g. "에러", "실패", "오류", "안 됨", "안됨").
-/// 3. The user prompt contains a "settings change" keyword
-///    (e.g. "설정 변경", "config change", ...).
-/// 4. The user prompt is an explicit recall command — `/recall`,
-///    `/memento`, `/memory-read`, or carries `[memento:recall]` /
-///    `<memento:recall>` / `memento_recall` / `@memento recall` markers.
-///
-/// Outcome:
-/// * Any trigger above → `recall: true`, `mode: Full`.
-/// * Otherwise, on a fresh session (no memento context yet) → `recall: true`,
-///   `mode: IdentityOnly`. The backend returns the identity-only payload so
-///   the model still has the lightweight identity context.
-/// * Otherwise → `recall: false` (the in-context memento payload is reused).
-///
-/// Non-memento backends always recall in `Full` mode for backwards
-/// compatibility — they pay nothing for the trigger logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MementoRecallGateDecision {
-    should_recall: bool,
-    mode: RecallMode,
-    reason: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionResetReason {
-    IdleExpired,
-    AssistantTurnCap,
-}
 
 const WATCHDOG_DEADLOCK_PREALERT_MS: i64 = 5 * 60 * 1000;
 const WATCHDOG_DEADLOCK_PREALERT_BOT: &str = "announce";
@@ -90,6 +80,13 @@ fn metadata_delivery_bot(metadata: Option<&serde_json::Value>) -> Option<String>
         .and_then(|value| value.get("delivery_bot"))
         .and_then(|value| value.as_str())
         .and_then(normalize_delivery_bot_name)
+}
+
+fn metadata_silent_flag(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|value| value.get("silent"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn normalize_delivery_bot_name(value: &str) -> Option<String> {
@@ -411,174 +408,6 @@ pub(crate) mod test_harness_exports {
     }
 }
 
-fn build_memory_injection_plan<'a>(
-    provider: &ProviderKind,
-    has_session_id: bool,
-    dispatch_profile: DispatchProfile,
-    memory_recall: &'a RecallResponse,
-) -> MemoryInjectionPlan<'a> {
-    let should_inject_shared_knowledge =
-        dispatch_profile == DispatchProfile::Full && !has_session_id;
-    let shared_knowledge_for_context =
-        if should_inject_shared_knowledge && !matches!(provider, ProviderKind::Claude) {
-            memory_recall.shared_knowledge.as_deref()
-        } else {
-            None
-        };
-    let shared_knowledge_for_system_prompt =
-        if dispatch_profile == DispatchProfile::Full && matches!(provider, ProviderKind::Claude) {
-            memory_recall.shared_knowledge.as_deref()
-        } else {
-            None
-        };
-    let external_recall_for_context = if dispatch_profile != DispatchProfile::ReviewLite {
-        memory_recall.external_recall.as_deref()
-    } else {
-        None
-    };
-    let longterm_catalog_for_system_prompt = if dispatch_profile == DispatchProfile::Full {
-        memory_recall.longterm_catalog.as_deref()
-    } else {
-        None
-    };
-
-    MemoryInjectionPlan {
-        shared_knowledge_for_context,
-        shared_knowledge_for_system_prompt,
-        external_recall_for_context,
-        longterm_catalog_for_system_prompt,
-    }
-}
-
-fn memento_recall_gate_decision(
-    memory_settings: &settings::ResolvedMemorySettings,
-    memento_context_loaded: bool,
-    user_text: &str,
-    dispatch_profile: DispatchProfile,
-) -> MementoRecallGateDecision {
-    if memory_settings.backend != settings::MemoryBackendKind::Memento {
-        return MementoRecallGateDecision {
-            should_recall: true,
-            mode: RecallMode::Full,
-            reason: "non_memento_backend",
-        };
-    }
-
-    if dispatch_profile == DispatchProfile::ReviewLite {
-        return MementoRecallGateDecision {
-            should_recall: false,
-            mode: RecallMode::Full,
-            reason: "review_lite_profile",
-        };
-    }
-
-    let normalized = user_text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = normalized.to_lowercase();
-    let text = lower.as_str();
-
-    if ["이전에", "저번에", "전에"]
-        .iter()
-        .any(|keyword| text.contains(keyword))
-    {
-        return MementoRecallGateDecision {
-            should_recall: true,
-            mode: RecallMode::Full,
-            reason: "previous_context_signal",
-        };
-    }
-
-    if ["에러", "실패", "오류", "안 됨", "안됨"]
-        .iter()
-        .any(|keyword| text.contains(keyword))
-    {
-        return MementoRecallGateDecision {
-            should_recall: true,
-            mode: RecallMode::Full,
-            reason: "error_context_signal",
-        };
-    }
-
-    if [
-        "설정 변경",
-        "설정 바",
-        "설정 업데이트",
-        "config change",
-        "configuration change",
-        "settings change",
-    ]
-    .iter()
-    .any(|keyword| text.contains(keyword))
-    {
-        return MementoRecallGateDecision {
-            should_recall: true,
-            mode: RecallMode::Full,
-            reason: "setting_change_signal",
-        };
-    }
-
-    let trimmed = text.trim_start();
-    if trimmed.starts_with("/recall")
-        || trimmed.starts_with("/memento")
-        || trimmed.starts_with("/memory-read")
-        || text.contains("[memento:recall]")
-        || text.contains("<memento:recall>")
-        || text.contains("memento_recall")
-        || text.contains("@memento recall")
-    {
-        return MementoRecallGateDecision {
-            should_recall: true,
-            mode: RecallMode::Full,
-            reason: "explicit_recall_signal",
-        };
-    }
-
-    // #1083: No trigger signal. Default behaviour:
-    // * If memento context has not been loaded for this session yet, fetch a
-    //   *lightweight identity-only* payload so the model still gets the
-    //   identity context, but skip the heavy ranked / core memory sections.
-    // * If the identity context was already loaded this session, skip the
-    //   memento call entirely and reuse the in-context payload.
-    if !memento_context_loaded {
-        return MementoRecallGateDecision {
-            should_recall: true,
-            mode: RecallMode::IdentityOnly,
-            reason: if dispatch_profile == DispatchProfile::Lite {
-                "lite_identity_only"
-            } else {
-                "identity_only_session_start"
-            },
-        };
-    }
-
-    MementoRecallGateDecision {
-        should_recall: false,
-        mode: RecallMode::Full,
-        reason: if dispatch_profile == DispatchProfile::Lite {
-            "lite_no_turn_signal"
-        } else {
-            "no_turn_signal"
-        },
-    }
-}
-
-fn dispatch_profile_label(dispatch_profile: DispatchProfile) -> &'static str {
-    match dispatch_profile {
-        DispatchProfile::Full => "full",
-        DispatchProfile::Lite => "lite",
-        DispatchProfile::ReviewLite => "review_lite",
-    }
-}
-
-fn should_note_memento_context_loaded(
-    memory_settings: &settings::ResolvedMemorySettings,
-    memento_context_loaded: bool,
-    memory_recall: &RecallResponse,
-) -> bool {
-    memory_settings.backend == settings::MemoryBackendKind::Memento
-        && !memento_context_loaded
-        && memory_recall.memento_context_loaded
-}
-
 fn should_add_turn_pending_reaction(_dispatch_id: Option<&str>) -> bool {
     // #750: announce bot no longer writes lifecycle emojis, so the command bot
     // is now the single source of ⏳ for both regular and dispatch turns.
@@ -621,206 +450,6 @@ fn effective_fast_mode_channel_id(
         .unwrap_or(channel_id)
 }
 
-fn session_reset_reason_for_turn(
-    session: &DiscordSession,
-    now: tokio::time::Instant,
-) -> Option<SessionResetReason> {
-    if now.duration_since(session.last_active) > super::super::SESSION_MAX_IDLE {
-        Some(SessionResetReason::IdleExpired)
-    } else if session.assistant_turn_count() >= super::super::SESSION_MAX_ASSISTANT_TURNS {
-        Some(SessionResetReason::AssistantTurnCap)
-    } else {
-        None
-    }
-}
-
-fn format_session_retry_context(raw_context: &str) -> Option<String> {
-    let raw_context = raw_context.trim();
-    if raw_context.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "[이전 대화 복원 — 새 세션 시작으로 최근 대화를 컨텍스트에 포함합니다]\n\n{raw_context}"
-        ))
-    }
-}
-
-fn merge_reply_contexts(primary: Option<String>, secondary: Option<String>) -> Option<String> {
-    match (primary, secondary) {
-        (Some(primary), Some(secondary)) => Some(format!("{secondary}\n\n{primary}")),
-        (Some(primary), None) => Some(primary),
-        (None, Some(secondary)) => Some(secondary),
-        (None, None) => None,
-    }
-}
-
-fn take_session_retry_context(shared: &Arc<SharedData>, channel_id: ChannelId) -> Option<String> {
-    super::super::turn_bridge::take_session_retry_context(None::<&crate::db::Db>, channel_id.get())
-        .and_then(|raw| format_session_retry_context(&raw))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HeadlessTurnStartOutcome {
-    pub turn_id: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HeadlessTurnReservation {
-    user_msg_id: MessageId,
-    placeholder_msg_id: MessageId,
-}
-
-impl HeadlessTurnReservation {
-    pub(in crate::services::discord) fn turn_id(&self, channel_id: ChannelId) -> String {
-        format!("discord:{}:{}", channel_id.get(), self.user_msg_id.get())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HeadlessTurnStartError {
-    Conflict(String),
-    Internal(String),
-}
-
-impl std::fmt::Display for HeadlessTurnStartError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Conflict(message) | Self::Internal(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for HeadlessTurnStartError {}
-
-const HEADLESS_TURN_MESSAGE_ID_BASE: u64 = 9_100_000_000_000_000_000;
-const HEADLESS_TURN_MESSAGE_ID_EPOCH_MILLIS: u64 = 1_700_000_000_000;
-const HEADLESS_TURN_MESSAGE_IDS_PER_MILLI: u64 = 1_024;
-
-fn next_headless_turn_message_id() -> MessageId {
-    static HEADLESS_TURN_MESSAGE_ID_SEQ: AtomicU64 = AtomicU64::new(0);
-    ensure_headless_turn_message_id_seeded(&HEADLESS_TURN_MESSAGE_ID_SEQ);
-    MessageId::new(HEADLESS_TURN_MESSAGE_ID_SEQ.fetch_add(1, Ordering::Relaxed))
-}
-
-fn ensure_headless_turn_message_id_seeded(sequence: &AtomicU64) {
-    if sequence.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    let _ = sequence.compare_exchange(
-        0,
-        headless_turn_message_id_seed(current_unix_millis(), std::process::id()),
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
-}
-
-fn current_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-fn headless_turn_message_id_seed(now_millis: u64, process_id: u32) -> u64 {
-    let max_elapsed_millis =
-        (u64::MAX - HEADLESS_TURN_MESSAGE_ID_BASE - (HEADLESS_TURN_MESSAGE_IDS_PER_MILLI - 1))
-            / HEADLESS_TURN_MESSAGE_IDS_PER_MILLI;
-    let elapsed_millis = now_millis
-        .saturating_sub(HEADLESS_TURN_MESSAGE_ID_EPOCH_MILLIS)
-        .min(max_elapsed_millis);
-    HEADLESS_TURN_MESSAGE_ID_BASE
-        + (elapsed_millis * HEADLESS_TURN_MESSAGE_IDS_PER_MILLI)
-        + (u64::from(process_id) % HEADLESS_TURN_MESSAGE_IDS_PER_MILLI)
-}
-
-pub(in crate::services::discord) fn reserve_headless_turn() -> HeadlessTurnReservation {
-    HeadlessTurnReservation {
-        user_msg_id: next_headless_turn_message_id(),
-        placeholder_msg_id: next_headless_turn_message_id(),
-    }
-}
-
-fn build_headless_trigger_context(
-    source: Option<&str>,
-    metadata: Option<&serde_json::Value>,
-) -> Option<String> {
-    let source = source.map(str::trim).filter(|value| !value.is_empty());
-    let metadata = metadata.filter(|value| !value.is_null());
-    if source.is_none() && metadata.is_none() {
-        return None;
-    }
-
-    let mut lines = vec!["[Headless trigger context]".to_string()];
-    if let Some(source) = source {
-        lines.push(format!("source: {source}"));
-    }
-    if let Some(metadata) = metadata {
-        lines.push(format!("metadata: {}", metadata));
-    }
-    Some(lines.join("\n"))
-}
-
-fn build_system_discord_context(
-    channel_name: Option<&str>,
-    category_name: Option<&str>,
-    channel_id: ChannelId,
-    headless_fallback: bool,
-) -> String {
-    match channel_name {
-        Some(name) => {
-            let cat_part = category_name
-                .map(|value| format!(" (category: {value})"))
-                .unwrap_or_default();
-            format!(
-                "Discord context: channel #{} (ID: {}){}",
-                name,
-                channel_id.get(),
-                cat_part
-            )
-        }
-        None if headless_fallback => format!(
-            "Discord context: headless channel {} (no bound channel name)",
-            channel_id.get()
-        ),
-        None => "Discord context: DM".to_string(),
-    }
-}
-
-fn normalize_turn_author_name(request_owner_name: &str, request_owner: UserId) -> String {
-    let collapsed = request_owner_name
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let base = if collapsed.is_empty() {
-        format!("user {}", request_owner.get())
-    } else {
-        collapsed
-    };
-    let sanitized = base
-        .chars()
-        .map(|ch| match ch {
-            '\r' | '\n' => ' ',
-            '[' | '{' => '(',
-            ']' | '}' => ')',
-            _ => ch,
-        })
-        .collect::<String>();
-    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn wrap_user_prompt_with_author(
-    request_owner_name: &str,
-    request_owner: UserId,
-    sanitized_prompt: String,
-) -> String {
-    let author = normalize_turn_author_name(request_owner_name, request_owner);
-    format!(
-        "[User: {author} (ID: {})]\n{}",
-        request_owner.get(),
-        sanitized_prompt
-    )
-}
-
 pub(in crate::services::discord) async fn start_headless_turn(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -842,6 +471,7 @@ pub(in crate::services::discord) async fn start_headless_turn(
         source,
         metadata,
         channel_name_hint,
+        None,
         reserve_headless_turn(),
     )
     .await
@@ -857,6 +487,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     source: Option<&str>,
     metadata: Option<serde_json::Value>,
     channel_name_hint: Option<String>,
+    is_dm_hint: Option<bool>,
     reservation: HeadlessTurnReservation,
 ) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
     let prompt = prompt.trim();
@@ -867,7 +498,12 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     }
 
     let request_owner = UserId::new(1);
-    shared.record_channel_speaker(channel_id, request_owner, request_owner_name, false);
+    shared.record_channel_speaker(
+        channel_id,
+        request_owner,
+        request_owner_name,
+        is_dm_hint.unwrap_or(false),
+    );
     let user_msg_id = reservation.user_msg_id;
     let placeholder_msg_id = reservation.placeholder_msg_id;
     let mut session_reset_reason = None;
@@ -961,6 +597,11 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
             )
         }
     };
+    let mut session_strategy_reason = if session_id.is_some() {
+        "runtime_cached_provider_session"
+    } else {
+        "no_runtime_provider_session"
+    };
 
     let pending_uploads = {
         let mut data = shared.core.lock().await;
@@ -978,7 +619,11 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         (settings.provider.clone(), settings.allowed_tools.clone())
     };
 
-    let reply_context = take_session_retry_context(shared, channel_id);
+    let turn_id = reservation.turn_id(channel_id);
+    let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
+    let reply_context = session_retry_context
+        .as_ref()
+        .map(|context| context.formatted_context.clone());
     let role_binding = {
         let data = shared.core.lock().await;
         let channel_name = data
@@ -1015,6 +660,14 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         fast_mode_channel_id,
     )
     .await;
+    refresh_session_strategy_after_pending_reset(
+        shared,
+        channel_id,
+        &mut session_id,
+        &mut memento_context_loaded,
+        &mut session_strategy_reason,
+    )
+    .await;
 
     let prompt_prep_started = std::time::Instant::now();
     let (channel_name, tmux_session_name, category_name) = {
@@ -1045,14 +698,15 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     if session_id.is_none() {
         if let Some(reason) = session_reset_reason {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            let reason = match reason {
+            session_strategy_reason = session_reset_reason_lifecycle_code(reason);
+            let display_reason = match reason {
                 SessionResetReason::IdleExpired => "idle timeout",
                 SessionResetReason::AssistantTurnCap => "assistant turn cap",
             };
             tracing::info!(
                 "  [{ts}] ↻ Skipping DB provider session restore for headless channel {} due to {}",
                 channel_id.get(),
-                reason
+                display_reason
             );
         } else if let Some(ref key) = adk_session_key {
             let restored = super::super::adk_session::fetch_provider_session_id(
@@ -1062,6 +716,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
             )
             .await;
             if restored.is_some() {
+                session_strategy_reason = "db_provider_session_restored";
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
                     "  [{ts}] ↻ Restored provider session_id from DB for headless {}",
@@ -1072,8 +727,12 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                     session.restore_provider_session(restored.clone());
                     memento_context_loaded = session.memento_context_loaded;
                 }
+            } else {
+                session_strategy_reason = "no_cached_provider_session";
             }
             session_id = restored;
+        } else {
+            session_strategy_reason = "session_key_unavailable";
         }
     }
 
@@ -1098,6 +757,30 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
+    log_session_strategy_diagnostic(
+        channel_id,
+        &provider,
+        dispatch_profile,
+        session_strategy_reason,
+        session_id.as_deref(),
+        adk_session_key.as_deref(),
+        tmux_session_name.as_deref(),
+        session_retry_context.is_some(),
+        memento_context_loaded,
+    )
+    .await;
+    let cli_was_just_spawned = cli_just_spawned_for_emit(tmux_session_name.as_deref());
+    emit_session_strategy_lifecycle(
+        shared,
+        channel_id,
+        &turn_id,
+        adk_session_key.as_deref(),
+        None,
+        session_id.as_deref(),
+        session_strategy_reason,
+        cli_was_just_spawned,
+    )
+    .await;
 
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
     let memento_recall_gate = memento_recall_gate_decision(
@@ -1209,7 +892,19 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     let longterm_catalog_for_prompt = memory_injection_plan.longterm_catalog_for_system_prompt;
     let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
     let channel_participants = shared.channel_roster(channel_id, request_owner, request_owner_name);
-    let system_prompt_owned = build_system_prompt(
+    let memory_recall_manifest = super::super::prompt_builder::MemoryRecallManifestInput {
+        should_recall: memento_recall_gate.should_recall,
+        gate_reason: memento_recall_gate.reason,
+        external_recall: memory_recall.external_recall.as_deref(),
+    };
+    let recovery_context_for_manifest =
+        session_retry_context
+            .as_ref()
+            .map(|context| RecoveryContextManifestInput {
+                raw_context: context.raw_context.as_str(),
+                audit_record: context.audit_record.as_ref(),
+            });
+    let built_system_prompt = build_system_prompt_with_manifest(
         &discord_context,
         &channel_participants,
         &current_path,
@@ -1224,7 +919,14 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         longterm_catalog_for_prompt,
         Some(&memory_settings),
         memento_mcp_available,
+        recovery_context_for_manifest.as_ref(),
+        Some(&memory_recall_manifest),
+        Some(&turn_id),
     );
+    let system_prompt_owned = built_system_prompt.system_prompt;
+    if let Some(manifest) = built_system_prompt.manifest {
+        crate::db::prompt_manifests::spawn_save_prompt_manifest(shared.pg_pool.clone(), manifest);
+    }
     let prompt_prep_duration_ms = prompt_prep_started.elapsed().as_millis();
     let memory_backend_label = memory_settings.backend.as_str();
     let provider_label = match &provider {
@@ -1260,7 +962,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         let now_ms = chrono::Utc::now().timestamp_millis();
         let turn_started_ms = now_ms;
         let deadline_ms = now_ms + timeout.as_millis() as i64;
-        let max_deadline_ms = now_ms + 3 * 3600 * 1000;
+        let max_deadline_ms = deadline_ms;
         watchdog_token
             .watchdog_deadline_ms
             .store(deadline_ms, std::sync::atomic::Ordering::Relaxed);
@@ -1306,17 +1008,20 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
                                 let updated_ms = updated.and_utc().timestamp_millis();
                                 let age_ms = now_ms_check - updated_ms;
                                 if age_ms < 300_000 {
-                                    let max_dl = watchdog_token
-                                        .watchdog_max_deadline_ms
-                                        .load(std::sync::atomic::Ordering::Relaxed);
-                                    let new_dl = std::cmp::min(
-                                        now_ms_check + timeout.as_millis() as i64,
-                                        max_dl,
-                                    );
+                                    let new_dl = now_ms_check + timeout.as_millis() as i64;
                                     if new_dl > current_dl {
                                         watchdog_token
                                             .watchdog_deadline_ms
                                             .store(new_dl, std::sync::atomic::Ordering::Relaxed);
+                                        watchdog_token.watchdog_max_deadline_ms.store(
+                                            std::cmp::max(
+                                                watchdog_token
+                                                    .watchdog_max_deadline_ms
+                                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                                new_dl,
+                                            ),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         last_deadlock_prealert_deadline_ms = None;
                                     }
                                 }
@@ -1510,6 +1215,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     inflight_state.logical_channel_id = Some(channel_id.get());
     inflight_state.session_key = adk_session_key.clone();
     inflight_state.delivery_bot = metadata_delivery_bot(metadata.as_ref());
+    inflight_state.silent_turn = metadata_silent_flag(metadata.as_ref());
     if let Err(error) = save_inflight_state(&inflight_state) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!("  [{ts}]   ⚠ inflight state save failed: {error}");
@@ -1743,13 +1449,17 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
             adk_session_info: Some(adk_session_info),
             adk_cwd: Some(current_path),
             dispatch_id: None,
+            dispatch_kind: None,
             memory_recall_usage: memory_recall.token_usage,
+            context_window_tokens: model_context_window,
+            context_compact_percent: compact_percent,
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
             full_response: String::new(),
             tmux_last_offset: Some(inflight_offset),
             new_session_id: session_id,
             defer_watcher_resume: false,
+            reuse_status_panel_message: false,
             completion_tx: None,
             inflight_state,
         },
@@ -1813,272 +1523,6 @@ async fn send_restore_notification(
             channel_id,
             err
         );
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct DispatchContextHints {
-    worktree_path: Option<String>,
-    stale_worktree_path: Option<String>,
-    /// #762: when the dispatch context explicitly pins a `target_repo` (e.g. an
-    /// external-repo review), propagate it so bootstrap fallbacks can resolve
-    /// to the correct repo instead of the default AgentDesk workspace.
-    target_repo: Option<String>,
-    reset_provider_state: bool,
-    recreate_tmux: bool,
-}
-
-fn parse_dispatch_context_hints(
-    dispatch_context: Option<&str>,
-    dispatch_type: Option<&str>,
-) -> DispatchContextHints {
-    let parsed =
-        dispatch_context.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    let requested_worktree_path = parsed
-        .as_ref()
-        .and_then(|v| v.get("worktree_path"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let target_repo = parsed
-        .as_ref()
-        .and_then(|v| v.get("target_repo"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(String::from);
-    let strategy =
-        crate::dispatch::dispatch_session_strategy_from_context(parsed.as_ref(), dispatch_type);
-    DispatchContextHints {
-        worktree_path: requested_worktree_path
-            .as_deref()
-            .filter(|p| std::path::Path::new(p).exists())
-            .map(str::to_string),
-        stale_worktree_path: requested_worktree_path.filter(|p| !std::path::Path::new(p).exists()),
-        target_repo,
-        reset_provider_state: strategy.reset_provider_state,
-        recreate_tmux: strategy.recreate_tmux,
-    }
-}
-
-/// #762: Resolve a bootstrap fallback path for a dispatch without a usable
-/// `worktree_path`. When the context pins an external `target_repo`, the
-/// dispatch must land in that repo's configured directory rather than the
-/// default AgentDesk workspace — otherwise external-repo reviews silently
-/// review this repo's default HEAD.
-///
-/// Returns `None` when `target_repo` is unset or cannot be resolved; callers
-/// fall back to `resolve_repo_dir()` / session CWD as before.
-fn resolve_dispatch_target_repo_dir(target_repo: Option<&str>) -> Option<String> {
-    let target_repo = target_repo
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    match crate::services::platform::shell::resolve_repo_dir_for_target(Some(target_repo)) {
-        Ok(Some(path)) => std::path::Path::new(&path).is_dir().then_some(path),
-        Ok(None) => None,
-        Err(err) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                "  [{ts}] ⚠ Dispatch target_repo '{}' could not be resolved: {}",
-                target_repo,
-                err
-            );
-            None
-        }
-    }
-}
-
-fn load_session_runtime_state(
-    sessions: &mut std::collections::HashMap<ChannelId, DiscordSession>,
-    channel_id: ChannelId,
-) -> Option<(Option<String>, bool, String)> {
-    sessions.get_mut(&channel_id).and_then(|session| {
-        let current_path = session.validated_path(channel_id)?;
-        Some((
-            session.session_id.clone(),
-            session.memento_context_loaded,
-            current_path,
-        ))
-    })
-}
-
-fn session_runtime_state_after_redirect(
-    sessions: &mut std::collections::HashMap<ChannelId, DiscordSession>,
-    original_channel_id: ChannelId,
-    effective_channel_id: ChannelId,
-    original_state: (Option<String>, bool, String),
-) -> (Option<String>, bool, String) {
-    if effective_channel_id == original_channel_id {
-        return original_state;
-    }
-
-    load_session_runtime_state(sessions, effective_channel_id).unwrap_or(original_state)
-}
-
-/// #762 (B): Decide whether a dispatch's `dispatch_effective_path` should
-/// overwrite the active session's current_path.
-///
-/// Triggers when any of the following holds:
-/// - The dispatch emitted a concrete `worktree_path` (classic #259 path —
-///   review/rework sessions must execute inside the checked-out worktree).
-/// - The dispatch pinned a `target_repo` whose resolved directory differs
-///   from the session's current path. This covers reused threads where
-///   `bootstrap_thread_session` returned early because the thread already
-///   had a session: without this branch the session keeps its stale
-///   `current_path` and an external-repo review quietly executes inside
-///   the previous repo.
-///
-/// Returns `true` when the effective path should overwrite the session path.
-fn dispatch_session_path_should_update(
-    has_dispatch: bool,
-    dispatch_type: Option<&str>,
-    has_worktree_path: bool,
-    bootstrapped_fresh_thread_session: bool,
-    current_path: &str,
-    dispatch_effective_path: &str,
-) -> bool {
-    if !has_dispatch {
-        return false;
-    }
-    if crate::dispatch::dispatch_type_requires_fresh_worktree(dispatch_type)
-        && bootstrapped_fresh_thread_session
-    {
-        return false;
-    }
-    if has_worktree_path {
-        return true;
-    }
-    dispatch_effective_path != current_path
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DispatchCwdPolicyDecision {
-    log_main_workspace_error: bool,
-    reject_for_missing_fresh_worktree: bool,
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-fn evaluate_dispatch_cwd_policy(
-    dispatch_type: Option<&str>,
-    current_path: &str,
-    main_workspace: Option<&std::path::Path>,
-    worktrees_root: Option<&std::path::Path>,
-) -> DispatchCwdPolicyDecision {
-    let requires_fresh_worktree =
-        crate::dispatch::dispatch_type_requires_fresh_worktree(dispatch_type);
-    let current_path = std::path::Path::new(current_path);
-    let is_main_workspace = main_workspace.is_some_and(|workspace| current_path == workspace);
-    let is_managed_worktree = worktrees_root.is_some_and(|root| current_path.starts_with(root));
-
-    DispatchCwdPolicyDecision {
-        log_main_workspace_error: requires_fresh_worktree && is_main_workspace,
-        reject_for_missing_fresh_worktree: requires_fresh_worktree
-            && worktrees_root.is_some()
-            && !is_managed_worktree,
-    }
-}
-
-fn build_race_requeued_intervention(
-    request_owner: UserId,
-    user_msg_id: MessageId,
-    user_text: &str,
-    reply_context: Option<String>,
-    has_reply_boundary: bool,
-    merge_consecutive: bool,
-) -> Intervention {
-    Intervention {
-        author_id: request_owner,
-        message_id: user_msg_id,
-        source_message_ids: vec![user_msg_id],
-        text: user_text.to_string(),
-        mode: super::super::InterventionMode::Soft,
-        created_at: std::time::Instant::now(),
-        reply_context,
-        has_reply_boundary,
-        merge_consecutive,
-    }
-}
-
-/// Classifies how a turn was triggered. Drives the race-handler delete-on-loss
-/// behavior — background-trigger turns must never have their placeholder
-/// deleted, because the placeholder may already carry information the user
-/// needs (e.g. "🟢 main CI 통과!" relayed from a `Bash run_in_background`
-/// completion). See #796.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum TurnKind {
-    /// Triggered by a human user message. Race-handler may delete the
-    /// placeholder when this turn loses to another active turn — the user
-    /// still sees their own message and can be told "queued for later".
-    Foreground,
-    /// Triggered by a background-task notification (notify bot post or other
-    /// agent self-emitted info-only delivery). The placeholder content is the
-    /// only visible record of the notification and MUST be preserved when
-    /// this turn loses a race.
-    BackgroundTrigger,
-}
-
-impl TurnKind {
-    pub(in crate::services::discord) fn is_background_trigger(self) -> bool {
-        matches!(self, TurnKind::BackgroundTrigger)
-    }
-}
-
-/// Returns `true` when a Discord message arriving on a channel was authored
-/// by the dedicated notify bot (or the agent's own background-task self-emit
-/// channel). Such turns are exempt from the race-handler delete-on-loss path
-/// per #796.
-///
-/// **Phase 2 note**: today the intake gate at
-/// `intake_gate.rs::is_allowed_turn_sender` early-returns for any bot-authored
-/// message that is not in `allowed_bot_ids`, so a real notify-bot post is
-/// dropped before this classifier runs. The race-handler exemption here is
-/// scaffolding for the proper turn-origin propagation work (tracked as Phase 2
-/// in `docs/background-task-pattern.md`). The agent-side convention to deliver
-/// background results through `bot: notify` is what avoids the message-loss
-/// bug today; this enum lets us evolve the runtime behavior without another
-/// signature churn when Phase 2 lands.
-pub(in crate::services::discord) fn classify_turn_kind_from_author(
-    author_id: u64,
-    notify_bot_user_id: Option<u64>,
-) -> TurnKind {
-    if notify_bot_user_id.is_some_and(|id| id == author_id) {
-        TurnKind::BackgroundTrigger
-    } else {
-        TurnKind::Foreground
-    }
-}
-
-/// codex review round-8 P2 (#1332): release the mailbox slot acquired by
-/// `mailbox_try_start_turn` after a `send_intake_placeholder` POST failure.
-///
-/// During the await window of the failed POST, a concurrent message can lose
-/// the start-turn race and enqueue a soft intervention on this channel. Once
-/// we release the slot here the channel becomes idle, and unless we explicitly
-/// schedule a kickoff that queued message is stranded behind the now-idle
-/// mailbox until some unrelated event drains it. `mailbox_finish_turn`
-/// reports `has_pending == true` whenever such a backlog exists; in that
-/// case we fan out via the standard `schedule_deferred_idle_queue_kickoff`
-/// hook (the same one used by `recovery_engine` / `placeholder_sweeper` /
-/// the cancel paths), which spawns a deferred drain so this failure path
-/// returns promptly to its caller.
-///
-/// Returns `true` when a kickoff was scheduled so the caller can log it.
-pub(in crate::services::discord) async fn release_mailbox_after_placeholder_post_failure(
-    shared: &Arc<SharedData>,
-    provider: &super::super::ProviderKind,
-    channel_id: ChannelId,
-) -> bool {
-    let finish = super::super::mailbox_finish_turn(shared, provider, channel_id).await;
-    if finish.mailbox_online && finish.has_pending {
-        super::super::schedule_deferred_idle_queue_kickoff(
-            shared.clone(),
-            provider.clone(),
-            channel_id,
-            "intake_placeholder_post_failed",
-        );
-        true
-    } else {
-        false
     }
 }
 
@@ -2359,6 +1803,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     let dispatch_target_repo = dispatch_context_hints.target_repo.clone();
     let dispatch_reset_provider_state = dispatch_context_hints.reset_provider_state;
     let dispatch_recreate_tmux = dispatch_context_hints.recreate_tmux;
+    let dispatch_retry_resume_session_id = dispatch_context_hints.retry_resume_session_id.clone();
     if let (Some(wt), Some(did)) = (&dispatch_worktree_path, &dispatch_id_for_thread) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!("  [{ts}] 🌿 Dispatch {did}: resolved worktree CWD: {wt}");
@@ -2601,6 +2046,13 @@ pub(in crate::services::discord) async fn handle_text_message(
             (session_id, memento_context_loaded, current_path),
         )
     };
+    let mut session_strategy_reason = if session_id.is_some() {
+        "runtime_cached_provider_session"
+    } else if bootstrapped_fresh_thread_session {
+        "thread_session_bootstrapped"
+    } else {
+        "no_runtime_provider_session"
+    };
 
     // #259: Override current_path with the pre-computed dispatch worktree path.
     // Also update the in-memory session so the worktree sticks for subsequent turns.
@@ -2674,6 +2126,29 @@ pub(in crate::services::discord) async fn handle_text_message(
         provider
     };
 
+    if matches!(provider, ProviderKind::Codex)
+        && !dispatch_reset_provider_state
+        && !dispatch_recreate_tmux
+        && let Some(resume_session_id) = dispatch_retry_resume_session_id.as_deref()
+    {
+        if session_id.as_deref() != Some(resume_session_id) {
+            let mut data = shared.core.lock().await;
+            if let Some(session) = data.sessions.get_mut(&channel_id) {
+                session.restore_provider_session(Some(resume_session_id.to_string()));
+                memento_context_loaded = session.memento_context_loaded;
+            } else {
+                memento_context_loaded = false;
+            }
+            session_id = Some(resume_session_id.to_string());
+        }
+        session_strategy_reason = "dispatch_context_retry_resume";
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] ↻ Dispatch retry: using context-supplied Codex resume session for channel {}",
+            channel_id.get()
+        );
+    }
+
     // Derive dispatch prompt profile before memory recall so ReviewLite can
     // skip heavy memory work consistently across supported backends.
     let dispatch_profile = {
@@ -2709,6 +2184,8 @@ pub(in crate::services::discord) async fn handle_text_message(
         .await;
         session_id = None;
         memento_context_loaded = false;
+        session_strategy_reason =
+            dispatch_reset_lifecycle_code(dispatch_reset_provider_state, dispatch_recreate_tmux);
         if let Some(ref did) = dispatch_id_for_thread {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -2727,6 +2204,14 @@ pub(in crate::services::discord) async fn handle_text_message(
         &provider,
         channel_id,
         fast_mode_channel_id,
+    )
+    .await;
+    refresh_session_strategy_after_pending_reset(
+        shared,
+        channel_id,
+        &mut session_id,
+        &mut memento_context_loaded,
+        &mut session_strategy_reason,
     )
     .await;
     let prompt_prep_started = std::time::Instant::now();
@@ -2755,6 +2240,10 @@ pub(in crate::services::discord) async fn handle_text_message(
     }
     if session_id.is_none() {
         if dispatch_reset_provider_state || dispatch_recreate_tmux {
+            session_strategy_reason = dispatch_reset_lifecycle_code(
+                dispatch_reset_provider_state,
+                dispatch_recreate_tmux,
+            );
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] ↻ Skipping DB provider session restore for dispatch reset_provider_state={} recreate_tmux={}",
@@ -2763,14 +2252,15 @@ pub(in crate::services::discord) async fn handle_text_message(
             );
         } else if let Some(reason) = session_reset_reason {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            let reason = match reason {
+            session_strategy_reason = session_reset_reason_lifecycle_code(reason);
+            let display_reason = match reason {
                 SessionResetReason::IdleExpired => "idle timeout",
                 SessionResetReason::AssistantTurnCap => "assistant turn cap",
             };
             tracing::info!(
                 "  [{ts}] ↻ Skipping DB provider session restore for channel {} due to {}",
                 channel_id.get(),
-                reason
+                display_reason
             );
         } else if let Some(ref key) = adk_session_key {
             let restored = super::super::adk_session::fetch_provider_session_id(
@@ -2780,6 +2270,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             )
             .await;
             if restored.is_some() {
+                session_strategy_reason = "db_provider_session_restored";
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
                     "  [{ts}] ↻ Restored provider session_id from DB for {}",
@@ -2799,13 +2290,21 @@ pub(in crate::services::discord) async fn handle_text_message(
                     restored.as_deref(),
                 )
                 .await;
+            } else {
+                session_strategy_reason = "no_cached_provider_session";
             }
             session_id = restored;
+        } else {
+            session_strategy_reason = "session_key_unavailable";
         }
     }
+    let turn_id = format!("discord:{}:{}", channel_id.get(), user_msg_id.get());
+    let session_retry_context = take_session_retry_context(shared, channel_id, Some(&turn_id));
     let reply_context = merge_reply_contexts(
         reply_context,
-        take_session_retry_context(shared, channel_id),
+        session_retry_context
+            .as_ref()
+            .map(|context| context.formatted_context.clone()),
     );
 
     // #1332: probe turn liveness BEFORE posting any placeholder so a queued
@@ -3445,6 +2944,30 @@ pub(in crate::services::discord) async fn handle_text_message(
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
+    log_session_strategy_diagnostic(
+        channel_id,
+        &provider,
+        dispatch_profile,
+        session_strategy_reason,
+        session_id.as_deref(),
+        adk_session_key.as_deref(),
+        tmux_session_name.as_deref(),
+        session_retry_context.is_some(),
+        memento_context_loaded,
+    )
+    .await;
+    let cli_was_just_spawned = cli_just_spawned_for_emit(tmux_session_name.as_deref());
+    emit_session_strategy_lifecycle(
+        shared,
+        channel_id,
+        &turn_id,
+        adk_session_key.as_deref(),
+        active_dispatch_id_for_prompt.as_deref(),
+        session_id.as_deref(),
+        session_strategy_reason,
+        cli_was_just_spawned,
+    )
+    .await;
 
     let (memory_settings, memory_backend) = build_memory_backend(role_binding.as_ref());
     let memento_recall_gate = memento_recall_gate_decision(
@@ -3571,8 +3094,20 @@ pub(in crate::services::discord) async fn handle_text_message(
     });
     let memento_mcp_available = crate::services::mcp_config::provider_has_memento_mcp(&provider);
     let channel_participants = shared.channel_roster(channel_id, request_owner, request_owner_name);
+    let memory_recall_manifest = super::super::prompt_builder::MemoryRecallManifestInput {
+        should_recall: memento_recall_gate.should_recall,
+        gate_reason: memento_recall_gate.reason,
+        external_recall: memory_recall.external_recall.as_deref(),
+    };
 
-    let system_prompt_owned = build_system_prompt(
+    let recovery_context_for_manifest =
+        session_retry_context
+            .as_ref()
+            .map(|context| RecoveryContextManifestInput {
+                raw_context: context.raw_context.as_str(),
+                audit_record: context.audit_record.as_ref(),
+            });
+    let built_system_prompt = build_system_prompt_with_manifest(
         &discord_context,
         &channel_participants,
         &current_path,
@@ -3587,7 +3122,14 @@ pub(in crate::services::discord) async fn handle_text_message(
         longterm_catalog_for_prompt,
         Some(&memory_settings),
         memento_mcp_available,
+        recovery_context_for_manifest.as_ref(),
+        Some(&memory_recall_manifest),
+        Some(&turn_id),
     );
+    let system_prompt_owned = built_system_prompt.system_prompt;
+    if let Some(manifest) = built_system_prompt.manifest {
+        crate::db::prompt_manifests::spawn_save_prompt_manifest(shared.pg_pool.clone(), manifest);
+    }
     if sak_for_system.is_some() {
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!(
@@ -3627,18 +3169,19 @@ pub(in crate::services::discord) async fn handle_text_message(
     );
     // Spawn turn watchdog — cancels the turn if it exceeds the deadline.
     // The deadline is stored in cancel_token.watchdog_deadline_ms and can be
-    // extended via POST /api/turns/{channel_id}/extend-timeout (up to 3h cap).
+    // extended via POST /api/turns/{channel_id}/extend-timeout.
     {
         let watchdog_token = cancel_token.clone();
         let watchdog_shared = shared.clone();
         let watchdog_http = ctx.http.clone();
         let timeout = super::super::turn_watchdog_timeout();
 
-        // Set initial deadline and max ceiling (initial + 3h)
+        // Set initial deadline. max_deadline tracks the farthest accepted
+        // extension for alert context; it is no longer an absolute cap.
         let now_ms = chrono::Utc::now().timestamp_millis();
         let turn_started_ms = now_ms;
         let deadline_ms = now_ms + timeout.as_millis() as i64;
-        let max_deadline_ms = now_ms + 3 * 3600 * 1000; // 3 hours absolute cap
+        let max_deadline_ms = deadline_ms;
         watchdog_token
             .watchdog_deadline_ms
             .store(deadline_ms, std::sync::atomic::Ordering::Relaxed);
@@ -3701,17 +3244,20 @@ pub(in crate::services::discord) async fn handle_text_message(
                                 let age_ms = now_ms_check - updated_ms;
                                 // If inflight was updated within the last 5 minutes, auto-extend
                                 if age_ms < 300_000 {
-                                    let max_dl = watchdog_token
-                                        .watchdog_max_deadline_ms
-                                        .load(std::sync::atomic::Ordering::Relaxed);
-                                    let new_dl = std::cmp::min(
-                                        now_ms_check + timeout.as_millis() as i64,
-                                        max_dl,
-                                    );
+                                    let new_dl = now_ms_check + timeout.as_millis() as i64;
                                     if new_dl > current_dl {
                                         watchdog_token
                                             .watchdog_deadline_ms
                                             .store(new_dl, std::sync::atomic::Ordering::Relaxed);
+                                        watchdog_token.watchdog_max_deadline_ms.store(
+                                            std::cmp::max(
+                                                watchdog_token
+                                                    .watchdog_max_deadline_ms
+                                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                                new_dl,
+                                            ),
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
                                         last_deadlock_prealert_deadline_ms = None;
                                         let ts = chrono::Local::now().format("%H:%M:%S");
                                         let remaining_min = (new_dl - now_ms_check) / 1000 / 60;
@@ -4223,13 +3769,23 @@ pub(in crate::services::discord) async fn handle_text_message(
             adk_session_info: Some(adk_session_info),
             adk_cwd: Some(current_path.clone()),
             dispatch_id,
+            dispatch_kind: super::super::turn_bridge::classify_turn_finished_dispatch_kind(
+                active_dispatch_info
+                    .as_ref()
+                    .and_then(|info| info.context.as_deref()),
+                dispatch_type_str.as_deref(),
+            )
+            .map(str::to_string),
             memory_recall_usage: memory_recall.token_usage,
+            context_window_tokens: model_context_window,
+            context_compact_percent: compact_percent,
             current_msg_id: placeholder_msg_id,
             response_sent_offset: 0,
             full_response: String::new(),
             tmux_last_offset: Some(inflight_offset),
             new_session_id: session_id.clone(),
             defer_watcher_resume,
+            reuse_status_panel_message: false,
             completion_tx,
             inflight_state,
         },
@@ -4715,13 +4271,21 @@ pub(super) async fn handle_text_command(
                     cancel_text_stop_token_mailbox(&data.shared, &data.provider, channel_id).await;
                 match stop_lookup {
                     TextStopLookup::Stop(token) => {
-                        super::super::turn_bridge::stop_active_turn(
+                        let termination_recorded = super::super::turn_bridge::stop_active_turn(
                             &data.provider,
                             &token,
                             super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
                             "!stop",
                         )
                         .await;
+                        crate::services::turn_cancel_finalizer::finalize_turn_cancel(
+                            crate::services::turn_cancel_finalizer::FinalizeTurnCancelRequest::from_text_stop(
+                                data.provider.clone(),
+                                channel_id,
+                                "!stop",
+                                termination_recorded,
+                            ),
+                        );
                         super::super::commands::notify_turn_stop(
                             &ctx.http,
                             &data.shared,
@@ -4761,21 +4325,13 @@ pub(super) async fn handle_text_command(
 
                 auto_restore_session(&data.shared, channel_id, ctx).await;
 
-                let (current_path, remote_name) = {
+                let current_path = {
                     let d = data.shared.core.lock().await;
                     let session = d.sessions.get(&channel_id);
-                    (
-                        session.and_then(|s| s.current_path.clone()),
-                        session.and_then(|s| s.remote_profile_name.clone()),
-                    )
+                    session.and_then(|s| s.current_path.clone())
                 };
                 let reply = match current_path {
-                    Some(path) => {
-                        let remote_info = remote_name
-                            .map(|n| format!(" (remote: **{}**)", n))
-                            .unwrap_or_else(|| " (local)".to_string());
-                        format!("`{}`{}", path, remote_info)
-                    }
+                    Some(path) => format!("`{}`", path),
                     None => "No active session. Use `!start <path>` first.".to_string(),
                 };
                 let _ = msg.reply(&ctx.http, &reply).await;
@@ -5070,18 +4626,6 @@ Any other message is sent to {p}.
             }
 
             // ── Commands with arguments ──
-            "!model" => {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!("  [{ts}] ◀ [{}] !model {} {}", msg.author.name, arg1, arg2);
-                let _ = msg
-                    .reply(
-                        &ctx.http,
-                        "Model picker text commands are deprecated. Use `/model`.",
-                    )
-                    .await;
-                return Ok(true);
-            }
-
             "!allowed" => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!("  [{ts}] ◀ [{}] !allowed {}", msg.author.name, arg1);
@@ -5472,13 +5016,22 @@ Any other message is sent to {p}.
                                 .await;
                         match stop_lookup {
                             TextStopLookup::Stop(token) => {
-                                super::super::turn_bridge::stop_active_turn(
+                                let termination_recorded =
+                                    super::super::turn_bridge::stop_active_turn(
                                     &data.provider,
                                     &token,
                                     super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
                                     "!cc stop",
                                 )
                                 .await;
+                                crate::services::turn_cancel_finalizer::finalize_turn_cancel(
+                                    crate::services::turn_cancel_finalizer::FinalizeTurnCancelRequest::from_text_stop(
+                                        data.provider.clone(),
+                                        channel_id,
+                                        "!cc stop",
+                                        termination_recorded,
+                                    ),
+                                );
                                 super::super::commands::notify_turn_stop(
                                     &ctx.http,
                                     &data.shared,
@@ -5617,11 +5170,72 @@ Any other message is sent to {p}.
     super::super::commands::handle_text_command(ctx, msg, data, channel_id, text).await
 }
 
-fn resolve_session_id_for_current_turn(
-    session_id: Option<String>,
-    reset_applied: bool,
-) -> Option<String> {
-    if reset_applied { None } else { session_id }
+#[cfg(test)]
+mod session_strategy_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn session_strategy_lifecycle_event_records_fresh_and_resumed_details() {
+        let fresh = session_strategy_lifecycle_event(None, "no_cached_provider_session");
+        match fresh {
+            TurnEvent::SessionFresh(details) => {
+                assert_eq!(details.reason, "no_cached_provider_session");
+                assert_eq!(details.provider_session_id, None);
+                assert_eq!(details.fingerprint, None);
+            }
+            other => panic!("expected session_fresh event, got {other:?}"),
+        }
+
+        let resumed = session_strategy_lifecycle_event(
+            Some("provider-session-123"),
+            "db_provider_session_restored",
+        );
+        match resumed {
+            TurnEvent::SessionResumed(details) => {
+                assert_eq!(details.reason, "db_provider_session_restored");
+                assert_eq!(
+                    details.provider_session_id.as_deref(),
+                    Some("provider-session-123")
+                );
+                assert_eq!(
+                    details.fingerprint.as_deref(),
+                    Some(
+                        crate::services::observability::turn_lifecycle::provider_session_fingerprint(
+                            "provider-session-123",
+                        )
+                        .as_str()
+                    )
+                );
+            }
+            other => panic!("expected session_resumed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_just_spawned_for_emit_handles_none_and_blank_session_names() {
+        // Non-tmux mode (ProcessBackend / no managed session) always
+        // re-spawns the CLI per turn, so the helper must report "just
+        // spawned" for None / blank tmux session names.
+        assert!(cli_just_spawned_for_emit(None));
+        assert!(cli_just_spawned_for_emit(Some("")));
+        assert!(cli_just_spawned_for_emit(Some("   ")));
+    }
+
+    #[test]
+    fn parse_dispatch_context_hints_extracts_auto_queue_retry_resume_session() {
+        let hints = parse_dispatch_context_hints(
+            Some(
+                r#"{"auto_queue_retry_resume_session_id":" thread-1585 ","reset_provider_state":false}"#,
+            ),
+            Some("implementation"),
+        );
+
+        assert_eq!(
+            hints.retry_resume_session_id.as_deref(),
+            Some("thread-1585")
+        );
+        assert!(!hints.reset_provider_state);
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -6357,25 +5971,25 @@ mod tests {
         // is a valid git worktree.
         let external = tempfile::tempdir().unwrap();
         let external_dir = external.path().to_str().unwrap();
-        std::process::Command::new("git")
+        GitCommand::new()
             .args(["init", "-b", "main"])
-            .current_dir(external_dir)
-            .output()
+            .repo(external_dir)
+            .run_output()
             .unwrap();
-        std::process::Command::new("git")
+        GitCommand::new()
             .args(["config", "user.email", "test@test.com"])
-            .current_dir(external_dir)
-            .output()
+            .repo(external_dir)
+            .run_output()
             .unwrap();
-        std::process::Command::new("git")
+        GitCommand::new()
             .args(["config", "user.name", "Test"])
-            .current_dir(external_dir)
-            .output()
+            .repo(external_dir)
+            .run_output()
             .unwrap();
-        std::process::Command::new("git")
+        GitCommand::new()
             .args(["commit", "--allow-empty", "-m", "initial"])
-            .current_dir(external_dir)
-            .output()
+            .repo(external_dir)
+            .run_output()
             .unwrap();
 
         let raw = serde_json::json!({
@@ -6728,7 +6342,7 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_deadline_extension_moves_deadline_and_cap() {
+    fn watchdog_deadline_extension_moves_deadline_and_tracked_max() {
         let token = CancelToken::new();
         token
             .watchdog_deadline_ms
@@ -6743,9 +6357,9 @@ mod tests {
             applied_extend_secs: 2,
             requested_extend_secs: 2,
             extension_count: 1,
-            extension_count_limit: 6,
+            extension_count_limit: u32::MAX,
             extension_total_secs: 2,
-            extension_total_secs_limit: 10_800,
+            extension_total_secs_limit: u64::MAX,
             clamped: false,
         };
 
@@ -7367,6 +6981,33 @@ mod tests {
         assert!(
             !shared.queued_placeholder_still_owned(channel_id, our_msg_id, placeholder_msg_id),
             "queued_placeholder_still_owned must report not-owned so the PATCH branch skips the render",
+        );
+    }
+
+    #[test]
+    fn session_strategy_lifecycle_event_records_fresh_and_resumed_details() {
+        let fresh = session_strategy_lifecycle_event(None, "no_cached_provider_session");
+        assert_eq!(fresh.meta().kind, "session_fresh");
+        assert!(fresh.notify_user());
+        let fresh_details = fresh.details_json();
+        assert_eq!(fresh_details["reason"], "no_cached_provider_session");
+        assert!(fresh_details["providerSessionId"].is_null());
+        assert!(fresh_details["fingerprint"].is_null());
+
+        let resumed = session_strategy_lifecycle_event(
+            Some("provider-session-123"),
+            "db_provider_session_restored",
+        );
+        assert_eq!(resumed.meta().kind, "session_resumed");
+        assert!(!resumed.notify_user());
+        let resumed_details = resumed.details_json();
+        assert_eq!(resumed_details["reason"], "db_provider_session_restored");
+        assert_eq!(resumed_details["providerSessionId"], "provider-session-123");
+        assert_eq!(
+            resumed_details["fingerprint"],
+            crate::services::observability::turn_lifecycle::provider_session_fingerprint(
+                "provider-session-123",
+            )
         );
     }
 }

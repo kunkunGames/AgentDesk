@@ -5,6 +5,7 @@ on:
     branches-ignore:
       - main
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-pr-${{ github.head_ref || github.ref }}
@@ -130,6 +131,32 @@ jobs:
           cargo test --all-targets cancel -- --skip _pg --skip pg_ --skip postgres
           cargo test --all-targets review_decision -- --skip _pg --skip pg_ --skip postgres
           cargo test invariant --all-targets -- --skip _pg --skip pg_ --skip postgres
+
+  fast_check_required_context:
+    name: Fast check (ubuntu-latest)
+    needs: check_fast
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror fast check result for branch protection
+        run: |
+          if [ "${{ needs.check_fast.result }}" != "success" ]; then
+            echo "check_fast result: ${{ needs.check_fast.result }}"
+            exit 1
+          fi
+
+  fast_targeted_tests_required_context:
+    name: Fast targeted tests (ubuntu-latest)
+    needs: test_fast
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror targeted test result for branch protection
+        run: |
+          if [ "${{ needs.test_fast.result }}" != "success" ]; then
+            echo "test_fast result: ${{ needs.test_fast.result }}"
+            exit 1
+          fi
 
   test_fast:
     name: PostgreSQL tests (ubuntu-postgres)
@@ -346,7 +373,7 @@ jobs:
           if python3 scripts/generate_inventory_docs.py --check; then
             echo "Inventory docs are up to date."
           else
-            echo "::warning::Generated docs drift detected — the Regen inventory docs workflow will push a fix commit. If CI PR does not re-run on the new commit (a known GitHub Actions limitation when bots push via GITHUB_TOKEN), push an empty commit or rerun this workflow."
+            echo "::warning::Inventory docs drift detected. The weekly Regen inventory docs workflow opens a maintenance PR every Monday. To fix sooner, run python3 scripts/generate_inventory_docs.py locally or trigger the workflow manually from the Actions tab."
           fi
 
       - name: Agent maintenance freshness gate (warn, #1432)

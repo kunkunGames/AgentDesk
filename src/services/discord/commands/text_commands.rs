@@ -34,6 +34,41 @@ async fn cancel_text_stop_token_mailbox(
     }
 }
 
+/// #1672: After a `!stop`/`!cc stop` completes, kick the deferred
+/// idle-queue drain so any pending_queue items the user already sent
+/// (and that we explicitly preserved across cancel) get picked up
+/// without waiting for the next user message. Mirrors the
+/// `cancel_turn` API path's `schedule_pending_queue_drain_after_cancel`
+/// call so the three cancel surfaces (`!stop`, `!cc stop`, and the
+/// REST cancel endpoint) all share the same post-cancel drain
+/// semantics.
+fn schedule_text_stop_pending_queue_drain(
+    shared: &Arc<SharedData>,
+    provider: &crate::services::provider::ProviderKind,
+    channel_id: serenity::ChannelId,
+    stop_source: &'static str,
+) {
+    let shared = shared.clone();
+    let provider = provider.clone();
+    tokio::spawn(async move {
+        let snapshot = shared
+            .mailbox(channel_id)
+            .snapshot()
+            .await
+            .intervention_queue
+            .len();
+        if snapshot == 0 {
+            return;
+        }
+        super::super::schedule_deferred_idle_queue_kickoff(
+            shared,
+            provider,
+            channel_id,
+            stop_source,
+        );
+    });
+}
+
 async fn fetch_escalation_settings_via_api()
 -> Result<crate::server::routes::escalation::EscalationSettingsResponse, String> {
     let body = crate::services::discord::internal_api::get_escalation_settings().await?;
@@ -338,13 +373,21 @@ pub(in crate::services::discord) async fn handle_text_command(
                 TextStopLookup::Stop(token) => {
                     // #1218: send abort key first, then SIGKILL — see
                     // `stop_active_turn` doc comment.
-                    super::super::turn_bridge::stop_active_turn(
+                    let termination_recorded = super::super::turn_bridge::stop_active_turn(
                         &data.provider,
                         &token,
                         super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
                         "!stop",
                     )
                     .await;
+                    crate::services::turn_cancel_finalizer::finalize_turn_cancel(
+                        crate::services::turn_cancel_finalizer::FinalizeTurnCancelRequest::from_text_stop(
+                            data.provider.clone(),
+                            channel_id,
+                            "!stop",
+                            termination_recorded,
+                        ),
+                    );
                     super::super::commands::notify_turn_stop(
                         &ctx.http,
                         &data.shared,
@@ -353,6 +396,18 @@ pub(in crate::services::discord) async fn handle_text_command(
                         "!stop",
                     )
                     .await;
+                    // #1672: belt-and-suspenders drain trigger so the
+                    // !stop surface matches the cancel-API contract.
+                    // The turn_bridge cancellation tail also schedules
+                    // a drain when `has_pending` is true, but we
+                    // re-arm here so a watcher-finalized turn (where
+                    // the bridge skips its own finalize) still drains.
+                    schedule_text_stop_pending_queue_drain(
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        "!stop",
+                    );
                 }
                 TextStopLookup::AlreadyStopping => {
                     let _ = msg.reply(&ctx.http, "Already stopping...").await;
@@ -383,21 +438,13 @@ pub(in crate::services::discord) async fn handle_text_command(
 
             auto_restore_session(&data.shared, channel_id, ctx).await;
 
-            let (current_path, remote_name) = {
+            let current_path = {
                 let d = data.shared.core.lock().await;
                 let session = d.sessions.get(&channel_id);
-                (
-                    session.and_then(|s| s.current_path.clone()),
-                    session.and_then(|s| s.remote_profile_name.clone()),
-                )
+                session.and_then(|s| s.current_path.clone())
             };
             let reply = match current_path {
-                Some(path) => {
-                    let remote_info = remote_name
-                        .map(|n| format!(" (remote: **{}**)", n))
-                        .unwrap_or_else(|| " (local)".to_string());
-                    format!("`{}`{}", path, remote_info)
-                }
+                Some(path) => format!("`{}`", path),
                 None => "No active session. Use `!start <path>` first.".to_string(),
             };
             let _ = msg.reply(&ctx.http, &reply).await;
@@ -687,18 +734,6 @@ Any other message is sent to {p}.
                 tools.len()
             ));
             send_long_message_raw(&ctx.http, channel_id, &reply, &data.shared).await?;
-            return Ok(true);
-        }
-
-        "!model" => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!("  [{ts}] ◀ [{}] !model {} {}", msg.author.name, arg1, arg2);
-            let _ = msg
-                .reply(
-                    &ctx.http,
-                    "Model picker text commands are deprecated. Use `/model`.",
-                )
-                .await;
             return Ok(true);
         }
 
@@ -1142,13 +1177,21 @@ Any other message is sent to {p}.
                             .await;
                     match stop_lookup {
                         TextStopLookup::Stop(token) => {
-                            super::super::turn_bridge::stop_active_turn(
+                            let termination_recorded = super::super::turn_bridge::stop_active_turn(
                                 &data.provider,
                                 &token,
                                 super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
                                 "!cc stop",
                             )
                             .await;
+                            crate::services::turn_cancel_finalizer::finalize_turn_cancel(
+                                crate::services::turn_cancel_finalizer::FinalizeTurnCancelRequest::from_text_stop(
+                                    data.provider.clone(),
+                                    channel_id,
+                                    "!cc stop",
+                                    termination_recorded,
+                                ),
+                            );
                             super::super::commands::notify_turn_stop(
                                 &ctx.http,
                                 &data.shared,
@@ -1157,6 +1200,16 @@ Any other message is sent to {p}.
                                 "!cc stop",
                             )
                             .await;
+                            // #1672: mirror the !stop / cancel API drain
+                            // trigger so the three cancel surfaces all
+                            // pick up the queued user message after the
+                            // channel goes idle.
+                            schedule_text_stop_pending_queue_drain(
+                                &data.shared,
+                                &data.provider,
+                                channel_id,
+                                "!cc stop",
+                            );
                             let _ = msg.reply(&ctx.http, "Stopping...").await;
                         }
                         TextStopLookup::AlreadyStopping => {

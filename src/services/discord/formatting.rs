@@ -1,6 +1,6 @@
 use poise::serenity_prelude as serenity;
 use regex::Regex;
-use serenity::{ChannelId, CreateAttachment, CreateMessage, EditMessage, MessageId};
+use serenity::{ChannelId, CreateAttachment, MessageId};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
@@ -14,7 +14,7 @@ const UTF8_ELLIPSIS_EXTRA_BYTES: usize = "…".len().saturating_sub(1);
 const THINKING_STATUS_MAX_BYTES: usize = 600;
 const TOOL_STATUS_MAX_BYTES: usize = 300;
 
-pub(super) fn redact_sensitive_for_placeholder(input: &str) -> String {
+pub(crate) fn redact_sensitive_for_placeholder(input: &str) -> String {
     static OPENAI_KEY_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{8,}").expect("valid key regex"));
     static BEARER_RE: LazyLock<Regex> =
@@ -23,12 +23,14 @@ pub(super) fn redact_sensitive_for_placeholder(input: &str) -> String {
         Regex::new(r"(?i)\b(password|token|api[_-]?key)=\S+")
             .expect("valid secret assignment regex")
     });
+    static EMAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b").expect("valid email regex")
+    });
 
     let redacted = OPENAI_KEY_RE.replace_all(input, "***");
     let redacted = BEARER_RE.replace_all(&redacted, "Bearer ***");
-    ASSIGNMENT_RE
-        .replace_all(&redacted, "${1}=***")
-        .into_owned()
+    let redacted = ASSIGNMENT_RE.replace_all(&redacted, "${1}=***");
+    EMAIL_RE.replace_all(&redacted, "***@***").into_owned()
 }
 
 /// Inline footer appended to a summary when a long message is delivered as a
@@ -2079,7 +2081,7 @@ pub(super) fn format_for_discord_with_status_panel(
 
 #[cfg(test)]
 mod status_panel_v2_formatter_tests {
-    use super::format_for_discord_with_provider;
+    use super::{format_for_discord, format_for_discord_with_provider};
     use crate::services::provider::ProviderKind;
 
     #[test]
@@ -2087,6 +2089,30 @@ mod status_panel_v2_formatter_tests {
         let input = "[Bash] /bin/zsh -lc \"ls\"\nkeep";
         let output = format_for_discord_with_provider(input, &ProviderKind::Codex);
         assert_eq!(output, "⚙️ Bash\nkeep");
+    }
+
+    #[test]
+    fn format_for_discord_does_not_insert_blank_line_before_header() {
+        let input = "previous line\n## Heading\nfollowing line";
+        let output = format_for_discord(input);
+        assert_eq!(output, "previous line\n**Heading**\nfollowing line");
+    }
+
+    #[test]
+    fn format_for_discord_does_not_insert_blank_line_before_list() {
+        let input = "lead-in paragraph\n- first item\n- second item\ntrailing line";
+        let output = format_for_discord(input);
+        assert_eq!(
+            output,
+            "lead-in paragraph\n- first item\n- second item\ntrailing line"
+        );
+    }
+
+    #[test]
+    fn format_for_discord_preserves_explicit_blank_line_when_agent_provides_one() {
+        let input = "first paragraph\n\nsecond paragraph";
+        let output = format_for_discord(input);
+        assert_eq!(output, "first paragraph\n\nsecond paragraph");
     }
 }
 
@@ -2130,56 +2156,24 @@ pub(super) fn format_for_discord(s: &str) -> String {
 
         let trimmed = line.trim_start();
 
-        // Convert # headers to **bold** (Discord doesn't render headers in bot messages)
+        // Convert # headers to **bold** (Discord doesn't render headers in bot messages).
+        // Do not inject blank lines around headers; preserve the agent's spacing as-is so
+        // that mobile screens are not wasted by forced double line breaks.
         if let Some(rest) = trimmed.strip_prefix("### ") {
-            if let Some(prev) = lines.last() {
-                if !prev.trim().is_empty() {
-                    lines.push(String::new());
-                }
-            }
             lines.push(format!("**{}**", rest));
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("## ") {
-            if let Some(prev) = lines.last() {
-                if !prev.trim().is_empty() {
-                    lines.push(String::new());
-                }
-            }
             lines.push(format!("**{}**", rest));
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("# ") {
-            if let Some(prev) = lines.last() {
-                if !prev.trim().is_empty() {
-                    lines.push(String::new());
-                }
-            }
             lines.push(format!("**{}**", rest));
             continue;
         }
 
-        // Ensure blank line before the first item of a list block
-        let is_list_item = trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || (trimmed.len() > 2
-                && trimmed.as_bytes()[0].is_ascii_digit()
-                && trimmed.contains(". "));
-
-        if is_list_item {
-            if let Some(prev) = lines.last() {
-                let prev_trimmed = prev.trim();
-                let prev_is_list = prev_trimmed.starts_with("- ")
-                    || prev_trimmed.starts_with("* ")
-                    || (prev_trimmed.len() > 2
-                        && prev_trimmed.as_bytes()[0].is_ascii_digit()
-                        && prev_trimmed.contains(". "));
-                if !prev_trimmed.is_empty() && !prev_is_list {
-                    lines.push(String::new());
-                }
-            }
-        }
-
+        // List items are passed through verbatim. Blank lines around them, if any,
+        // come from the agent and are preserved by the blank-line collapse below.
         lines.push(line.to_string());
     }
 
@@ -2262,10 +2256,7 @@ pub(super) async fn send_long_message_raw(
             "discord send single"
         );
         rate_limit_wait(shared, channel_id).await;
-        match channel_id
-            .send_message(http, CreateMessage::new().content(text))
-            .await
-        {
+        match super::http::send_channel_message(http, channel_id, text).await {
             Ok(_) => {
                 tracing::debug!(
                     target: "discord::chunker",
@@ -2317,9 +2308,7 @@ pub(super) async fn send_long_message_raw(
             "discord send chunk"
         );
         rate_limit_wait(shared, channel_id).await;
-        let send_result = channel_id
-            .send_message(http, CreateMessage::new().content(chunk))
-            .await;
+        let send_result = super::http::send_channel_message(http, channel_id, chunk).await;
         match send_result {
             Ok(_) => {
                 if is_last {
@@ -2422,9 +2411,8 @@ pub(super) async fn replace_long_message_raw_with_outcome(
         "discord edit first chunk"
     );
     rate_limit_wait(shared, channel_id).await;
-    let edit_result = channel_id
-        .edit_message(http, message_id, EditMessage::new().content(first_chunk))
-        .await;
+    let edit_result =
+        super::http::edit_channel_message(http, channel_id, message_id, first_chunk).await;
 
     if let Err(e) = edit_result {
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -2479,9 +2467,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
             "discord send continuation chunk"
         );
         rate_limit_wait(shared, channel_id).await;
-        let send_result = channel_id
-            .send_message(http, CreateMessage::new().content(chunk))
-            .await;
+        let send_result = super::http::send_channel_message(http, channel_id, chunk).await;
         match send_result {
             Ok(_) => {
                 if is_last {

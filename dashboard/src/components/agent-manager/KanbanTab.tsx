@@ -1935,7 +1935,9 @@ export default function KanbanTab({
                   const { cardId, agentId } = assignBeforeReady;
                   setAssignBeforeReady(null);
                   try {
-                    await onUpdateCard(cardId, { status: "ready", assignee_agent_id: agentId });
+                    await onUpdateCard(cardId, { assignee_agent_id: agentId });
+                    await onUpdateCard(cardId, { status: "ready" });
+                    invalidateCardActivity(cardId);
                   } catch (error) {
                     setActionError(error instanceof Error ? error.message : tr("상태 전환에 실패했습니다.", "Failed to change status."));
                   }

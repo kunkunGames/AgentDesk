@@ -17,18 +17,57 @@ pub async fn list_nodes(state: State<AppState>) -> (StatusCode, Json<serde_json:
     };
     let lease_ttl_secs = state.config.cluster.lease_ttl_secs.max(1);
     match crate::server::cluster::list_worker_nodes(pool, lease_ttl_secs).await {
-        Ok(nodes) => (
-            StatusCode::OK,
-            Json(json!({
-                "cluster": {
-                    "enabled": state.config.cluster.enabled,
-                    "configured_role": state.config.cluster.role,
-                    "lease_ttl_secs": lease_ttl_secs,
-                    "heartbeat_interval_secs": state.config.cluster.heartbeat_interval_secs.max(1),
-                },
-                "nodes": nodes,
-            })),
-        ),
+        Ok(mut nodes) => {
+            let (session_owners, session_owner_error) =
+                match crate::db::dispatched_sessions::list_dispatched_sessions_pg(pool, false).await
+                {
+                    Ok(mut sessions) => {
+                        crate::server::cluster_session_routing::enrich_session_owner_routing(
+                            &mut sessions,
+                            state.cluster_instance_id.as_deref(),
+                            &nodes,
+                        );
+                        crate::server::cluster_session_routing::attach_active_session_counts_to_worker_nodes(
+                            &mut nodes,
+                            &sessions,
+                        );
+                        (
+                            crate::server::cluster_session_routing::summarize_session_owner_routing(
+                                &sessions,
+                            ),
+                            None,
+                        )
+                    }
+                    Err(error) => {
+                        tracing::warn!("failed to load active session owner summary: {error}");
+                        crate::server::cluster_session_routing::attach_active_session_counts_to_worker_nodes(
+                            &mut nodes,
+                            &[],
+                        );
+                        (
+                            json!({"total_active_sessions": null}),
+                            Some(json!({
+                                "code": "session_owner_summary_unavailable",
+                                "message": "active session owner summary unavailable",
+                            })),
+                        )
+                    }
+                };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "cluster": {
+                        "enabled": state.config.cluster.enabled,
+                        "configured_role": state.config.cluster.role,
+                        "lease_ttl_secs": lease_ttl_secs,
+                        "heartbeat_interval_secs": state.config.cluster.heartbeat_interval_secs.max(1),
+                    },
+                    "nodes": nodes,
+                    "session_owners": session_owners,
+                    "session_owner_error": session_owner_error,
+                })),
+            )
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": error})),

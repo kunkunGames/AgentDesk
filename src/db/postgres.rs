@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
 use crate::config::{AgentChannel, AgentDef, Config};
-use crate::server::routes::settings::{KvSeedAction, config_default_seed_actions};
+use crate::services::settings::{KvSeedAction, config_default_seed_actions};
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
@@ -284,6 +284,48 @@ pub async fn migration_status(pool: &PgPool) -> Result<MigrationStatus, String> 
         missing_from_resolved,
         pending_versions,
     })
+}
+
+pub async fn applied_migration_checksum_mismatches(pool: &PgPool) -> Result<Vec<i64>, String> {
+    let rows = sqlx::query(
+        "SELECT version, checksum, success
+         FROM _sqlx_migrations
+         ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("query _sqlx_migrations checksums: {error}"))?;
+
+    // sqlx Migrator yields both ReversibleUp and ReversibleDown entries for the
+    // same version. The applied checksum stored in `_sqlx_migrations` is the Up
+    // checksum (sqlx::run_direct skips Down migrations when applying), so the
+    // expected map must mirror that — collecting all entries collapses Up/Down
+    // for the same version and a Down checksum can shadow the Up, producing a
+    // false-positive drift signal. Mirror sqlx's own `is_down_migration()`
+    // filter from `Migrator::run_direct`.
+    let resolved_checksums = POSTGRES_MIGRATOR
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
+        .map(|migration| (migration.version, migration.checksum.as_ref()))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut mismatches = Vec::new();
+    for row in rows {
+        let version = row.get::<i64, _>("version");
+        let success = row.get::<bool, _>("success");
+        if !success {
+            continue;
+        }
+        let Some(expected_checksum) = resolved_checksums.get(&version) else {
+            continue;
+        };
+        let applied_checksum = row.get::<Vec<u8>, _>("checksum");
+        if applied_checksum.as_slice() != *expected_checksum {
+            mismatches.push(version);
+        }
+    }
+
+    Ok(mismatches)
 }
 
 async fn apply_kv_seed_actions(pool: &PgPool, actions: &[KvSeedAction]) -> Result<(), String> {
@@ -875,12 +917,13 @@ pub(crate) async fn close_test_pool(pool: PgPool, label: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvisoryLockLease, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, close_test_pool,
+        AdvisoryLockLease, POSTGRES_MIGRATOR, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, close_test_pool,
         config_database_summary, connect_options, connect_test_pool_and_migrate_config,
         create_test_database, database_enabled, database_summary, health_check,
         run_test_postgres_sqlx_op_with_timeout, startup_pool_settings, startup_reseed,
     };
     use sqlx::Row;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     struct TestDatabase {
@@ -992,6 +1035,74 @@ mod tests {
             avatar_emoji: Some(":gear:".to_string()),
         }];
         config
+    }
+
+    #[test]
+    fn checksum_resolution_filters_down_migrations_to_avoid_false_positive() {
+        // Regression for #1688: applied_migration_checksum_mismatches() builds
+        // a `version → expected_checksum` BTreeMap from POSTGRES_MIGRATOR.iter().
+        // sqlx yields ReversibleUp + ReversibleDown for the same version, and
+        // the applied checksum stored in `_sqlx_migrations` is the Up checksum
+        // (sqlx::run_direct skips Down when applying). Without filtering Down
+        // out, a Down checksum would shadow the Up in the BTreeMap and the
+        // helper would report a false-positive mismatch on every reversible
+        // migration in the tree.
+        use sqlx::migrate::MigrationType;
+
+        // Identify any reversible pair currently in the tree. As of #1688 this
+        // is at least the agent-quality-daily migration (version 13).
+        let mut reversible_versions: Vec<i64> = POSTGRES_MIGRATOR
+            .iter()
+            .filter(|m| matches!(m.migration_type, MigrationType::ReversibleUp))
+            .map(|m| m.version)
+            .collect();
+        reversible_versions.sort();
+        reversible_versions.dedup();
+
+        assert!(
+            !reversible_versions.is_empty(),
+            "test guards a real bug only when the tree contains at least one reversible migration; \
+             if all migrations became `Simple` the filter is no longer load-bearing — adjust this test"
+        );
+
+        // Helper using the same filter as the production code (mirrors sqlx's
+        // own `Migrator::run_direct`).
+        let filtered: BTreeMap<i64, &[u8]> = POSTGRES_MIGRATOR
+            .iter()
+            .filter(|migration| !migration.migration_type.is_down_migration())
+            .map(|migration| (migration.version, migration.checksum.as_ref()))
+            .collect();
+
+        for version in reversible_versions {
+            let up_checksum = POSTGRES_MIGRATOR
+                .iter()
+                .find(|m| {
+                    m.version == version && matches!(m.migration_type, MigrationType::ReversibleUp)
+                })
+                .map(|m| m.checksum.as_ref())
+                .expect("reversible up entry");
+            let down_checksum = POSTGRES_MIGRATOR
+                .iter()
+                .find(|m| {
+                    m.version == version
+                        && matches!(m.migration_type, MigrationType::ReversibleDown)
+                })
+                .map(|m| m.checksum.as_ref())
+                .expect("reversible down entry");
+            assert_ne!(
+                up_checksum, down_checksum,
+                "test only catches the bug when up/down checksums actually differ"
+            );
+
+            let resolved = filtered
+                .get(&version)
+                .copied()
+                .expect("filtered map must retain reversible up version");
+            assert_eq!(
+                resolved, up_checksum,
+                "filtered checksum map for version {version} must keep Up, not Down"
+            );
+        }
     }
 
     #[test]

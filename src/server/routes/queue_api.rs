@@ -104,7 +104,11 @@ pub async fn cancel_dispatch(
     State(state): State<AppState>,
     Path(dispatch_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.queue_service().cancel_dispatch(&dispatch_id).await {
+    match state
+        .queue_service()
+        .cancel_dispatch(state.health_registry.as_ref(), &dispatch_id)
+        .await
+    {
         Ok(body) => (StatusCode::OK, Json(body)),
         Err(error) => error.into_json_response(),
     }
@@ -252,9 +256,8 @@ fn default_extend_secs() -> u64 {
 
 /// Extend the watchdog timeout for an active turn in a channel.
 ///
-/// The per-turn hard cap moves with accepted operator extensions and is bounded
-/// by `AGENTDESK_TURN_TIMEOUT_EXTEND_MAX_COUNT` and
-/// `AGENTDESK_TURN_TIMEOUT_EXTEND_MAX_TOTAL_SECS`.
+/// The per-turn deadline moves with accepted operator extensions. Extensions are
+/// intentionally uncapped so productive long-running turns can continue.
 pub async fn extend_turn_timeout(
     Path(channel_id): Path<String>,
     Json(body): Json<ExtendTimeoutBody>,
@@ -296,30 +299,15 @@ pub async fn extend_turn_timeout(
                 })),
             )
         }
-        Err(crate::services::turn_orchestrator::WatchdogDeadlineExtensionError::MailboxUnavailable) => (
+        Err(
+            crate::services::turn_orchestrator::WatchdogDeadlineExtensionError::MailboxUnavailable,
+        ) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "no mailbox for channel", "channel_id": channel_id})),
         ),
         Err(crate::services::turn_orchestrator::WatchdogDeadlineExtensionError::NoActiveTurn) => (
             StatusCode::CONFLICT,
             Json(json!({"error": "no active turn for channel", "channel_id": channel_id})),
-        ),
-        Err(crate::services::turn_orchestrator::WatchdogDeadlineExtensionError::ExtensionLimitReached {
-            extension_count,
-            extension_count_limit,
-            extension_total_secs,
-            extension_total_secs_limit,
-        }) => (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "error": "watchdog extension limit reached",
-                "channel_id": channel_id,
-                "extension_count": extension_count,
-                "extension_count_limit": extension_count_limit,
-                "extension_total_secs": extension_total_secs,
-                "extension_total_secs_limit": extension_total_secs_limit,
-                "clamped": true,
-            })),
         ),
     }
 }
@@ -365,7 +353,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
-    async fn extend_turn_timeout_reports_effective_deadline_and_cap() {
+    async fn extend_turn_timeout_reports_effective_deadline_and_tracked_max() {
         let channel_id = ChannelId::new(1_417_000_001);
         let registry = ChannelMailboxRegistry::default();
         let handle = registry.handle(channel_id);

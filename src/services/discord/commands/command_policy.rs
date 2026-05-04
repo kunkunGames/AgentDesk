@@ -159,7 +159,7 @@ pub(in crate::services::discord) fn slash_command_risk(slash_cmd: &str) -> Comma
     match slash_cmd {
         // Inspection only.
         "/help" | "/pwd" | "/health" | "/status" | "/inflight" | "/queue" | "/metrics"
-        | "/allowedtools" | "/sessions" | "/receipt" => CommandRisk::ReadOnly,
+        | "/allowedtools" | "/sessions" | "/receipt" | "/adk" => CommandRisk::ReadOnly,
 
         // Per-channel session shaping (mirrors text-command tiers).
         "/start" | "/down" | "/cc" | "/meeting" | "/model" | "/fast" | "/goals" | "/clear"

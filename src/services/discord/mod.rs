@@ -7,6 +7,7 @@ pub(crate) mod formatting;
 mod gateway;
 mod handoff;
 pub(crate) mod health;
+pub(crate) mod http;
 mod idle_detector;
 mod inflight;
 pub(crate) mod internal_api;
@@ -52,6 +53,7 @@ mod session_runtime;
 pub(crate) mod settings;
 pub(crate) mod shared_memory;
 mod stall_recovery;
+pub(in crate::services::discord) mod streaming_finalizer;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]
@@ -113,7 +115,7 @@ use formatting::{
 use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 pub(crate) use inflight::clear_inflight_state;
 use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
-use prompt_builder::build_system_prompt;
+use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
 use recovery_engine::restore_inflight_turns;
 use restart_report::flush_restart_reports;
 use router::handle_event;
@@ -2321,18 +2323,13 @@ async fn apply_queue_exit_feedback(
     // exit-state notice so the user is not left looking at a `📬` promise
     // for a turn that will never run. Edit-on-failure falls back to delete
     // — either way the stale `📬 메시지 대기 중` text is removed. We use
-    // the bare serenity HTTP edit instead of the placeholder controller
+    // the shared Discord HTTP boundary instead of the placeholder controller
     // because the controller entry was just detached (and the public
     // `transition` API only renders terminal monitor-handoff cards).
     for card in &visible_cards_to_clear {
         let body = queue_exit_card_body(card.kind);
-        let edit_result = channel_id
-            .edit_message(
-                &ctx.http,
-                card.placeholder_msg_id,
-                serenity::EditMessage::new().content(body),
-            )
-            .await;
+        let edit_result =
+            http::edit_channel_message(&ctx.http, channel_id, card.placeholder_msg_id, &body).await;
         if edit_result.is_err() {
             let _ = channel_id
                 .delete_message(&ctx.http, card.placeholder_msg_id)
@@ -2634,6 +2631,24 @@ async fn mailbox_replace_queue(
             queue_persistence_context(shared, provider, channel_id),
         )
         .await;
+}
+
+/// codex review round-4 P2-1 (#1672): atomic disk → in-memory hydration
+/// helper. See `ChannelMailboxHandle::hydrate_pending_queue` for the
+/// race-free merge contract.
+async fn mailbox_hydrate_pending_queue(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    disk_items: Vec<Intervention>,
+) -> usize {
+    shared
+        .mailbox(channel_id)
+        .hydrate_pending_queue(
+            disk_items,
+            queue_persistence_context(shared, provider, channel_id),
+        )
+        .await
 }
 
 async fn mailbox_restart_drain_all(shared: &SharedData, provider: &ProviderKind) -> usize {

@@ -1,30 +1,27 @@
 name: Regen inventory docs
 
 on:
-  pull_request_target:
-    types:
-      - opened
-      - synchronize
-      - reopened
+  workflow_dispatch:
+  schedule:
+    # Monday 01:00 UTC (10:00 KST). Surfaces accumulated docs drift weekly.
+    - cron: "0 1 * * 1"
 
 concurrency:
-  group: regen-docs-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: regen-docs-main
+  cancel-in-progress: false
 
 permissions:
   contents: write
   pull-requests: write
-  statuses: write
 
 jobs:
   regen:
     name: Regen inventory docs
     runs-on: ubuntu-latest
-    if: github.event.pull_request.head.repo.fork == false
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: main
           fetch-depth: 0
 
       - name: Configure git identity
@@ -32,59 +29,46 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Check for bot regen commit
-        id: guard
-        shell: bash
-        run: |
-          set -euo pipefail
-          subject=$(git log -1 --pretty=%s)
-          author=$(git log -1 --pretty=%an)
-          if [[ "$subject" == *"[skip regen]"* || "$author" == "github-actions[bot]" ]]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Skipping inventory regen for bot commit: $subject"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Generate inventory docs
-        if: steps.guard.outputs.skip != 'true'
         run: python3 scripts/generate_inventory_docs.py
 
-      - name: Commit regenerated docs
-        id: commit
-        if: steps.guard.outputs.skip != 'true'
+      - name: Detect drift
+        id: drift
         shell: bash
-        env:
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
           if git diff --quiet -- ARCHITECTURE.md docs/generated; then
-            echo "No inventory docs drift detected."
-            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "has_drift=false" >> "$GITHUB_OUTPUT"
+            echo "Inventory docs are up to date."
+          else
+            echo "has_drift=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open maintenance PR with regenerated docs
+        if: steps.drift.outputs.has_drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${BASE_SHA:0:7}"
+          branch="regen-docs/${short_sha}"
+
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            echo "Branch $branch already exists on remote; another regen run handled it."
             exit 0
           fi
 
+          git checkout -b "$branch"
           git add ARCHITECTURE.md docs/generated
-          git commit -m "chore: regenerate inventory docs [skip regen]"
-          git push origin "HEAD:${PR_HEAD_REF}"
-          echo "pushed=true" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git commit -m "chore: regenerate inventory docs"
+          git push -u origin "$branch"
 
-      - name: Publish post-regen commit status
-        if: steps.commit.outputs.pushed == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          STATUS_CONTEXT: regen-docs
-          STATUS_SHA: ${{ steps.commit.outputs.sha }}
-          TARGET_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          gh api \
-            --method POST \
-            "/repos/${REPOSITORY}/statuses/${STATUS_SHA}" \
-            -f state=success \
-            -f context="${STATUS_CONTEXT}" \
-            -f description="Inventory docs regenerated and pushed" \
-            -f target_url="${TARGET_URL}" \
-            --silent
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "chore: weekly inventory docs regen (${short_sha})" \
+            --body "Automated weekly maintenance PR. Inventory drift detected against main HEAD [\`${short_sha}\`](${SERVER_URL}/${REPOSITORY}/commit/${BASE_SHA}). Review and merge when convenient. No auto-merge — drift in generated inventory is informational only."

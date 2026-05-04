@@ -1,12 +1,15 @@
 mod completion_guard;
 mod context_window;
 mod memory_lifecycle;
+mod output_lifecycle;
 mod recall_feedback;
 mod recovery_text;
 mod retry_state;
 mod skill_usage;
 mod stale_resume;
+mod terminal_delivery;
 mod tmux_runtime;
+mod turn_analytics;
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests;
@@ -28,17 +31,20 @@ use crate::services::observability::session_inventory::{
     format_child_inventory_progress, load_child_inventory_by_parent_key_pg,
 };
 use crate::services::provider::cancel_requested;
+use output_lifecycle::{BridgeOutputOwner, classify_bridge_output_owner};
 use std::collections::VecDeque;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
 pub(crate) use completion_guard::build_work_dispatch_completion_result;
 pub(super) use completion_guard::{
-    fail_dispatch_with_retry, guard_review_dispatch_completion,
+    fail_dispatch_auth_expired, fail_dispatch_with_retry, guard_review_dispatch_completion,
     queue_dispatch_followup_with_handles, runtime_db_fallback_complete_with_result,
+    streaming_final_complete_dispatch_with_result,
 };
 pub(super) use recovery_text::{
-    auto_retry_with_history, build_session_retry_context_from_history, store_session_retry_context,
-    take_session_retry_context,
+    SessionRetryContext, auto_retry_with_history, build_session_retry_context_from_history,
+    store_session_retry_context, take_session_retry_context, take_session_retry_context_for_turn,
+    take_session_retry_context_for_turn_with_audit,
 };
 pub(super) use stale_resume::result_event_has_stale_resume_error;
 pub(crate) use tmux_runtime::TmuxCleanupPolicy;
@@ -49,6 +55,94 @@ pub(super) use tmux_runtime::handoff_interrupted_message;
 pub(super) use tmux_runtime::interrupt_provider_cli_turn;
 pub(super) use tmux_runtime::stale_inflight_message;
 pub(super) use tmux_runtime::stop_active_turn;
+
+pub(super) fn classify_turn_finished_dispatch_kind(
+    dispatch_context: Option<&str>,
+    dispatch_type: Option<&str>,
+) -> Option<&'static str> {
+    let parsed =
+        dispatch_context.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    if parsed
+        .as_ref()
+        .is_some_and(|value| json_has_bool_key(value, "auto_queue", true))
+    {
+        return Some("auto_queue");
+    }
+    match dispatch_type {
+        Some("review-decision") => Some("review_decision"),
+        _ => None,
+    }
+}
+
+fn json_has_bool_key(value: &serde_json::Value, key: &str, expected: bool) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get(key).and_then(|value| value.as_bool()) == Some(expected)
+                || map
+                    .values()
+                    .any(|value| json_has_bool_key(value, key, expected))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| json_has_bool_key(value, key, expected)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod dispatch_kind_tests {
+    use super::classify_turn_finished_dispatch_kind;
+
+    #[test]
+    fn marks_auto_queue_context() {
+        assert_eq!(
+            classify_turn_finished_dispatch_kind(
+                Some(r#"{"auto_queue":true,"worktree_path":"/tmp/wt"}"#),
+                Some("implementation"),
+            ),
+            Some("auto_queue")
+        );
+    }
+
+    #[test]
+    fn marks_nested_auto_queue_context_to_match_slo_sql_filter() {
+        assert_eq!(
+            classify_turn_finished_dispatch_kind(
+                Some(r#"{"phase_gate":{"auto_queue":true}}"#),
+                Some("implementation"),
+            ),
+            Some("auto_queue")
+        );
+    }
+
+    #[test]
+    fn marks_review_decision_type() {
+        assert_eq!(
+            classify_turn_finished_dispatch_kind(None, Some("review-decision")),
+            Some("review_decision")
+        );
+    }
+
+    #[test]
+    fn auto_queue_takes_precedence_over_review_decision_type() {
+        assert_eq!(
+            classify_turn_finished_dispatch_kind(
+                Some(r#"{"auto_queue":true}"#),
+                Some("review-decision"),
+            ),
+            Some("auto_queue")
+        );
+    }
+
+    #[test]
+    fn keeps_interactive_unclassified() {
+        assert_eq!(classify_turn_finished_dispatch_kind(None, None), None);
+        assert_eq!(
+            classify_turn_finished_dispatch_kind(Some(r#"{"auto_queue":false}"#), Some("review")),
+            None
+        );
+    }
+}
 
 // Re-export pub(crate) items
 pub(crate) use tmux_runtime::tmux_runtime_paths;
@@ -74,11 +168,19 @@ use stale_resume::{
     output_file_has_stale_resume_error_after_offset, stream_error_has_stale_resume_error,
     stream_error_requires_terminal_session_reset,
 };
+use terminal_delivery::{
+    should_complete_work_dispatch_after_terminal_delivery,
+    should_fail_dispatch_after_terminal_delivery, turn_bridge_replace_outcome_committed,
+};
 use tmux_runtime::is_dcserver_restart_command;
+use turn_analytics::{
+    assert_response_sent_offset_progress, discord_turn_id, emit_turn_quality_event,
+    record_turn_bridge_invariant, turn_duration_ms,
+};
 
-use super::formatting::ReplaceLongMessageOutcome;
 use super::watcher_lifecycle_decision::should_resume_watcher_after_turn;
 use crate::db::session_status::{AWAITING_BG, AWAITING_USER, IDLE};
+use sqlx::Row;
 
 #[cfg(unix)]
 fn tmux_generation_file_mtime_ns(tmux_session_name: &str) -> i64 {
@@ -195,6 +297,131 @@ async fn child_progress_line(
     }
 }
 
+async fn refresh_session_panel_line_from_lifecycle(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    turn_id: &str,
+) -> bool {
+    let Some(pg_pool) = shared.pg_pool.as_ref() else {
+        return false;
+    };
+    let channel_id_text = channel_id.get().to_string();
+    match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
+        pg_pool,
+        &channel_id_text,
+        turn_id,
+    )
+    .await
+    {
+        Ok(Some(event)) => shared
+            .placeholder_live_events
+            .set_session_panel_lifecycle_event(channel_id, &event.kind, &event.details_json),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                "[turn_bridge] failed to load session lifecycle line for turn {} in channel {}: {}",
+                turn_id,
+                channel_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+async fn refresh_prompt_panel_line_from_manifest(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    turn_id: &str,
+) -> bool {
+    let Some(pg_pool) = shared.pg_pool.as_ref() else {
+        return false;
+    };
+    match crate::db::prompt_manifests::fetch_prompt_manifest(Some(pg_pool), turn_id).await {
+        Ok(Some(manifest)) => shared
+            .placeholder_live_events
+            .set_prompt_manifest(channel_id, &manifest),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::debug!(
+                "[turn_bridge] failed to load prompt manifest line for turn {} in channel {}: {}",
+                turn_id,
+                channel_id,
+                error
+            );
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskPanelDispatchMetadata {
+    card_id: Option<String>,
+    dispatch_type: Option<String>,
+}
+
+async fn load_task_panel_dispatch_metadata(
+    pg_pool: Option<&sqlx::PgPool>,
+    dispatch_id: &str,
+) -> Result<Option<TaskPanelDispatchMetadata>, String> {
+    let Some(pg_pool) = pg_pool else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT kanban_card_id, dispatch_type
+         FROM task_dispatches
+         WHERE id = $1",
+    )
+    .bind(dispatch_id)
+    .fetch_optional(pg_pool)
+    .await
+    .map_err(|error| format!("load task panel dispatch metadata for {dispatch_id}: {error}"))?;
+
+    row.map(|row| {
+        Ok::<TaskPanelDispatchMetadata, String>(TaskPanelDispatchMetadata {
+            card_id: row
+                .try_get("kanban_card_id")
+                .map_err(|error| format!("decode task panel card_id for {dispatch_id}: {error}"))?,
+            dispatch_type: row.try_get("dispatch_type").map_err(|error| {
+                format!("decode task panel dispatch_type for {dispatch_id}: {error}")
+            })?,
+        })
+    })
+    .transpose()
+}
+
+async fn refresh_task_panel_line_from_dispatch(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    dispatch_id: &str,
+) -> bool {
+    let dispatch_id = dispatch_id.trim();
+    if dispatch_id.is_empty() {
+        return false;
+    }
+    let metadata =
+        match load_task_panel_dispatch_metadata(shared.pg_pool.as_ref(), dispatch_id).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(
+                    "[turn_bridge] failed to load task line for dispatch {} in channel {}: {}",
+                    dispatch_id,
+                    channel_id,
+                    error
+                );
+                None
+            }
+        };
+    shared.placeholder_live_events.set_task_panel_info(
+        channel_id,
+        dispatch_id,
+        metadata.as_ref().and_then(|value| value.card_id.as_deref()),
+        metadata
+            .as_ref()
+            .and_then(|value| value.dispatch_type.as_deref()),
+    )
+}
+
 async fn close_all_tracked_background_children(
     pg_pool: Option<&sqlx::PgPool>,
     child_session_ids: &mut Vec<i64>,
@@ -292,37 +519,6 @@ fn redacted_thinking_transcript_event(_summary: Option<String>) -> SessionTransc
     }
 }
 
-fn emit_turn_quality_event(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    dispatch_id: Option<&str>,
-    session_key: Option<&str>,
-    turn_id: &str,
-    role_binding: Option<&RoleBinding>,
-    event_type: &str,
-    payload: serde_json::Value,
-) {
-    crate::services::observability::emit_agent_quality_event(
-        crate::services::observability::AgentQualityEvent {
-            source_event_id: Some(turn_id.to_string()),
-            correlation_id: dispatch_id
-                .map(str::to_string)
-                .or_else(|| Some(turn_id.to_string())),
-            agent_id: role_binding.map(|binding| binding.role_id.clone()),
-            provider: Some(provider.as_str().to_string()),
-            channel_id: Some(channel_id.get().to_string()),
-            card_id: None,
-            dispatch_id: dispatch_id.map(str::to_string),
-            event_type: event_type.to_string(),
-            payload: serde_json::json!({
-                "turn_id": turn_id,
-                "session_key": session_key,
-                "details": payload,
-            }),
-        },
-    );
-}
-
 pub(super) struct TurnBridgeContext {
     pub(super) provider: ProviderKind,
     pub(super) gateway: Arc<dyn TurnGateway>,
@@ -336,13 +532,20 @@ pub(super) struct TurnBridgeContext {
     pub(super) adk_session_info: Option<String>,
     pub(super) adk_cwd: Option<String>,
     pub(super) dispatch_id: Option<String>,
+    pub(super) dispatch_kind: Option<String>,
     pub(super) memory_recall_usage: TokenUsage,
+    pub(super) context_window_tokens: u64,
+    pub(super) context_compact_percent: u64,
     pub(super) current_msg_id: MessageId,
     pub(super) response_sent_offset: usize,
     pub(super) full_response: String,
     pub(super) tmux_last_offset: Option<u64>,
     pub(super) new_session_id: Option<String>,
     pub(super) defer_watcher_resume: bool,
+    /// Reuse the persisted V2 status panel only when resuming the same
+    /// in-flight turn. Fresh turns must allocate a new panel near the new
+    /// response instead of editing an old panel buried in scrollback.
+    pub(super) reuse_status_panel_message: bool,
     pub(super) completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub(super) inflight_state: InflightTurnState,
 }
@@ -371,8 +574,14 @@ fn push_transcript_event(events: &mut Vec<SessionTranscriptEvent>, event: Sessio
     }
 }
 
-fn turn_duration_ms(started_at: std::time::Instant) -> i64 {
-    i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX)
+fn status_panel_message_id_for_turn(
+    inflight_state: &mut InflightTurnState,
+    reuse_status_panel_message: bool,
+) -> Option<MessageId> {
+    if !reuse_status_panel_message {
+        inflight_state.status_message_id = None;
+    }
+    inflight_state.status_message_id.map(MessageId::new)
 }
 
 fn response_portion_after_offset(full_response: &str, response_sent_offset: usize) -> &str {
@@ -402,120 +611,6 @@ fn live_watcher_registered_for_relay(shared: &SharedData, owner_channel_id: Chan
         .tmux_watchers
         .get(&owner_channel_id)
         .is_some_and(|watcher| !watcher.cancel.load(Ordering::Relaxed))
-}
-
-fn record_turn_bridge_invariant(
-    condition: bool,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    dispatch_id: Option<&str>,
-    session_key: Option<&str>,
-    turn_id: Option<&str>,
-    invariant: &'static str,
-    code_location: &'static str,
-    message: &'static str,
-    details: serde_json::Value,
-) -> bool {
-    crate::services::observability::record_invariant_check(
-        condition,
-        crate::services::observability::InvariantViolation {
-            provider: Some(provider.as_str()),
-            channel_id: Some(channel_id.get()),
-            dispatch_id,
-            session_key,
-            turn_id,
-            invariant,
-            code_location,
-            message,
-            details,
-        },
-    )
-}
-
-fn discord_turn_id(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    user_msg_id: MessageId,
-    session_key: Option<&str>,
-) -> String {
-    let turn_id = format!("discord:{}:{}", channel_id.get(), user_msg_id.get());
-    let nonzero_components = channel_id.get() != 0 && user_msg_id.get() != 0;
-    record_turn_bridge_invariant(
-        nonzero_components,
-        provider,
-        channel_id,
-        None,
-        session_key,
-        Some(turn_id.as_str()),
-        "turn_id_unique_within_session",
-        "src/services/discord/turn_bridge/mod.rs:discord_turn_id",
-        "turn_id must be built from non-zero Discord channel/message ids",
-        serde_json::json!({
-            "channel_id": channel_id.get(),
-            "user_msg_id": user_msg_id.get(),
-            "turn_id": turn_id.as_str(),
-        }),
-    );
-    debug_assert!(
-        nonzero_components,
-        "turn_id requires non-zero Discord channel/message ids"
-    );
-    turn_id
-}
-
-fn assert_response_sent_offset_progress(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    dispatch_id: Option<&str>,
-    session_key: Option<&str>,
-    turn_id: &str,
-    previous: usize,
-    next: usize,
-    full_response: &str,
-    code_location: &'static str,
-) {
-    let monotonic = next >= previous;
-    record_turn_bridge_invariant(
-        monotonic,
-        provider,
-        channel_id,
-        dispatch_id,
-        session_key,
-        Some(turn_id),
-        "response_sent_offset_monotonic",
-        code_location,
-        "turn_bridge response_sent_offset must not move backwards",
-        serde_json::json!({
-            "previous": previous,
-            "next": next,
-            "full_response_len": full_response.len(),
-        }),
-    );
-    debug_assert!(
-        monotonic,
-        "turn_bridge response_sent_offset must not move backwards"
-    );
-
-    let in_bounds = next <= full_response.len() && full_response.is_char_boundary(next);
-    record_turn_bridge_invariant(
-        in_bounds,
-        provider,
-        channel_id,
-        dispatch_id,
-        session_key,
-        Some(turn_id),
-        "response_sent_offset_in_bounds",
-        code_location,
-        "turn_bridge response_sent_offset must stay on a full_response boundary",
-        serde_json::json!({
-            "next": next,
-            "full_response_len": full_response.len(),
-        }),
-    );
-    debug_assert!(
-        in_bounds,
-        "turn_bridge response_sent_offset must stay on a full_response boundary"
-    );
 }
 
 fn advance_tmux_relay_confirmed_end(
@@ -615,90 +710,6 @@ fn advance_tmux_relay_confirmed_end(
     );
 }
 
-fn record_turn_bridge_terminal_replace_cleanup(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    message_id: MessageId,
-    tmux_session_name: Option<&str>,
-    outcome: super::placeholder_cleanup::PlaceholderCleanupOutcome,
-    source: &'static str,
-) {
-    if let super::placeholder_cleanup::PlaceholderCleanupOutcome::Failed { class, detail } =
-        &outcome
-    {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            "  [{ts}] ⚠ placeholder cleanup {} failed ({}) for channel {} msg {}: {}",
-            super::placeholder_cleanup::PlaceholderCleanupOperation::EditTerminal.as_str(),
-            class.as_str(),
-            channel_id.get(),
-            message_id.get(),
-            detail
-        );
-    }
-    shared
-        .placeholder_cleanup
-        .record(super::placeholder_cleanup::PlaceholderCleanupRecord {
-            provider: provider.clone(),
-            channel_id,
-            message_id,
-            tmux_session_name: tmux_session_name.map(str::to_string),
-            operation: super::placeholder_cleanup::PlaceholderCleanupOperation::EditTerminal,
-            outcome,
-            source,
-        });
-}
-
-fn turn_bridge_replace_outcome_committed(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    message_id: MessageId,
-    tmux_session_name: Option<&str>,
-    replace_result: Result<ReplaceLongMessageOutcome, String>,
-    source: &'static str,
-) -> bool {
-    match replace_result {
-        Ok(ReplaceLongMessageOutcome::EditedOriginal) => {
-            record_turn_bridge_terminal_replace_cleanup(
-                shared,
-                provider,
-                channel_id,
-                message_id,
-                tmux_session_name,
-                super::placeholder_cleanup::PlaceholderCleanupOutcome::Succeeded,
-                source,
-            );
-            true
-        }
-        Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
-            record_turn_bridge_terminal_replace_cleanup(
-                shared,
-                provider,
-                channel_id,
-                message_id,
-                tmux_session_name,
-                super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(edit_error),
-                source,
-            );
-            false
-        }
-        Err(error) => {
-            record_turn_bridge_terminal_replace_cleanup(
-                shared,
-                provider,
-                channel_id,
-                message_id,
-                tmux_session_name,
-                super::placeholder_cleanup::PlaceholderCleanupOutcome::failed(error),
-                source,
-            );
-            false
-        }
-    }
-}
-
 fn active_turn_thread_channel_id(
     adk_session_name: Option<&str>,
     inflight_state: &InflightTurnState,
@@ -712,122 +723,6 @@ fn active_turn_thread_channel_id(
                 .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name)
         })
         .or(inflight_state.thread_id)
-}
-
-fn should_complete_work_dispatch_after_terminal_delivery(
-    completion_candidate: bool,
-    terminal_delivery_committed: bool,
-    preserve_inflight_for_cleanup_retry: bool,
-    resume_failure_detected: bool,
-    recovery_retry: bool,
-    full_response: &str,
-) -> bool {
-    completion_candidate
-        && terminal_delivery_committed
-        && !preserve_inflight_for_cleanup_retry
-        && !resume_failure_detected
-        && !recovery_retry
-        && !full_response.trim().is_empty()
-}
-
-fn should_fail_dispatch_after_terminal_delivery(
-    fail_candidate: bool,
-    terminal_delivery_committed: bool,
-    preserve_inflight_for_cleanup_retry: bool,
-) -> bool {
-    fail_candidate && terminal_delivery_committed && !preserve_inflight_for_cleanup_retry
-}
-
-#[cfg(test)]
-mod terminal_delivery_gate_tests {
-    use super::{
-        should_complete_work_dispatch_after_terminal_delivery,
-        should_fail_dispatch_after_terminal_delivery,
-    };
-
-    #[test]
-    fn work_dispatch_completion_requires_terminal_delivery_commit() {
-        assert!(should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            true,
-            false,
-            false,
-            false,
-            "visible final response",
-        ));
-
-        assert!(!should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            false,
-            false,
-            false,
-            false,
-            "visible final response",
-        ));
-        assert!(!should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            true,
-            true,
-            false,
-            false,
-            "visible final response",
-        ));
-        assert!(!should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            true,
-            false,
-            true,
-            false,
-            "visible final response",
-        ));
-        assert!(!should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            true,
-            false,
-            false,
-            true,
-            "visible final response",
-        ));
-        assert!(!should_complete_work_dispatch_after_terminal_delivery(
-            true, true, false, false, false, "   ",
-        ));
-    }
-
-    #[test]
-    fn final_completion_delivery_stays_blocked_until_terminal_message_commits() {
-        assert!(!should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            false,
-            false,
-            false,
-            false,
-            "final response waiting for Discord delivery",
-        ));
-        assert!(should_complete_work_dispatch_after_terminal_delivery(
-            true,
-            true,
-            false,
-            false,
-            false,
-            "final response delivered",
-        ));
-    }
-
-    #[test]
-    fn transport_error_dispatch_failure_requires_terminal_delivery_commit() {
-        assert!(should_fail_dispatch_after_terminal_delivery(
-            true, true, false,
-        ));
-        assert!(!should_fail_dispatch_after_terminal_delivery(
-            true, false, false,
-        ));
-        assert!(!should_fail_dispatch_after_terminal_delivery(
-            true, true, true,
-        ));
-        assert!(!should_fail_dispatch_after_terminal_delivery(
-            false, true, false,
-        ));
-    }
 }
 
 fn maybe_refresh_active_turn_activity_heartbeat(
@@ -1171,6 +1066,9 @@ pub(super) fn spawn_turn_bridge(
         let adk_session_info = bridge.adk_session_info.clone();
         let adk_cwd = bridge.adk_cwd.clone();
         let dispatch_id = bridge.dispatch_id.clone();
+        let dispatch_kind = bridge.dispatch_kind.clone();
+        let context_window_tokens = bridge.context_window_tokens;
+        let context_compact_percent = bridge.context_compact_percent;
 
         let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
@@ -1296,7 +1194,13 @@ pub(super) fn spawn_turn_bridge(
         let mut inflight_state = bridge.inflight_state.clone();
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
-        let mut status_panel_msg_id = inflight_state.status_message_id.map(MessageId::new);
+        let mut last_session_panel_lifecycle_refresh =
+            tokio::time::Instant::now() - status_interval;
+        let mut last_prompt_panel_manifest_refresh = tokio::time::Instant::now() - status_interval;
+        let mut status_panel_msg_id = status_panel_message_id_for_turn(
+            &mut inflight_state,
+            bridge.reuse_status_panel_message,
+        );
         let mut last_status_panel_text = String::new();
         let mut status_panel_dirty = shared_owned.status_panel_v2_enabled;
         let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
@@ -1325,6 +1229,17 @@ pub(super) fn spawn_turn_bridge(
                     status_panel_dirty = false;
                 }
             }
+        }
+
+        if shared_owned.status_panel_v2_enabled
+            && let Some(dispatch_id) = dispatch_id.as_deref()
+        {
+            status_panel_dirty |= refresh_task_panel_line_from_dispatch(
+                shared_owned.as_ref(),
+                channel_id,
+                dispatch_id,
+            )
+            .await;
         }
 
         // codex round-5 P2 on PR #1308: a dcserver restart resumed an inflight
@@ -1948,6 +1863,32 @@ pub(super) fn spawn_turn_bridge(
                                     "task notification",
                                 )
                                 .await;
+                                // #1670: `merge_task_notification_kind` is an
+                                // absorb operator (priority-max). Without an
+                                // explicit release on the terminal status the
+                                // outer `inflight_state.task_notification_kind`
+                                // sticks at Subagent/Background past the child
+                                // close, which then misroutes downstream
+                                // suppression decisions and persists into the
+                                // saved inflight when the watcher takes over.
+                                //
+                                // codex P2 followup: only reset the kind once
+                                // ALL tracked children have closed.
+                                // `active_background_child_session_ids` is a
+                                // queue and `close_next_tracked_background_child`
+                                // pops a single entry, so when concurrent
+                                // subagent children are tracked and only one
+                                // emits a terminal status we must keep the
+                                // outer kind so the remaining child still
+                                // routes through the ExplicitBackground/
+                                // Subagent classification path. A stack/multiset
+                                // of kinds would be the proper structural fix;
+                                // here we approximate by gating reset on the
+                                // remaining-children count, which covers the
+                                // single-kind concurrent-children regression.
+                                if active_background_child_session_ids.is_empty() {
+                                    inflight_state.task_notification_kind = None;
+                                }
                             }
                             push_transcript_event(
                                 &mut transcript_events,
@@ -2135,6 +2076,9 @@ pub(super) fn spawn_turn_bridge(
                             output_tokens,
                             ..
                         } => {
+                            let has_context_token_data = input_tokens.is_some()
+                                || cache_create_tokens.is_some()
+                                || cache_read_tokens.is_some();
                             // Use latest values (not cumulative) — provider adapters emit
                             // cumulative totals for the current turn/session snapshot.
                             if let Some(it) = input_tokens {
@@ -2148,6 +2092,18 @@ pub(super) fn spawn_turn_bridge(
                             }
                             if let Some(ot) = output_tokens {
                                 accumulated_output_tokens = ot;
+                            }
+                            if shared_owned.status_panel_v2_enabled && has_context_token_data {
+                                status_panel_dirty |= shared_owned
+                                    .placeholder_live_events
+                                    .set_context_panel_usage(
+                                        channel_id,
+                                        accumulated_input_tokens,
+                                        accumulated_cache_create_tokens,
+                                        accumulated_cache_read_tokens,
+                                        context_window_tokens,
+                                        context_compact_percent,
+                                    );
                             }
                         }
                         StreamMessage::TmuxReady {
@@ -2355,6 +2311,30 @@ pub(super) fn spawn_turn_bridge(
                         break;
                     }
                 }
+            }
+
+            if shared_owned.status_panel_v2_enabled
+                && last_session_panel_lifecycle_refresh.elapsed() >= status_interval
+            {
+                last_session_panel_lifecycle_refresh = tokio::time::Instant::now();
+                status_panel_dirty |= refresh_session_panel_line_from_lifecycle(
+                    shared_owned.as_ref(),
+                    channel_id,
+                    turn_id.as_str(),
+                )
+                .await;
+            }
+
+            if shared_owned.status_panel_v2_enabled
+                && last_prompt_panel_manifest_refresh.elapsed() >= status_interval
+            {
+                last_prompt_panel_manifest_refresh = tokio::time::Instant::now();
+                status_panel_dirty |= refresh_prompt_panel_line_from_manifest(
+                    shared_owned.as_ref(),
+                    channel_id,
+                    turn_id.as_str(),
+                )
+                .await;
             }
 
             let indicator = SPINNER[spin_idx % SPINNER.len()];
@@ -2935,9 +2915,13 @@ pub(super) fn spawn_turn_bridge(
 
         // Remove ⏳ only if NOT handing off to tmux watcher.
         // When tmux watcher is handling the response, it will do ⏳→✅ after delivery.
-        let tmux_handoff_path = (rx_disconnected && tmux_handed_off && full_response.is_empty())
-            || bridge_relay_delegated_to_watcher;
-        if !tmux_handoff_path {
+        let bridge_output_owner = classify_bridge_output_owner(
+            rx_disconnected,
+            tmux_handed_off,
+            full_response.is_empty(),
+            bridge_relay_delegated_to_watcher,
+        );
+        if !bridge_output_owner.skips_bridge_spinner_cleanup() {
             gateway.remove_reaction(channel_id, user_msg_id, '⏳').await;
         }
 
@@ -2977,6 +2961,13 @@ pub(super) fn spawn_turn_bridge(
                 .await;
             full_response = String::new();
         }
+
+        let bridge_output_owner_for_delivery = classify_bridge_output_owner(
+            rx_disconnected,
+            tmux_handed_off,
+            full_response.is_empty(),
+            bridge_relay_delegated_to_watcher,
+        );
 
         if cancelled {
             close_all_tracked_background_children(
@@ -3143,7 +3134,7 @@ pub(super) fn spawn_turn_bridge(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
-        } else if rx_disconnected && tmux_handed_off && full_response.is_empty() {
+        } else if bridge_output_owner_for_delivery == BridgeOutputOwner::LegacyTmuxHandoff {
             // Tmux watcher is handling response delivery — this is normal.
             // Don't delete placeholder — update it so the user sees the turn is still active.
             // The tmux watcher will replace this content when output arrives.
@@ -3262,7 +3253,7 @@ pub(super) fn spawn_turn_bridge(
                     channel_id
                 );
             }
-        } else if bridge_relay_delegated_to_watcher {
+        } else if bridge_output_owner_for_delivery == BridgeOutputOwner::WatcherRelay {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] 👁 tmux watcher owns assistant relay; bridge skipped direct response delivery (channel {})",
@@ -3484,9 +3475,24 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
-            // If response is empty (e.g. auto-retry on stale session), show
-            // recovery notice instead of deleting — avoids visual gap.
-            if delivery_response.trim().is_empty() {
+            // Headless silent trigger (metadata.silent=true): suppress assistant
+            // text delivery entirely. Lifecycle/error/cancel notifications still
+            // flow through their own paths.
+            if inflight_state.silent_turn {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🤫 turn_bridge: silent_turn suppressed terminal delivery for channel {} ({} chars)",
+                    channel_id,
+                    delivery_response.len()
+                );
+                terminal_delivery_committed = true;
+                advance_tmux_relay_confirmed_end(
+                    shared_owned.as_ref(),
+                    watcher_owner_channel_id,
+                    tmux_last_offset,
+                    inflight_state.tmux_session_name.as_deref(),
+                );
+            } else if delivery_response.trim().is_empty() {
                 if gateway
                     .edit_message(
                         channel_id,
@@ -3793,7 +3799,7 @@ pub(super) fn spawn_turn_bridge(
         } else {
             "completed"
         };
-        crate::services::observability::emit_turn_finished(
+        crate::services::observability::emit_turn_finished_with_dispatch_kind(
             provider.as_str(),
             channel_id.get(),
             dispatch_id.as_deref(),
@@ -3802,6 +3808,7 @@ pub(super) fn spawn_turn_bridge(
             turn_outcome,
             turn_duration_ms(turn_start),
             rx_disconnected && tmux_handed_off && full_response.is_empty(),
+            dispatch_kind.as_deref(),
         );
         let turn_quality_event_type = if matches!(
             turn_outcome,
@@ -4090,10 +4097,55 @@ pub(super) fn spawn_turn_bridge(
         } else if preserve_inflight_for_cleanup_retry || bridge_relay_delegated_to_watcher {
             let _ = save_inflight_state(&inflight_state);
             inflight_guard.provider.take();
+            if bridge_relay_delegated_to_watcher {
+                crate::services::observability::emit_inflight_lifecycle_event(
+                    provider.as_str(),
+                    channel_id.get(),
+                    dispatch_id.as_deref(),
+                    adk_session_key.as_deref(),
+                    Some(turn_id.as_str()),
+                    "delegated_to_watcher",
+                    serde_json::json!({
+                        "preserve_inflight_for_cleanup_retry": preserve_inflight_for_cleanup_retry,
+                        "full_response_len": inflight_state.full_response.len(),
+                        "response_sent_offset": inflight_state.response_sent_offset,
+                        "watcher_owns_live_relay": inflight_state.watcher_owns_live_relay,
+                        // #1671 — record the dispatch outcome and notification
+                        // kind on every bridge-side lifecycle event so
+                        // same-class incidents (orphan inflight after the
+                        // bridge handed off) can be triaged from log payloads
+                        // alone instead of requiring a watcher-state hit.
+                        "dispatch_ok": false,
+                        "task_notification_kind": inflight_state
+                            .task_notification_kind
+                            .map(|kind| kind.as_str()),
+                    }),
+                );
+            }
         } else {
             clear_inflight_state(&provider, channel_id.get());
             // Defuse the guard — cleanup already done above.
             inflight_guard.provider.take();
+            crate::services::observability::emit_inflight_lifecycle_event(
+                provider.as_str(),
+                channel_id.get(),
+                dispatch_id.as_deref(),
+                adk_session_key.as_deref(),
+                Some(turn_id.as_str()),
+                "cleared_by_bridge",
+                serde_json::json!({
+                    "full_response_len": inflight_state.full_response.len(),
+                    "response_sent_offset": inflight_state.response_sent_offset,
+                    // #1671 — `dispatch_ok=true` here marks "bridge handled
+                    // the full lifecycle without delegation"; pair with the
+                    // notification kind so a stale `task_notification_kind`
+                    // pattern is searchable directly off the lifecycle event.
+                    "dispatch_ok": true,
+                    "task_notification_kind": inflight_state
+                        .task_notification_kind
+                        .map(|kind| kind.as_str()),
+                }),
+            );
         }
         super::mailbox_clear_recovery_marker(&shared_owned, channel_id).await;
 
@@ -4196,13 +4248,162 @@ pub(super) fn spawn_turn_bridge(
     }.instrument(bridge_span));
 }
 
+/// codex P2 followup (#1670): unit-level coverage of the
+/// "preserve task_notification_kind while other children remain" rule.
+/// This mirrors the production logic at the
+/// `task_notification_closes_background_child` arm in
+/// `StreamMessage::TaskNotification` (search: `codex P2 followup`).
+///
+/// The existing exhaustive-status coverage lives in
+/// `tests::task_notification_kind_resets_after_terminal_status` but that
+/// module is feature-gated on `legacy-sqlite-tests`; this lighter copy is
+/// added in the non-gated mod so the regression is observable in normal
+/// `cargo test` runs.
+#[cfg(test)]
+mod task_notification_kind_lifecycle_tests {
+    use super::{
+        TaskNotificationKind, merge_task_notification_kind,
+        task_notification_closes_background_child,
+    };
+
+    #[test]
+    fn kind_persists_while_other_children_remain() {
+        let mut child_ids: Vec<i64> = vec![100, 101];
+        let mut kind: Option<TaskNotificationKind> = None;
+        kind = merge_task_notification_kind(kind, TaskNotificationKind::Subagent);
+
+        let new_kind = TaskNotificationKind::Subagent;
+        let status = "completed";
+        kind = merge_task_notification_kind(kind, new_kind);
+        if task_notification_closes_background_child(new_kind, status) {
+            // Mirror the single-pop behavior of
+            // `close_next_tracked_background_child` at the call site.
+            let _ = child_ids.remove(0);
+            if child_ids.is_empty() {
+                kind = None;
+            }
+        }
+
+        assert_eq!(child_ids, vec![101]);
+        assert_eq!(
+            kind,
+            Some(TaskNotificationKind::Subagent),
+            "#1670 P2: kind must persist while other tracked children remain"
+        );
+
+        // Second terminal closes the queue, kind releases.
+        let new_kind = TaskNotificationKind::Subagent;
+        let status = "completed";
+        kind = merge_task_notification_kind(kind, new_kind);
+        if task_notification_closes_background_child(new_kind, status) {
+            let _ = child_ids.remove(0);
+            if child_ids.is_empty() {
+                kind = None;
+            }
+        }
+        assert!(child_ids.is_empty());
+        assert_eq!(
+            kind, None,
+            "#1670 P2: kind must release once the last child closes"
+        );
+    }
+
+    #[test]
+    fn kind_releases_immediately_when_queue_was_already_singleton() {
+        let mut child_ids: Vec<i64> = vec![42];
+        let mut kind: Option<TaskNotificationKind> = Some(TaskNotificationKind::Background);
+
+        let new_kind = TaskNotificationKind::Background;
+        let status = "aborted";
+        kind = merge_task_notification_kind(kind, new_kind);
+        if task_notification_closes_background_child(new_kind, status) {
+            let _ = child_ids.remove(0);
+            if child_ids.is_empty() {
+                kind = None;
+            }
+        }
+
+        assert!(child_ids.is_empty());
+        assert_eq!(
+            kind, None,
+            "#1670 P2: with a single tracked child, terminal status must release the kind"
+        );
+    }
+
+    #[test]
+    fn non_terminal_status_keeps_kind_and_does_not_pop() {
+        let mut child_ids: Vec<i64> = vec![1, 2];
+        let mut kind: Option<TaskNotificationKind> = None;
+        kind = merge_task_notification_kind(kind, TaskNotificationKind::Subagent);
+
+        let new_kind = TaskNotificationKind::Subagent;
+        let status = "started";
+        kind = merge_task_notification_kind(kind, new_kind);
+        if task_notification_closes_background_child(new_kind, status) {
+            let _ = child_ids.remove(0);
+            if child_ids.is_empty() {
+                kind = None;
+            }
+        }
+
+        assert_eq!(child_ids, vec![1, 2], "non-terminal must not pop");
+        assert_eq!(
+            kind,
+            Some(TaskNotificationKind::Subagent),
+            "non-terminal must keep kind"
+        );
+    }
+}
+
 #[cfg(test)]
 mod status_panel_v2_rework_tests {
-    use super::should_open_long_running_placeholder_controller;
+    use super::{
+        InflightTurnState, MessageId, ProviderKind,
+        should_open_long_running_placeholder_controller, status_panel_message_id_for_turn,
+    };
 
     #[test]
     fn status_panel_v2_disables_long_running_placeholder_controller() {
         assert!(!should_open_long_running_placeholder_controller(true));
         assert!(should_open_long_running_placeholder_controller(false));
+    }
+
+    fn test_inflight_state() -> InflightTurnState {
+        InflightTurnState::new(
+            ProviderKind::Codex,
+            1,
+            Some("adk-cdx-test".to_string()),
+            2,
+            3,
+            4,
+            "test turn".to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+    }
+
+    #[test]
+    fn fresh_turn_discards_stale_status_panel_message_id() {
+        let mut state = test_inflight_state();
+        state.status_message_id = Some(99);
+
+        let status_panel_msg_id = status_panel_message_id_for_turn(&mut state, false);
+
+        assert_eq!(status_panel_msg_id, None);
+        assert_eq!(state.status_message_id, None);
+    }
+
+    #[test]
+    fn resume_turn_preserves_status_panel_message_id() {
+        let mut state = test_inflight_state();
+        state.status_message_id = Some(99);
+
+        let status_panel_msg_id = status_panel_message_id_for_turn(&mut state, true);
+
+        assert_eq!(status_panel_msg_id, Some(MessageId::new(99)));
+        assert_eq!(state.status_message_id, Some(99));
     }
 }

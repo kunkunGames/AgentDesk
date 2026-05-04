@@ -660,10 +660,17 @@ pub struct ClusterConfig {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_cluster_lease_ttl_secs")]
     pub lease_ttl_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub capabilities: serde_json::Map<String, serde_json::Value>,
+    #[serde(
+        default,
+        skip_serializing_if = "ClusterDispatchRoutingConfig::is_default"
+    )]
+    pub dispatch_routing: ClusterDispatchRoutingConfig,
 }
 
 impl Default for ClusterConfig {
@@ -674,8 +681,10 @@ impl Default for ClusterConfig {
             role: default_cluster_role(),
             heartbeat_interval_secs: default_cluster_heartbeat_interval_secs(),
             lease_ttl_secs: default_cluster_lease_ttl_secs(),
+            api_base_url: None,
             labels: Vec::new(),
             capabilities: serde_json::Map::new(),
+            dispatch_routing: ClusterDispatchRoutingConfig::default(),
         }
     }
 }
@@ -683,6 +692,27 @@ impl Default for ClusterConfig {
 impl ClusterConfig {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClusterDispatchRoutingConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub default_preferred_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opt_out_dispatch_types: Vec<String>,
+}
+
+impl ClusterDispatchRoutingConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn is_opted_out(&self, dispatch_type: &str) -> bool {
+        self.opt_out_dispatch_types
+            .iter()
+            .any(|value| value == dispatch_type)
     }
 }
 
@@ -1600,7 +1630,7 @@ pub fn load_graceful() -> Config {
     config
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[cfg(test)]
 pub(crate) fn shared_test_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))

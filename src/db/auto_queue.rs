@@ -821,7 +821,6 @@ pub async fn update_entry_status_on_pg_tx(
 }
 
 /// Route dispatch-linked terminal transitions through the canonical entry
-/// Route dispatch-linked terminal transitions through the canonical entry
 /// helper so PG transition bookkeeping and run finalization stay consistent.
 pub async fn sync_dispatch_terminal_entries_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -830,11 +829,33 @@ pub async fn sync_dispatch_terminal_entries_on_pg_tx(
     trigger_source: &str,
     preserve_dispatch_link: bool,
 ) -> Result<usize, String> {
+    // #1562 RC8: also match entries via kanban_card_id when the agent has
+    // performed a self-recovery (replaced a cancelled dispatch with a fresh
+    // one on the same card). The entry's `dispatch_id` pointer still
+    // references the cancelled original, so direct dispatch_id match would
+    // miss the completion. Card-id fallback only fires when the entry's
+    // tracked dispatch is NOT itself the dispatch being completed (avoids
+    // cross-row updates when both pointers happen to align) AND when the
+    // entry's previously-tracked dispatch is in a terminal non-completed
+    // state — i.e. genuine self-recovery, not normal lifecycle.
     let rows = sqlx::query(
-        "SELECT id, dispatch_id, slot_index
-         FROM auto_queue_entries
-         WHERE dispatch_id = $1
-           AND status = 'dispatched'",
+        "SELECT e.id, e.dispatch_id, e.slot_index
+         FROM auto_queue_entries e
+         WHERE e.status = 'dispatched'
+           AND (
+                 e.dispatch_id = $1
+              OR (
+                   e.kanban_card_id = (
+                     SELECT kanban_card_id
+                     FROM task_dispatches
+                     WHERE id = $1
+                   )
+                   AND COALESCE(
+                     (SELECT status FROM task_dispatches WHERE id = e.dispatch_id),
+                     ''
+                   ) IN ('cancelled', 'failed', 'superseded')
+                 )
+           )",
     )
     .bind(dispatch_id)
     .fetch_all(&mut **tx)
@@ -999,6 +1020,91 @@ pub async fn list_entry_dispatch_history_pg(
     rows.into_iter()
         .map(|row| row.try_get("dispatch_id"))
         .collect()
+}
+
+fn normalized_optional_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn resume_session_id_from_context(context: Option<&str>) -> Option<String> {
+    let context = context
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(|value| value.is_object())?;
+    context
+        .get("auto_queue_retry_resume_session_id")
+        .or_else(|| context.get("resume_session_id"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| normalized_optional_text(Some(value)))
+}
+
+pub async fn latest_entry_phase_codex_session_id_pg(
+    pool: &PgPool,
+    entry_id: &str,
+    dispatch_type: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT
+             h.dispatch_id,
+             d.context,
+             session_state.claude_session_id,
+             session_state.raw_provider_session_id,
+             turn_state.session_id AS turn_session_id
+         FROM auto_queue_entry_dispatch_history h
+         JOIN task_dispatches d ON d.id = h.dispatch_id
+         LEFT JOIN LATERAL (
+             SELECT claude_session_id, raw_provider_session_id
+             FROM sessions
+             WHERE active_dispatch_id = h.dispatch_id
+               AND provider = 'codex'
+             ORDER BY last_heartbeat DESC NULLS LAST, created_at DESC NULLS LAST
+             LIMIT 1
+         ) session_state ON TRUE
+         LEFT JOIN LATERAL (
+             SELECT session_id
+             FROM turns
+             WHERE dispatch_id = h.dispatch_id
+               AND provider = 'codex'
+               AND session_id IS NOT NULL
+               AND BTRIM(session_id) != ''
+             ORDER BY finished_at DESC NULLS LAST, started_at DESC NULLS LAST
+             LIMIT 1
+         ) turn_state ON TRUE
+         WHERE h.entry_id = $1
+           AND d.dispatch_type = $2
+         ORDER BY h.id DESC
+         LIMIT 10",
+    )
+    .bind(entry_id)
+    .bind(dispatch_type)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let claude_session_id: Option<String> = row.try_get("claude_session_id")?;
+        if let Some(session_id) = normalized_optional_text(claude_session_id.as_deref()) {
+            return Ok(Some(session_id));
+        }
+
+        let raw_provider_session_id: Option<String> = row.try_get("raw_provider_session_id")?;
+        if let Some(session_id) = normalized_optional_text(raw_provider_session_id.as_deref()) {
+            return Ok(Some(session_id));
+        }
+
+        let turn_session_id: Option<String> = row.try_get("turn_session_id")?;
+        if let Some(session_id) = normalized_optional_text(turn_session_id.as_deref()) {
+            return Ok(Some(session_id));
+        }
+
+        let context: Option<String> = row.try_get("context")?;
+        if let Some(session_id) = resume_session_id_from_context(context.as_deref()) {
+            return Ok(Some(session_id));
+        }
+    }
+
+    Ok(None)
 }
 
 pub async fn rebind_slot_for_group_agent_pg(
@@ -1909,9 +2015,13 @@ pub async fn first_pending_entry_for_group_pg(
     run_id: &str,
     thread_group: i64,
     current_phase: Option<i64>,
-) -> Result<Option<(String, String, String, i64)>, sqlx::Error> {
+) -> Result<Option<(String, String, String, i64, i64)>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT e.id, COALESCE(e.kanban_card_id, '') AS kanban_card_id, e.agent_id, COALESCE(e.batch_phase, 0)::BIGINT AS batch_phase
+        "SELECT e.id,
+                COALESCE(e.kanban_card_id, '') AS kanban_card_id,
+                e.agent_id,
+                COALESCE(e.batch_phase, 0)::BIGINT AS batch_phase,
+                COALESCE(e.retry_count, 0)::BIGINT AS retry_count
          FROM auto_queue_entries e
          WHERE e.run_id = $1
            AND COALESCE(e.thread_group, 0) = $2
@@ -1931,6 +2041,7 @@ pub async fn first_pending_entry_for_group_pg(
                 row.try_get("kanban_card_id")?,
                 row.try_get("agent_id")?,
                 batch_phase,
+                row.try_get("retry_count")?,
             )));
         }
     }
@@ -2835,15 +2946,366 @@ fn auto_queue_run_history_record_from_pg_row(
     })
 }
 
+#[cfg(test)]
+mod resume_session_context_tests {
+    use super::resume_session_id_from_context;
+
+    #[test]
+    fn resume_session_id_from_context_prefers_retry_field_and_trims() {
+        assert_eq!(
+            resume_session_id_from_context(Some(
+                r#"{"auto_queue_retry_resume_session_id":" thread-1585 ","resume_session_id":"old"}"#,
+            ))
+            .as_deref(),
+            Some("thread-1585")
+        );
+        assert_eq!(
+            resume_session_id_from_context(Some(r#"{"resume_session_id":" fallback-thread "}"#))
+                .as_deref(),
+            Some("fallback-thread")
+        );
+        assert_eq!(
+            resume_session_id_from_context(Some(r#"{"auto_queue_retry_resume_session_id":"   "}"#)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod dispatch_terminal_sync_pg_tests {
+    use super::{ENTRY_STATUS_DONE, ENTRY_STATUS_SKIPPED, sync_dispatch_terminal_entries_on_pg_tx};
+    use chrono::{DateTime, Utc};
+    use sqlx::{PgPool, Row};
+
+    struct TestPostgresDb {
+        _lock: crate::db::postgres::PostgresTestLifecycleGuard,
+        admin_url: String,
+        database_name: String,
+        database_url: String,
+        cleanup_armed: bool,
+    }
+
+    impl TestPostgresDb {
+        async fn create() -> Self {
+            let lock = crate::db::postgres::lock_test_lifecycle();
+            let admin_url = postgres_admin_database_url();
+            let database_name = format!(
+                "agentdesk_dispatch_terminal_sync_{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
+            crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "dispatch terminal sync pg tests",
+            )
+            .await
+            .expect("create dispatch terminal sync test db");
+
+            Self {
+                _lock: lock,
+                admin_url,
+                database_name,
+                database_url,
+                cleanup_armed: true,
+            }
+        }
+
+        async fn connect_and_migrate(&self) -> PgPool {
+            crate::db::postgres::connect_test_pool_and_migrate(
+                &self.database_url,
+                "dispatch terminal sync pg tests",
+            )
+            .await
+            .expect("connect + migrate dispatch terminal sync test db")
+        }
+
+        async fn drop(mut self) {
+            crate::db::postgres::drop_test_database(
+                &self.admin_url,
+                &self.database_name,
+                "dispatch terminal sync pg tests",
+            )
+            .await
+            .expect("drop dispatch terminal sync test db");
+            self.cleanup_armed = false;
+        }
+    }
+
+    impl Drop for TestPostgresDb {
+        fn drop(&mut self) {
+            if !self.cleanup_armed {
+                return;
+            }
+            let admin_url = self.admin_url.clone();
+            let database_name = self.database_name.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("dispatch terminal sync pg cleanup {database_name}"))
+                .spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    let _ = runtime.block_on(crate::db::postgres::drop_test_database(
+                        &admin_url,
+                        &database_name,
+                        "dispatch terminal sync pg tests cleanup",
+                    ));
+                })
+                .map(|handle| handle.join());
+        }
+    }
+
+    fn postgres_base_database_url() -> String {
+        if let Ok(base) = std::env::var("POSTGRES_TEST_DATABASE_URL_BASE") {
+            let trimmed = base.trim();
+            if !trimmed.is_empty() {
+                return trimmed.trim_end_matches('/').to_string();
+            }
+        }
+        let user = std::env::var("PGUSER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| std::env::var("USER").ok())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgres".to_string());
+        let password = std::env::var("PGPASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let host = std::env::var("PGHOST")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "localhost".to_string());
+        let port = std::env::var("PGPORT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "5432".to_string());
+        match password {
+            Some(password) => format!("postgresql://{user}:{password}@{host}:{port}"),
+            None => format!("postgresql://{user}@{host}:{port}"),
+        }
+    }
+
+    fn postgres_admin_database_url() -> String {
+        let admin_db = std::env::var("POSTGRES_TEST_ADMIN_DB")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgres".to_string());
+        format!("{}/{}", postgres_base_database_url(), admin_db)
+    }
+
+    async fn setup_pool(pg_db: &TestPostgresDb) -> PgPool {
+        let pool = pg_db.connect_and_migrate().await;
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-1', 'repo-1', 'agent-1', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed run");
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, discord_channel_id)
+             VALUES ('agent-1', 'Agent 1', 'claude', '123')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+        sqlx::query(
+            "INSERT INTO auto_queue_slots
+                (agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map)
+             VALUES ('agent-1', 0, 'run-1', 0, CAST('{}' AS jsonb))",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed slot");
+        pool
+    }
+
+    async fn entry_row_status_dispatch_completed(
+        pool: &PgPool,
+        entry_id: &str,
+    ) -> (String, Option<String>, Option<DateTime<Utc>>) {
+        let row = sqlx::query(
+            "SELECT status, dispatch_id, completed_at
+             FROM auto_queue_entries
+             WHERE id = $1",
+        )
+        .bind(entry_id)
+        .fetch_one(pool)
+        .await
+        .expect("entry row");
+        (
+            row.try_get::<String, _>("status").expect("status"),
+            row.try_get::<Option<String>, _>("dispatch_id")
+                .expect("dispatch_id"),
+            row.try_get::<Option<DateTime<Utc>>, _>("completed_at")
+                .expect("completed_at"),
+        )
+    }
+
+    async fn run_status(pool: &PgPool, run_id: &str) -> String {
+        sqlx::query_scalar::<_, String>("SELECT status FROM auto_queue_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .expect("run row")
+    }
+
+    async fn slot_run(pool: &PgPool, agent_id: &str, slot_index: i64) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT assigned_run_id
+             FROM auto_queue_slots
+             WHERE agent_id = $1 AND slot_index = $2",
+        )
+        .bind(agent_id)
+        .bind(slot_index)
+        .fetch_one(pool)
+        .await
+        .expect("slot row")
+    }
+
+    #[tokio::test]
+    async fn dispatch_terminal_sync_marks_entry_done_without_finalizing_active_run_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id)
+             VALUES ('card-sync-done', 'Card Sync Done', 'in_progress', 'agent-1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed card");
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, dispatch_type, status, context)
+             VALUES ('dispatch-sync-done', 'card-sync-done', 'agent-1',
+                     'implementation', 'completed', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dispatch");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index,
+                 thread_group, batch_phase)
+             VALUES ('entry-sync-done', 'run-1', 'card-sync-done', 'agent-1',
+                     'dispatched', 'dispatch-sync-done', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed entry");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let changed = sync_dispatch_terminal_entries_on_pg_tx(
+            &mut tx,
+            "dispatch-sync-done",
+            ENTRY_STATUS_DONE,
+            "test_runtime_finalizer",
+            true,
+        )
+        .await
+        .expect("sync dispatch terminal");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(changed, 1);
+        let (status, dispatch_id, completed_at) =
+            entry_row_status_dispatch_completed(&pool, "entry-sync-done").await;
+        assert_eq!(status, ENTRY_STATUS_DONE);
+        assert_eq!(dispatch_id.as_deref(), Some("dispatch-sync-done"));
+        assert!(completed_at.is_some());
+        assert_eq!(run_status(&pool, "run-1").await, "active");
+        assert_eq!(
+            slot_run(&pool, "agent-1", 0).await.as_deref(),
+            Some("run-1")
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_terminal_sync_respects_blocking_phase_gate_on_paused_run_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET status = 'paused' WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("pause run");
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id)
+             VALUES ('card-sync-skip', 'Card Sync Skip', 'in_progress', 'agent-1')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed card");
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, dispatch_type, status, context)
+             VALUES ('dispatch-sync-skip', 'card-sync-skip', 'agent-1',
+                     'implementation', 'cancelled', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dispatch");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index,
+                 thread_group, batch_phase)
+             VALUES ('entry-sync-skip', 'run-1', 'card-sync-skip', 'agent-1',
+                     'dispatched', 'dispatch-sync-skip', 0, 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed entry");
+        sqlx::query(
+            "INSERT INTO auto_queue_phase_gates
+                (run_id, phase, status, verdict, pass_verdict, next_phase,
+                 final_phase, anchor_card_id)
+             VALUES ('run-1', 0, 'pending', NULL, 'phase_gate_passed',
+                     NULL, TRUE, 'card-sync-skip')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed blocking phase gate");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let changed = sync_dispatch_terminal_entries_on_pg_tx(
+            &mut tx,
+            "dispatch-sync-skip",
+            ENTRY_STATUS_SKIPPED,
+            "test_phase_gate_finalizer",
+            true,
+        )
+        .await
+        .expect("sync dispatch terminal");
+        tx.commit().await.expect("commit tx");
+
+        assert_eq!(changed, 1);
+        assert_eq!(
+            entry_row_status_dispatch_completed(&pool, "entry-sync-skip")
+                .await
+                .0,
+            ENTRY_STATUS_SKIPPED
+        );
+        assert_eq!(run_status(&pool, "run-1").await, "paused");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+}
+
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
         ENTRY_STATUS_DISPATCHED, ENTRY_STATUS_DONE, ENTRY_STATUS_PENDING, ENTRY_STATUS_SKIPPED,
         EntryStatusUpdateOptions, PhaseGateStateWrite, SlotAllocation,
         allocate_slot_for_group_agent_pg, clear_phase_gate_state_on_pg,
-        list_entry_dispatch_history_pg, reactivate_done_entry_on_pg,
-        record_consultation_dispatch_on_pg, release_run_slots_pg, release_slot_for_group_agent_pg,
-        save_phase_gate_state_on_pg, slot_has_active_dispatch_pg, update_entry_status_on_pg,
+        latest_entry_phase_codex_session_id_pg, list_entry_dispatch_history_pg,
+        reactivate_done_entry_on_pg, record_consultation_dispatch_on_pg, release_run_slots_pg,
+        release_slot_for_group_agent_pg, save_phase_gate_state_on_pg, slot_has_active_dispatch_pg,
+        update_entry_status_on_pg,
     };
     use chrono::{DateTime, Utc};
     use sqlx::{PgPool, Row};
@@ -3423,6 +3885,105 @@ mod tests {
         .await
         .expect("current dispatch");
         assert_eq!(current_dispatch_id.as_deref(), Some("dispatch-impl"));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn latest_entry_phase_codex_session_id_uses_same_phase_history_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-resume', 'run-1', NULL, 'agent-1', 'pending', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed entry");
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, to_agent_id, dispatch_type, status, context)
+             VALUES
+                ('dispatch-turn', 'agent-1', 'implementation', 'failed', '{}'),
+                ('dispatch-review', 'agent-1', 'review', 'failed', '{}'),
+                ('dispatch-context', 'agent-1', 'implementation', 'failed',
+                    '{\"auto_queue_retry_resume_session_id\":\"context-session\"}'),
+                ('dispatch-live', 'agent-1', 'implementation', 'failed', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dispatches");
+        sqlx::query(
+            "INSERT INTO auto_queue_entry_dispatch_history (entry_id, dispatch_id, trigger_source)
+             VALUES
+                ('entry-resume', 'dispatch-turn', 'test'),
+                ('entry-resume', 'dispatch-review', 'test'),
+                ('entry-resume', 'dispatch-context', 'test'),
+                ('entry-resume', 'dispatch-live', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed history");
+        sqlx::query(
+            "INSERT INTO turns
+                (turn_id, channel_id, provider, session_id, dispatch_id, started_at, finished_at)
+             VALUES
+                ('turn-1', '123', 'codex', 'turn-session', 'dispatch-turn', NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed turn");
+        sqlx::query(
+            "INSERT INTO sessions
+                (session_key, agent_id, provider, status, active_dispatch_id, claude_session_id)
+             VALUES
+                ('codex/test/live', 'agent-1', 'codex', 'turn_active',
+                 'dispatch-live', 'live-session')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed live session");
+
+        assert_eq!(
+            latest_entry_phase_codex_session_id_pg(&pool, "entry-resume", "implementation")
+                .await
+                .expect("lookup session")
+                .as_deref(),
+            Some("live-session")
+        );
+        sqlx::query("DELETE FROM sessions WHERE active_dispatch_id = 'dispatch-live'")
+            .execute(&pool)
+            .await
+            .expect("remove live session");
+        assert_eq!(
+            latest_entry_phase_codex_session_id_pg(&pool, "entry-resume", "implementation")
+                .await
+                .expect("lookup context fallback")
+                .as_deref(),
+            Some("context-session")
+        );
+        sqlx::query(
+            "DELETE FROM auto_queue_entry_dispatch_history
+             WHERE entry_id = 'entry-resume' AND dispatch_id = 'dispatch-context'",
+        )
+        .execute(&pool)
+        .await
+        .expect("remove context fallback");
+        assert_eq!(
+            latest_entry_phase_codex_session_id_pg(&pool, "entry-resume", "implementation")
+                .await
+                .expect("lookup turn fallback")
+                .as_deref(),
+            Some("turn-session")
+        );
+        assert_eq!(
+            latest_entry_phase_codex_session_id_pg(&pool, "entry-resume", "review")
+                .await
+                .expect("lookup review session"),
+            None,
+            "review phase history must not leak into implementation retries"
+        );
 
         pool.close().await;
         pg_db.drop().await;

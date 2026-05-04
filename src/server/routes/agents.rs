@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -17,6 +17,7 @@ use crate::services::observability::session_inventory::{
 };
 use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, stop_turn_preserving_queue};
+use crate::utils::api::{bad_request, clamp_api_limit, internal_error, not_found};
 
 // ── Query types ──────────────────────────────────────────────
 
@@ -66,6 +67,10 @@ pub struct StartAgentTurnBody {
     /// Takes precedence over `provider` when both are set.
     #[serde(default)]
     pub channel_id: Option<String>,
+    /// Optional Discord user id. When set, the turn is bound to the
+    /// agent's primary bot DM with that user instead of a guild channel.
+    #[serde(default)]
+    pub dm_user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,10 +109,7 @@ pub async fn agent_quality(
     .await
     {
         Ok(summary) => (StatusCode::OK, Json(json!(summary))),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("query agent quality summary: {error}")})),
-        ),
+        Err(error) => internal_error(format!("query agent quality summary: {error}")),
     }
 }
 
@@ -130,10 +132,7 @@ pub async fn agents_quality_ranking(
     .await
     {
         Ok(ranking) => (StatusCode::OK, Json(json!(ranking))),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("query agent quality ranking: {error}")})),
-        ),
+        Err(error) => internal_error(format!("query agent quality ranking: {error}")),
     }
 }
 
@@ -170,6 +169,10 @@ struct InflightTurnSnapshot {
     current_tool_line: Option<String>,
     prev_tool_status: Option<String>,
     full_response: Option<String>,
+    /// #1671: persisted notification kind (`subagent`/`background`/
+    /// `monitor_auto_turn`) for the live turn, surfaced through `agentdesk
+    /// diag` so operators do not have to hit the watcher-state endpoint.
+    task_notification_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -374,6 +377,10 @@ fn load_inflight_snapshot(
                     .map(str::to_string),
                 full_response: state
                     .get("full_response")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                task_notification_kind: state
+                    .get("task_notification_kind")
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
             });
@@ -720,16 +727,10 @@ pub async fn agent_diag(
     let session = match find_diag_session_pg(pool, &identifier).await {
         Ok(Some(session)) => session,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "agent/channel session not found"})),
-            );
+            return not_found("agent/channel session not found");
         }
         Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("query diag session: {error}")})),
-            );
+            return internal_error(format!("query diag session: {error}"));
         }
     };
 
@@ -762,6 +763,57 @@ pub async fn agent_diag(
         .min()
         .map(|value| value.to_rfc3339());
 
+    // #1671: surface `relay_stall_state`, `pending_queue_depth`,
+    // `inflight_age_secs`, and `task_notification_kind` directly on the diag
+    // payload. Operators previously had to call
+    // `/api/channels/{id}/watcher-state` to see these signals; folding them
+    // into `agentdesk diag` shortens the same-class incident playbook.
+    //
+    // codex P2 — scope the watcher-state snapshot to *this* session's
+    // provider. The unscoped helper returns the FIRST registered provider
+    // that knows the channel, so when multiple providers share a Discord
+    // channel the diag would surface another runtime's state for the same
+    // channel (silently misleading). When the session row has no provider
+    // recorded, fall back to the unscoped lookup so we still report
+    // something useful instead of forcing a hard `null`.
+    let session_provider_kind = session.provider.as_deref().and_then(ProviderKind::from_str);
+    let watcher_snapshot = match (
+        state.health_registry.as_ref(),
+        session
+            .thread_channel_id
+            .as_deref()
+            .and_then(|raw| raw.trim().parse::<u64>().ok()),
+    ) {
+        (Some(registry), Some(channel_num)) => match session_provider_kind {
+            Some(provider) => {
+                registry
+                    .snapshot_watcher_state_for_provider(&provider, channel_num)
+                    .await
+            }
+            None => registry.snapshot_watcher_state(channel_num).await,
+        },
+        _ => None,
+    };
+    let watcher_snapshot_json = watcher_snapshot
+        .as_ref()
+        .and_then(|snapshot| serde_json::to_value(snapshot).ok());
+    let relay_stall_state = watcher_snapshot_json
+        .as_ref()
+        .and_then(|value| value.get("relay_stall_state").cloned());
+    let pending_queue_depth = watcher_snapshot_json
+        .as_ref()
+        .and_then(|value| value.get("relay_health"))
+        .and_then(|value| value.get("queue_depth"))
+        .and_then(serde_json::Value::as_u64);
+    let inflight_age_secs = inflight
+        .as_ref()
+        .and_then(|state| state.updated_at.as_deref())
+        .and_then(parse_local_timestamp_to_unix)
+        .map(|unix| Utc::now().timestamp().saturating_sub(unix).max(0));
+    let task_notification_kind = inflight
+        .as_ref()
+        .and_then(|state| state.task_notification_kind.clone());
+
     (
         StatusCode::OK,
         Json(json!({
@@ -788,8 +840,25 @@ pub async fn agent_diag(
                 "line": event.line,
             })),
             "recent_loop_suspicion": loop_suspicion(&events),
+            // #1671 — observability fields lifted from the watcher-state
+            // endpoint. `null` when the registry/channel is unavailable.
+            "relay_stall_state": relay_stall_state,
+            "inflight_age_secs": inflight_age_secs,
+            "pending_queue_depth": pending_queue_depth,
+            "task_notification_kind": task_notification_kind,
         })),
     )
+}
+
+/// #1671 — parse the inflight `started_at`/`updated_at` localtime encoding
+/// (`YYYY-MM-DD HH:MM:SS`) into a Unix timestamp without pulling in the
+/// service-side helper (which is not exposed at the route layer).
+pub(super) fn parse_local_timestamp_to_unix(value: &str) -> Option<i64> {
+    let naive = chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    chrono::Local
+        .from_local_datetime(&naive)
+        .single()
+        .map(|local| local.with_timezone(&Utc).timestamp())
 }
 
 /// GET /api/agents/:id/offices
@@ -1334,6 +1403,37 @@ pub async fn start_agent_turn(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    let dm_user_id = body
+        .dm_user_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let dm_user_id_num = if let Some(dm_user_id) = dm_user_id.as_deref() {
+        if channel_override.is_some() || provider_override.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "error": "dm_user_id cannot be combined with provider or channel_id overrides",
+                })),
+            );
+        }
+        match dm_user_id.parse::<u64>().ok().filter(|id| *id > 0) {
+            Some(id) => Some(id),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": "dm_user_id must be a Discord snowflake string",
+                    })),
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let Some(pool) = state.pg_pool_ref() else {
         return (
@@ -1466,17 +1566,32 @@ pub async fn start_agent_turn(
         .then_some(None)
         .unwrap_or_else(|| Some(primary_channel.clone()));
 
-    match crate::services::discord::health::start_headless_agent_turn(
-        registry,
-        poise::serenity_prelude::ChannelId::new(channel_id_num),
-        provider,
-        prompt.to_string(),
-        body.source,
-        body.metadata,
-        channel_name_hint,
-    )
-    .await
-    {
+    let start_result = if let Some(dm_user_id_num) = dm_user_id_num {
+        let metadata = metadata_with_parent_channel_id(body.metadata, channel_id_num);
+        crate::services::discord::health::start_headless_agent_turn_in_dm(
+            registry,
+            poise::serenity_prelude::ChannelId::new(channel_id_num),
+            dm_user_id_num,
+            provider,
+            prompt.to_string(),
+            body.source,
+            metadata,
+        )
+        .await
+    } else {
+        crate::services::discord::health::start_headless_agent_turn(
+            registry,
+            poise::serenity_prelude::ChannelId::new(channel_id_num),
+            provider,
+            prompt.to_string(),
+            body.source,
+            body.metadata,
+            channel_name_hint,
+        )
+        .await
+    };
+
+    match start_result {
         Ok(outcome) => (
             StatusCode::OK,
             Json(json!({
@@ -1500,6 +1615,28 @@ pub async fn start_agent_turn(
                 "error": error,
             })),
         ),
+    }
+}
+
+fn metadata_with_parent_channel_id(
+    metadata: Option<serde_json::Value>,
+    parent_channel_id: u64,
+) -> Option<serde_json::Value> {
+    let parent_channel_id = parent_channel_id.to_string();
+    match metadata {
+        Some(serde_json::Value::Object(mut object)) => {
+            object
+                .entry("parent_channel_id")
+                .or_insert_with(|| serde_json::Value::String(parent_channel_id));
+            Some(serde_json::Value::Object(object))
+        }
+        Some(value) => Some(json!({
+            "trigger_metadata": value,
+            "parent_channel_id": parent_channel_id,
+        })),
+        None => Some(json!({
+            "parent_channel_id": parent_channel_id,
+        })),
     }
 }
 
@@ -1792,7 +1929,7 @@ async fn list_agent_transcripts_pg_json(
          LIMIT $2",
     )
     .bind(agent_id)
-    .bind(limit.clamp(1, 100) as i64)
+    .bind(clamp_api_limit(Some(limit)) as i64)
     .fetch_all(pool)
     .await?;
 
@@ -1838,10 +1975,7 @@ pub async fn agent_signal(
     let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("");
 
     if signal != "blocked" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("unknown signal: {signal}. supported: blocked")})),
-        );
+        return bad_request(format!("unknown signal: {signal}. supported: blocked"));
     }
 
     let Some(pool) = state.pg_pool_ref() else {
@@ -1971,6 +2105,28 @@ mod tests {
         assert_eq!(value["reason"], serde_json::Value::Null);
         assert_eq!(value["repeat_count"], 0);
         assert_eq!(value["tool"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn metadata_with_parent_channel_id_adds_parent_for_dm_turns() {
+        let metadata = metadata_with_parent_channel_id(
+            Some(json!({"trigger_source": "test", "target_key": "obujang"})),
+            123,
+        )
+        .unwrap();
+
+        assert_eq!(metadata["trigger_source"], "test");
+        assert_eq!(metadata["target_key"], "obujang");
+        assert_eq!(metadata["parent_channel_id"], "123");
+    }
+
+    #[test]
+    fn metadata_with_parent_channel_id_preserves_existing_parent() {
+        let metadata =
+            metadata_with_parent_channel_id(Some(json!({"parent_channel_id": "456"})), 123)
+                .unwrap();
+
+        assert_eq!(metadata["parent_channel_id"], "456");
     }
 
     #[test]

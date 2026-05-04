@@ -53,10 +53,14 @@ src/
 │   ├── agents.rs
 │   ├── auto_queue.rs
 │   ├── cancel_tombstones.rs
+│   ├── dispatched_sessions.rs
+│   ├── dispatches.rs
 │   ├── kanban.rs
+│   ├── kanban_cards.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
+│   ├── prompt_manifests.rs
 │   ├── schema.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
@@ -122,6 +126,9 @@ src/
 │   ├── paths.rs
 │   └── skill_sync.rs
 ├── server/
+│   ├── dto/
+│   │   ├── kanban.rs
+│   │   └── mod.rs
 │   ├── routes/
 │   │   ├── dispatches/
 │   │   │   ├── crud.rs
@@ -192,6 +199,7 @@ src/
 │   │   ├── termination_events.rs
 │   │   └── v1.rs
 │   ├── cluster.rs
+│   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
 │   ├── issue_specs.rs
 │   ├── maintenance.rs
@@ -238,6 +246,7 @@ src/
 │   │   │   ├── diagnostics.rs
 │   │   │   ├── fast_mode.rs
 │   │   │   ├── help.rs
+│   │   │   ├── inspect.rs
 │   │   │   ├── meeting_cmd.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── model_picker.rs
@@ -259,12 +268,16 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
+│   │   │   ├── authorization.rs
 │   │   │   ├── control_intent.rs
+│   │   │   ├── dispatch_trigger.rs
 │   │   │   ├── intake_gate.rs
 │   │   │   ├── message_handler.rs
 │   │   │   ├── mod.rs
+│   │   │   ├── response_format.rs
 │   │   │   ├── tests.rs
-│   │   │   └── thread_binding.rs
+│   │   │   ├── thread_binding.rs
+│   │   │   └── turn_start.rs
 │   │   ├── settings/
 │   │   │   ├── content.rs
 │   │   │   ├── memory.rs
@@ -276,13 +289,16 @@ src/
 │   │   │   ├── context_window.rs
 │   │   │   ├── memory_lifecycle.rs
 │   │   │   ├── mod.rs
+│   │   │   ├── output_lifecycle.rs
 │   │   │   ├── recall_feedback.rs
 │   │   │   ├── recovery_text.rs
 │   │   │   ├── retry_state.rs
 │   │   │   ├── skill_usage.rs
 │   │   │   ├── stale_resume.rs
+│   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tests.rs
-│   │   │   └── tmux_runtime.rs
+│   │   │   ├── tmux_runtime.rs
+│   │   │   └── turn_analytics.rs
 │   │   ├── watchers/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
@@ -294,6 +310,7 @@ src/
 │   │   ├── gateway.rs
 │   │   ├── handoff.rs
 │   │   ├── health.rs
+│   │   ├── http.rs
 │   │   ├── idle_detector.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
@@ -330,18 +347,25 @@ src/
 │   │   ├── settings.rs
 │   │   ├── shared_memory.rs
 │   │   ├── stall_recovery.rs
+│   │   ├── streaming_finalizer.rs
 │   │   ├── tmux.rs
 │   │   ├── tmux_error_detect.rs
+│   │   ├── tmux_kill_policy.rs
 │   │   ├── tmux_lifecycle.rs
+│   │   ├── tmux_output_stream.rs
 │   │   ├── tmux_overload_retry.rs
 │   │   ├── tmux_reaper.rs
-│   │   └── tmux_restart_handoff.rs
+│   │   ├── tmux_reattach_offsets.rs
+│   │   ├── tmux_restart_handoff.rs
+│   │   ├── tmux_session_files.rs
+│   │   └── tmux_watcher.rs
 │   ├── git/
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
 │   │   ├── mod.rs
 │   │   ├── remote.rs
 │   │   ├── repo_resolver.rs
+│   │   ├── runner.rs
 │   │   └── worktree_resolver.rs
 │   ├── maintenance/
 │   │   ├── jobs/
@@ -362,7 +386,9 @@ src/
 │   │   ├── events.rs
 │   │   ├── metrics.rs
 │   │   ├── mod.rs
+│   │   ├── recovery_audit.rs
 │   │   ├── session_inventory.rs
+│   │   ├── turn_lifecycle.rs
 │   │   └── watcher_latency.rs
 │   ├── platform/
 │   │   ├── binary_resolver.rs
@@ -403,17 +429,25 @@ src/
 │   ├── codex.rs
 │   ├── codex_tmux_wrapper.rs
 │   ├── discord_config_audit.rs
+│   ├── discord_delivery.rs
+│   ├── discord_delivery_metadata.rs
 │   ├── discord_dm_reply_store.rs
 │   ├── disk_monitor.rs
+│   ├── dispatch_watchdog.rs
+│   ├── dispatched_sessions.rs
 │   ├── dispatches.rs
 │   ├── dispatches_followup.rs
 │   ├── gemini.rs
 │   ├── issue_announcements.rs
 │   ├── kanban.rs
+│   ├── kanban_cards.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
 │   ├── mod.rs
+│   ├── onboarding.rs
 │   ├── opencode.rs
+│   ├── pipeline_override.rs
+│   ├── pipeline_routes.rs
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_exec.rs
@@ -425,6 +459,7 @@ src/
 │   ├── retrospectives.rs
 │   ├── service_error.rs
 │   ├── session_backend.rs
+│   ├── session_forwarding.rs
 │   ├── settings.rs
 │   ├── shell_guard.rs
 │   ├── termination_audit.rs
@@ -432,6 +467,7 @@ src/
 │   ├── tmux_diagnostics.rs
 │   ├── tmux_wrapper.rs
 │   ├── tool_output_guard.rs
+│   ├── turn_cancel_finalizer.rs
 │   ├── turn_lifecycle.rs
 │   └── turn_orchestrator.rs
 ├── supervisor/
@@ -440,8 +476,10 @@ src/
 │   ├── ai_screen.rs
 │   └── mod.rs
 ├── utils/
+│   ├── api.rs
 │   ├── async_bridge.rs
 │   ├── format.rs
+│   ├── loopback_url.rs
 │   ├── mod.rs
 │   └── wip_detect.rs
 ├── bootstrap.rs

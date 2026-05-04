@@ -27,6 +27,7 @@ use crate::services::tmux_diagnostics::{
     record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
     tmux_session_exists, tmux_session_has_live_pane,
 };
+
 /// Resolve the path to the claude binary.
 pub fn resolve_claude_path() -> Option<String> {
     crate::services::platform::resolve_provider_binary("claude").resolved_path
@@ -157,6 +158,31 @@ pub fn debug_log_to(filename: &str, msg: &str) {
             let _ = writeln!(file, "[{}] {}", timestamp, msg);
         }
     }
+}
+
+/// SDK→bridge mpsc disconnect diagnostics (#1589 follow-up). Emits a single
+/// structured WARN line at every `execute_command_streaming` exit path so the
+/// operator can see *why* the producer task ended whenever the bridge
+/// subsequently observes `TryRecvError::Disconnected`. Pair-tracking against
+/// the bridge-side handoff log line lets us classify each disconnect as
+/// cancel / IO error / CLI crash / synthetic-done / normal-done without
+/// guessing.
+fn log_producer_exit(
+    kind: &'static str,
+    session_id: Option<&str>,
+    channel_id: Option<u64>,
+    line_count: usize,
+    extra: serde_json::Value,
+) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::warn!(
+        "  [{ts}] 🔚 claude producer exit kind={} channel={:?} session={:?} lines={} extra={}",
+        kind,
+        channel_id,
+        session_id,
+        line_count,
+        extra
+    );
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -742,6 +768,13 @@ IMPORTANT: Format your responses using Markdown for better readability:
         if cancel_requested(cancel_token.as_deref()) {
             debug_log("Cancel detected — killing child process tree");
             kill_child_tree(&mut child);
+            log_producer_exit(
+                "cancel_during_read",
+                last_session_id.as_deref(),
+                report_channel_id,
+                line_count,
+                serde_json::json!({}),
+            );
             return Ok(());
         }
 
@@ -757,12 +790,24 @@ IMPORTANT: Format your responses using Markdown for better readability:
             }
             Err(e) => {
                 debug_log(&format!("ERROR: Failed to read line: {}", e));
-                let _ = sender.send(StreamMessage::Error {
-                    message: format!("Failed to read output: {}", e),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
+                let send_ok = sender
+                    .send(StreamMessage::Error {
+                        message: format!("Failed to read output: {}", e),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    })
+                    .is_ok();
+                log_producer_exit(
+                    "io_error_read",
+                    last_session_id.as_deref(),
+                    report_channel_id,
+                    line_count,
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "error_message_send_ok": send_ok,
+                    }),
+                );
                 break;
             }
         };
@@ -1031,20 +1076,40 @@ IMPORTANT: Format your responses using Markdown for better readability:
     if cancel_requested(cancel_token.as_deref()) {
         debug_log("Cancel detected after loop — killing child process tree");
         kill_child_tree(&mut child);
+        log_producer_exit(
+            "cancel_after_loop",
+            last_session_id.as_deref(),
+            report_channel_id,
+            line_count,
+            serde_json::json!({}),
+        );
         return Ok(());
     }
 
     // Wait for process to finish
     debug_log("Waiting for child process to finish (child.wait())...");
     let wait_start = std::time::Instant::now();
-    let status = child.wait().map_err(|e| {
-        debug_log(&format!(
-            "ERROR: Process wait failed after {:?}: {}",
-            wait_start.elapsed(),
-            e
-        ));
-        format!("Process error: {}", e)
-    })?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            debug_log(&format!(
+                "ERROR: Process wait failed after {:?}: {}",
+                wait_start.elapsed(),
+                e
+            ));
+            log_producer_exit(
+                "child_wait_error",
+                last_session_id.as_deref(),
+                report_channel_id,
+                line_count,
+                serde_json::json!({
+                    "error": e.to_string(),
+                    "elapsed_ms": wait_start.elapsed().as_millis() as u64,
+                }),
+            );
+            return Err(format!("Process error: {}", e));
+        }
+    };
     debug_log(&format!(
         "Process finished in {:?}, status: {:?}, exit_code: {:?}",
         wait_start.elapsed(),
@@ -1074,12 +1139,35 @@ IMPORTANT: Format your responses using Markdown for better readability:
             message,
             status.code()
         ));
-        let _ = sender.send(StreamMessage::Error {
-            message,
-            stdout: stdout_raw,
-            stderr: stderr_msg,
-            exit_code: status.code(),
-        });
+        let exit_code = status.code();
+        #[cfg(unix)]
+        let exit_signal = {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let exit_signal: Option<i32> = None;
+        let send_ok = sender
+            .send(StreamMessage::Error {
+                message: message.clone(),
+                stdout: stdout_raw,
+                stderr: stderr_msg.clone(),
+                exit_code,
+            })
+            .is_ok();
+        log_producer_exit(
+            "child_exit_error",
+            last_session_id.as_deref(),
+            report_channel_id,
+            line_count,
+            serde_json::json!({
+                "exit_code": exit_code,
+                "exit_signal": exit_signal,
+                "message_truncated": message.chars().take(160).collect::<String>(),
+                "stderr_truncated": stderr_msg.chars().take(160).collect::<String>(),
+                "error_message_send_ok": send_ok,
+            }),
+        );
         return Ok(());
     }
 
@@ -1090,12 +1178,31 @@ IMPORTANT: Format your responses using Markdown for better readability:
             result: String::new(),
             session_id: last_session_id.clone(),
         });
+        log_producer_exit(
+            "synthetic_done",
+            last_session_id.as_deref(),
+            report_channel_id,
+            line_count,
+            serde_json::json!({
+                "send_ok": send_result.is_ok(),
+                "child_exit_code": status.code(),
+            }),
+        );
         debug_log(&format!(
             "Synthetic Done message sent, result={:?}",
             send_result.is_ok()
         ));
     } else {
         debug_log("Done message was already received, not sending synthetic one");
+        log_producer_exit(
+            "natural_done",
+            last_session_id.as_deref(),
+            report_channel_id,
+            line_count,
+            serde_json::json!({
+                "child_exit_code": status.code(),
+            }),
+        );
     }
 
     debug_log("========================================");
@@ -1164,6 +1271,52 @@ pub fn is_tmux_available() -> bool {
     crate::services::platform::tmux::is_available()
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalTmuxStartupPlan {
+    /// Existing tmux pane plus both runtime paths are present. The provider
+    /// writes the prompt to FIFO, reads this turn from the current JSONL
+    /// offset, then emits `TmuxReady` for watcher handoff.
+    WarmFollowup,
+    /// A tmux session name exists, but the pane or runtime paths are stale.
+    /// The provider kills it and recreates it through the cold-start path.
+    RecreateStaleSession,
+    /// No usable existing session exists. The provider starts a new wrapper
+    /// and hands JSONL ownership to the watcher from offset 0.
+    ColdStart,
+}
+
+#[cfg(unix)]
+fn classify_local_tmux_startup_plan(
+    session_exists: bool,
+    has_live_pane: bool,
+    has_output_path: bool,
+    has_input_fifo_path: bool,
+) -> LocalTmuxStartupPlan {
+    if session_exists && has_live_pane && has_output_path && has_input_fifo_path {
+        LocalTmuxStartupPlan::WarmFollowup
+    } else if session_exists {
+        LocalTmuxStartupPlan::RecreateStaleSession
+    } else {
+        LocalTmuxStartupPlan::ColdStart
+    }
+}
+
+#[cfg(unix)]
+fn emit_fresh_session_watcher_handoff(
+    sender: &Sender<StreamMessage>,
+    output_path: String,
+    input_fifo_path: String,
+    tmux_session_name: &str,
+) {
+    let _ = sender.send(StreamMessage::TmuxReady {
+        output_path,
+        input_fifo_path,
+        tmux_session_name: tmux_session_name.to_string(),
+        last_offset: 0,
+    });
+}
+
 /// Execute Claude inside a local tmux session with bidirectional input.
 ///
 /// If a tmux session with this name already exists, sends the prompt as a
@@ -1207,11 +1360,14 @@ fn execute_streaming_local_tmux(
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
-    let session_usable = tmux_session_has_live_pane(tmux_session_name)
-        && resolved_output.is_some()
-        && resolved_input.is_some();
+    let startup_plan = classify_local_tmux_startup_plan(
+        session_exists,
+        tmux_session_has_live_pane(tmux_session_name),
+        resolved_output.is_some(),
+        resolved_input.is_some(),
+    );
 
-    if session_usable {
+    if startup_plan == LocalTmuxStartupPlan::WarmFollowup {
         // Use the resolved paths (which may be the legacy /tmp path) for the
         // follow-up so we read the jsonl the live wrapper actually writes.
         let output_path = resolved_output
@@ -1221,16 +1377,54 @@ fn execute_streaming_local_tmux(
             .clone()
             .unwrap_or_else(|| input_fifo_path.clone());
         debug_log("Existing tmux session found — sending follow-up message");
-        match send_followup_to_tmux(
+        let followup = send_followup_to_tmux(
             prompt,
             &output_path,
             &input_fifo_path,
             sender.clone(),
             cancel_token.clone(),
             tmux_session_name,
-        )? {
-            ClaudeFollowupResult::Delivered => return Ok(()),
+        );
+        let followup = match followup {
+            Ok(value) => value,
+            Err(error) => {
+                log_producer_exit(
+                    "warm_followup_error",
+                    None,
+                    report_channel_id,
+                    0,
+                    serde_json::json!({
+                        "tmux_session_name": tmux_session_name,
+                        "error_truncated": error.chars().take(200).collect::<String>(),
+                    }),
+                );
+                return Err(error);
+            }
+        };
+        match followup {
+            ClaudeFollowupResult::Delivered => {
+                log_producer_exit(
+                    "warm_followup_delivered",
+                    None,
+                    report_channel_id,
+                    0,
+                    serde_json::json!({
+                        "tmux_session_name": tmux_session_name,
+                    }),
+                );
+                return Ok(());
+            }
             ClaudeFollowupResult::RecreateSession { error } => {
+                log_producer_exit(
+                    "warm_followup_recreate",
+                    None,
+                    report_channel_id,
+                    0,
+                    serde_json::json!({
+                        "tmux_session_name": tmux_session_name,
+                        "error_truncated": error.chars().take(200).collect::<String>(),
+                    }),
+                );
                 debug_log(&format!("Follow-up failed, recreating session: {}", error));
                 crate::services::termination_audit::record_termination_for_tmux(
                     tmux_session_name,
@@ -1275,10 +1469,20 @@ fn execute_streaming_local_tmux(
                     &format!("partial follow-up output already delivered: {}", error),
                 );
                 emit_followup_restart_suppressed_notice(&sender, &notice);
+                log_producer_exit(
+                    "warm_followup_finalize_notice",
+                    None,
+                    report_channel_id,
+                    0,
+                    serde_json::json!({
+                        "tmux_session_name": tmux_session_name,
+                        "error_truncated": error.chars().take(200).collect::<String>(),
+                    }),
+                );
                 return Ok(());
             }
         }
-    } else if session_exists {
+    } else if startup_plan == LocalTmuxStartupPlan::RecreateStaleSession {
         debug_log("Stale tmux session found — recreating");
         crate::services::termination_audit::record_termination_for_tmux(
             tmux_session_name,
@@ -1409,118 +1613,17 @@ fn execute_streaming_local_tmux(
         *token.tmux_session.lock().unwrap() = Some(tmux_session_name.to_string());
     }
 
-    // Read output file from beginning (new session), with retry on session death
-    const MAX_RETRIES: u32 = 2;
-    let mut attempt = 0u32;
-
-    loop {
-        let read_result = read_output_file_until_result(
-            &output_path,
-            0,
-            sender.clone(),
-            cancel_token.clone(),
-            SessionProbe::tmux(tmux_session_name.to_string()),
-        )?;
-
-        match read_result {
-            ReadOutputResult::Completed { offset } => {
-                let _ = sender.send(StreamMessage::TmuxReady {
-                    output_path,
-                    input_fifo_path,
-                    tmux_session_name: tmux_session_name.to_string(),
-                    last_offset: offset,
-                });
-                return Ok(());
-            }
-            ReadOutputResult::Cancelled { offset } => {
-                // Normal user cancel — notify caller
-                let _ = sender.send(StreamMessage::TmuxReady {
-                    output_path,
-                    input_fifo_path,
-                    tmux_session_name: tmux_session_name.to_string(),
-                    last_offset: offset,
-                });
-                return Ok(());
-            }
-            ReadOutputResult::SessionDied { .. } => {
-                attempt += 1;
-                if attempt > MAX_RETRIES {
-                    debug_log(&format!("tmux session died {} times, giving up", attempt));
-                    let _ = sender.send(StreamMessage::Done {
-                        result: "⚠ tmux 세션이 반복 종료되었습니다. 다시 시도해 주세요."
-                            .to_string(),
-                        session_id: None,
-                    });
-                    return Ok(());
-                }
-
-                debug_log(&format!(
-                    "tmux session died, retrying ({}/{})",
-                    attempt, MAX_RETRIES
-                ));
-
-                // Wait before retry
-                std::thread::sleep(std::time::Duration::from_secs(2));
-
-                // Kill stale session if lingering
-                record_tmux_exit_reason(
-                    tmux_session_name,
-                    "stream retry after repeated tmux session death",
-                );
-                crate::services::platform::tmux::kill_session_with_reason(
-                    tmux_session_name,
-                    "stream retry after repeated tmux session death",
-                );
-
-                // Clean up and recreate temp files
-                let _ = std::fs::remove_file(&output_path);
-                let _ = std::fs::remove_file(&input_fifo_path);
-                let _ = std::fs::remove_file(&prompt_path);
-
-                std::fs::write(&output_path, "")
-                    .map_err(|e| format!("Failed to recreate output file: {}", e))?;
-
-                let mkfifo = Command::new("mkfifo")
-                    .arg(&input_fifo_path)
-                    .output()
-                    .map_err(|e| format!("Failed to recreate input FIFO: {}", e))?;
-                if !mkfifo.status.success() {
-                    return Err(format!(
-                        "mkfifo failed on retry: {}",
-                        String::from_utf8_lossy(&mkfifo.stderr)
-                    ));
-                }
-
-                std::fs::write(&prompt_path, prompt)
-                    .map_err(|e| format!("Failed to rewrite prompt file: {}", e))?;
-
-                // Re-launch tmux session using existing script file
-                let tmux_retry = crate::services::platform::tmux::create_session(
-                    tmux_session_name,
-                    Some(working_dir),
-                    &format!("bash {}", shell_escape(&script_path)),
-                )
-                .map_err(|e| format!("Failed to recreate tmux session: {}", e))?;
-
-                if !tmux_retry.status.success() {
-                    let stderr = String::from_utf8_lossy(&tmux_retry.stderr);
-                    return Err(format!("tmux retry error: {}", stderr));
-                }
-
-                // Re-stamp generation marker after tmux re-create
-                let gen_marker_retry = crate::services::tmux_common::session_temp_path(
-                    tmux_session_name,
-                    "generation",
-                );
-                let _ = std::fs::write(
-                    &gen_marker_retry,
-                    crate::services::discord::runtime_store::load_generation().to_string(),
-                );
-
-                debug_log("tmux session re-created, retrying read...");
-            }
-        }
-    }
+    emit_fresh_session_watcher_handoff(&sender, output_path, input_fifo_path, tmux_session_name);
+    log_producer_exit(
+        "fresh_session_watcher_owned_handoff",
+        None,
+        report_channel_id,
+        0,
+        serde_json::json!({
+            "tmux_session_name": tmux_session_name,
+        }),
+    );
+    Ok(())
 }
 
 /// Send a follow-up message to an existing tmux Claude session.
@@ -1882,6 +1985,81 @@ fn execute_streaming_remote_tmux(
     _tmux_session_name: &str,
 ) -> Result<(), String> {
     Err("Remote SSH tmux execution is not available in AgentDesk".to_string())
+}
+
+#[cfg(all(test, unix))]
+mod local_tmux_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn local_tmux_plan_uses_warm_followup_only_with_live_pane_and_runtime_paths() {
+        assert_eq!(
+            classify_local_tmux_startup_plan(true, true, true, true),
+            LocalTmuxStartupPlan::WarmFollowup,
+            "warm follow-up is the only path where an existing wrapper is usable"
+        );
+
+        for (has_live_pane, has_output_path, has_input_fifo_path) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                classify_local_tmux_startup_plan(
+                    true,
+                    has_live_pane,
+                    has_output_path,
+                    has_input_fifo_path,
+                ),
+                LocalTmuxStartupPlan::RecreateStaleSession,
+                "existing tmux sessions missing live ownership evidence must be killed and recreated"
+            );
+        }
+    }
+
+    #[test]
+    fn local_tmux_plan_keeps_cold_start_on_watcher_handoff_path() {
+        assert_eq!(
+            classify_local_tmux_startup_plan(false, false, false, false),
+            LocalTmuxStartupPlan::ColdStart
+        );
+        assert_eq!(
+            classify_local_tmux_startup_plan(false, true, true, true),
+            LocalTmuxStartupPlan::ColdStart,
+            "impossible live-pane evidence without session_exists stays on the safe cold path"
+        );
+    }
+
+    #[test]
+    fn fresh_session_watcher_handoff_starts_at_jsonl_offset_zero() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        emit_fresh_session_watcher_handoff(
+            &sender,
+            "/tmp/session.jsonl".to_string(),
+            "/tmp/session.input".to_string(),
+            "claude-test",
+        );
+
+        let message = receiver.recv().unwrap();
+        match message {
+            StreamMessage::TmuxReady {
+                output_path,
+                input_fifo_path,
+                tmux_session_name,
+                last_offset,
+            } => {
+                assert_eq!(output_path, "/tmp/session.jsonl");
+                assert_eq!(input_fifo_path, "/tmp/session.input");
+                assert_eq!(tmux_session_name, "claude-test");
+                assert_eq!(
+                    last_offset, 0,
+                    "fresh cold-start watcher must consume JSONL from the beginning"
+                );
+            }
+            other => panic!("expected TmuxReady, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]

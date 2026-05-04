@@ -14,9 +14,12 @@ use tokio::sync::{mpsc, oneshot};
 // `metrics` → lightweight channel/provider atomic counters for hot paths.
 // `events`  → bounded in-memory structured event log + periodic JSONL flush.
 // `watcher_latency` → #1134 attach→first-relay latency histogram + counters.
+// `turn_lifecycle` → durable turn lifecycle event model for session/context transitions.
 pub mod events;
 pub mod metrics;
+pub mod recovery_audit;
 pub mod session_inventory;
+pub mod turn_lifecycle;
 pub mod watcher_latency;
 
 const EVENT_BATCH_SIZE: usize = 64;
@@ -520,7 +523,33 @@ pub fn emit_turn_finished(
     duration_ms: i64,
     tmux_handoff: bool,
 ) {
+    emit_turn_finished_with_dispatch_kind(
+        provider,
+        channel_id,
+        dispatch_id,
+        session_key,
+        turn_id,
+        outcome,
+        duration_ms,
+        tmux_handoff,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_turn_finished_with_dispatch_kind(
+    provider: &str,
+    channel_id: u64,
+    dispatch_id: Option<&str>,
+    session_key: Option<&str>,
+    turn_id: Option<&str>,
+    outcome: &str,
+    duration_ms: i64,
+    tmux_handoff: bool,
+    dispatch_kind: Option<&str>,
+) {
     let normalized_outcome = normalize_string(outcome);
+    let dispatch_kind = dispatch_kind.and_then(normalize_string);
     let is_success = matches!(
         normalized_outcome.as_deref(),
         Some("completed") | Some("tmux_handoff")
@@ -542,6 +571,7 @@ pub fn emit_turn_finished(
             "outcome": normalized_outcome,
             "duration_ms": duration_ms.max(0),
             "tmux_handoff": tmux_handoff,
+            "dispatch_kind": dispatch_kind.as_deref(),
         }),
     ));
     emit_event(
@@ -560,6 +590,7 @@ pub fn emit_turn_finished(
         json!({
             "duration_ms": duration_ms.max(0),
             "tmux_handoff": tmux_handoff,
+            "dispatch_kind": dispatch_kind.as_deref(),
         }),
     );
 }
@@ -651,6 +682,76 @@ pub fn emit_recovery_fired(
         },
         json!({
             "reason": normalize_string(reason),
+        }),
+    );
+}
+
+/// Records a cancellation attempt/result from shared lifecycle paths. Callers
+/// should pass correlation IDs when they own them; lower-level stop helpers may
+/// only know provider/channel and still emit a channel-scoped event.
+pub fn emit_turn_cancelled(
+    provider: Option<&str>,
+    channel_id: Option<u64>,
+    dispatch_id: Option<&str>,
+    session_key: Option<&str>,
+    turn_id: Option<&str>,
+    details: turn_lifecycle::TurnCancellationDetails,
+) {
+    let mut payload = serde_json::to_value(&details).unwrap_or_else(|_| json!({}));
+    if let Value::Object(fields) = &mut payload {
+        fields.insert("dispatch_id".to_string(), json!(dispatch_id));
+        fields.insert("session_key".to_string(), json!(session_key));
+        fields.insert("turn_id".to_string(), json!(turn_id));
+    }
+    events::record(events::StructuredEvent::new(
+        "turn_cancelled",
+        channel_id,
+        provider,
+        payload.clone(),
+    ));
+    emit_event(
+        "turn_cancelled",
+        provider,
+        channel_id,
+        dispatch_id,
+        session_key,
+        turn_id,
+        Some("cancelled"),
+        CounterDelta::default(),
+        payload,
+    );
+}
+
+/// Inflight lifecycle observability: pair-tracking events so external monitors
+/// can detect cleanup leaks. `kind` is the lifecycle phase identifier:
+/// `"delegated_to_watcher"`, `"cleared_by_bridge"`, `"cleared_by_watcher"`,
+/// `"leak_detected_completed_stale"`. `delegated_to_watcher` and
+/// `cleared_by_watcher` should pair 1:1; a sustained drift between counters
+/// indicates the bridge handed off cleanup but the watcher never executed it.
+/// `leak_detected_completed_stale` fires from the stall-watchdog when an
+/// inflight is healthy/synced but the mailbox is idle past the staleness
+/// threshold — the smoking-gun signal for the deadlock-manager alarm pattern.
+pub fn emit_inflight_lifecycle_event(
+    provider: &str,
+    channel_id: u64,
+    dispatch_id: Option<&str>,
+    session_key: Option<&str>,
+    turn_id: Option<&str>,
+    kind: &str,
+    extra: Value,
+) {
+    emit_event(
+        "inflight_lifecycle",
+        Some(provider),
+        Some(channel_id),
+        dispatch_id,
+        session_key,
+        turn_id,
+        normalize_string(kind).as_deref(),
+        CounterDelta::default(),
+        json!({
+            "kind": normalize_string(kind),
+            "extra": extra,
         }),
     );
 }
@@ -2817,10 +2918,11 @@ pub(crate) async fn flush_for_tests() {
     let _ = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[cfg(test)]
 pub(crate) fn reset_for_tests() {
     let runtime = runtime();
     runtime.counters.clear();
+    events::global().clear();
     if let Ok(mut sender) = runtime.sender.lock() {
         *sender = None;
     }
@@ -2829,7 +2931,7 @@ pub(crate) fn reset_for_tests() {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[cfg(test)]
 pub(crate) fn test_runtime_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -2841,6 +2943,55 @@ pub(crate) fn test_runtime_lock() -> std::sync::MutexGuard<'static, ()> {
 fn test_storage_presence() -> (bool, bool) {
     let handles = storage_handles(&runtime());
     (false, handles.pg_pool.is_some())
+}
+
+#[cfg(test)]
+mod cancellation_observability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn turn_cancelled_emit_records_normalized_payload_without_pg() {
+        let _guard = test_runtime_lock();
+        reset_for_tests();
+        init_observability(None);
+
+        emit_turn_cancelled(
+            Some("Codex"),
+            Some(42),
+            Some("dispatch-1"),
+            Some("session-1"),
+            Some("turn-1"),
+            turn_lifecycle::TurnCancellationDetails::new(
+                " queue-api cancel_turn (preserve) ",
+                crate::services::turn_lifecycle::cleanup_policy_observability_surface(
+                    crate::services::discord::TmuxCleanupPolicy::PreserveSessionAndInflight {
+                        restart_mode: crate::services::discord::InflightRestartMode::HotSwapHandoff,
+                    },
+                ),
+                "mailbox_canonical",
+                false,
+                false,
+                Some(2),
+                true,
+                false,
+            ),
+        );
+
+        let event = events::recent(10)
+            .into_iter()
+            .find(|event| event.event_type == "turn_cancelled")
+            .expect("turn_cancelled event should be recorded");
+        assert_eq!(event.channel_id, Some(42));
+        assert_eq!(event.provider.as_deref(), Some("codex"));
+        assert_eq!(event.payload["reason"], "queue-api cancel_turn (preserve)");
+        assert_eq!(event.payload["surface"], "queue_cancel_preserve");
+        assert_eq!(event.payload["lifecyclePath"], "mailbox_canonical");
+        assert_eq!(event.payload["queueDepth"], 2);
+        assert_eq!(event.payload["queuePreserved"], true);
+        assert_eq!(event.payload["dispatch_id"], "dispatch-1");
+        assert_eq!(event.payload["session_key"], "session-1");
+        assert_eq!(event.payload["turn_id"], "turn-1");
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]

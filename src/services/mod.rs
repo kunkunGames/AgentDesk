@@ -8,20 +8,31 @@ pub mod codex;
 pub mod codex_tmux_wrapper;
 pub mod discord;
 pub mod discord_config_audit;
+// #1693: `discord_delivery` moved to `dispatches::discord_delivery`. The
+// flat path is preserved as a re-export so existing import sites and
+// tests keep working without churn.
+pub(crate) use dispatches::discord_delivery;
+pub mod discord_delivery_metadata;
 pub mod discord_dm_reply_store;
 pub mod disk_monitor;
+pub mod dispatch_watchdog;
+pub mod dispatched_sessions;
 pub mod dispatches;
 pub mod dispatches_followup;
 pub mod gemini;
 pub mod git;
 pub mod issue_announcements;
 pub mod kanban;
+pub mod kanban_cards;
 pub mod maintenance;
 pub mod mcp_config;
 pub mod memory;
 pub mod message_outbox;
 pub mod observability;
+pub mod onboarding;
 pub mod opencode;
+pub mod pipeline_override;
+pub mod pipeline_routes;
 pub mod platform;
 pub mod process;
 pub mod provider;
@@ -37,6 +48,7 @@ pub mod retrospectives;
 pub mod routines;
 pub mod service_error;
 pub mod session_backend;
+pub mod session_forwarding;
 pub mod settings;
 pub mod shell_guard;
 pub mod slo;
@@ -46,6 +58,7 @@ pub mod tmux_diagnostics;
 #[cfg(unix)]
 pub mod tmux_wrapper;
 pub mod tool_output_guard;
+pub mod turn_cancel_finalizer;
 pub mod turn_lifecycle;
 pub mod turn_orchestrator;
 

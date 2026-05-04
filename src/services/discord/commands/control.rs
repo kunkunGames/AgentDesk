@@ -20,7 +20,6 @@ use super::config::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedSessionClearBehavior {
-    NativeProviderClear,
     ResetManagedProcess,
     Noop,
 }
@@ -39,8 +38,9 @@ struct PendingSessionResetPlan {
 
 fn managed_session_clear_behavior(provider: &ProviderKind) -> ManagedSessionClearBehavior {
     match provider {
-        ProviderKind::Claude => ManagedSessionClearBehavior::NativeProviderClear,
-        ProviderKind::Codex | ProviderKind::Qwen => {
+        // Claude/Codex/Qwen keep reusable local wrapper state; `/clear` must
+        // drop that process/tmux state instead of sending provider-native keys.
+        ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Qwen => {
             ManagedSessionClearBehavior::ResetManagedProcess
         }
         ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Unsupported(_) => {
@@ -66,7 +66,6 @@ fn pending_session_reset_plan(
     fast_mode_reset_pending: bool,
     codex_goals_reset_pending: bool,
     model_reset_pending: bool,
-    legacy_session_reset_pending: bool,
 ) -> Option<PendingSessionResetPlan> {
     if fast_mode_reset_pending {
         return Some(PendingSessionResetPlan {
@@ -86,29 +85,39 @@ fn pending_session_reset_plan(
             recreate_tmux: false,
         });
     }
-    if legacy_session_reset_pending {
-        return Some(PendingSessionResetPlan {
-            reset_source: "session reset pending",
-            recreate_tmux: false,
-        });
-    }
     None
 }
 
 pub(in crate::services::discord) fn reset_managed_process_session(session_name: &str) -> bool {
+    let mut reset = false;
     let lingering_pid =
         crate::services::session_backend::process_session_pid(session_name).map(|pid| pid as i32);
     if let Some(handle) = crate::services::session_backend::remove_process_session(session_name) {
         crate::services::session_backend::terminate_process_handle(handle);
-        return true;
-    }
-    if let Some(pid) = lingering_pid {
+        reset = true;
+    } else if let Some(pid) = lingering_pid {
         if let Ok(pid) = u32::try_from(pid) {
             crate::services::process::kill_pid_tree(pid);
-            return true;
+            reset = true;
         }
     }
-    false
+
+    #[cfg(unix)]
+    if crate::services::platform::tmux::has_session(session_name) {
+        crate::services::tmux_diagnostics::record_tmux_exit_reason(
+            session_name,
+            "managed session reset",
+        );
+        if crate::services::platform::tmux::kill_session_with_reason(
+            session_name,
+            "managed session reset",
+        ) {
+            crate::services::tmux_common::cleanup_session_temp_files(session_name);
+            reset = true;
+        }
+    }
+
+    reset
 }
 
 #[cfg(unix)]
@@ -285,19 +294,12 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
             .codex_goals_session_reset_pending
             .contains(&fast_mode_channel_id);
     let model_reset_pending = shared.model_session_reset_pending.contains(&channel_id);
-    let legacy_session_reset_pending = shared.session_reset_pending.contains(&channel_id)
-        && !any_fast_mode_reset_pending(shared, fast_mode_channel_id)
-        && !shared
-            .codex_goals_session_reset_pending
-            .contains(&fast_mode_channel_id)
-        && !model_reset_pending;
 
     let Some(plan) = pending_session_reset_plan(
         provider,
         fast_mode_reset_pending,
         codex_goals_reset_pending,
         model_reset_pending,
-        legacy_session_reset_pending,
     ) else {
         sync_session_reset_pending(shared, channel_id);
         if fast_mode_channel_id != channel_id {
@@ -328,9 +330,6 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
     }
     if model_reset_pending {
         shared.model_session_reset_pending.remove(&channel_id);
-    }
-    if legacy_session_reset_pending {
-        shared.session_reset_pending.remove(&channel_id);
     }
     sync_session_reset_pending(shared, channel_id);
     if fast_mode_channel_id != channel_id {
@@ -414,16 +413,6 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
     }
 
     match managed_session_clear_behavior(provider) {
-        ManagedSessionClearBehavior::NativeProviderClear =>
-        {
-            #[cfg(unix)]
-            if let Some(name) = tmux_name {
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::services::platform::tmux::send_keys(&name, &["/clear", "Enter"])
-                })
-                .await;
-            }
-        }
         ManagedSessionClearBehavior::ResetManagedProcess => {
             if let Some(name) = tmux_name {
                 reset_managed_process_session(&name);
@@ -604,6 +593,7 @@ mod tests {
         ManagedSessionClearBehavior, ManagedSessionResetBehavior, PendingSessionResetPlan,
         build_fallback_session_key_for_clear, fallback_channel_name_for_clear,
         managed_session_clear_behavior, managed_session_reset_behavior, pending_session_reset_plan,
+        reset_managed_process_session,
     };
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::ChannelId;
@@ -612,7 +602,7 @@ mod tests {
     fn managed_session_clear_behavior_matches_provider_transport() {
         assert_eq!(
             managed_session_clear_behavior(&ProviderKind::Claude),
-            ManagedSessionClearBehavior::NativeProviderClear
+            ManagedSessionClearBehavior::ResetManagedProcess
         );
         assert_eq!(
             managed_session_clear_behavior(&ProviderKind::Codex),
@@ -626,6 +616,46 @@ mod tests {
             managed_session_clear_behavior(&ProviderKind::Gemini),
             ManagedSessionClearBehavior::Noop
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_managed_process_session_kills_lingering_tmux_session() {
+        if !crate::services::platform::tmux::is_available() {
+            return;
+        }
+
+        let session_name = format!(
+            "AgentDesk-test-clear-reset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after unix epoch")
+                .as_nanos()
+        );
+        let _ = crate::services::platform::tmux::kill_session_with_reason(
+            &session_name,
+            "test cleanup before create",
+        );
+
+        let created =
+            crate::services::platform::tmux::create_session(&session_name, None, "sleep 60")
+                .expect("tmux create session command should run");
+        if !created.status.success() {
+            return;
+        }
+
+        assert!(crate::services::platform::tmux::has_session(&session_name));
+        let reset = reset_managed_process_session(&session_name);
+        let still_exists = crate::services::platform::tmux::has_session(&session_name);
+        if still_exists {
+            let _ = crate::services::platform::tmux::kill_session_with_reason(
+                &session_name,
+                "test cleanup after failed reset",
+            );
+        }
+        assert!(reset);
+        assert!(!still_exists);
     }
 
     #[test]
