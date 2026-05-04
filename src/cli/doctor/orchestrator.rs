@@ -463,13 +463,13 @@ fn provider_runtime_guidance(provider: &ProviderKind) -> String {
     let provider_name = provider.as_str();
     let log_hint = dcserver_log_hint();
     format!(
-        "{provider_name} CLI 설치/PATH와 서비스 런타임 PATH를 확인하고, 연결 문제가 있으면 {log_hint} 로그와 provider 인증 상태를 점검하세요."
+        "Check {provider_name} CLI installation/PATH and service runtime PATH. If there are connection issues, check the {log_hint} logs and provider authentication status."
     )
 }
 
 fn provider_unused_guidance(provider: &ProviderKind) -> String {
     format!(
-        "{} CLI는 설치되어 있지만 현재 config/health 기준 활성 provider가 아닙니다. 의도한 구성이면 무시해도 됩니다.",
+        "{} CLI is installed but not active based on current config/health. If intentional, ignore this.",
         provider.as_str()
     )
 }
@@ -569,7 +569,7 @@ fn check_qwen_settings_files(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen은 settings 없이도 동작할 수 있지만, 모델 picker와 운영 surface를 안정적으로 쓰려면 ~/.qwen/settings.json 또는 <workspace>/.qwen/settings.json 구성을 권장합니다.";
+    let guidance = "Qwen can run without settings, but for stable model picker and operator surfaces, configuring ~/.qwen/settings.json or <workspace>/.qwen/settings.json is recommended.";
     if configured {
         Check::warn(
             "provider_qwen_settings",
@@ -643,7 +643,7 @@ fn check_qwen_auth_hints(configured: bool) -> Check {
         ]);
     }
 
-    let guidance = "API key 경로는 project .qwen/.env 우선, 그다음 .env를 확인하세요. Qwen CLI는 env-file을 merge하지 않습니다. 사용량/제한은 숫자를 doctor에 고정하지 말고 Qwen CLI 세션의 /stats 또는 공식 문서를 확인하세요.";
+    let guidance = "Check API key paths: project .qwen/.env first, then .env. Qwen CLI does not merge env-files. For usage/limits, do not hardcode numbers in doctor; check /stats in a Qwen CLI session or official docs.";
     if configured {
         Check::warn(
             "provider_qwen_auth",
@@ -798,7 +798,7 @@ fn check_qwen_runtime_artifacts(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen은 ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, <workspace>/.qwen/.env 같은 로컬 자산을 그대로 사용합니다. headless 환경에서는 project .qwen/.env 우선 여부를 함께 확인하세요.";
+    let guidance = "Qwen uses local assets like ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, and <workspace>/.qwen/.env directly. In headless environments, also verify if project .qwen/.env takes precedence.";
     if configured {
         Check::warn(
             "provider_qwen_runtime",
@@ -946,7 +946,7 @@ fn check_opencode_mcp_config(configured: bool) -> Check {
             CheckGroup::ProviderRuntime,
             "OpenCode MCP config",
             "memento MCP not visible for OpenCode",
-            "runtime mcp_servers 또는 ~/.config/opencode/opencode.json top-level mcp에 memento 서버를 설정하세요.",
+            "Configure the memento server in runtime mcp_servers or top-level mcp of ~/.config/opencode/opencode.json.",
         )
         .with_expected_actual("memento MCP configured", "memento MCP missing")
         .with_next_steps(vec![
@@ -994,7 +994,7 @@ fn check_opencode_serve_health_probe(configured: bool) -> Check {
             CheckGroup::ProviderRuntime,
             "OpenCode serve health",
             error,
-            "opencode serve가 정상 기동되는지 CLI 설치, 설정 파일, provider/model 인증 상태를 확인하세요.",
+            "Check CLI installation, config files, and provider/model authentication to ensure `opencode serve` starts correctly.",
         )
         .with_expected_actual("opencode serve /global/health returns 200", "probe failed")
         .with_next_steps(vec![
@@ -1012,7 +1012,7 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "DB/Dashboard Health",
             "health payload unavailable",
-            "dcserver health detail endpoint에 접근할 수 있어야 DB/dashboard 상태를 요약할 수 있습니다.",
+            "Access to the dcserver health detail endpoint is required to summarize DB/dashboard status.",
         )
         .with_subsystem("health")
         .with_fix_safety(FixSafety::NotFixable)
@@ -1048,7 +1048,7 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "DB/Dashboard Health",
             detail.clone(),
-            "DB health가 false입니다. Postgres/SQLite source-of-truth 상태를 먼저 확인하세요.",
+            "DB health is false. Check the Postgres/SQLite source-of-truth status first.",
         )
         .with_subsystem("health")
         .with_severity(Severity::Error)
@@ -1061,7 +1061,7 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "DB/Dashboard Health",
             detail.clone(),
-            "dashboard dist가 없거나 unreadable입니다. API는 동작하더라도 UI asset 배포 상태를 확인하세요.",
+            "Dashboard dist is missing or unreadable. Even if the API works, check the UI asset deployment status.",
         )
         .with_subsystem("health")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -1073,7 +1073,7 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "DB/Dashboard Health",
             detail.clone(),
-            "health detail payload가 DB/dashboard summary를 제공하지 않습니다.",
+            "Health detail payload does not provide DB/dashboard summary.",
         )
         .with_subsystem("health")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -1089,7 +1089,7 @@ fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Dispatch Outbox",
             "health payload unavailable",
-            "dispatch outbox health를 읽을 수 없습니다.",
+            "Cannot read dispatch outbox health.",
         )
         .with_subsystem("health")
         .with_fix_safety(FixSafety::NotFixable);
@@ -1130,7 +1130,7 @@ fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Dispatch Outbox",
             detail.clone(),
-            "permanent dispatch outbox failure가 있습니다. delivery/follow-up 경로를 확인하세요.",
+            "There is a permanent dispatch outbox failure. Check the delivery/follow-up paths.",
         )
         .with_subsystem("health")
         .with_severity(Severity::Error)
@@ -1144,7 +1144,7 @@ fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Dispatch Outbox",
             detail.clone(),
-            "pending/retrying outbox가 남아 있습니다. oldest age가 증가하면 delivery worker를 확인하세요.",
+            "Pending/retrying outbox remains. If the oldest age increases, check the delivery worker.",
         )
         .with_subsystem("health")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -1172,7 +1172,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Config Audit",
             "health payload unavailable",
-            "config audit report를 읽을 수 없습니다.",
+            "Cannot read config audit report.",
         )
         .with_subsystem("config_audit")
         .with_fix_safety(FixSafety::NotFixable);
@@ -1183,7 +1183,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Config Audit",
             "no persisted config audit report in health detail",
-            "dcserver startup config audit가 아직 실행되지 않았거나 persisted report가 없습니다.",
+            "The dcserver startup config audit has not run yet or there is no persisted report.",
         )
         .with_subsystem("config_audit")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -1233,7 +1233,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Config Audit",
             detail.clone(),
-            "agentdesk.yaml/legacy role map/bot settings drift summary를 확인하세요. public health에는 raw source path를 노출하지 않습니다.",
+            "Check agentdesk.yaml/legacy role map/bot settings drift summary. Public health does not expose raw source paths.",
         )
         .with_subsystem("config_audit")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -1367,7 +1367,7 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
             CheckGroup::ProviderRuntime,
             "Provider Bindings",
             detail.clone(),
-            "health registry에 duplicate provider entry가 있습니다. registration deduplication과 runtime bootstrap 로그를 확인하세요.",
+            "Duplicate provider entry found in health registry. Check registration deduplication and runtime bootstrap logs.",
         )
         .with_subsystem("provider_binding")
         .with_severity(Severity::Error)
@@ -1391,7 +1391,7 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
             CheckGroup::ProviderRuntime,
             "Provider Bindings",
             detail.clone(),
-            "agent/provider/channel binding과 Discord bot auth hint를 분리해 확인하세요.",
+            "Check agent/provider/channel binding and Discord bot auth hint separately.",
         )
         .with_subsystem("provider_binding")
         .with_expected_actual("provider/agent/channel bindings consistent", detail)
@@ -1554,7 +1554,7 @@ fn check_credential_permissions(cfg: &config::Config) -> Check {
             CheckGroup::ProviderRuntime,
             "Credential Permissions",
             format!("{detail}; {}", risks.join("; ")),
-            "credential/config 파일 내용은 읽거나 출력하지 않고 권한/owner metadata만 점검했습니다.",
+            "Checked only permissions/owner metadata without reading or outputting credential/config file contents.",
         )
         .with_subsystem("security")
         .with_expected_actual("credential files owned by current user with private permissions", detail)
@@ -2149,7 +2149,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                 CheckGroup::Core,
                 "Discord Bot",
                 format!("overall={overall}, connected={total}/{total}; {detail}"),
-                "모든 provider가 connected 상태이므로 token/offline 안내 대신 degraded reason을 확인하세요.",
+                "All providers are connected. Check the degraded reason instead of token/offline guidance.",
             )
             .with_subsystem("provider_runtime")
             .with_severity(highest_reason_severity(&provider_reasons))
@@ -2173,7 +2173,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                 CheckGroup::Core,
                 "Discord Bot",
                 format!("no providers registered in unified health payload — {base}"),
-                "dcserver가 아직 provider를 등록하지 못했을 수 있습니다. startup 로그와 bot token 구성을 확인하세요.",
+                "The dcserver may not have registered the provider yet. Check the startup logs and bot token configuration.",
             )
             .with_path(health_endpoint(base))
             .with_expected_actual("provider registry populated", "providers=0")
@@ -2196,7 +2196,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                     disconnected.join(", ")
                 }
             ),
-            "오프라인 provider의 Discord token, gateway 연결 상태, dcserver stdout 로그를 확인하세요.",
+            "Check the offline provider's Discord token, gateway connection status, and dcserver stdout logs.",
         )
         .with_subsystem("provider_runtime")
         .with_security_exposure(SecurityExposure::OperationalMetadata)
@@ -2228,7 +2228,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
             CheckGroup::Core,
             "Discord Bot",
             format!("standalone health only — provider status unavailable at {base}"),
-            "현재 서버는 응답하지만 Discord provider health registry는 비어 있습니다. standalone 실행 중인지 확인하세요.",
+            "The server is responding, but the Discord provider health registry is empty. Check if it is running standalone.",
         )
         .with_path(health_endpoint(base))
         .with_expected_actual("unified provider registry available", "standalone health payload only")
@@ -2242,7 +2242,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
             CheckGroup::Core,
             "Discord Bot",
             format!("server unhealthy or provider data missing: ok={ok} db={db}"),
-            "서버가 떠 있더라도 Discord provider 초기화가 실패했을 수 있습니다. dcserver stdout 로그를 확인하세요.",
+            "Even if the server is running, the Discord provider initialization may have failed. Check the dcserver stdout logs.",
         )
         .with_path(health_endpoint(base))
         .with_expected_actual("healthy server with provider registry", format!("ok={ok} db={db}"))
@@ -2267,7 +2267,7 @@ fn check_discord_bot(snapshot: &HealthSnapshot) -> Check {
                     .clone()
                     .unwrap_or_else(|| "unknown error".to_string())
             ),
-            "dcserver가 실행 중인지, /api/health가 접근 가능한지 확인하세요.",
+            "Check if the dcserver is running and /api/health is accessible.",
         )
         .with_path(health_endpoint(&snapshot.base))
         .with_expected_actual("reachable health endpoint", "health endpoint unreachable")
@@ -2288,7 +2288,7 @@ fn check_tmux() -> Check {
             CheckGroup::Core,
             "tmux",
             "not found in PATH",
-            "Claude/Codex tmux backend를 쓸 계획이면 tmux를 설치하세요.",
+            "Install tmux if you plan to use the Claude/Codex tmux backend.",
         )
         .with_path("tmux")
         .with_expected_actual("tmux available in PATH", "tmux not found")
@@ -2477,7 +2477,7 @@ fn check_provider_cli(
             CheckGroup::ProviderRuntime,
             name,
             "unsupported provider",
-            "지원되지 않는 provider입니다.",
+            "Unsupported provider.",
         )
         .with_expected_actual("supported provider", "unsupported provider"),
     }
@@ -2513,7 +2513,7 @@ fn check_runtime_path() -> Check {
             CheckGroup::ProviderRuntime,
             "Runtime PATH",
             "unable to resolve provider runtime PATH",
-            "login shell PATH를 읽지 못했습니다. 서비스 환경 PATH와 shell PATH를 비교하세요.",
+            "Failed to read the login shell PATH. Compare the service environment PATH and the shell PATH.",
         )
         .with_expected_actual("runtime PATH resolved", "runtime PATH resolution failed")
         .with_next_steps(vec!["echo $PATH".to_string()]),
@@ -2565,7 +2565,7 @@ fn check_server_running(snapshot: &HealthSnapshot) -> Check {
                     CheckGroup::Core,
                     "Server",
                     reason_detail.clone(),
-                    "health endpoint는 응답했지만 서비스 상태가 healthy가 아닙니다. degraded reason별 subsystem을 먼저 확인하세요.",
+                    "The health endpoint responded, but the service status is not healthy. Check the subsystem for each degraded reason first.",
                 )
                 .with_subsystem("health")
                 .with_severity(highest_reason_severity(&reasons))
@@ -2593,19 +2593,19 @@ fn check_server_running(snapshot: &HealthSnapshot) -> Check {
                 (
                     "unauthorized",
                     Severity::Error,
-                    "auth token 또는 /api/health/detail 권한을 확인하세요.",
+                    "Check the auth token or /api/health/detail permissions.",
                 )
             } else if error.contains("--allow-remote") {
                 (
                     "blocked_remote_token",
                     Severity::Critical,
-                    "non-loopback URL에 token을 보내려면 명시적으로 --allow-remote를 사용하세요.",
+                    "Use --allow-remote explicitly to send a token to a non-loopback URL.",
                 )
             } else {
                 (
                     "unreachable",
                     Severity::Error,
-                    "dcserver/axum 서버가 떠 있는지와 방화벽/포트 접근 가능 여부를 확인하세요.",
+                    "Check if the dcserver/axum server is running and if the firewall/port is accessible.",
                 )
             };
             Check::fail(
@@ -2644,7 +2644,7 @@ fn check_runtime_root() -> Check {
             CheckGroup::Core,
             "Runtime Root",
             format!("{} — missing", path.display()),
-            "agentdesk doctor --fix 로 기본 runtime 디렉터리를 생성할 수 있습니다.",
+            "Run `agentdesk doctor --fix` to create the default runtime directory.",
         )
         .with_path(path.display().to_string())
         .with_expected_actual("runtime root exists", "runtime root missing")
@@ -2654,7 +2654,7 @@ fn check_runtime_root() -> Check {
             CheckGroup::Core,
             "Runtime Root",
             "unable to determine runtime root",
-            "AGENTDESK_ROOT_DIR 또는 기본 ~/.adk/release 경로를 확인하세요.",
+            "Check AGENTDESK_ROOT_DIR or the default ~/.adk/release path.",
         )
         .with_expected_actual(
             "runtime root path resolvable",
@@ -2673,7 +2673,7 @@ fn check_degraded_reasons(snapshot: &HealthSnapshot) -> Check {
                 .error
                 .clone()
                 .unwrap_or_else(|| "health endpoint unavailable".to_string()),
-            "health endpoint에 접근할 수 없어 degraded reason을 분류하지 못했습니다.",
+            "Cannot classify the degraded reason because the health endpoint is inaccessible.",
         )
         .with_subsystem("health")
         .with_security_exposure(SecurityExposure::OperationalMetadata)
@@ -2718,14 +2718,14 @@ fn check_degraded_reasons(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Health Reasons",
             detail.clone(),
-            "health degraded reason을 subsystem별로 확인하세요.",
+            "Check the health degraded reason by subsystem.",
         ),
         CheckStatus::Fail => Check::fail(
             "health_degraded_reasons",
             CheckGroup::Core,
             "Health Reasons",
             detail.clone(),
-            "error/critical degraded reason을 먼저 해결하세요.",
+            "Resolve error/critical degraded reasons first.",
         ),
     };
     check = check
@@ -2762,9 +2762,9 @@ fn check_mailbox_consistency(snapshot: &HealthSnapshot) -> Vec<Check> {
                 "Turn Mailbox Consistency",
                 finding.detail,
                 if finding.live_work_present {
-                    "live work evidence가 있으므로 자동 정리를 건너뛰고 operator 확인이 필요합니다."
+                    "Automatic cleanup is skipped because there is live work evidence. Operator verification is required."
                 } else {
-                    "live work evidence가 없으면 protected stale-mailbox repair를 적용할 수 있습니다."
+                    "Protected stale-mailbox repair can be applied if there is no live work evidence."
                 },
             )
             .with_subsystem("provider_runtime")
@@ -2796,7 +2796,7 @@ fn check_data_dir(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Data Directory",
             format!("{} — missing", cfg.data.dir.display()),
-            "agentdesk doctor --fix 로 data 디렉터리와 DB를 생성할 수 있습니다.",
+            "Run `agentdesk doctor --fix` to create the data directory and database.",
         )
         .with_path(cfg.data.dir.display().to_string())
         .with_expected_actual("data directory exists", "data directory missing")
@@ -2821,7 +2821,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             format!("launchd — {label} not loaded"),
-            "launchd로 운영 중이면 plist 로드 상태를 확인하세요. 수동 실행 환경이면 무시해도 됩니다.",
+            "If running via launchd, check the plist load state. If running manually, this can be ignored.",
         )
         .with_expected_actual("launchd job loaded", format!("{label} not loaded"))
         .with_next_steps(vec![
@@ -2849,7 +2849,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "systemd --user — agentdesk-dcserver enabled but inactive",
-            "`systemctl --user status agentdesk-dcserver` 로 상태를 확인하거나 `agentdesk doctor --fix`로 restart를 시도하세요.",
+            "Check status with `systemctl --user status agentdesk-dcserver` or restart with `agentdesk doctor --fix`.",
         )
         .with_expected_actual("systemd user service active", "systemd user service enabled but inactive")
         .with_next_steps(vec![
@@ -2862,7 +2862,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "systemd --user — agentdesk-dcserver not enabled",
-            "서비스로 운영할 계획이면 systemd user service 등록 여부를 확인하세요.",
+            "If planning to run as a service, verify the systemd user service registration.",
         )
         .with_expected_actual(
             "systemd user service enabled",
@@ -2892,7 +2892,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "Windows service — AgentDeskDcserver installed but not running",
-            "`sc query AgentDeskDcserver` 로 상태를 확인하거나 `agentdesk doctor --fix`로 restart를 시도하세요.",
+            "Check status with `sc query AgentDeskDcserver` or restart with `agentdesk doctor --fix`.",
         )
         .with_expected_actual("Windows service running", "Windows service installed but not running")
         .with_next_steps(vec![
@@ -2905,7 +2905,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "Windows service — AgentDeskDcserver not installed",
-            "Windows service 또는 수동 실행 방식 중 어떤 배포인지 확인하세요.",
+            "Determine if the deployment is using a Windows service or manual execution.",
         )
         .with_expected_actual("Windows service installed", "Windows service not installed")
         .with_next_steps(vec!["sc query AgentDeskDcserver".to_string()])
@@ -2977,7 +2977,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 CheckGroup::Core,
                 "PostgreSQL",
                 format!("{summary} — runtime init failed"),
-                "postgres 연결 검증용 async runtime 생성에 실패했습니다.",
+                "Failed to create async runtime for postgres connection verification.",
             )
             .with_expected_actual(
                 "postgres check runtime initializes",
@@ -3080,7 +3080,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "PostgreSQL",
             format!("{summary} — failed"),
-            "DATABASE_URL 또는 database 설정값(host/port/dbname/user/password)을 확인하세요.",
+            "Check DATABASE_URL or database configuration values (host/port/dbname/user/password).",
         )
         .with_expected_actual("postgres connection succeeds", error)
         .with_next_steps(vec!["agentdesk doctor --json".to_string()]),
@@ -3112,7 +3112,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
             CheckGroup::Core,
             "Stale DB Files",
             "runtime root unresolved",
-            "실제 DB 경로를 먼저 확인한 뒤 root 경로의 0바이트 stale DB 파일을 정리하세요.",
+            "Check the actual DB path first, then clean up 0-byte stale DB files in the root path.",
         )
         .with_expected_actual(
             "runtime root path resolvable",
@@ -3168,7 +3168,7 @@ fn check_stale_zero_byte_db_files(cfg: &config::Config) -> Check {
         "Stale DB Files",
         format!("zero-byte stale DB file(s): {listed}"),
         format!(
-            "실제 DB는 {} 입니다. 추측 경로로 sqlite3를 열지 말고, 필요하면 agentdesk doctor --fix 로 stale 파일을 정리하세요.",
+            "The canonical database is {}. Do not open sqlite3 at guessed paths. Run `agentdesk doctor --fix` to clean up stale files if needed.",
             canonical_db_path.display()
         ),
     )
@@ -3272,7 +3272,7 @@ fn check_disk_usage() -> Check {
             CheckGroup::Core,
             "Disk Usage",
             format!("{} — runtime root missing", path.display()),
-            "agentdesk doctor --fix 로 기본 runtime 디렉터리를 생성할 수 있습니다.",
+            "Run `agentdesk doctor --fix` to create the default runtime directory.",
         )
         .with_path(path.display().to_string())
         .with_expected_actual(
@@ -3362,7 +3362,7 @@ fn check_disk_usage() -> Check {
                 CheckGroup::Core,
                 "Disk Usage",
                 format!("{} — unreadable ({e})", path.display()),
-                "runtime root 권한을 확인하세요.",
+                "Check runtime root permissions.",
             )
             .with_path(path.display().to_string())
             .with_expected_actual(
@@ -3376,7 +3376,7 @@ fn check_disk_usage() -> Check {
             CheckGroup::Core,
             "Disk Usage",
             "cannot determine runtime root",
-            "AGENTDESK_ROOT_DIR 또는 기본 ~/.adk/release 경로를 확인하세요.",
+            "Check AGENTDESK_ROOT_DIR or the default ~/.adk/release path.",
         )
         .with_expected_actual(
             "runtime root path resolvable",
@@ -3767,7 +3767,7 @@ mod tests {
                 .guidance
                 .as_deref()
                 .unwrap_or_default()
-                .contains("오프라인 provider의 Discord token")
+                .contains("the offline provider's Discord token")
         );
     }
 
