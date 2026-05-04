@@ -126,6 +126,13 @@ than omitted.
 - `tests` — the test file(s) that guard the invariants.
 - `related_issues` — GitHub issue numbers that own the migration or cleanup.
 
+
+## Agent Queue Hygiene
+
+Automated agents (e.g., Scribe, Steward) must adhere to the following duplicate-prevention guards before proposing changes:
+- **Duplicate Guards:** Always inspect open branches and PRs. Do not open a PR if another agent has an open PR targeting the same invariant or boundary.
+- **Generated Inventory Overlap:** Scribe agents specifically must check if an existing branch is already attempting to resolve `docs/generated/` drift before regenerating docs.
+
 ## Cross-Reference
 
 `docs/source-of-truth.md` lists this directory in its `Deprecated References`
