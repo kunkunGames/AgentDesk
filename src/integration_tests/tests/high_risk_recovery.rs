@@ -1109,34 +1109,35 @@ mod outbox_boundary {
 mod delayed_worker {
     use super::*;
 
-    #[test]
-    #[ignore = "SQLite message_outbox runtime path removed in #868; delayed-worker notification coverage needs PG fixtures."]
-    fn scenario_421_deadlock_recent_output_extends_watchdog() {
+    #[tokio::test]
+    async fn scenario_421_deadlock_recent_output_extends_watchdog() {
+        let pg_db = IntegrationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
         let runtime_root = tempfile::tempdir().unwrap();
         let _runtime = RuntimeRootOverride::new(runtime_root.path());
         let policies_dir = setup_timeouts_policy_dir();
         let db = test_db();
-        let engine = test_engine_with_dir(&db, policies_dir.path());
+        let engine = test_engine_with_pg_and_dir(pool.clone(), policies_dir.path());
         let session_key = "host:tmux-421-recent";
 
-        seed_agent(&db);
-        set_kv(&db, "deadlock_manager_channel_id", "999");
-        set_kv(&db, "server_port", "8791");
-        set_kv(
-            &db,
+        seed_agent_pg(&pool).await;
+        set_kv_pg(&pool, "deadlock_manager_channel_id", "999").await;
+        set_kv_pg(&pool, "server_port", "8791").await;
+        set_kv_pg(
+            &pool,
             &format!("deadlock_check:{session_key}"),
             r#"{"count":2,"ts":0}"#,
-        );
+        )
+        .await;
 
-        {
-            let conn = db.lock().unwrap();
-            conn.execute(
-                "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat, created_at) \
-                 VALUES (?1, 'agent-1', 'codex', 'turn_active', datetime('now', '-31 minutes'), datetime('now', '-90 minutes'))",
-                [session_key],
-            )
-            .unwrap();
-        }
+        sqlx::query(
+            "INSERT INTO sessions (session_key, agent_id, provider, status, last_heartbeat, created_at) \
+             VALUES ($1, 'agent-1', 'codex', 'turn_active', NOW() - INTERVAL '31 minutes', NOW() - INTERVAL '90 minutes')"
+        )
+        .bind(session_key)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         write_codex_inflight(
             runtime_root.path(),
@@ -1151,17 +1152,20 @@ mod delayed_worker {
         engine
             .try_fire_hook_by_name("OnTick30s", serde_json::json!({}))
             .unwrap();
-        kanban::drain_hook_side_effects(&db, &engine);
+        kanban::drain_hook_side_effects_with_backends(None, &engine);
 
         assert_eq!(
-            kv_value(&db, &format!("deadlock_check:{session_key}")),
+            kv_value_pg(&pool, &format!("deadlock_check:{session_key}")).await,
             None,
             "recent output should clear the deadlock counter"
         );
-        assert_eq!(kv_value(&db, "test_http_count").as_deref(), Some("1"));
+        assert_eq!(
+            kv_value_pg(&pool, "test_http_count").await.as_deref(),
+            Some("1")
+        );
 
         let http_last: serde_json::Value =
-            serde_json::from_str(&kv_value(&db, "test_http_last").unwrap()).unwrap();
+            serde_json::from_str(&kv_value_pg(&pool, "test_http_last").await.unwrap()).unwrap();
         assert_eq!(http_last["body"]["extend_secs"], 1800);
         assert!(
             http_last["url"]
@@ -1171,11 +1175,14 @@ mod delayed_worker {
             "watchdog extension must target the inflight channel"
         );
 
-        let messages = message_outbox_rows(&db);
+        let messages = message_outbox_rows_pg(&pool).await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].0, "channel:999");
         assert!(messages[0].1.contains("정상 진행 확인, +30분 연장"));
         assert!(!messages[0].1.contains("watchdog 연장 실패"));
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[test]
