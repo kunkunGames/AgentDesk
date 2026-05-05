@@ -1,0 +1,3 @@
+## $(date +%Y-%m-%d) - Reuse expand_user_path helper
+**Learning:** AgentDesk provides a shared path expansion helper `crate::runtime_layout::expand_user_path` that handles tilde expansion safely without enforcing a lossy String conversion when unnecessary. Ad-hoc implementations in services (e.g., `binary_resolver.rs`) should be removed in favor of this helper.
+**Action:** Always check `src/runtime_layout/paths.rs` for path manipulation utilities before implementing local expansion logic. When replacing local `expand_user_path` implementations, ensure fallback behavior (like `unwrap_or_else(|| PathBuf::from(...))`) matches the original local behavior.
