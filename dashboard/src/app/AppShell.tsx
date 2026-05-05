@@ -909,6 +909,7 @@ export default function AppShell({
                         type="button"
                         onClick={() => setShowNotificationPanel(false)}
                         className="flex h-8 w-8 items-center justify-center rounded-xl text-[var(--th-text-muted)]"
+                        aria-label={tr("알림 창 닫기", "Close notification panel")}
                       >
                         <X size={14} />
                       </button>
@@ -974,6 +975,7 @@ export default function AppShell({
                                 type="button"
                                 onClick={() => dismissNotification(notification.id)}
                                 className="flex h-8 w-8 items-center justify-center rounded-xl text-[var(--th-text-muted)]"
+                                aria-label={tr("알림 지우기", "Dismiss notification")}
                               >
                                 <X size={12} />
                               </button>
