@@ -3564,7 +3564,7 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
-        Check, CheckGroup, CheckStatus, DoctorOptions, FixAction, HealthSnapshot,
+        Check, CheckGroup, CheckStatus, DoctorOptions, FixAction, HealthSnapshot, apply_safe_fixes,
         apply_service_fix, apply_stale_mailbox_fixes, build_json_report, check_config_audit,
         check_credential_permissions, check_degraded_reasons, check_github_repo_registry,
         check_mailbox_consistency, check_postgres_connection, check_provider_bindings,
@@ -3826,6 +3826,27 @@ mod tests {
         assert!(actions[0].skipped);
         assert!(actions[0].requires_explicit_consent);
         assert_eq!(actions[0].fix_safety, FixSafety::ExplicitRestartRequired);
+    }
+
+    #[test]
+    fn repair_sqlite_cache_fix_requires_explicit_consent() {
+        let cfg = crate::config::Config::default();
+        let options = default_doctor_options();
+
+        let actions = apply_safe_fixes(&cfg, &options);
+
+        let schema_action = actions.iter().find(|a| a.id == "db_schema").unwrap();
+        assert!(schema_action.skipped);
+        assert!(schema_action.requires_explicit_consent);
+        assert_eq!(
+            schema_action.fix_safety,
+            FixSafety::ExplicitDbRepairRequired
+        );
+
+        let files_action = actions.iter().find(|a| a.id == "stale_db_files").unwrap();
+        assert!(files_action.skipped);
+        assert!(files_action.requires_explicit_consent);
+        assert_eq!(files_action.fix_safety, FixSafety::ExplicitDbRepairRequired);
     }
 
     #[test]
