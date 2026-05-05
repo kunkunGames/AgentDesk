@@ -111,7 +111,6 @@
   - `src/services/discord/recovery_engine.rs` (4842 lines).
   - `src/services/discord/health.rs` (6247 lines).
   - `src/services/discord/placeholder_controller.rs` (1237 lines).
-  - `src/services/discord/placeholder_live_events.rs` (2038 lines).
   - `src/services/discord/router/message_handler.rs` (7013 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (4267 lines).
@@ -234,6 +233,8 @@
     persistence helpers).
   - `src/db/session_transcripts.rs` (877 lines, retained PG-cleanup surface).
   - `src/db/agents.rs` (1125 lines).
+  - `src/db/prompt_manifests.rs` (1219 lines, post-#1699 retention policy +
+    write-time byte cap pushed it past the giant-file threshold).
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
   see `known-legacy.md`.
 - invariants: production reads/writes go through `pg_pool_ref()`; `legacy_db()`
@@ -291,6 +292,17 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/session_backend.rs` (1053).
 
 Same rule: `bugfix` only without a split issue.
+
+## Shared API Helpers
+
+For new HTTP route logic that paginates over Postgres-backed lists, prefer the
+shared helper `crate::utils::api::clamp_api_limit` (in `src/utils/api.rs`) over
+inline `limit.clamp(1, 100)` calls. The helper applies the standard API-limit
+shape (default 50, clamped to 1..=100) and is the single canonical site for
+that bound — `scripts/audit_maintainability/checks/limit_clamp_duplication.py`
+flags any new inline `clamp(1, 100)` outside the helper definition (#1698).
+For non-standard bounds, extend `clamp_limit(limit, default, max)` rather than
+reintroducing bespoke clamp expressions.
 
 ## Updating This Page
 

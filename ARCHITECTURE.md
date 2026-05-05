@@ -53,12 +53,17 @@ src/
 │   ├── dispatches/
 │   │   ├── mod.rs
 │   │   └── outbox.rs
+│   ├── kanban_cards/
+│   │   ├── crud.rs
+│   │   ├── listing.rs
+│   │   ├── metadata.rs
+│   │   ├── mod.rs
+│   │   └── transitions.rs
 │   ├── agents.rs
 │   ├── auto_queue.rs
 │   ├── cancel_tombstones.rs
 │   ├── dispatched_sessions.rs
 │   ├── kanban.rs
-│   ├── kanban_cards.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
@@ -139,6 +144,7 @@ src/
 │   │   │   ├── discord_delivery_tests.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── outbox.rs
+│   │   │   ├── outbox_tests.rs
 │   │   │   ├── tests.rs
 │   │   │   └── thread_reuse.rs
 │   │   ├── domains/
@@ -188,6 +194,7 @@ src/
 │   │   ├── offices.rs
 │   │   ├── onboarding.rs
 │   │   ├── pipeline.rs
+│   │   ├── prompt_manifest_retention.rs
 │   │   ├── provider_cli_api.rs
 │   │   ├── queue_api.rs
 │   │   ├── receipt.rs
@@ -268,6 +275,24 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
 │   │   │   └── result.rs
+│   │   ├── placeholder_live_events/
+│   │   │   ├── common.rs
+│   │   │   ├── context_panel.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── prompt_panel.rs
+│   │   │   ├── recent_events.rs
+│   │   │   ├── session_panel.rs
+│   │   │   ├── status_events.rs
+│   │   │   ├── task_panel.rs
+│   │   │   └── tests.rs
+│   │   ├── prompt_builder/
+│   │   │   ├── dispatch_contract.rs
+│   │   │   ├── dispatch_contract_tests.rs
+│   │   │   ├── layer_rendering.rs
+│   │   │   ├── manifest.rs
+│   │   │   ├── memory_guidance.rs
+│   │   │   ├── mod.rs
+│   │   │   └── tests.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── mod.rs
 │   │   │   └── shared.rs
@@ -331,9 +356,7 @@ src/
 │   │   ├── org_writer.rs
 │   │   ├── placeholder_cleanup.rs
 │   │   ├── placeholder_controller.rs
-│   │   ├── placeholder_live_events.rs
 │   │   ├── placeholder_sweeper.rs
-│   │   ├── prompt_builder.rs
 │   │   ├── queue_io.rs
 │   │   ├── queued_placeholders_store.rs
 │   │   ├── recovery_engine.rs
@@ -365,7 +388,8 @@ src/
 │   │   └── tmux_watcher.rs
 │   ├── dispatches/
 │   │   ├── discord_delivery.rs
-│   │   └── mod.rs
+│   │   ├── mod.rs
+│   │   └── outbox_queue.rs
 │   ├── git/
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
