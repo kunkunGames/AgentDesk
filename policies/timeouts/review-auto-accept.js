@@ -39,6 +39,7 @@ module.exports = function attachReviewAutoAccept(timeouts, helpers) {
         "SELECT id, assigned_agent_id, title FROM kanban_cards " +
         "WHERE status = ? AND review_status = 'suggestion_pending' " +
         "AND suggestion_pending_at IS NOT NULL AND suggestion_pending_at < datetime('now', '-15 minutes') " +
+        "AND assigned_agent_id IS NOT NULL " +
         "ORDER BY suggestion_pending_at ASC LIMIT 50",
         [eReview]
       );
