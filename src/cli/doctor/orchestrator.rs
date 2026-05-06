@@ -3815,7 +3815,10 @@ mod tests {
         let snapshot = HealthSnapshot {
             base: base.to_string(),
             body: None,
-            error: Some("non-loopback AGENTDESK_API_URL with configured auth token requires --allow-remote".to_string()),
+            error: Some(
+                "non-loopback AGENTDESK_API_URL with configured auth token requires --allow-remote"
+                    .to_string(),
+            ),
         };
 
         let check = check_server_running(&snapshot);
@@ -3823,7 +3826,13 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Fail);
         assert_eq!(check.severity, Severity::Critical);
         assert!(check.detail.contains("blocked_remote_token"));
-        assert!(check.guidance.as_deref().unwrap_or_default().contains("--allow-remote"));
+        assert!(
+            check
+                .guidance
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--allow-remote")
+        );
     }
 
     #[test]
