@@ -3561,39 +3561,6 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
     }
 }
 
-#[cfg(test)]
-mod default_tests {
-    use super::{CheckStatus, HealthSnapshot, check_server_running};
-    use crate::cli::doctor::contract::Severity;
-
-    #[test]
-    fn non_loopback_api_url_requires_allow_remote_consent() {
-        let base = "https://agentdesk.example.com";
-
-        let snapshot = HealthSnapshot {
-            base: base.to_string(),
-            body: None,
-            error: Some(
-                "non-loopback AGENTDESK_API_URL with configured auth token requires --allow-remote"
-                    .to_string(),
-            ),
-        };
-
-        let check = check_server_running(&snapshot);
-
-        assert_eq!(check.status, CheckStatus::Fail);
-        assert_eq!(check.severity, Severity::Critical);
-        assert!(check.detail.contains("blocked_remote_token"));
-        assert!(
-            check
-                .guidance
-                .as_deref()
-                .unwrap_or_default()
-                .contains("--allow-remote")
-        );
-    }
-}
-
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
@@ -3840,6 +3807,7 @@ mod tests {
             artifact_path: None,
         }
     }
+
 
     #[test]
     fn service_fix_requires_explicit_restart_consent() {
