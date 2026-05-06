@@ -424,7 +424,6 @@ src/
 │   ├── dispatches/
 │   │   ├── discord_delivery.rs
 │   │   ├── mod.rs
-│   │   ├── outbox_claiming.rs
 │   │   ├── outbox_queue.rs
 │   │   └── outbox_route.rs
 │   ├── git/
