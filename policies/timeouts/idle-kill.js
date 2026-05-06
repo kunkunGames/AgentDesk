@@ -58,9 +58,15 @@ module.exports = function attachIdleKill(timeouts, helpers) {
 
       var now = Date.now();
       var processed = {};
+      var killedCount = 0;
 
       function forceKillIdleSessions(sessions, minimumIdleMinutes, reasonLabel) {
         for (var i = 0; i < sessions.length; i++) {
+          if (killedCount >= 5) {
+            agentdesk.log.info("[idle-kill] Reached max 5 kills per tick. Breaking early.");
+            break;
+          }
+
           var s = sessions[i];
           if (!s.session_key || processed[s.session_key]) continue;
           processed[s.session_key] = true;
@@ -72,6 +78,7 @@ module.exports = function attachIdleKill(timeouts, helpers) {
 
           var forceKillResp = null;
           try {
+            killedCount++;
             var forceKillUrl = "http://127.0.0.1:" + apiPort +
               "/api/sessions/" + encodeURIComponent(s.session_key) + "/force-kill";
             forceKillResp = agentdesk.http.post(forceKillUrl, { retry: false, reason: "idle " + idleMin + "분 초과 — 자동 정리" });
