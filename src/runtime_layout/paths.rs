@@ -142,7 +142,11 @@ mod tests {
     fn test_resolve_memory_path_absolute() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let raw = if cfg!(windows) { "C:\\absolute\\path" } else { "/absolute/path" };
+        let raw = if cfg!(windows) {
+            "C:\\absolute\\path"
+        } else {
+            "/absolute/path"
+        };
         let resolved = resolve_memory_path(root, raw);
         assert_eq!(resolved, PathBuf::from(raw));
     }
