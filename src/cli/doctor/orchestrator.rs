@@ -11,7 +11,7 @@ use crate::config;
 use crate::db::{open_write_connection, schema};
 use crate::services::provider::ProviderKind;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
 pub(crate) struct DoctorOptions {
@@ -2893,7 +2893,7 @@ fn check_service_manager() -> Check {
             "systemd user service not enabled",
         )
         .with_next_steps(vec![
-            "systemctl --user status agentdesk-dcserver".to_string(),
+            "systemctl --user status agentdesk-dcserver".to_string()
         ])
     }
 }
@@ -3564,7 +3564,6 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
-        Check, CheckGroup, CheckStatus, DoctorOptions, FixAction, HealthSnapshot,
         apply_service_fix, apply_stale_mailbox_fixes, build_json_report, check_config_audit,
         check_credential_permissions, check_degraded_reasons, check_github_repo_registry,
         check_mailbox_consistency, check_postgres_connection, check_provider_bindings,
@@ -3573,7 +3572,8 @@ mod tests {
         discord_bot_check_from_health, postgres_migration_status_is_healthy,
         provider_capability_summary, stale_mailbox_repair_fix_safety,
         stale_mailbox_repair_response_status, stale_mailbox_repair_safety_gate,
-        unsuccessful_migration_versions,
+        unsuccessful_migration_versions, Check, CheckGroup, CheckStatus, DoctorOptions, FixAction,
+        HealthSnapshot,
     };
     use crate::cli::doctor::contract::{FixSafety, RunContext, Severity};
     use crate::config::{AgentChannel, AgentChannels, AgentDef, ServerConfig};
@@ -3754,12 +3754,10 @@ mod tests {
         assert_eq!(check.subsystem, "provider_runtime");
         assert_eq!(check.fix_safety, FixSafety::ReadOnly);
         assert!(check.detail.contains("provider codex is disconnected"));
-        assert!(
-            check
-                .next_steps
-                .iter()
-                .any(|step| step.contains("codex Discord token"))
-        );
+        assert!(check
+            .next_steps
+            .iter()
+            .any(|step| step.contains("codex Discord token")));
     }
 
     #[test]
@@ -3779,20 +3777,16 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Warn);
         assert_eq!(check.subsystem, "provider_runtime");
         assert_eq!(check.fix_safety, FixSafety::ReadOnly);
-        assert!(
-            check
-                .path
-                .as_deref()
-                .is_some_and(|path| path.ends_with("/api/health/detail"))
-        );
+        assert!(check
+            .path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("/api/health/detail")));
         assert!(check.detail.contains("pending queue depth 2"));
-        assert!(
-            !check
-                .guidance
-                .as_deref()
-                .unwrap_or_default()
-                .contains("오프라인 provider의 Discord token")
-        );
+        assert!(!check
+            .guidance
+            .as_deref()
+            .unwrap_or_default()
+            .contains("오프라인 provider의 Discord token"));
     }
 
     fn default_doctor_options() -> DoctorOptions {
@@ -3807,7 +3801,6 @@ mod tests {
             artifact_path: None,
         }
     }
-
 
     #[test]
     fn service_fix_requires_explicit_restart_consent() {
@@ -4112,14 +4105,12 @@ mod tests {
         let check = check_provider_bindings(&cfg, &snapshot);
         assert_eq!(check.status, CheckStatus::Fail);
         assert_eq!(check.subsystem, "provider_binding");
-        assert!(
-            check
-                .evidence
-                .as_ref()
-                .and_then(|evidence| evidence.get("duplicate_providers"))
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| items.iter().any(|item| item == "codexx2"))
-        );
+        assert!(check
+            .evidence
+            .as_ref()
+            .and_then(|evidence| evidence.get("duplicate_providers"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item == "codexx2")));
     }
 
     #[test]
@@ -4337,21 +4328,19 @@ mod tests {
 
     #[test]
     fn json_report_uses_stable_machine_friendly_fields() {
-        let checks = vec![
-            Check::warn(
-                "service_manager",
-                CheckGroup::Core,
-                "Service Manager",
-                "systemd inactive",
-                "restart service",
-            )
-            .with_path("systemctl --user")
-            .with_expected_actual("service active", "service inactive")
-            .with_next_steps(vec![
-                "systemctl --user status agentdesk-dcserver".to_string(),
-                "agentdesk doctor --fix".to_string(),
-            ]),
-        ];
+        let checks = vec![Check::warn(
+            "service_manager",
+            CheckGroup::Core,
+            "Service Manager",
+            "systemd inactive",
+            "restart service",
+        )
+        .with_path("systemctl --user")
+        .with_expected_actual("service active", "service inactive")
+        .with_next_steps(vec![
+            "systemctl --user status agentdesk-dcserver".to_string(),
+            "agentdesk doctor --fix".to_string(),
+        ])];
         let fixes = vec![FixAction::ok(
             "service_restart",
             "Service Restart",
