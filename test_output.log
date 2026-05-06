@@ -1,0 +1,494 @@
+
+> test:policies
+> node --test policies/__tests__/*.test.js
+
+TAP version 13
+# Subtest: auto-queue infers phase_gate_passed when every declared check passes
+ok 1 - auto-queue infers phase_gate_passed when every declared check passes
+  ---
+  duration_ms: 48.94548
+  type: 'test'
+  ...
+# Subtest: auto-queue does not infer a phase gate verdict when the result already carries an explicit verdict
+ok 2 - auto-queue does not infer a phase gate verdict when the result already carries an explicit verdict
+  ---
+  duration_ms: 10.30727
+  type: 'test'
+  ...
+# Subtest: auto-queue dispatchable targets prioritize requested and keep unique dispatch anchors
+ok 3 - auto-queue dispatchable targets prioritize requested and keep unique dispatch anchors
+  ---
+  duration_ms: 16.529977
+  type: 'test'
+  ...
+# Subtest: auto-queue finds a free path from backlog to the nearest dispatchable state
+ok 4 - auto-queue finds a free path from backlog to the nearest dispatchable state
+  ---
+  duration_ms: 7.55983
+  type: 'test'
+  ...
+# Subtest: auto-queue onTick1min honors stale dispatched runtime config
+ok 5 - auto-queue onTick1min honors stale dispatched runtime config
+  ---
+  duration_ms: 7.849229
+  type: 'test'
+  ...
+# Subtest: auto-queue terminal cleanup uses pipeline terminal states
+ok 6 - auto-queue terminal cleanup uses pipeline terminal states
+  ---
+  duration_ms: 10.662055
+  type: 'test'
+  ...
+# Subtest: auto-queue rotates saturated active runs in bounded tick sweep
+ok 7 - auto-queue rotates saturated active runs in bounded tick sweep
+  ---
+  duration_ms: 8.886386
+  type: 'test'
+  ...
+# Subtest: auto-queue does not rotate deferred active run activations
+ok 8 - auto-queue does not rotate deferred active run activations
+  ---
+  duration_ms: 7.166968
+  type: 'test'
+  ...
+# Subtest: auto-queue marks pending entries skipped when a card progresses externally into a dispatchable state
+ok 9 - auto-queue marks pending entries skipped when a card progresses externally into a dispatchable state
+  ---
+  duration_ms: 6.036225
+  type: 'test'
+  ...
+# Subtest: quality gate pass: emits agent action for valid candidate
+ok 10 - quality gate pass: emits agent action for valid candidate
+  ---
+  duration_ms: 11.720773
+  type: 'test'
+  ...
+# Subtest: normalized provider candidate_review emits agent action
+ok 11 - normalized provider candidate_review emits agent action
+  ---
+  duration_ms: 1.964867
+  type: 'test'
+  ...
+# Subtest: already approved candidate is skipped without re-emitting
+ok 12 - already approved candidate is skipped without re-emitting
+  ---
+  duration_ms: 3.397691
+  type: 'test'
+  ...
+# Subtest: evidence_age reject: candidate older than 48h is rejected at quality gate
+ok 13 - evidence_age reject: candidate older than 48h is rejected at quality gate
+  ---
+  duration_ms: 1.471798
+  type: 'test'
+  ...
+# Subtest: invalid last_seen_at is rejected at quality gate
+ok 14 - invalid last_seen_at is rejected at quality gate
+  ---
+  duration_ms: 1.326271
+  type: 'test'
+  ...
+# Subtest: previously emitted candidate is not re-emitted on second tick
+ok 15 - previously emitted candidate is not re-emitted on second tick
+  ---
+  duration_ms: 7.628119
+  type: 'test'
+  ...
+# Subtest: emitted candidate is retried when durable approval is still missing
+ok 16 - emitted candidate is retried when durable approval is still missing
+  ---
+  duration_ms: 4.875035
+  type: 'test'
+  ...
+# Subtest: multiple review observations only mark the emitted candidate
+ok 17 - multiple review observations only mark the emitted candidate
+  ---
+  duration_ms: 22.625816
+  type: 'test'
+  ...
+# Subtest: approved candidate triggers agent dispatch with GitHub Issue prompt
+ok 18 - approved candidate triggers agent dispatch with GitHub Issue prompt
+  ---
+  duration_ms: 12.271176
+  type: 'test'
+  ...
+# Subtest: normalized approved observation triggers agent dispatch
+ok 19 - normalized approved observation triggers agent dispatch
+  ---
+  duration_ms: 15.935152
+  type: 'test'
+  ...
+# Subtest: already dispatched candidate is skipped
+ok 20 - already dispatched candidate is skipped
+  ---
+  duration_ms: 15.230199
+  type: 'test'
+  ...
+# Subtest: durable dispatched observation preserves marker timestamp
+ok 21 - durable dispatched observation preserves marker timestamp
+  ---
+  duration_ms: 4.354243
+  type: 'test'
+  ...
+# Subtest: no approved candidates returns complete with empty summary
+ok 22 - no approved candidates returns complete with empty summary
+  ---
+  duration_ms: 8.899457
+  type: 'test'
+  ...
+# Subtest: kanban-rules preflight returns already_applied when the linked GitHub issue is closed
+ok 23 - kanban-rules preflight returns already_applied when the linked GitHub issue is closed
+  ---
+  duration_ms: 5.34248
+  type: 'test'
+  ...
+# Subtest: kanban-rules skips preflight once for api_reopen cards and preserves other metadata
+ok 24 - kanban-rules skips preflight once for api_reopen cards and preserves other metadata
+  ---
+  duration_ms: 2.843768
+  type: 'test'
+  ...
+# Subtest: kanban-rules preflight already_applied transitions the card to done and skips pending queue entries
+ok 25 - kanban-rules preflight already_applied transitions the card to done and skips pending queue entries
+  ---
+  duration_ms: 2.768607
+  type: 'test'
+  ...
+# Subtest: kanban-rules sends completed rework dispatches directly back to review
+ok 26 - kanban-rules sends completed rework dispatches directly back to review
+  ---
+  duration_ms: 3.183605
+  type: 'test'
+  ...
+# Subtest: kanban-rules marks DoD-only gate failures as awaiting_dod instead of escalating immediately
+ok 27 - kanban-rules marks DoD-only gate failures as awaiting_dod instead of escalating immediately
+  ---
+  duration_ms: 3.175109
+  type: 'test'
+  ...
+# Subtest: kanban-rules _loadCardAlertContext uses typed facade agentdesk.cards.get
+ok 28 - kanban-rules _loadCardAlertContext uses typed facade agentdesk.cards.get
+  ---
+  duration_ms: 1.577151
+  type: 'test'
+  ...
+# Subtest: merge automation blocks tracked PR when required phase evidence is missing for head SHA
+ok 29 - merge automation blocks tracked PR when required phase evidence is missing for head SHA
+  ---
+  duration_ms: 25.588216
+  type: 'test'
+  ...
+# Subtest: merge automation accepts tracked PR when CI and all required phase evidence pass
+ok 30 - merge automation accepts tracked PR when CI and all required phase evidence pass
+  ---
+  duration_ms: 6.491167
+  type: 'test'
+  ...
+# Subtest: phase_gate registry installs with built-in gates
+ok 31 - phase_gate registry installs with built-in gates
+  ---
+  duration_ms: 6.904474
+  type: 'test'
+  ...
+# Subtest: phase_gate evaluate returns unregistered for unknown gates
+ok 32 - phase_gate evaluate returns unregistered for unknown gates
+  ---
+  duration_ms: 1.762014
+  type: 'test'
+  ...
+# Subtest: phase_gate merge_verified built-in reads pr_merge_verified_at
+ok 33 - phase_gate merge_verified built-in reads pr_merge_verified_at
+  ---
+  duration_ms: 7.73143
+  type: 'test'
+  ...
+# Subtest: phase_gate custom register overrides and returns reason on failure
+ok 34 - phase_gate custom register overrides and returns reason on failure
+  ---
+  duration_ms: 1.481385
+  type: 'test'
+  ...
+# Subtest: phase_gate evaluate wraps thrown errors
+ok 35 - phase_gate evaluate wraps thrown errors
+  ---
+  duration_ms: 1.475859
+  type: 'test'
+  ...
+# Subtest: pipeline phase 1: recommender accumulates evidence and escalates candidate
+ok 36 - pipeline phase 1: recommender accumulates evidence and escalates candidate
+  ---
+  duration_ms: 12.594365
+  type: 'test'
+  ...
+# Subtest: pipeline phase 2: detector quality-gates candidate_review and emits agent
+ok 37 - pipeline phase 2: detector quality-gates candidate_review and emits agent
+  ---
+  duration_ms: 2.423778
+  type: 'test'
+  ...
+# Subtest: pipeline phase 3: executor dispatches approved candidate and does not pre-mark dispatched
+ok 38 - pipeline phase 3: executor dispatches approved candidate and does not pre-mark dispatched
+  ---
+  duration_ms: 2.014768
+  type: 'test'
+  ...
+# Subtest: pipeline phase 4: executor skips candidate once durable dispatched kv_meta is observed
+ok 39 - pipeline phase 4: executor skips candidate once durable dispatched kv_meta is observed
+  ---
+  duration_ms: 1.688121
+  type: 'test'
+  ...
+# Subtest: pipeline phase 5: recommender suppresses re-recommendation after dispatched kv_meta observed
+ok 40 - pipeline phase 5: recommender suppresses re-recommendation after dispatched kv_meta observed
+  ---
+  duration_ms: 2.327535
+  type: 'test'
+  ...
+# Subtest: pipeline phase 6: full sequential recommender→detector→executor flow
+ok 41 - pipeline phase 6: full sequential recommender→detector→executor flow
+  ---
+  duration_ms: 5.879243
+  type: 'test'
+  ...
+# Subtest: pipeline: normalized kv_meta obs (key+evidence_ref) works across all three routines
+ok 42 - pipeline: normalized kv_meta obs (key+evidence_ref) works across all three routines
+  ---
+  duration_ms: 2.490044
+  type: 'test'
+  ...
+# Subtest: same evidence_ref is deduped on consecutive ticks
+ok 43 - same evidence_ref is deduped on consecutive ticks
+  ---
+  duration_ms: 9.204261
+  type: 'test'
+  ...
+# Subtest: dedup hit refreshes seen_evidence timestamp for LRU
+ok 44 - dedup hit refreshes seen_evidence timestamp for LRU
+  ---
+  duration_ms: 2.300191
+  type: 'test'
+  ...
+# Subtest: rolling grouped evidence scores only newly increased occurrences
+ok 45 - rolling grouped evidence scores only newly increased occurrences
+  ---
+  duration_ms: 2.053045
+  type: 'test'
+  ...
+# Subtest: rolling grouped evidence tracks the latest observed count after a window drop
+ok 46 - rolling grouped evidence tracks the latest observed count after a window drop
+  ---
+  duration_ms: 3.930386
+  type: 'test'
+  ...
+# Subtest: evidence is re-scored after 25h TTL expires
+ok 47 - evidence is re-scored after 25h TTL expires
+  ---
+  duration_ms: 2.029405
+  type: 'test'
+  ...
+# Subtest: seen_evidence LRU cap trims entries above 500
+ok 48 - seen_evidence LRU cap trims entries above 500
+  ---
+  duration_ms: 4.693189
+  type: 'test'
+  ...
+# Subtest: composite key deduplication works when evidence_ref is absent
+ok 49 - composite key deduplication works when evidence_ref is absent
+  ---
+  duration_ms: 3.365148
+  type: 'test'
+  ...
+# Subtest: multiple distinct evidence_refs are each scored independently
+ok 50 - multiple distinct evidence_refs are each scored independently
+  ---
+  duration_ms: 2.277561
+  type: 'test'
+  ...
+# Subtest: fast-fail: 2 consecutive all-dedup ticks trigger reopt
+ok 51 - fast-fail: 2 consecutive all-dedup ticks trigger reopt
+  ---
+  duration_ms: 9.46495
+  type: 'test'
+  ...
+# Subtest: EMA tier: 5 consecutive low-ema ticks trigger reopt
+ok 52 - EMA tier: 5 consecutive low-ema ticks trigger reopt
+  ---
+  duration_ms: 2.525367
+  type: 'test'
+  ...
+# Subtest: EMA calculation: scored=1 produces ema≈0.1 from zero
+ok 53 - EMA calculation: scored=1 produces ema≈0.1 from zero
+  ---
+  duration_ms: 2.932549
+  type: 'test'
+  ...
+# Subtest: partial seen_evidence reset removes old entries that were not just refreshed
+ok 54 - partial seen_evidence reset removes old entries that were not just refreshed
+  ---
+  duration_ms: 5.210655
+  type: 'test'
+  ...
+# Subtest: diversity mode activates after reopt and decrements each tick
+ok 55 - diversity mode activates after reopt and decrements each tick
+  ---
+  duration_ms: 2.830485
+  type: 'test'
+  ...
+# Subtest: saturation counters reset after reopt
+ok 56 - saturation counters reset after reopt
+  ---
+  duration_ms: 2.088913
+  type: 'test'
+  ...
+# Subtest: scoring_summary includes ema_scored, saturation_ticks, reopt_count fields
+ok 57 - scoring_summary includes ema_scored, saturation_ticks, reopt_count fields
+  ---
+  duration_ms: 1.905877
+  type: 'test'
+  ...
+# Subtest: candidate_dispatched obs suppresses re-recommendation (REQ-P1-004)
+ok 58 - candidate_dispatched obs suppresses re-recommendation (REQ-P1-004)
+  ---
+  duration_ms: 5.348437
+  type: 'test'
+  ...
+# Subtest: review-automation immediately terminals cards when review_enabled is false
+ok 59 - review-automation immediately terminals cards when review_enabled is false
+  ---
+  duration_ms: 7.404246
+  type: 'test'
+  ...
+# Subtest: review-automation auto-approves review entry when the assigned agent has no counter-model channel
+ok 60 - review-automation auto-approves review entry when the assigned agent has no counter-model channel
+  ---
+  duration_ms: 2.085266
+  type: 'test'
+  ...
+# Subtest: review-automation keeps canonical review state but defers dispatch creation while active work still exists
+ok 61 - review-automation keeps canonical review state but defers dispatch creation while active work still exists
+  ---
+  duration_ms: 4.123943
+  type: 'test'
+  ...
+# Subtest: review-automation creates a review-decision dispatch when an auto-completed review has no verdict
+ok 62 - review-automation creates a review-decision dispatch when an auto-completed review has no verdict
+  ---
+  duration_ms: 2.991858
+  type: 'test'
+  ...
+# Subtest: review-automation noop verification passes go terminal without creating a PR dispatch
+ok 63 - review-automation noop verification passes go terminal without creating a PR dispatch
+  ---
+  duration_ms: 3.063296
+  type: 'test'
+  ...
+# Subtest: timeouts helper module parses session channel names
+ok 64 - timeouts helper module parses session channel names
+  ---
+  duration_ms: 16.854367
+  type: 'test'
+  ...
+# Subtest: timeouts helper module identifies synthetic missing-inflight reattach placeholders
+ok 65 - timeouts helper module identifies synthetic missing-inflight reattach placeholders
+  ---
+  duration_ms: 4.348895
+  type: 'test'
+  ...
+# Subtest: timeouts helper module ignores synthetic reattach placeholders for inflight progress
+ok 66 - timeouts helper module ignores synthetic reattach placeholders for inflight progress
+  ---
+  duration_ms: 8.361624
+  type: 'test'
+  ...
+# Subtest: timeouts reconciliation module scans pending fallback dispatch keys
+ok 67 - timeouts reconciliation module scans pending fallback dispatch keys
+  ---
+  duration_ms: 5.310267
+  type: 'test'
+  ...
+# Subtest: timeouts card timeout module marks requested dispatches failed before retry
+ok 68 - timeouts card timeout module marks requested dispatches failed before retry
+  ---
+  duration_ms: 7.545426
+  type: 'test'
+  ...
+# Subtest: timeouts review timeout module escalates overdue DoD waits
+ok 69 - timeouts review timeout module escalates overdue DoD waits
+  ---
+  duration_ms: 10.097076
+  type: 'test'
+  ...
+# Subtest: timeouts review auto-accept module creates rework dispatches before transitioning
+ok 70 - timeouts review auto-accept module creates rework dispatches before transitioning
+  ---
+  duration_ms: 10.987327
+  type: 'test'
+  ...
+# Subtest: timeouts dispatch maintenance module re-enqueues unnotified pending dispatches
+ok 71 - timeouts dispatch maintenance module re-enqueues unnotified pending dispatches
+  ---
+  duration_ms: 5.585097
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor module checks tmux live panes exactly
+ok 72 - timeouts active monitor module checks tmux live panes exactly
+  ---
+  duration_ms: 5.865166
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor module treats synthetic reattach placeholders as absent
+ok 73 - timeouts active monitor module treats synthetic reattach placeholders as absent
+  ---
+  duration_ms: 9.985456
+  type: 'test'
+  ...
+# Subtest: timeouts orphan dispatch module emits orphan recovery signals
+ok 74 - timeouts orphan dispatch module emits orphan recovery signals
+  ---
+  duration_ms: 3.541716
+  type: 'test'
+  ...
+# Subtest: timeouts long turn monitor module alerts every 30-minute threshold
+ok 75 - timeouts long turn monitor module alerts every 30-minute threshold
+  ---
+  duration_ms: 3.925376
+  type: 'test'
+  ...
+# Subtest: timeouts long turn monitor module skips synthetic reattach placeholders
+ok 76 - timeouts long turn monitor module skips synthetic reattach placeholders
+  ---
+  duration_ms: 2.131262
+  type: 'test'
+  ...
+# Subtest: timeouts long turn monitor module skips repeated 30-minute threshold
+ok 77 - timeouts long turn monitor module skips repeated 30-minute threshold
+  ---
+  duration_ms: 2.710642
+  type: 'test'
+  ...
+# Subtest: timeouts long turn monitor module uses configured alert interval
+ok 78 - timeouts long turn monitor module uses configured alert interval
+  ---
+  duration_ms: 2.413579
+  type: 'test'
+  ...
+# Subtest: timeouts workspace branch guard module recovers wt branches
+ok 79 - timeouts workspace branch guard module recovers wt branches
+  ---
+  duration_ms: 3.256271
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module calls force-kill API for expired idle sessions
+ok 80 - timeouts idle-kill module calls force-kill API for expired idle sessions
+  ---
+  duration_ms: 3.49903
+  type: 'test'
+  ...
+1..80
+# tests 80
+# suites 0
+# pass 80
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 944.055418
