@@ -1,0 +1,15 @@
+Summary:
+Generated inventory drift detected in module inventory due to line changes in `src/db/auto_queue.rs` and `src/services/discord/placeholder_live_events/context_panel.rs`. Ran the generator script to reconcile the source of truth.
+
+## Boundary fingerprint
+- Agent: Scribe
+- Boundary: Generated Module Inventory
+- Primary files: `docs/generated/module-inventory.md`
+- Invariant: Module inventory must match actual codebase source lines
+- Search terms: generate_inventory_docs.py
+- Related PRs/issues checked: No direct overlapping PR currently open for Scribe and `docs/generated/module-inventory.md` based on manual review. Open PRs for Cartographer-Lite exist for `generated inventory docs`, but Scribe is explicitly instructed to update stale inventories when code behavior changed but docs are stale (daily stop condition: "update a PR-blocking generated inventory drift").
+- Why this is non-overlapping: This resolves the specific CI failure for inventory drift detected in `python3 scripts/generate_inventory_docs.py --check`.
+
+Verification:
+- `python3 scripts/generate_inventory_docs.py --check` passed.
+- `cargo check --config 'build.rustc-wrapper=""' --all-targets` passed.
