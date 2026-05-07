@@ -58,7 +58,6 @@ module.exports = function attachIdleKill(timeouts, helpers) {
 
       var now = Date.now();
       var processed = {};
-      var killedCount = 0;
 
       function forceKillIdleSessions(sessions, minimumIdleMinutes, reasonLabel, maxKills) {
         var killedCount = 0;
