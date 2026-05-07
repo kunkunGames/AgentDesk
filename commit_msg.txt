@@ -1,0 +1,31 @@
+🧩 FacadePilot: replace raw policy DB access in loadPhaseGateCardLabel
+
+Summary
+Replaced a raw `agentdesk.db.query` call with the typed `agentdesk.cards.get` facade in `loadPhaseGateCardLabel` within `policies/auto-queue.js`. Also added a dedicated regression test to verify the updated behavior.
+
+Policy/facade invariant
+`loadPhaseGateCardLabel` must correctly resolve card titles and issue numbers without performing raw `SELECT` queries on `kanban_cards`.
+
+Slice or facade function affected
+`policies/auto-queue.js` (`loadPhaseGateCardLabel`)
+
+Behavior preserved
+The function still returns `unknown card` if the ID is falsy, defaults to the given ID if the card doesn't exist or lacks a title, and correctly formats strings matching `#<issue_number> <title>` if `github_issue_number` is present.
+
+Tests added
+`policies/__tests__/auto-queue-facade.test.js`
+
+Verification commands and results
+`npm run test:policies` (Passed, 90 tests total)
+`cargo check --config 'build.rustc-wrapper=""' --all-targets` (Passed)
+
+Blocked verification
+None
+
+## Boundary fingerprint
+- Agent: FacadePilot
+- Boundary: auto-queue phase gate label formatting
+- Primary files: `policies/auto-queue.js`, `policies/__tests__/auto-queue-facade.test.js`
+- Policy/facade invariant: `loadPhaseGateCardLabel` does not call `agentdesk.db.query`.
+- Related PRs/issues checked: No overlapping open branches or PRs touching `policies/auto-queue.js` phase gates or `agentdesk.cards.get`.
+- Why this is non-overlapping: Other open PRs affect pipeline, card alert context, and dashboard/UI, completely isolating this change.
