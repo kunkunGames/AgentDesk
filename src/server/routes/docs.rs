@@ -2217,6 +2217,38 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "reviews",
             "Trigger rework for review // TODO: example",
         ),
+        ep(
+            "POST",
+            "/api/reviews/recovery",
+            "reviews",
+            "Recover a review dispatch target commit/worktree after stale cwd or incorrect metadata.",
+        )
+        .with_params([
+            ("dispatch_id", body_param("string", false, "Review dispatch ID")),
+            (
+                "card_id",
+                body_param("string", false, "Kanban card ID; resolves the latest active or failed review dispatch when dispatch_id is omitted"),
+            ),
+            (
+                "target_commit",
+                body_param("string", false, "Reviewed commit SHA to pin; must reference or belong to the card issue"),
+            ),
+            (
+                "worktree_path",
+                body_param("string", false, "Worktree path whose HEAD must match target_commit; used to infer target_commit when omitted"),
+            ),
+            ("reason", body_param("string", false, "Operator reason recorded in audit payload")),
+        ])
+        .with_example(
+            json!({"body": {"dispatch_id": "review-1874-r1", "target_commit": "abc1234", "worktree_path": "/Users/me/.adk/release/workspaces/agentdesk-issue-1874", "reason": "stale cwd correction"}}),
+            json!({"ok": true, "dispatch_id": "review-1874-r1", "card_id": "card-1874", "from_status": "failed", "to_status": "pending", "target": {"reviewed_commit": "abc1234", "worktree_path": "/Users/me/.adk/release/workspaces/agentdesk-issue-1874", "branch": "fix/1874-review-recovery-endpoint"}, "cleared_failure_markers": 2}),
+        )
+        .with_error_example(
+            422,
+            json!({"body": {"dispatch_id": "review-1874-r1", "target_commit": "def9999"}}),
+            json!({"error": "target_commit def9999 does not reference or belong to card card-1874"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/reviews/recovery -H 'Content-Type: application/json' -d '{\"dispatch_id\":\"review-1874-r1\",\"target_commit\":\"abc1234\",\"worktree_path\":\"/Users/me/.adk/release/workspaces/agentdesk-issue-1874\",\"reason\":\"stale cwd correction\"}'"),
         ep("GET", "/api/dispatches", "dispatches", "List dispatches")
             .with_params([
                 (
@@ -3523,7 +3555,11 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_params([
             (
                 "repo",
-                query_param("string", false, "Restrict status view to a repo"),
+                query_param(
+                    "string",
+                    false,
+                    "Restrict status view to a repository id; use agent_id for agent filters",
+                ),
             ),
             (
                 "agent_id",
@@ -3592,7 +3628,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "PATCH",
             "/api/queue/entries/{id}",
             "auto-queue",
-            "Update one pending auto-queue entry",
+            "Update one auto-queue entry or reconcile a failed terminal entry",
         )
         .with_params([
             ("id", path_param("Auto-queue entry ID")),
@@ -3608,10 +3644,22 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 "priority_rank",
                 body_param("number", false, "Set the entry's rank within its group"),
             ),
+            (
+                "status",
+                body_param(
+                    "string",
+                    false,
+                    "Manual status update: pending, skipped, or done only when reconciling a failed entry whose card is done and completed_commit evidence exists",
+                ),
+            ),
         ])
         .with_example(
             json!({"path": {"id": "entry-1"}, "body": {"thread_group": 1, "batch_phase": 2, "priority_rank": 0}}),
             json!({"ok": true, "entry": {"id": "entry-1", "thread_group": 1, "batch_phase": 2, "priority_rank": 0, "status": "pending"}}),
+        )
+        .with_example(
+            json!({"path": {"id": "entry-failed"}, "body": {"status": "done"}}),
+            json!({"ok": true, "entry": {"id": "entry-failed", "status": "done", "card_id": "card-1794", "github_issue_number": 1794}}),
         ),
         ep(
             "PATCH",

@@ -75,6 +75,10 @@ pub enum ConsultationDispatchRecordError {
 }
 
 const SLOT_ALLOCATION_MAX_RETRIES: usize = 16;
+// Give the provider bridge a short cleanup window after a terminal turn before
+// reusing the same slot/thread. The auto-queue tick retries roughly every
+// minute, so 45s avoids immediate same-thread delivery without adding another
+// full tick of avoidable delay in the common case.
 pub const SLOT_TERMINAL_DISPATCH_COOLDOWN_SECONDS: i64 = 45;
 
 #[derive(Debug, Clone)]
@@ -310,6 +314,118 @@ pub async fn record_entry_dispatch_failure_on_pg(
             changed: true,
         });
     }
+}
+
+fn dispatch_json_field(document: Option<&str>, field: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(document?).ok()?;
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn dispatch_completed_commit(result: Option<&str>, context: Option<&str>) -> Option<String> {
+    dispatch_json_field(result, "completed_commit")
+        .or_else(|| dispatch_json_field(context, "completed_commit"))
+}
+
+pub async fn reconcile_failed_entry_done_on_pg(
+    pool: &PgPool,
+    entry_id: &str,
+    trigger_source: &str,
+) -> Result<EntryStatusUpdateResult, String> {
+    let row = sqlx::query(
+        "SELECT e.status AS entry_status,
+                c.status AS card_status,
+                d.id AS dispatch_id,
+                d.status AS dispatch_status,
+                d.result AS dispatch_result,
+                d.context AS dispatch_context
+         FROM auto_queue_entries e
+         LEFT JOIN kanban_cards c ON c.id = e.kanban_card_id
+         LEFT JOIN LATERAL (
+             SELECT td.id, td.status, td.result, td.context, td.completed_at, td.created_at
+             FROM task_dispatches td
+             WHERE td.kanban_card_id = e.kanban_card_id
+               AND (
+                   td.id = e.dispatch_id
+                   OR td.id = c.latest_dispatch_id
+                   OR EXISTS (
+                       SELECT 1
+                       FROM auto_queue_entry_dispatch_history h
+                       WHERE h.entry_id = e.id
+                         AND h.dispatch_id = td.id
+                   )
+               )
+             ORDER BY (td.status = 'completed') DESC,
+                      td.completed_at DESC NULLS LAST,
+                      td.created_at DESC
+             LIMIT 1
+         ) d ON TRUE
+         WHERE e.id = $1",
+    )
+    .bind(entry_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("load auto-queue entry {entry_id} reconciliation state: {error}"))?;
+
+    let Some(row) = row else {
+        return Err(format!("auto-queue entry not found: {entry_id}"));
+    };
+
+    let entry_status: String = row
+        .try_get("entry_status")
+        .map_err(|error| format!("decode auto-queue entry {entry_id} status: {error}"))?;
+    if entry_status != ENTRY_STATUS_FAILED {
+        return Err(format!(
+            "cannot reconcile auto-queue entry {entry_id} as done from status {entry_status}"
+        ));
+    }
+
+    let card_status: Option<String> = row
+        .try_get("card_status")
+        .map_err(|error| format!("decode auto-queue entry {entry_id} card status: {error}"))?;
+    if card_status.as_deref() != Some(ENTRY_STATUS_DONE) {
+        return Err(format!(
+            "cannot reconcile auto-queue entry {entry_id} as done unless its card is done"
+        ));
+    }
+
+    let dispatch_id: Option<String> = row
+        .try_get("dispatch_id")
+        .map_err(|error| format!("decode auto-queue entry {entry_id} dispatch id: {error}"))?;
+    let dispatch_status: Option<String> = row
+        .try_get("dispatch_status")
+        .map_err(|error| format!("decode auto-queue entry {entry_id} dispatch status: {error}"))?;
+    if dispatch_id.is_none() || dispatch_status.as_deref() != Some("completed") {
+        return Err(format!(
+            "cannot reconcile auto-queue entry {entry_id} as done without a completed dispatch"
+        ));
+    }
+
+    let dispatch_result: Option<String> = row
+        .try_get("dispatch_result")
+        .map_err(|error| format!("decode auto-queue entry {entry_id} dispatch result: {error}"))?;
+    let dispatch_context: Option<String> = row
+        .try_get("dispatch_context")
+        .map_err(|error| format!("decode auto-queue entry {entry_id} dispatch context: {error}"))?;
+    if dispatch_completed_commit(dispatch_result.as_deref(), dispatch_context.as_deref()).is_none()
+    {
+        return Err(format!(
+            "cannot reconcile auto-queue entry {entry_id} as done without completed_commit evidence"
+        ));
+    }
+
+    update_entry_status_on_pg(
+        pool,
+        entry_id,
+        ENTRY_STATUS_DONE,
+        trigger_source,
+        &EntryStatusUpdateOptions::default(),
+    )
+    .await
 }
 
 pub async fn update_entry_status_on_pg(
@@ -1239,6 +1355,10 @@ pub struct StatusFilter {
     pub agent_id: Option<String>,
 }
 
+fn normalized_status_filter_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct BacklogCardRecord {
     pub card_id: String,
@@ -1316,14 +1436,33 @@ pub async fn find_latest_run_id_pg(
     pool: &PgPool,
     filter: &StatusFilter,
 ) -> Result<Option<String>, sqlx::Error> {
-    let repo = filter.repo.as_deref().filter(|value| !value.is_empty());
-    let agent_id = filter.agent_id.as_deref().filter(|value| !value.is_empty());
+    let repo = normalized_status_filter_value(filter.repo.as_deref());
+    let agent_id = normalized_status_filter_value(filter.agent_id.as_deref());
 
     sqlx::query_scalar::<_, String>(
         "SELECT id
-         FROM auto_queue_runs
-         WHERE ($1::TEXT IS NULL OR repo = $1 OR repo IS NULL OR repo = '')
-           AND ($2::TEXT IS NULL OR agent_id = $2 OR agent_id IS NULL OR agent_id = '')
+         FROM auto_queue_runs r
+         WHERE (
+             $1::TEXT IS NULL
+             OR r.repo = $1
+             OR EXISTS (
+                 SELECT 1
+                 FROM auto_queue_entries e
+                 JOIN kanban_cards kc ON kc.id = e.kanban_card_id
+                 WHERE e.run_id = r.id
+                   AND kc.repo_id = $1
+             )
+         )
+           AND (
+             $2::TEXT IS NULL
+             OR r.agent_id = $2
+             OR EXISTS (
+                 SELECT 1
+                 FROM auto_queue_entries e
+                 WHERE e.run_id = r.id
+                   AND e.agent_id = $2
+             )
+         )
          ORDER BY created_at DESC
          LIMIT 1",
     )
@@ -1411,8 +1550,8 @@ pub async fn list_status_entries_pg(
     run_id: &str,
     filter: &StatusFilter,
 ) -> Result<Vec<StatusEntryRecord>, sqlx::Error> {
-    let agent_id = filter.agent_id.as_deref().filter(|value| !value.is_empty());
-    let repo = filter.repo.as_deref().filter(|value| !value.is_empty());
+    let agent_id = normalized_status_filter_value(filter.agent_id.as_deref());
+    let repo = normalized_status_filter_value(filter.repo.as_deref());
 
     let rows = sqlx::query(
         "SELECT e.id,
@@ -1464,8 +1603,8 @@ pub async fn list_run_history_pg(
     filter: &StatusFilter,
     limit: usize,
 ) -> Result<Vec<AutoQueueRunHistoryRecord>, sqlx::Error> {
-    let repo = filter.repo.as_deref().filter(|value| !value.is_empty());
-    let agent_id = filter.agent_id.as_deref().filter(|value| !value.is_empty());
+    let repo = normalized_status_filter_value(filter.repo.as_deref());
+    let agent_id = normalized_status_filter_value(filter.agent_id.as_deref());
     let limit = limit.clamp(1, 20) as i64;
 
     let rows = sqlx::query(
@@ -2301,6 +2440,15 @@ fn active_dispatch_slot_guard_sql(agent_expr: &str, slot_expr: &str) -> String {
                AND COALESCE(NULLIF((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1) = {slot_expr}
                AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
                AND (COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->'phase_gate' IS NULL
+               AND (
+                   COALESCE(d.dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
+                   OR EXISTS (
+                       SELECT 1
+                       FROM sessions s
+                       WHERE s.active_dispatch_id = d.id
+                         AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
+                   )
+               )
          )"
     )
 }
@@ -2315,6 +2463,15 @@ fn active_dispatch_slot_exists_sql(agent_expr: &str, slot_expr: &str) -> String 
                AND COALESCE(NULLIF((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1) = {slot_expr}
                AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
                AND (COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->'phase_gate' IS NULL
+               AND (
+                   COALESCE(d.dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
+                   OR EXISTS (
+                       SELECT 1
+                       FROM sessions s
+                       WHERE s.active_dispatch_id = d.id
+                         AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
+                   )
+               )
          )"
     )
 }
@@ -2403,7 +2560,8 @@ pub async fn allocate_slot_for_group_agent_pg(
 
         let reusable_slot_guard = active_dispatch_slot_guard_sql("s.agent_id", "s.slot_index");
         let reusable_slot_query = format!(
-            "SELECT s.slot_index::BIGINT
+            "SELECT s.slot_index::BIGINT,
+                    s.assigned_thread_group::BIGINT
              FROM auto_queue_slots s
              WHERE s.agent_id = $1
                AND s.assigned_run_id = $2
@@ -2420,18 +2578,30 @@ pub async fn allocate_slot_for_group_agent_pg(
              ORDER BY s.slot_index ASC
              LIMIT 1"
         );
-        let reusable_slot = sqlx::query_scalar::<_, i64>(&reusable_slot_query)
-        .bind(agent_id)
-        .bind(run_id)
-        .bind(thread_group)
-        .fetch_optional(pool)
-        .await
-        .map_err(|error| {
-            format!(
-                "inspect reusable postgres slot for run {run_id} agent {agent_id} group {thread_group}: {error}"
-            )
-        })?;
-        if let Some(slot_index) = reusable_slot {
+        let reusable_slot = sqlx::query(&reusable_slot_query)
+            .bind(agent_id)
+            .bind(run_id)
+            .bind(thread_group)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                format!(
+                    "inspect reusable postgres slot for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                )
+            })?;
+        if let Some(reusable_slot) = reusable_slot {
+            let slot_index = reusable_slot.try_get::<i64, _>("slot_index").map_err(|error| {
+                format!(
+                    "decode reusable postgres slot index for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                )
+            })?;
+            let previous_thread_group = reusable_slot
+                .try_get::<Option<i64>, _>("assigned_thread_group")
+                .map_err(|error| {
+                    format!(
+                        "decode reusable postgres slot previous group for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                    )
+                })?;
             let rebound_slot_guard = active_dispatch_slot_guard_sql(
                 "auto_queue_slots.agent_id",
                 "auto_queue_slots.slot_index",
@@ -2472,6 +2642,55 @@ pub async fn allocate_slot_for_group_agent_pg(
                     return Err(format!(
                         "slot allocation retry limit exceeded for run {run_id} agent {agent_id} group {thread_group} after {attempt} attempts"
                     ));
+                }
+                continue;
+            }
+
+            let slot_busy = slot_has_active_dispatch_pg(pool, agent_id, slot_index)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "inspect rebound postgres slot {slot_index} active dispatch for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                    )
+                })?;
+            if slot_busy {
+                tracing::warn!(
+                    run_id,
+                    agent_id,
+                    thread_group,
+                    slot_index,
+                    "[auto-queue] rebound slot raced with active dispatch; restoring previous group"
+                );
+                let restored = sqlx::query(
+                    "UPDATE auto_queue_slots
+                     SET assigned_thread_group = $1,
+                         updated_at = NOW()
+                     WHERE agent_id = $2
+                       AND slot_index = $3
+                       AND assigned_run_id = $4
+                       AND COALESCE(assigned_thread_group, -1) = $5",
+                )
+                .bind(previous_thread_group)
+                .bind(agent_id)
+                .bind(slot_index)
+                .bind(run_id)
+                .bind(thread_group)
+                .execute(pool)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "restore raced rebound postgres slot {slot_index} for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                    )
+                })?
+                .rows_affected();
+                if restored == 0 {
+                    tracing::warn!(
+                        run_id,
+                        agent_id,
+                        thread_group,
+                        slot_index,
+                        "[auto-queue] failed to restore raced rebound slot"
+                    );
                 }
                 continue;
             }
@@ -2587,6 +2806,55 @@ pub async fn allocate_slot_for_group_agent_pg(
             continue;
         }
 
+        let slot_busy = slot_has_active_dispatch_pg(pool, agent_id, slot_index)
+            .await
+            .map_err(|error| {
+                format!(
+                    "inspect claimed postgres slot {slot_index} active dispatch for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                )
+            })?;
+        if slot_busy {
+            tracing::warn!(
+                run_id,
+                agent_id,
+                thread_group,
+                slot_index,
+                "[auto-queue] claimed free slot raced with active dispatch; releasing claim"
+            );
+            let released = sqlx::query(
+                "UPDATE auto_queue_slots
+                 SET assigned_run_id = NULL,
+                     assigned_thread_group = NULL,
+                     updated_at = NOW()
+                 WHERE agent_id = $1
+                   AND slot_index = $2
+                   AND assigned_run_id = $3
+                   AND COALESCE(assigned_thread_group, -1) = $4",
+            )
+            .bind(agent_id)
+            .bind(slot_index)
+            .bind(run_id)
+            .bind(thread_group)
+            .execute(pool)
+            .await
+            .map_err(|error| {
+                format!(
+                    "release raced claimed postgres slot {slot_index} for run {run_id} agent {agent_id} group {thread_group}: {error}"
+                )
+            })?
+            .rows_affected();
+            if released == 0 {
+                tracing::warn!(
+                    run_id,
+                    agent_id,
+                    thread_group,
+                    slot_index,
+                    "[auto-queue] failed to release raced claimed free slot"
+                );
+            }
+            continue;
+        }
+
         bind_slot_index_for_group_entries_pg(pool, run_id, agent_id, thread_group, slot_index)
             .await
             .map_err(|error| {
@@ -2670,7 +2938,16 @@ pub async fn slot_has_active_dispatch_excluding_pg(
            AND COALESCE(NULLIF((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'slot_index', '')::BIGINT, -1) = $2
            AND COALESCE(((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
            AND (COALESCE(NULLIF(context, ''), '{}')::jsonb)->'phase_gate' IS NULL
-           AND id != $3",
+           AND id != $3
+           AND (
+               COALESCE(dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
+               OR EXISTS (
+                   SELECT 1
+                   FROM sessions s
+                   WHERE s.active_dispatch_id = task_dispatches.id
+                     AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
+               )
+           )",
     )
     .bind(agent_id)
     .bind(slot_index)
@@ -2802,6 +3079,12 @@ fn is_allowed_entry_transition(from_status: &str, to_status: &str, trigger_sourc
     if from_status == ENTRY_STATUS_DONE
         && to_status == ENTRY_STATUS_DISPATCHED
         && matches!(trigger_source, "pmd_reopen" | "rereview_dispatch")
+    {
+        return true;
+    }
+    if from_status == ENTRY_STATUS_FAILED
+        && to_status == ENTRY_STATUS_DONE
+        && trigger_source == "manual_terminal_reconcile"
     {
         return true;
     }
@@ -3278,7 +3561,7 @@ mod dispatch_terminal_sync_pg_tests {
         update_entry_status_on_pg,
     };
     use chrono::{DateTime, Utc};
-    use sqlx::{PgPool, Row};
+    use sqlx::{Connection, PgConnection, PgPool, Row};
 
     struct TestPostgresDb {
         _lock: crate::db::postgres::PostgresTestLifecycleGuard,
@@ -3469,6 +3752,157 @@ mod dispatch_terminal_sync_pg_tests {
         .expect("slot row")
     }
 
+    async fn slot_group(pool: &PgPool, agent_id: &str, slot_index: i64) -> Option<i64> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT assigned_thread_group
+             FROM auto_queue_slots
+             WHERE agent_id = $1 AND slot_index = $2",
+        )
+        .bind(agent_id)
+        .bind(slot_index)
+        .fetch_one(pool)
+        .await
+        .expect("slot row")
+    }
+
+    async fn seed_active_slot_dispatch(pool: &PgPool, dispatch_id: &str, slot_index: i64) {
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, to_agent_id, status, context)
+             VALUES ($1, 'agent-1', 'dispatched', $2)",
+        )
+        .bind(dispatch_id)
+        .bind(
+            serde_json::json!({
+                "auto_queue": true,
+                "slot_index": slot_index
+            })
+            .to_string(),
+        )
+        .execute(pool)
+        .await
+        .expect("seed active slot dispatch");
+    }
+
+    async fn seed_active_slot_dispatch_on_conn(
+        conn: &mut PgConnection,
+        dispatch_id: &str,
+        slot_index: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, to_agent_id, status, context)
+             VALUES ($1, 'agent-1', 'dispatched', $2)",
+        )
+        .bind(dispatch_id)
+        .bind(
+            serde_json::json!({
+                "auto_queue": true,
+                "slot_index": slot_index
+            })
+            .to_string(),
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed active slot dispatch");
+    }
+
+    async fn lock_slot_row_on_conn(
+        database_url: &str,
+        agent_id: &str,
+        slot_index: i64,
+    ) -> PgConnection {
+        let mut conn = PgConnection::connect(database_url)
+            .await
+            .expect("connect slot lock connection");
+        sqlx::query("BEGIN")
+            .execute(&mut conn)
+            .await
+            .expect("begin slot lock tx");
+        sqlx::query(
+            "SELECT 1
+             FROM auto_queue_slots
+             WHERE agent_id = $1 AND slot_index = $2
+             FOR UPDATE",
+        )
+        .bind(agent_id)
+        .bind(slot_index)
+        .fetch_one(&mut conn)
+        .await
+        .expect("lock slot row");
+        conn
+    }
+
+    async fn wait_for_blocked_slot_update(conn: &mut PgConnection, query_fragment: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let blocked = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                     SELECT 1
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND wait_event_type = 'Lock'
+                       AND state = 'active'
+                       AND query LIKE '%UPDATE auto_queue_slots%'
+                       AND query LIKE $1
+                 )",
+            )
+            .bind(format!("%{query_fragment}%"))
+            .fetch_one(&mut *conn)
+            .await
+            .expect("inspect blocked slot update");
+            if blocked {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "allocator did not block on expected slot update"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn install_active_dispatch_after_slot_update_trigger(
+        pool: &PgPool,
+        function_name: &str,
+        trigger_name: &str,
+        dispatch_id: &str,
+    ) {
+        let function_sql = format!(
+            "CREATE OR REPLACE FUNCTION {function_name}()
+             RETURNS TRIGGER AS $$
+             BEGIN
+                 IF NEW.agent_id = 'agent-1'
+                    AND NEW.slot_index = 0
+                    AND NEW.assigned_run_id = 'run-1'
+                    AND NEW.assigned_thread_group = 1 THEN
+                     INSERT INTO task_dispatches (id, to_agent_id, status, context)
+                     VALUES (
+                         '{dispatch_id}',
+                         'agent-1',
+                         'dispatched',
+                         jsonb_build_object('auto_queue', TRUE, 'slot_index', 0)::TEXT
+                     )
+                     ON CONFLICT (id) DO NOTHING;
+                 END IF;
+                 RETURN NEW;
+             END;
+             $$ LANGUAGE plpgsql"
+        );
+        sqlx::query(&function_sql)
+            .execute(pool)
+            .await
+            .expect("create active dispatch trigger function");
+
+        let trigger_sql = format!(
+            "CREATE TRIGGER {trigger_name}
+             AFTER UPDATE ON auto_queue_slots
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        );
+        sqlx::query(&trigger_sql)
+            .execute(pool)
+            .await
+            .expect("create active dispatch trigger");
+    }
+
     async fn count_transitions(pool: &PgPool, entry_id: &str) -> i64 {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::BIGINT
@@ -3568,6 +4002,315 @@ mod dispatch_terminal_sync_pg_tests {
                 .fetch_one(&pool)
                 .await
                 .expect("next entry slot");
+        assert_eq!(slot_index, Some(1));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allocate_slot_for_group_agent_pg_skips_rebind_update_with_active_dispatch() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET max_concurrent_threads = 2 WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("expand slot pool");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, slot_index, thread_group,
+                 batch_phase, completed_at)
+             VALUES ('entry-rebind-complete', 'run-1', NULL, 'agent-1', 'done', 0, 0, 0, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed completed slot entry");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-rebind-next', 'run-1', NULL, 'agent-1', 'pending', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next phase entry");
+
+        let mut lock_conn = lock_slot_row_on_conn(&pg_db.database_url, "agent-1", 0).await;
+
+        let mut seed_conn = PgConnection::connect(&pg_db.database_url)
+            .await
+            .expect("connect race seed connection");
+        let pool_for_allocation = pool.clone();
+        let allocation_task = tokio::spawn(async move {
+            allocate_slot_for_group_agent_pg(&pool_for_allocation, "run-1", 1, "agent-1").await
+        });
+        wait_for_blocked_slot_update(&mut seed_conn, "SET assigned_thread_group").await;
+        seed_active_slot_dispatch_on_conn(&mut seed_conn, "dispatch-rebind-race-slot-0", 0).await;
+        sqlx::query("COMMIT")
+            .execute(&mut lock_conn)
+            .await
+            .expect("release slot lock");
+        lock_conn.close().await.expect("close slot lock connection");
+        seed_conn.close().await.expect("close race seed connection");
+
+        let allocation = allocation_task
+            .await
+            .expect("allocation task join")
+            .expect("allocation must succeed via a different free slot");
+        assert_eq!(
+            allocation,
+            Some(SlotAllocation {
+                slot_index: 1,
+                newly_assigned: true,
+                reassigned_from_other_group: false,
+            })
+        );
+        assert_eq!(slot_group(&pool, "agent-1", 0).await, Some(0));
+
+        let slot_index: Option<i64> = sqlx::query_scalar(
+            "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-rebind-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("next entry slot");
+        assert_eq!(slot_index, Some(1));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allocate_slot_for_group_agent_pg_restores_rebind_when_dispatch_appears_after_update() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET max_concurrent_threads = 2 WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("expand slot pool");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, slot_index, thread_group,
+                 batch_phase, completed_at)
+             VALUES ('entry-rebind-post-complete', 'run-1', NULL, 'agent-1', 'done', 0, 0, 0, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed completed slot entry");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-rebind-post-next', 'run-1', NULL, 'agent-1', 'pending', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next phase entry");
+        install_active_dispatch_after_slot_update_trigger(
+            &pool,
+            "test_seed_rebind_post_update_dispatch",
+            "test_seed_rebind_post_update_dispatch_trigger",
+            "dispatch-rebind-post-update-slot-0",
+        )
+        .await;
+
+        let allocation = allocate_slot_for_group_agent_pg(&pool, "run-1", 1, "agent-1")
+            .await
+            .expect("allocation must succeed via a different free slot");
+        assert_eq!(
+            allocation,
+            Some(SlotAllocation {
+                slot_index: 1,
+                newly_assigned: true,
+                reassigned_from_other_group: false,
+            })
+        );
+        assert_eq!(slot_group(&pool, "agent-1", 0).await, Some(0));
+
+        let slot_index: Option<i64> = sqlx::query_scalar(
+            "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-rebind-post-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("next entry slot");
+        assert_eq!(slot_index, Some(1));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allocate_slot_for_group_agent_pg_skips_free_slot_fallback_with_active_dispatch() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET max_concurrent_threads = 2 WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("expand slot pool");
+        sqlx::query(
+            "UPDATE auto_queue_slots
+             SET assigned_run_id = NULL,
+                 assigned_thread_group = NULL
+             WHERE agent_id = 'agent-1' AND slot_index = 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("free seed slot");
+        seed_active_slot_dispatch(&pool, "dispatch-free-select-slot-0", 0).await;
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-free-select-next', 'run-1', NULL, 'agent-1', 'pending', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next phase entry");
+
+        let allocation = allocate_slot_for_group_agent_pg(&pool, "run-1", 1, "agent-1")
+            .await
+            .expect("allocation must succeed via a different free slot");
+        assert_eq!(
+            allocation,
+            Some(SlotAllocation {
+                slot_index: 1,
+                newly_assigned: true,
+                reassigned_from_other_group: false,
+            })
+        );
+        assert_eq!(slot_run(&pool, "agent-1", 0).await, None);
+
+        let slot_index: Option<i64> = sqlx::query_scalar(
+            "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-free-select-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("next entry slot");
+        assert_eq!(slot_index, Some(1));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allocate_slot_for_group_agent_pg_releases_claim_when_dispatch_appears_after_update() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET max_concurrent_threads = 2 WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("expand slot pool");
+        sqlx::query(
+            "UPDATE auto_queue_slots
+             SET assigned_run_id = NULL,
+                 assigned_thread_group = NULL
+             WHERE agent_id = 'agent-1' AND slot_index = 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("free seed slot");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-free-post-claim-next', 'run-1', NULL, 'agent-1', 'pending', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next phase entry");
+        install_active_dispatch_after_slot_update_trigger(
+            &pool,
+            "test_seed_free_post_update_dispatch",
+            "test_seed_free_post_update_dispatch_trigger",
+            "dispatch-free-post-update-slot-0",
+        )
+        .await;
+
+        let allocation = allocate_slot_for_group_agent_pg(&pool, "run-1", 1, "agent-1")
+            .await
+            .expect("allocation must succeed via a different free slot");
+        assert_eq!(
+            allocation,
+            Some(SlotAllocation {
+                slot_index: 1,
+                newly_assigned: true,
+                reassigned_from_other_group: false,
+            })
+        );
+        assert_eq!(slot_run(&pool, "agent-1", 0).await, None);
+
+        let slot_index: Option<i64> = sqlx::query_scalar(
+            "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-free-post-claim-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("next entry slot");
+        assert_eq!(slot_index, Some(1));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allocate_slot_for_group_agent_pg_skips_free_slot_claim_with_active_dispatch() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query("UPDATE auto_queue_runs SET max_concurrent_threads = 2 WHERE id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("expand slot pool");
+        sqlx::query(
+            "UPDATE auto_queue_slots
+             SET assigned_run_id = NULL,
+                 assigned_thread_group = NULL
+             WHERE agent_id = 'agent-1' AND slot_index = 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("free seed slot");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-free-claim-next', 'run-1', NULL, 'agent-1', 'pending', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed next phase entry");
+
+        let mut lock_conn = lock_slot_row_on_conn(&pg_db.database_url, "agent-1", 0).await;
+
+        let mut seed_conn = PgConnection::connect(&pg_db.database_url)
+            .await
+            .expect("connect race seed connection");
+        let pool_for_allocation = pool.clone();
+        let allocation_task = tokio::spawn(async move {
+            allocate_slot_for_group_agent_pg(&pool_for_allocation, "run-1", 1, "agent-1").await
+        });
+        wait_for_blocked_slot_update(&mut seed_conn, "SET assigned_run_id").await;
+        seed_active_slot_dispatch_on_conn(&mut seed_conn, "dispatch-free-claim-race-slot-0", 0)
+            .await;
+        sqlx::query("COMMIT")
+            .execute(&mut lock_conn)
+            .await
+            .expect("release slot lock");
+        lock_conn.close().await.expect("close slot lock connection");
+        seed_conn.close().await.expect("close race seed connection");
+
+        let allocation = allocation_task
+            .await
+            .expect("allocation task join")
+            .expect("allocation must succeed via a different free slot");
+        assert_eq!(
+            allocation,
+            Some(SlotAllocation {
+                slot_index: 1,
+                newly_assigned: true,
+                reassigned_from_other_group: false,
+            })
+        );
+        assert_eq!(slot_run(&pool, "agent-1", 0).await, None);
+
+        let slot_index: Option<i64> = sqlx::query_scalar(
+            "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-free-claim-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("next entry slot");
         assert_eq!(slot_index, Some(1));
 
         pool.close().await;
@@ -4210,13 +4953,13 @@ mod dispatch_terminal_sync_pg_tests {
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
-        ENTRY_STATUS_DISPATCHED, ENTRY_STATUS_DONE, ENTRY_STATUS_PENDING, ENTRY_STATUS_SKIPPED,
-        EntryStatusUpdateOptions, PhaseGateStateWrite, SlotAllocation,
+        ENTRY_STATUS_DISPATCHED, ENTRY_STATUS_DONE, ENTRY_STATUS_FAILED, ENTRY_STATUS_PENDING,
+        ENTRY_STATUS_SKIPPED, EntryStatusUpdateOptions, PhaseGateStateWrite, SlotAllocation,
         allocate_slot_for_group_agent_pg, clear_phase_gate_state_on_pg,
         latest_entry_phase_codex_session_id_pg, list_entry_dispatch_history_pg,
-        reactivate_done_entry_on_pg, record_consultation_dispatch_on_pg, release_run_slots_pg,
-        release_slot_for_group_agent_pg, save_phase_gate_state_on_pg, slot_has_active_dispatch_pg,
-        update_entry_status_on_pg,
+        reactivate_done_entry_on_pg, reconcile_failed_entry_done_on_pg,
+        record_consultation_dispatch_on_pg, release_run_slots_pg, release_slot_for_group_agent_pg,
+        save_phase_gate_state_on_pg, slot_has_active_dispatch_pg, update_entry_status_on_pg,
     };
     use chrono::{DateTime, Utc};
     use sqlx::{PgPool, Row};
@@ -5667,6 +6410,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slot_has_active_dispatch_ignores_orphaned_review_dispatches_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, to_agent_id, dispatch_type, status, context)
+             VALUES ($1, $2, 'review', 'dispatched', $3)",
+        )
+        .bind("dispatch-orphan-review")
+        .bind("agent-1")
+        .bind(serde_json::json!({"slot_index": 0}).to_string())
+        .execute(&pool)
+        .await
+        .expect("seed orphan review dispatch");
+
+        assert!(
+            !slot_has_active_dispatch_pg(&pool, "agent-1", 0)
+                .await
+                .expect("query orphan review dispatch"),
+            "review dispatches without an active provider session must not block slot reuse"
+        );
+
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, to_agent_id, dispatch_type, status, context)
+             VALUES ($1, $2, 'review', 'dispatched', $3)",
+        )
+        .bind("dispatch-live-review")
+        .bind("agent-1")
+        .bind(serde_json::json!({"slot_index": 0}).to_string())
+        .execute(&pool)
+        .await
+        .expect("seed live review dispatch");
+        sqlx::query(
+            "INSERT INTO sessions (session_key, agent_id, status, active_dispatch_id)
+             VALUES ('session-live-review', 'agent-1', 'turn_active', 'dispatch-live-review')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed live review session");
+
+        assert!(
+            slot_has_active_dispatch_pg(&pool, "agent-1", 0)
+                .await
+                .expect("query live review dispatch"),
+            "review dispatches with an active provider session must still block slot reuse"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn allocate_slot_for_group_agent_pg_ignores_orphaned_review_slot_blocker() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, dispatch_type, status, context)
+             VALUES ('dispatch-orphan-review-slot', NULL, 'agent-1', 'review', 'dispatched', $1)",
+        )
+        .bind(
+            serde_json::json!({
+                "slot_index": 0,
+                "review_target_reject_reason": "latest_work_target_issue_mismatch"
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .expect("seed orphan review slot dispatch");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, thread_group, batch_phase)
+             VALUES ('entry-next-after-orphan-review', 'run-1', NULL, 'agent-1', 'pending', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed pending entry");
+
+        let allocation = allocate_slot_for_group_agent_pg(&pool, "run-1", 0, "agent-1")
+            .await
+            .expect("allocate slot past orphan review dispatch")
+            .expect("existing slot should be reusable");
+        assert_eq!(allocation.slot_index, 0);
+        assert!(!allocation.newly_assigned);
+
+        let next_slot: Option<i64> = sqlx::query_scalar(
+            "SELECT slot_index FROM auto_queue_entries WHERE id = 'entry-next-after-orphan-review'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("next entry slot");
+        assert_eq!(next_slot, Some(0));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
     async fn record_consultation_dispatch_preserves_metadata_and_marks_entry_dispatched_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
@@ -5998,6 +6839,136 @@ mod tests {
         assert!(restored.changed);
         assert_eq!(restored.from_status, ENTRY_STATUS_DONE);
         assert_eq!(restored.to_status, ENTRY_STATUS_DISPATCHED);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn failed_entry_can_reconcile_done_when_card_done_and_commit_recorded_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO agents (id, name) VALUES ('agent-1', 'Agent 1')
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-1866', 'repo-1', 'agent-1', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed run");
+        sqlx::query(
+            "INSERT INTO kanban_cards
+                (id, repo_id, title, status, assigned_agent_id, latest_dispatch_id, completed_at)
+             VALUES ('card-1866', 'repo-1', 'Issue 1866', 'done', 'agent-1', 'dispatch-1866', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed done card");
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, status, result, completed_at)
+             VALUES ('dispatch-1866', 'card-1866', 'agent-1', 'completed', $1, NOW())",
+        )
+        .bind(r#"{"completed_commit":"abc123"}"#)
+        .execute(&pool)
+        .await
+        .expect("seed completed dispatch");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, retry_count, thread_group, completed_at)
+             VALUES ('entry-1866', 'run-1866', 'card-1866', 'agent-1', 'failed', 1, 0, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed failed entry");
+        sqlx::query(
+            "INSERT INTO auto_queue_entry_dispatch_history (entry_id, dispatch_id, trigger_source)
+             VALUES ('entry-1866', 'dispatch-1866', 'test')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed dispatch history");
+
+        let result =
+            reconcile_failed_entry_done_on_pg(&pool, "entry-1866", "manual_terminal_reconcile")
+                .await
+                .expect("terminal reconciliation should succeed");
+        assert!(result.changed);
+        assert_eq!(result.from_status, ENTRY_STATUS_FAILED);
+        assert_eq!(result.to_status, ENTRY_STATUS_DONE);
+
+        let entry_status: String =
+            sqlx::query_scalar("SELECT status FROM auto_queue_entries WHERE id = 'entry-1866'")
+                .fetch_one(&pool)
+                .await
+                .expect("entry status");
+        assert_eq!(entry_status, ENTRY_STATUS_DONE);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn failed_entry_done_reconcile_requires_completed_commit_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup_pool(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO agents (id, name) VALUES ('agent-1', 'Agent 1')
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-1866-no-commit', 'repo-1', 'agent-1', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed run");
+        sqlx::query(
+            "INSERT INTO kanban_cards
+                (id, repo_id, title, status, assigned_agent_id, latest_dispatch_id, completed_at)
+             VALUES ('card-1866-no-commit', 'repo-1', 'Issue 1866', 'done', 'agent-1', 'dispatch-1866-no-commit', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed done card");
+        sqlx::query(
+            "INSERT INTO task_dispatches
+                (id, kanban_card_id, to_agent_id, status, result, completed_at)
+             VALUES ('dispatch-1866-no-commit', 'card-1866-no-commit', 'agent-1', 'completed', $1, NOW())",
+        )
+        .bind(r#"{"summary":"done"}"#)
+        .execute(&pool)
+        .await
+        .expect("seed completed dispatch without commit");
+        sqlx::query(
+            "INSERT INTO auto_queue_entries
+                (id, run_id, kanban_card_id, agent_id, status, retry_count, thread_group, completed_at)
+             VALUES ('entry-1866-no-commit', 'run-1866-no-commit', 'card-1866-no-commit', 'agent-1', 'failed', 1, 0, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed failed entry");
+
+        let error = reconcile_failed_entry_done_on_pg(
+            &pool,
+            "entry-1866-no-commit",
+            "manual_terminal_reconcile",
+        )
+        .await
+        .expect_err("missing completed_commit must block reconciliation");
+        assert!(
+            error.contains("completed_commit"),
+            "expected completed_commit error, got: {error}"
+        );
 
         pool.close().await;
         pg_db.drop().await;

@@ -2,7 +2,6 @@
 
 use crate::config;
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 /// Resolve the API base URL from config or environment.
 pub fn api_base() -> String {
@@ -503,6 +502,67 @@ fn render_cards_table(cards: &[Value]) -> String {
     lines.join("\n")
 }
 
+fn queue_status_count(entries: &[Value], status: &str) -> usize {
+    entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(Value::as_str) == Some(status))
+        .count()
+}
+
+fn format_queue_entry_ref(entry: &Value) -> String {
+    let entry_id = entry.get("id").and_then(Value::as_str).unwrap_or("-");
+    let card_id = entry
+        .get("card_id")
+        .or_else(|| entry.get("kanban_card_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let issue = entry
+        .get("github_issue_number")
+        .and_then(Value::as_i64)
+        .map(|value| format!("#{value}"))
+        .unwrap_or_else(|| "-".to_string());
+    format!("entry={entry_id} card={card_id} issue={issue}")
+}
+
+fn format_queue_attention_entries(entries: &[Value], status: &str) -> Option<String> {
+    let refs: Vec<String> = entries
+        .iter()
+        .filter(|entry| entry.get("status").and_then(Value::as_str) == Some(status))
+        .take(3)
+        .map(format_queue_entry_ref)
+        .collect();
+    if refs.is_empty() {
+        None
+    } else {
+        Some(format!("{status}: {}", refs.join("; ")))
+    }
+}
+
+fn render_auto_queue_status_lines(queue_summary: &str, entries: &[Value]) -> Vec<String> {
+    let pending = queue_status_count(entries, "pending");
+    let dispatched = queue_status_count(entries, "dispatched");
+    let done = queue_status_count(entries, "done");
+    let skipped = queue_status_count(entries, "skipped");
+    let failed = queue_status_count(entries, "failed");
+    let mut lines = vec![format!(
+        "  Auto-Queue: {queue_summary} | total={} pending={pending} dispatched={dispatched} done={done} failed={failed} skipped={skipped}",
+        entries.len(),
+    )];
+
+    if failed > 0 || skipped > 0 {
+        let mut details = Vec::new();
+        if let Some(failed_entries) = format_queue_attention_entries(entries, "failed") {
+            details.push(failed_entries);
+        }
+        if let Some(skipped_entries) = format_queue_attention_entries(entries, "skipped") {
+            details.push(skipped_entries);
+        }
+        lines.push(format!("  Auto-Queue Attention: {}", details.join(" | ")));
+    }
+
+    lines
+}
+
 // ── Subcommand handlers ──────────────────────────────────────
 
 /// `agentdesk status` — server health + auto-queue status
@@ -552,15 +612,6 @@ pub fn cmd_status() -> Result<(), String> {
         .get("entries")
         .and_then(Value::as_array)
         .ok_or_else(|| "invalid /api/queue/status response".to_string())?;
-    let mut counts = BTreeMap::<String, usize>::new();
-    for entry in queue_entries {
-        let status = entry
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        *counts.entry(status).or_default() += 1;
-    }
     let queue_run = queue.get("run").and_then(Value::as_object);
     let queue_summary = if let Some(run) = queue_run {
         format!(
@@ -582,15 +633,9 @@ pub fn cmd_status() -> Result<(), String> {
         "  Sessions: {} total, {} working, {} with active dispatch",
         total_sessions, working_sessions, active_dispatch_sessions
     );
-    println!(
-        "  Auto-Queue: {} | total={} pending={} dispatched={} done={} skipped={}",
-        queue_summary,
-        queue_entries.len(),
-        counts.get("pending").copied().unwrap_or(0),
-        counts.get("dispatched").copied().unwrap_or(0),
-        counts.get("done").copied().unwrap_or(0),
-        counts.get("skipped").copied().unwrap_or(0),
-    );
+    for line in render_auto_queue_status_lines(&queue_summary, queue_entries) {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -726,6 +771,44 @@ pub fn cmd_dispatch_redispatch(card_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `agentdesk review-recover-target --dispatch <id> --commit <sha> --worktree <path>`
+pub fn cmd_review_recover_target(
+    dispatch_id: Option<&str>,
+    card_id: Option<&str>,
+    target_commit: Option<&str>,
+    worktree_path: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let mut body = serde_json::Map::new();
+    if let Some(value) = dispatch_id.map(str::trim).filter(|value| !value.is_empty()) {
+        body.insert("dispatch_id".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = card_id.map(str::trim).filter(|value| !value.is_empty()) {
+        body.insert("card_id".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = target_commit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body.insert("target_commit".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = worktree_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body.insert("worktree_path".to_string(), serde_json::json!(value));
+    }
+    if let Some(value) = reason.map(str::trim).filter(|value| !value.is_empty()) {
+        body.insert("reason".to_string(), serde_json::json!(value));
+    }
+    let value = post_json(
+        "/api/reviews/recovery",
+        Some(serde_json::Value::Object(body)),
+    )?;
+    print_json(&value);
+    Ok(())
+}
+
 /// `agentdesk resume <card_id_or_issue_number>`
 ///
 /// The API handler resolves GitHub issue numbers automatically,
@@ -854,6 +937,63 @@ pub fn cmd_config_audit(dry_run: bool) -> Result<(), String> {
     )?;
     print_json(&serde_json::to_value(outcome.report).map_err(|err| err.to_string())?);
     Ok(())
+}
+
+/// `agentdesk config sync-mcp`
+pub fn cmd_config_sync_mcp() -> Result<(), String> {
+    let root = crate::config::runtime_root()
+        .ok_or_else(|| "Failed to resolve AGENTDESK_ROOT_DIR".to_string())?;
+    crate::runtime_layout::ensure_runtime_layout(&root)?;
+    let loaded = crate::services::discord_config_audit::load_runtime_config(&root)?;
+    let config = loaded.config;
+
+    let mut providers = Vec::new();
+    let mut failures = Vec::new();
+    for (provider, result) in [
+        (
+            "codex",
+            crate::services::mcp_config::sync_codex_mcp_servers(&config),
+        ),
+        (
+            "opencode",
+            crate::services::mcp_config::sync_opencode_mcp_servers(&config),
+        ),
+        (
+            "qwen",
+            crate::services::mcp_config::sync_qwen_mcp_servers(&config),
+        ),
+        (
+            "gemini",
+            crate::services::mcp_config::sync_gemini_mcp_servers(&config),
+        ),
+    ] {
+        match result {
+            Ok(()) => providers.push(serde_json::json!({
+                "provider": provider,
+                "ok": true,
+            })),
+            Err(error) => {
+                failures.push(provider.to_string());
+                providers.push(serde_json::json!({
+                    "provider": provider,
+                    "ok": false,
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    print_json(&serde_json::json!({
+        "ok": failures.is_empty(),
+        "config_path": loaded.path,
+        "providers": providers,
+    }));
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("MCP sync failed for {}", failures.join(", ")))
+    }
 }
 
 /// `agentdesk api <method> <path> [body]`
@@ -1104,8 +1244,8 @@ pub fn cmd_terminations(
 mod tests {
     use super::{
         build_cli_advance_completion_result, cmd_advance, cmd_dispatch, encode_path_segment,
-        parse_github_repo_from_remote, render_cards_table, render_queue_thread_links,
-        runtime_config_payload,
+        parse_github_repo_from_remote, render_auto_queue_status_lines, render_cards_table,
+        render_queue_thread_links, runtime_config_payload,
     };
     use axum::extract::{Path, Query, State};
     use axum::routing::{get, patch, post};
@@ -1372,6 +1512,39 @@ mod tests {
         assert!(rendered.contains("#90"));
         assert!(rendered.contains("feat: AgentDesk CLI client"));
         assert!(!rendered.contains("description"));
+    }
+
+    #[test]
+    fn render_auto_queue_status_lines_includes_failed_and_skipped_counts() {
+        let lines = render_auto_queue_status_lines(
+            "completed for project-agentdesk",
+            &[
+                json!({"id": "entry-done", "status": "done", "card_id": "card-done", "github_issue_number": 1801}),
+                json!({"id": "entry-failed", "status": "failed", "card_id": "card-failed", "github_issue_number": 1875}),
+                json!({"id": "entry-skipped", "status": "skipped", "card_id": "card-skipped", "github_issue_number": 1807}),
+            ],
+        );
+
+        assert_eq!(
+            lines[0],
+            "  Auto-Queue: completed for project-agentdesk | total=3 pending=0 dispatched=0 done=1 failed=1 skipped=1"
+        );
+        assert!(lines[1].contains("failed: entry=entry-failed card=card-failed issue=#1875"));
+        assert!(lines[1].contains("skipped: entry=entry-skipped card=card-skipped issue=#1807"));
+    }
+
+    #[test]
+    fn render_auto_queue_status_lines_omits_attention_when_clear() {
+        let lines = render_auto_queue_status_lines(
+            "idle",
+            &[json!({"id": "entry-done", "status": "done", "card_id": "card-done"})],
+        );
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            "  Auto-Queue: idle | total=1 pending=0 dispatched=0 done=1 failed=0 skipped=0"
+        );
     }
 
     #[test]

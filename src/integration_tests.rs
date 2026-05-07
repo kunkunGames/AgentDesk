@@ -2689,6 +2689,99 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_queue_status_repo_filter_rejects_agent_id_value_pg() {
+        let pg_db = IntegrationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
+        let engine = test_engine_with_pg(pool.clone());
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+             VALUES ('project-agentdesk', 'Project AgentDesk', '111', '222')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at, completed_at) \
+             VALUES \
+             ('run-agent-id-as-repo-old', 'project-agentdesk', 'project-agentdesk', 'completed', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '55 minutes'), \
+             ('run-agent-id-active', NULL, 'project-agentdesk', 'active', NOW(), NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::test_state_with_pg(test_db(), engine, pool.clone());
+        let (status, body) = crate::server::routes::auto_queue::status(
+            axum::extract::State(state),
+            axum::extract::Query(crate::server::routes::auto_queue::StatusQuery {
+                repo: Some("project-agentdesk".to_string()),
+                agent_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["code"], "auto_queue");
+        assert!(body.0["error"].as_str().unwrap().contains("agent id"));
+        assert_eq!(body.0["context"]["agent_id"], "project-agentdesk");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn auto_queue_status_repo_filter_finds_unscoped_run_by_entry_repo_pg() {
+        let pg_db = IntegrationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
+        let engine = test_engine_with_pg(pool.clone());
+
+        seed_agent_pg(&pool).await;
+        seed_repo_pg(&pool, "owner/repo").await;
+
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, created_at, updated_at) \
+             VALUES ('card-status-repo-filter', 'Status Repo Filter', 'ready', 'agent-1', 'owner/repo', NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, created_at) \
+             VALUES ('run-status-repo-filter', NULL, NULL, 'active', NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, priority_rank, created_at) \
+             VALUES ('entry-status-repo-filter', 'run-status-repo-filter', 'card-status-repo-filter', 'agent-1', 'pending', 0, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::test_state_with_pg(test_db(), engine, pool.clone());
+        let (status, body) = crate::server::routes::auto_queue::status(
+            axum::extract::State(state),
+            axum::extract::Query(crate::server::routes::auto_queue::StatusQuery {
+                repo: Some("owner/repo".to_string()),
+                agent_id: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body.0["run"]["id"], "run-status-repo-filter");
+        assert_eq!(body.0["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body.0["entries"][0]["id"], "entry-status-repo-filter");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
     // #1239: migrated to PG fixtures because `activate_with_deps` is now
     // PG-only — the SQLite fallback was removed in favor of `activate_with_deps_pg`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3073,6 +3166,202 @@ mod tests {
         assert!(
             next_row.2.is_some(),
             "newly dispatched group must persist dispatch_id"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_queue_activate_cools_down_recent_terminal_same_slot_dispatch_pg() {
+        let pg_db = IntegrationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
+        let engine = test_engine_with_pg(pool.clone());
+        let (_repo, _repo_guard) = setup_test_repo();
+        let repo_id = _repo.path().to_str().unwrap().to_string();
+
+        sqlx::query(
+            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+             VALUES ('agent-1', 'Test Agent', '111', '222') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, github_issue_number, created_at, updated_at) \
+             VALUES ('card-aq-terminal', 'AQ Terminal', 'done', 'agent-1', $1, 182600, NOW(), NOW())",
+        )
+        .bind(&repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, repo_id, github_issue_number, created_at, updated_at) \
+             VALUES ('card-aq-same-slot-next', 'AQ Same Slot Next', 'ready', 'agent-1', $1, 182601, NOW(), NOW())",
+        )
+        .bind(&repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status, max_concurrent_threads, thread_group_count, created_at) \
+             VALUES ('run-aq-same-slot-cooldown', $1, 'agent-1', 'active', 1, 1, NOW())",
+        )
+        .bind(&repo_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, completed_at, created_at, updated_at) \
+             VALUES ('dispatch-aq-terminal', 'card-aq-terminal', 'agent-1', 'implementation', 'completed', 'Terminal Dispatch', $1, NOW(), NOW(), NOW())",
+        )
+        .bind(
+            serde_json::json!({
+                "auto_queue": true,
+                "entry_id": "entry-aq-terminal",
+                "thread_group": 0,
+                "slot_index": 0
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE kanban_cards SET latest_dispatch_id = $1 WHERE id = $2")
+            .bind("dispatch-aq-terminal")
+            .bind("card-aq-terminal")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, dispatch_id, slot_index, thread_group, priority_rank, dispatched_at, completed_at, created_at) \
+             VALUES ('entry-aq-terminal', 'run-aq-same-slot-cooldown', 'card-aq-terminal', 'agent-1', 'done', 'dispatch-aq-terminal', 0, 0, 0, NOW(), NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status, thread_group, priority_rank, created_at) \
+             VALUES ('entry-aq-same-slot-next', 'run-aq-same-slot-cooldown', 'card-aq-same-slot-next', 'agent-1', 'pending', 0, 1, NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO auto_queue_slots (agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at) \
+             VALUES ('agent-1', 0, 'run-aq-same-slot-cooldown', 0, '{}'::jsonb, NOW(), NOW())",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let deps = crate::server::routes::auto_queue::AutoQueueActivateDeps::for_bridge(
+            test_db(),
+            engine.clone(),
+        );
+        let (status, body) = crate::server::routes::auto_queue::activate_with_deps_pg(
+            &deps,
+            crate::server::routes::auto_queue::ActivateBody {
+                run_id: Some("run-aq-same-slot-cooldown".to_string()),
+                repo: Some(repo_id.clone()),
+                agent_id: Some("agent-1".to_string()),
+                thread_group: None,
+                unified_thread: None,
+                active_only: Some(true),
+            },
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body.0["count"].as_u64(),
+            Some(0),
+            "recent terminal same-slot dispatch should be left for a later tick"
+        );
+
+        let next_row: (String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT status, slot_index, dispatch_id \
+             FROM auto_queue_entries \
+             WHERE id = 'entry-aq-same-slot-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(next_row.0, "pending");
+        assert_eq!(next_row.1, Some(0));
+        assert_eq!(next_row.2, None);
+
+        let slot_row: (Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT assigned_run_id, assigned_thread_group \
+             FROM auto_queue_slots \
+             WHERE agent_id = 'agent-1' AND slot_index = 0",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(slot_row.0.as_deref(), Some("run-aq-same-slot-cooldown"));
+        assert_eq!(
+            slot_row.1,
+            Some(0),
+            "cooldown skip should leave the slot binding stable for the retry tick"
+        );
+
+        let new_dispatches = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*)::BIGINT \
+             FROM task_dispatches \
+             WHERE kanban_card_id = 'card-aq-same-slot-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(new_dispatches, 0);
+
+        sqlx::query(
+            "UPDATE task_dispatches \
+             SET completed_at = NOW() - INTERVAL '2 minutes', \
+                 updated_at = NOW() - INTERVAL '2 minutes' \
+             WHERE id = 'dispatch-aq-terminal'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = crate::server::routes::auto_queue::activate_with_deps_pg(
+            &deps,
+            crate::server::routes::auto_queue::ActivateBody {
+                run_id: Some("run-aq-same-slot-cooldown".to_string()),
+                repo: Some(repo_id.clone()),
+                agent_id: Some("agent-1".to_string()),
+                thread_group: None,
+                unified_thread: None,
+                active_only: Some(true),
+            },
+        )
+        .await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            body.0["count"].as_u64(),
+            Some(1),
+            "aged terminal same-slot dispatch should be eligible on a later tick"
+        );
+
+        kanban::drain_hook_side_effects_with_backends(None, &engine);
+
+        let next_row: (String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT status, slot_index, dispatch_id \
+             FROM auto_queue_entries \
+             WHERE id = 'entry-aq-same-slot-next'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(next_row.0, "dispatched");
+        assert_eq!(next_row.1, Some(0));
+        assert!(
+            next_row.2.is_some(),
+            "same-slot entry should dispatch after cooldown expires"
         );
 
         pool.close().await;
@@ -11447,6 +11736,65 @@ mod tests {
         assert_eq!(metadata["preflight_status"], "consult_required");
         assert!(metadata["preflight_summary"].is_string());
         assert!(metadata["preflight_checked_at"].is_string());
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kanban_rules_merge_metadata_binds_json_object_to_pg_jsonb() {
+        let pg_db = IntegrationPgDatabase::create().await;
+        let pool = pg_db.migrate().await;
+        let engine = test_engine_with_pg(pool.clone());
+        seed_agent_pg(&pool).await;
+        seed_card_pg(&pool, "card-jsonb-bind", "ready").await;
+
+        sqlx::query("UPDATE kanban_cards SET description = $1, metadata = $2::jsonb WHERE id = $3")
+            .bind("too short")
+            .bind(
+                serde_json::json!({
+                    "existing": {
+                        "nested": true
+                    }
+                })
+                .to_string(),
+            )
+            .bind("card-jsonb-bind")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        engine
+            .try_fire_hook_by_name(
+                "OnCardTransition",
+                serde_json::json!({
+                    "card_id": "card-jsonb-bind",
+                    "from": "ready",
+                    "to": "requested"
+                }),
+            )
+            .unwrap();
+
+        let (metadata, metadata_type, metadata_text): (serde_json::Value, String, String) =
+            sqlx::query_as(
+                "SELECT metadata, jsonb_typeof(metadata), metadata::text
+                 FROM kanban_cards
+                 WHERE id = $1",
+            )
+            .bind("card-jsonb-bind")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(metadata_type, "object");
+        assert_eq!(metadata["existing"]["nested"], true);
+        assert_eq!(metadata["preflight_status"], "consult_required");
+        assert!(metadata["preflight_summary"].is_string());
+        assert!(metadata["preflight_checked_at"].is_string());
+        assert!(
+            !metadata_text.starts_with('"'),
+            "metadata must be stored as a jsonb object, not a JSON-encoded string: {metadata_text}"
+        );
 
         pool.close().await;
         pg_db.drop().await;

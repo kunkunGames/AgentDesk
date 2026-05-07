@@ -114,7 +114,8 @@
   - `src/services/discord/tmux_watcher.rs` (3214 lines after #1520 watcher
     loop extraction; split loop helpers further before adding behavior).
   - `src/services/discord/recovery_engine.rs` (4842 lines).
-  - `src/services/discord/health.rs` (6247 lines).
+  - `src/services/discord/health.rs` (4880 lines after #1879 snapshot/mailbox
+    extraction).
   - `src/services/discord/health/recovery.rs` (1433 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior).
   - `src/services/discord/placeholder_controller.rs` (1237 lines).
@@ -171,7 +172,8 @@
   - `src/server/routes/meetings.rs` (2158 lines).
   - `src/server/routes/review_verdict/decision_route.rs` (1865 lines).
   - `src/server/routes/{agents,agents_crud,agents_setup,analytics,v1,
-    settings,resume,pipeline,dispatches/thread_reuse}.rs` (all 1000+ lines).
+    settings,resume,pipeline,reviews,dispatches/thread_reuse}.rs` (all 1000+
+    lines).
 - active_callsite_coverage: legacy_db helper coverage tracked separately —
   see `known-legacy.md` row `legacy_db_helper`.
 - invariants:

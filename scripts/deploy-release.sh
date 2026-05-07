@@ -30,6 +30,7 @@ DEPLOY_LOCK_TIMEOUT_SECS="${AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS:-1800}"
 DEPLOY_MKDIR_LOCK_DIR=""
 CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
 ALLOW_ADHOC_RELEASE_SIGN="${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-0}"
+RESOLVED_RELEASE_SIGNING_MODE=""
 DASHBOARD_SOURCE=""
 STAGED_BINARY=""
 POLICIES_STAGED=""
@@ -91,6 +92,7 @@ sign_binary_with_fallback() {
         else
             current_authority=$(printf '%s\n' "$signature_details" | grep "^Authority=" | head -1 || true)
             if printf '%s\n' "$current_authority" | grep -qF "$identity" 2>/dev/null; then
+                RESOLVED_RELEASE_SIGNING_MODE="developer-id"
                 echo "✓ Already signed with matching identity — skipping re-sign (TCC preserved)"
                 return 0
             fi
@@ -98,8 +100,10 @@ sign_binary_with_fallback() {
     fi
 
     if [ "$identity" = "-" ]; then
+        RESOLVED_RELEASE_SIGNING_MODE="adhoc"
         codesign -f -s "$identity" --identifier "com.itismyfield.agentdesk" "$target"
     else
+        RESOLVED_RELEASE_SIGNING_MODE="developer-id"
         codesign -f -s "$identity" --options runtime --identifier "com.itismyfield.agentdesk" "$target"
     fi
 
@@ -157,6 +161,29 @@ _resolve_dashboard_source() {
     return 1
 }
 
+_ensure_dashboard_dependencies() {
+    local dashboard_dir="$REPO/dashboard"
+    [ -d "$dashboard_dir" ] || return 0
+
+    if ! command -v node >/dev/null 2>&1; then
+        echo "✗ node is required to build dashboard before deploy"
+        exit 1
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+        echo "✗ npm is required to build dashboard before deploy"
+        exit 1
+    fi
+    if [ ! -f "$dashboard_dir/package-lock.json" ]; then
+        echo "✗ dashboard/package-lock.json missing — cannot install deterministic dashboard dependencies"
+        exit 1
+    fi
+
+    if [ ! -x "$dashboard_dir/node_modules/.bin/tsc" ]; then
+        echo "▸ Installing dashboard dependencies (npm ci)..."
+        (cd "$dashboard_dir" && npm ci --no-audit --no-fund)
+    fi
+}
+
 _resolve_default_release_binary() {
     local target_dir
     target_dir="$(cd "$REPO" && cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.target_directory // empty' 2>/dev/null || true)"
@@ -168,6 +195,120 @@ _resolve_default_release_binary() {
         *) target_dir="$REPO/$target_dir" ;;
     esac
     printf '%s/release/agentdesk\n' "$target_dir"
+}
+
+_latest_postgres_migration_path() {
+    local migrations_dir="$REPO/migrations/postgres"
+    if [ ! -d "$migrations_dir" ]; then
+        return 0
+    fi
+    find "$migrations_dir" -maxdepth 1 -type f -name '[0-9][0-9][0-9][0-9]_*.sql' 2>/dev/null \
+        | sort \
+        | tail -n 1
+}
+
+_sha256_file() {
+    local path="$1"
+    if [ -z "$path" ] || [ ! -f "$path" ]; then
+        return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    fi
+}
+
+_write_release_source_manifest() {
+    mkdir -p "$ADK_REL/runtime"
+
+    local manifest_tmp="$ADK_REL/runtime/release-source.json.new"
+    local manifest_path="$ADK_REL/runtime/release-source.json"
+    local generated_at repo_head repo_branch repo_upstream repo_upstream_sha repo_dirty latest_migration latest_migration_name latest_migration_sha
+
+    generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    repo_head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+    repo_branch="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    repo_upstream="$(git -C "$REPO" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+    repo_upstream_sha=""
+    if [ -n "$repo_upstream" ]; then
+        repo_upstream_sha="$(git -C "$REPO" rev-parse "$repo_upstream" 2>/dev/null || true)"
+    fi
+    repo_dirty="unknown"
+    if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
+            repo_dirty="true"
+        else
+            repo_dirty="false"
+        fi
+    fi
+
+    latest_migration="$(_latest_postgres_migration_path)"
+    latest_migration_name=""
+    latest_migration_sha=""
+    if [ -n "$latest_migration" ]; then
+        latest_migration_name="$(basename "$latest_migration")"
+        latest_migration_sha="$(_sha256_file "$latest_migration")"
+    fi
+
+    AGENTDESK_MANIFEST_GENERATED_AT="$generated_at" \
+    AGENTDESK_MANIFEST_REPO="$REPO" \
+    AGENTDESK_MANIFEST_REPO_BRANCH="$repo_branch" \
+    AGENTDESK_MANIFEST_REPO_HEAD="$repo_head" \
+    AGENTDESK_MANIFEST_REPO_UPSTREAM="$repo_upstream" \
+    AGENTDESK_MANIFEST_REPO_UPSTREAM_SHA="$repo_upstream_sha" \
+    AGENTDESK_MANIFEST_REPO_DIRTY="$repo_dirty" \
+    AGENTDESK_MANIFEST_SOURCE_BINARY="${SOURCE_BINARY:-}" \
+    AGENTDESK_MANIFEST_LATEST_MIGRATION="$latest_migration_name" \
+    AGENTDESK_MANIFEST_LATEST_MIGRATION_SHA="$latest_migration_sha" \
+    AGENTDESK_MANIFEST_SIGNING_MODE="${RESOLVED_RELEASE_SIGNING_MODE:-unknown}" \
+    AGENTDESK_MANIFEST_CODESIGN_IDENTITY="$CODESIGN_IDENTITY" \
+    AGENTDESK_MANIFEST_ALLOW_ADHOC_RELEASE_SIGN="$ALLOW_ADHOC_RELEASE_SIGN" \
+    AGENTDESK_MANIFEST_SKIP_TURN_DRAIN="${AGENTDESK_SKIP_TURN_DRAIN:-1}" \
+    AGENTDESK_MANIFEST_SKIP_FRESHNESS="${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" \
+    AGENTDESK_MANIFEST_SKIP_REMOTE_FRESHNESS="${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}" \
+    python3 - "$manifest_tmp" <<PY
+import json
+import os
+import sys
+
+path = sys.argv[1]
+payload = {
+    "generated_at": os.environ.get("AGENTDESK_MANIFEST_GENERATED_AT", ""),
+    "repo_path": os.environ.get("AGENTDESK_MANIFEST_REPO", ""),
+    "repo_branch": os.environ.get("AGENTDESK_MANIFEST_REPO_BRANCH", ""),
+    "repo_head": os.environ.get("AGENTDESK_MANIFEST_REPO_HEAD", ""),
+    "repo_upstream": os.environ.get("AGENTDESK_MANIFEST_REPO_UPSTREAM", ""),
+    "repo_upstream_sha": os.environ.get("AGENTDESK_MANIFEST_REPO_UPSTREAM_SHA", ""),
+    "repo_dirty": os.environ.get("AGENTDESK_MANIFEST_REPO_DIRTY", "unknown"),
+    "source_binary": os.environ.get("AGENTDESK_MANIFEST_SOURCE_BINARY", ""),
+    "latest_postgres_migration": os.environ.get("AGENTDESK_MANIFEST_LATEST_MIGRATION", ""),
+    "latest_postgres_migration_sha256": os.environ.get("AGENTDESK_MANIFEST_LATEST_MIGRATION_SHA", ""),
+    "signing_mode": os.environ.get("AGENTDESK_MANIFEST_SIGNING_MODE", ""),
+    "codesign_identity": os.environ.get("AGENTDESK_MANIFEST_CODESIGN_IDENTITY", ""),
+    "allow_adhoc_release_sign": os.environ.get("AGENTDESK_MANIFEST_ALLOW_ADHOC_RELEASE_SIGN", ""),
+    "skip_turn_drain": os.environ.get("AGENTDESK_MANIFEST_SKIP_TURN_DRAIN", "1"),
+    "skip_freshness": os.environ.get("AGENTDESK_MANIFEST_SKIP_FRESHNESS", "0"),
+    "skip_remote_freshness": os.environ.get("AGENTDESK_MANIFEST_SKIP_REMOTE_FRESHNESS", "0"),
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+    mv -f "$manifest_tmp" "$manifest_path"
+    echo "▸ Release source manifest: $manifest_path"
+}
+
+_clean_release_build_cache_after_staging() {
+    [ "${AGENTDESK_DEPLOY_SKIP_BUILD_CACHE_CLEANUP:-0}" != "1" ] || return 0
+    [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] || return 0
+
+    echo "▸ Cleaning release build cache after staging binary..."
+    if (cd "$REPO" && cargo clean --release); then
+        echo "  ✓ release build cache cleaned"
+    else
+        echo "⚠ cargo clean --release failed; continuing with staged release artifact"
+    fi
 }
 
 _check_repo_remote_freshness() {
@@ -432,6 +573,7 @@ fi
 # Build the release binary from the current workspace by default so deploy
 # always ships code compiled from the current HEAD. When a validated external
 # artifact is provided explicitly, keep the existing override behavior.
+_ensure_dashboard_dependencies
 _check_repo_remote_freshness
 if [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     SOURCE_BINARY="$AGENTDESK_DEPLOY_BINARY"
@@ -584,12 +726,22 @@ if not postgres:
     raise SystemExit(1)
 
 status = str(postgres.get("status", "")).lower()
-if status in {"pass", "ok", "info"}:
+evidence = postgres.get("evidence") or {}
+drift_fields = {
+    "missing_from_resolved": evidence.get("missing_from_resolved") or [],
+    "unsuccessful_versions": evidence.get("unsuccessful_versions") or [],
+    "checksum_mismatches": evidence.get("checksum_mismatches") or [],
+}
+drift = {key: value for key, value in drift_fields.items() if value}
+if status in {"pass", "ok", "info"} and not drift:
     raise SystemExit(0)
 
 detail = postgres.get("detail") or "no detail"
 actual = postgres.get("actual") or "unknown"
-print(f"✗ Doctor postgres preflight failed: status={status}, detail={detail}, actual={actual}")
+if drift:
+    print(f"✗ Doctor postgres preflight failed: status={status}, drift={drift}, detail={detail}, actual={actual}")
+else:
+    print(f"✗ Doctor postgres preflight failed: status={status}, detail={detail}, actual={actual}")
 raise SystemExit(1)
 PY
 then
@@ -609,6 +761,7 @@ cp "$SOURCE_BINARY" "$STAGED_BINARY"
 chmod +x "$STAGED_BINARY"
 xattr -d com.apple.provenance "$STAGED_BINARY" 2>/dev/null || true
 sign_binary_with_fallback "$STAGED_BINARY"
+_clean_release_build_cache_after_staging
 
 # Stop release — wait for process to actually die (flock release)
 echo "▸ Stopping release..."
@@ -723,5 +876,7 @@ elif _health_json_reconcile_only "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; 
 else
     echo "✓ Release is healthy on :${REL_PORT}"
 fi
+
+_write_release_source_manifest
 
 echo "═══ Deploy Complete ═══"
