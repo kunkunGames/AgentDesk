@@ -58,12 +58,12 @@ module.exports = function attachIdleKill(timeouts, helpers) {
 
       var now = Date.now();
       var processed = {};
-      var killedCount = 0;
 
-      function forceKillIdleSessions(sessions, minimumIdleMinutes, reasonLabel) {
+      function forceKillIdleSessions(sessions, minimumIdleMinutes, reasonLabel, maxKills) {
+        var killedCount = 0;
         for (var i = 0; i < sessions.length; i++) {
-          if (killedCount >= 5) {
-            agentdesk.log.info("[idle-kill] Reached max 5 kills per tick. Breaking early.");
+          if (killedCount >= maxKills) {
+            agentdesk.log.info("[idle-kill] Reached max " + maxKills + " kills for this category. Breaking early.");
             break;
           }
 
@@ -106,7 +106,7 @@ module.exports = function attachIdleKill(timeouts, helpers) {
         }
       }
 
-      forceKillIdleSessions(idleSessions, 60, "idle 60분 경과 (active_dispatch_id 없음)");
-      forceKillIdleSessions(safetySessions, 180, "idle 180분 경과 (safety TTL)");
+      forceKillIdleSessions(safetySessions, 180, "idle 180분 경과 (safety TTL)", 2);
+      forceKillIdleSessions(idleSessions, 60, "idle 60분 경과 (active_dispatch_id 없음)", 3);
     };
 };
