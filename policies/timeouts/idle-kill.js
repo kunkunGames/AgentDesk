@@ -78,7 +78,6 @@ module.exports = function attachIdleKill(timeouts, helpers) {
 
           var forceKillResp = null;
           try {
-            killedCount++;
             var forceKillUrl = "http://127.0.0.1:" + apiPort +
               "/api/sessions/" + encodeURIComponent(s.session_key) + "/force-kill";
             forceKillResp = agentdesk.http.post(forceKillUrl, { retry: false, reason: "idle " + idleMin + "분 초과 — 자동 정리" });
