@@ -331,7 +331,7 @@
 | `services::discord::health` | `src/services/discord/health.rs` | 4882 | giant-file |
 | `services::discord::health::mailbox` | `src/services/discord/health/mailbox.rs` | 22 |  |
 | `services::discord::health::provider_probe` | `src/services/discord/health/provider_probe.rs` | 242 |  |
-| `services::discord::health::recovery` | `src/services/discord/health/recovery.rs` | 1433 | giant-file |
+| `services::discord::health::recovery` | `src/services/discord/health/recovery.rs` | 1448 | giant-file |
 | `services::discord::health::redaction` | `src/services/discord/health/redaction.rs` | 33 |  |
 | `services::discord::health::session_enrichment` | `src/services/discord/health/session_enrichment.rs` | 204 |  |
 | `services::discord::health::snapshot` | `src/services/discord/health/snapshot.rs` | 666 |  |
