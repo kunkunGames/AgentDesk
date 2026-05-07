@@ -1,0 +1,20 @@
+Replaces a raw `agentdesk.db.query("SELECT repo_id FROM kanban_cards ...")` call in `policies/pipeline.js`'s `onCardTransition` hook with the existing `agentdesk.cards.get` typed facade.
+
+This directly reduces policy coupling to the underlying `kanban_cards` SQLite/PostgreSQL schema while maintaining perfect behavioral parity. A dedicated unit test has been added to prove that the typed facade is invoked correctly.
+
+## Boundary fingerprint
+
+- Agent: FacadePilot
+- Boundary: policies/pipeline.js repo_id read migration
+- Primary files: policies/pipeline.js, policies/__tests__/pipeline-transition.test.js
+- Policy/facade invariant: pipeline onCardTransition hook logic remains equivalent when migrating off raw SQL.
+- Related PRs/issues checked: None overlapping `policies/pipeline.js` or `agentdesk.cards.get`
+- Why this is non-overlapping: This specifically touches the read in `pipeline.js` transitioning to typed facades, which no open PR currently addresses.
+
+Tests added:
+- `policies/__tests__/pipeline-transition.test.js`
+
+Verification commands run:
+- `npm run test:policies`
+- `node --test policies/__tests__/pipeline-transition.test.js`
+- `cargo check --all-targets --config 'build.rustc-wrapper=""'`
