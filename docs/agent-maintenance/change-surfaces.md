@@ -220,6 +220,7 @@
   - `src/config.rs` (2601 lines).
   - `src/runtime_layout/mod.rs` (1425 lines).
   - `src/server/mod.rs` (3370 lines).
+  - `src/server/cluster.rs` (1042 lines).
   - `src/kanban/state_machine.rs` (3550 lines).
   - `src/kanban/transition_core.rs` (1107 lines; relocated from state_machine
     via #1786 epic decompose, awaiting further split).
