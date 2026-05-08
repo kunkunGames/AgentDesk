@@ -232,6 +232,7 @@
     delivery outbox/notify path — bugfix only).
   - `src/server/task_dispatch_claims.rs` (1038 lines; cluster-aware
     task-dispatch claim TTL/limit + semaphore coordination).
+  - `src/server/cluster.rs` (1042 lines; cluster resource lock and test-phase FSM coordination).
 - active_callsite_coverage: n/a.
 - invariants: config precedence, runtime path generation, kanban state, receipt
   persistence, and GitHub sync must keep their existing owner-specific
