@@ -210,27 +210,42 @@
 ### `runtime_core`
 
 - canonical_modules: `src/config.rs`, `src/runtime_layout/mod.rs`,
-  `src/server/mod.rs`, `src/kanban.rs`, `src/receipt.rs`, and
-  `src/github/sync.rs`.
+  `src/server/mod.rs`, `src/kanban/state_machine.rs`, `src/receipt.rs`,
+  `src/github/sync.rs`, `src/reconcile.rs` (periodic stale-inflight + orphan
+  sweep), `src/high_risk_recovery.rs` (PG recovery harness for delivery
+  outbox/notify), `src/server/task_dispatch_claims.rs` (cluster-aware
+  task-dispatch claim coordination), and `src/server/cluster.rs`
+  (cluster role/leader-failover coordination).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
   - `src/config.rs` (2601 lines).
   - `src/runtime_layout/mod.rs` (1425 lines).
   - `src/server/mod.rs` (3370 lines).
-  - `src/kanban.rs` (4041 lines).
+  - `src/kanban/state_machine.rs` (3550 lines).
+  - `src/kanban/transition_core.rs` (1107 lines; relocated from state_machine
+    via #1786 epic decompose, awaiting further split).
   - `src/receipt.rs` (2133 lines).
   - `src/github/sync.rs` (1059 lines).
+  - `src/reconcile.rs` (1867 lines; periodic reconcile loop covering stale
+    inflights, orphan uploads, dispatched-session drift, and queue-review
+    drift — split before adding non-bugfix behavior).
+  - `src/high_risk_recovery.rs` (1161 lines; PG recovery harness for the
+    delivery outbox/notify path — bugfix only).
+  - `src/server/task_dispatch_claims.rs` (1038 lines; cluster-aware
+    task-dispatch claim TTL/limit + semaphore coordination).
+  - `src/server/cluster.rs` (1046 lines; cluster role detection, leader
+    advisory-lock coordination, and failover wiring — bugfix only).
 - active_callsite_coverage: n/a.
 - invariants: config precedence, runtime path generation, kanban state, receipt
   persistence, and GitHub sync must keep their existing owner-specific
   contracts; split work needs a dedicated extraction issue before new feature
   logic lands here.
-- allowed_changes: `bugfix` only; `src/kanban.rs` extraction is scoped by
+- allowed_changes: `bugfix` only; `src/kanban/` extraction is scoped by
   `docs/agent-maintenance/kanban-extraction-plan.md`; new feature logic must
   land in smaller owner-specific modules or a scoped extraction branch.
-- tests: owner-specific tests, with `src/kanban.rs` inline tests moving per
+- tests: owner-specific tests, with `src/kanban/state_machine.rs` inline tests moving per
   `docs/agent-maintenance/kanban-extraction-plan.md`.
-- related_issues: #1786, #1787, #1818-#1825 for `src/kanban.rs`; other runtime
+- related_issues: #1786, #1787, #1818-#1825 for `src/kanban/`; other runtime
   giant-file split issues TBD.
 
 ### `db_layer`
@@ -238,10 +253,12 @@
 - canonical_modules: `src/db/{mod,postgres,schema}.rs` and per-domain modules.
 - legacy_modules: SQLite path through `libsql_rusqlite` (see `known-legacy.md`).
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/db/auto_queue.rs` (5691 lines).
+  - `src/db/auto_queue/tests.rs` (3182 lines; migrated auto-queue test harness).
+  - `src/db/auto_queue/entries.rs` (1436 lines; awaiting follow-up split per
+    auto-queue decompose epic #1782).
   - `src/db/schema.rs` (3194 lines).
-  - `src/db/kanban_cards.rs` (1903 lines; kanban card persistence and GitHub
-    sync lookup surface).
+  - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
+    GitHub sync lookup surface).
   - `src/db/postgres.rs` (1536 lines).
   - `src/db/dispatched_sessions.rs` (1200 lines; dispatched session
     persistence helpers).
@@ -307,7 +324,8 @@ The remaining giant-file modules under `src/services/` not covered above:
   Discord notification plumbing. Split before broadening behavior outside the
   current routine API/runtime contract.
 - `src/services/discord/mod.rs` (5519),
-  `src/services/discord_config_audit.rs` (1310), and
+  `src/services/discord_config_audit.rs` (1310),
+  `src/services/discord/tmux_lifecycle.rs` (1129), and
   `src/services/qwen_tmux_wrapper.rs` (1194).
 - `src/services/turn_orchestrator.rs` (2070).
 - `src/services/session_backend.rs` (1053).

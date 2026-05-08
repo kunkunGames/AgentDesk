@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub mcp_servers: std::collections::BTreeMap<String, McpServerConfig>,
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_mcp_allowlist: Vec<String>,
     #[serde(default)]
@@ -671,11 +672,17 @@ pub struct ClusterConfig {
     pub labels: Vec<String>,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub capabilities: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nodes: BTreeMap<String, ClusterNodeConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blackout_windows: BTreeMap<String, Vec<ClusterBlackoutWindowConfig>>,
     #[serde(
         default,
         skip_serializing_if = "ClusterDispatchRoutingConfig::is_default"
     )]
     pub dispatch_routing: ClusterDispatchRoutingConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub semaphores: BTreeMap<String, ClusterSemaphoreConfig>,
 }
 
 impl Default for ClusterConfig {
@@ -689,7 +696,10 @@ impl Default for ClusterConfig {
             api_base_url: None,
             labels: Vec::new(),
             capabilities: serde_json::Map::new(),
+            nodes: BTreeMap::new(),
+            blackout_windows: BTreeMap::new(),
             dispatch_routing: ClusterDispatchRoutingConfig::default(),
+            semaphores: BTreeMap::new(),
         }
     }
 }
@@ -702,11 +712,51 @@ impl ClusterConfig {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct ClusterNodeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_dispatches: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClusterBlackoutWindowConfig {
+    pub start: String,
+    pub end: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ClusterDispatchRoutingConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub default_preferred_labels: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opt_out_dispatch_types: Vec<String>,
+    #[serde(
+        default = "default_dispatch_routing_constraints",
+        skip_serializing_if = "is_default_dispatch_routing_constraints"
+    )]
+    pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_timeout_secs: Option<u64>,
+    #[serde(
+        default = "default_dispatch_routing_wake_interval_secs",
+        skip_serializing_if = "is_default_dispatch_routing_wake_interval_secs"
+    )]
+    pub wake_interval_secs: u64,
+}
+
+impl Default for ClusterDispatchRoutingConfig {
+    fn default() -> Self {
+        Self {
+            default_preferred_labels: Vec::new(),
+            opt_out_dispatch_types: Vec::new(),
+            constraints: default_dispatch_routing_constraints(),
+            wait_timeout_secs: None,
+            wake_interval_secs: default_dispatch_routing_wake_interval_secs(),
+        }
+    }
 }
 
 impl ClusterDispatchRoutingConfig {
@@ -718,6 +768,145 @@ impl ClusterDispatchRoutingConfig {
         self.opt_out_dispatch_types
             .iter()
             .any(|value| value == dispatch_type)
+    }
+}
+
+fn default_dispatch_routing_constraints() -> Vec<String> {
+    vec![crate::services::dispatches::routing_constraint::NOOP_CONSTRAINT_NAME.to_string()]
+}
+
+fn is_default_dispatch_routing_constraints(values: &[String]) -> bool {
+    values == default_dispatch_routing_constraints().as_slice()
+}
+
+fn default_dispatch_routing_wake_interval_secs() -> u64 {
+    30
+}
+
+fn is_default_dispatch_routing_wake_interval_secs(value: &u64) -> bool {
+    *value == default_dispatch_routing_wake_interval_secs()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ClusterSemaphoreConfig {
+    #[serde(default = "default_cluster_semaphore_capacity")]
+    pub capacity: u32,
+    #[serde(default)]
+    pub scope: ClusterSemaphoreScope,
+}
+
+impl Default for ClusterSemaphoreConfig {
+    fn default() -> Self {
+        Self {
+            capacity: default_cluster_semaphore_capacity(),
+            scope: ClusterSemaphoreScope::default(),
+        }
+    }
+}
+
+impl ClusterSemaphoreConfig {
+    pub fn effective_capacity(&self) -> i32 {
+        self.capacity.clamp(1, 1024) as i32
+    }
+}
+
+fn default_cluster_semaphore_capacity() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterSemaphoreScope {
+    #[serde(alias = "per_node")]
+    PerNode,
+    #[serde(alias = "per_cluster")]
+    PerCluster,
+}
+
+impl Default for ClusterSemaphoreScope {
+    fn default() -> Self {
+        Self::PerNode
+    }
+}
+
+impl ClusterSemaphoreScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerNode => "per-node",
+            Self::PerCluster => "per-cluster",
+        }
+    }
+
+    pub fn scope_key(self, instance_id: &str) -> String {
+        match self {
+            Self::PerNode => instance_id.to_string(),
+            Self::PerCluster => "cluster".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cluster_semaphore_config_tests {
+    use super::{ClusterConfig, ClusterSemaphoreScope};
+
+    #[test]
+    fn cluster_semaphores_parse_kebab_scope_and_default_capacity() {
+        let config: ClusterConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+semaphores:
+  ue_editor:
+    capacity: 1
+    scope: per-node
+  gpu:
+    scope: per-cluster
+"#,
+        )
+        .expect("cluster semaphore config parses");
+
+        assert_eq!(
+            config.semaphores["ue_editor"].scope,
+            ClusterSemaphoreScope::PerNode
+        );
+        assert_eq!(config.semaphores["ue_editor"].effective_capacity(), 1);
+        assert_eq!(
+            config.semaphores["gpu"].scope,
+            ClusterSemaphoreScope::PerCluster
+        );
+        assert_eq!(config.semaphores["gpu"].effective_capacity(), 1);
+    }
+
+    #[test]
+    fn cluster_nodes_parse_max_concurrent_dispatches() {
+        let config: ClusterConfig = serde_yaml::from_str(
+            r#"
+enabled: true
+nodes:
+  mac-mini-release:
+    max_concurrent_dispatches: 4
+blackout_windows:
+  mac-mini-release:
+    - start: "23:00"
+      end: "23:30"
+      reason: maintenance
+dispatch_routing:
+  wait_timeout_secs: 600
+"#,
+        )
+        .expect("cluster node config parses");
+
+        assert_eq!(
+            config.nodes["mac-mini-release"].max_concurrent_dispatches,
+            Some(4)
+        );
+        assert_eq!(
+            config.blackout_windows["mac-mini-release"][0]
+                .reason
+                .as_deref(),
+            Some("maintenance")
+        );
+        assert_eq!(config.dispatch_routing.wait_timeout_secs, Some(600));
     }
 }
 

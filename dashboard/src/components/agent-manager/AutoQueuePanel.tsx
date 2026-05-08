@@ -20,6 +20,7 @@ import {
   shouldClearSuppressedAutoQueueRun,
 } from "./auto-queue-panel-state";
 import { buildDiscordThreadLinks } from "./discord-routing";
+import { buildGitHubIssueUrl } from "./kanban-utils";
 
 interface Props {
   tr: (ko: string, en: string) => string;
@@ -234,6 +235,7 @@ function EntryRow({
   const isFailed = entry.status === "failed";
   const retryCount = entry.retry_count ?? 0;
   const showReviewRound = (entry.card_status === "review" || entry.card_status === "rework") && (entry.review_round ?? 0) > 0;
+  const githubIssueUrl = buildGitHubIssueUrl(entry.github_repo, entry.github_issue_number);
   const threadLinks = (entry.thread_links ?? []).filter(
     (link) => Boolean(link.url || link.thread_id),
   );
@@ -312,9 +314,9 @@ function EntryRow({
               </span>
             )}
             {entry.github_issue_number && (
-              entry.github_repo ? (
+              githubIssueUrl ? (
                 <a
-                  href={`https://github.com/${entry.github_repo}/issues/${entry.github_issue_number}`}
+                  href={githubIssueUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="mr-1 font-medium hover:underline"
@@ -353,10 +355,14 @@ function EntryRow({
               {threadLinks.map((link) => {
                 const label = formatThreadLinkLabel(link, tr);
                 const key = `${entry.id}:${link.role}:${link.thread_id}`;
+                const resolvedLink = link.url ? buildDiscordThreadLinks(link) : null;
+                const href = resolvedLink
+                  ? (resolvedLink.deepLink ?? resolvedLink.webUrl)
+                  : null;
                 const content = (
                   <>
                     <span>{label}</span>
-                    {link.url ? (
+                    {href ? (
                       <span aria-hidden="true">↗</span>
                     ) : (
                       <span className="font-mono opacity-70">
@@ -366,12 +372,11 @@ function EntryRow({
                   </>
                 );
 
-                if (link.url) {
-                  const { deepLink } = buildDiscordThreadLinks(link);
+                if (href) {
                   return (
                     <a
                       key={key}
-                      href={deepLink ?? link.url}
+                      href={href}
                       target="_blank"
                       rel="noreferrer"
                       onClick={(event) => event.stopPropagation()}

@@ -1,6 +1,13 @@
 use sqlx::PgPool;
 use std::fs;
 
+#[derive(Clone)]
+pub(super) struct MockHttpResponse {
+    pub(super) status_line: &'static str,
+    pub(super) headers: Vec<(&'static str, &'static str)>,
+    pub(super) body: String,
+}
+
 pub(super) struct MockGhIssueCreateEnv {
     _dir: tempfile::TempDir,
     old_gh_path: Option<std::ffi::OsString>,
@@ -101,6 +108,48 @@ impl Drop for MockGhIssueCreateEnv {
     }
 }
 
+pub(super) async fn spawn_response_sequence_server(
+    responses: Vec<MockHttpResponse>,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<Vec<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for response in responses {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 32768];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            requests.push(String::from_utf8_lossy(&buf[..n]).to_string());
+
+            let mut raw_response = format!(
+                "HTTP/1.1 {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
+                response.status_line,
+                response.body.len()
+            );
+            for (header, value) in response.headers {
+                raw_response.push_str(&format!("{header}: {value}\r\n"));
+            }
+            raw_response.push_str("\r\n");
+            raw_response.push_str(&response.body);
+
+            let _ = stream.write_all(raw_response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+        let _ = requests_tx.send(requests);
+    });
+
+    (format!("http://{}", addr), requests_rx, handle)
+}
+
 #[cfg(unix)]
 pub(super) fn install_mock_gh_issue_create(url: &str) -> MockGhIssueCreateEnv {
     use std::os::unix::fs::PermissionsExt;
@@ -124,12 +173,53 @@ pub(super) fn install_mock_gh_issue_create(url: &str) -> MockGhIssueCreateEnv {
     }
 }
 
+#[cfg(unix)]
+pub(super) fn install_mock_gh_issue_create_failure(stderr: &str) -> MockGhIssueCreateEnv {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gh_path = dir.path().join("gh");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nif [ \"${{1-}}\" = \"issue\" ] && [ \"${{2-}}\" = \"create\" ]; then\ncat >&2 <<'EOF'\n{stderr}\nEOF\nexit 23\nfi\nexit 1\n"
+    );
+    fs::write(&gh_path, script).unwrap();
+    let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+
+    let old_gh_path = std::env::var_os("AGENTDESK_GH_PATH");
+    unsafe { std::env::set_var("AGENTDESK_GH_PATH", &gh_path) };
+
+    MockGhIssueCreateEnv {
+        _dir: dir,
+        old_gh_path,
+    }
+}
+
 #[cfg(windows)]
 pub(super) fn install_mock_gh_issue_create(url: &str) -> MockGhIssueCreateEnv {
     let dir = tempfile::tempdir().unwrap();
     let gh_cmd_path = dir.path().join("gh.cmd");
     let wrapper = format!(
         "@echo off\r\nsetlocal\r\nif /I \"%~1\"==\"--version\" goto version\r\nif /I not \"%~1\"==\"issue\" exit /b 1\r\nif /I not \"%~2\"==\"create\" exit /b 1\r\necho {url}\r\nexit /b 0\r\n:version\r\necho gh mock 1.0\r\nexit /b 0\r\n"
+    );
+    fs::write(&gh_cmd_path, wrapper).unwrap();
+
+    let old_gh_path = std::env::var_os("AGENTDESK_GH_PATH");
+    unsafe { std::env::set_var("AGENTDESK_GH_PATH", &gh_cmd_path) };
+
+    MockGhIssueCreateEnv {
+        _dir: dir,
+        old_gh_path,
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn install_mock_gh_issue_create_failure(stderr: &str) -> MockGhIssueCreateEnv {
+    let dir = tempfile::tempdir().unwrap();
+    let gh_cmd_path = dir.path().join("gh.cmd");
+    let wrapper = format!(
+        "@echo off\r\nsetlocal\r\nif /I \"%~1\"==\"--version\" goto version\r\nif /I not \"%~1\"==\"issue\" exit /b 1\r\nif /I not \"%~2\"==\"create\" exit /b 1\r\necho {stderr} 1>&2\r\nexit /b 23\r\n:version\r\necho gh mock 1.0\r\nexit /b 0\r\n"
     );
     fs::write(&gh_cmd_path, wrapper).unwrap();
 

@@ -156,6 +156,7 @@ pub(crate) async fn run(
     health_registry: Option<Arc<HealthRegistry>>,
     pg_pool: Option<PgPool>,
 ) -> Result<()> {
+    crate::services::dispatches::wait_queue::set_runtime_cluster_config(config.cluster.clone());
     let pg_pool = match pg_pool {
         Some(pool) => Some(pool),
         None => crate::db::postgres::connect_and_migrate(&config)
@@ -349,6 +350,25 @@ async fn policy_tick_loop(
         // ── 1min tier: every 2nd tick (60s) ──
         if count % 2 == 0 {
             fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick1min", "1min").await;
+            if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
+                match crate::reconcile::reconcile_auto_queue_pending_delivery_orphans_pg(pool).await
+                {
+                    Ok(stats) if stats.touched() => {
+                        tracing::info!(
+                            candidates = stats.candidates,
+                            requeued_notify = stats.requeued_notify,
+                            skipped = stats.skipped,
+                            "[policy-tick] auto-queue pending delivery orphan reconcile repaired notify rows"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "[policy-tick] auto-queue pending delivery orphan reconcile failed: {error}"
+                        );
+                    }
+                }
+            }
         }
 
         // ── 5min tier: every 10th tick (300s) ──
@@ -385,6 +405,24 @@ async fn policy_tick_loop(
                     Err(error) => {
                         tracing::warn!(
                             "[policy-tick] completed queue review drift reconcile failed: {error}"
+                        );
+                    }
+                }
+
+                match crate::reconcile::reconcile_dispatch_delivery_events_pg(pool).await {
+                    Ok(stats) if stats.touched() => {
+                        tracing::warn!(
+                            mismatch_count = stats.mismatch_count,
+                            missing_typed = stats.missing_typed,
+                            notified_status_mismatch = stats.notified_status_mismatch,
+                            missing_kv_meta = stats.missing_kv_meta,
+                            "[policy-tick] dispatch delivery event reconcile found mismatches"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            "[policy-tick] dispatch delivery event reconcile failed: {error}"
                         );
                     }
                 }

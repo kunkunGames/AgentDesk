@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../../api";
 import type { DispatchDeliveryEvent, GitHubIssue, GitHubRepoOption, KanbanRepoSource } from "../../api";
 import { STORAGE_KEYS } from "../../lib/storageKeys";
@@ -40,6 +40,7 @@ import {
   STATUS_TRANSITIONS,
   TERMINAL_STATUSES,
   TRANSITION_STYLE,
+  buildGitHubIssueUrl,
   coerceEditor,
   createChecklistItem,
   formatIso,
@@ -64,6 +65,17 @@ import {
   formatAuditResult,
   formatDispatchSummary,
 } from "./card-detail-activity";
+import {
+  createDeliveryEventsLoadState,
+  compactStringParts,
+  deliveryEventMessagesCount,
+  finishDeliveryEventsLoadError,
+  finishDeliveryEventsLoadSuccess,
+  getDeliveryEventStatusStyle,
+  startDeliveryEventsLoad,
+  summarizeDeliveryError,
+  type DeliveryEventsLoadState,
+} from "./dispatch-delivery-events";
 
 interface KanbanTabProps {
   tr: (ko: string, en: string) => string;
@@ -143,31 +155,12 @@ const SURFACE_CHIP_STYLE = {
   borderColor: "color-mix(in srgb, var(--th-border) 64%, transparent)",
 } as const;
 
+const DELIVERY_EVENTS_POLL_MS = 5_000;
+
 const SURFACE_GHOST_BUTTON_STYLE = {
   background: "color-mix(in srgb, var(--th-card-bg) 88%, transparent)",
   borderColor: "color-mix(in srgb, var(--th-border) 64%, transparent)",
 } as const;
-
-const DELIVERY_EVENT_STATUS_STYLE: Record<string, { bg: string; text: string }> = {
-  reserved: { bg: "rgba(96,165,250,0.16)", text: "#93c5fd" },
-  sent: { bg: "rgba(34,197,94,0.16)", text: "#86efac" },
-  fallback: { bg: "rgba(249,115,22,0.16)", text: "#fdba74" },
-  duplicate: { bg: "rgba(168,85,247,0.16)", text: "#c4b5fd" },
-  skipped: { bg: "rgba(148,163,184,0.12)", text: "#cbd5e1" },
-  failed: { bg: "rgba(248,113,113,0.16)", text: "#fca5a5" },
-};
-
-function getDeliveryEventStatusStyle(status: string): { bg: string; text: string } {
-  return DELIVERY_EVENT_STATUS_STYLE[status] ?? { bg: "rgba(148,163,184,0.10)", text: "#94a3b8" };
-}
-
-function deliveryEventMessagesCount(value: unknown): number {
-  return Array.isArray(value) ? value.length : 0;
-}
-
-function compactStringParts(parts: Array<string | null | undefined | false>): string[] {
-  return parts.filter((part): part is string => Boolean(part));
-}
 
 const SURFACE_MODAL_CARD_STYLE = {
   background:
@@ -244,15 +237,30 @@ export default function KanbanTab({
   const [cancelBusy, setCancelBusy] = useState(false);
   const [auditLog, setAuditLog] = useState<api.CardAuditLogEntry[]>([]);
   const [ghComments, setGhComments] = useState<api.GitHubComment[]>([]);
-  const [deliveryEvents, setDeliveryEvents] = useState<DispatchDeliveryEvent[]>([]);
-  const [deliveryEventsLoading, setDeliveryEventsLoading] = useState(false);
-  const [deliveryEventsError, setDeliveryEventsError] = useState<string | null>(null);
+  const [deliveryEventsState, setDeliveryEventsState] = useState<DeliveryEventsLoadState<DispatchDeliveryEvent>>(
+    () => createDeliveryEventsLoadState(),
+  );
+  const [deliveryEventsPanelVisible, setDeliveryEventsPanelVisible] = useState(true);
   const [timelineFilter, setTimelineFilter] = useState<"review" | "pm" | "work" | "general" | null>(null);
   const [activityRefreshTick, setActivityRefreshTick] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [liveTurnsByAgentId, setLiveTurnsByAgentId] = useState<Record<string, api.AgentTurnState>>({});
   const ghCommentsCache = useRef<Map<string, { comments: api.GitHubComment[]; body: string; ts: number }>>(new Map());
+  const deliveryEventsStateRef = useRef(deliveryEventsState);
+  const deliveryEventsPanelRef = useRef<HTMLDivElement | null>(null);
   const detailRequestSeq = useRef(0);
+  const commitDeliveryEventsState = useCallback((
+    updater: (prev: DeliveryEventsLoadState<DispatchDeliveryEvent>) => DeliveryEventsLoadState<DispatchDeliveryEvent>,
+  ) => {
+    setDeliveryEventsState((prev) => {
+      const next = updater(prev);
+      deliveryEventsStateRef.current = next;
+      return next;
+    });
+  }, []);
+  const deliveryEvents = deliveryEventsState.events;
+  const deliveryEventsLoading = deliveryEventsState.loading;
+  const deliveryEventsError = deliveryEventsState.error;
 
   const agentMap = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
   const cardsById = useMemo(() => new Map(cards.map((card) => [card.id, card])), [cards]);
@@ -709,6 +717,13 @@ export default function KanbanTab({
   const selectedCardChecklistSummary = selectedCard ? getChecklistSummary(selectedCard) : null;
   const selectedCardDelayBadge = selectedCard ? getCardDelayBadge(selectedCard, tr) : null;
   const selectedCardDwellBadge = selectedCard ? getCardDwellBadge(selectedCard, nowMs, tr) : null;
+  const selectedCardGitHubIssueUrl = selectedCard
+    ? buildGitHubIssueUrl(
+        selectedCard.github_repo,
+        selectedCard.github_issue_number,
+        selectedCard.github_issue_url,
+      )
+    : null;
   const selectedParentCard = selectedCard?.parent_card_id
     ? repoCardsById.get(selectedCard.parent_card_id) ?? null
     : null;
@@ -812,35 +827,66 @@ export default function KanbanTab({
 
   useEffect(() => {
     if (!selectedDeliveryDispatchId) {
-      setDeliveryEvents([]);
-      setDeliveryEventsError(null);
-      setDeliveryEventsLoading(false);
+      setDeliveryEventsPanelVisible(true);
+      return;
+    }
+    const node = deliveryEventsPanelRef.current;
+    if (!node || typeof IntersectionObserver === "undefined") {
+      setDeliveryEventsPanelVisible(true);
       return;
     }
 
-    let stale = false;
-    setDeliveryEventsLoading(true);
-    setDeliveryEventsError(null);
-    setDeliveryEvents([]);
+    const observer = new IntersectionObserver(
+      ([entry]) => setDeliveryEventsPanelVisible(Boolean(entry?.isIntersecting)),
+      { threshold: 0.05 },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [selectedDeliveryDispatchId]);
 
-    api.getDispatchDeliveryEvents(selectedDeliveryDispatchId)
-      .then((response) => {
+  useEffect(() => {
+    if (!selectedDeliveryDispatchId) {
+      commitDeliveryEventsState(() => createDeliveryEventsLoadState());
+      return;
+    }
+    if (!deliveryEventsPanelVisible) return;
+
+    let stale = false;
+    let pollTimer: number | null = null;
+    const resetEvents = deliveryEventsStateRef.current.loadedDispatchId !== selectedDeliveryDispatchId;
+
+    const loadDeliveryEvents = async (showLoading: boolean) => {
+      if (showLoading) {
+        commitDeliveryEventsState((prev) => (
+          startDeliveryEventsLoad(prev, selectedDeliveryDispatchId, resetEvents)
+        ));
+      }
+      try {
+        const response = await api.getDispatchDeliveryEvents(selectedDeliveryDispatchId);
         if (stale) return;
-        setDeliveryEvents(response.events);
-      })
-      .catch((error) => {
+        commitDeliveryEventsState((prev) => (
+          finishDeliveryEventsLoadSuccess(prev, selectedDeliveryDispatchId, response.events)
+        ));
+      } catch (error) {
         if (stale) return;
-        setDeliveryEvents([]);
-        setDeliveryEventsError((error as Error).message || "Failed to load delivery events");
-      })
-      .finally(() => {
-        if (!stale) setDeliveryEventsLoading(false);
-      });
+        commitDeliveryEventsState((prev) => (
+          finishDeliveryEventsLoadError(
+            prev,
+            (error as Error).message || "Failed to load delivery events",
+            showLoading && resetEvents,
+          )
+        ));
+      }
+    };
+
+    void loadDeliveryEvents(true);
+    pollTimer = window.setInterval(() => void loadDeliveryEvents(false), DELIVERY_EVENTS_POLL_MS);
 
     return () => {
       stale = true;
+      if (pollTimer !== null) window.clearInterval(pollTimer);
     };
-  }, [activityRefreshTick, selectedDeliveryDispatchId]);
+  }, [activityRefreshTick, commitDeliveryEventsState, deliveryEventsPanelVisible, selectedDeliveryDispatchId]);
 
   const filteredCards = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -2332,8 +2378,8 @@ export default function KanbanTab({
                         <SurfaceCard className="space-y-1.5 p-3 md:col-span-2" style={{ ...SURFACE_PANEL_STYLE }}>
                           <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("GitHub", "GitHub")}</div>
                           <div style={{ color: "var(--th-text-primary)" }}>
-                            {selectedCard.github_issue_url ? (
-                              <a href={selectedCard.github_issue_url} target="_blank" rel="noreferrer" className="hover:underline" style={{ color: "#93c5fd" }}>
+                            {selectedCardGitHubIssueUrl ? (
+                              <a href={selectedCardGitHubIssueUrl} target="_blank" rel="noreferrer" className="hover:underline" style={{ color: "#93c5fd" }}>
                                 #{selectedCard.github_issue_number ?? "-"}
                               </a>
                             ) : (
@@ -3138,113 +3184,111 @@ export default function KanbanTab({
                     })()}
 
                     {selectedDeliveryDispatchId && (
-                      <SurfaceSubsection
-                        data-testid="kanban-dispatch-delivery-events"
-                        title={tr("Delivery 이벤트", "Delivery Events")}
-                        description={tr(
-                          "typed dispatch_delivery_events 테이블에서 읽은 전송 예약·성공·fallback·중복·실패 기록입니다.",
-                          "Delivery reservation, success, fallback, duplicate, and failure records read from the typed dispatch_delivery_events table.",
-                        )}
-                        actions={(
-                          <SurfaceMetricPill
-                            tone={deliveryEventsError ? "warn" : "info"}
-                            label={tr("이벤트", "Events")}
-                            value={deliveryEventsLoading ? tr("로딩", "Loading") : deliveryEvents.length}
-                            className="min-w-[96px]"
-                          />
-                        )}
-                      >
-                        <div className="space-y-3">
-                          <div className="flex flex-wrap gap-2 text-xs" style={{ color: "var(--th-text-secondary)" }}>
-                            <span className="rounded-full border px-2 py-0.5 font-mono" style={{ ...SURFACE_CHIP_STYLE }}>
-                              #{selectedDeliveryDispatchId.slice(0, 8)}
-                            </span>
-                            <span className="rounded-full border px-2 py-0.5" style={{ ...SURFACE_CHIP_STYLE }}>
-                              dispatch_delivery_events
-                            </span>
-                          </div>
-
-                          {deliveryEventsError && (
-                            <SurfaceNotice tone="warn" compact>
-                              {deliveryEventsError}
-                            </SurfaceNotice>
+                      <div ref={deliveryEventsPanelRef}>
+                        <SurfaceSubsection
+                          data-testid="kanban-dispatch-delivery-events"
+                          title={tr("Delivery 이벤트", "Delivery Events")}
+                          description={tr(
+                            "typed dispatch_delivery_events 테이블에서 읽은 전송 예약·성공·fallback·중복·실패 기록입니다.",
+                            "Delivery reservation, success, fallback, duplicate, and failure records read from the typed dispatch_delivery_events table.",
                           )}
-
-                          {deliveryEventsError ? null : deliveryEventsLoading ? (
-                            <SurfaceEmptyState className="px-3 py-4 text-center text-xs">
-                              {tr("delivery 이벤트를 불러오는 중입니다.", "Loading delivery events.")}
-                            </SurfaceEmptyState>
-                          ) : deliveryEvents.length === 0 ? (
-                            <SurfaceEmptyState className="px-3 py-4 text-center text-xs">
-                              {tr("기록된 delivery 이벤트가 없습니다.", "No delivery events recorded.")}
-                            </SurfaceEmptyState>
-                          ) : (
-                            <div className="space-y-2 max-h-64 overflow-y-auto">
-                              {deliveryEvents.map((event) => {
-                                const statusStyle = getDeliveryEventStatusStyle(event.status);
-                                const messageCount = deliveryEventMessagesCount(event.messages_json);
-                                const meta = compactStringParts([
-                                  `${event.operation} · ${event.target_kind}`,
-                                  event.attempt > 0 ? `attempt ${event.attempt}` : null,
-                                  event.target_channel_id ? `${tr("채널", "Channel")} ${event.target_channel_id}` : null,
-                                  event.target_thread_id ? `${tr("스레드", "Thread")} ${event.target_thread_id}` : null,
-                                  messageCount > 0 ? `${tr("메시지", "Messages")} ${messageCount}` : null,
-                                ]);
-
-                                return (
-                                  <SurfaceCard
-                                    key={event.id}
-                                    className="space-y-2 p-3 text-xs"
-                                    style={{ borderColor: "rgba(148,163,184,0.12)", backgroundColor: "rgba(255,255,255,0.03)" }}
-                                  >
-                                    <div className="flex flex-wrap items-center gap-2">
-                                      <span
-                                        className="rounded px-1.5 py-0.5 text-[10px] font-medium"
-                                        style={{ backgroundColor: statusStyle.bg, color: statusStyle.text }}
-                                      >
-                                        {event.status}
-                                      </span>
-                                      <span className="font-mono" style={{ color: "var(--th-text-muted)" }}>
-                                        event #{event.id}
-                                      </span>
-                                      <span className="ml-auto" style={{ color: "var(--th-text-muted)" }}>
-                                        {formatIso(event.created_at, locale)}
-                                      </span>
-                                    </div>
-                                    <div className="flex flex-wrap gap-x-3 gap-y-1" style={{ color: "var(--th-text-secondary)" }}>
-                                      {meta.map((part) => (
-                                        <span key={part}>{part}</span>
-                                      ))}
-                                    </div>
-                                    <div className="flex flex-wrap gap-2">
-                                      {event.message_id && (
-                                        <span className="rounded-full border px-2 py-0.5 font-mono" style={{ ...SURFACE_CHIP_STYLE, color: "var(--th-text-secondary)" }}>
-                                          msg {event.message_id}
-                                        </span>
-                                      )}
-                                      {event.fallback_kind && (
-                                        <span className="rounded-full border px-2 py-0.5" style={{ ...SURFACE_CHIP_STYLE, color: "#fdba74" }}>
-                                          fallback {event.fallback_kind}
-                                        </span>
-                                      )}
-                                      {event.reserved_until && (
-                                        <span className="rounded-full border px-2 py-0.5" style={{ ...SURFACE_CHIP_STYLE, color: "var(--th-text-secondary)" }}>
-                                          {tr("예약 만료", "Reserved until")} {formatIso(event.reserved_until, locale)}
-                                        </span>
-                                      )}
-                                    </div>
-                                    {event.error && (
-                                      <SurfaceNotice tone="danger" compact className="break-words">
-                                        {event.error}
-                                      </SurfaceNotice>
-                                    )}
-                                  </SurfaceCard>
-                                );
-                              })}
+                          actions={(
+                            <SurfaceMetricPill
+                              tone={deliveryEventsError ? "warn" : "info"}
+                              label={tr("이벤트", "Events")}
+                              value={deliveryEventsLoading && deliveryEvents.length === 0 ? tr("로딩", "Loading") : deliveryEvents.length}
+                              className="min-w-[96px]"
+                            />
+                          )}
+                        >
+                          <div className="space-y-3">
+                            <div className="flex flex-wrap gap-2 text-xs" style={{ color: "var(--th-text-secondary)" }}>
+                              <span className="rounded-full border px-2 py-0.5 font-mono" style={{ ...SURFACE_CHIP_STYLE }}>
+                                #{selectedDeliveryDispatchId.slice(0, 8)}
+                              </span>
+                              <span className="rounded-full border px-2 py-0.5" style={{ ...SURFACE_CHIP_STYLE }}>
+                                {tr("5초 polling", "5s polling")}
+                              </span>
                             </div>
-                          )}
-                        </div>
-                      </SurfaceSubsection>
+
+                            {deliveryEventsError && (
+                              <SurfaceNotice tone="warn" compact>
+                                {deliveryEventsError}
+                              </SurfaceNotice>
+                            )}
+
+                            {deliveryEvents.length > 0 ? (
+                              <div className="-mx-2 overflow-x-auto px-2">
+                                <table className="min-w-[720px] w-full table-fixed text-left text-xs">
+                                  <thead style={{ color: "var(--th-text-muted)" }}>
+                                    <tr className="[&>th]:px-2 [&>th]:py-2 [&>th]:font-medium">
+                                      <th className="w-[150px]">created_at</th>
+                                      <th className="w-[104px]">status</th>
+                                      <th className="w-[74px]">attempt</th>
+                                      <th className="w-[160px]">target_channel_id</th>
+                                      <th className="w-[150px]">message_id</th>
+                                      <th>{tr("error 요약", "error summary")}</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {deliveryEvents.map((event) => {
+                                      const statusStyle = getDeliveryEventStatusStyle(event.status);
+                                      const messageCount = deliveryEventMessagesCount(event.messages_json);
+                                      const title = compactStringParts([
+                                        `${event.operation} · ${event.target_kind}`,
+                                        event.target_thread_id ? `thread ${event.target_thread_id}` : null,
+                                        event.fallback_kind ? `fallback ${event.fallback_kind}` : null,
+                                        event.reserved_until ? `reserved until ${event.reserved_until}` : null,
+                                        messageCount > 0 ? `${messageCount} messages` : null,
+                                      ]).join(" · ");
+
+                                      return (
+                                        <tr
+                                          key={event.id}
+                                          className="border-t align-top"
+                                          style={{ borderColor: "rgba(148,163,184,0.12)" }}
+                                        >
+                                          <td className="px-2 py-2 font-mono" title={title} style={{ color: "var(--th-text-secondary)" }}>
+                                            {formatIso(event.created_at, locale)}
+                                          </td>
+                                          <td className="px-2 py-2">
+                                            <span
+                                              className="inline-flex rounded-md px-2 py-0.5 font-medium"
+                                              style={{ backgroundColor: statusStyle.bg, color: statusStyle.text }}
+                                            >
+                                              {event.status}
+                                            </span>
+                                          </td>
+                                          <td className="px-2 py-2 font-mono" style={{ color: "var(--th-text-secondary)" }}>
+                                            {event.attempt}
+                                          </td>
+                                          <td className="truncate px-2 py-2 font-mono" title={event.target_channel_id ?? ""} style={{ color: "var(--th-text-secondary)" }}>
+                                            {event.target_channel_id ?? "-"}
+                                          </td>
+                                          <td className="truncate px-2 py-2 font-mono" title={event.message_id ?? ""} style={{ color: "var(--th-text-secondary)" }}>
+                                            {event.message_id ?? "-"}
+                                          </td>
+                                          <td className="px-2 py-2" title={event.error ?? ""} style={{ color: event.error ? "#fca5a5" : "var(--th-text-muted)" }}>
+                                            {summarizeDeliveryError(event.error)}
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            ) : deliveryEventsLoading ? (
+                              <SurfaceEmptyState className="px-3 py-4 text-center text-xs">
+                                {tr("delivery 이벤트를 불러오는 중입니다.", "Loading delivery events.")}
+                              </SurfaceEmptyState>
+                            ) : deliveryEventsError ? null : (
+                              <SurfaceEmptyState className="px-3 py-4 text-center text-xs">
+                                {tr("No delivery events recorded", "No delivery events recorded")}
+                              </SurfaceEmptyState>
+                            )}
+                          </div>
+                        </SurfaceSubsection>
+                      </div>
                     )}
 
                     {auditLog.length > 0 && (

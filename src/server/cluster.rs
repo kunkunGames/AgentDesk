@@ -172,6 +172,23 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     if let Err(error) = upsert_worker_mcp_endpoints(&pool, &instance_id, &capabilities).await {
         tracing::warn!("[cluster] worker MCP endpoint registration failed: {error}");
     }
+    if should_wake_wait_queue_after_node_join(&leader_active) {
+        crate::services::dispatches::wait_queue::spawn_wait_queue_wake_pg(
+            pool.clone(),
+            config.cluster.clone(),
+            "node_join",
+            "cluster_node_join",
+            None,
+        );
+    }
+
+    let stale_reassignment_pool = pool.clone();
+    let stale_reassignment_config = config.cluster.clone();
+    spawn_stale_claim_owner_reassignment_loop(
+        stale_reassignment_pool,
+        stale_reassignment_config,
+        leader_active.clone(),
+    );
 
     spawn_heartbeat_loop(
         pool,
@@ -179,7 +196,6 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
         hostname,
         pid,
         configured_role,
-        effective_role,
         labels,
         capabilities,
         config.cluster.heartbeat_interval_secs,
@@ -198,6 +214,10 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     runtime
 }
 
+fn should_wake_wait_queue_after_node_join(leader_active: &AtomicBool) -> bool {
+    leader_active.load(Ordering::Acquire)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_loop(
     pool: PgPool,
@@ -205,7 +225,6 @@ fn spawn_heartbeat_loop(
     hostname: String,
     pid: i32,
     configured_role: ClusterRole,
-    effective_role: ClusterRole,
     labels: serde_json::Value,
     capabilities: serde_json::Value,
     heartbeat_interval_secs: u64,
@@ -213,6 +232,7 @@ fn spawn_heartbeat_loop(
     mut leader_lease: Option<AdvisoryLockLease>,
 ) {
     let interval_secs = heartbeat_interval_secs.max(1);
+    let leader_eligible = matches!(configured_role, ClusterRole::Leader | ClusterRole::Auto);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await;
@@ -223,9 +243,36 @@ fn spawn_heartbeat_loop(
             {
                 tracing::warn!("[cluster] leader lease keepalive failed: {error}");
                 leader_active.store(false, Ordering::Release);
+                leader_lease = None;
+            }
+            // Live failover: if this node is eligible to lead and currently is
+            // not leader, retry the advisory lock. Picks up leadership when the
+            // previous leader's session is gone (Postgres releases the lock on
+            // session disconnect), without waiting for a dcserver restart.
+            if leader_eligible && leader_lease.is_none() && !leader_active.load(Ordering::Acquire) {
+                match AdvisoryLockLease::try_acquire(
+                    &pool,
+                    CLUSTER_LEADER_ADVISORY_LOCK_ID,
+                    "cluster-leader",
+                )
+                .await
+                {
+                    Ok(Some(new_lease)) => {
+                        tracing::info!(
+                            instance_id,
+                            "[cluster] acquired leader advisory lock via failover"
+                        );
+                        leader_lease = Some(new_lease);
+                        leader_active.store(true, Ordering::Release);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!("[cluster] leader lease retry failed: {error}");
+                    }
+                }
             }
             let current_effective_role = if leader_active.load(Ordering::Acquire) {
-                effective_role
+                ClusterRole::Leader
             } else {
                 ClusterRole::Worker
             };
@@ -247,6 +294,44 @@ fn spawn_heartbeat_loop(
                 upsert_worker_mcp_endpoints(&pool, &instance_id, &capabilities).await
             {
                 tracing::warn!("[cluster] heartbeat MCP endpoint sync failed: {error}");
+            }
+        }
+    });
+}
+
+fn spawn_stale_claim_owner_reassignment_loop(
+    pool: PgPool,
+    cluster_config: ClusterConfig,
+    leader_active: Arc<AtomicBool>,
+) {
+    let interval_secs = cluster_config.heartbeat_interval_secs.max(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if !leader_active.load(Ordering::Acquire) {
+                continue;
+            }
+            match crate::services::dispatches::outbox_claiming::reassign_stale_dispatch_outbox_claim_owners_with_cluster_config_pg(
+                &pool,
+                &cluster_config,
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    tracing::info!(
+                        count,
+                        "[cluster] reassigned stale dispatch_outbox claim owners"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error,
+                        "[cluster] stale dispatch_outbox claim-owner reassignment failed"
+                    );
+                }
             }
         }
     });
@@ -424,10 +509,18 @@ pub(crate) async fn list_worker_nodes(
             END AS computed_status,
             labels,
             capabilities,
+            COALESCE(active_dispatches.active_dispatch_count, 0)::BIGINT AS active_dispatch_count,
             last_heartbeat_at,
             started_at,
             updated_at
         FROM worker_nodes
+        LEFT JOIN (
+            SELECT claim_owner, COUNT(*)::BIGINT AS active_dispatch_count
+              FROM dispatch_outbox
+             WHERE status IN ('claimed', 'processing')
+               AND claim_owner IS NOT NULL
+             GROUP BY claim_owner
+        ) active_dispatches ON active_dispatches.claim_owner = worker_nodes.instance_id
         ORDER BY last_heartbeat_at DESC, instance_id ASC
         "#,
     )
@@ -459,6 +552,11 @@ pub(crate) async fn list_worker_nodes(
                     .flatten()
                     .unwrap_or_else(|| serde_json::json!([])),
                 "capabilities": capabilities,
+                "active_dispatch_count": row
+                    .try_get::<Option<i64>, _>("active_dispatch_count")
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0),
                 "api_base_url": api_base_url,
                 "session_api_routable": session_api_routable,
                 "last_heartbeat_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_heartbeat_at").ok().flatten(),
@@ -641,11 +739,14 @@ fn capability_preference_score(node: &Value, preferred: Option<&Value>) -> i64 {
 
     let labels = string_set(node.get("labels"));
     if let Some(preferred_labels) = preferred.get("labels").and_then(|value| value.as_array()) {
+        let preferred_count = preferred_labels.len() as i64;
         score += preferred_labels
             .iter()
-            .filter_map(|value| value.as_str())
-            .filter(|label| labels.contains(label))
-            .count() as i64;
+            .enumerate()
+            .filter_map(|(index, value)| value.as_str().map(|label| (index, label)))
+            .filter(|(_, label)| labels.contains(label))
+            .map(|(index, _)| preferred_count.saturating_sub(index as i64))
+            .sum::<i64>();
     }
 
     let capabilities = node.get("capabilities").unwrap_or(&Value::Null);
@@ -726,9 +827,11 @@ fn parse_last_heartbeat(node: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
 mod tests {
     use super::{
         ClusterRole, explain_capability_match, resolve_instance_id, select_capability_route,
+        should_wake_wait_queue_after_node_join,
     };
     use crate::config::ClusterConfig;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn cluster_role_parses_known_values_and_defaults_to_auto() {
@@ -744,6 +847,15 @@ mod tests {
             ..ClusterConfig::default()
         };
         assert_eq!(resolve_instance_id(&config), "mac-mini-release");
+    }
+
+    #[test]
+    fn node_join_wake_runs_only_on_leader() {
+        let leader = AtomicBool::new(true);
+        assert!(should_wake_wait_queue_after_node_join(&leader));
+
+        leader.store(false, Ordering::Release);
+        assert!(!should_wake_wait_queue_after_node_join(&leader));
     }
 
     #[test]
@@ -879,6 +991,32 @@ mod tests {
             Some("mac-book-release")
         );
         assert_eq!(preferred_candidates[0].score, 1);
+    }
+
+    #[test]
+    fn preferred_label_order_beats_newer_heartbeat() {
+        let first_label = json!({
+            "instance_id": "mac-book-release",
+            "status": "online",
+            "labels": ["mac-book"],
+            "capabilities": {"providers": ["codex"]},
+            "last_heartbeat_at": "2026-05-03T00:00:01Z"
+        });
+        let second_label_newer = json!({
+            "instance_id": "mac-mini-release",
+            "status": "online",
+            "labels": ["mac-mini"],
+            "capabilities": {"providers": ["codex"]},
+            "last_heartbeat_at": "2026-05-03T00:00:02Z"
+        });
+        let route = json!({"preferred": {"labels": ["mac-book", "mac-mini"]}});
+
+        let candidates = select_capability_route(&[second_label_newer, first_label], &route);
+        assert_eq!(
+            candidates[0].decision.instance_id.as_deref(),
+            Some("mac-book-release")
+        );
+        assert!(candidates[0].score > candidates[1].score);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::Row;
 
 use crate::server::dto::dispatches::{DispatchListItem, DispatchRouteResponse};
@@ -35,6 +36,8 @@ pub struct CreateDispatchBody {
 pub struct UpdateDispatchBody {
     pub status: Option<String>,
     pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_from: Option<Vec<String>>,
 }
 
 // ── Handlers ───────────────────────────────────────────────────
@@ -112,6 +115,33 @@ pub async fn get_dispatch_delivery_events(
             Json(DispatchRouteResponse::delivery_events(id, events)),
         ),
         Err(error) => internal_error(format!("{error}")),
+    }
+}
+
+/// GET /api/dispatches/delivery-events/reconcile-stats
+pub async fn get_dispatch_delivery_reconcile_stats(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "postgres pool unavailable"})),
+        );
+    };
+
+    match crate::reconcile::dispatch_delivery_event_reconcile_report_pg(pool).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "stats": report.stats,
+                "mismatches": report.mismatches,
+                "metrics": crate::reconcile::dispatch_delivery_event_mismatch_metrics_snapshot(),
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query dispatch delivery reconcile stats: {error}")})),
+        ),
     }
 }
 
@@ -234,8 +264,26 @@ pub async fn update_dispatch(
             ))),
         );
     }
+    if let Some(allowed_from) = body.allowed_from.as_ref()
+        && let Some(invalid) = allowed_from
+            .iter()
+            .find(|status| !VALID_DISPATCH_STATUSES.contains(&status.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DispatchRouteResponse::error(format!(
+                "invalid allowed_from status '{}' — allowed values: {}",
+                invalid,
+                VALID_DISPATCH_STATUSES.join(", ")
+            ))),
+        );
+    }
 
     if let Some(status) = body.status {
+        let allowed_from_refs = body
+            .allowed_from
+            .as_ref()
+            .map(|statuses| statuses.iter().map(String::as_str).collect::<Vec<_>>());
         let changed = crate::dispatch::set_dispatch_status_with_backends(
             None,
             Some(pool),
@@ -243,11 +291,19 @@ pub async fn update_dispatch(
             &status,
             body.result.as_ref(),
             "api_update_dispatch",
-            None,
+            allowed_from_refs.as_deref(),
             false,
         );
         match changed {
             Ok(0) => {
+                if allowed_from_refs.is_some()
+                    && let Ok(dispatch) = crate::dispatch::query_dispatch_row_pg(pool, &id).await
+                {
+                    return (
+                        StatusCode::OK,
+                        Json(DispatchRouteResponse::dispatch(dispatch)),
+                    );
+                }
                 return (
                     StatusCode::NOT_FOUND,
                     Json(DispatchRouteResponse::error("dispatch not found")),
@@ -514,7 +570,7 @@ async fn update_dispatch_result_pg(
 
 #[cfg(test)]
 mod tests {
-    use super::get_dispatch_delivery_events;
+    use super::{get_dispatch_delivery_events, get_dispatch_delivery_reconcile_stats};
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
 
@@ -548,6 +604,34 @@ mod tests {
                 database_name,
                 database_url,
             }
+        }
+
+        async fn try_create() -> Option<Self> {
+            let lock = crate::db::postgres::lock_test_lifecycle();
+            let admin_url = postgres_admin_database_url();
+            let database_name = format!(
+                "agentdesk_dispatch_route_events_{}",
+                uuid::Uuid::new_v4().simple()
+            );
+            let database_url = format!("{}/{}", postgres_base_database_url(), database_name);
+            if let Err(error) = crate::db::postgres::create_test_database(
+                &admin_url,
+                &database_name,
+                "dispatch delivery events route test",
+            )
+            .await
+            {
+                eprintln!("skipping postgres-backed dispatch route test: {error}");
+                drop(lock);
+                return None;
+            }
+
+            Some(Self {
+                _lock: lock,
+                admin_url,
+                database_name,
+                database_url,
+            })
         }
 
         async fn connect_and_migrate(&self) -> sqlx::PgPool {
@@ -697,6 +781,55 @@ mod tests {
         assert_eq!(body["events"][0]["message_id"], "1500000000000000001");
         assert_eq!(body["events"][1]["status"], "failed");
         assert_eq!(body["events"][1]["error"], "first failure");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_delivery_reconcile_stats_route_returns_current_stats_and_metric_rows() {
+        crate::reconcile::reset_dispatch_delivery_event_mismatch_metrics_for_tests();
+        let Some(pg_db) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg_db.connect_and_migrate().await;
+        let state = test_state_with_pg(pool.clone());
+
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, status, title)
+             VALUES ($1, 'pending', 'Delivery reconcile route test')",
+        )
+        .bind("dispatch-route-reconcile")
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO kv_meta (key, value)
+             VALUES ('dispatch_reserving:dispatch-route-reconcile', 'dispatch-route-reconcile')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::reconcile::reconcile_dispatch_delivery_events_pg(&pool)
+            .await
+            .unwrap();
+
+        let (status, body) = get_dispatch_delivery_reconcile_stats(State(state)).await;
+        let body = body.0;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["stats"]["mismatch_count"], 1);
+        assert_eq!(body["stats"]["missing_typed"], 1);
+        assert_eq!(
+            body["mismatches"][0]["dispatch_id"],
+            "dispatch-route-reconcile"
+        );
+        assert_eq!(
+            body["metrics"][0]["name"],
+            "agentdesk_dispatch_delivery_event_mismatch_total"
+        );
+        assert_eq!(body["metrics"][0]["kind"], "missing_typed");
+        assert_eq!(body["metrics"][0]["value"], 1);
 
         pool.close().await;
         pg_db.drop().await;

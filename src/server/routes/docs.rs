@@ -249,6 +249,7 @@ pub(crate) const TOP_40_PAIRED_PATHS: &[(&str, &str)] = &[
     ("POST", "/api/dispatches"),
     ("GET", "/api/dispatches/{id}"),
     ("GET", "/api/dispatches/{id}/events"),
+    ("GET", "/api/dispatches/delivery-events/reconcile-stats"),
     ("PATCH", "/api/dispatches/{id}"),
     ("POST", "/api/queue/generate"),
     ("POST", "/api/queue/dispatch-next"),
@@ -918,7 +919,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/cluster/task-dispatches/claim",
             "cluster",
-            "Atomically claim pending task_dispatches for a worker with PG row locking and capability-match diagnostics.",
+            "Atomically claim pending task_dispatches for a worker with PG row locking, capability-match diagnostics, and named semaphore routing constraints. Named semaphore acquire happens in this claim transaction after route owner selection; dispatch terminal statuses release holdings, and expired holdings are reclaimed before each claim.",
         )
         .with_example(
             json!({
@@ -931,11 +932,16 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 "claimed": [{
                     "id": "dispatch-123",
                     "claim_owner": "mac-book-release",
-                    "required_capabilities": {"labels": ["mac-book"]}
+                    "required_capabilities": {
+                        "required": {
+                            "labels": ["mac-book"],
+                            "semaphores": ["ue_editor"]
+                        }
+                    }
                 }],
                 "skipped": [{
                     "id": "dispatch-456",
-                    "reasons": ["missing label 'mac-mini'"]
+                    "reasons": ["semaphore 'ue_editor' exhausted for per-node:mac-mini-release (1/1 active)"]
                 }]
             }),
         )
@@ -2371,6 +2377,43 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         )
         .with_curl("curl http://localhost:8787/api/dispatches/dispatch-1/events"),
         ep(
+            "GET",
+            "/api/dispatches/delivery-events/reconcile-stats",
+            "dispatches",
+            "Read typed dispatch_delivery_events versus kv_meta delivery guard reconciliation stats. Compares dispatch_reserving and dispatch_notified guard keys with latest typed reserved/sent rows, returns mismatch samples, and exposes the cumulative agentdesk_dispatch_delivery_event_mismatch_total metric by kind.",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "stats": {
+                    "kv_reserving_checked": 1,
+                    "kv_notified_checked": 2,
+                    "typed_events_checked": 3,
+                    "mismatch_count": 1,
+                    "missing_typed": 0,
+                    "notified_status_mismatch": 1,
+                    "missing_kv_meta": 0
+                },
+                "mismatches": [{
+                    "dispatch_id": "dispatch-1",
+                    "kind": "notified_status_mismatch",
+                    "expected_status": "sent",
+                    "actual_status": "reserved"
+                }],
+                "metrics": [{
+                    "name": "agentdesk_dispatch_delivery_event_mismatch_total",
+                    "kind": "notified_status_mismatch",
+                    "value": 1
+                }]
+            }),
+        )
+        .with_error_example(
+            503,
+            json!({}),
+            json!({"error": "postgres pool unavailable"}),
+        )
+        .with_curl("curl http://localhost:8787/api/dispatches/delivery-events/reconcile-stats"),
+        ep(
             "PATCH",
             "/api/dispatches/{id}",
             "dispatches",
@@ -2394,6 +2437,14 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                     "object",
                     false,
                     "Structured dispatch result payload; response derives result_summary from result/context",
+                ),
+            ),
+            (
+                "allowed_from",
+                body_param(
+                    "array<string>",
+                    false,
+                    "Optional status precondition for non-completed lifecycle updates; when the dispatch exists but its current status is outside this set, the request is a no-op and returns the current dispatch",
                 ),
             ),
         ])
@@ -3550,7 +3601,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/queue/status",
             "auto-queue",
-            "Get latest auto-queue run state. When auto_queue_slot_single_active_entry is violated, diagnostics.slot_invariant_violations identifies run_id, agent_id, slot_index, conflicting entry_ids, related dispatch_ids, and recovery endpoints. Recommended recovery: choose the entry that should retain the active slot, complete/cancel/skip stale entries, then use /api/queue/slots/{agent_id}/{slot_index}/reset-thread or /api/queue/slots/{agent_id}/{slot_index}/rebind if the slot binding points at the wrong thread group.",
+            "Get latest auto-queue run state. diagnostics.entry_dispatch_delivery_mismatches surfaces split-brain delivery where an entry is dispatched but the linked dispatch/session is not live; it includes run_id, entry_id, dispatch_id, card_id, github_issue_number, thread_group, slot_index, dispatch_status, entry_status, age_ms, and recovery endpoints. diagnostics.run_timeout_overruns reports active runs beyond timeout_minutes. When auto_queue_slot_single_active_entry is violated, diagnostics.slot_invariant_violations identifies run_id, agent_id, slot_index, conflicting entry_ids, related dispatch_ids, and recovery endpoints. Recommended recovery: reset stale entries to pending, release slot bindings with /api/queue/slots/{agent_id}/{slot_index}/reset-thread or /api/queue/slots/{agent_id}/{slot_index}/rebind, then dispatch again.",
         )
         .with_params([
             (
@@ -3611,6 +3662,9 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                     "repo": "test-repo",
                     "agent_id": "agent-1",
                     "status": "completed",
+                    "timeout_minutes": 120,
+                    "timeout_exceeded": false,
+                    "timeout_overrun_ms": 0,
                     "created_at": 1712600000000_i64,
                     "completed_at": 1712600300000_i64,
                     "duration_ms": 300000_i64,
@@ -4315,7 +4369,40 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/reviews/decision",
             "reviews",
-            "Submit review-decision action // TODO: example",
+            "Submit review-decision action. For accept, optional commit_sha takes precedence over worktree inference for skip_rework detection.",
+        )
+        .with_params([
+            ("card_id", body_param("string", true, "Kanban card ID")),
+            (
+                "decision",
+                body_param("string", true, "accept | dispute | dismiss"),
+            ),
+            ("comment", body_param("string", false, "Optional decision comment")),
+            (
+                "commit_sha",
+                body_param(
+                    "string",
+                    false,
+                    "Current implementation commit SHA. On accept, explicit commit_sha is compared to the last review reviewed_commit before falling back to worktree inference.",
+                ),
+            ),
+            (
+                "dispatch_id",
+                body_param(
+                    "string",
+                    false,
+                    "Pending review-decision dispatch ID for stale/replay protection",
+                ),
+            ),
+        ])
+        .with_example(
+            json!({"body": {"card_id": "card-1977", "decision": "accept", "commit_sha": "dbadcb1234567890"}}),
+            json!({"ok": true, "card_id": "card-1977", "decision": "accept", "rework_dispatch_created": false, "direct_review_created": true, "review_auto_approved": false, "skip_rework": true}),
+        )
+        .with_error_example(
+            400,
+            json!({"body": {"card_id": "card-1977", "decision": "accept", "commit_sha": "not-a-sha"}}),
+            json!({"error": "commit_sha must be a 7-64 character hex git commit SHA", "field": "commit_sha"}),
         ),
         ep(
             "POST",
@@ -5229,6 +5316,15 @@ mod tests {
                 .description
                 .contains("diagnostics.slot_invariant_violations"),
             "status docs must describe slot invariant recovery diagnostics"
+        );
+        assert!(
+            status
+                .description
+                .contains("diagnostics.entry_dispatch_delivery_mismatches")
+                && status
+                    .description
+                    .contains("diagnostics.run_timeout_overruns"),
+            "status docs must describe delivery split-brain and timeout diagnostics"
         );
         assert!(
             status.description.contains("entry_ids")

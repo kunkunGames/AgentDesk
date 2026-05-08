@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde_json::json;
-use sqlx::{PgPool, Postgres, Row as SqlxRow};
+use sqlx::{PgPool, Postgres, Row};
 
 use crate::db::Db;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -26,15 +26,14 @@ use super::dispatch_context::{
     resolve_card_target_repo_ref_sqlite_test, resolve_card_worktree_sqlite_test,
     resolve_parent_dispatch_context_sqlite_test,
 };
+use super::dispatch_query::query_dispatch_row_pg;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use super::dispatch_status::{
     ensure_dispatch_notify_outbox_on_conn, record_dispatch_status_event_on_conn,
 };
-use super::{
-    DispatchCreateOptions, cancel_dispatch_and_reset_auto_queue_on_pg_tx, summarize_dispatch_result,
-};
+use super::{DispatchCreateOptions, cancel_dispatch_and_reset_auto_queue_on_pg_tx};
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-use super::{cancel_dispatch_and_reset_auto_queue_on_conn, query_dispatch_row};
+use super::{cancel_dispatch_and_reset_auto_queue_on_conn, dispatch_query::query_dispatch_row};
 
 fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
     context
@@ -250,6 +249,296 @@ fn is_single_active_dispatch_violation_pg(error: &sqlx::Error) -> bool {
     )
 }
 
+const SESSION_AFFINITY_WORKER_LEASE_TTL_SECS: i64 = 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DispatchSessionAffinity {
+    SessionId(i64),
+    SessionKey(String),
+}
+
+fn dispatch_session_affinity_from_context(
+    context_str: Option<&str>,
+) -> Option<DispatchSessionAffinity> {
+    let context =
+        context_str.and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())?;
+    let object = context.as_object()?;
+
+    if let Some(session_id) = object.get("session_id") {
+        if let Some(id) = session_id.as_i64().filter(|id| *id > 0) {
+            return Some(DispatchSessionAffinity::SessionId(id));
+        }
+        if let Some(raw) = session_id
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Ok(id) = raw.parse::<i64>()
+                && id > 0
+            {
+                return Some(DispatchSessionAffinity::SessionId(id));
+            }
+            return Some(DispatchSessionAffinity::SessionKey(raw.to_string()));
+        }
+    }
+
+    object
+        .get("session_key")
+        .or_else(|| object.get("sessionKey"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| DispatchSessionAffinity::SessionKey(value.to_string()))
+}
+
+async fn load_live_session_owner_by_id_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    session_id: i64,
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "WITH session_owner AS (
+            SELECT NULLIF(BTRIM(instance_id), '') AS instance_id
+              FROM sessions
+             WHERE id = $1
+             FOR UPDATE
+         )
+         SELECT so.instance_id
+           FROM session_owner so
+           JOIN worker_nodes wn ON wn.instance_id = so.instance_id
+          WHERE wn.status = 'online'
+            AND wn.last_heartbeat_at IS NOT NULL
+            AND wn.last_heartbeat_at >= NOW() - ($2::BIGINT * INTERVAL '1 second')
+          LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(SESSION_AFFINITY_WORKER_LEASE_TTL_SECS)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!("load live session owner for session id {session_id}: {error}")
+    })
+}
+
+async fn load_live_session_owner_by_key_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    session_key: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "WITH session_owner AS (
+            SELECT NULLIF(BTRIM(instance_id), '') AS instance_id
+              FROM sessions
+             WHERE session_key = $1
+             FOR UPDATE
+         )
+         SELECT so.instance_id
+           FROM session_owner so
+           JOIN worker_nodes wn ON wn.instance_id = so.instance_id
+          WHERE wn.status = 'online'
+            AND wn.last_heartbeat_at IS NOT NULL
+            AND wn.last_heartbeat_at >= NOW() - ($2::BIGINT * INTERVAL '1 second')
+          LIMIT 1",
+    )
+    .bind(session_key)
+    .bind(SESSION_AFFINITY_WORKER_LEASE_TTL_SECS)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!("load live session owner for session key {session_key}: {error}")
+    })
+}
+
+async fn load_session_affinity_claim_owner_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    context_str: Option<&str>,
+) -> Result<Option<String>> {
+    match dispatch_session_affinity_from_context(context_str) {
+        Some(DispatchSessionAffinity::SessionId(session_id)) => {
+            load_live_session_owner_by_id_pg_tx(tx, session_id).await
+        }
+        Some(DispatchSessionAffinity::SessionKey(session_key)) => {
+            load_live_session_owner_by_key_pg_tx(tx, &session_key).await
+        }
+        None => Ok(None),
+    }
+}
+
+fn non_empty_dispatch_required_capabilities(
+    required: Option<&serde_json::Value>,
+) -> Option<&serde_json::Value> {
+    match required {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(map)) if map.is_empty() => None,
+        Some(required) => Some(required),
+    }
+}
+
+fn has_hard_required_capabilities(required: &serde_json::Value) -> bool {
+    if let Some(hard_required) = required.get("required") {
+        return capability_value_is_non_empty(hard_required);
+    }
+    match required {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, value)| key != "preferred" && capability_value_is_non_empty(value)),
+        _ => true,
+    }
+}
+
+fn capability_value_is_non_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        _ => true,
+    }
+}
+
+fn has_preferred_capabilities(required: &serde_json::Value) -> bool {
+    required
+        .get("preferred")
+        .and_then(|value| value.as_object())
+        .is_some_and(|map| !map.is_empty())
+}
+
+async fn load_live_capability_route_nodes_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+) -> Result<Vec<serde_json::Value>> {
+    let rows = sqlx::query(
+        "SELECT instance_id, labels, capabilities, last_heartbeat_at
+         FROM worker_nodes
+         WHERE status = 'online'
+           AND last_heartbeat_at IS NOT NULL
+           AND last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second')
+         ORDER BY last_heartbeat_at DESC, instance_id ASC",
+    )
+    .bind(SESSION_AFFINITY_WORKER_LEASE_TTL_SECS)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("load live capability route worker nodes: {error}"))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let labels = row
+                .try_get::<Option<serde_json::Value>, _>("labels")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| json!([]));
+            let capabilities = row
+                .try_get::<Option<serde_json::Value>, _>("capabilities")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| json!({}));
+            json!({
+                "instance_id": row.try_get::<String, _>("instance_id").ok(),
+                "status": "online",
+                "labels": labels,
+                "capabilities": capabilities,
+                "last_heartbeat_at": row
+                    .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("last_heartbeat_at")
+                    .ok()
+                    .flatten(),
+            })
+        })
+        .collect())
+}
+
+async fn load_capability_claim_owner_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    required_capabilities: Option<&serde_json::Value>,
+) -> Result<Option<String>> {
+    let Some(required) = non_empty_dispatch_required_capabilities(required_capabilities) else {
+        return Ok(None);
+    };
+
+    let worker_nodes = load_live_capability_route_nodes_pg_tx(tx).await?;
+    let route_candidates = crate::server::cluster::select_capability_route(&worker_nodes, required);
+    let Some(selected_owner) = route_candidates
+        .first()
+        .and_then(|candidate| candidate.decision.instance_id.as_deref())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+
+    if !has_hard_required_capabilities(required)
+        && has_preferred_capabilities(required)
+        && route_candidates
+            .first()
+            .map_or(true, |candidate| candidate.score <= 0)
+    {
+        return Ok(None);
+    }
+
+    let owner_node = worker_nodes.iter().find(|node| {
+        node.get("instance_id").and_then(|value| value.as_str()) == Some(&selected_owner)
+    });
+    let decision =
+        crate::services::dispatches::outbox_claiming::capability_decision_for_claim_owner(
+            owner_node,
+            &selected_owner,
+            required,
+        );
+
+    Ok(decision.eligible.then_some(selected_owner))
+}
+
+async fn load_proactive_claim_owner_pg_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    context_str: Option<&str>,
+    required_capabilities: Option<&serde_json::Value>,
+) -> Result<Option<String>> {
+    if dispatch_session_affinity_from_context(context_str).is_some() {
+        return load_session_affinity_claim_owner_pg_tx(tx, context_str).await;
+    }
+
+    load_capability_claim_owner_pg_tx(tx, required_capabilities).await
+}
+
+#[cfg(test)]
+mod session_affinity_context_tests {
+    use super::{DispatchSessionAffinity, dispatch_session_affinity_from_context};
+
+    #[test]
+    fn dispatch_session_affinity_prefers_numeric_session_id() {
+        assert_eq!(
+            dispatch_session_affinity_from_context(Some(r#"{"session_id":42}"#)),
+            Some(DispatchSessionAffinity::SessionId(42))
+        );
+        assert_eq!(
+            dispatch_session_affinity_from_context(Some(r#"{"session_id":" 42 "}"#)),
+            Some(DispatchSessionAffinity::SessionId(42))
+        );
+    }
+
+    #[test]
+    fn dispatch_session_affinity_accepts_session_key_fallbacks() {
+        assert_eq!(
+            dispatch_session_affinity_from_context(Some(
+                r#"{"session_id":"mac-mini:AgentDesk-codex"}"#
+            )),
+            Some(DispatchSessionAffinity::SessionKey(
+                "mac-mini:AgentDesk-codex".to_string()
+            ))
+        );
+        assert_eq!(
+            dispatch_session_affinity_from_context(Some(r#"{"sessionKey":" session-a "}"#)),
+            Some(DispatchSessionAffinity::SessionKey("session-a".to_string()))
+        );
+    }
+
+    #[test]
+    fn dispatch_session_affinity_ignores_missing_or_malformed_context() {
+        assert_eq!(dispatch_session_affinity_from_context(None), None);
+        assert_eq!(dispatch_session_affinity_from_context(Some("{")), None);
+        assert_eq!(
+            dispatch_session_affinity_from_context(Some(r#"{"session_id":" "}"#)),
+            None
+        );
+    }
+}
+
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 fn validate_dispatch_target_on_conn(
     conn: &sqlite_test::Connection,
@@ -390,10 +679,6 @@ where
     })
 }
 
-fn parse_dispatch_json_text_pg(raw: Option<&str>) -> Option<serde_json::Value> {
-    raw.and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-}
-
 fn normalize_required_capabilities(required: serde_json::Value) -> Option<serde_json::Value> {
     match &required {
         serde_json::Value::Null => None,
@@ -402,7 +687,7 @@ fn normalize_required_capabilities(required: serde_json::Value) -> Option<serde_
     }
 }
 
-fn dispatch_required_capabilities_from_routing(
+pub(crate) fn dispatch_required_capabilities_from_routing(
     context: &serde_json::Value,
     dispatch_type: &str,
     routing: &crate::config::ClusterDispatchRoutingConfig,
@@ -432,88 +717,6 @@ fn dispatch_required_capabilities(
         dispatch_type,
         &config.cluster.dispatch_routing,
     )
-}
-
-pub(crate) async fn query_dispatch_row_pg(
-    pool: &PgPool,
-    dispatch_id: &str,
-) -> Result<serde_json::Value> {
-    let row = sqlx::query(
-        "SELECT
-            id,
-            kanban_card_id,
-            from_agent_id,
-            to_agent_id,
-            dispatch_type,
-            status,
-            title,
-            context,
-            result,
-            parent_dispatch_id,
-            COALESCE(chain_depth, 0)::bigint AS chain_depth,
-            created_at::text AS created_at,
-            updated_at::text AS updated_at,
-            completed_at::text AS completed_at,
-            COALESCE(retry_count, 0)::bigint AS retry_count,
-            required_capabilities,
-            routing_diagnostics
-         FROM task_dispatches
-         WHERE id = $1",
-    )
-    .bind(dispatch_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?
-    .ok_or_else(|| anyhow::anyhow!("Dispatch query error: Query returned no rows"))?;
-
-    let status = row
-        .try_get::<String, _>("status")
-        .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?;
-    let updated_at = row
-        .try_get::<String, _>("updated_at")
-        .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?;
-    let dispatch_type = row
-        .try_get::<Option<String>, _>("dispatch_type")
-        .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?;
-    let context_raw = row
-        .try_get::<Option<String>, _>("context")
-        .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?;
-    let result_raw = row
-        .try_get::<Option<String>, _>("result")
-        .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?;
-    let context = parse_dispatch_json_text_pg(context_raw.as_deref());
-    let result = parse_dispatch_json_text_pg(result_raw.as_deref());
-    let result_summary = summarize_dispatch_result(
-        dispatch_type.as_deref(),
-        Some(status.as_str()),
-        result.as_ref(),
-        context.as_ref(),
-    );
-    let completed_at = row
-        .try_get::<Option<String>, _>("completed_at")
-        .map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?
-        .or_else(|| (status == "completed").then(|| updated_at.clone()));
-
-    Ok(json!({
-        "id": row.try_get::<String, _>("id").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "kanban_card_id": row.try_get::<Option<String>, _>("kanban_card_id").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "from_agent_id": row.try_get::<Option<String>, _>("from_agent_id").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "to_agent_id": row.try_get::<Option<String>, _>("to_agent_id").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "dispatch_type": dispatch_type,
-        "status": status,
-        "title": row.try_get::<Option<String>, _>("title").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "context": context,
-        "result": result,
-        "result_summary": result_summary,
-        "parent_dispatch_id": row.try_get::<Option<String>, _>("parent_dispatch_id").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "chain_depth": row.try_get::<i64, _>("chain_depth").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "created_at": row.try_get::<String, _>("created_at").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "updated_at": updated_at,
-        "completed_at": completed_at,
-        "retry_count": row.try_get::<i64, _>("retry_count").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "required_capabilities": row.try_get::<Option<serde_json::Value>, _>("required_capabilities").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-        "routing_diagnostics": row.try_get::<Option<serde_json::Value>, _>("routing_diagnostics").map_err(|error| anyhow::anyhow!("Dispatch query error: {error}"))?,
-    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1458,8 +1661,8 @@ async fn ensure_dispatch_notify_outbox_on_pg_tx(
     card_id: &str,
     title: &str,
 ) -> Result<bool> {
-    let dispatch_status = sqlx::query_scalar::<_, String>(
-        "SELECT status
+    let dispatch_row = sqlx::query_as::<_, (String, Option<String>, Option<serde_json::Value>)>(
+        "SELECT status, context, required_capabilities
          FROM task_dispatches
          WHERE id = $1",
     )
@@ -1468,18 +1671,29 @@ async fn ensure_dispatch_notify_outbox_on_pg_tx(
     .await
     .map_err(|error| anyhow::anyhow!("load postgres dispatch status {dispatch_id}: {error}"))?;
 
+    let Some((dispatch_status, context_str, required_capabilities)) = dispatch_row else {
+        return Ok(false);
+    };
+
     if matches!(
-        dispatch_status.as_deref(),
-        Some("completed") | Some("failed") | Some("cancelled")
+        dispatch_status.as_str(),
+        "completed" | "failed" | "cancelled"
     ) {
         return Ok(false);
     }
 
+    let claim_owner = load_proactive_claim_owner_pg_tx(
+        tx,
+        context_str.as_deref(),
+        required_capabilities.as_ref(),
+    )
+    .await?;
+
     let inserted = sqlx::query(
         "INSERT INTO dispatch_outbox (
-            dispatch_id, action, agent_id, card_id, title, required_capabilities
+            dispatch_id, action, agent_id, card_id, title, required_capabilities, claim_owner
          )
-         SELECT $1, 'notify', $2, $3, $4, required_capabilities
+         SELECT $1, 'notify', $2, $3, $4, required_capabilities, $5
            FROM task_dispatches
           WHERE id = $1
          ON CONFLICT DO NOTHING",
@@ -1488,6 +1702,7 @@ async fn ensure_dispatch_notify_outbox_on_pg_tx(
     .bind(agent_id)
     .bind(card_id)
     .bind(title)
+    .bind(claim_owner.as_deref())
     .execute(&mut **tx)
     .await
     .map_err(|error| {
@@ -1915,6 +2130,7 @@ mod capability_routing_tests {
         crate::config::ClusterDispatchRoutingConfig {
             default_preferred_labels: vec!["mac-book".to_string()],
             opt_out_dispatch_types: vec!["create-pr".to_string(), "github-sync".to_string()],
+            ..Default::default()
         }
     }
 
@@ -1975,6 +2191,24 @@ mod capability_routing_tests {
 
         assert_eq!(required, None);
     }
+
+    #[test]
+    fn hard_required_detection_ignores_preferred_only_routes() {
+        assert!(!has_hard_required_capabilities(
+            &json!({"preferred": {"labels": ["linux"]}})
+        ));
+        assert!(!has_hard_required_capabilities(&json!({
+            "required": {},
+            "preferred": {"labels": ["linux"]}
+        })));
+        assert!(has_hard_required_capabilities(
+            &json!({"labels": ["mac-book"]})
+        ));
+        assert!(has_hard_required_capabilities(&json!({
+            "required": {"labels": ["mac-book"]},
+            "preferred": {"labels": ["mac-mini"]}
+        })));
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -1983,6 +2217,7 @@ mod tests {
     use super::create_dispatch_core_with_id_and_options as create_dispatch_core_with_id_and_options_async;
     use super::*;
 
+    use crate::dispatch::test_support::DispatchEnvOverride;
     use crate::pipeline::ClockConfig;
     use std::collections::HashMap;
 
@@ -2212,6 +2447,83 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed agents");
+    }
+
+    fn write_cluster_routing_config(labels: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp config dir");
+        let mut config = crate::config::Config::default();
+        config.cluster.dispatch_routing.default_preferred_labels =
+            labels.iter().map(|label| (*label).to_string()).collect();
+        crate::config::save_to_path(&dir.path().join("agentdesk.yaml"), &config)
+            .expect("write cluster routing config");
+        dir
+    }
+
+    async fn pg_seed_worker_node_with_capabilities(
+        pool: &PgPool,
+        instance_id: &str,
+        labels: serde_json::Value,
+        capabilities: serde_json::Value,
+        heartbeat_age_secs: i64,
+    ) {
+        sqlx::query(
+            "INSERT INTO worker_nodes (
+                instance_id, hostname, process_id, role, effective_role, status,
+                labels, capabilities, last_heartbeat_at, started_at, updated_at
+             ) VALUES (
+                $1, $2, 100, 'worker', 'worker', 'online',
+                $3, $4,
+                NOW() - ($5::BIGINT * INTERVAL '1 second'), NOW(), NOW()
+             )",
+        )
+        .bind(instance_id)
+        .bind(instance_id)
+        .bind(labels)
+        .bind(capabilities)
+        .bind(heartbeat_age_secs)
+        .execute(pool)
+        .await
+        .expect("seed worker_nodes");
+    }
+
+    async fn pg_seed_worker_node(pool: &PgPool, instance_id: &str, heartbeat_age_secs: i64) {
+        pg_seed_worker_node_with_capabilities(
+            pool,
+            instance_id,
+            json!([]),
+            json!({}),
+            heartbeat_age_secs,
+        )
+        .await;
+    }
+
+    async fn pg_seed_session(pool: &PgPool, session_key: &str, instance_id: Option<&str>) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO sessions (
+                session_key, provider, status, instance_id, last_heartbeat
+             ) VALUES (
+                $1, 'codex', 'working', $2, NOW()
+             )
+             RETURNING id",
+        )
+        .bind(session_key)
+        .bind(instance_id)
+        .fetch_one(pool)
+        .await
+        .expect("seed sessions")
+    }
+
+    async fn pg_notify_claim_owner(pool: &PgPool, dispatch_id: &str) -> Option<String> {
+        sqlx::query_scalar(
+            "SELECT claim_owner
+             FROM dispatch_outbox
+             WHERE dispatch_id = $1
+               AND action = 'notify'",
+        )
+        .bind(dispatch_id)
+        .fetch_one(pool)
+        .await
+        .expect("load notify outbox claim_owner")
     }
 
     async fn pg_seed_dispatch(
@@ -2503,6 +2815,574 @@ mod tests {
                 .as_deref(),
             Some("dispatch-apply-happy"),
             "latest_dispatch_id must track the new dispatch"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_dispatch_attached_intents_pg_pins_notify_outbox_to_live_session_owner() {
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-affinity-live", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-affinity-live", None, None).await;
+        pg_seed_worker_node(&pool, "mac-book-release", 0).await;
+        let session_id =
+            pg_seed_session(&pool, "session-affinity-live", Some("mac-book-release")).await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-affinity-live",
+            "agent-affinity-live",
+            "dispatch-affinity-live",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Affinity live",
+            &json!({"session_id": session_id}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create session affinity dispatch");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-affinity-live")
+                .await
+                .as_deref(),
+            Some("mac-book-release")
+        );
+        let wrong_node_claim =
+            crate::services::dispatches::outbox_claiming::claim_pending_dispatch_outbox_batch_pg(
+                &pool,
+                "mac-mini-release",
+            )
+            .await;
+        assert!(
+            wrong_node_claim.is_empty(),
+            "a different node must not claim an affinity-pinned outbox row"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_dispatch_attached_intents_pg_keeps_notify_claim_owner_null_without_session() {
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-affinity-none", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-affinity-none", None, None).await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-affinity-none",
+            "agent-affinity-none",
+            "dispatch-affinity-none",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Affinity none",
+            &json!({}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create dispatch without session affinity");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-affinity-none").await,
+            None
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_dispatch_attached_intents_pg_pins_default_preferred_label_order() {
+        let _config_dir = write_cluster_routing_config(&["mac-book", "mac-mini"]);
+        let config_path = _config_dir.path().join("agentdesk.yaml");
+        let _env = DispatchEnvOverride::new(None, Some(config_path.to_str().unwrap()));
+
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-label-default", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-label-default", None, None).await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-mini-release",
+            json!(["mac-mini"]),
+            json!({"providers": ["codex"]}),
+            0,
+        )
+        .await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-book-release",
+            json!(["mac-book"]),
+            json!({"providers": ["codex"]}),
+            5,
+        )
+        .await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-label-default",
+            "agent-label-default",
+            "dispatch-label-default",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Label default",
+            &json!({}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create default label dispatch");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-label-default")
+                .await
+                .as_deref(),
+            Some("mac-book-release"),
+            "first configured preferred label must win even when the second label has a fresher heartbeat"
+        );
+
+        let wrong_node_claim =
+            crate::services::dispatches::outbox_claiming::claim_pending_dispatch_outbox_batch_pg(
+                &pool,
+                "mac-mini-release",
+            )
+            .await;
+        assert!(
+            wrong_node_claim.is_empty(),
+            "a non-selected label node must not claim the pinned notify row"
+        );
+        let selected_node_claim =
+            crate::services::dispatches::outbox_claiming::claim_pending_dispatch_outbox_batch_pg(
+                &pool,
+                "mac-book-release",
+            )
+            .await;
+        assert_eq!(selected_node_claim.len(), 1);
+        assert_eq!(selected_node_claim[0].1, "dispatch-label-default");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_dispatch_attached_intents_pg_falls_back_to_next_default_label_when_first_stale()
+    {
+        let _config_dir = write_cluster_routing_config(&["mac-book", "mac-mini"]);
+        let config_path = _config_dir.path().join("agentdesk.yaml");
+        let _env = DispatchEnvOverride::new(None, Some(config_path.to_str().unwrap()));
+
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-label-fallback", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-label-fallback", None, None).await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-book-release",
+            json!(["mac-book"]),
+            json!({"providers": ["codex"]}),
+            600,
+        )
+        .await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-mini-release",
+            json!(["mac-mini"]),
+            json!({"providers": ["codex"]}),
+            0,
+        )
+        .await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-label-fallback",
+            "agent-label-fallback",
+            "dispatch-label-fallback",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Label fallback",
+            &json!({}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create default label fallback dispatch");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-label-fallback")
+                .await
+                .as_deref(),
+            Some("mac-mini-release")
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_dispatch_attached_intents_pg_leaves_claim_owner_null_when_no_label_matches() {
+        let _config_dir = write_cluster_routing_config(&["linux"]);
+        let config_path = _config_dir.path().join("agentdesk.yaml");
+        let _env = DispatchEnvOverride::new(None, Some(config_path.to_str().unwrap()));
+
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-label-none", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-label-none", None, None).await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-mini-release",
+            json!(["mac-mini"]),
+            json!({"providers": ["codex"]}),
+            0,
+        )
+        .await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-label-none",
+            "agent-label-none",
+            "dispatch-label-none",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Label none",
+            &json!({}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create no label match dispatch");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-label-none").await,
+            None
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_dispatch_attached_intents_pg_pins_explicit_required_label_match() {
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-label-required", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-label-required", None, None).await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-book-release",
+            json!(["mac-book"]),
+            json!({"providers": ["codex"]}),
+            0,
+        )
+        .await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-mini-release",
+            json!(["mac-mini"]),
+            json!({"providers": ["codex"]}),
+            5,
+        )
+        .await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-label-required",
+            "agent-label-required",
+            "dispatch-label-required",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Label required",
+            &json!({"required_capabilities": {"required": {"labels": ["mac-mini"]}}}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create explicit required label dispatch");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-label-required")
+                .await
+                .as_deref(),
+            Some("mac-mini-release")
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_dispatch_attached_intents_pg_session_affinity_suppresses_label_routing() {
+        let _config_dir = write_cluster_routing_config(&["mac-book"]);
+        let config_path = _config_dir.path().join("agentdesk.yaml");
+        let _env = DispatchEnvOverride::new(None, Some(config_path.to_str().unwrap()));
+
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-affinity-label", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-affinity-label", None, None).await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "stale-session-owner",
+            json!(["mac-mini"]),
+            json!({"providers": ["codex"]}),
+            600,
+        )
+        .await;
+        pg_seed_worker_node_with_capabilities(
+            &pool,
+            "mac-book-release",
+            json!(["mac-book"]),
+            json!({"providers": ["codex"]}),
+            0,
+        )
+        .await;
+        let session_id = pg_seed_session(
+            &pool,
+            "session-affinity-suppresses-label",
+            Some("stale-session-owner"),
+        )
+        .await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-affinity-label",
+            "agent-affinity-label",
+            "dispatch-affinity-label",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Affinity suppresses labels",
+            &json!({"session_id": session_id}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create session affinity label dispatch");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-affinity-label").await,
+            None,
+            "session affinity must stay higher priority than label routing even when the session owner is stale"
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_dispatch_attached_intents_pg_nulls_stale_session_owner() {
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-affinity-stale", Some("111"), Some("222")).await;
+        pg_seed_card(&pool, "card-affinity-stale", None, None).await;
+        pg_seed_worker_node(&pool, "stale-node", 600).await;
+        let session_id = pg_seed_session(&pool, "session-affinity-stale", Some("stale-node")).await;
+        let effective = pg_default_pipeline(&pool).await;
+
+        let mut tx = pool.begin().await.expect("begin postgres tx");
+        apply_dispatch_attached_intents_pg(
+            &mut tx,
+            "card-affinity-stale",
+            "agent-affinity-stale",
+            "dispatch-affinity-stale",
+            "review",
+            true,
+            "ready",
+            &effective,
+            "Affinity stale",
+            &json!({"session_id": session_id}).to_string(),
+            None,
+            0,
+            DispatchCreateOptions::default(),
+            is_single_active_dispatch_violation_pg,
+        )
+        .await
+        .expect("create dispatch with stale session owner");
+        tx.commit().await.expect("commit postgres tx");
+
+        assert_eq!(
+            pg_notify_claim_owner(&pool, "dispatch-affinity-stale").await,
+            None
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_dispatch_attached_intents_pg_pins_100_concurrent_session_dispatches() {
+        let Some(pg_db) = TestPostgresDb::create().await else {
+            return;
+        };
+        let Some(pool) = pg_db.migrate().await else {
+            pg_db.drop().await;
+            return;
+        };
+
+        pg_seed_agent(&pool, "agent-affinity-load", Some("111"), Some("222")).await;
+        pg_seed_worker_node(&pool, "mac-book-release", 0).await;
+        let session_id =
+            pg_seed_session(&pool, "session-affinity-load", Some("mac-book-release")).await;
+        let effective = pg_default_pipeline(&pool).await;
+        let context = json!({"session_id": session_id}).to_string();
+
+        for idx in 0..100 {
+            pg_seed_card(&pool, &format!("card-affinity-load-{idx}"), None, None).await;
+        }
+
+        let futures = (0..100).map(|idx| {
+            let pool = pool.clone();
+            let effective = effective.clone();
+            let context = context.clone();
+            async move {
+                let card_id = format!("card-affinity-load-{idx}");
+                let dispatch_id = format!("dispatch-affinity-load-{idx}");
+                let mut tx = pool.begin().await.expect("begin postgres tx");
+                apply_dispatch_attached_intents_on_pg_tx(
+                    &mut tx,
+                    &card_id,
+                    "agent-affinity-load",
+                    &dispatch_id,
+                    "review",
+                    true,
+                    "ready",
+                    &effective,
+                    "Affinity load",
+                    &context,
+                    None,
+                    0,
+                    DispatchCreateOptions::default(),
+                )
+                .await
+                .expect("create load dispatch");
+                tx.commit().await.expect("commit postgres tx");
+            }
+        });
+        futures::future::join_all(futures).await;
+
+        let pinned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+             FROM dispatch_outbox
+             WHERE action = 'notify'
+               AND claim_owner = 'mac-book-release'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count pinned outbox rows");
+        assert_eq!(pinned, 100);
+
+        let wrong_node_claim =
+            crate::services::dispatches::outbox_claiming::claim_pending_dispatch_outbox_batch_pg(
+                &pool,
+                "mac-mini-release",
+            )
+            .await;
+        assert!(
+            wrong_node_claim.is_empty(),
+            "different owner claim attempt count must stay at zero"
         );
 
         pool.close().await;
@@ -2875,3 +3755,7 @@ mod tests {
         pg_db.drop().await;
     }
 }
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[path = "dispatch_create_relocated_tests.rs"]
+mod relocated_tests;

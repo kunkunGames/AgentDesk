@@ -100,15 +100,12 @@ function resetPhaseGateFailureCount(cardId, phase) {
 
 function loadPhaseGateCardLabel(cardId) {
   if (!cardId) return "unknown card";
-  var rows = agentdesk.db.query(
-    "SELECT COALESCE(title, id) as title, github_issue_number FROM kanban_cards WHERE id = ?",
-    [cardId]
-  );
-  if (rows.length === 0) return cardId;
-  if (rows[0].github_issue_number) {
-    return "#" + rows[0].github_issue_number + " " + rows[0].title;
+  var card = agentdesk.cards.get(cardId);
+  if (!card) return cardId;
+  if (card.github_issue_number) {
+    return "#" + card.github_issue_number + " " + (card.title || card.id);
   }
-  return rows[0].title || cardId;
+  return card.title || card.id;
 }
 
 function handlePhaseGateFailure(cardId, phase, reason, context) {
@@ -865,7 +862,22 @@ function _phaseGateRequired(runId, phase) {
 function completeRunAndNotify(runId) {
   if (!runId) return;
   try {
-    agentdesk.autoQueue.resumeRun(runId, "phase_gate_complete_resume");
+    var completed = agentdesk.autoQueue.completeRun(
+      runId,
+      "phase_gate_complete",
+      { releaseSlots: true }
+    );
+    if (completed && completed.changed) return;
+    autoQueueLog("warn", "Phase-gate completion did not mark run " + runId + " completed; falling back to resume", {
+      run_id: runId
+    });
+  } catch (e) {
+    autoQueueLog("warn", "Failed to complete final phase-gate run " + runId + ": " + e, {
+      run_id: runId
+    });
+  }
+  try {
+    agentdesk.autoQueue.resumeRun(runId, "phase_gate_complete_resume_fallback");
   } catch (e) {
     autoQueueLog("warn", "Failed to resume final phase-gate run " + runId + ": " + e, {
       run_id: runId

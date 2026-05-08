@@ -110,6 +110,14 @@ impl OutboxNotifier for RealOutboxNotifier {
 const RETRY_BACKOFF_SECS: [i64; 4] = [60, 300, 900, 3600];
 /// Maximum number of retries before marking as permanent failure.
 const MAX_RETRY_COUNT: i64 = 4;
+/// #1967: slot-busy errors are transient resource conflicts, not failures.
+/// They should retry every 60s without consuming retry budget so a slot
+/// release that lands mid-backoff isn't ignored for up to 1 hour.
+const SLOT_BUSY_RETRY_SECS: i64 = 60;
+
+fn is_transient_slot_busy_error(err: &str) -> bool {
+    err.contains("has active dispatch")
+}
 
 /// Invariant: `dispatch_outbox_retry_count_in_bounds`.
 ///
@@ -352,6 +360,20 @@ async fn process_outbox_batch_sqlite<N: OutboxNotifier>(db: &crate::db::Db, noti
                 }
             }
             Err(err) => {
+                if is_transient_slot_busy_error(&err) {
+                    if let Ok(conn) = db.lock() {
+                        conn.execute(
+                            "UPDATE dispatch_outbox
+                                SET status = 'pending',
+                                    error = ?1,
+                                    next_attempt_at = datetime('now', '+' || ?2 || ' seconds')
+                              WHERE id = ?3",
+                            sqlite_test::params![err, SLOT_BUSY_RETRY_SECS, id],
+                        )
+                        .ok();
+                    }
+                    continue;
+                }
                 let new_count = retry_count + 1;
                 if new_count > MAX_RETRY_COUNT {
                     let delivery_result = DispatchNotifyDeliveryResult::permanent_failure(
@@ -501,6 +523,14 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                 }
             }
             Err(err) => {
+                if is_transient_slot_busy_error(&err) {
+                    tracing::info!(
+                        "[dispatch-outbox] Slot busy for entry {id} (dispatch={dispatch_id}, action={action}); retrying in {SLOT_BUSY_RETRY_SECS}s without consuming retry budget"
+                    );
+                    schedule_outbox_retry_pg(pool, id, &err, retry_count, SLOT_BUSY_RETRY_SECS)
+                        .await;
+                    continue;
+                }
                 let new_count = retry_count + 1;
                 if new_count > MAX_RETRY_COUNT {
                     // Permanent failure — exhausted all 4 retries (1m → 5m → 15m → 1h)
@@ -551,8 +581,13 @@ pub(crate) async fn process_outbox_batch_with_real_notifier(
 ///
 /// This is the SINGLE place where dispatch-related Discord HTTP calls originate.
 /// All other code paths insert into the outbox table and return immediately.
-pub(crate) async fn dispatch_outbox_loop(pg_pool: Arc<PgPool>, claim_owner: String) {
-    use std::time::Duration;
+pub(crate) async fn dispatch_outbox_loop(
+    pg_pool: Arc<PgPool>,
+    claim_owner: String,
+    cluster_runtime: crate::server::cluster::ClusterRuntime,
+    cluster_config: crate::config::ClusterConfig,
+) {
+    use std::time::{Duration, Instant};
 
     // Wait for server to be ready
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -564,9 +599,38 @@ pub(crate) async fn dispatch_outbox_loop(pg_pool: Arc<PgPool>, claim_owner: Stri
     let notifier = RealOutboxNotifier::new(pg_pool);
     let mut poll_interval = Duration::from_millis(500);
     let max_interval = Duration::from_secs(5);
+    let wake_interval =
+        Duration::from_secs(cluster_config.dispatch_routing.wake_interval_secs.max(1));
+    let mut last_wake = Instant::now() - wake_interval;
 
     loop {
         tokio::time::sleep(poll_interval).await;
+
+        if cluster_runtime.is_leader() && last_wake.elapsed() >= wake_interval {
+            match crate::services::dispatches::wait_queue::wake_waiting_dispatch_outbox_pg(
+                notifier.pg_pool.as_ref(),
+                &cluster_config,
+                "periodic",
+            )
+            .await
+            {
+                Ok(summary) if !summary.is_empty() => {
+                    tracing::info!(
+                        trigger = summary.trigger,
+                        reassigned = summary.reassigned,
+                        timed_out = summary.timed_out,
+                        still_waiting = summary.still_waiting,
+                        "[dispatch-outbox] wait queue wake-up"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error,
+                    "[dispatch-outbox] wait queue periodic wake-up failed"
+                ),
+            }
+            last_wake = Instant::now();
+        }
 
         let processed = process_outbox_batch_with_pg(
             None,

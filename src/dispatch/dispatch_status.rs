@@ -10,8 +10,8 @@ use crate::engine::PolicyEngine;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use super::dispatch_context::validate_dispatch_completion_evidence_on_conn;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-use super::query_dispatch_row;
-use super::query_dispatch_row_pg;
+use super::dispatch_query::query_dispatch_row;
+use super::dispatch_query::query_dispatch_row_pg;
 
 /// #750: Sources whose completion path already writes ✅ to the Discord
 /// message via the command bot (turn_bridge / tmux watcher). For those, the
@@ -685,6 +685,15 @@ async fn set_dispatch_status_on_pg_with_sync(
         }
 
         if matches!(to_status, "completed" | "failed" | "cancelled") {
+            crate::db::dispatch_semaphores::release_dispatch_semaphores_on_pg_tx(
+                &mut tx,
+                dispatch_id,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("release postgres dispatch semaphores for {dispatch_id}: {error}")
+            })?;
+
             let session_info = format!("Dispatch {to_status}");
             let cleared = sqlx::query(
                 "UPDATE sessions
@@ -719,6 +728,14 @@ async fn set_dispatch_status_on_pg_with_sync(
     tx.commit()
         .await
         .map_err(|error| anyhow::anyhow!("commit postgres dispatch status tx: {error}"))?;
+    if changed > 0 && matches!(to_status, "completed" | "failed" | "cancelled") {
+        crate::services::dispatches::wait_queue::spawn_cached_constraint_release_wake(
+            pool.clone(),
+            "constraint_release",
+            dispatch_id.to_string(),
+            "dispatch_terminal_status",
+        );
+    }
     Ok(changed)
 }
 
@@ -1919,3 +1936,7 @@ fn check_entry_is_pass(entry: &serde_json::Value) -> bool {
     }
     false
 }
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[path = "dispatch_status_relocated_tests.rs"]
+mod relocated_tests;

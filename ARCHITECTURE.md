@@ -51,6 +51,17 @@ src/
 │   ├── legacy_tmp_paths.rs
 │   └── mod.rs
 ├── db/
+│   ├── auto_queue/
+│   │   ├── claim.rs
+│   │   ├── consultation.rs
+│   │   ├── entries.rs
+│   │   ├── mod.rs
+│   │   ├── phase_gates.rs
+│   │   ├── queries.rs
+│   │   ├── runs.rs
+│   │   ├── slots.rs
+│   │   ├── test_support.rs
+│   │   └── tests.rs
 │   ├── dispatches/
 │   │   ├── outbox/
 │   │   │   ├── claim.rs
@@ -80,8 +91,8 @@ src/
 │   │   ├── storage_stats.rs
 │   │   └── tests.rs
 │   ├── agents.rs
-│   ├── auto_queue.rs
 │   ├── cancel_tombstones.rs
+│   ├── dispatch_semaphores.rs
 │   ├── dispatched_sessions.rs
 │   ├── kanban.rs
 │   ├── memento_feedback_stats.rs
@@ -95,11 +106,21 @@ src/
 │   ├── table_metadata.rs
 │   └── turns.rs
 ├── dispatch/
+│   ├── dispatch_cancel.rs
+│   ├── dispatch_cancel_tests.rs
 │   ├── dispatch_channel.rs
+│   ├── dispatch_channel_relocated_tests.rs
 │   ├── dispatch_context.rs
+│   ├── dispatch_context_relocated_tests.rs
 │   ├── dispatch_create.rs
+│   ├── dispatch_create_relocated_tests.rs
+│   ├── dispatch_query.rs
 │   ├── dispatch_status.rs
-│   └── mod.rs
+│   ├── dispatch_status_relocated_tests.rs
+│   ├── dispatch_summary.rs
+│   ├── mod.rs
+│   ├── test_support.rs
+│   └── types.rs
 ├── engine/
 │   ├── ops/
 │   │   ├── agent_ops.rs
@@ -145,6 +166,18 @@ src/
 │   ├── tests/
 │   │   └── high_risk_recovery.rs
 │   └── agents_setup_e2e.rs
+├── kanban/
+│   ├── audit.rs
+│   ├── github_sync.rs
+│   ├── github_sync_target.rs
+│   ├── hooks.rs
+│   ├── mod.rs
+│   ├── review_tuning.rs
+│   ├── state_machine.rs
+│   ├── terminal_cleanup.rs
+│   ├── test_support.rs
+│   ├── transition_cleanup.rs
+│   └── transition_core.rs
 ├── runtime_layout/
 │   ├── config_merge.rs
 │   ├── legacy_migration.rs
@@ -261,13 +294,21 @@ src/
 │   │   ├── queue_metrics.rs
 │   │   └── session_metrics.rs
 │   ├── api_friction/
-│   │   └── tests/
-│   │       ├── helpers.rs
-│   │       ├── memory_sync.rs
-│   │       ├── mod.rs
-│   │       ├── parser.rs
-│   │       ├── pg_storage.rs
-│   │       └── processing.rs
+│   │   ├── tests/
+│   │   │   ├── helpers.rs
+│   │   │   ├── memory_sync.rs
+│   │   │   ├── mod.rs
+│   │   │   ├── parser.rs
+│   │   │   ├── pg_storage.rs
+│   │   │   └── processing.rs
+│   │   ├── core.rs
+│   │   ├── issue_body.rs
+│   │   ├── issues.rs
+│   │   ├── markers.rs
+│   │   ├── memory_sync.rs
+│   │   ├── mod.rs
+│   │   ├── patterns.rs
+│   │   └── storage.rs
 │   ├── auto_queue/
 │   │   ├── activate_bridge.rs
 │   │   ├── activate_command.rs
@@ -339,7 +380,6 @@ src/
 │   │   │   ├── common.rs
 │   │   │   ├── context_panel.rs
 │   │   │   ├── mod.rs
-│   │   │   ├── prompt_panel.rs
 │   │   │   ├── recent_events.rs
 │   │   │   ├── session_panel.rs
 │   │   │   ├── status_events.rs
@@ -455,7 +495,9 @@ src/
 │   │   ├── mod.rs
 │   │   ├── outbox_claiming.rs
 │   │   ├── outbox_queue.rs
-│   │   └── outbox_route.rs
+│   │   ├── outbox_route.rs
+│   │   ├── routing_constraint.rs
+│   │   └── wait_queue.rs
 │   ├── git/
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
@@ -521,7 +563,6 @@ src/
 │   │   └── mod.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
-│   ├── api_friction.rs
 │   ├── auto_queue.rs
 │   ├── claude.rs
 │   ├── codex.rs
@@ -573,7 +614,9 @@ src/
 ├── utils/
 │   ├── api.rs
 │   ├── async_bridge.rs
+│   ├── discord.rs
 │   ├── format.rs
+│   ├── github_links.rs
 │   ├── loopback_url.rs
 │   ├── mod.rs
 │   └── wip_detect.rs
@@ -583,7 +626,6 @@ src/
 ├── error.rs
 ├── high_risk_recovery.rs
 ├── integration_tests.rs
-├── kanban.rs
 ├── launch.rs
 ├── logging.rs
 ├── main.rs
@@ -613,6 +655,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/engine/` | QuickJS policy runtime, hook wiring, transition logic, and Rust-JS bridge ops. |
 | `src/github/` | GitHub sync, issue triage, and Definition-of-Done mirroring. |
 | `src/integration_tests/` | Scenario-specific integration test modules that supplement `src/integration_tests.rs`. |
+| `src/kanban/` | High-level kanban orchestration, state machine facade, and shared test support. |
 | `src/runtime_layout/` | Managed runtime layout, memory-path migration, shared prompt sync, and skill deployment. |
 | `src/server/` | Axum server boot, routes, workers, background loops, and WebSocket broadcast. |
 | `src/services/` | Core runtime services: provider runners, Discord bot, queueing, memory, and platform helpers. |
@@ -625,7 +668,6 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/error.rs` | Shared HTTP and policy error type with typed codes and JSON response helpers. |
 | `src/high_risk_recovery.rs` | PG-only high-risk recovery tests for boot reconciliation and review refire paths. |
 | `src/integration_tests.rs` | End-to-end pipeline, dispatch, review, and recovery integration test harness. |
-| `src/kanban.rs` | High-level kanban orchestration and transition entrypoints. |
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |
 | `src/logging.rs` | Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs. |
 | `src/main.rs` | Binary entry point. Dispatches CLI commands or boots the server runtime. |
