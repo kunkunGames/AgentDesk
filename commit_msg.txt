@@ -1,0 +1,22 @@
+🗺️ Cartographer-Lite: refresh generated inventory docs
+
+Summary: Refreshed generated architecture, module, and route inventory documentation to reflect recent codebase changes (specifically the addition of routing constraint features).
+
+Generated surface: `ARCHITECTURE.md`, `docs/generated/module-inventory.md`, `docs/generated/route-inventory.md`
+
+Generator command used: `python3 scripts/generate_inventory_docs.py`
+
+Drift detected: Stale line counts and missing entries for `routing_constraint` and `wait_queue` in the `dispatch` domain.
+
+Verification commands and results:
+- `python3 scripts/generate_inventory_docs.py --check` (Passed)
+- `python3 -m unittest tests.test_agent_maintenance_docs` (Passed, 13 tests)
+
+## Boundary fingerprint
+
+- Agent: Cartographer-Lite
+- Boundary: Generated inventory drift
+- Primary files: `ARCHITECTURE.md`, `docs/generated/module-inventory.md`, `docs/generated/route-inventory.md`
+- Inventory/generator invariant: Ensure module list matches the file structure and route lists are up-to-date.
+- Related PRs/issues checked: None detected in `git branch -a`.
+- Why this is non-overlapping: Only touches standard generated surfaces that currently show script-verified drift. No other open PR handles this drift.
