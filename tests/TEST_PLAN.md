@@ -168,6 +168,7 @@
 
 ### Config Domains
 - `patch_config_entries_rejects_readonly_metadata` — read-only runtime metadata like server_port cannot be written
+- `put_settings_is_full_replace_semantics` — dashboard settings remain full-replace semantics
 
 ### bot_settings.json
 - `token_hash_sha256_correct` — SHA256 해시 계산 정확
