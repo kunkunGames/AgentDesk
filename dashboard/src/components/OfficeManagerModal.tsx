@@ -355,7 +355,7 @@ export default function OfficeManagerModal({
                         <button
                           key={ic}
                           type="button"
-                          aria-label={`Icon ${ic}`}
+                          aria-label={tr(`아이콘 ${ic}`, `Icon ${ic}`)}
                           aria-pressed={formIcon === ic}
                           onClick={() => setFormIcon(ic)}
                           className="flex h-8 w-8 items-center justify-center rounded text-base transition-all"
