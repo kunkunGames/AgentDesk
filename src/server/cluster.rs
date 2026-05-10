@@ -65,6 +65,9 @@ pub(crate) struct CapabilityRouteCandidate {
 
 impl ClusterRuntime {
     pub(crate) fn single_node() -> Self {
+        // Cache the synthetic id so the intake-routing leader hook
+        // sees a stable answer in single-node mode too.
+        let _ = SELF_INSTANCE_ID.set("single-node".to_string());
         Self {
             enabled: false,
             instance_id: "single-node".to_string(),
@@ -118,6 +121,12 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
     };
 
     let instance_id = resolve_instance_id(&config.cluster);
+    // Phase 4 of intake-node-routing: cache the resolved instance_id
+    // so the intake-routing leader hook (`services::cluster::intake_router_hook`)
+    // sees the same id we register with `worker_nodes`. The OnceLock
+    // ignores subsequent sets; if bootstrap is called twice in tests,
+    // the first wins.
+    let _ = SELF_INSTANCE_ID.set(instance_id.clone());
     let hostname = crate::services::platform::hostname_short();
     let configured_role = ClusterRole::parse(&config.cluster.role);
     let mut leader_lease = match configured_role {
@@ -199,6 +208,7 @@ pub(crate) async fn bootstrap(config: &Config, pg_pool: Option<PgPool>) -> Clust
         labels,
         capabilities,
         config.cluster.heartbeat_interval_secs,
+        config.cluster.lease_ttl_secs,
         leader_active.clone(),
         leader_lease.take(),
     );
@@ -228,10 +238,12 @@ fn spawn_heartbeat_loop(
     labels: serde_json::Value,
     capabilities: serde_json::Value,
     heartbeat_interval_secs: u64,
+    lease_ttl_secs: u64,
     leader_active: Arc<AtomicBool>,
     mut leader_lease: Option<AdvisoryLockLease>,
 ) {
     let interval_secs = heartbeat_interval_secs.max(1);
+    let stale_threshold_secs = lease_ttl_secs.max(interval_secs * 3);
     let leader_eligible = matches!(configured_role, ClusterRole::Leader | ClusterRole::Auto);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -295,6 +307,17 @@ fn spawn_heartbeat_loop(
             {
                 tracing::warn!("[cluster] heartbeat MCP endpoint sync failed: {error}");
             }
+            // Stale-row GC: leader-only sweep that flips
+            // worker_nodes.status='offline' when a peer's last_heartbeat_at is
+            // beyond stale_threshold_secs. Without this, dead nodes keep
+            // status='online' and split-brain diagnostics remain unreliable.
+            if leader_active.load(Ordering::Acquire) {
+                if let Err(error) =
+                    mark_stale_worker_nodes_offline(&pool, stale_threshold_secs, &instance_id).await
+                {
+                    tracing::warn!("[cluster] stale worker_node GC failed: {error}");
+                }
+            }
         }
     });
 }
@@ -335,6 +358,34 @@ fn spawn_stale_claim_owner_reassignment_loop(
             }
         }
     });
+}
+
+async fn mark_stale_worker_nodes_offline(
+    pool: &PgPool,
+    stale_threshold_secs: u64,
+    self_instance_id: &str,
+) -> Result<u64, String> {
+    let result = sqlx::query(
+        "UPDATE worker_nodes
+            SET status = 'offline'
+          WHERE status = 'online'
+            AND instance_id <> $2
+            AND last_heartbeat_at < NOW() - ($1::BIGINT * INTERVAL '1 second')",
+    )
+    .bind(stale_threshold_secs.max(1) as i64)
+    .bind(self_instance_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("mark stale worker_nodes offline: {error}"))?;
+    let affected = result.rows_affected();
+    if affected > 0 {
+        tracing::info!(
+            stale_threshold_secs,
+            affected,
+            "[cluster] flipped stale worker_nodes to offline"
+        );
+    }
+    Ok(affected)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -468,6 +519,61 @@ async fn upsert_worker_mcp_endpoints(
     .await
     .map_err(|error| format!("prune worker_mcp_endpoints: {error}"))?;
     Ok(())
+}
+
+/// Process-global cache of the resolved self `instance_id`. Set once
+/// during `bootstrap()` from `ClusterRuntime.instance_id()` so callers
+/// (e.g. the intake-routing leader hook in `services::cluster::intake_router_hook`)
+/// see the SAME id the cluster bootstrap registered with `worker_nodes`,
+/// even when the id was supplied via `ClusterConfig.instance_id` rather
+/// than env or hostname.
+pub(crate) static SELF_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Resolve the self instance_id, preferring the value the cluster
+/// bootstrap registered (config-driven if present), falling back to
+/// the env-var/hostname pair only when the OnceLock has not yet been
+/// initialised (e.g. unit tests, early startup before bootstrap).
+///
+/// Phase 4 codex blocker fix #1: a config-driven id must be reachable
+/// from the intake hook so `pick_intake_target` can correctly
+/// classify the leader as self. Otherwise the hook can route a
+/// message to leader's own `instance_id` and the gate then skips
+/// local execution, leaving the row unconsumed.
+pub(crate) fn resolve_self_instance_id_without_config() -> String {
+    if let Some(value) = SELF_INSTANCE_ID.get() {
+        return value.clone();
+    }
+    if let Ok(value) = std::env::var("AGENTDESK_INSTANCE_ID")
+        && !value.trim().is_empty()
+    {
+        return value.trim().to_string();
+    }
+    format!(
+        "{}-{}",
+        crate::services::platform::hostname_short(),
+        std::process::id()
+    )
+}
+
+/// Wait until `cluster::bootstrap` has populated `SELF_INSTANCE_ID`, then
+/// return its value. Used by callers (Phase 5.1 intake_worker spawn) that
+/// race with cluster bootstrap and would otherwise pick up the
+/// hostname+PID fallback. Times out after `max_wait` and falls back to
+/// `resolve_self_instance_id_without_config()` so the caller never blocks
+/// forever in degraded boots.
+pub(crate) async fn wait_for_self_instance_id(max_wait: std::time::Duration) -> String {
+    let start = std::time::Instant::now();
+    while SELF_INSTANCE_ID.get().is_none() {
+        if start.elapsed() >= max_wait {
+            tracing::warn!(
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "[cluster] wait_for_self_instance_id timed out — falling back to hostname/PID"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    resolve_self_instance_id_without_config()
 }
 
 fn resolve_instance_id(config: &ClusterConfig) -> String {

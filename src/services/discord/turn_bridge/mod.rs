@@ -341,6 +341,7 @@ async fn refresh_session_panel_line_from_lifecycle(
 struct TaskPanelDispatchMetadata {
     card_id: Option<String>,
     dispatch_type: Option<String>,
+    claim_owner: Option<String>,
 }
 
 async fn load_task_panel_dispatch_metadata(
@@ -351,9 +352,12 @@ async fn load_task_panel_dispatch_metadata(
         return Ok(None);
     };
     let row = sqlx::query(
-        "SELECT kanban_card_id, dispatch_type
-         FROM task_dispatches
-         WHERE id = $1",
+        "SELECT td.kanban_card_id, td.dispatch_type, dox.claim_owner
+         FROM task_dispatches td
+         LEFT JOIN dispatch_outbox dox ON dox.dispatch_id = td.id
+         WHERE td.id = $1
+         ORDER BY dox.created_at DESC NULLS LAST
+         LIMIT 1",
     )
     .bind(dispatch_id)
     .fetch_optional(pg_pool)
@@ -367,6 +371,9 @@ async fn load_task_panel_dispatch_metadata(
                 .map_err(|error| format!("decode task panel card_id for {dispatch_id}: {error}"))?,
             dispatch_type: row.try_get("dispatch_type").map_err(|error| {
                 format!("decode task panel dispatch_type for {dispatch_id}: {error}")
+            })?,
+            claim_owner: row.try_get("claim_owner").map_err(|error| {
+                format!("decode task panel claim_owner for {dispatch_id}: {error}")
             })?,
         })
     })
@@ -402,6 +409,9 @@ async fn refresh_task_panel_line_from_dispatch(
         metadata
             .as_ref()
             .and_then(|value| value.dispatch_type.as_deref()),
+        metadata
+            .as_ref()
+            .and_then(|value| value.claim_owner.as_deref()),
     )
 }
 
@@ -935,8 +945,11 @@ async fn enqueue_headless_delivery(
         None
     };
 
+    // Phase 5.2 of intake-node-routing (issue #2009): use gateway-or-token
+    // fallback so the standby worker path can still deliver headless
+    // messages even when `cached_serenity_ctx` is None.
     let http = notify_http
-        .or_else(|| shared.cached_serenity_ctx.get().map(|ctx| ctx.http.clone()))
+        .or_else(|| shared.serenity_http_or_token_fallback())
         .ok_or_else(|| {
             format!(
                 "headless delivery unavailable for channel {}: no outbox storage or discord http",
@@ -2271,8 +2284,103 @@ pub(super) fn spawn_turn_bridge(
                             if watcher_claimed {
                                 #[cfg(unix)]
                                 {
-                                    if let Some(ctx) = shared_owned.cached_serenity_ctx.get() {
-                                        let http_bg = ctx.http.clone();
+                                    // Phase 5.3 of intake-node-routing
+                                    // (issue #2011): on cluster-standby nodes
+                                    // (no Discord gateway lease, no
+                                    // `cached_serenity_ctx`), bypass the tmux
+                                    // watcher entirely — its internal state
+                                    // machine has multiple gateway-coupled
+                                    // assumptions that prevent the relay step
+                                    // from firing on standby (verified
+                                    // 2026-05-10). Instead, leave
+                                    // `watcher_relay_available_for_turn=false`
+                                    // so the bridge delivers the response
+                                    // itself via
+                                    // `gateway.replace_message_with_outcome`
+                                    // after the producer's `Done` event
+                                    // populates `delivery_response`. The
+                                    // bridge's REST gateway path already uses
+                                    // `serenity_http_or_token_fallback()`
+                                    // (Phase 5.2) so the post lands on Discord
+                                    // even without the gateway runtime.
+                                    //
+                                    // Leader path is unchanged: when
+                                    // `cached_serenity_ctx` is set, spawn the
+                                    // watcher as before so streaming partial
+                                    // output continues to work.
+                                    let on_standby = shared_owned.cached_serenity_ctx.get().is_none();
+                                    if on_standby {
+                                        // Phase 5.3 of intake-node-routing (issue #2011):
+                                        // skip the watcher entirely on standby and
+                                        // spawn the standalone JSONL → Discord relay
+                                        // task instead. The watcher's leader-only
+                                        // state machine prevents its relay step from
+                                        // firing on standby nodes; bypassing it
+                                        // sidesteps an entire class of
+                                        // gateway-coupling bugs.
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        tracing::info!(
+                                            "  [{ts}] ⏭ standby relay: skipping tmux watcher spawn for channel {}; spawning JSONL→Discord standby_relay",
+                                            channel_id
+                                        );
+                                        // Drop the registered watcher slot so a
+                                        // subsequent turn does not falsely reuse
+                                        // a "live" watcher that we never spawned.
+                                        // Do NOT call `cancel.store(true)` on the
+                                        // returned handle: the inner cancel Arc
+                                        // is shared with the local `cancel` and
+                                        // would pre-cancel the standby_relay we
+                                        // are about to spawn (Codex P1 review on
+                                        // PR #2012). The cancel Arc is otherwise
+                                        // unused on this branch since no watcher
+                                        // task ever reads it.
+                                        let _ = shared_owned
+                                            .tmux_watchers
+                                            .remove(&watcher_owner_channel_id);
+                                        if let Some(http_for_standby) =
+                                            shared_owned.serenity_http_or_token_fallback()
+                                        {
+                                            let placeholder_msg_id_opt =
+                                                if inflight_state.current_msg_id == 0 {
+                                                    None
+                                                } else {
+                                                    Some(serenity::MessageId::new(
+                                                        inflight_state.current_msg_id,
+                                                    ))
+                                                };
+                                            let output_path_for_standby = output_path.clone();
+                                            // Use a fresh cancel Arc, independent
+                                            // from the watcher's `cancel` (which
+                                            // is shared via `handle.cancel`).
+                                            let cancel_for_standby = Arc::new(
+                                                std::sync::atomic::AtomicBool::new(false),
+                                            );
+                                            let shared_for_standby = shared_owned.clone();
+                                            let provider_for_standby = provider.clone();
+                                            tokio::spawn(super::standby_relay::run_standby_relay(
+                                                http_for_standby,
+                                                channel_id,
+                                                placeholder_msg_id_opt,
+                                                output_path_for_standby,
+                                                last_offset,
+                                                cancel_for_standby,
+                                                shared_for_standby,
+                                                provider_for_standby,
+                                                std::time::Duration::from_secs(900),
+                                            ));
+                                        } else {
+                                            let ts = chrono::Local::now().format("%H:%M:%S");
+                                            tracing::warn!(
+                                                "  [{ts}] ⚠ standby relay skipped: no Http source for channel {}",
+                                                channel_id
+                                            );
+                                        }
+                                        // Leave watcher_relay_available_for_turn=false
+                                        // and watcher_ready_for_relay=false so the
+                                        // bridge does NOT delegate to a non-existent
+                                        // watcher. The standby_relay task delivers
+                                        // the response independently.
+                                    } else if let Some(http_bg) = shared_owned.serenity_http_or_token_fallback() {
                                         let shared_bg = shared_owned.clone();
                                         inflight_state.watcher_owns_live_relay = true;
                                         let restored_turn =
@@ -2310,7 +2418,7 @@ pub(super) fn spawn_turn_bridge(
                                     } else {
                                         let ts = chrono::Local::now().format("%H:%M:%S");
                                         tracing::warn!(
-                                            "  [{ts}] ⚠ cached serenity context missing; tmux watcher not started for channel {}",
+                                            "  [{ts}] ⚠ no Http source (neither cached_serenity_ctx nor cached_bot_token); tmux watcher not started for channel {}",
                                             channel_id
                                         );
                                         if let Some((_, handle)) =

@@ -1792,15 +1792,106 @@ async fn send_restore_notification(
     }
 }
 
+/// Bundle of Discord-runtime dependencies that `handle_text_message`
+/// reads from outside its per-message parameters. Phase 2-pre.2 of
+/// intake-node-routing (docs/design/intake-node-routing.md): the body
+/// reads only `http` and (optionally) `cache`, both of which are REST-
+/// or cache-backed primitives. Worker-side callers without a live shard
+/// pass `cache: None` and `ctx_for_chained_dispatch: None`; leader-side
+/// callers pass `Some(&ctx.cache)` and `Some(ctx)` to preserve the
+/// in-process category cache and the chained-dispatch path.
+///
+/// `ctx_for_chained_dispatch` is the only remaining `&serenity::Context`
+/// dependency: `DiscordGateway::new` accepts an optional
+/// `LiveDiscordTurnContext { ctx, .. }` that wires the queued-turn
+/// hand-off back through the gateway's live shard. Workers cannot
+/// participate in that flow (they have no shard) so they pass `None`
+/// and the gateway is constructed with `live_turn = None`.
+#[derive(Clone, Copy)]
+pub(in crate::services::discord) struct IntakeDeps<'a> {
+    pub http: &'a Arc<serenity::http::Http>,
+    pub cache: Option<&'a Arc<serenity::cache::Cache>>,
+    pub ctx_for_chained_dispatch: Option<&'a serenity::Context>,
+    pub shared: &'a Arc<SharedData>,
+    pub token: &'a str,
+}
+
+/// Per-message inputs of `handle_text_message` bundled into a single
+/// owned struct. Phase 2-pre.3 of intake-node-routing: lets worker-side
+/// callers (`execute_intake_turn_core`) accept a single deserialized
+/// row from `intake_outbox` instead of 13 positional parameters.
+///
+/// All fields mirror the `intake_outbox` payload columns (see
+/// migrations/postgres/0052_intake_node_routing.sql) and the per-message
+/// parameters of the legacy 13-arg `handle_text_message` signature.
+/// Adding a column to `intake_outbox` means adding a field here.
+#[derive(Clone, Debug)]
+pub(crate) struct IntakeRequest {
+    pub channel_id: ChannelId,
+    pub user_msg_id: MessageId,
+    pub request_owner: UserId,
+    pub request_owner_name: String,
+    pub user_text: String,
+    pub reply_to_user_message: bool,
+    pub defer_watcher_resume: bool,
+    pub wait_for_completion: bool,
+    pub merge_consecutive: bool,
+    pub reply_context: Option<String>,
+    pub has_reply_boundary: bool,
+    pub dm_hint: Option<bool>,
+    pub turn_kind: TurnKind,
+}
+
+/// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
+/// of intake-node-routing: this is the public surface a worker node will
+/// invoke after claiming an `intake_outbox` row from its target queue. Pass
+/// the runtime primitives the worker has (`Arc<Http>`, `Arc<SharedData>`,
+/// bot token) plus the deserialized message payload; the function constructs
+/// `IntakeDeps` with `cache: None` and `ctx_for_chained_dispatch: None`
+/// (workers have no live gateway shard) and delegates to the existing
+/// intake body.
+///
+/// Leader code keeps using `handle_text_message` directly with a
+/// fully-populated `IntakeDeps` — leader behaviour is unchanged.
+pub(crate) async fn execute_intake_turn_core(
+    http: &Arc<serenity::http::Http>,
+    shared: &Arc<SharedData>,
+    token: &str,
+    request: IntakeRequest,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deps = IntakeDeps {
+        http,
+        cache: None,
+        ctx_for_chained_dispatch: None,
+        shared,
+        token,
+    };
+    handle_text_message(
+        &deps,
+        request.channel_id,
+        request.user_msg_id,
+        request.request_owner,
+        &request.request_owner_name,
+        &request.user_text,
+        request.reply_to_user_message,
+        request.defer_watcher_resume,
+        request.wait_for_completion,
+        request.merge_consecutive,
+        request.reply_context,
+        request.has_reply_boundary,
+        request.dm_hint,
+        request.turn_kind,
+    )
+    .await
+}
+
 pub(in crate::services::discord) async fn handle_text_message(
-    ctx: &serenity::Context,
+    deps: &IntakeDeps<'_>,
     channel_id: ChannelId,
     user_msg_id: MessageId,
     request_owner: UserId,
     request_owner_name: &str,
     user_text: &str,
-    shared: &Arc<SharedData>,
-    token: &str,
     reply_to_user_message: bool,
     defer_watcher_resume: bool,
     wait_for_completion: bool,
@@ -1810,6 +1901,13 @@ pub(in crate::services::discord) async fn handle_text_message(
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
 ) -> Result<(), Error> {
+    let IntakeDeps {
+        http,
+        cache,
+        ctx_for_chained_dispatch,
+        shared,
+        token,
+    } = *deps;
     let original_channel_id = channel_id;
     let mut session_reset_reason = None;
     let mut reset_session_id_to_clear = None;
@@ -1854,7 +1952,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         )
     };
     let is_dm_channel = matches!(
-        channel_id.to_channel(&ctx.http).await.ok(),
+        channel_id.to_channel(http).await.ok(),
         Some(serenity::Channel::Private(_))
     );
     let is_dm_channel = super::super::resolve_is_dm_channel(dm_hint, is_dm_channel);
@@ -1879,7 +1977,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             // Fallback: if this is a thread, try resolving workspace from parent channel
             if workspace.is_none() {
                 if let Some((parent_id, parent_name)) =
-                    super::super::resolve_thread_parent(&ctx.http, channel_id).await
+                    super::super::resolve_thread_parent(http, channel_id).await
                 {
                     // Use parent name from Discord API first, fall back to session map
                     let parent_ch_name = parent_name.or_else(|| {
@@ -1917,9 +2015,9 @@ pub(in crate::services::discord) async fn handle_text_message(
                         .unwrap_or_else(|_| ws_path.clone());
                     // Resolve channel name from Discord API before worktree
                     // creation so the path uses the real name, not "unknown".
-                    let (ch_name_api, cat_name) = resolve_channel_category(ctx, channel_id).await;
-                    let ch_name = match super::super::resolve_thread_parent(&ctx.http, channel_id)
-                        .await
+                    let (ch_name_api, cat_name) =
+                        resolve_channel_category(http, cache, channel_id).await;
+                    let ch_name = match super::super::resolve_thread_parent(http, channel_id).await
                     {
                         Some((_parent_id, parent_name)) => {
                             let parent = parent_name.unwrap_or_else(|| format!("{}", _parent_id));
@@ -1937,7 +2035,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                     // dispatch_thread_parents hasn't been populated yet).
                     let wt_info = {
                         let is_thread = shared.dispatch_thread_parents.contains_key(&channel_id)
-                            || super::super::resolve_thread_parent(&ctx.http, channel_id)
+                            || super::super::resolve_thread_parent(http, channel_id)
                                 .await
                                 .is_some();
                         let data = shared.core.lock().await;
@@ -2018,14 +2116,14 @@ pub(in crate::services::discord) async fn handle_text_message(
                 } else {
                     rate_limit_wait(shared, channel_id).await;
                     let _ = channel_id
-                        .say(&ctx.http, "No active session. Use `/start <path>` first.")
+                        .say(http, "No active session. Use `/start <path>` first.")
                         .await;
                     return Ok(());
                 }
             } else {
                 rate_limit_wait(shared, channel_id).await;
                 let _ = channel_id
-                    .say(&ctx.http, "No active session. Use `/start <path>` first.")
+                    .say(http, "No active session. Use `/start <path>` first.")
                     .await;
                 return Ok(());
             }
@@ -2034,7 +2132,7 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     let dispatch_id_for_thread = super::super::adk_session::parse_dispatch_id(user_text);
     if should_add_turn_pending_reaction(dispatch_id_for_thread.as_deref()) {
-        add_reaction(ctx, channel_id, user_msg_id, '⏳').await;
+        add_reaction(http, channel_id, user_msg_id, '⏳').await;
     }
 
     // ── Dispatch thread auto-creation ──────────────────────────────
@@ -2043,7 +2141,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     // Skip if already inside a thread (threads cannot nest).
     // Thread reuse: if the card already has an active_thread_id, redirect
     // to the existing thread instead of creating a new one.
-    let is_already_thread = super::super::resolve_thread_parent(&ctx.http, channel_id)
+    let is_already_thread = super::super::resolve_thread_parent(http, channel_id)
         .await
         .is_some();
     // #259: Fetch dispatch metadata once before thread creation so we can extract
@@ -2144,7 +2242,7 @@ pub(in crate::services::discord) async fn handle_text_message(
 
             if is_already_thread {
                 // Ensure thread is accessible (unarchive if needed) before proceeding
-                if !super::verify_thread_accessible(ctx, channel_id).await {
+                if !super::verify_thread_accessible(http, channel_id).await {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::warn!(
                         "  [{ts}] ⚠ Dispatch {did} thread {channel_id} is not accessible (archived/locked), skipping"
@@ -2183,7 +2281,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 });
 
                 let reused = if let Some(tid) = reuse_tid {
-                    if super::verify_thread_accessible(ctx, tid).await {
+                    if super::verify_thread_accessible(http, tid).await {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!(
                             "  [{ts}] 🧵 Reusing existing thread {} for dispatch {}",
@@ -2194,7 +2292,8 @@ pub(in crate::services::discord) async fn handle_text_message(
                             shared,
                             tid,
                             &dispatch_effective_path,
-                            ctx,
+                            http,
+                            cache,
                         )
                         .await;
                         shared.dispatch_thread_parents.insert(channel_id, tid);
@@ -2238,7 +2337,7 @@ pub(in crate::services::discord) async fn handle_text_message(
 
                     match channel_id
                         .create_thread(
-                            &ctx.http,
+                            http,
                             poise::serenity_prelude::builder::CreateThread::new(thread_title)
                                 .kind(poise::serenity_prelude::ChannelType::PublicThread)
                                 .auto_archive_duration(
@@ -2259,7 +2358,8 @@ pub(in crate::services::discord) async fn handle_text_message(
                                     shared,
                                     thread.id,
                                     &dispatch_effective_path,
-                                    ctx,
+                                    http,
+                                    cache,
                                 )
                                 .await;
                             shared.dispatch_thread_parents.insert(channel_id, thread.id);
@@ -2492,7 +2592,7 @@ pub(in crate::services::discord) async fn handle_text_message(
 
     if dispatch_reset_provider_state || dispatch_recreate_tmux {
         super::super::commands::reset_channel_provider_state(
-            &ctx.http,
+            http,
             shared,
             &provider,
             channel_id,
@@ -2520,10 +2620,10 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     }
 
-    let thread_parent = super::super::resolve_thread_parent(&ctx.http, channel_id).await;
+    let thread_parent = super::super::resolve_thread_parent(http, channel_id).await;
     let fast_mode_channel_id = effective_fast_mode_channel_id(channel_id, thread_parent.clone());
     super::super::commands::reset_provider_session_if_pending(
-        &ctx.http,
+        http,
         shared,
         &provider,
         channel_id,
@@ -2634,14 +2734,8 @@ pub(in crate::services::discord) async fn handle_text_message(
                     memento_context_loaded = session.memento_context_loaded;
                 }
                 // Notify: session restored — send before placeholder so it appears first
-                send_restore_notification(
-                    shared,
-                    &ctx.http,
-                    channel_id,
-                    &provider,
-                    restored.as_deref(),
-                )
-                .await;
+                send_restore_notification(shared, http, channel_id, &provider, restored.as_deref())
+                    .await;
             } else {
                 session_strategy_reason = "no_cached_provider_session";
             }
@@ -2780,7 +2874,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         // it. `📬` reaction is also skipped (the prior live enqueue already
         // owns the card and emoji). Just clean up `⏳` and return.
         if !enqueued {
-            super::super::formatting::remove_reaction_raw(&ctx.http, channel_id, user_msg_id, '⏳')
+            super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳')
                 .await;
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -2822,7 +2916,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             existing
         } else {
             let post_result = send_intake_placeholder(
-                ctx.http.clone(),
+                http.clone(),
                 shared.clone(),
                 channel_id,
                 if reply_to_user_message && dispatch_id_for_thread.is_none() {
@@ -2847,7 +2941,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                     // sentinel so the user knows we did not silently
                     // accept the message.
                     super::super::formatting::remove_reaction_raw(
-                        &ctx.http,
+                        http,
                         channel_id,
                         user_msg_id,
                         '⏳',
@@ -2858,6 +2952,17 @@ pub(in crate::services::discord) async fn handle_text_message(
                         "  [{ts}] ⚠ RACE: placeholder POST failed for race-lost message AFTER enqueue (channel {}, error={}); message remains queued, dispatch will POST fresh card",
                         channel_id,
                         error
+                    );
+                    // #1984 (codex C — observation): the user message is
+                    // already in the mailbox queue; the dispatch path will
+                    // POST a fresh card via the missing-mapping fallback.
+                    crate::services::observability::emit_intake_placeholder_post_failed(
+                        provider.as_str(),
+                        channel_id.get(),
+                        Some(user_msg_id.get()),
+                        "race_after_enqueue",
+                        "fresh_card_via_dispatch",
+                        &error.to_string(),
                     );
                     return Ok(());
                 }
@@ -2968,16 +3073,9 @@ pub(in crate::services::discord) async fn handle_text_message(
                 // orphan, remove the `⏳` reaction, and skip the mapping
                 // insert.
                 drop(persist_guard);
-                let _ = channel_id
-                    .delete_message(&ctx.http, placeholder_msg_id)
+                let _ = channel_id.delete_message(http, placeholder_msg_id).await;
+                super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳')
                     .await;
-                super::super::formatting::remove_reaction_raw(
-                    &ctx.http,
-                    channel_id,
-                    user_msg_id,
-                    '⏳',
-                )
-                .await;
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 if dispatch_already_running_for_our_msg {
                     tracing::info!(
@@ -3024,7 +3122,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             } else {
                 '📬'
             };
-            add_reaction(ctx, channel_id, user_msg_id, emoji).await;
+            add_reaction(http, channel_id, user_msg_id, emoji).await;
         }
         // #796: Background-trigger turns (notify-bot driven, info-only) must
         // NOT have their placeholder deleted on race-loss. The placeholder is
@@ -3087,7 +3185,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 );
             } else {
                 let gateway = DiscordGateway::new(
-                    ctx.http.clone(),
+                    http.clone(),
                     shared.clone(),
                     bot_owner_provider.clone(),
                     None,
@@ -3141,9 +3239,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                         }
                         drop(persist_guard);
                         if still_owned_under_lock {
-                            let _ = channel_id
-                                .delete_message(&ctx.http, placeholder_msg_id)
-                                .await;
+                            let _ = channel_id.delete_message(http, placeholder_msg_id).await;
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             tracing::info!(
                                 "  [{ts}] ⚠ RACE: queued placeholder render failed, deleted instead (channel {}, msg {})",
@@ -3187,12 +3283,9 @@ pub(in crate::services::discord) async fn handle_text_message(
             // remaining cases (e.g. is_thread_routed) fall here and have
             // no queued card to render — POSTed placeholder is a bare
             // `...` and would otherwise leak.
-            let _ = channel_id
-                .delete_message(&ctx.http, placeholder_msg_id)
-                .await;
+            let _ = channel_id.delete_message(http, placeholder_msg_id).await;
         }
-        super::super::formatting::remove_reaction_raw(&ctx.http, channel_id, user_msg_id, '⏳')
-            .await;
+        super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!(
             "  [{ts}] 🔀 RACE: message queued (another turn won), channel {}",
@@ -3228,7 +3321,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             progress_line: None,
         };
         let gateway = super::super::gateway::DiscordGateway::new(
-            ctx.http.clone(),
+            http.clone(),
             shared.clone(),
             provider_for_handoff,
             None,
@@ -3259,7 +3352,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         // the channel is stuck with `current_msg_id == 0` until the cancel
         // token times out (codex review P1).
         match send_intake_placeholder(
-            ctx.http.clone(),
+            http.clone(),
             shared.clone(),
             channel_id,
             if reply_to_user_message && dispatch_id_for_thread.is_none() {
@@ -3285,6 +3378,22 @@ pub(in crate::services::discord) async fn handle_text_message(
                     channel_id,
                     error,
                     kicked
+                );
+                // #1984 (codex C — observation): the mailbox slot is
+                // released; whether a follow-up kickoff was scheduled
+                // determines if the user message can still progress.
+                let recovery = if kicked {
+                    "mailbox_released_kickoff_rescheduled"
+                } else {
+                    "mailbox_released_kickoff_skipped"
+                };
+                crate::services::observability::emit_intake_placeholder_post_failed(
+                    provider.as_str(),
+                    channel_id.get(),
+                    Some(user_msg_id.get()),
+                    "intake_after_mailbox_slot",
+                    recovery,
+                    &error.to_string(),
                 );
                 return Err::<(), Error>(error.into());
             }
@@ -3526,7 +3635,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     {
         let watchdog_token = cancel_token.clone();
         let watchdog_shared = shared.clone();
-        let watchdog_http = ctx.http.clone();
+        let watchdog_http = http.clone();
         let timeout = super::super::turn_watchdog_timeout();
 
         // Set initial deadline. max_deadline tracks the farthest accepted
@@ -3810,14 +3919,14 @@ pub(in crate::services::discord) async fn handle_text_message(
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
 
-    let (logical_channel_id, thread_id, thread_title) = if let Some((parent_id, _parent_name)) =
-        thread_parent
-    {
-        let (live_thread_title, _) = super::super::resolve_channel_category(ctx, channel_id).await;
-        (parent_id.get(), Some(channel_id.get()), live_thread_title)
-    } else {
-        (channel_id.get(), None, None)
-    };
+    let (logical_channel_id, thread_id, thread_title) =
+        if let Some((parent_id, _parent_name)) = thread_parent {
+            let (live_thread_title, _) =
+                super::super::resolve_channel_category(http, cache, channel_id).await;
+            (parent_id.get(), Some(channel_id.get()), live_thread_title)
+        } else {
+            (channel_id.get(), None, None)
+        };
 
     let mut inflight_state = InflightTurnState::new(
         provider.clone(),
@@ -3877,7 +3986,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     // channel rather than the requested thread channel.
     let _watcher_owner_channel_id = attach_paused_turn_watcher(
         shared,
-        ctx.http.clone(),
+        http.clone(),
         &provider,
         channel_id,
         watcher_tmux_name,
@@ -4094,11 +4203,11 @@ pub(in crate::services::discord) async fn handle_text_message(
         TurnBridgeContext {
             provider: provider.clone(),
             gateway: Arc::new(DiscordGateway::new(
-                ctx.http.clone(),
+                http.clone(),
                 shared.clone(),
                 provider.clone(),
-                Some(LiveDiscordTurnContext {
-                    ctx: ctx.clone(),
+                ctx_for_chained_dispatch.map(|live_ctx| LiveDiscordTurnContext {
+                    ctx: live_ctx.clone(),
                     token: token.to_string(),
                     request_owner,
                 }),

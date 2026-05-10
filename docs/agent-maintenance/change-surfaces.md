@@ -256,6 +256,11 @@
   - `src/db/auto_queue/tests.rs` (3182 lines; migrated auto-queue test harness).
   - `src/db/auto_queue/entries.rs` (1436 lines; awaiting follow-up split per
     auto-queue decompose epic #1782).
+  - `src/db/auto_queue/phase_gates.rs` (~2128 lines after #1980 durable
+    reconciliation; ~1300 LoC of PG-backed tests for `current_batch_phase_pg`
+    + `reconcile_phase_gate_for_terminal_dispatch_on_pg_tx`. Split the test
+    module out into a sibling `phase_gates_tests.rs` before adding new
+    feature logic).
   - `src/db/schema.rs` (3194 lines).
   - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
     GitHub sync lookup surface).
@@ -266,6 +271,11 @@
   - `src/db/agents.rs` (1125 lines).
   - `src/db/prompt_manifests.rs` (1219 lines, post-#1699 retention policy +
     write-time byte cap pushed it past the giant-file threshold).
+  - `src/db/intake_outbox.rs` (~1240 lines after intake-node-routing Phase 2;
+    schema migration tests + claim/transition/sweep helpers + their
+    PG-backed integration coverage. Phase 5 transition-12 helper +
+    provider-JOIN claim push it further. Split the helper_tests module out
+    into a sibling `intake_outbox_tests.rs` before adding new feature logic).
 - active_callsite_coverage: PG-only cleanup tracked per #1237/#1238/#1239 —
   see `known-legacy.md`.
 - invariants: production reads/writes go through `pg_pool_ref()`; `legacy_db()`
