@@ -8,6 +8,7 @@ use serde_json::json;
 use super::AppState;
 use crate::services::automation_candidate_materializer::{
     AutomationCandidateMaterializer, IterationResultInput, MaterializerError,
+    PrepareWorktreeOutput,
 };
 
 fn pg_unavailable() -> (StatusCode, Json<serde_json::Value>) {
@@ -41,6 +42,10 @@ fn materializer_error_response(error: MaterializerError) -> (StatusCode, Json<se
                 "error": "iteration result already recorded for this card/iteration",
                 "code": "DUPLICATE_ITERATION",
             })),
+        ),
+        MaterializerError::WorktreeError(msg) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": msg, "code": "WORKTREE_ERROR"})),
         ),
         MaterializerError::Database(msg) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -127,8 +132,8 @@ pub async fn list_iterations(
 /// POST /api/automation-candidates/{card_id}/approve
 ///
 /// Human (or auto_apply_after_green) approves the final iteration.
-/// Sets review_status = 'approved'. The card stays in 'review' until
-/// a downstream job (merge, deploy) consumes the approval.
+/// Sets review_status = 'approved'. Returns `final_gate` so callers know
+/// whether to wait for CI (`auto_apply_after_green`) or just notify.
 pub async fn approve_candidate(
     State(state): State<AppState>,
     Path(card_id): Path<String>,
@@ -139,14 +144,63 @@ pub async fn approve_candidate(
 
     let materializer = AutomationCandidateMaterializer::new(pool.clone());
     match materializer.approve_candidate(&card_id).await {
-        Ok(()) => {
+        Ok(final_gate) => {
             crate::server::ws::emit_event(
                 &state.broadcast_tx,
                 "automation_candidate_approved",
-                json!({"card_id": card_id}),
+                json!({"card_id": card_id, "final_gate": final_gate}),
             );
-            (StatusCode::OK, Json(json!({"status": "approved", "card_id": card_id})))
+            let next_action = if final_gate == "auto_apply_after_green" {
+                "monitor_ci_and_merge"
+            } else {
+                "await_manual_merge"
+            };
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "approved",
+                    "card_id": card_id,
+                    "final_gate": final_gate,
+                    "next_action": next_action,
+                })),
+            )
         }
+        Err(error) => materializer_error_response(error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PrepareWorktreeRequest {
+    pub iteration: i32,
+}
+
+/// POST /api/automation-candidates/{card_id}/prepare-worktree
+///
+/// Creates (or returns existing) git worktree for the given iteration.
+/// The executor calls this before dispatching an LLM agent so the agent
+/// has an isolated branch to commit into.
+///
+/// Requires `metadata.program.repo_dir` on the card.
+pub async fn prepare_worktree(
+    State(state): State<AppState>,
+    Path(card_id): Path<String>,
+    Json(body): Json<PrepareWorktreeRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable();
+    };
+
+    let materializer = AutomationCandidateMaterializer::new(pool.clone());
+    match materializer.prepare_worktree(&card_id, body.iteration).await {
+        Ok(PrepareWorktreeOutput { path, branch, commit, created }) => (
+            if created { StatusCode::CREATED } else { StatusCode::OK },
+            Json(json!({
+                "path": path,
+                "branch": branch,
+                "commit": commit,
+                "created": created,
+            })),
+        ),
         Err(error) => materializer_error_response(error),
     }
 }

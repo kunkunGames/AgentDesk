@@ -3,8 +3,12 @@ use sqlx::{PgPool, Row};
 use crate::db::automation_candidates::{
     InsertIterationParams, IterationRecord, approve_candidate_card_pg,
     compute_verdict, create_child_candidate_card_pg, insert_iteration_pg,
-    is_final_iteration, list_iterations_for_card_pg, load_card_program_pg,
-    transition_card_status_pg,
+    is_final_iteration, list_iterations_for_card_pg, load_card_final_gate_pg,
+    load_card_program_pg, load_card_repo_dir_pg, transition_card_status_pg,
+};
+use crate::services::git::{
+    automation_branch_name, ensure_automation_worktree, find_automation_worktree,
+    remove_automation_worktree,
 };
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -80,12 +84,21 @@ impl From<IterationRecord> for IterationRecordView {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PrepareWorktreeOutput {
+    pub path: String,
+    pub branch: String,
+    pub commit: String,
+    pub created: bool,
+}
+
 #[derive(Debug)]
 pub enum MaterializerError {
     CardNotFound,
     MissingProgram(String),
     AllowedPathsViolation { path: String },
     DuplicateIteration,
+    WorktreeError(String),
     Database(String),
 }
 
@@ -100,6 +113,7 @@ impl std::fmt::Display for MaterializerError {
             Self::DuplicateIteration => {
                 write!(f, "iteration result already exists for this card/iteration")
             }
+            Self::WorktreeError(msg) => write!(f, "worktree error: {msg}"),
             Self::Database(msg) => write!(f, "database error: {msg}"),
         }
     }
@@ -227,6 +241,18 @@ impl AutomationCandidateMaterializer {
                     None => return Err(MaterializerError::CardNotFound),
                 };
 
+                // Best-effort worktree cleanup for the discarded iteration.
+                if let Some(repo_dir) = program
+                    .get("repo_dir")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    let branch = automation_branch_name(card_id, input.iteration);
+                    if let Some(wt) = find_automation_worktree(repo_dir, card_id, input.iteration) {
+                        let _ = remove_automation_worktree(repo_dir, &wt.path, &branch);
+                    }
+                }
+
                 transition_card_status_pg(&self.pool, card_id, "review")
                     .await
                     .map_err(MaterializerError::Database)?;
@@ -262,9 +288,56 @@ impl AutomationCandidateMaterializer {
             .map(|records| records.into_iter().map(IterationRecordView::from).collect())
     }
 
-    pub async fn approve_candidate(&self, card_id: &str) -> Result<(), MaterializerError> {
+    /// Prepare (create or find) a git worktree for `card_id` at `iteration`.
+    ///
+    /// Requires `metadata.program.repo_dir` to be set on the card.
+    pub async fn prepare_worktree(
+        &self,
+        card_id: &str,
+        iteration: i32,
+    ) -> Result<PrepareWorktreeOutput, MaterializerError> {
+        if iteration < 1 {
+            return Err(MaterializerError::MissingProgram(
+                "iteration must be >= 1".to_string(),
+            ));
+        }
+
+        let repo_dir = load_card_repo_dir_pg(&self.pool, card_id)
+            .await
+            .map_err(MaterializerError::Database)?
+            .ok_or_else(|| {
+                MaterializerError::MissingProgram(
+                    "metadata.program.repo_dir is required for worktree isolation".to_string(),
+                )
+            })?;
+
+        if repo_dir.trim().is_empty() {
+            return Err(MaterializerError::MissingProgram(
+                "metadata.program.repo_dir must not be empty".to_string(),
+            ));
+        }
+
+        let info = ensure_automation_worktree(&repo_dir, card_id, iteration)
+            .map_err(MaterializerError::WorktreeError)?;
+
+        Ok(PrepareWorktreeOutput {
+            path: info.path,
+            branch: info.branch,
+            commit: info.commit,
+            created: info.created,
+        })
+    }
+
+    pub async fn approve_candidate(&self, card_id: &str) -> Result<String, MaterializerError> {
         approve_candidate_card_pg(&self.pool, card_id)
             .await
-            .map_err(MaterializerError::Database)
+            .map_err(MaterializerError::Database)?;
+
+        let final_gate = load_card_final_gate_pg(&self.pool, card_id)
+            .await
+            .map_err(MaterializerError::Database)?
+            .unwrap_or_else(|| "manual_review".to_string());
+
+        Ok(final_gate)
     }
 }

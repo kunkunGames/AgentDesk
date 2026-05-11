@@ -65,6 +65,54 @@ pub fn is_final_iteration(iteration: i32) -> bool {
     iteration >= MAX_ITERATIONS
 }
 
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    #[test]
+    fn crashed_always_discards() {
+        assert_eq!(compute_verdict(Some(0.9), Some(0.95), false, "crashed"), "discard");
+        assert_eq!(compute_verdict(None, None, true, "crashed"), "discard");
+    }
+
+    #[test]
+    fn timeout_always_discards() {
+        assert_eq!(compute_verdict(Some(0.8), Some(0.9), false, "timeout"), "discard");
+    }
+
+    #[test]
+    fn simplification_always_keeps() {
+        assert_eq!(compute_verdict(Some(0.9), Some(0.5), true, "ok"), "keep");
+        assert_eq!(compute_verdict(None, None, true, "ok"), "keep");
+    }
+
+    #[test]
+    fn metric_regression_discards() {
+        assert_eq!(compute_verdict(Some(0.9), Some(0.8), false, "ok"), "discard");
+        assert_eq!(compute_verdict(Some(1.0), Some(0.0), false, "ok"), "discard");
+    }
+
+    #[test]
+    fn metric_improvement_keeps() {
+        assert_eq!(compute_verdict(Some(0.8), Some(0.9), false, "ok"), "keep");
+        assert_eq!(compute_verdict(Some(0.5), Some(0.5), false, "ok"), "keep");
+    }
+
+    #[test]
+    fn no_metrics_keeps() {
+        assert_eq!(compute_verdict(None, None, false, "ok"), "keep");
+        assert_eq!(compute_verdict(Some(0.8), None, false, "ok"), "keep");
+        assert_eq!(compute_verdict(None, Some(0.8), false, "ok"), "keep");
+    }
+
+    #[test]
+    fn final_iteration_boundary() {
+        assert!(!is_final_iteration(9));
+        assert!(is_final_iteration(10));
+        assert!(is_final_iteration(11));
+    }
+}
+
 pub async fn insert_iteration_pg(
     pool: &PgPool,
     params: InsertIterationParams,
@@ -269,6 +317,43 @@ pub async fn create_child_candidate_card_pg(
     .map_err(|error| format!("create child card: {error}"))?;
 
     Ok(child_id)
+}
+
+/// Read `metadata->'program'->>'repo_dir'` for the card.
+///
+/// Returns `None` if the card doesn't exist or the field isn't set.
+pub async fn load_card_repo_dir_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> Result<Option<String>, String> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT metadata->'program'->>'repo_dir' FROM kanban_cards WHERE id = $1",
+    )
+    .bind(card_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("load card repo_dir: {e}"))?
+    .flatten();
+    Ok(value)
+}
+
+/// Read `metadata->'program'->>'final_gate'` for the card.
+///
+/// Returns `None` if the card doesn't exist or the field isn't set.
+/// Expected values: `"manual_review"` (default) | `"auto_apply_after_green"`.
+pub async fn load_card_final_gate_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> Result<Option<String>, String> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT metadata->'program'->>'final_gate' FROM kanban_cards WHERE id = $1",
+    )
+    .bind(card_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("load card final_gate: {e}"))?
+    .flatten();
+    Ok(value)
 }
 
 /// Approve a card for final application (manual_review gate).

@@ -70,6 +70,10 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/automation-candidates/{card_id}/approve",
                 post(automation_candidates::approve_candidate),
+            )
+            .route(
+                "/automation-candidates/{card_id}/prepare-worktree",
+                post(automation_candidates::prepare_worktree),
             ),
         state,
     )
