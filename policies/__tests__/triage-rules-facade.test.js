@@ -280,8 +280,33 @@ function stripJsStrings(content) {
   return output;
 }
 
+function isIdentifierChar(ch) {
+  return Boolean(ch) && /[A-Za-z0-9_$]/.test(ch);
+}
+
+function normalizeWhitespaceBoundaries(content) {
+  var output = "";
+
+  for (var i = 0; i < content.length; i++) {
+    var ch = content[i];
+    if (!/\s/.test(ch)) {
+      output += ch;
+      continue;
+    }
+
+    var start = i;
+    while (i + 1 < content.length && /\s/.test(content[i + 1])) i += 1;
+
+    var previous = start > 0 ? content[start - 1] : "";
+    var next = i + 1 < content.length ? content[i + 1] : "";
+    if (isIdentifierChar(previous) && isIdentifierChar(next)) output += ";";
+  }
+
+  return output;
+}
+
 function normalizeStaticMemberAccess(content) {
-  return stripJsStrings(stripJsComments(content)
+  var normalized = stripJsStrings(stripJsComments(content)
     .replace(/\\u\{([0-9a-fA-F]+)\}/g, function(_match, codePoint) {
       return String.fromCodePoint(parseInt(codePoint, 16));
     })
@@ -294,7 +319,11 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
   )
     .replace(/\.+/g, ".")
-    .replace(/\s+/g, "");
+    .replace(/\s*\.\s*/g, ".")
+    .replace(/\s*\[\s*/g, "[")
+    .replace(/\s*\]\s*/g, "]");
+
+  return normalizeWhitespaceBoundaries(normalized);
 }
 
 function findMatchingBrace(content, startIndex) {
@@ -347,9 +376,9 @@ function collectAliasesForObject(normalized, objectName, fromIndex) {
   var escapedObjectName = escapeRegExp(objectName);
   var objectReference = "\\(*" + escapedObjectName + "\\)*";
   var patterns = [
-    new RegExp("(^|[;{:(,])(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
-    new RegExp("(^|[;{])for\\((?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
-    new RegExp("(^|[;{])for(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{:(,])(?:const|let|var);?([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{])for\\((?:const|let|var);?([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{])for(?:const|let|var);?([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for\\(([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{:(,])([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g")
@@ -457,6 +486,8 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const re = /https?:\\/\\//; agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("return /https?:\\/\\//.test(url) && agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) /https?:\\/\\//.test(url); agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("return agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("throw agentdesk.db.execute('DELETE')"));
   assert.ok(hasRawDbAccess("(agentdesk.db).query('SELECT 1')"));
   assert.ok(hasRawDbAccess("(agentdesk['db']).execute('DELETE')"));
   assert.ok(hasRawDbAccess("const db = agentdesk.db; db.query('SELECT 1')"));
@@ -475,6 +506,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("switch (kind) { case 'x': const { db } = agentdesk; db.query('SELECT 1'); }"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) { const ad = agentdesk; ad.db.execute('DELETE'); }"));
+  assert.ok(hasRawDbAccess("const ad = agentdesk; return ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const { db } = ad; db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const next = ad; next.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("let ad; for (ad = agentdesk; ; ) ad.db.query('SELECT 1')"));
