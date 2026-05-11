@@ -12,6 +12,7 @@ function canStartRegex(output) {
       "await",
       "case",
       "delete",
+      "else",
       "in",
       "instanceof",
       "of",
@@ -316,6 +317,7 @@ function normalizeStaticMemberAccess(content) {
     .replace(/[\r\n]+\s*(?=[.\[])/g, "")
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
+    .replace(/(["'`])db\1\s*:/g, "db:")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
   )
     .replace(/\.{2,}(?=(db|query|execute)\b)/g, ".")
@@ -487,6 +489,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const re = /https?:\\/\\//; agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("return /https?:\\/\\//.test(url) && agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) /https?:\\/\\//.test(url); agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("if (ok) {} else /https?:\\/\\//.test(url); agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("return agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("throw agentdesk.db.execute('DELETE')"));
   assert.ok(hasRawDbAccess("(agentdesk.db).query('SELECT 1')"));
@@ -499,6 +502,8 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const { query: q$ } = agentdesk.db; q$('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { db } = agentdesk; db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { db: rawDb } = agentdesk; rawDb.execute('DELETE')"));
+  assert.ok(hasRawDbAccess('const { "db": rawDb } = agentdesk; rawDb.query("SELECT 1")'));
+  assert.ok(hasRawDbAccess("const { ['db']: rawDb } = agentdesk; rawDb.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { cards, db: rawDb } = agentdesk\nrawDb['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { db: { query } } = agentdesk; query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) { const { db } = agentdesk; db.query('SELECT 1'); }"));
