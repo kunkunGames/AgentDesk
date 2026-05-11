@@ -280,6 +280,7 @@ export default function DepartmentFormModal({
                     <button
                       key={c}
                       type="button"
+                      aria-label={tr(`테마 색상 ${c} 선택`, `Select theme color ${c}`)}
                       onClick={() => setForm({ ...form, color: c })}
                       className="w-11 h-11 rounded-full transition-all hover:scale-110"
                       style={{
