@@ -108,41 +108,9 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\s+/g, "");
 }
 
-function escapeRegExp(content) {
-  return content.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function hasIdentifierUse(content, identifier) {
-  return new RegExp("(^|[^A-Za-z0-9_$])" + escapeRegExp(identifier) + "([^A-Za-z0-9_$]|$)").test(content);
-}
-
 function hasRawDbAccess(content) {
   var normalized = normalizeStaticMemberAccess(content);
-  if (normalized.includes("agentdesk.db.query") || normalized.includes("agentdesk.db.execute")) return true;
-
-  var dbAliasMatch;
-  var dbAliasPattern = /(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=agentdesk\.db[;,]/g;
-  while ((dbAliasMatch = dbAliasPattern.exec(normalized)) !== null) {
-    var dbAlias = dbAliasMatch[1];
-    var afterAlias = normalized.slice(dbAliasPattern.lastIndex);
-    if (afterAlias.includes(dbAlias + ".query") || afterAlias.includes(dbAlias + ".execute")) return true;
-  }
-
-  var destructuredMatch;
-  var destructuredPattern = /(?:const|let|var)\{([^}]+)\}=agentdesk\.db[;,]/g;
-  while ((destructuredMatch = destructuredPattern.exec(normalized)) !== null) {
-    var afterDestructure = normalized.slice(destructuredPattern.lastIndex);
-    var bindings = destructuredMatch[1].split(",");
-    for (var i = 0; i < bindings.length; i++) {
-      var parts = bindings[i].split(":");
-      var sourceName = parts[0];
-      if (sourceName !== "query" && sourceName !== "execute") continue;
-      var localName = parts.length > 1 ? parts[1] : sourceName;
-      if (hasIdentifierUse(afterDestructure, localName)) return true;
-    }
-  }
-
-  return false;
+  return /(^|[^A-Za-z0-9_$])agentdesk\.db([^A-Za-z0-9_$]|$)/.test(normalized);
 }
 
 test("triage-rules avoids raw agentdesk.db.* access", () => {
@@ -178,4 +146,5 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
   assert.equal(hasRawDbAccess("// agentdesk.db.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess("agentdesk.database.query('SELECT 1')"), false);
 });
