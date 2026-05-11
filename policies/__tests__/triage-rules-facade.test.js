@@ -338,7 +338,52 @@ function splitTopLevelDestructuringFields(content) {
   return fields;
 }
 
-function hasAgentdeskDbDestructuring(normalized) {
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function collectAliasesForObject(normalized, objectName, fromIndex) {
+  var aliases = [];
+  var content = normalized.slice(fromIndex);
+  var escapedObjectName = escapeRegExp(objectName);
+  var patterns = [
+    new RegExp("(^|[;{:])(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{])for(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{:])([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g")
+  ];
+
+  for (var p = 0; p < patterns.length; p++) {
+    var match;
+    while ((match = patterns[p].exec(content)) !== null) {
+      var alias = match[2];
+      if (alias !== objectName) {
+        aliases.push({ name: alias, fromIndex: fromIndex + match.index + match[0].length });
+      }
+    }
+  }
+
+  return aliases;
+}
+
+function collectAgentdeskNames(normalized) {
+  var names = [{ name: "agentdesk", fromIndex: 0 }];
+  var seen = { agentdesk: true };
+
+  for (var i = 0; i < names.length; i++) {
+    var aliases = collectAliasesForObject(normalized, names[i].name, names[i].fromIndex);
+    for (var j = 0; j < aliases.length; j++) {
+      if (seen[aliases[j].name]) continue;
+      seen[aliases[j].name] = true;
+      names.push(aliases[j]);
+    }
+  }
+
+  return names;
+}
+
+function hasDbDestructuringFromObject(normalized, objectName) {
+  var escapedObjectName = escapeRegExp(objectName);
+
   for (var i = 0; i < normalized.length; i++) {
     if (normalized[i] !== "{") continue;
 
@@ -351,7 +396,7 @@ function hasAgentdeskDbDestructuring(normalized) {
     if (endIndex === -1) continue;
 
     var suffix = normalized.slice(endIndex + 1);
-    if (!/^=agentdesk($|[^A-Za-z0-9_$])/.test(suffix)) continue;
+    if (!new RegExp("^=" + escapedObjectName + "($|[^A-Za-z0-9_$])").test(suffix)) continue;
 
     var fields = splitTopLevelDestructuringFields(normalized.slice(i + 1, endIndex));
     for (var j = 0; j < fields.length; j++) {
@@ -362,10 +407,22 @@ function hasAgentdeskDbDestructuring(normalized) {
   return false;
 }
 
+function hasDbAccessFromObject(normalized, objectName, fromIndex) {
+  var content = normalized.slice(fromIndex);
+  var escapedObjectName = escapeRegExp(objectName);
+  return new RegExp("(^|[^A-Za-z0-9_$])" + escapedObjectName + "\\.db([^A-Za-z0-9_$]|$)").test(content)
+    || hasDbDestructuringFromObject(content, objectName);
+}
+
 function hasRawDbAccess(content) {
   var normalized = normalizeStaticMemberAccess(content);
-  return /(^|[^A-Za-z0-9_$])agentdesk\.db([^A-Za-z0-9_$]|$)/.test(normalized)
-    || hasAgentdeskDbDestructuring(normalized);
+  var agentdeskNames = collectAgentdeskNames(normalized);
+  for (var i = 0; i < agentdeskNames.length; i++) {
+    if (hasDbAccessFromObject(normalized, agentdeskNames[i].name, agentdeskNames[i].fromIndex)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 test("triage-rules avoids raw agentdesk.db.* access", () => {
@@ -410,6 +467,10 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("function run() { const { db: rawDb } = agentdesk; rawDb.execute('DELETE'); }"));
   assert.ok(hasRawDbAccess("for (const { db } = agentdesk; ; ) db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("switch (kind) { case 'x': const { db } = agentdesk; db.query('SELECT 1'); }"));
+  assert.ok(hasRawDbAccess("const ad = agentdesk; ad.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("if (ok) { const ad = agentdesk; ad.db.execute('DELETE'); }"));
+  assert.ok(hasRawDbAccess("const ad = agentdesk; const { db } = ad; db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const ad = agentdesk; const next = ad; next.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
@@ -422,4 +483,5 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.equal(hasRawDbAccess("agentdesk.database.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("const { database } = agentdesk; database.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("const { db } = other; db.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess("const ad = other; ad.db.query('SELECT 1')"), false);
 });
