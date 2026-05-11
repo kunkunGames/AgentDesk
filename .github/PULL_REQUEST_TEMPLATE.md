@@ -22,3 +22,4 @@
 - Queue hygiene invariant:
 - Related PRs/issues checked:
 - Why this is non-overlapping:
+- Verification command:
