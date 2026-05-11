@@ -343,7 +343,9 @@ function hasAgentdeskDbDestructuring(normalized) {
     if (normalized[i] !== "{") continue;
 
     var prefix = normalized.slice(0, i);
-    if (!/(^|;)(const|let|var)?$/.test(prefix)) continue;
+    var startsDeclaration = /(^|[;{:])(const|let|var)?$/.test(prefix)
+      || /(^|[;{])for(const|let|var)?$/.test(prefix);
+    if (!startsDeclaration) continue;
 
     var endIndex = findMatchingBrace(normalized, i);
     if (endIndex === -1) continue;
@@ -404,6 +406,10 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const { db: rawDb } = agentdesk; rawDb.execute('DELETE')"));
   assert.ok(hasRawDbAccess("const { cards, db: rawDb } = agentdesk\nrawDb['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { db: { query } } = agentdesk; query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("if (ok) { const { db } = agentdesk; db.query('SELECT 1'); }"));
+  assert.ok(hasRawDbAccess("function run() { const { db: rawDb } = agentdesk; rawDb.execute('DELETE'); }"));
+  assert.ok(hasRawDbAccess("for (const { db } = agentdesk; ; ) db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("switch (kind) { case 'x': const { db } = agentdesk; db.query('SELECT 1'); }"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
