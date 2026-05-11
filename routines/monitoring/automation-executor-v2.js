@@ -65,6 +65,7 @@ function buildIterationPrompt(cardId, card, iteration, previousIterations) {
   const program = (card.metadata && card.metadata.program) || {};
   const allowedPaths = (program.allowed_write_paths || []).join(", ") || "(not specified)";
   const metricName   = program.metric_name || "improvement_score";
+  const metricDirection = program.metric_direction || program.direction || "lower_is_better";
   const metricTarget = program.metric_target != null ? String(program.metric_target) : "(not specified)";
   const iterBudget   = program.iteration_budget || MAX_ITERATIONS;
   const description  = program.description || card.title || "(no description)";
@@ -86,6 +87,7 @@ function buildIterationPrompt(cardId, card, iteration, previousIterations) {
     `- **목표**: ${description}`,
     `- **수정 허용 경로**: \`${allowedPaths}\``,
     `- **지표명**: ${metricName}`,
+    `- **지표 방향**: ${metricDirection}`,
     `- **목표값**: ${metricTarget}`,
     "",
     "### 이전 반복 결과",
@@ -93,7 +95,15 @@ function buildIterationPrompt(cardId, card, iteration, previousIterations) {
     "",
     "### 실행 지침",
     "",
-    "1. **격리된 git worktree 생성** (브랜치: `automation/" + cardId + "/iter-" + iteration + "`)",
+    "1. **먼저 아래 API로 격리된 git worktree를 준비**하고, 응답의 `path`에서만 작업:",
+    "",
+    "```",
+    `POST /api/automation-candidates/${cardId}/prepare-worktree`,
+    "Content-Type: application/json",
+    "",
+    JSON.stringify({ iteration }, null, 2),
+    "```",
+    "",
     "2. **allowed_write_paths 내에서만** 코드 수정",
     "3. 지표 측정 (변경 전/후)",
     "4. **반드시 아래 API 호출로 결과 제출** (다른 방법으로 상태 변경 금지):",
@@ -117,7 +127,7 @@ function buildIterationPrompt(cardId, card, iteration, previousIterations) {
     }, null, 2),
     "```",
     "",
-    "**주의**: `metric_before > metric_after` 인 경우 Rust가 자동으로 `discard` 판정합니다.",
+    "**주의**: `lower_is_better`에서는 `metric_after < metric_before`, `higher_is_better`에서는 `metric_after > metric_before`인 경우에만 Rust가 `keep` 판정합니다.",
     "**주의**: allowed_write_paths 외 경로 수정 시 API가 403을 반환합니다.",
     "**주의**: 이 API 호출 없이 카드 상태를 직접 변경하지 마세요.",
   ].join("\n");

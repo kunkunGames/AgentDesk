@@ -37,17 +37,38 @@ pub struct InsertIterationParams {
     pub crash_trace: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricDirection {
+    LowerIsBetter,
+    HigherIsBetter,
+}
+
+impl MetricDirection {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value
+            .unwrap_or("lower_is_better")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "higher" | "higher_is_better" | "maximize" | "max" => Self::HigherIsBetter,
+            _ => Self::LowerIsBetter,
+        }
+    }
+}
+
 /// Deterministically compute keep/discard from metrics.
 /// Rules (in order):
 ///  1. `crashed` / `timeout` → status is already set by caller, returned as-is.
 ///  2. `is_simplification=true` → keep (simplification always wins).
-///  3. `metric_after >= metric_before` (or before is null) → keep.
-///  4. Otherwise → discard.
+///  3. metric improvement in the configured direction → keep.
+///  4. Missing/equal/regressed metrics → discard.
 pub fn compute_verdict(
     metric_before: Option<f64>,
     metric_after: Option<f64>,
     is_simplification: bool,
     caller_status: &str,
+    metric_direction: MetricDirection,
 ) -> &'static str {
     if matches!(caller_status, "crashed" | "timeout") {
         return "discard";
@@ -56,8 +77,12 @@ pub fn compute_verdict(
         return "keep";
     }
     match (metric_before, metric_after) {
-        (Some(before), Some(after)) if after < before => "discard",
-        _ => "keep",
+        (Some(before), Some(after)) => match metric_direction {
+            MetricDirection::LowerIsBetter if after < before => "keep",
+            MetricDirection::HigherIsBetter if after > before => "keep",
+            _ => "discard",
+        },
+        _ => "discard",
     }
 }
 
@@ -72,49 +97,156 @@ mod verdict_tests {
     #[test]
     fn crashed_always_discards() {
         assert_eq!(
-            compute_verdict(Some(0.9), Some(0.95), false, "crashed"),
+            compute_verdict(
+                Some(0.9),
+                Some(0.95),
+                false,
+                "crashed",
+                MetricDirection::LowerIsBetter
+            ),
             "discard"
         );
-        assert_eq!(compute_verdict(None, None, true, "crashed"), "discard");
+        assert_eq!(
+            compute_verdict(None, None, true, "crashed", MetricDirection::LowerIsBetter),
+            "discard"
+        );
     }
 
     #[test]
     fn timeout_always_discards() {
         assert_eq!(
-            compute_verdict(Some(0.8), Some(0.9), false, "timeout"),
+            compute_verdict(
+                Some(0.8),
+                Some(0.9),
+                false,
+                "timeout",
+                MetricDirection::LowerIsBetter
+            ),
             "discard"
         );
     }
 
     #[test]
     fn simplification_always_keeps() {
-        assert_eq!(compute_verdict(Some(0.9), Some(0.5), true, "ok"), "keep");
-        assert_eq!(compute_verdict(None, None, true, "ok"), "keep");
+        assert_eq!(
+            compute_verdict(
+                Some(0.9),
+                Some(0.5),
+                true,
+                "ok",
+                MetricDirection::LowerIsBetter
+            ),
+            "keep"
+        );
+        assert_eq!(
+            compute_verdict(None, None, true, "ok", MetricDirection::HigherIsBetter),
+            "keep"
+        );
     }
 
     #[test]
-    fn metric_regression_discards() {
+    fn lower_metric_improvement_keeps() {
         assert_eq!(
-            compute_verdict(Some(0.9), Some(0.8), false, "ok"),
+            compute_verdict(
+                Some(0.9),
+                Some(0.8),
+                false,
+                "ok",
+                MetricDirection::LowerIsBetter
+            ),
+            "keep"
+        );
+        assert_eq!(
+            compute_verdict(
+                Some(1.0),
+                Some(0.0),
+                false,
+                "ok",
+                MetricDirection::LowerIsBetter
+            ),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn higher_metric_improvement_keeps() {
+        assert_eq!(
+            compute_verdict(
+                Some(0.8),
+                Some(0.9),
+                false,
+                "ok",
+                MetricDirection::HigherIsBetter
+            ),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn metric_regression_or_equal_discards() {
+        assert_eq!(
+            compute_verdict(
+                Some(0.8),
+                Some(0.9),
+                false,
+                "ok",
+                MetricDirection::LowerIsBetter
+            ),
             "discard"
         );
         assert_eq!(
-            compute_verdict(Some(1.0), Some(0.0), false, "ok"),
+            compute_verdict(
+                Some(0.9),
+                Some(0.8),
+                false,
+                "ok",
+                MetricDirection::HigherIsBetter
+            ),
+            "discard"
+        );
+        assert_eq!(
+            compute_verdict(
+                Some(0.5),
+                Some(0.5),
+                false,
+                "ok",
+                MetricDirection::LowerIsBetter
+            ),
             "discard"
         );
     }
 
     #[test]
-    fn metric_improvement_keeps() {
-        assert_eq!(compute_verdict(Some(0.8), Some(0.9), false, "ok"), "keep");
-        assert_eq!(compute_verdict(Some(0.5), Some(0.5), false, "ok"), "keep");
+    fn no_metrics_discards() {
+        assert_eq!(
+            compute_verdict(None, None, false, "ok", MetricDirection::LowerIsBetter),
+            "discard"
+        );
+        assert_eq!(
+            compute_verdict(Some(0.8), None, false, "ok", MetricDirection::LowerIsBetter),
+            "discard"
+        );
+        assert_eq!(
+            compute_verdict(None, Some(0.8), false, "ok", MetricDirection::LowerIsBetter),
+            "discard"
+        );
     }
 
     #[test]
-    fn no_metrics_keeps() {
-        assert_eq!(compute_verdict(None, None, false, "ok"), "keep");
-        assert_eq!(compute_verdict(Some(0.8), None, false, "ok"), "keep");
-        assert_eq!(compute_verdict(None, Some(0.8), false, "ok"), "keep");
+    fn parses_metric_direction_aliases() {
+        assert_eq!(
+            MetricDirection::parse(Some("higher")),
+            MetricDirection::HigherIsBetter
+        );
+        assert_eq!(
+            MetricDirection::parse(Some("higher_is_better")),
+            MetricDirection::HigherIsBetter
+        );
+        assert_eq!(
+            MetricDirection::parse(Some("lower")),
+            MetricDirection::LowerIsBetter
+        );
+        assert_eq!(MetricDirection::parse(None), MetricDirection::LowerIsBetter);
     }
 
     #[test]

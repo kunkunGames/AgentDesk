@@ -3,8 +3,8 @@ use std::path::{Component, Path};
 use sqlx::{PgPool, Row};
 
 use crate::db::automation_candidates::{
-    InsertIterationParams, IterationRecord, approve_candidate_card_pg, compute_verdict,
-    create_child_candidate_card_pg, insert_iteration_pg, is_final_iteration,
+    InsertIterationParams, IterationRecord, MetricDirection, approve_candidate_card_pg,
+    compute_verdict, create_child_candidate_card_pg, insert_iteration_pg, is_final_iteration,
     list_iterations_for_card_pg, load_card_final_gate_pg, load_card_program_pg,
     load_card_repo_dir_pg, transition_card_status_pg, update_card_program_current_iteration_pg,
 };
@@ -174,11 +174,18 @@ impl AutomationCandidateMaterializer {
 
         // 3. Compute deterministic verdict
         let is_simplification = input.is_simplification.unwrap_or(false);
+        let metric_direction = MetricDirection::parse(
+            program
+                .get("metric_direction")
+                .or_else(|| program.get("direction"))
+                .and_then(|v| v.as_str()),
+        );
         let verdict = compute_verdict(
             input.metric_before,
             input.metric_after,
             is_simplification,
             &input.status,
+            metric_direction,
         );
 
         // 4. Insert iteration record
