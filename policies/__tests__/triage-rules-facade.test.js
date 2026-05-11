@@ -58,12 +58,8 @@ function stripJsComments(content) {
       var inClass = false;
       for (i += 1; i < content.length; i++) {
         ch = content[i];
-        output += ch;
         if (ch === "\\") {
-          if (i + 1 < content.length) {
-            i += 1;
-            output += content[i];
-          }
+          if (i + 1 < content.length) i += 1;
           continue;
         }
         if (ch === "[") {
@@ -74,7 +70,10 @@ function stripJsComments(content) {
           inClass = false;
           continue;
         }
-        if (ch === "/" && !inClass) break;
+        if (ch === "/" && !inClass) {
+          output += ch;
+          break;
+        }
       }
       continue;
     }
@@ -317,6 +316,7 @@ function normalizeStaticMemberAccess(content) {
     .replace(/[\r\n]+\s*(?=[.\[])/g, "")
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
+    .replace(/\[\s*(["'`])d\1\s*\+\s*(["'`])b\2\s*\]\s*:/g, "db:")
     .replace(/(["'`])db\1\s*:/g, "db:")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
   )
@@ -504,6 +504,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const { db: rawDb } = agentdesk; rawDb.execute('DELETE')"));
   assert.ok(hasRawDbAccess('const { "db": rawDb } = agentdesk; rawDb.query("SELECT 1")'));
   assert.ok(hasRawDbAccess("const { ['db']: rawDb } = agentdesk; rawDb.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { ['d' + 'b']: rawDb } = agentdesk; rawDb.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { cards, db: rawDb } = agentdesk\nrawDb['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { db: { query } } = agentdesk; query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) { const { db } = agentdesk; db.query('SELECT 1'); }"));
@@ -536,6 +537,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.equal(hasRawDbAccess('const msg = "agentdesk.db.query";'), false);
   assert.equal(hasRawDbAccess("const msg = `agentdesk.db.query`;"), false);
   assert.equal(hasRawDbAccess('const msg = `${"agentdesk.db.query"}`;'), false);
+  assert.equal(hasRawDbAccess("const re = /agentdesk\\.db\\.query/;"), false);
   assert.equal(hasRawDbAccess("agentdesk.database.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("const { database } = agentdesk; database.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("const { db } = other; db.query('SELECT 1')"), false);
