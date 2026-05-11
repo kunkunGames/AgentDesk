@@ -211,24 +211,24 @@ static PROCESS_HANDLES: LazyLock<Mutex<HashMap<String, SessionHandle>>> =
 pub fn insert_process_session(session_name: impl Into<String>, handle: SessionHandle) {
     PROCESS_HANDLES
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(session_name.into(), handle);
 }
 
 pub fn remove_process_session(session_name: &str) -> Option<SessionHandle> {
-    PROCESS_HANDLES.lock().unwrap().remove(session_name)
+    PROCESS_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).remove(session_name)
 }
 
 pub fn process_session_pid(session_name: &str) -> Option<u32> {
     PROCESS_HANDLES
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(session_name)
         .map(SessionHandle::pid)
 }
 
 pub fn process_session_is_alive(session_name: &str) -> bool {
-    let handles = PROCESS_HANDLES.lock().unwrap();
+    let handles = PROCESS_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
     handles
         .get(session_name)
         .map(|handle| ProcessBackend::new().is_alive(handle))
@@ -236,7 +236,7 @@ pub fn process_session_is_alive(session_name: &str) -> bool {
 }
 
 pub fn send_process_session_input(session_name: &str, message: &str) -> Result<(), String> {
-    let handles = PROCESS_HANDLES.lock().unwrap();
+    let handles = PROCESS_HANDLES.lock().unwrap_or_else(|e| e.into_inner());
     let handle = handles
         .get(session_name)
         .ok_or_else(|| format!("No process handle found for session {}", session_name))?;
