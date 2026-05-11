@@ -3,6 +3,15 @@ var assert = require("node:assert");
 var fs = require("fs");
 var path = require("path");
 
+function canStartRegex(output) {
+  for (var i = output.length - 1; i >= 0; i--) {
+    var ch = output[i];
+    if (/\s/.test(ch)) continue;
+    return /[=(:,[!&|?;{}]/.test(ch);
+  }
+  return true;
+}
+
 function stripJsComments(content) {
   var output = "";
   var quote = null;
@@ -27,6 +36,32 @@ function stripJsComments(content) {
     if (ch === "\"" || ch === "'" || ch === "`") {
       quote = ch;
       output += ch;
+      continue;
+    }
+
+    if (ch === "/" && next !== "/" && next !== "*" && canStartRegex(output)) {
+      output += ch;
+      var inClass = false;
+      for (i += 1; i < content.length; i++) {
+        ch = content[i];
+        output += ch;
+        if (ch === "\\") {
+          if (i + 1 < content.length) {
+            i += 1;
+            output += content[i];
+          }
+          continue;
+        }
+        if (ch === "[") {
+          inClass = true;
+          continue;
+        }
+        if (ch === "]") {
+          inClass = false;
+          continue;
+        }
+        if (ch === "/" && !inClass) break;
+      }
       continue;
     }
 
@@ -55,6 +90,7 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\?\s*\./g, ".")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
     .replace(/\.+/g, ".")
+    .replace(/[()]/g, "")
     .replace(/\s+/g, "");
 }
 
@@ -82,6 +118,9 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk[`db`].query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk /* comment */ . db . execute('DELETE')"));
   assert.ok(hasRawDbAccess('const u = "https://example.com"; agentdesk.db.query("SELECT 1")'));
+  assert.ok(hasRawDbAccess("const re = /https?:\\/\\//; agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("(agentdesk.db).query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("(agentdesk['db']).execute('DELETE')"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
