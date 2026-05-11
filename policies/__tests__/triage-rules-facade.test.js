@@ -98,6 +98,149 @@ function stripJsComments(content) {
   return output;
 }
 
+function readRegexLiteral(content, startIndex) {
+  var inClass = false;
+
+  for (var i = startIndex + 1; i < content.length; i++) {
+    var ch = content[i];
+    if (ch === "\\") {
+      i += 1;
+      continue;
+    }
+    if (ch === "[") {
+      inClass = true;
+      continue;
+    }
+    if (ch === "]") {
+      inClass = false;
+      continue;
+    }
+    if (ch === "/" && !inClass) return i;
+  }
+
+  return content.length - 1;
+}
+
+function readQuotedLiteral(content, startIndex, quote) {
+  var escaped = false;
+
+  for (var i = startIndex + 1; i < content.length; i++) {
+    var ch = content[i];
+    if (escaped) {
+      escaped = false;
+    } else if (ch === "\\") {
+      escaped = true;
+    } else if (ch === quote) {
+      return i;
+    }
+  }
+
+  return content.length - 1;
+}
+
+function readTemplateLiteralExpressions(content, startIndex) {
+  var expression = "";
+  var escaped = false;
+
+  for (var i = startIndex; i < content.length; i++) {
+    var ch = content[i];
+    var next = content[i + 1];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === "`") {
+      return { expression: expression, endIndex: i };
+    }
+
+    if (ch === "$" && next === "{") {
+      var nestedExpression = readTemplateExpression(content, i + 2);
+      expression += " " + nestedExpression.expression + " ";
+      i = nestedExpression.endIndex;
+    }
+  }
+
+  return { expression: expression, endIndex: content.length - 1 };
+}
+
+function readTemplateExpression(content, startIndex) {
+  var expression = "";
+  var depth = 1;
+
+  for (var i = startIndex; i < content.length; i++) {
+    var ch = content[i];
+    var next = content[i + 1];
+
+    if (ch === "\"" || ch === "'") {
+      var quoteEnd = readQuotedLiteral(content, i, ch);
+      expression += content.slice(i, quoteEnd + 1);
+      i = quoteEnd;
+      continue;
+    }
+
+    if (ch === "`") {
+      var template = readTemplateLiteralExpressions(content, i + 1);
+      expression += "`" + template.expression + "`";
+      i = template.endIndex;
+      continue;
+    }
+
+    if (ch === "/" && next === "/") {
+      while (i < content.length && content[i] !== "\n" && content[i] !== "\r") {
+        expression += content[i];
+        i += 1;
+      }
+      i -= 1;
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      expression += ch + next;
+      i += 2;
+      while (i < content.length && !(content[i] === "*" && content[i + 1] === "/")) {
+        expression += content[i];
+        i += 1;
+      }
+      if (i < content.length) expression += "*/";
+      i += 1;
+      continue;
+    }
+
+    if (ch === "/" && next !== "/" && next !== "*" && canStartRegex(expression)) {
+      var regexEnd = readRegexLiteral(content, i);
+      expression += content.slice(i, regexEnd + 1);
+      i = regexEnd;
+      continue;
+    }
+
+    if (ch === "{") {
+      depth += 1;
+      expression += ch;
+      continue;
+    }
+
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return { expression: expression, endIndex: i };
+      }
+      expression += ch;
+      continue;
+    }
+
+    expression += ch;
+  }
+
+  return { expression: expression, endIndex: content.length - 1 };
+}
+
 function stripJsStrings(content) {
   var output = "";
   var quote = null;
@@ -118,7 +261,14 @@ function stripJsStrings(content) {
       continue;
     }
 
-    if (ch === "\"" || ch === "'" || ch === "`") {
+    if (ch === "`") {
+      var template = readTemplateLiteralExpressions(content, i + 1);
+      output += "`" + stripJsStrings(stripJsComments(template.expression)) + "`";
+      i = template.endIndex;
+      continue;
+    }
+
+    if (ch === "\"" || ch === "'") {
       quote = ch;
       output += ch;
       continue;
@@ -190,8 +340,11 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
+  assert.ok(hasRawDbAccess('const x = `${agentdesk.db.query("SELECT 1")}`;'));
+  assert.ok(hasRawDbAccess('const x = `${agentdesk["db"].execute("DELETE")}`;'));
   assert.equal(hasRawDbAccess("// agentdesk.db.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess('const msg = "agentdesk.db.query";'), false);
   assert.equal(hasRawDbAccess("const msg = `agentdesk.db.query`;"), false);
+  assert.equal(hasRawDbAccess('const msg = `${"agentdesk.db.query"}`;'), false);
   assert.equal(hasRawDbAccess("agentdesk.database.query('SELECT 1')"), false);
 });
