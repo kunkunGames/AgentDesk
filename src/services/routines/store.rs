@@ -1234,8 +1234,6 @@ impl RoutineStore {
             FROM kanban_cards
             WHERE status = 'ready'
               AND pipeline_stage_id = $1
-              AND metadata->'automation_candidate'->>'enabled' = 'true'
-              AND metadata->'automation_candidate'->>'loop_enabled' = 'true'
               AND NULLIF(metadata->'program'->>'repo_dir', '') IS NOT NULL
               AND jsonb_typeof(metadata->'program'->'allowed_write_paths') = 'array'
               AND jsonb_array_length(metadata->'program'->'allowed_write_paths') > 0
@@ -1294,8 +1292,6 @@ impl RoutineStore {
             FROM kanban_cards
             WHERE status = 'done'
               AND pipeline_stage_id = $1
-              AND metadata->'automation_candidate'->>'enabled' = 'true'
-              AND metadata->'automation_candidate'->>'loop_enabled' = 'true'
               AND updated_at > NOW() - INTERVAL '7 days'
             ORDER BY updated_at DESC
             LIMIT 20

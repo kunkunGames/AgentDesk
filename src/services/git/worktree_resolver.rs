@@ -20,7 +20,12 @@ pub struct EnsuredWorktreeInfo {
 
 impl From<WorktreeInfo> for EnsuredWorktreeInfo {
     fn from(wt: WorktreeInfo) -> Self {
-        Self { path: wt.path, branch: wt.branch, commit: wt.commit, created: false }
+        Self {
+            path: wt.path,
+            branch: wt.branch,
+            commit: wt.commit,
+            created: false,
+        }
     }
 }
 
@@ -72,7 +77,11 @@ fn parse_worktree_list(repo_dir: &str) -> Vec<WorktreeInfo> {
         }
     }
     if !wt_path.is_empty() && !wt_branch.is_empty() {
-        result.push(WorktreeInfo { path: wt_path, branch: wt_branch, commit: wt_head });
+        result.push(WorktreeInfo {
+            path: wt_path,
+            branch: wt_branch,
+            commit: wt_head,
+        });
     }
     result
 }
@@ -259,7 +268,9 @@ pub fn find_automation_worktree(
     iteration: i32,
 ) -> Option<WorktreeInfo> {
     let target = automation_branch_name(card_id, iteration);
-    parse_worktree_list(repo_dir).into_iter().find(|wt| wt.branch == target)
+    parse_worktree_list(repo_dir)
+        .into_iter()
+        .find(|wt| wt.branch == target)
 }
 
 /// Create (or return existing) automation worktree for `card_id` iteration `iteration`.

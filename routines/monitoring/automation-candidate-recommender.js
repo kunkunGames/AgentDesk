@@ -1024,7 +1024,8 @@ ${verificationMethod}
 ${handoffAcceptance}
 
 ## 자동화 후보 카드 생성 초안
-아래 JSON은 바로 자동 실행하지 말고, \`program.repo_dir\`를 채운 뒤 사람이 승인하거나 별도 materializer가 호출해야 합니다.
+아래 JSON은 탐지기(detector)가 자동으로 카드를 생성할 때 사용합니다.
+\`program.repo_dir\`에 현재 워크스페이스의 실제 절대 경로를 채워 kv_meta를 기록해주세요.
 ${JSON.stringify(materializeRequest, null, 2)}
 
 ## 지시사항
@@ -1036,8 +1037,29 @@ ${JSON.stringify(materializeRequest, null, 2)}
 5. 예상 부작용, 오탐/중복 억제 방법, 자동화 동작 검증 방법
 6. 이전 추천과 같은 결론이면 다른 탐색/진행 방식 또는 추가로 수집할 근거
 
-구현, 파일 수정, 서비스 재시작, memento 쓰기, PR/카드/이슈 생성은 금지합니다.
-이 요청은 제안 전용입니다.`;
+## kv_meta 기록 지침
+
+평가 완료 후 **자동화 가치가 있다(예 / 부분 예)** 고 판단한 경우에만 아래를 실행합니다.
+
+**key** (TTL: 48h):
+\`routine_observation:candidate_review:${patternId}\`
+
+**value** (JSON):
+\`\`\`json
+{
+  "score": ${candidate.score},
+  "evidence_count": ${candidate.evidence_count || 0},
+  "last_seen_at": "${candidate.last_seen_at || ""}",
+  "category": "${normalizeCategory(candidate.category)}",
+  "suggested_automation": "<평가에서 도출한 제안 자동화 내용>",
+  "outcome_summary": "<평가에서 도출한 한 줄 결과 요약>",
+  "materialize_request": <위 '자동화 후보 카드 생성 초안' JSON에서 program.repo_dir을 실제 절대 경로로 채운 버전>
+}
+\`\`\`
+
+\`program.repo_dir\`는 현재 워크스페이스에서 확인한 agentdesk 리포지터리 절대 경로로 채웁니다.
+자동화 가치가 없거나 보류라면 kv_meta를 기록하지 않습니다.
+구현, 파일 수정, 서비스 재시작, memento 쓰기, PR/카드/이슈 생성은 금지합니다.`;
 
   if (utf8ByteLength(raw) <= PROMPT_CAP_BYTES) {
     return raw;

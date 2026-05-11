@@ -6,16 +6,16 @@ use crate::db::automation_candidates::{
     InsertIterationParams, IterationRecord, MaterializeCandidateCardParams,
     MaterializedCandidateCard, MetricDirection, approve_candidate_card_pg, compute_verdict,
     create_child_candidate_card_pg, insert_iteration_pg, is_final_iteration,
-    list_iterations_for_card_pg, load_card_header_pg, load_card_program_pg,
-    load_card_repo_dir_pg, materialize_candidate_card_pg, transition_card_status_pg,
+    list_iterations_for_card_pg, load_card_header_pg, load_card_program_pg, load_card_repo_dir_pg,
+    materialize_candidate_card_pg, transition_card_status_pg,
     update_card_program_current_iteration_pg,
 };
 use crate::services::automation_candidate_contract::{
-    AutomationCandidateDiscriminator, MARKER_ENABLED_KEY, MARKER_LOOP_ENABLED_KEY,
-    MARKER_METADATA_KEY, PIPELINE_STAGE_ID, PROGRAM_ALLOWED_WRITE_PATHS_KEY,
-    PROGRAM_CURRENT_ITERATION_KEY, PROGRAM_DESCRIPTION_KEY, PROGRAM_FINAL_GATE_KEY,
-    PROGRAM_ITERATION_BUDGET_KEY, PROGRAM_METADATA_KEY, PROGRAM_METRIC_DIRECTION_KEY,
-    PROGRAM_METRIC_NAME_KEY, PROGRAM_METRIC_TARGET_KEY, PROGRAM_REPO_DIR_KEY, discriminator,
+    AutomationCandidateDiscriminator, MARKER_METADATA_KEY, PIPELINE_STAGE_ID,
+    PROGRAM_ALLOWED_WRITE_PATHS_KEY, PROGRAM_CURRENT_ITERATION_KEY, PROGRAM_DESCRIPTION_KEY,
+    PROGRAM_FINAL_GATE_KEY, PROGRAM_ITERATION_BUDGET_KEY, PROGRAM_METADATA_KEY,
+    PROGRAM_METRIC_DIRECTION_KEY, PROGRAM_METRIC_NAME_KEY, PROGRAM_METRIC_TARGET_KEY,
+    PROGRAM_REPO_DIR_KEY, discriminator,
 };
 use crate::services::git::{
     automation_branch_name, ensure_automation_worktree, find_automation_worktree,
@@ -76,7 +76,6 @@ pub struct MaterializeCandidateOutput {
     pub created: bool,
     pub status: String,
     pub pipeline_stage_id: &'static str,
-    pub loop_enabled: bool,
     pub start_ready: bool,
     pub discriminator: AutomationCandidateDiscriminator,
 }
@@ -237,7 +236,6 @@ impl AutomationCandidateMaterializer {
             created,
             status,
             pipeline_stage_id: PIPELINE_STAGE_ID,
-            loop_enabled: true,
             start_ready: input.start_ready,
             discriminator: discriminator(),
         })
@@ -342,11 +340,10 @@ impl AutomationCandidateMaterializer {
             }
             _ => {
                 // Discard: transition current card to review, create child ready card
-                let (parent_title, parent_metadata) =
-                    load_card_header_pg(&self.pool, card_id)
-                        .await
-                        .map_err(MaterializerError::Database)?
-                        .ok_or(MaterializerError::CardNotFound)?;
+                let (parent_title, parent_metadata) = load_card_header_pg(&self.pool, card_id)
+                    .await
+                    .map_err(MaterializerError::Database)?
+                    .ok_or(MaterializerError::CardNotFound)?;
 
                 // Best-effort worktree cleanup for the discarded iteration.
                 if let Some(repo_dir) = program
@@ -545,7 +542,11 @@ fn extract_allowed_write_paths(program: &serde_json::Value) -> Vec<String> {
     program
         .get("allowed_write_paths")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -606,14 +607,6 @@ fn normalize_candidate_metadata(
 
     let iteration_budget = input.program.iteration_budget.unwrap_or(3).clamp(1, 10);
     let mut marker = serde_json::Map::new();
-    marker.insert(
-        MARKER_ENABLED_KEY.to_string(),
-        serde_json::Value::Bool(true),
-    );
-    marker.insert(
-        MARKER_LOOP_ENABLED_KEY.to_string(),
-        serde_json::Value::Bool(true),
-    );
     marker.insert(
         "source".to_string(),
         serde_json::Value::String(input.source.as_deref().unwrap_or("user").to_string()),
@@ -791,14 +784,12 @@ mod allowed_path_tests {
         })
         .expect("valid metadata");
 
+        // pipeline_stage_id alone is the discriminator — no enabled/loop_enabled flags
         assert_eq!(
-            metadata["automation_candidate"]["enabled"],
-            serde_json::Value::Bool(true)
+            metadata["automation_candidate"]["source"],
+            "routine_recommender"
         );
-        assert_eq!(
-            metadata["automation_candidate"]["loop_enabled"],
-            serde_json::Value::Bool(true)
-        );
+        assert_eq!(metadata["automation_candidate"]["dedupe_key"], "pattern:1");
         assert_eq!(metadata["program"]["metric_direction"], "lower_is_better");
         assert_eq!(
             metadata["program"]["iteration_budget"],

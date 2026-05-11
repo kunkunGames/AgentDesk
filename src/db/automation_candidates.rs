@@ -343,13 +343,12 @@ pub async fn load_card_header_pg(
     pool: &PgPool,
     card_id: &str,
 ) -> Result<Option<(String, serde_json::Value)>, String> {
-    let row = sqlx::query(
-        "SELECT title, metadata::text AS metadata FROM kanban_cards WHERE id = $1",
-    )
-    .bind(card_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("load card header: {e}"))?;
+    let row =
+        sqlx::query("SELECT title, metadata::text AS metadata FROM kanban_cards WHERE id = $1")
+            .bind(card_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("load card header: {e}"))?;
 
     let Some(row) = row else { return Ok(None) };
     let title: String = row.try_get("title").unwrap_or_else(|_| card_id.to_string());

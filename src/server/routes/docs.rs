@@ -1734,7 +1734,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/automation-candidates",
             "automation-candidates",
-            "Create or upsert a loop-enabled automation candidate card. Cards enter the iteration loop only with pipeline_stage_id='automation-candidate', metadata.automation_candidate.enabled=true, metadata.automation_candidate.loop_enabled=true, and a complete metadata.program contract.",
+            "Create or upsert an automation candidate card. Cards enter the iteration loop when pipeline_stage_id='automation-candidate' and metadata.program contains repo_dir, allowed_write_paths, metric_name, and metric_target. pipeline_stage_id alone is the discriminator — no extra boolean flags required.",
         )
         .with_params([
             ("title", body_param("string", true, "Candidate card title")),
@@ -1772,11 +1772,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 "created": true,
                 "status": "backlog",
                 "pipeline_stage_id": "automation-candidate",
-                "loop_enabled": true,
                 "discriminator": {
                     "pipeline_stage_id": "automation-candidate",
-                    "metadata_enabled_path": "metadata.automation_candidate.enabled",
-                    "metadata_loop_enabled_path": "metadata.automation_candidate.loop_enabled",
                     "required_program_fields": ["repo_dir", "allowed_write_paths", "metric_name", "metric_target"]
                 }
             }),
@@ -2299,9 +2296,35 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/automation-candidates/{card_id}/iterations",
             "automation-candidates",
-            "List recorded automation candidate iterations for a card // TODO: example",
+            "List all iteration records for a card in chronological order.",
         )
-        .with_params([("card_id", path_param("Automation candidate card ID"))]),
+        .with_params([("card_id", path_param("Automation candidate card ID"))])
+        .with_example(
+            json!({}),
+            json!({
+                "iterations": [
+                    { "iteration": 1, "status": "keep", "metric_before": 0.4, "metric_after": 0.2, "description": "Reduced routing failure rate", "branch": "automation/card-1/iter-1" }
+                ]
+            }),
+        )
+        .with_curl("curl http://localhost:8787/api/automation-candidates/card-1/iterations"),
+        ep(
+            "GET",
+            "/api/automation-candidates/{card_id}/automation-inventory",
+            "automation-candidates",
+            "Return per-card iteration history wrapped with card_id, in the shape consumed by ctx.automationInventory[cardId] in the automation executor routine.",
+        )
+        .with_params([("card_id", path_param("Automation candidate card ID"))])
+        .with_example(
+            json!({}),
+            json!({
+                "card_id": "card-1",
+                "iterations": [
+                    { "iteration": 1, "status": "keep", "metric_before": 0.4, "metric_after": 0.2, "description": "Reduced routing failure rate", "branch": "automation/card-1/iter-1" }
+                ]
+            }),
+        )
+        .with_curl("curl http://localhost:8787/api/automation-candidates/card-1/automation-inventory"),
         ep(
             "POST",
             "/api/automation-candidates/{card_id}/approve",

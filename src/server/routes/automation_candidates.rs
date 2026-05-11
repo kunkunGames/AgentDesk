@@ -93,7 +93,6 @@ pub async fn materialize_candidate(
                     "created": output.created,
                     "status": output.status,
                     "pipeline_stage_id": output.pipeline_stage_id,
-                    "loop_enabled": output.loop_enabled,
                     "start_ready": output.start_ready,
                     "discriminator": output.discriminator,
                 })),
@@ -223,6 +222,36 @@ pub async fn approve_candidate(
 #[derive(serde::Deserialize)]
 pub struct PrepareWorktreeRequest {
     pub iteration: i32,
+}
+
+/// GET /api/automation-candidates/{card_id}/automation-inventory
+///
+/// Returns the per-card iteration history in the shape expected by
+/// `ctx.automationInventory[cardId]` in the automation executor routine.
+/// Each element contains `iteration`, `status`, `metric_before`, `metric_after`,
+/// and `description` fields that the executor prompt uses to summarise past work.
+pub async fn get_automation_inventory(
+    State(state): State<AppState>,
+    Path(card_id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable();
+    };
+
+    let materializer = AutomationCandidateMaterializer::new(pool.clone());
+    match materializer.list_iterations(&card_id).await {
+        Ok(records) => (
+            StatusCode::OK,
+            Json(json!({
+                "card_id": card_id,
+                "iterations": records,
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error})),
+        ),
+    }
 }
 
 /// POST /api/automation-candidates/{card_id}/prepare-worktree

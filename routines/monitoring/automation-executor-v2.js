@@ -19,7 +19,6 @@ const DISPATCHED_WINDOW_DAYS = 7;
 const CHECKPOINT_VERSION = 2;
 const AUTOMATION_CANDIDATE_CONTRACT = Object.freeze({
   pipelineStageId: "automation-candidate",
-  metadataKey: "automation_candidate",
   programKey: "program",
   requiredProgramFields: Object.freeze([
     "repo_dir",
@@ -84,12 +83,8 @@ function hasCompleteProgramContract(program) {
 }
 
 function isAutomationCandidateCard(obs) {
-  const meta = obs.metadata || {};
-  const marker = meta[AUTOMATION_CANDIDATE_CONTRACT.metadataKey] || {};
-  const program = meta[AUTOMATION_CANDIDATE_CONTRACT.programKey] || {};
+  const program = (obs.metadata || {})[AUTOMATION_CANDIDATE_CONTRACT.programKey] || {};
   return obs.pipeline_stage_id === AUTOMATION_CANDIDATE_CONTRACT.pipelineStageId
-    && marker.enabled === true
-    && marker.loop_enabled === true
     && hasCompleteProgramContract(program);
 }
 
