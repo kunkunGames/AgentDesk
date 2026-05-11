@@ -635,6 +635,7 @@ impl SupervisedWorkerRegistry {
     fn log_start(&self, spec: WorkerSpec) {
         tracing::info!(
             worker = spec.name,
+            target = spec.target,
             kind = spec.kind.as_doc_str(),
             stage = spec.start_stage.as_doc_str(),
             order = spec.start_order,
@@ -652,6 +653,7 @@ impl SupervisedWorkerRegistry {
     fn log_skip(&self, spec: WorkerSpec, reason: &str) {
         tracing::info!(
             worker = spec.name,
+            target = spec.target,
             stage = spec.start_stage.as_doc_str(),
             execution_scope = spec.execution_scope.as_doc_str(),
             reason,
