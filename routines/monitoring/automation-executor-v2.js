@@ -17,6 +17,17 @@ const DISPATCH_RETRY_MS = 30 * 60 * 1000;
 const MAX_DISPATCH_RETRIES = 3;
 const DISPATCHED_WINDOW_DAYS = 7;
 const CHECKPOINT_VERSION = 2;
+const AUTOMATION_CANDIDATE_CONTRACT = Object.freeze({
+  pipelineStageId: "automation-candidate",
+  metadataKey: "automation_candidate",
+  programKey: "program",
+  requiredProgramFields: Object.freeze([
+    "repo_dir",
+    "allowed_write_paths",
+    "metric_name",
+    "metric_target",
+  ]),
+});
 
 // --- Checkpoint helpers ---
 
@@ -59,20 +70,27 @@ function pruneDispatched(cp, nowStr) {
   }
 }
 
+function hasCompleteProgramContract(program) {
+  const [repoDirField, allowedPathsField, metricNameField, metricTargetField] =
+    AUTOMATION_CANDIDATE_CONTRACT.requiredProgramFields;
+  return typeof program[repoDirField] === "string"
+    && program[repoDirField].trim().length > 0
+    && Array.isArray(program[allowedPathsField])
+    && program[allowedPathsField].length > 0
+    && program[allowedPathsField].every((path) => typeof path === "string" && path.trim().length > 0)
+    && typeof program[metricNameField] === "string"
+    && program[metricNameField].trim().length > 0
+    && program[metricTargetField] != null;
+}
+
 function isAutomationCandidateCard(obs) {
   const meta = obs.metadata || {};
-  const marker = meta.automation_candidate || {};
-  const program = meta.program || {};
-  return marker.enabled === true
+  const marker = meta[AUTOMATION_CANDIDATE_CONTRACT.metadataKey] || {};
+  const program = meta[AUTOMATION_CANDIDATE_CONTRACT.programKey] || {};
+  return obs.pipeline_stage_id === AUTOMATION_CANDIDATE_CONTRACT.pipelineStageId
+    && marker.enabled === true
     && marker.loop_enabled === true
-    && typeof program.repo_dir === "string"
-    && program.repo_dir.trim().length > 0
-    && Array.isArray(program.allowed_write_paths)
-    && program.allowed_write_paths.length > 0
-    && program.allowed_write_paths.every((path) => typeof path === "string" && path.trim().length > 0)
-    && typeof program.metric_name === "string"
-    && program.metric_name.trim().length > 0
-    && program.metric_target != null;
+    && hasCompleteProgramContract(program);
 }
 
 function candidateIterationBudget(program) {

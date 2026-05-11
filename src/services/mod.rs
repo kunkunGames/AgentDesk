@@ -4,6 +4,7 @@ pub mod agents;
 pub mod analytics;
 pub mod api_friction;
 pub mod auto_queue;
+pub mod automation_candidate_contract;
 pub mod automation_candidate_materializer;
 pub mod claude;
 pub mod cluster;

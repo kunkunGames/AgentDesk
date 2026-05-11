@@ -10,6 +10,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::services::automation_candidate_contract::{
+    PIPELINE_STAGE_ID, has_complete_loop_contract,
+};
 use crate::utils::api::clamp_api_limit;
 
 pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
@@ -1030,16 +1033,17 @@ impl RoutineStore {
                        AS stuck_hours
             FROM kanban_cards
             WHERE status NOT IN ('done', 'cancelled', 'archived', 'detached')
-              AND (pipeline_stage_id IS NULL OR pipeline_stage_id != 'automation-candidate')
+              AND (pipeline_stage_id IS NULL OR pipeline_stage_id != $1)
               AND GREATEST(updated_at, created_at) < NOW() - INTERVAL '24 hours'
               AND (
                     blocked_reason IS NOT NULL
                     OR GREATEST(updated_at, created_at) < NOW() - INTERVAL '48 hours'
                   )
             ORDER BY GREATEST(updated_at, created_at) ASC
-            LIMIT $1
+            LIMIT $2
             "#,
         )
+        .bind(PIPELINE_STAGE_ID)
         .bind(CAP_KANBAN)
         .fetch_all(&*self.pool)
         .await
@@ -1229,7 +1233,7 @@ impl RoutineStore {
                    updated_at
             FROM kanban_cards
             WHERE status = 'ready'
-              AND pipeline_stage_id = 'automation-candidate'
+              AND pipeline_stage_id = $1
               AND metadata->'automation_candidate'->>'enabled' = 'true'
               AND metadata->'automation_candidate'->>'loop_enabled' = 'true'
               AND NULLIF(metadata->'program'->>'repo_dir', '') IS NOT NULL
@@ -1241,6 +1245,7 @@ impl RoutineStore {
             LIMIT 20
             "#,
         )
+        .bind(PIPELINE_STAGE_ID)
         .fetch_all(&*self.pool)
         .await
         {
@@ -1261,10 +1266,14 @@ impl RoutineStore {
             let metadata: serde_json::Value = row
                 .try_get::<serde_json::Value, _>("metadata")
                 .unwrap_or(serde_json::Value::Null);
+            if !has_complete_loop_contract(&metadata) {
+                continue;
+            }
             kanban_ready_obs.push(serde_json::json!({
                 "timestamp": updated_at.to_rfc3339(),
                 "source": "kanban_ready",
                 "category": "automation-candidate",
+                "pipeline_stage_id": PIPELINE_STAGE_ID,
                 "signature": format!("kanban-ready:{card_id}"),
                 "summary": format!("automation candidate ready: {} (agent={})", truncate_chars(&title, 100), assigned),
                 "weight": 3,
@@ -1280,10 +1289,11 @@ impl RoutineStore {
             r#"
             SELECT id,
                    COALESCE(NULLIF(TRIM(title), ''), id) AS title,
+                   metadata,
                    updated_at
             FROM kanban_cards
             WHERE status = 'done'
-              AND pipeline_stage_id = 'automation-candidate'
+              AND pipeline_stage_id = $1
               AND metadata->'automation_candidate'->>'enabled' = 'true'
               AND metadata->'automation_candidate'->>'loop_enabled' = 'true'
               AND updated_at > NOW() - INTERVAL '7 days'
@@ -1291,6 +1301,7 @@ impl RoutineStore {
             LIMIT 20
             "#,
         )
+        .bind(PIPELINE_STAGE_ID)
         .fetch_all(&*self.pool)
         .await
         {
@@ -1307,10 +1318,17 @@ impl RoutineStore {
             let title: String = row.try_get("title").unwrap_or_default();
             let updated_at: DateTime<Utc> =
                 row.try_get("updated_at").unwrap_or_else(|_| Utc::now());
+            let metadata: serde_json::Value = row
+                .try_get::<serde_json::Value, _>("metadata")
+                .unwrap_or(serde_json::Value::Null);
+            if !has_complete_loop_contract(&metadata) {
+                continue;
+            }
             kanban_dispatched_obs.push(serde_json::json!({
                 "timestamp": updated_at.to_rfc3339(),
                 "source": "kanban_dispatched",
                 "category": "automation-candidate",
+                "pipeline_stage_id": PIPELINE_STAGE_ID,
                 "signature": format!("kanban-dispatched:{card_id}"),
                 "summary": format!("automation candidate dispatched: {}", truncate_chars(&title, 120)),
                 "weight": 1,

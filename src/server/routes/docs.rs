@@ -1734,7 +1734,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/automation-candidates",
             "automation-candidates",
-            "Create or upsert a loop-enabled automation candidate card. Cards enter the iteration loop only with pipeline_stage_id='automation-candidate', metadata.automation_candidate.enabled=true, and a complete metadata.program contract.",
+            "Create or upsert a loop-enabled automation candidate card. Cards enter the iteration loop only with pipeline_stage_id='automation-candidate', metadata.automation_candidate.enabled=true, metadata.automation_candidate.loop_enabled=true, and a complete metadata.program contract.",
         )
         .with_params([
             ("title", body_param("string", true, "Candidate card title")),
@@ -1776,6 +1776,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 "discriminator": {
                     "pipeline_stage_id": "automation-candidate",
                     "metadata_enabled_path": "metadata.automation_candidate.enabled",
+                    "metadata_loop_enabled_path": "metadata.automation_candidate.loop_enabled",
                     "required_program_fields": ["repo_dir", "allowed_write_paths", "metric_name", "metric_target"]
                 }
             }),

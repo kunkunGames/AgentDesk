@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
+use crate::services::automation_candidate_contract::PIPELINE_STAGE_ID;
+
 const MAX_ITERATIONS: i32 = 10;
 
 #[derive(Debug, Clone)]
@@ -356,12 +358,13 @@ pub async fn materialize_candidate_card_pg(
             r#"
             SELECT id
             FROM kanban_cards
-            WHERE pipeline_stage_id = 'automation-candidate'
-              AND metadata->'automation_candidate'->>'dedupe_key' = $1
+            WHERE pipeline_stage_id = $1
+              AND metadata->'automation_candidate'->>'dedupe_key' = $2
             ORDER BY updated_at DESC
             LIMIT 1
             "#,
         )
+        .bind(PIPELINE_STAGE_ID)
         .bind(dedupe_key)
         .fetch_optional(pool)
         .await
@@ -390,9 +393,9 @@ pub async fn materialize_candidate_card_pg(
                        description = COALESCE($5, description),
                        metadata = CAST($6 AS jsonb),
                        status = CASE WHEN $7 THEN 'ready' ELSE status END,
-                       pipeline_stage_id = 'automation-candidate',
+                       pipeline_stage_id = $8,
                        updated_at = NOW()
-                 WHERE id = $8
+                 WHERE id = $9
                 "#,
             )
             .bind(&params.title)
@@ -402,6 +405,7 @@ pub async fn materialize_candidate_card_pg(
             .bind(params.description.as_deref())
             .bind(&params.metadata_json)
             .bind(params.start_ready)
+            .bind(PIPELINE_STAGE_ID)
             .bind(&card_id)
             .execute(pool)
             .await
@@ -425,7 +429,7 @@ pub async fn materialize_candidate_card_pg(
         ) VALUES (
             $1, $2, $3, $4, COALESCE($5, 'medium'),
             $6, $7, CAST($8 AS jsonb),
-            'automation-candidate', NOW(), NOW()
+            $9, NOW(), NOW()
         )
         "#,
     )
@@ -437,6 +441,7 @@ pub async fn materialize_candidate_card_pg(
     .bind(params.assigned_agent_id.as_deref())
     .bind(params.description.as_deref())
     .bind(&params.metadata_json)
+    .bind(PIPELINE_STAGE_ID)
     .execute(pool)
     .await
     .map_err(|error| format!("insert automation candidate card: {error}"))?;
@@ -558,11 +563,12 @@ pub async fn update_card_program_current_iteration_pg(
                ),
                updated_at = NOW()
          WHERE id = $2
-           AND pipeline_stage_id = 'automation-candidate'
+           AND pipeline_stage_id = $3
         "#,
     )
     .bind(current_iteration)
     .bind(card_id)
+    .bind(PIPELINE_STAGE_ID)
     .execute(pool)
     .await
     .map_err(|error| {
@@ -605,13 +611,14 @@ pub async fn create_child_candidate_card_pg(
             metadata, created_at, updated_at
         ) VALUES (
             $1, $2, 'ready', 'medium',
-            'automation-candidate', $3,
-            CAST($4 AS jsonb), NOW(), NOW()
+            $3, $4,
+            CAST($5 AS jsonb), NOW(), NOW()
         )
         "#,
     )
     .bind(&child_id)
     .bind(&child_title)
+    .bind(PIPELINE_STAGE_ID)
     .bind(parent_card_id)
     .bind(&child_meta_json)
     .execute(pool)
@@ -662,9 +669,10 @@ pub async fn approve_candidate_card_pg(pool: &PgPool, card_id: &str) -> Result<(
            SET review_status = 'approved',
                updated_at    = NOW()
            WHERE id = $1
-             AND pipeline_stage_id = 'automation-candidate'"#,
+             AND pipeline_stage_id = $2"#,
     )
     .bind(card_id)
+    .bind(PIPELINE_STAGE_ID)
     .execute(pool)
     .await
     .map_err(|error| format!("approve candidate card: {error}"))?;

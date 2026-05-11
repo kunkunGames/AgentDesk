@@ -577,6 +577,7 @@ src/
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
 │   ├── auto_queue.rs
+│   ├── automation_candidate_contract.rs
 │   ├── automation_candidate_materializer.rs
 │   ├── claude.rs
 │   ├── codex.rs

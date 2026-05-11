@@ -13,10 +13,17 @@ const MAX_DISPATCH_RETRIES = 3;
 function makeReadyObs(cardId, overrides = {}) {
   return {
     source: "kanban_ready",
+    pipeline_stage_id: overrides.pipeline_stage_id ?? "automation-candidate",
     card_id: cardId,
     summary: overrides.summary || `Test card ${cardId}`,
     metadata: {
+      automation_candidate: {
+        enabled: overrides.enabled ?? true,
+        loop_enabled: overrides.loop_enabled ?? true,
+        ...(overrides.automation_candidate || {}),
+      },
       program: {
+        repo_dir: overrides.repo_dir || "/tmp/repo",
         description: overrides.description || "Fix something",
         allowed_write_paths: overrides.allowed_write_paths || ["src/"],
         metric_name: overrides.metric_name || "score",
@@ -46,6 +53,34 @@ test("no ready observations → complete with no-candidates summary", () => {
   assert.ok(r.result.summary.includes("없음"), `summary should mention no candidates: ${r.result.summary}`);
   assert.equal(r.checkpoint.stats.ticks, 1);
   assert.equal(r.checkpoint.stats.dispatched, 0);
+});
+
+test("general kanban ready card without automation discriminator is skipped", () => {
+  const { tick } = loadRoutine(ROUTINE_PATH);
+  const obs = [makeReadyObs("card-general", {
+    pipeline_stage_id: null,
+    automation_candidate: null,
+  })];
+  delete obs[0].pipeline_stage_id;
+  delete obs[0].metadata.automation_candidate;
+
+  const r = tick({ now: BASE_NOW, checkpoint: null, observations: obs, automationInventory: [] });
+
+  assert.equal(r.action, "complete");
+  assert.equal(r.checkpoint.stats.dispatched, 0);
+  assert.equal(r.checkpoint.stats.skipped, 1);
+});
+
+test("automation candidate marker without complete program is skipped", () => {
+  const { tick } = loadRoutine(ROUTINE_PATH);
+  const obs = [makeReadyObs("card-incomplete-program")];
+  delete obs[0].metadata.program.repo_dir;
+
+  const r = tick({ now: BASE_NOW, checkpoint: null, observations: obs, automationInventory: [] });
+
+  assert.equal(r.action, "complete");
+  assert.equal(r.checkpoint.stats.dispatched, 0);
+  assert.equal(r.checkpoint.stats.skipped, 1);
 });
 
 // --- Single ready card dispatch ---

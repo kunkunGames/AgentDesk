@@ -10,6 +10,13 @@ use crate::db::automation_candidates::{
     load_card_repo_dir_pg, materialize_candidate_card_pg, transition_card_status_pg,
     update_card_program_current_iteration_pg,
 };
+use crate::services::automation_candidate_contract::{
+    AutomationCandidateDiscriminator, MARKER_ENABLED_KEY, MARKER_LOOP_ENABLED_KEY,
+    MARKER_METADATA_KEY, PIPELINE_STAGE_ID, PROGRAM_ALLOWED_WRITE_PATHS_KEY,
+    PROGRAM_CURRENT_ITERATION_KEY, PROGRAM_DESCRIPTION_KEY, PROGRAM_FINAL_GATE_KEY,
+    PROGRAM_ITERATION_BUDGET_KEY, PROGRAM_METADATA_KEY, PROGRAM_METRIC_DIRECTION_KEY,
+    PROGRAM_METRIC_NAME_KEY, PROGRAM_METRIC_TARGET_KEY, PROGRAM_REPO_DIR_KEY, discriminator,
+};
 use crate::services::git::{
     automation_branch_name, ensure_automation_worktree, find_automation_worktree,
     remove_automation_worktree,
@@ -72,13 +79,6 @@ pub struct MaterializeCandidateOutput {
     pub loop_enabled: bool,
     pub start_ready: bool,
     pub discriminator: AutomationCandidateDiscriminator,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AutomationCandidateDiscriminator {
-    pub pipeline_stage_id: &'static str,
-    pub metadata_enabled_path: &'static str,
-    pub required_program_fields: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -236,10 +236,10 @@ impl AutomationCandidateMaterializer {
             card_id,
             created,
             status,
-            pipeline_stage_id: "automation-candidate",
+            pipeline_stage_id: PIPELINE_STAGE_ID,
             loop_enabled: true,
             start_ready: input.start_ready,
-            discriminator: automation_candidate_discriminator(),
+            discriminator: discriminator(),
         })
     }
 
@@ -639,25 +639,83 @@ fn normalize_candidate_metadata(
     };
 
     let iteration_budget = input.program.iteration_budget.unwrap_or(3).clamp(1, 10);
-    Ok(serde_json::json!({
-        "automation_candidate": {
-            "enabled": true,
-            "loop_enabled": true,
-            "source": input.source.as_deref().unwrap_or("user"),
-            "dedupe_key": input.dedupe_key.as_deref().unwrap_or(""),
-        },
-        "program": {
-            "repo_dir": repo_dir,
-            "allowed_write_paths": allowed_write_paths,
-            "metric_name": metric_name,
-            "metric_target": input.program.metric_target,
-            "metric_direction": metric_direction,
-            "final_gate": final_gate,
-            "iteration_budget": iteration_budget,
-            "current_iteration": 0,
-            "description": input.description.as_deref().unwrap_or(input.title.as_str()),
-        },
-    }))
+    let mut marker = serde_json::Map::new();
+    marker.insert(
+        MARKER_ENABLED_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    marker.insert(
+        MARKER_LOOP_ENABLED_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    marker.insert(
+        "source".to_string(),
+        serde_json::Value::String(input.source.as_deref().unwrap_or("user").to_string()),
+    );
+    marker.insert(
+        "dedupe_key".to_string(),
+        serde_json::Value::String(input.dedupe_key.as_deref().unwrap_or("").to_string()),
+    );
+
+    let mut program = serde_json::Map::new();
+    program.insert(
+        PROGRAM_REPO_DIR_KEY.to_string(),
+        serde_json::Value::String(repo_dir.to_string()),
+    );
+    program.insert(
+        PROGRAM_ALLOWED_WRITE_PATHS_KEY.to_string(),
+        serde_json::Value::Array(
+            allowed_write_paths
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    program.insert(
+        PROGRAM_METRIC_NAME_KEY.to_string(),
+        serde_json::Value::String(metric_name.to_string()),
+    );
+    program.insert(
+        PROGRAM_METRIC_TARGET_KEY.to_string(),
+        serde_json::json!(input.program.metric_target),
+    );
+    program.insert(
+        PROGRAM_METRIC_DIRECTION_KEY.to_string(),
+        serde_json::Value::String(metric_direction.to_string()),
+    );
+    program.insert(
+        PROGRAM_FINAL_GATE_KEY.to_string(),
+        serde_json::Value::String(final_gate.to_string()),
+    );
+    program.insert(
+        PROGRAM_ITERATION_BUDGET_KEY.to_string(),
+        serde_json::json!(iteration_budget),
+    );
+    program.insert(
+        PROGRAM_CURRENT_ITERATION_KEY.to_string(),
+        serde_json::json!(0),
+    );
+    program.insert(
+        PROGRAM_DESCRIPTION_KEY.to_string(),
+        serde_json::Value::String(
+            input
+                .description
+                .as_deref()
+                .unwrap_or(input.title.as_str())
+                .to_string(),
+        ),
+    );
+
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        MARKER_METADATA_KEY.to_string(),
+        serde_json::Value::Object(marker),
+    );
+    metadata.insert(
+        PROGRAM_METADATA_KEY.to_string(),
+        serde_json::Value::Object(program),
+    );
+    Ok(serde_json::Value::Object(metadata))
 }
 
 fn normalize_allowed_paths(paths: &[String]) -> Result<Vec<String>, MaterializerError> {
@@ -683,22 +741,6 @@ fn normalize_allowed_paths(paths: &[String]) -> Result<Vec<String>, Materializer
         ));
     }
     Ok(normalized)
-}
-
-fn automation_candidate_discriminator() -> AutomationCandidateDiscriminator {
-    AutomationCandidateDiscriminator {
-        pipeline_stage_id: "automation-candidate",
-        metadata_enabled_path: "metadata.automation_candidate.enabled",
-        required_program_fields: vec![
-            "repo_dir",
-            "allowed_write_paths",
-            "metric_name",
-            "metric_target",
-            "metric_direction",
-            "final_gate",
-            "iteration_budget",
-        ],
-    }
 }
 
 fn is_final_program_iteration(iteration: i32, program: &serde_json::Value) -> bool {
