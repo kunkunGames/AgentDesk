@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod automation_candidates;
 pub mod auto_queue;
 pub mod cancel_tombstones;
 pub mod dispatch_semaphores;

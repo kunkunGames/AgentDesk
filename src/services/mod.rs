@@ -1,5 +1,6 @@
 pub mod agent_protocol;
 pub mod agent_quality;
+pub mod automation_candidate_materializer;
 pub mod agents;
 pub mod analytics;
 pub mod api_friction;

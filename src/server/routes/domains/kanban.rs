@@ -3,7 +3,10 @@ use axum::{
     routing::{get, patch, post},
 };
 
-use super::super::{ApiRouter, AppState, kanban, kanban_repos, protected_api_domain, resume};
+use super::super::{
+    ApiRouter, AppState, automation_candidates, kanban, kanban_repos, protected_api_domain,
+    resume,
+};
 
 // Category: kanban
 
@@ -55,7 +58,19 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/kanban-repos/{owner}/{repo}",
                 patch(kanban_repos::update_repo).delete(kanban_repos::delete_repo),
             )
-            .route("/pm-decision", post(kanban::pm_decision)),
+            .route("/pm-decision", post(kanban::pm_decision))
+            .route(
+                "/automation-candidates/{card_id}/iteration-result",
+                post(automation_candidates::submit_iteration_result),
+            )
+            .route(
+                "/automation-candidates/{card_id}/iterations",
+                get(automation_candidates::list_iterations),
+            )
+            .route(
+                "/automation-candidates/{card_id}/approve",
+                post(automation_candidates::approve_candidate),
+            ),
         state,
     )
 }

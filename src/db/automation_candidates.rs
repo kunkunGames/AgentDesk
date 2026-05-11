@@ -1,0 +1,291 @@
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Row};
+
+const MAX_ITERATIONS: i32 = 10;
+
+#[derive(Debug, Clone)]
+pub struct IterationRecord {
+    pub id: String,
+    pub card_id: String,
+    pub iteration: i32,
+    pub branch: String,
+    pub commit_hash: Option<String>,
+    pub metric_before: Option<f64>,
+    pub metric_after: Option<f64>,
+    pub is_simplification: bool,
+    pub status: String,
+    pub description: Option<String>,
+    pub allowed_write_paths_used: Vec<String>,
+    pub run_seconds: Option<i32>,
+    pub crash_trace: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertIterationParams {
+    pub card_id: String,
+    pub iteration: i32,
+    pub branch: String,
+    pub commit_hash: Option<String>,
+    pub metric_before: Option<f64>,
+    pub metric_after: Option<f64>,
+    pub is_simplification: bool,
+    pub status: String,
+    pub description: Option<String>,
+    pub allowed_write_paths_used: Vec<String>,
+    pub run_seconds: Option<i32>,
+    pub crash_trace: Option<String>,
+}
+
+/// Deterministically compute keep/discard from metrics.
+/// Rules (in order):
+///  1. `crashed` / `timeout` → status is already set by caller, returned as-is.
+///  2. `is_simplification=true` → keep (simplification always wins).
+///  3. `metric_after >= metric_before` (or before is null) → keep.
+///  4. Otherwise → discard.
+pub fn compute_verdict(
+    metric_before: Option<f64>,
+    metric_after: Option<f64>,
+    is_simplification: bool,
+    caller_status: &str,
+) -> &'static str {
+    if matches!(caller_status, "crashed" | "timeout") {
+        return "discard";
+    }
+    if is_simplification {
+        return "keep";
+    }
+    match (metric_before, metric_after) {
+        (Some(before), Some(after)) if after < before => "discard",
+        _ => "keep",
+    }
+}
+
+pub fn is_final_iteration(iteration: i32) -> bool {
+    iteration >= MAX_ITERATIONS
+}
+
+pub async fn insert_iteration_pg(
+    pool: &PgPool,
+    params: InsertIterationParams,
+) -> Result<IterationRecord, String> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO automation_candidate_iterations (
+            card_id, iteration, branch, commit_hash,
+            metric_before, metric_after, is_simplification,
+            status, description, allowed_write_paths_used,
+            run_seconds, crash_trace
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING id, card_id, iteration, branch, commit_hash,
+                  metric_before, metric_after, is_simplification,
+                  status, description, allowed_write_paths_used,
+                  run_seconds, crash_trace, created_at
+        "#,
+    )
+    .bind(&params.card_id)
+    .bind(params.iteration)
+    .bind(&params.branch)
+    .bind(params.commit_hash.as_deref())
+    .bind(params.metric_before)
+    .bind(params.metric_after)
+    .bind(params.is_simplification)
+    .bind(&params.status)
+    .bind(params.description.as_deref())
+    .bind(&params.allowed_write_paths_used)
+    .bind(params.run_seconds)
+    .bind(params.crash_trace.as_deref())
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("insert iteration: {error}"))?;
+
+    row_to_record(&row)
+}
+
+pub async fn list_iterations_for_card_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> Result<Vec<IterationRecord>, String> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, card_id, iteration, branch, commit_hash,
+               metric_before, metric_after, is_simplification,
+               status, description, allowed_write_paths_used,
+               run_seconds, crash_trace, created_at
+        FROM automation_candidate_iterations
+        WHERE card_id = $1
+        ORDER BY iteration ASC
+        "#,
+    )
+    .bind(card_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| format!("list iterations: {error}"))?;
+
+    rows.iter().map(|row| row_to_record(row)).collect()
+}
+
+pub async fn iteration_count_for_card_pg(pool: &PgPool, card_id: &str) -> Result<i64, String> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM automation_candidate_iterations WHERE card_id = $1",
+    )
+    .bind(card_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| format!("count iterations: {error}"))
+}
+
+fn row_to_record(row: &sqlx::postgres::PgRow) -> Result<IterationRecord, String> {
+    Ok(IterationRecord {
+        id: row
+            .try_get("id")
+            .map_err(|error| format!("decode id: {error}"))?,
+        card_id: row
+            .try_get("card_id")
+            .map_err(|error| format!("decode card_id: {error}"))?,
+        iteration: row
+            .try_get("iteration")
+            .map_err(|error| format!("decode iteration: {error}"))?,
+        branch: row
+            .try_get("branch")
+            .map_err(|error| format!("decode branch: {error}"))?,
+        commit_hash: row
+            .try_get("commit_hash")
+            .map_err(|error| format!("decode commit_hash: {error}"))?,
+        metric_before: row
+            .try_get("metric_before")
+            .map_err(|error| format!("decode metric_before: {error}"))?,
+        metric_after: row
+            .try_get("metric_after")
+            .map_err(|error| format!("decode metric_after: {error}"))?,
+        is_simplification: row
+            .try_get("is_simplification")
+            .map_err(|error| format!("decode is_simplification: {error}"))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| format!("decode status: {error}"))?,
+        description: row
+            .try_get("description")
+            .map_err(|error| format!("decode description: {error}"))?,
+        allowed_write_paths_used: row
+            .try_get::<Vec<String>, _>("allowed_write_paths_used")
+            .unwrap_or_default(),
+        run_seconds: row
+            .try_get("run_seconds")
+            .map_err(|error| format!("decode run_seconds: {error}"))?,
+        crash_trace: row
+            .try_get("crash_trace")
+            .map_err(|error| format!("decode crash_trace: {error}"))?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|error| format!("decode created_at: {error}"))?,
+    })
+}
+
+/// Load the card's metadata JSON and extract the program contract.
+pub async fn load_card_program_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let metadata_raw: Option<String> = sqlx::query_scalar(
+        "SELECT metadata::text FROM kanban_cards WHERE id = $1",
+    )
+    .bind(card_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("load card metadata: {error}"))?
+    .flatten();
+
+    let program = metadata_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|meta| meta.get("program").cloned());
+
+    Ok(program)
+}
+
+/// Transition the card to a new status.
+pub async fn transition_card_status_pg(
+    pool: &PgPool,
+    card_id: &str,
+    new_status: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE kanban_cards SET status = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(new_status)
+    .bind(card_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("transition card {card_id} to {new_status}: {error}"))?;
+    Ok(())
+}
+
+/// Create a child card for the next iteration of an automation candidate.
+pub async fn create_child_candidate_card_pg(
+    pool: &PgPool,
+    parent_card_id: &str,
+    parent_title: &str,
+    iteration: i32,
+    parent_metadata: &serde_json::Value,
+) -> Result<String, String> {
+    let child_id = uuid::Uuid::new_v4().to_string();
+    let child_title = format!("{parent_title} [iter {iteration}]");
+
+    let mut child_meta = parent_metadata.clone();
+    if let Some(program) = child_meta.get_mut("program") {
+        if let Some(obj) = program.as_object_mut() {
+            obj.insert(
+                "current_iteration".to_string(),
+                serde_json::Value::Number((iteration - 1).into()),
+            );
+        }
+    }
+    child_meta["parent_iteration"] = serde_json::Value::Number((iteration - 1).into());
+    child_meta["iteration"] = serde_json::Value::Number(iteration.into());
+
+    let child_meta_json = serde_json::to_string(&child_meta)
+        .map_err(|error| format!("serialize child metadata: {error}"))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO kanban_cards (
+            id, title, status, priority,
+            pipeline_stage_id, parent_card_id,
+            metadata, created_at, updated_at
+        ) VALUES (
+            $1, $2, 'ready', 'medium',
+            'automation-candidate', $3,
+            CAST($4 AS jsonb), NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(&child_id)
+    .bind(&child_title)
+    .bind(parent_card_id)
+    .bind(&child_meta_json)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("create child card: {error}"))?;
+
+    Ok(child_id)
+}
+
+/// Approve a card for final application (manual_review gate).
+pub async fn approve_candidate_card_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> Result<(), String> {
+    sqlx::query(
+        r#"UPDATE kanban_cards
+           SET review_status = 'approved',
+               updated_at    = NOW()
+           WHERE id = $1
+             AND pipeline_stage_id = 'automation-candidate'"#,
+    )
+    .bind(card_id)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("approve candidate card: {error}"))?;
+    Ok(())
+}
