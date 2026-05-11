@@ -59,6 +59,28 @@ function pruneDispatched(cp, nowStr) {
   }
 }
 
+function isAutomationCandidateCard(obs) {
+  const meta = obs.metadata || {};
+  const marker = meta.automation_candidate || {};
+  const program = meta.program || {};
+  return marker.enabled === true
+    && marker.loop_enabled === true
+    && typeof program.repo_dir === "string"
+    && program.repo_dir.trim().length > 0
+    && Array.isArray(program.allowed_write_paths)
+    && program.allowed_write_paths.length > 0
+    && program.allowed_write_paths.every((path) => typeof path === "string" && path.trim().length > 0)
+    && typeof program.metric_name === "string"
+    && program.metric_name.trim().length > 0
+    && program.metric_target != null;
+}
+
+function candidateIterationBudget(program) {
+  const value = Number(program.iteration_budget || MAX_ITERATIONS);
+  if (!Number.isFinite(value)) return MAX_ITERATIONS;
+  return Math.max(1, Math.min(MAX_ITERATIONS, Math.floor(value)));
+}
+
 // --- Build executor prompt (autoresearch-style: program contract + previous findings) ---
 
 function buildIterationPrompt(cardId, card, iteration, previousIterations) {
@@ -67,7 +89,7 @@ function buildIterationPrompt(cardId, card, iteration, previousIterations) {
   const metricName   = program.metric_name || "improvement_score";
   const metricDirection = program.metric_direction || program.direction || "lower_is_better";
   const metricTarget = program.metric_target != null ? String(program.metric_target) : "(not specified)";
-  const iterBudget   = program.iteration_budget || MAX_ITERATIONS;
+  const iterBudget   = candidateIterationBudget(program);
   const description  = program.description || card.title || "(no description)";
 
   const prevSummary = previousIterations.length === 0
@@ -148,6 +170,11 @@ agentdesk.routines.register({
     // Collect kanban_ready candidates (source 8 in store.rs)
     const readyCards = observations
       .filter((o) => o.source === "kanban_ready")
+      .filter((o) => {
+        const valid = isAutomationCandidateCard(o);
+        if (!valid) cp.stats.skipped++;
+        return valid;
+      })
       .map((o) => ({ cardId: o.card_id || o.evidence_ref?.replace("kanban_cards:", ""), obs: o }))
       .filter((c) => c.cardId);
 
@@ -178,6 +205,7 @@ agentdesk.routines.register({
       }
       const meta = obs.metadata || {};
       const program = meta.program || {};
+      const maxIterations = candidateIterationBudget(program);
       const iteration = (program.current_iteration || 0) + 1;
       const pending = cp.pending[cardId];
       const pendingIteration = Number.isFinite(Number(pending?.iteration))
@@ -194,7 +222,7 @@ agentdesk.routines.register({
         continue;
       }
 
-      if (iteration > MAX_ITERATIONS) {
+      if (iteration > maxIterations) {
         cp.stats.max_iterations_reached++;
         cp.dispatched[cardId] = { dispatched_at: nowStr, status: "max_iterations_reached", iteration };
         continue;

@@ -733,6 +733,7 @@ function markRecommended(cp, escalation, nowStr) {
   candidate.expected_side_effects = assessment.expectedSideEffects;
   candidate.verification_method = assessment.verificationMethod;
   candidate.gated_handoff = assessment.gatedHandoff;
+  candidate.materialize_request = assessment.materializeRequest;
   candidate.decision_summary = decisionSummary;
   candidate.top_evidence = topEvidenceForCandidate(candidate, 3);
   candidate.top_evidence_summary = topEvidenceSummary;
@@ -748,6 +749,7 @@ function markRecommended(cp, escalation, nowStr) {
     outcome_summary: assessment.outcomeSummary,
     decision_summary: decisionSummary,
     top_evidence_summary: topEvidenceSummary,
+    materialize_request: assessment.materializeRequest,
   });
   // Keep recommendations list bounded
   if (cp.recommendations.length > 50) {
@@ -832,6 +834,7 @@ function candidateAssessment(patternId, candidate) {
     ? "rule"
     : "agent";
   const title = patternId.replace(/\s+/g, " ").slice(0, 96);
+  const allowedWritePaths = candidateProgramAllowedPaths(profile.files);
   return {
     suggestedAutomation: profile.suggestedAutomation,
     recommendedExecution,
@@ -860,7 +863,50 @@ function candidateAssessment(patternId, candidate) {
       },
       side_effects: "사람이 게이트된 핸드오프를 명시적으로 승인하기 전까지는 없음",
     },
+    materializeRequest: {
+      endpoint: "POST /api/automation-candidates",
+      body: {
+        title: `[automation-candidate] ${title}`,
+        source: "routine_recommender",
+        dedupe_key: patternId,
+        start_ready: false,
+        program: {
+          repo_dir: "<required: absolute repo path>",
+          allowed_write_paths: allowedWritePaths,
+          metric_name: candidateMetricName(category),
+          metric_target: 0,
+          metric_direction: "lower_is_better",
+          final_gate: "manual_review",
+          iteration_budget: 3,
+        },
+      },
+      needs_human_fields: ["program.repo_dir"],
+    },
   };
+}
+
+function candidateProgramAllowedPaths(files) {
+  const out = [];
+  for (const file of files || []) {
+    let path = String(file || "").trim();
+    if (!path || path.startsWith("/") || path.includes("..")) continue;
+    const star = path.indexOf("*");
+    if (star >= 0) path = path.slice(0, star);
+    path = path.replace(/\/+$/, "");
+    if (!path) continue;
+    if (!out.includes(path)) out.push(path);
+  }
+  return out.length ? out : ["src"];
+}
+
+function candidateMetricName(category) {
+  return {
+    "routine-candidate": "manual_routine_touch_count",
+    "release-freshness": "release_drift_count",
+    "outbox-delivery": "outbox_delivery_failure_count",
+    "memento-hygiene": "memento_hygiene_issue_count",
+    "api-friction": "api_friction_count",
+  }[category] || "automation_friction_count";
 }
 
 function candidateDecisionSummary(patternId, candidate, assessment) {
@@ -903,6 +949,7 @@ function buildPrompt(escalation) {
     verificationMethod,
     outcomeSummary,
     gatedHandoff,
+    materializeRequest,
   } = candidateAssessment(patternId, candidate);
   const decisionSummary = candidateDecisionSummary(patternId, candidate, {
     outcomeSummary,
@@ -975,6 +1022,10 @@ ${verificationMethod}
 - PR 제목: ${gatedHandoff.pr_draft.title}
 - 핸드오프 부작용: ${gatedHandoff.side_effects}
 ${handoffAcceptance}
+
+## 자동화 후보 카드 생성 초안
+아래 JSON은 바로 자동 실행하지 말고, \`program.repo_dir\`를 채운 뒤 사람이 승인하거나 별도 materializer가 호출해야 합니다.
+${JSON.stringify(materializeRequest, null, 2)}
 
 ## 지시사항
 에이전트가 도출한 내용은 반드시 한국어로 작성합니다. 이 자동화를 구현할 가치가 있는지 평가하고 다음을 제공합니다:

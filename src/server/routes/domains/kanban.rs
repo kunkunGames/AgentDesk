@@ -59,6 +59,10 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route("/pm-decision", post(kanban::pm_decision))
             .route(
+                "/automation-candidates",
+                post(automation_candidates::materialize_candidate),
+            )
+            .route(
                 "/automation-candidates/{card_id}/iteration-result",
                 post(automation_candidates::submit_iteration_result),
             )

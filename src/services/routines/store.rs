@@ -1230,6 +1230,13 @@ impl RoutineStore {
             FROM kanban_cards
             WHERE status = 'ready'
               AND pipeline_stage_id = 'automation-candidate'
+              AND metadata->'automation_candidate'->>'enabled' = 'true'
+              AND metadata->'automation_candidate'->>'loop_enabled' = 'true'
+              AND NULLIF(metadata->'program'->>'repo_dir', '') IS NOT NULL
+              AND jsonb_typeof(metadata->'program'->'allowed_write_paths') = 'array'
+              AND jsonb_array_length(metadata->'program'->'allowed_write_paths') > 0
+              AND NULLIF(metadata->'program'->>'metric_name', '') IS NOT NULL
+              AND metadata->'program' ? 'metric_target'
             ORDER BY updated_at ASC
             LIMIT 20
             "#,
@@ -1277,6 +1284,8 @@ impl RoutineStore {
             FROM kanban_cards
             WHERE status = 'done'
               AND pipeline_stage_id = 'automation-candidate'
+              AND metadata->'automation_candidate'->>'enabled' = 'true'
+              AND metadata->'automation_candidate'->>'loop_enabled' = 'true'
               AND updated_at > NOW() - INTERVAL '7 days'
             ORDER BY updated_at DESC
             LIMIT 20

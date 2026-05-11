@@ -37,6 +37,25 @@ pub struct InsertIterationParams {
     pub crash_trace: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MaterializeCandidateCardParams {
+    pub title: String,
+    pub repo_id: Option<String>,
+    pub priority: Option<String>,
+    pub assigned_agent_id: Option<String>,
+    pub description: Option<String>,
+    pub metadata_json: String,
+    pub dedupe_key: Option<String>,
+    pub start_ready: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializedCandidateCard {
+    pub card_id: String,
+    pub created: bool,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricDirection {
     LowerIsBetter,
@@ -315,6 +334,118 @@ pub async fn list_iterations_for_card_pg(
     .map_err(|error| format!("list iterations: {error}"))?;
 
     rows.iter().map(|row| row_to_record(row)).collect()
+}
+
+pub async fn materialize_candidate_card_pg(
+    pool: &PgPool,
+    params: MaterializeCandidateCardParams,
+) -> Result<MaterializedCandidateCard, String> {
+    let create_status = if params.start_ready {
+        "ready"
+    } else {
+        "backlog"
+    };
+
+    if let Some(dedupe_key) = params
+        .dedupe_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let existing_id: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM kanban_cards
+            WHERE pipeline_stage_id = 'automation-candidate'
+              AND metadata->'automation_candidate'->>'dedupe_key' = $1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(dedupe_key)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| format!("find automation candidate by dedupe_key: {error}"))?;
+
+        if let Some(card_id) = existing_id {
+            let status = if params.start_ready {
+                "ready".to_string()
+            } else {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT status FROM kanban_cards WHERE id = $1 LIMIT 1",
+                )
+                .bind(&card_id)
+                .fetch_one(pool)
+                .await
+                .map_err(|error| format!("load existing candidate status: {error}"))?
+            };
+
+            sqlx::query(
+                r#"
+                UPDATE kanban_cards
+                   SET title = $1,
+                       repo_id = COALESCE($2, repo_id),
+                       priority = COALESCE($3, priority),
+                       assigned_agent_id = COALESCE($4, assigned_agent_id),
+                       description = COALESCE($5, description),
+                       metadata = CAST($6 AS jsonb),
+                       status = CASE WHEN $7 THEN 'ready' ELSE status END,
+                       pipeline_stage_id = 'automation-candidate',
+                       updated_at = NOW()
+                 WHERE id = $8
+                "#,
+            )
+            .bind(&params.title)
+            .bind(params.repo_id.as_deref())
+            .bind(params.priority.as_deref())
+            .bind(params.assigned_agent_id.as_deref())
+            .bind(params.description.as_deref())
+            .bind(&params.metadata_json)
+            .bind(params.start_ready)
+            .bind(&card_id)
+            .execute(pool)
+            .await
+            .map_err(|error| format!("update automation candidate card: {error}"))?;
+
+            return Ok(MaterializedCandidateCard {
+                card_id,
+                created: false,
+                status,
+            });
+        }
+    }
+
+    let card_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority,
+            assigned_agent_id, description, metadata,
+            pipeline_stage_id, created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, COALESCE($5, 'medium'),
+            $6, $7, CAST($8 AS jsonb),
+            'automation-candidate', NOW(), NOW()
+        )
+        "#,
+    )
+    .bind(&card_id)
+    .bind(params.repo_id.as_deref())
+    .bind(&params.title)
+    .bind(create_status)
+    .bind(params.priority.as_deref())
+    .bind(params.assigned_agent_id.as_deref())
+    .bind(params.description.as_deref())
+    .bind(&params.metadata_json)
+    .execute(pool)
+    .await
+    .map_err(|error| format!("insert automation candidate card: {error}"))?;
+
+    Ok(MaterializedCandidateCard {
+        card_id,
+        created: true,
+        status: create_status.to_string(),
+    })
 }
 
 pub async fn iteration_count_for_card_pg(pool: &PgPool, card_id: &str) -> Result<i64, String> {

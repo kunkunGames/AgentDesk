@@ -7,7 +7,8 @@ use serde_json::json;
 
 use super::AppState;
 use crate::services::automation_candidate_materializer::{
-    AutomationCandidateMaterializer, IterationResultInput, MaterializerError, PrepareWorktreeOutput,
+    AutomationCandidateMaterializer, IterationResultInput, MaterializeCandidateInput,
+    MaterializerError, PrepareWorktreeOutput,
 };
 
 fn pg_unavailable() -> (StatusCode, Json<serde_json::Value>) {
@@ -50,6 +51,55 @@ fn materializer_error_response(error: MaterializerError) -> (StatusCode, Json<se
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": msg})),
         ),
+    }
+}
+
+/// POST /api/automation-candidates
+///
+/// Materialize a loop-enabled automation candidate Kanban card.
+/// A card enters the executor loop only when:
+/// `pipeline_stage_id='automation-candidate'`,
+/// `metadata.automation_candidate.enabled=true`,
+/// and `metadata.program` contains the required contract fields.
+pub async fn materialize_candidate(
+    State(state): State<AppState>,
+    Json(body): Json<MaterializeCandidateInput>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(pool) = state.pg_pool_ref() else {
+        return pg_unavailable();
+    };
+
+    let materializer = AutomationCandidateMaterializer::new(pool.clone());
+    match materializer.materialize_candidate(body).await {
+        Ok(output) => {
+            crate::server::ws::emit_event(
+                &state.broadcast_tx,
+                "automation_candidate_materialized",
+                json!({
+                    "card_id": output.card_id,
+                    "created": output.created,
+                    "status": output.status,
+                    "start_ready": output.start_ready,
+                }),
+            );
+            (
+                if output.created {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                Json(json!({
+                    "card_id": output.card_id,
+                    "created": output.created,
+                    "status": output.status,
+                    "pipeline_stage_id": output.pipeline_stage_id,
+                    "loop_enabled": output.loop_enabled,
+                    "start_ready": output.start_ready,
+                    "discriminator": output.discriminator,
+                })),
+            )
+        }
+        Err(error) => materializer_error_response(error),
     }
 }
 
@@ -143,24 +193,26 @@ pub async fn approve_candidate(
 
     let materializer = AutomationCandidateMaterializer::new(pool.clone());
     match materializer.approve_candidate(&card_id).await {
-        Ok(final_gate) => {
+        Ok(output) => {
             crate::server::ws::emit_event(
                 &state.broadcast_tx,
                 "automation_candidate_approved",
-                json!({"card_id": card_id, "final_gate": final_gate}),
+                json!({
+                    "card_id": card_id,
+                    "final_gate": output.final_gate,
+                    "effective_final_gate": output.effective_final_gate,
+                    "safe_for_auto_apply": output.side_effect_simulation.safe_for_auto_apply,
+                }),
             );
-            let next_action = if final_gate == "auto_apply_after_green" {
-                "monitor_ci_and_merge"
-            } else {
-                "await_manual_merge"
-            };
             (
                 StatusCode::OK,
                 Json(json!({
                     "status": "approved",
                     "card_id": card_id,
-                    "final_gate": final_gate,
-                    "next_action": next_action,
+                    "final_gate": output.final_gate,
+                    "effective_final_gate": output.effective_final_gate,
+                    "next_action": output.next_action,
+                    "side_effect_simulation": output.side_effect_simulation,
                 })),
             )
         }
