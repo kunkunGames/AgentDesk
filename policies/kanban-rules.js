@@ -496,12 +496,8 @@ var rules = {
       return;
     }
 
-    var cards = agentdesk.db.query(
-      "SELECT id, title, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
-      [dispatch.kanban_card_id]
-    );
-    if (cards.length === 0) return;
-    var card = cards[0];
+    var card = agentdesk.cards.get(dispatch.kanban_card_id);
+    if (!card) return;
     var cfg = agentdesk.pipeline.resolveForCard(card.id);
     var inProgressState = agentdesk.pipeline.nextGatedTarget(agentdesk.pipeline.kickoffState(cfg), cfg);
     var reviewState = agentdesk.pipeline.nextGatedTarget(inProgressState, cfg);

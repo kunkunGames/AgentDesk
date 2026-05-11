@@ -122,6 +122,16 @@ test("kanban-rules skips preflight once for api_reopen cards and preserves other
 
 test("kanban-rules writes consultation-clear metadata as a JSON object param", () => {
   const { policy, state } = loadPolicy("policies/kanban-rules.js", {
+    cards: {
+      "card-consult": {
+        id: "card-consult",
+        title: "Consulted card",
+        status: "in_progress",
+        priority: "medium",
+        assigned_agent_id: "agent-1",
+        deferred_dod_json: null
+      }
+    },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
@@ -136,19 +146,6 @@ test("kanban-rules writes consultation-clear metadata as a JSON object param", (
             result: JSON.stringify({ verdict: "clear", summary: "ready" }),
             context: "{}",
             status: "completed"
-          }
-        ]
-      },
-      {
-        match: "SELECT id, title, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
-        result: [
-          {
-            id: "card-consult",
-            title: "Consulted card",
-            status: "in_progress",
-            priority: "medium",
-            assigned_agent_id: "agent-1",
-            deferred_dod_json: null
           }
         ]
       },
@@ -172,6 +169,16 @@ test("kanban-rules writes consultation-clear metadata as a JSON object param", (
 
 test("kanban-rules writes consultation-escalated metadata as a JSON object param", () => {
   const { policy, state } = loadPolicy("policies/kanban-rules.js", {
+    cards: {
+      "card-consult-blocked": {
+        id: "card-consult-blocked",
+        title: "Blocked consultation card",
+        status: "in_progress",
+        priority: "medium",
+        assigned_agent_id: "agent-1",
+        deferred_dod_json: null
+      }
+    },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
@@ -186,19 +193,6 @@ test("kanban-rules writes consultation-escalated metadata as a JSON object param
             result: JSON.stringify({ verdict: "blocked", summary: "ambiguous" }),
             context: "{}",
             status: "completed"
-          }
-        ]
-      },
-      {
-        match: "SELECT id, title, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
-        result: [
-          {
-            id: "card-consult-blocked",
-            title: "Blocked consultation card",
-            status: "in_progress",
-            priority: "medium",
-            assigned_agent_id: "agent-1",
-            deferred_dod_json: null
           }
         ]
       },
@@ -224,6 +218,16 @@ test("kanban-rules writes consultation-escalated metadata as a JSON object param
 
 test("kanban-rules writes noop work-resolution metadata as a JSON object param", () => {
   const { policy, state } = loadPolicy("policies/kanban-rules.js", {
+    cards: {
+      "card-noop": {
+        id: "card-noop",
+        title: "Noop card",
+        status: "in_progress",
+        priority: "medium",
+        assigned_agent_id: "agent-1",
+        deferred_dod_json: null
+      }
+    },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
@@ -242,19 +246,6 @@ test("kanban-rules writes noop work-resolution metadata as a JSON object param",
             }),
             context: "{}",
             status: "completed"
-          }
-        ]
-      },
-      {
-        match: "SELECT id, title, status, priority, assigned_agent_id, deferred_dod_json FROM kanban_cards WHERE id = ?",
-        result: [
-          {
-            id: "card-noop",
-            title: "Noop card",
-            status: "in_progress",
-            priority: "medium",
-            assigned_agent_id: "agent-1",
-            deferred_dod_json: null
           }
         ]
       },
@@ -315,6 +306,16 @@ test("kanban-rules preflight already_applied transitions the card to done and sk
 
 test("kanban-rules sends completed rework dispatches directly back to review", () => {
   const { policy, state } = loadPolicy("policies/kanban-rules.js", {
+    cards: {
+      "card-3": {
+        id: "card-3",
+        title: "Rework card",
+        status: "in_progress",
+        priority: "medium",
+        assigned_agent_id: "agent-3",
+        deferred_dod_json: null
+      }
+    },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
@@ -331,19 +332,6 @@ test("kanban-rules sends completed rework dispatches directly back to review", (
             status: "completed"
           }
         ]
-      },
-      {
-        match: "FROM kanban_cards WHERE id = ?",
-        result: [
-          {
-            id: "card-3",
-            title: "Rework card",
-            status: "in_progress",
-            priority: "medium",
-            assigned_agent_id: "agent-3",
-            deferred_dod_json: null
-          }
-        ]
       }
     ])
   });
@@ -355,6 +343,19 @@ test("kanban-rules sends completed rework dispatches directly back to review", (
 
 test("kanban-rules marks DoD-only gate failures as awaiting_dod instead of escalating immediately", () => {
   const { policy, state } = loadPolicy("policies/kanban-rules.js", {
+    cards: {
+      "card-4": {
+        id: "card-4",
+        title: "DoD incomplete card",
+        status: "in_progress",
+        priority: "high",
+        assigned_agent_id: "agent-4",
+        deferred_dod_json: JSON.stringify({
+          items: ["add tests", "update docs"],
+          verified: ["add tests"]
+        })
+      }
+    },
     dbQuery: createSqlRouter([
       {
         match: "FROM task_dispatches WHERE id = ?",
@@ -369,22 +370,6 @@ test("kanban-rules marks DoD-only gate failures as awaiting_dod instead of escal
             result: "{}",
             context: "{}",
             status: "completed"
-          }
-        ]
-      },
-      {
-        match: "FROM kanban_cards WHERE id = ?",
-        result: [
-          {
-            id: "card-4",
-            title: "DoD incomplete card",
-            status: "in_progress",
-            priority: "high",
-            assigned_agent_id: "agent-4",
-            deferred_dod_json: JSON.stringify({
-              items: ["add tests", "update docs"],
-              verified: ["add tests"]
-            })
           }
         ]
       }
