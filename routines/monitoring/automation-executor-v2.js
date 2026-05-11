@@ -3,9 +3,9 @@
 // Consumes kanban_ready observations (pipeline_stage_id='automation-candidate', status='ready')
 // and drives an autoresearch-style iteration loop per card:
 //
-//   ready → requested → in_progress → [score-based re-queue OR review → done]
+//   ready → requested → in_progress → [metric-regression re-queue OR review → done]
 //
-// Re-queue on score < threshold: current card → "review", new child card → "ready"
+// Re-queue on metric regression: current card → "review", new child card → "ready"
 // (intermediate cards go to "review", NOT "done", to avoid premature kanban_dispatched suppression)
 //
 // Loop ends when MAX_ITERATIONS is reached or final gate triggers.
@@ -13,7 +13,6 @@
 // Rust computes keep/discard verdict deterministically.
 
 const MAX_ITERATIONS = 10;
-const SCORE_THRESHOLD = 0.85;         // metric_after must improve by at least this ratio vs metric_before
 const DISPATCH_RETRY_MS = 30 * 60 * 1000;
 const MAX_DISPATCH_RETRIES = 3;
 const DISPATCHED_WINDOW_DAYS = 7;
@@ -167,16 +166,23 @@ agentdesk.routines.register({
         cp.stats.skipped++;
         continue;
       }
-      const pending = cp.pending[cardId];
-      if (pending && (pending.attempt_count || 0) >= MAX_DISPATCH_RETRIES) continue;
-      if (pending && isRecent(pending.last_attempted_at, nowStr, DISPATCH_RETRY_MS)) {
-        cp.stats.skipped++;
-        continue;
-      }
-
       const meta = obs.metadata || {};
       const program = meta.program || {};
       const iteration = (program.current_iteration || 0) + 1;
+      const pending = cp.pending[cardId];
+      const pendingIteration = Number.isFinite(Number(pending?.iteration))
+        ? Number(pending.iteration)
+        : iteration;
+      if (pending && pendingIteration !== iteration) {
+        delete cp.pending[cardId];
+      }
+      const activePending = pending && pendingIteration === iteration ? pending : null;
+
+      if (activePending && (activePending.attempt_count || 0) >= MAX_DISPATCH_RETRIES) continue;
+      if (activePending && isRecent(activePending.last_attempted_at, nowStr, DISPATCH_RETRY_MS)) {
+        cp.stats.skipped++;
+        continue;
+      }
 
       if (iteration > MAX_ITERATIONS) {
         cp.stats.max_iterations_reached++;

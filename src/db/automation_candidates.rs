@@ -71,13 +71,19 @@ mod verdict_tests {
 
     #[test]
     fn crashed_always_discards() {
-        assert_eq!(compute_verdict(Some(0.9), Some(0.95), false, "crashed"), "discard");
+        assert_eq!(
+            compute_verdict(Some(0.9), Some(0.95), false, "crashed"),
+            "discard"
+        );
         assert_eq!(compute_verdict(None, None, true, "crashed"), "discard");
     }
 
     #[test]
     fn timeout_always_discards() {
-        assert_eq!(compute_verdict(Some(0.8), Some(0.9), false, "timeout"), "discard");
+        assert_eq!(
+            compute_verdict(Some(0.8), Some(0.9), false, "timeout"),
+            "discard"
+        );
     }
 
     #[test]
@@ -88,8 +94,14 @@ mod verdict_tests {
 
     #[test]
     fn metric_regression_discards() {
-        assert_eq!(compute_verdict(Some(0.9), Some(0.8), false, "ok"), "discard");
-        assert_eq!(compute_verdict(Some(1.0), Some(0.0), false, "ok"), "discard");
+        assert_eq!(
+            compute_verdict(Some(0.9), Some(0.8), false, "ok"),
+            "discard"
+        );
+        assert_eq!(
+            compute_verdict(Some(1.0), Some(0.0), false, "ok"),
+            "discard"
+        );
     }
 
     #[test]
@@ -125,7 +137,7 @@ pub async fn insert_iteration_pg(
             status, description, allowed_write_paths_used,
             run_seconds, crash_trace
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        RETURNING id, card_id, iteration, branch, commit_hash,
+        RETURNING id::text AS id, card_id, iteration, branch, commit_hash,
                   metric_before, metric_after, is_simplification,
                   status, description, allowed_write_paths_used,
                   run_seconds, crash_trace, created_at
@@ -156,7 +168,7 @@ pub async fn list_iterations_for_card_pg(
 ) -> Result<Vec<IterationRecord>, String> {
     let rows = sqlx::query(
         r#"
-        SELECT id, card_id, iteration, branch, commit_hash,
+        SELECT id::text AS id, card_id, iteration, branch, commit_hash,
                metric_before, metric_after, is_simplification,
                status, description, allowed_write_paths_used,
                run_seconds, crash_trace, created_at
@@ -235,14 +247,13 @@ pub async fn load_card_program_pg(
     pool: &PgPool,
     card_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    let metadata_raw: Option<String> = sqlx::query_scalar(
-        "SELECT metadata::text FROM kanban_cards WHERE id = $1",
-    )
-    .bind(card_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| format!("load card metadata: {error}"))?
-    .flatten();
+    let metadata_raw: Option<String> =
+        sqlx::query_scalar("SELECT metadata::text FROM kanban_cards WHERE id = $1")
+            .bind(card_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| format!("load card metadata: {error}"))?
+            .flatten();
 
     let program = metadata_raw
         .as_deref()
@@ -258,14 +269,42 @@ pub async fn transition_card_status_pg(
     card_id: &str,
     new_status: &str,
 ) -> Result<(), String> {
+    sqlx::query("UPDATE kanban_cards SET status = $1, updated_at = NOW() WHERE id = $2")
+        .bind(new_status)
+        .bind(card_id)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("transition card {card_id} to {new_status}: {error}"))?;
+    Ok(())
+}
+
+/// Persist the last completed automation iteration on the card's program metadata.
+pub async fn update_card_program_current_iteration_pg(
+    pool: &PgPool,
+    card_id: &str,
+    current_iteration: i32,
+) -> Result<(), String> {
     sqlx::query(
-        "UPDATE kanban_cards SET status = $1, updated_at = NOW() WHERE id = $2",
+        r#"
+        UPDATE kanban_cards
+           SET metadata = jsonb_set(
+                   COALESCE(metadata, '{}'::jsonb),
+                   '{program,current_iteration}',
+                   to_jsonb($1::int),
+                   true
+               ),
+               updated_at = NOW()
+         WHERE id = $2
+           AND pipeline_stage_id = 'automation-candidate'
+        "#,
     )
-    .bind(new_status)
+    .bind(current_iteration)
     .bind(card_id)
     .execute(pool)
     .await
-    .map_err(|error| format!("transition card {card_id} to {new_status}: {error}"))?;
+    .map_err(|error| {
+        format!("update card {card_id} program current_iteration to {current_iteration}: {error}")
+    })?;
     Ok(())
 }
 
@@ -322,10 +361,7 @@ pub async fn create_child_candidate_card_pg(
 /// Read `metadata->'program'->>'repo_dir'` for the card.
 ///
 /// Returns `None` if the card doesn't exist or the field isn't set.
-pub async fn load_card_repo_dir_pg(
-    pool: &PgPool,
-    card_id: &str,
-) -> Result<Option<String>, String> {
+pub async fn load_card_repo_dir_pg(pool: &PgPool, card_id: &str) -> Result<Option<String>, String> {
     let value: Option<String> = sqlx::query_scalar(
         "SELECT metadata->'program'->>'repo_dir' FROM kanban_cards WHERE id = $1",
     )
@@ -357,10 +393,7 @@ pub async fn load_card_final_gate_pg(
 }
 
 /// Approve a card for final application (manual_review gate).
-pub async fn approve_candidate_card_pg(
-    pool: &PgPool,
-    card_id: &str,
-) -> Result<(), String> {
+pub async fn approve_candidate_card_pg(pool: &PgPool, card_id: &str) -> Result<(), String> {
     sqlx::query(
         r#"UPDATE kanban_cards
            SET review_status = 'approved',

@@ -1,10 +1,10 @@
 pub mod agents;
 mod agents_crud;
 mod agents_setup;
-pub mod automation_candidates;
 pub mod analytics;
 pub mod auth;
 pub mod auto_queue;
+pub mod automation_candidates;
 pub mod cluster;
 pub mod cron_api;
 pub mod departments;

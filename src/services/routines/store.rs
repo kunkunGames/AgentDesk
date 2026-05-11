@@ -1251,8 +1251,9 @@ impl RoutineStore {
             let assigned: String = row.try_get("assigned_agent_id").unwrap_or_default();
             let updated_at: DateTime<Utc> =
                 row.try_get("updated_at").unwrap_or_else(|_| Utc::now());
-            let metadata: serde_json::Value =
-                row.try_get::<serde_json::Value, _>("metadata").unwrap_or(serde_json::Value::Null);
+            let metadata: serde_json::Value = row
+                .try_get::<serde_json::Value, _>("metadata")
+                .unwrap_or(serde_json::Value::Null);
             kanban_ready_obs.push(serde_json::json!({
                 "timestamp": updated_at.to_rfc3339(),
                 "source": "kanban_ready",

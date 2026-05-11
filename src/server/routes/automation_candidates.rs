@@ -7,8 +7,7 @@ use serde_json::json;
 
 use super::AppState;
 use crate::services::automation_candidate_materializer::{
-    AutomationCandidateMaterializer, IterationResultInput, MaterializerError,
-    PrepareWorktreeOutput,
+    AutomationCandidateMaterializer, IterationResultInput, MaterializerError, PrepareWorktreeOutput,
 };
 
 fn pg_unavailable() -> (StatusCode, Json<serde_json::Value>) {
@@ -191,9 +190,21 @@ pub async fn prepare_worktree(
     };
 
     let materializer = AutomationCandidateMaterializer::new(pool.clone());
-    match materializer.prepare_worktree(&card_id, body.iteration).await {
-        Ok(PrepareWorktreeOutput { path, branch, commit, created }) => (
-            if created { StatusCode::CREATED } else { StatusCode::OK },
+    match materializer
+        .prepare_worktree(&card_id, body.iteration)
+        .await
+    {
+        Ok(PrepareWorktreeOutput {
+            path,
+            branch,
+            commit,
+            created,
+        }) => (
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
             Json(json!({
                 "path": path,
                 "branch": branch,

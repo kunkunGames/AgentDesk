@@ -1,10 +1,12 @@
+use std::path::{Component, Path};
+
 use sqlx::{PgPool, Row};
 
 use crate::db::automation_candidates::{
-    InsertIterationParams, IterationRecord, approve_candidate_card_pg,
-    compute_verdict, create_child_candidate_card_pg, insert_iteration_pg,
-    is_final_iteration, list_iterations_for_card_pg, load_card_final_gate_pg,
-    load_card_program_pg, load_card_repo_dir_pg, transition_card_status_pg,
+    InsertIterationParams, IterationRecord, approve_candidate_card_pg, compute_verdict,
+    create_child_candidate_card_pg, insert_iteration_pg, is_final_iteration,
+    list_iterations_for_card_pg, load_card_final_gate_pg, load_card_program_pg,
+    load_card_repo_dir_pg, transition_card_status_pg, update_card_program_current_iteration_pg,
 };
 use crate::services::git::{
     automation_branch_name, ensure_automation_worktree, find_automation_worktree,
@@ -162,10 +164,11 @@ impl AutomationCandidateMaterializer {
         // 2. Validate allowed_write_paths_used against contract
         let paths_used = input.allowed_write_paths_used.clone().unwrap_or_default();
         for path in &paths_used {
-            if !allowed_write_paths.iter().any(|allowed| path.starts_with(allowed.as_str())) {
-                return Err(MaterializerError::AllowedPathsViolation {
-                    path: path.clone(),
-                });
+            if !allowed_write_paths
+                .iter()
+                .any(|allowed| allowed_path_matches(path, allowed))
+            {
+                return Err(MaterializerError::AllowedPathsViolation { path: path.clone() });
             }
         }
 
@@ -208,13 +211,21 @@ impl AutomationCandidateMaterializer {
         // 5. Act on verdict
         let (action, child_card_id) = match verdict {
             "keep" if is_final_iteration(input.iteration) => {
+                update_card_program_current_iteration_pg(&self.pool, card_id, input.iteration)
+                    .await
+                    .map_err(MaterializerError::Database)?;
                 // All iterations done — move to review for final gate
                 transition_card_status_pg(&self.pool, card_id, "review")
                     .await
                     .map_err(MaterializerError::Database)?;
                 (MaterializerAction::KeepFinalGate, None)
             }
-            "keep" => (MaterializerAction::KeepContinue, None),
+            "keep" => {
+                update_card_program_current_iteration_pg(&self.pool, card_id, input.iteration)
+                    .await
+                    .map_err(MaterializerError::Database)?;
+                (MaterializerAction::KeepContinue, None)
+            }
             _ => {
                 // Discard: transition current card to review, create child ready card
                 let card_row = sqlx::query(
@@ -227,11 +238,9 @@ impl AutomationCandidateMaterializer {
 
                 let (parent_title, parent_metadata) = match card_row {
                     Some(row) => {
-                        let title: String = row
-                            .try_get("title")
-                            .unwrap_or_else(|_| card_id.to_string());
-                        let meta_raw: Option<String> =
-                            row.try_get("metadata").unwrap_or(None);
+                        let title: String =
+                            row.try_get("title").unwrap_or_else(|_| card_id.to_string());
+                        let meta_raw: Option<String> = row.try_get("metadata").unwrap_or(None);
                         let meta = meta_raw
                             .as_deref()
                             .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
@@ -279,10 +288,7 @@ impl AutomationCandidateMaterializer {
         })
     }
 
-    pub async fn list_iterations(
-        &self,
-        card_id: &str,
-    ) -> Result<Vec<IterationRecordView>, String> {
+    pub async fn list_iterations(&self, card_id: &str) -> Result<Vec<IterationRecordView>, String> {
         list_iterations_for_card_pg(&self.pool, card_id)
             .await
             .map(|records| records.into_iter().map(IterationRecordView::from).collect())
@@ -339,5 +345,44 @@ impl AutomationCandidateMaterializer {
             .unwrap_or_else(|| "manual_review".to_string());
 
         Ok(final_gate)
+    }
+}
+
+fn allowed_path_matches(path: &str, allowed: &str) -> bool {
+    let path = Path::new(path);
+    let allowed = Path::new(allowed);
+    is_clean_relative_path(path) && is_clean_relative_path(allowed) && path.starts_with(allowed)
+}
+
+fn is_clean_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod allowed_path_tests {
+    use super::allowed_path_matches;
+
+    #[test]
+    fn accepts_exact_and_child_paths() {
+        assert!(allowed_path_matches("src/foo", "src/foo"));
+        assert!(allowed_path_matches("src/foo/bar.rs", "src/foo"));
+    }
+
+    #[test]
+    fn rejects_prefix_siblings_and_traversal() {
+        assert!(!allowed_path_matches("src/foo2/bar.rs", "src/foo"));
+        assert!(!allowed_path_matches("src/foo/../bar.rs", "src/foo"));
+        assert!(!allowed_path_matches("../src/foo.rs", "src"));
+    }
+
+    #[test]
+    fn rejects_absolute_or_empty_paths() {
+        assert!(!allowed_path_matches("/src/foo.rs", "src"));
+        assert!(!allowed_path_matches("src/foo.rs", ""));
+        assert!(!allowed_path_matches("", "src"));
     }
 }
