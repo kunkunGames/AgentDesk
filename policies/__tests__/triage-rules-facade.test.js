@@ -316,6 +316,8 @@ function normalizeStaticMemberAccess(content) {
     .replace(/[\r\n]+\s*(?=[.\[])/g, "")
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
+    .replace(/\[\s*`d\$\{\s*(["'])b\1\s*\}`\s*\]/g, ".db")
+    .replace(/\[\s*(["'`])d\1\s*\+\s*(["'`])b\2\s*\]/g, ".db")
     .replace(/\[\s*(["'`])d\1\s*\+\s*(["'`])b\2\s*\]\s*:/g, "db:")
     .replace(/(["'`])db\1\s*:/g, "db:")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
@@ -482,6 +484,8 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk.db?.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk?.db?.execute('DELETE')"));
   assert.ok(hasRawDbAccess("agentdesk['db'].query('SELECT 1')"));
+  assert.ok(hasRawDbAccess('agentdesk["d" + "b"].query("SELECT 1")'));
+  assert.ok(hasRawDbAccess('agentdesk[`d${"b"}`].execute("DELETE")'));
   assert.ok(hasRawDbAccess('agentdesk?.["db"]?.execute("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk[`db`].query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk /* comment */ . db . execute('DELETE')"));
