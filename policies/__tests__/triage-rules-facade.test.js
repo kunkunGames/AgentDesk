@@ -349,6 +349,7 @@ function collectAliasesForObject(normalized, objectName, fromIndex) {
   var patterns = [
     new RegExp("(^|[;{:])(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{])for([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{:])([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g")
   ];
 
@@ -471,6 +472,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("if (ok) { const ad = agentdesk; ad.db.execute('DELETE'); }"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const { db } = ad; db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const next = ad; next.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("let ad; for (ad = agentdesk; ; ) ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
