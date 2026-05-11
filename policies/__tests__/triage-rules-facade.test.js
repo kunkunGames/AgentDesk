@@ -22,7 +22,7 @@ function canStartRegex(output) {
       "yield"
     ].includes(wordMatch[0]);
   }
-  return /[=(:,[!&|?;{}>]/.test(trimmed[trimmed.length - 1]);
+  return /[=(:,[!&|?;{}>)]/.test(trimmed[trimmed.length - 1]);
 }
 
 function stripJsComments(content) {
@@ -137,6 +137,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess('const u = "https://example.com"; agentdesk.db.query("SELECT 1")'));
   assert.ok(hasRawDbAccess("const re = /https?:\\/\\//; agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("return /https?:\\/\\//.test(url) && agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("if (ok) /https?:\\/\\//.test(url); agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("(agentdesk.db).query('SELECT 1')"));
   assert.ok(hasRawDbAccess("(agentdesk['db']).execute('DELETE')"));
   assert.ok(hasRawDbAccess("const db = agentdesk.db; db.query('SELECT 1')"));
