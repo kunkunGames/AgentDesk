@@ -1,12 +1,12 @@
 use std::path::{Component, Path};
 
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 
 use crate::db::automation_candidates::{
     InsertIterationParams, IterationRecord, MaterializeCandidateCardParams,
     MaterializedCandidateCard, MetricDirection, approve_candidate_card_pg, compute_verdict,
     create_child_candidate_card_pg, insert_iteration_pg, is_final_iteration,
-    list_iterations_for_card_pg, load_card_final_gate_pg, load_card_program_pg,
+    list_iterations_for_card_pg, load_card_header_pg, load_card_program_pg,
     load_card_repo_dir_pg, materialize_candidate_card_pg, transition_card_status_pg,
     update_card_program_current_iteration_pg,
 };
@@ -258,16 +258,7 @@ impl AutomationCandidateMaterializer {
                 )
             })?;
 
-        let allowed_write_paths: Vec<String> = program
-            .get("allowed_write_paths")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
+        let allowed_write_paths = extract_allowed_write_paths(&program);
         if allowed_write_paths.is_empty() {
             return Err(MaterializerError::MissingProgram(
                 "allowed_write_paths must be non-empty".to_string(),
@@ -351,27 +342,11 @@ impl AutomationCandidateMaterializer {
             }
             _ => {
                 // Discard: transition current card to review, create child ready card
-                let card_row = sqlx::query(
-                    "SELECT title, metadata::text AS metadata FROM kanban_cards WHERE id = $1",
-                )
-                .bind(card_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| MaterializerError::Database(e.to_string()))?;
-
-                let (parent_title, parent_metadata) = match card_row {
-                    Some(row) => {
-                        let title: String =
-                            row.try_get("title").unwrap_or_else(|_| card_id.to_string());
-                        let meta_raw: Option<String> = row.try_get("metadata").unwrap_or(None);
-                        let meta = meta_raw
-                            .as_deref()
-                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                            .unwrap_or(serde_json::Value::Object(Default::default()));
-                        (title, meta)
-                    }
-                    None => return Err(MaterializerError::CardNotFound),
-                };
+                let (parent_title, parent_metadata) =
+                    load_card_header_pg(&self.pool, card_id)
+                        .await
+                        .map_err(MaterializerError::Database)?
+                        .ok_or(MaterializerError::CardNotFound)?;
 
                 // Best-effort worktree cleanup for the discarded iteration.
                 if let Some(repo_dir) = program
@@ -461,24 +436,22 @@ impl AutomationCandidateMaterializer {
         &self,
         card_id: &str,
     ) -> Result<ApproveCandidateOutput, MaterializerError> {
-        if load_card_program_pg(&self.pool, card_id)
+        let program = load_card_program_pg(&self.pool, card_id)
             .await
             .map_err(MaterializerError::Database)?
-            .is_none()
-        {
-            return Err(MaterializerError::CardNotFound);
-        }
+            .ok_or(MaterializerError::CardNotFound)?;
 
         approve_candidate_card_pg(&self.pool, card_id)
             .await
             .map_err(MaterializerError::Database)?;
 
-        let final_gate = load_card_final_gate_pg(&self.pool, card_id)
-            .await
-            .map_err(MaterializerError::Database)?
-            .unwrap_or_else(|| "manual_review".to_string());
+        let final_gate = program
+            .get("final_gate")
+            .and_then(|v| v.as_str())
+            .unwrap_or("manual_review")
+            .to_string();
 
-        let simulation = self.simulate_side_effects(card_id).await?;
+        let simulation = self.simulate_side_effects(card_id, &program).await?;
         let effective_final_gate =
             if final_gate == "auto_apply_after_green" && simulation.safe_for_auto_apply {
                 "auto_apply_after_green"
@@ -504,24 +477,9 @@ impl AutomationCandidateMaterializer {
     async fn simulate_side_effects(
         &self,
         card_id: &str,
+        program: &serde_json::Value,
     ) -> Result<SideEffectSimulation, MaterializerError> {
-        let program = load_card_program_pg(&self.pool, card_id)
-            .await
-            .map_err(MaterializerError::Database)?
-            .ok_or_else(|| {
-                MaterializerError::MissingProgram(
-                    "card not found or has no metadata.program".to_string(),
-                )
-            })?;
-        let allowed_write_paths: Vec<String> = program
-            .get("allowed_write_paths")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let allowed_write_paths = extract_allowed_write_paths(program);
 
         let iterations = list_iterations_for_card_pg(&self.pool, card_id)
             .await
@@ -581,6 +539,14 @@ impl AutomationCandidateMaterializer {
             latest_iteration: latest.map(|r| r.iteration),
         })
     }
+}
+
+fn extract_allowed_write_paths(program: &serde_json::Value) -> Vec<String> {
+    program
+        .get("allowed_write_paths")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 fn normalize_candidate_metadata(

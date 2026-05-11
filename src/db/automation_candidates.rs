@@ -338,6 +338,29 @@ pub async fn list_iterations_for_card_pg(
     rows.iter().map(|row| row_to_record(row)).collect()
 }
 
+/// Load `title` and `metadata` JSON for a card — used by the discard path to seed child cards.
+pub async fn load_card_header_pg(
+    pool: &PgPool,
+    card_id: &str,
+) -> Result<Option<(String, serde_json::Value)>, String> {
+    let row = sqlx::query(
+        "SELECT title, metadata::text AS metadata FROM kanban_cards WHERE id = $1",
+    )
+    .bind(card_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("load card header: {e}"))?;
+
+    let Some(row) = row else { return Ok(None) };
+    let title: String = row.try_get("title").unwrap_or_else(|_| card_id.to_string());
+    let meta_raw: Option<String> = row.try_get("metadata").unwrap_or(None);
+    let meta = meta_raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    Ok(Some((title, meta)))
+}
+
 pub async fn materialize_candidate_card_pg(
     pool: &PgPool,
     params: MaterializeCandidateCardParams,
