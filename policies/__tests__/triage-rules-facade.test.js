@@ -100,6 +100,7 @@ function stripJsComments(content) {
 
 function normalizeStaticMemberAccess(content) {
   return stripJsComments(content)
+    .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
     .replace(/\.+/g, ".")
@@ -107,8 +108,12 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\s+/g, "");
 }
 
+function escapeRegExp(content) {
+  return content.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function hasIdentifierUse(content, identifier) {
-  return new RegExp("(^|[^A-Za-z0-9_$])" + identifier + "([^A-Za-z0-9_$]|$)").test(content);
+  return new RegExp("(^|[^A-Za-z0-9_$])" + escapeRegExp(identifier) + "([^A-Za-z0-9_$]|$)").test(content);
 }
 
 function hasRawDbAccess(content) {
@@ -164,8 +169,11 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("(agentdesk.db).query('SELECT 1')"));
   assert.ok(hasRawDbAccess("(agentdesk['db']).execute('DELETE')"));
   assert.ok(hasRawDbAccess("const db = agentdesk.db; db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const db = agentdesk.db\ndb.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { query } = agentdesk.db; query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { query } = agentdesk.db\nquery('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { execute: run } = agentdesk.db; run('DELETE')"));
+  assert.ok(hasRawDbAccess("const { query: q$ } = agentdesk.db; q$('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
