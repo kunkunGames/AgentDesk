@@ -313,7 +313,7 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\\u([0-9a-fA-F]{4})/g, function(_match, codePoint) {
       return String.fromCharCode(parseInt(codePoint, 16));
     })
-    .replace(/[\r\n]+\s*(?=[.\[])/g, "")
+    .replace(/[\r\n]+\s*(?=(\?\s*\.|[.\[]))/g, "")
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
     .replace(/\[\s*`d\$\{\s*(["'])b\1\s*\}`\s*\]/g, ".db")
@@ -385,7 +385,7 @@ function collectAliasesForObject(normalized, objectName, fromIndex) {
     new RegExp("(^|[;{])for(?:const|let|var);?([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for\\(([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g"),
-    new RegExp("(^|[;{:(,])([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g")
+    new RegExp("(^|[;{:(,)])([A-Za-z_$][A-Za-z0-9_$]*)=" + objectReference + "(?=$|[^A-Za-z0-9_$])", "g")
   ];
 
   for (var p = 0; p < patterns.length; p++) {
@@ -479,6 +479,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk.\\u0064b.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.\\u{64}b.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk\n.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("agentdesk\n?.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk\n['db'].execute('DELETE')"));
   assert.ok(hasRawDbAccess("agentdesk?.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.db?.query('SELECT 1')"));
@@ -523,6 +524,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const { ...ad } = agentdesk; ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { cards, ...ad } = agentdesk; ad.db.execute('DELETE')"));
   assert.ok(hasRawDbAccess("let ad; for (ad = agentdesk; ; ) ad.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("let ad; if (ok) ad = agentdesk; ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("function run(ad = agentdesk) { ad.db.query('SELECT 1'); }"));
   assert.ok(hasRawDbAccess("const run = (ad = agentdesk) => ad.db.execute('DELETE')"));
   assert.ok(hasRawDbAccess("function run({ db } = agentdesk) { db.query('SELECT 1'); }"));
