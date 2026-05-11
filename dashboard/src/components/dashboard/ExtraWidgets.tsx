@@ -733,22 +733,32 @@ interface AgentQualityWidgetProps {
 
 type AgentQualityMetric = "turn" | "review";
 
-function agentQualityUnavailableLabel(t: TFunction): string {
-  return t({
-    ko: "측정 불가",
-    en: "Not enough data",
-    ja: "測定不可",
-    zh: "无法测量",
-  });
+function agentQualityUnavailableLabel(t: TFunction): React.ReactNode {
+  return (
+    <span
+      title={t({
+        ko: "샘플 부족",
+        en: "low sample",
+        ja: "サンプル不足",
+        zh: "样本不足",
+      })}
+    >
+      —
+    </span>
+  );
 }
 
 function formatQualityRate(
   window: api.AgentQualityWindow | null | undefined,
   metric: AgentQualityMetric,
   t: TFunction,
-): string {
+): React.ReactNode {
   if (!window || window.measurementUnavailable) {
-    return window?.measurementLabel || agentQualityUnavailableLabel(t);
+    return window?.measurementLabel ? (
+      <span title={window.measurementLabel}>—</span>
+    ) : (
+      agentQualityUnavailableLabel(t)
+    );
   }
   const value = metric === "turn" ? window.turnSuccessRate : window.reviewPassRate;
   if (value == null || !Number.isFinite(value)) return agentQualityUnavailableLabel(t);
@@ -785,7 +795,7 @@ function formatDailyQualityRate(
   record: api.AgentQualityDailyRecord,
   metric: AgentQualityMetric,
   t: TFunction,
-): string {
+): React.ReactNode {
   if (record.sampleSize < 5) return agentQualityUnavailableLabel(t);
   const value = dailyQualityValue(record, metric);
   if (value == null) return agentQualityUnavailableLabel(t);
@@ -880,8 +890,8 @@ function QualityMetricCell({
   accent,
 }: {
   label: string;
-  value: string;
-  sub: string;
+  value: React.ReactNode;
+  sub: React.ReactNode;
   accent: string;
 }) {
   return (
