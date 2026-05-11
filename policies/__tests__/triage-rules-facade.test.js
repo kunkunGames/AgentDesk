@@ -100,6 +100,12 @@ function stripJsComments(content) {
 
 function normalizeStaticMemberAccess(content) {
   return stripJsComments(content)
+    .replace(/\\u\{([0-9a-fA-F]+)\}/g, function(_match, codePoint) {
+      return String.fromCodePoint(parseInt(codePoint, 16));
+    })
+    .replace(/\\u([0-9a-fA-F]{4})/g, function(_match, codePoint) {
+      return String.fromCharCode(parseInt(codePoint, 16));
+    })
     .replace(/[\r\n]+\s*(?=[.\[])/g, "")
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
@@ -125,6 +131,8 @@ test("triage-rules avoids raw agentdesk.db.* access", () => {
 
 test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("agentdesk.\\u0064b.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("agentdesk.\\u{64}b.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk\n.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk\n['db'].execute('DELETE')"));
   assert.ok(hasRawDbAccess("agentdesk?.db.query('SELECT 1')"));
