@@ -216,7 +216,10 @@ pub fn insert_process_session(session_name: impl Into<String>, handle: SessionHa
 }
 
 pub fn remove_process_session(session_name: &str) -> Option<SessionHandle> {
-    PROCESS_HANDLES.lock().unwrap_or_else(|e| e.into_inner()).remove(session_name)
+    PROCESS_HANDLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_name)
 }
 
 pub fn process_session_pid(session_name: &str) -> Option<u32> {
