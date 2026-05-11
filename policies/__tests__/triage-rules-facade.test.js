@@ -318,7 +318,7 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\?\s*\./g, ".")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
   )
-    .replace(/\.+/g, ".")
+    .replace(/\.{2,}(?=(db|query|execute)\b)/g, ".")
     .replace(/\s*\.\s*/g, ".")
     .replace(/\s*\[\s*/g, "[")
     .replace(/\s*\]\s*/g, "]");
@@ -435,6 +435,7 @@ function hasDbDestructuringFromObject(normalized, objectName) {
     var fields = splitTopLevelDestructuringFields(normalized.slice(i + 1, endIndex));
     for (var j = 0; j < fields.length; j++) {
       if (/^\.?db($|:|=)/.test(fields[j])) return true;
+      if (/^\.\.\.[A-Za-z_$][A-Za-z0-9_$]*$/.test(fields[j])) return true;
     }
   }
 
@@ -509,6 +510,8 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const ad = agentdesk; return ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const { db } = ad; db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const next = ad; next.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { ...ad } = agentdesk; ad.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { cards, ...ad } = agentdesk; ad.db.execute('DELETE')"));
   assert.ok(hasRawDbAccess("let ad; for (ad = agentdesk; ; ) ad.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("function run(ad = agentdesk) { ad.db.query('SELECT 1'); }"));
   assert.ok(hasRawDbAccess("const run = (ad = agentdesk) => ad.db.execute('DELETE')"));
@@ -534,4 +537,5 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.equal(hasRawDbAccess("const ad = other; ad.db.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("function run(ad = other) { ad.db.query('SELECT 1'); }"), false);
   assert.equal(hasRawDbAccess("const ad = (other); ad.db.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess("const { ...ad } = other; ad.db.query('SELECT 1')"), false);
 });
