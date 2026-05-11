@@ -23,7 +23,32 @@ function canStartRegex(output) {
       "yield"
     ].includes(wordMatch[0]);
   }
-  return /[=(:,[!&|?;{}>)]/.test(trimmed[trimmed.length - 1]);
+  if (trimmed[trimmed.length - 1] === ")") {
+    return endsWithControlCondition(trimmed);
+  }
+  return /[=(:,[!&|?;{}>]/.test(trimmed[trimmed.length - 1]);
+}
+
+function endsWithControlCondition(trimmed) {
+  var depth = 0;
+
+  for (var i = trimmed.length - 1; i >= 0; i--) {
+    var ch = trimmed[i];
+    if (ch === ")") {
+      depth += 1;
+      continue;
+    }
+    if (ch !== "(") continue;
+
+    depth -= 1;
+    if (depth !== 0) continue;
+
+    var prefix = trimmed.slice(0, i).replace(/\s+$/g, "");
+    var wordMatch = prefix.match(/[A-Za-z_$][A-Za-z0-9_$]*$/);
+    return Boolean(wordMatch) && ["for", "if", "while", "with"].includes(wordMatch[0]);
+  }
+
+  return false;
 }
 
 function stripJsComments(content) {
@@ -495,6 +520,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const re = /https?:\\/\\//; agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("return /https?:\\/\\//.test(url) && agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) /https?:\\/\\//.test(url); agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("if (ok) foo() / 2; agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("if (ok) {} else /https?:\\/\\//.test(url); agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("return agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("throw agentdesk.db.execute('DELETE')"));
