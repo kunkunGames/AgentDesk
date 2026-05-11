@@ -294,7 +294,6 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
   )
     .replace(/\.+/g, ".")
-    .replace(/[()]/g, "")
     .replace(/\s+/g, "");
 }
 
@@ -347,10 +346,12 @@ function collectAliasesForObject(normalized, objectName, fromIndex) {
   var content = normalized.slice(fromIndex);
   var escapedObjectName = escapeRegExp(objectName);
   var patterns = [
-    new RegExp("(^|[;{:])(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{:(,])(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{])for\\((?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for(?:const|let|var)([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
+    new RegExp("(^|[;{])for\\(([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
     new RegExp("(^|[;{])for([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g"),
-    new RegExp("(^|[;{:])([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g")
+    new RegExp("(^|[;{:(,])([A-Za-z_$][A-Za-z0-9_$]*)=" + escapedObjectName + "(?=$|[^A-Za-z0-9_$])", "g")
   ];
 
   for (var p = 0; p < patterns.length; p++) {
@@ -389,7 +390,8 @@ function hasDbDestructuringFromObject(normalized, objectName) {
     if (normalized[i] !== "{") continue;
 
     var prefix = normalized.slice(0, i);
-    var startsDeclaration = /(^|[;{:])(const|let|var)?$/.test(prefix)
+    var startsDeclaration = /(^|[;{:(,])(const|let|var)?$/.test(prefix)
+      || /(^|[;{])for\((const|let|var)?$/.test(prefix)
       || /(^|[;{])for(const|let|var)?$/.test(prefix);
     if (!startsDeclaration) continue;
 
@@ -473,6 +475,10 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const ad = agentdesk; const { db } = ad; db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("const ad = agentdesk; const next = ad; next.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("let ad; for (ad = agentdesk; ; ) ad.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("function run(ad = agentdesk) { ad.db.query('SELECT 1'); }"));
+  assert.ok(hasRawDbAccess("const run = (ad = agentdesk) => ad.db.execute('DELETE')"));
+  assert.ok(hasRawDbAccess("function run({ db } = agentdesk) { db.query('SELECT 1'); }"));
+  assert.ok(hasRawDbAccess("const run = ({ db: rawDb } = agentdesk) => rawDb.execute('DELETE')"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
@@ -486,4 +492,5 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.equal(hasRawDbAccess("const { database } = agentdesk; database.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("const { db } = other; db.query('SELECT 1')"), false);
   assert.equal(hasRawDbAccess("const ad = other; ad.db.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess("function run(ad = other) { ad.db.query('SELECT 1'); }"), false);
 });
