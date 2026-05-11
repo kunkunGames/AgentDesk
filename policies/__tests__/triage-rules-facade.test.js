@@ -4,12 +4,25 @@ var fs = require("fs");
 var path = require("path");
 
 function canStartRegex(output) {
-  for (var i = output.length - 1; i >= 0; i--) {
-    var ch = output[i];
-    if (/\s/.test(ch)) continue;
-    return /[=(:,[!&|?;{}]/.test(ch);
+  var trimmed = output.replace(/\s+$/g, "");
+  if (!trimmed) return true;
+  var wordMatch = trimmed.match(/[A-Za-z_$][A-Za-z0-9_$]*$/);
+  if (wordMatch) {
+    return [
+      "await",
+      "case",
+      "delete",
+      "in",
+      "instanceof",
+      "of",
+      "return",
+      "throw",
+      "typeof",
+      "void",
+      "yield"
+    ].includes(wordMatch[0]);
   }
-  return true;
+  return /[=(:,[!&|?;{}>]/.test(trimmed[trimmed.length - 1]);
 }
 
 function stripJsComments(content) {
@@ -147,6 +160,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk /* comment */ . db . execute('DELETE')"));
   assert.ok(hasRawDbAccess('const u = "https://example.com"; agentdesk.db.query("SELECT 1")'));
   assert.ok(hasRawDbAccess("const re = /https?:\\/\\//; agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("return /https?:\\/\\//.test(url) && agentdesk.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("(agentdesk.db).query('SELECT 1')"));
   assert.ok(hasRawDbAccess("(agentdesk['db']).execute('DELETE')"));
   assert.ok(hasRawDbAccess("const db = agentdesk.db; db.query('SELECT 1')"));
