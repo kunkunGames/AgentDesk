@@ -98,8 +98,40 @@ function stripJsComments(content) {
   return output;
 }
 
+function stripJsStrings(content) {
+  var output = "";
+  var quote = null;
+  var escaped = false;
+
+  for (var i = 0; i < content.length; i++) {
+    var ch = content[i];
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === quote) {
+        quote = null;
+        output += ch;
+      }
+      continue;
+    }
+
+    if (ch === "\"" || ch === "'" || ch === "`") {
+      quote = ch;
+      output += ch;
+      continue;
+    }
+
+    output += ch;
+  }
+
+  return output;
+}
+
 function normalizeStaticMemberAccess(content) {
-  return stripJsComments(content)
+  return stripJsStrings(stripJsComments(content)
     .replace(/\\u\{([0-9a-fA-F]+)\}/g, function(_match, codePoint) {
       return String.fromCodePoint(parseInt(codePoint, 16));
     })
@@ -110,6 +142,7 @@ function normalizeStaticMemberAccess(content) {
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
+  )
     .replace(/\.+/g, ".")
     .replace(/[()]/g, "")
     .replace(/\s+/g, "");
@@ -158,5 +191,7 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
   assert.equal(hasRawDbAccess("// agentdesk.db.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess('const msg = "agentdesk.db.query";'), false);
+  assert.equal(hasRawDbAccess("const msg = `agentdesk.db.query`;"), false);
   assert.equal(hasRawDbAccess("agentdesk.database.query('SELECT 1')"), false);
 });
