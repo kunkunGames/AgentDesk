@@ -100,6 +100,7 @@ function stripJsComments(content) {
 
 function normalizeStaticMemberAccess(content) {
   return stripJsComments(content)
+    .replace(/[\r\n]+\s*(?=[.\[])/g, "")
     .replace(/[\r\n]+/g, ";")
     .replace(/\?\s*\./g, ".")
     .replace(/\[\s*(["'`])(db|query|execute)\1\s*\]/g, ".$2")
@@ -124,6 +125,8 @@ test("triage-rules avoids raw agentdesk.db.* access", () => {
 
 test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("agentdesk.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("agentdesk\n.db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("agentdesk\n['db'].execute('DELETE')"));
   assert.ok(hasRawDbAccess("agentdesk?.db.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.db?.query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk?.db?.execute('DELETE')"));
