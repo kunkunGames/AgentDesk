@@ -298,9 +298,72 @@ function normalizeStaticMemberAccess(content) {
     .replace(/\s+/g, "");
 }
 
+function findMatchingBrace(content, startIndex) {
+  var depth = 0;
+
+  for (var i = startIndex; i < content.length; i++) {
+    var ch = content[i];
+    if (ch === "{") depth += 1;
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+
+  return -1;
+}
+
+function splitTopLevelDestructuringFields(content) {
+  var fields = [];
+  var start = 0;
+  var depth = 0;
+
+  for (var i = 0; i < content.length; i++) {
+    var ch = content[i];
+    if (ch === "{" || ch === "[" || ch === "(") {
+      depth += 1;
+      continue;
+    }
+    if (ch === "}" || ch === "]" || ch === ")") {
+      depth -= 1;
+      continue;
+    }
+    if (ch === "," && depth === 0) {
+      fields.push(content.slice(start, i));
+      start = i + 1;
+    }
+  }
+
+  fields.push(content.slice(start));
+  return fields;
+}
+
+function hasAgentdeskDbDestructuring(normalized) {
+  for (var i = 0; i < normalized.length; i++) {
+    if (normalized[i] !== "{") continue;
+
+    var prefix = normalized.slice(0, i);
+    if (!/(^|;)(const|let|var)?$/.test(prefix)) continue;
+
+    var endIndex = findMatchingBrace(normalized, i);
+    if (endIndex === -1) continue;
+
+    var suffix = normalized.slice(endIndex + 1);
+    if (!/^=agentdesk($|[^A-Za-z0-9_$])/.test(suffix)) continue;
+
+    var fields = splitTopLevelDestructuringFields(normalized.slice(i + 1, endIndex));
+    for (var j = 0; j < fields.length; j++) {
+      if (/^\.?db($|:|=)/.test(fields[j])) return true;
+    }
+  }
+
+  return false;
+}
+
 function hasRawDbAccess(content) {
   var normalized = normalizeStaticMemberAccess(content);
-  return /(^|[^A-Za-z0-9_$])agentdesk\.db([^A-Za-z0-9_$]|$)/.test(normalized);
+  return /(^|[^A-Za-z0-9_$])agentdesk\.db([^A-Za-z0-9_$]|$)/.test(normalized)
+    || hasAgentdeskDbDestructuring(normalized);
 }
 
 test("triage-rules avoids raw agentdesk.db.* access", () => {
@@ -337,6 +400,10 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.ok(hasRawDbAccess("const { query } = agentdesk.db\nquery('SELECT 1')"));
   assert.ok(hasRawDbAccess("const { execute: run } = agentdesk.db; run('DELETE')"));
   assert.ok(hasRawDbAccess("const { query: q$ } = agentdesk.db; q$('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { db } = agentdesk; db.query('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { db: rawDb } = agentdesk; rawDb.execute('DELETE')"));
+  assert.ok(hasRawDbAccess("const { cards, db: rawDb } = agentdesk\nrawDb['query']('SELECT 1')"));
+  assert.ok(hasRawDbAccess("const { db: { query } } = agentdesk; query('SELECT 1')"));
   assert.ok(hasRawDbAccess("agentdesk.db['query']('SELECT 1')"));
   assert.ok(hasRawDbAccess('agentdesk.db?.["execute"]("DELETE")'));
   assert.ok(hasRawDbAccess("agentdesk.db[`execute`]('DELETE')"));
@@ -347,4 +414,6 @@ test("triage-rules raw db guard detects common access variants", () => {
   assert.equal(hasRawDbAccess("const msg = `agentdesk.db.query`;"), false);
   assert.equal(hasRawDbAccess('const msg = `${"agentdesk.db.query"}`;'), false);
   assert.equal(hasRawDbAccess("agentdesk.database.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess("const { database } = agentdesk; database.query('SELECT 1')"), false);
+  assert.equal(hasRawDbAccess("const { db } = other; db.query('SELECT 1')"), false);
 });
