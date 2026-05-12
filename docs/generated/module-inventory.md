@@ -83,7 +83,7 @@
 | `db::auto_queue::runs` | `src/db/auto_queue/runs.rs` | 275 |  |
 | `db::auto_queue::slots` | `src/db/auto_queue/slots.rs` | 197 |  |
 | `db::auto_queue::test_support` | `src/db/auto_queue/test_support.rs` | 150 |  |
-| `db::automation_candidates` | `src/db/automation_candidates.rs` | 680 |  |
+| `db::automation_candidates` | `src/db/automation_candidates.rs` | 702 |  |
 | `db::cancel_tombstones` | `src/db/cancel_tombstones.rs` | 489 |  |
 | `db::dispatch_semaphores` | `src/db/dispatch_semaphores.rs` | 331 |  |
 | `db::dispatched_sessions` | `src/db/dispatched_sessions.rs` | 1532 | giant-file |
@@ -215,7 +215,7 @@
 | `server::routes::analytics` | `src/server/routes/analytics.rs` | 489 |  |
 | `server::routes::auth` | `src/server/routes/auth.rs` | 89 |  |
 | `server::routes::auto_queue` | `src/server/routes/auto_queue.rs` | 151 |  |
-| `server::routes::automation_candidates` | `src/server/routes/automation_candidates.rs` | 269 |  |
+| `server::routes::automation_candidates` | `src/server/routes/automation_candidates.rs` | 298 |  |
 | `server::routes::cluster` | `src/server/routes/cluster.rs` | 408 |  |
 | `server::routes::cron_api` | `src/server/routes/cron_api.rs` | 180 |  |
 | `server::routes::departments` | `src/server/routes/departments.rs` | 300 |  |
@@ -227,15 +227,15 @@
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 43 |  |
 | `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 1411 | giant-file |
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 60 |  |
-| `server::routes::docs` | `src/server/routes/docs.rs` | 5718 | giant-file |
+| `server::routes::docs` | `src/server/routes/docs.rs` | 5741 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 |  |
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 13 |  |
 | `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 93 |  |
 | `server::routes::domains::agents` | `src/server/routes/domains/agents.rs` | 53 |  |
-| `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 67 |  |
-| `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 83 |  |
+| `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 73 |  |
+| `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 87 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 39 |  |
-| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 302 |  |
+| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 296 |  |
 | `server::routes::domains::reviews` | `src/server/routes/domains/reviews.rs` | 33 |  |
 | `server::routes::escalation` | `src/server/routes/escalation.rs` | 2391 | giant-file |
 | `server::routes::github` | `src/server/routes/github.rs` | 612 |  |
@@ -328,8 +328,8 @@
 | `services::auto_queue::slot_routes` | `src/services/auto_queue/slot_routes.rs` | 268 |  |
 | `services::auto_queue::view` | `src/services/auto_queue/view.rs` | 330 |  |
 | `services::auto_queue::view_admin_routes` | `src/services/auto_queue/view_admin_routes.rs` | 725 |  |
-| `services::automation_candidate_contract` | `src/services/automation_candidate_contract.rs` | 129 |  |
-| `services::automation_candidate_materializer` | `src/services/automation_candidate_materializer.rs` | 858 |  |
+| `services::automation_candidate_contract` | `src/services/automation_candidate_contract.rs` | 112 |  |
+| `services::automation_candidate_materializer` | `src/services/automation_candidate_materializer.rs` | 815 |  |
 | `services::claude` | `src/services/claude.rs` | 2667 | giant-file |
 | `services::cluster` | `src/services/cluster/mod.rs` | 13 |  |
 | `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 798 |  |
@@ -500,7 +500,7 @@
 | `services::git::remote` | `src/services/git/remote.rs` | 49 |  |
 | `services::git::repo_resolver` | `src/services/git/repo_resolver.rs` | 257 |  |
 | `services::git::runner` | `src/services/git/runner.rs` | 420 |  |
-| `services::git::worktree_resolver` | `src/services/git/worktree_resolver.rs` | 668 |  |
+| `services::git::worktree_resolver` | `src/services/git/worktree_resolver.rs` | 640 |  |
 | `services::issue_announcements` | `src/services/issue_announcements.rs` | 483 |  |
 | `services::kanban` | `src/services/kanban.rs` | 1 |  |
 | `services::kanban_cards` | `src/services/kanban_cards.rs` | 58 |  |
@@ -526,7 +526,7 @@
 | `services::observability::turn_lifecycle` | `src/services/observability/turn_lifecycle.rs` | 904 |  |
 | `services::observability::watcher_latency` | `src/services/observability/watcher_latency.rs` | 443 |  |
 | `services::onboarding` | `src/services/onboarding.rs` | 5287 | giant-file |
-| `services::opencode` | `src/services/opencode.rs` | 2136 | giant-file |
+| `services::opencode` | `src/services/opencode.rs` | 2203 | giant-file |
 | `services::pipeline_override` | `src/services/pipeline_override.rs` | 608 |  |
 | `services::pipeline_routes` | `src/services/pipeline_routes.rs` | 644 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 25 |  |
@@ -564,7 +564,7 @@
 | `services::routines::runtime` | `src/services/routines/runtime.rs` | 786 |  |
 | `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 108 |  |
 | `services::routines::session_control` | `src/services/routines/session_control.rs` | 419 |  |
-| `services::routines::store` | `src/services/routines/store.rs` | 2868 | giant-file |
+| `services::routines::store` | `src/services/routines/store.rs` | 2865 | giant-file |
 | `services::service_error` | `src/services/service_error.rs` | 1 |  |
 | `services::session_backend` | `src/services/session_backend.rs` | 1167 | giant-file |
 | `services::session_forwarding` | `src/services/session_forwarding.rs` | 471 |  |
