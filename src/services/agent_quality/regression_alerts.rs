@@ -191,8 +191,8 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             .try_get("agent_id")
             .map_err(|error| anyhow!("decode agent_id: {error}"))?;
 
-        let turn_7d: Option<f64> = row.try_get("turn_success_rate_7d").unwrap_or(None);
-        let turn_30d: Option<f64> = row.try_get("turn_success_rate_30d").unwrap_or(None);
+        let turn_7d: Option<f64> = row.try_get("turn_success_rate_7d").unwrap_or_default();
+        let turn_30d: Option<f64> = row.try_get("turn_success_rate_30d").unwrap_or_default();
         let turn_s7: i64 = row.try_get("turn_sample_size_7d").unwrap_or(0);
         let turn_s30: i64 = row.try_get("turn_sample_size_30d").unwrap_or(0);
         if let Some(reg) = build_regression(
@@ -206,8 +206,8 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             out.push(reg);
         }
 
-        let review_7d: Option<f64> = row.try_get("review_pass_rate_7d").unwrap_or(None);
-        let review_30d: Option<f64> = row.try_get("review_pass_rate_30d").unwrap_or(None);
+        let review_7d: Option<f64> = row.try_get("review_pass_rate_7d").unwrap_or_default();
+        let review_30d: Option<f64> = row.try_get("review_pass_rate_30d").unwrap_or_default();
         let review_s7: i64 = row.try_get("review_sample_size_7d").unwrap_or(0);
         let review_s30: i64 = row.try_get("review_sample_size_30d").unwrap_or(0);
         if let Some(reg) = build_regression(
