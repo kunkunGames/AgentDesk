@@ -5,8 +5,8 @@ use axum::{
 
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
-    health_api, maintenance, messages, pipeline, prompt_manifest_retention,
-    protected_api_domain, provider_cli_api, queue_api, routines, skills_api, termination_events,
+    health_api, maintenance, messages, pipeline, prompt_manifest_retention, protected_api_domain,
+    provider_cli_api, queue_api, routines, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
