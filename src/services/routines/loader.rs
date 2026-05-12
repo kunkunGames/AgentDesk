@@ -1128,8 +1128,8 @@ mod tests {
             vec![
                 "agent-checkpoint-review.js".to_string(),
                 "monitoring/automation-candidate-detector.js".to_string(),
+                "monitoring/automation-candidate-executor.js".to_string(),
                 "monitoring/automation-candidate-recommender.js".to_string(),
-                "monitoring/automation-executor-v2.js".to_string(),
                 "monitoring/automation-executor.js".to_string(),
                 "monitoring/memento-digest-writer.js".to_string(),
                 "monitoring/working-watchdog.js".to_string(),

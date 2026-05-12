@@ -143,7 +143,7 @@ fn default_observation_source(source_kind: &str) -> &'static str {
 fn include_automation_candidate_card_observations(current_script_ref: Option<&str>) -> bool {
     matches!(
         current_script_ref.map(str::trim),
-        Some("monitoring/automation-executor-v2.js" | "monitoring/automation-executor.js")
+        Some("monitoring/automation-candidate-executor.js" | "monitoring/automation-executor.js")
     )
 }
 
@@ -308,6 +308,8 @@ pub struct RoutineRunRecord {
     pub error: Option<String>,
     pub discord_log_status: Option<String>,
     pub discord_log_error: Option<String>,
+    pub discord_message_id: Option<String>,
+    pub discord_log_sections: Value,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -367,6 +369,12 @@ pub struct RecoveredRoutineRun {
     pub script_ref: String,
     pub name: String,
     pub discord_thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunDiscordLogState {
+    pub message_id: Option<String>,
+    pub sections: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -557,7 +565,8 @@ impl RoutineStore {
         sqlx::query_as(
             r#"
             SELECT id, routine_id, status, action, turn_id, lease_expires_at,
-                   result_json, error, discord_log_status, discord_log_error, started_at,
+                   result_json, error, discord_log_status, discord_log_error,
+                   discord_message_id, discord_log_sections, started_at,
                    finished_at, created_at, updated_at
             FROM routine_runs
             WHERE routine_id = $1
@@ -1864,6 +1873,80 @@ impl RoutineStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn record_run_discord_log_section(
+        &self,
+        run_id: &str,
+        section_key: &str,
+        section_text: &str,
+    ) -> Result<RunDiscordLogState> {
+        let mut tx = self.pool.begin().await?;
+        let row: Option<(Option<String>, Value)> = sqlx::query_as(
+            r#"
+            SELECT discord_message_id, discord_log_sections
+            FROM routine_runs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("load routine run discord log state {run_id}: {e}"))?;
+
+        let Some((message_id, sections)) = row else {
+            return Err(anyhow!("routine run {run_id} not found for discord log"));
+        };
+
+        let mut object = sections.as_object().cloned().unwrap_or_default();
+        object.insert(
+            section_key.trim().to_string(),
+            Value::String(section_text.to_string()),
+        );
+        let sections = Value::Object(object);
+
+        sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET discord_log_sections = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(run_id)
+        .bind(&sections)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("record routine run discord log section {run_id}: {e}"))?;
+
+        tx.commit().await?;
+        Ok(RunDiscordLogState {
+            message_id,
+            sections,
+        })
+    }
+
+    pub async fn record_run_discord_message_id(
+        &self,
+        run_id: &str,
+        message_id: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE routine_runs
+            SET discord_message_id = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(run_id)
+        .bind(message_id)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| anyhow!("record routine run discord message id {run_id}: {e}"))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn update_discord_thread_id(
         &self,
         routine_id: &str,
@@ -2539,7 +2622,7 @@ mod tests {
     #[test]
     fn automation_candidate_card_observations_are_executor_only() {
         assert!(include_automation_candidate_card_observations(Some(
-            "monitoring/automation-executor-v2.js"
+            "monitoring/automation-candidate-executor.js"
         )));
         assert!(include_automation_candidate_card_observations(Some(
             " monitoring/automation-executor.js "
