@@ -143,7 +143,11 @@ fn default_observation_source(source_kind: &str) -> &'static str {
 fn include_automation_candidate_card_observations(current_script_ref: Option<&str>) -> bool {
     matches!(
         current_script_ref.map(str::trim),
-        Some("monitoring/automation-candidate-executor.js" | "monitoring/automation-executor.js")
+        Some(
+            "monitoring/automation-candidate-executor.js"
+                | "monitoring/automation-executor.js"
+                | "monitoring/automation-executor-v2.js"
+        )
     )
 }
 
@@ -2708,6 +2712,9 @@ mod tests {
         )));
         assert!(include_automation_candidate_card_observations(Some(
             " monitoring/automation-executor.js "
+        )));
+        assert!(include_automation_candidate_card_observations(Some(
+            "monitoring/automation-executor-v2.js"
         )));
         assert!(!include_automation_candidate_card_observations(Some(
             "monitoring/automation-candidate-recommender.js"
