@@ -556,7 +556,12 @@ impl CancelToken {
     /// Cancel and clean up any associated tmux session.
     pub fn cancel_with_tmux_cleanup(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        if let Some(name) = self.tmux_session.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(name) = self
+            .tmux_session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             #[cfg(unix)]
             {
                 crate::services::tmux_diagnostics::record_tmux_exit_reason(
@@ -594,7 +599,10 @@ impl CancelToken {
     }
 
     pub fn cancel_source(&self) -> Option<String> {
-        self.cancel_source.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.cancel_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -1081,7 +1089,10 @@ mod cancel_token_tests {
         assert_eq!(token.cancel_source(), None);
 
         register_child_pid(Some(&token), 4242);
-        assert_eq!(*token.child_pid.lock().unwrap_or_else(|e| e.into_inner()), Some(4242));
+        assert_eq!(
+            *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(4242)
+        );
 
         token.set_cancel_source("watchdog_timeout");
         assert_eq!(token.cancel_source().as_deref(), Some("watchdog_timeout"));
@@ -1644,7 +1655,10 @@ mod tests {
         assert_eq!(token.cancel_source(), None);
 
         register_child_pid(Some(&token), 4242);
-        assert_eq!(*token.child_pid.lock().unwrap_or_else(|e| e.into_inner()), Some(4242));
+        assert_eq!(
+            *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(4242)
+        );
 
         token.set_cancel_source("watchdog_timeout");
         assert_eq!(token.cancel_source().as_deref(), Some("watchdog_timeout"));
