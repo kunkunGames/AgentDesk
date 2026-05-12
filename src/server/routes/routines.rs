@@ -222,8 +222,9 @@ pub async fn list_routine_runs(
             "routine {routine_id} not found"
         )));
     }
+    let limit = clamp_api_limit(Some(query.limit.unwrap_or(20).max(0) as usize)) as i64;
     let runs = store
-        .list_runs(&routine_id, query.limit.unwrap_or(20))
+        .list_runs(&routine_id, limit)
         .await
         .map_err(store_error)?;
     Ok(Json(json!({ "runs": runs })))
