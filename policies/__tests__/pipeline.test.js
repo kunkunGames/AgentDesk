@@ -148,6 +148,27 @@ test("pipeline phase 1b: ROI-aware high-impact category escalates with three evi
   assert.ok(r.prompt.includes("gate=60/3"), "prompt should explain the category-specific gate");
 });
 
+test("pipeline phase 1c: daily cap allows more than three recommendations per day", () => {
+  const { tick } = loadRoutine(RECOMMENDER_PATH);
+  const checkpoint = {
+    version: 1,
+    candidates: {},
+    suppressions: {},
+    seen_evidence: {},
+    recommendations: [],
+    stats: {
+      recommendations_today: 3,
+      recommendation_day: "2026-05-02",
+    },
+  };
+
+  const obs = makeRunObsSet("routine-candidate:fourth-daily-signal.js");
+  const r = tick({ now: BASE_NOW, checkpoint, observations: obs, automationInventory: [] });
+
+  assert.equal(r.action, "agent", "daily cap should not block the fourth valid recommendation");
+  assert.equal(r.checkpoint.stats.recommendations_today, 4);
+});
+
 // --- Phase 2: Detector passes quality gate for a candidate_review observation ---
 
 test("pipeline phase 2: detector quality-gates candidate_review and emits agent", () => {

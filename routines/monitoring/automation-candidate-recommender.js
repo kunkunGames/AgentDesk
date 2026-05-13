@@ -4,7 +4,7 @@
 // P0: read-only, no auto-implementation, proposal-only.
 
 const SCORE_THRESHOLD = 80;
-const DAILY_CAP = 3;
+const DAILY_CAP = 20;
 const COOLDOWN_HOURS = 6;
 const MAX_EXAMPLES_PER_CANDIDATE = 3;
 const PROMPT_CAP_BYTES = 12288;
