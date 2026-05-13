@@ -271,10 +271,7 @@ impl RoutineScriptLoader {
     }
 
     pub fn get_script(&self, script_ref: &str) -> Result<Option<LoadedRoutineScript>> {
-        let scripts = self
-            .scripts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let scripts = self.scripts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(script) = scripts.get(script_ref).cloned() {
             return Ok(Some(script));
         }
@@ -324,10 +321,7 @@ impl RoutineScriptLoader {
         loaded_scripts: Vec<LoadedRoutineScript>,
         seen_refs: &HashSet<String>,
     ) -> Result<usize> {
-        let mut scripts = self
-            .scripts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut scripts = self.scripts.lock().unwrap_or_else(|e| e.into_inner());
         for script in loaded_scripts {
             scripts.insert(script.script_ref.clone(), script);
         }
