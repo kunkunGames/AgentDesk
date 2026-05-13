@@ -112,19 +112,6 @@ function _writeCardMetadata(cardId, metadata) {
   );
 }
 
-function _parseDeferredDod(rawDod) {
-  if (!rawDod) return null;
-  if (typeof rawDod === "string") {
-    try {
-      var parsed = JSON.parse(rawDod);
-      return parsed && typeof parsed === "object" ? parsed : null;
-    } catch (e) {
-      return null;
-    }
-  }
-  return typeof rawDod === "object" ? rawDod : null;
-}
-
 var INVENTORY_DOC_PATHS = [
   "docs/generated/module-inventory.md",
   "docs/generated/route-inventory.md",
@@ -630,19 +617,21 @@ var rules = {
       // Check 1: DoD completion
       // Format: { items: ["task1", "task2"], verified: ["task1"] }
       // All items must be in verified to pass.
-      var dod = _parseDeferredDod(card.deferred_dod_json);
-      if (dod) {
-        var items = dod.items || [];
-        var verified = dod.verified || [];
-        if (items.length > 0) {
-          var unverified = 0;
-          for (var i = 0; i < items.length; i++) {
-            if (verified.indexOf(items[i]) === -1) unverified++;
+      if (card.deferred_dod_json) {
+        try {
+          var dod = JSON.parse(card.deferred_dod_json);
+          var items = dod.items || [];
+          var verified = dod.verified || [];
+          if (items.length > 0) {
+            var unverified = 0;
+            for (var i = 0; i < items.length; i++) {
+              if (verified.indexOf(items[i]) === -1) unverified++;
+            }
+            if (unverified > 0) {
+              reasons.push("DoD 미완료: " + (items.length - unverified) + "/" + items.length);
+            }
           }
-          if (unverified > 0) {
-            reasons.push("DoD 미완료: " + (items.length - unverified) + "/" + items.length);
-          }
-        }
+        } catch (e) { /* parse fail = skip */ }
       }
 
       // Minimum work duration heuristic was intentionally removed.
