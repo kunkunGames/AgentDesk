@@ -541,9 +541,9 @@ async fn set_dispatch_status_on_pg_with_sync(
     if let Some(allowed_from) = allowed_from
         && !allowed_from.contains(&current_status.as_str())
     {
-        tx.rollback().await.map_err(|error| {
-            anyhow::anyhow!("rollback postgres dispatch status tx: {error}")
-        })?;
+        tx.rollback()
+            .await
+            .map_err(|error| anyhow::anyhow!("rollback postgres dispatch status tx: {error}"))?;
         return Ok(0);
     }
 
