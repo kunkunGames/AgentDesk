@@ -13,15 +13,7 @@ use std::path::{Path, PathBuf};
 /// `~` or when the home directory cannot be resolved.
 pub(crate) fn expand_tilde(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
-    if raw == "~" {
-        return dirs::home_dir().unwrap_or_else(|| path.to_path_buf());
-    }
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest);
-    }
-    path.to_path_buf()
+    crate::runtime_layout::expand_user_path(&raw).unwrap_or_else(|| path.to_path_buf())
 }
 
 #[cfg(test)]
