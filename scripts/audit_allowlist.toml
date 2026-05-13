@@ -49,7 +49,6 @@ direct_discord_sends = [
   "src/services/discord/placeholder_controller.rs#direct_discord_sends:b2a2a937b5534092",
   "src/services/discord/placeholder_controller.rs#direct_discord_sends:6f0c077286559a63",
   "src/services/discord/router/intake_gate.rs#direct_discord_sends:0a2beaabe9619b4f",
-  "src/services/discord/router/intake_gate.rs#direct_discord_sends:596126752fe9a5d2",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:f377b5c8a89499a2",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9016a6940938ce84",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:2bf7e5b93d0fda6b",
@@ -60,7 +59,6 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:b4849c24f5cb7d09",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:590c5cd6bb3b93f8",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:1c3d5094762f23e4",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9de857dea13386a4",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:26d4f3ea346a4c7b",
 ]
 
