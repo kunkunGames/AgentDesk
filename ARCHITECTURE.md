@@ -255,6 +255,7 @@ src/
 │   │   ├── health_api.rs
 │   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
+│   │   ├── idle_recap.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
