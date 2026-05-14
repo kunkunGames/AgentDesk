@@ -268,7 +268,8 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route(
                 "/channels/{channel_id}/monitoring",
-                post(super::super::monitoring::upsert_monitoring).get(super::super::monitoring::list_monitoring),
+                post(super::super::monitoring::upsert_monitoring)
+                    .get(super::super::monitoring::list_monitoring),
             )
             .route(
                 "/channels/{channel_id}/monitoring/{key}",
