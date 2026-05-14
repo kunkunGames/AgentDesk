@@ -50,19 +50,9 @@ pub fn run(
     };
     let _ = std::fs::remove_file(prompt_file);
 
-    let expanded_dir = if working_dir.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&working_dir[2..]).to_string_lossy().to_string()
-        } else {
-            working_dir.to_string()
-        }
-    } else if working_dir == "~" {
-        dirs::home_dir()
-            .map(|h| h.to_string_lossy().to_string())
-            .unwrap_or_else(|| working_dir.to_string())
-    } else {
-        working_dir.to_string()
-    };
+    let expanded_dir = crate::runtime_layout::expand_user_path(working_dir)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| working_dir.to_string());
 
     let (prompt_tx, prompt_rx) = mpsc::channel::<String>();
 
