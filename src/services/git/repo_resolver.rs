@@ -58,12 +58,9 @@ pub fn resolve_repo_dir() -> Option<String> {
 }
 
 fn expand_tilde(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if path == "~" {
-            return home.display().to_string();
-        }
-        if let Some(rest) = path.strip_prefix("~/") {
-            return home.join(rest).display().to_string();
+    if path == "~" || path.starts_with("~/") {
+        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+            return expanded.to_string_lossy().into_owned();
         }
     }
     path.to_string()

@@ -929,12 +929,65 @@ pub(in crate::services::discord) async fn handle_event(
                     }
                     return handle_model_picker_interaction(ctx, component, data).await;
                 }
+                if super::super::idle_recap_interaction::is_idle_recap_clear_custom_id(
+                    &component.data.custom_id,
+                ) {
+                    return super::super::idle_recap_interaction::handle_idle_recap_clear_interaction(
+                        ctx, component, data,
+                    )
+                    .await;
+                }
             }
         }
         serenity::FullEvent::ReactionRemove { removed_reaction } => {
             handle_reaction_remove(ctx, removed_reaction, data).await?;
         }
         serenity::FullEvent::Message { new_message } => {
+            // PR #3b: clear any active idle-recap card for this channel —
+            // the user is back, the notification has served its purpose.
+            // Spawned so it never blocks turn dispatch; lookup is keyed by
+            // channel_id, so bot messages and irrelevant channels are a
+            // cheap no-op (one indexed SELECT that returns zero rows).
+            if !new_message.author.bot
+                && let Some(pool) = data.shared.pg_pool.as_ref().cloned()
+            {
+                let http_for_clear = ctx.http.clone();
+                let channel_id_for_clear = new_message.channel_id.get();
+                tokio::spawn(async move {
+                    match crate::services::discord::idle_recap::lookup_active_recap_for_channel(
+                        &pool,
+                        channel_id_for_clear,
+                    )
+                    .await
+                    {
+                        Ok(Some((session_key, chan, msg))) => {
+                            crate::services::discord::idle_recap::delete_previous_card(
+                                &http_for_clear,
+                                chan,
+                                msg,
+                            )
+                            .await;
+                            // Compare-and-clear: only nullify the pointer
+                            // when the row still references the message we
+                            // just deleted. Guards against a stale wake-up
+                            // racing the next 5-min cycle's fresh card.
+                            let _ = crate::services::discord::idle_recap::clear_recap_pointer(
+                                &pool,
+                                &session_key,
+                                msg,
+                            )
+                            .await;
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            channel_id = channel_id_for_clear,
+                            "idle_recap clear lookup failed"
+                        ),
+                    }
+                });
+            }
+
             // ── Universal message-ID dedup ─────────────────────────────
             // Guards against the same Discord message being processed twice,
             // which can happen when thread messages are delivered as both a
