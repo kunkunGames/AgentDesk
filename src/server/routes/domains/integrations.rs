@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 
 use super::super::{
