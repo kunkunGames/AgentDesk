@@ -255,6 +255,7 @@ src/
 │   │   ├── health_api.rs
 │   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
+│   │   ├── idle_recap.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
@@ -466,6 +467,8 @@ src/
 │   │   ├── health.rs
 │   │   ├── http.rs
 │   │   ├── idle_detector.rs
+│   │   ├── idle_recap.rs
+│   │   ├── idle_recap_interaction.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
 │   │   ├── mcp_credential_watcher.rs
