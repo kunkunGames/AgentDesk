@@ -606,6 +606,7 @@ impl SupervisedWorkerRegistry {
             _ = cluster_runtime.wait_until_not_leader() => {
                 tracing::warn!(
                     worker = spec.name,
+                    target = spec.target,
                     instance_id = cluster_runtime.instance_id(),
                     "leader-only worker self-fenced after cluster leadership was lost"
                 );
@@ -635,6 +636,7 @@ impl SupervisedWorkerRegistry {
     fn log_start(&self, spec: WorkerSpec) {
         tracing::info!(
             worker = spec.name,
+            target = spec.target,
             kind = spec.kind.as_doc_str(),
             stage = spec.start_stage.as_doc_str(),
             order = spec.start_order,
@@ -652,6 +654,7 @@ impl SupervisedWorkerRegistry {
     fn log_skip(&self, spec: WorkerSpec, reason: &str) {
         tracing::info!(
             worker = spec.name,
+            target = spec.target,
             stage = spec.start_stage.as_doc_str(),
             execution_scope = spec.execution_scope.as_doc_str(),
             reason,
