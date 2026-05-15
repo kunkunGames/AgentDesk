@@ -856,13 +856,18 @@ fn highest_reason_severity(reasons: &[health::ClassifiedReason]) -> Severity {
 fn highest_reason_fix_safety(reasons: &[health::ClassifiedReason]) -> FixSafety {
     let mut result = FixSafety::ReadOnly;
     for reason in reasons {
-        result = match (result, reason.fix_safety) {
-            (FixSafety::NotFixable, _) | (_, FixSafety::NotFixable) => FixSafety::NotFixable,
-            (FixSafety::ExplicitDbRepairRequired, _) | (_, FixSafety::ExplicitDbRepairRequired) => FixSafety::ExplicitDbRepairRequired,
-            (FixSafety::ExplicitRestartRequired, _) | (_, FixSafety::ExplicitRestartRequired) => FixSafety::ExplicitRestartRequired,
-            (FixSafety::SafeLocalRepair, _) | (_, FixSafety::SafeLocalRepair) => FixSafety::SafeLocalRepair,
-            _ => FixSafety::ReadOnly,
-        };
+        result =
+            match (result, reason.fix_safety) {
+                (FixSafety::NotFixable, _) | (_, FixSafety::NotFixable) => FixSafety::NotFixable,
+                (FixSafety::ExplicitDbRepairRequired, _)
+                | (_, FixSafety::ExplicitDbRepairRequired) => FixSafety::ExplicitDbRepairRequired,
+                (FixSafety::ExplicitRestartRequired, _)
+                | (_, FixSafety::ExplicitRestartRequired) => FixSafety::ExplicitRestartRequired,
+                (FixSafety::SafeLocalRepair, _) | (_, FixSafety::SafeLocalRepair) => {
+                    FixSafety::SafeLocalRepair
+                }
+                _ => FixSafety::ReadOnly,
+            };
     }
     result
 }
