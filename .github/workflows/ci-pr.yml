@@ -334,6 +334,22 @@ jobs:
       - name: High-risk recovery lane
         run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
 
+  high_risk_recovery_required_context:
+    name: High-risk recovery (ubuntu-latest)
+    needs: high-risk-recovery
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror high-risk recovery result for branch protection
+        run: |
+          result="${{ needs.high-risk-recovery.result }}"
+          if [ "$result" = "success" ] || [ "$result" = "skipped" ]; then
+            echo "high-risk-recovery result: $result (treated as pass)"
+            exit 0
+          fi
+          echo "high-risk-recovery result: $result"
+          exit 1
+
   lint:
     name: Lint
     needs: changes
