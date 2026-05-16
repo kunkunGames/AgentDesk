@@ -55,9 +55,9 @@
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 |  |
 | `cli::doctor::health` | `src/cli/doctor/health.rs` | 164 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 256 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4603 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4622 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 375 |  |
-| `cli::init` | `src/cli/init.rs` | 1573 | giant-file |
+| `cli::init` | `src/cli/init.rs` | 1627 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 348 |  |
 | `cli::migrate::apply` | `src/cli/migrate/apply.rs` | 3146 | giant-file |
 | `cli::migrate::plan` | `src/cli/migrate/plan.rs` | 1513 | giant-file |
@@ -96,7 +96,7 @@
 | `db::dispatches::outbox::diagnostics` | `src/db/dispatches/outbox/diagnostics.rs` | 127 |  |
 | `db::dispatches::outbox::followup` | `src/db/dispatches/outbox/followup.rs` | 91 |  |
 | `db::dispatches::outbox::model` | `src/db/dispatches/outbox/model.rs` | 65 |  |
-| `db::dispatches::outbox::notify` | `src/db/dispatches/outbox/notify.rs` | 118 |  |
+| `db::dispatches::outbox::notify` | `src/db/dispatches/outbox/notify.rs` | 73 |  |
 | `db::dispatches::outbox::retry` | `src/db/dispatches/outbox/retry.rs` | 28 |  |
 | `db::intake_outbox` | `src/db/intake_outbox.rs` | 1764 | giant-file |
 | `db::kanban` | `src/db/kanban.rs` | 1 |  |
@@ -595,7 +595,7 @@
 | `services::turn_orchestrator` | `src/services/turn_orchestrator.rs` | 2679 | giant-file |
 | `supervisor` | `src/supervisor/mod.rs` | 867 |  |
 | `ui` | `src/ui/mod.rs` | 1 |  |
-| `ui::ai_screen` | `src/ui/ai_screen.rs` | 159 |  |
+| `ui::ai_screen` | `src/ui/ai_screen.rs` | 155 |  |
 | `utils` | `src/utils/mod.rs` | 7 |  |
 | `utils::api` | `src/utils/api.rs` | 53 |  |
 | `utils::async_bridge` | `src/utils/async_bridge.rs` | 137 |  |
