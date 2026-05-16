@@ -3,7 +3,7 @@
 Routes commonly clamp ``limit`` / ``days`` query params with bespoke
 ``min(...)`` or ``.clamp(...)`` calls. The shared helper
 ``crate::utils::api::clamp_api_limit`` exists for the standard API-limit shape
-``clamp(1, 100)``; any inline call with those exact bounds outside the helper
+``clamp(1, 2000)``; any inline call with those exact bounds outside the helper
 definition is flagged regardless of how many files share the pattern (#1698).
 Other clamp signatures are still reported when they recur across 3+ files,
 preserving the original conservative aggregation.
@@ -28,10 +28,10 @@ PATTERN = re.compile(
     r"\b(limit|days)\b\s*\.?\s*(?:clamp|min|max)\s*\(\s*([^)]{1,80})\)",
 )
 
-# Inline ``clamp(1, 100)`` is the canonical API-limit shape that the shared
+# Inline ``clamp(1, 2000)`` is the canonical API-limit shape that the shared
 # helper ``crate::utils::api::clamp_api_limit`` covers (#1698). Any signature
 # matching this argument shape is flagged irrespective of file count.
-API_LIMIT_SIGNATURE = "1, 100"
+API_LIMIT_SIGNATURE = "1, 2000"
 
 HELPER_OPT_OUT_MARKER = "audit-allow: limit_clamp_helper_definition"
 
@@ -58,7 +58,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
 
     findings: list[Finding] = []
     for sig, hits in by_signature.items():
-        # Strict gate: the canonical API-limit shape ``clamp(1, 100)`` is
+        # Strict gate: the canonical API-limit shape ``clamp(1, 2000)`` is
         # owned by ``clamp_api_limit``; any inline occurrence is flagged
         # regardless of how many files share it.
         is_api_limit = sig.endswith(f"::{API_LIMIT_SIGNATURE}")
@@ -90,7 +90,7 @@ CHECK = CheckSpec(
     key="limit_clamp_duplication",
     title="limit/days clamp duplication",
     description=(
-        "Inline `clamp(1, 100)` is owned by `crate::utils::api::clamp_api_limit` "
+        "Inline `clamp(1, 2000)` is owned by `crate::utils::api::clamp_api_limit` "
         "and is flagged on every site outside the helper definition. Other "
         "limit/days clamp expressions are flagged when they appear in 3+ "
         "source files, signalling another shared helper candidate."

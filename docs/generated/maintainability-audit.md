@@ -73,7 +73,7 @@ _No findings._
 
 ## limit/days clamp duplication (`limit_clamp_duplication`)
 
-Inline `clamp(1, 100)` is owned by `crate::utils::api::clamp_api_limit` and is flagged on every site outside the helper definition. Other limit/days clamp expressions are flagged when they appear in 3+ source files, signalling another shared helper candidate.
+Inline `clamp(1, 2000)` is owned by `crate::utils::api::clamp_api_limit` and is flagged on every site outside the helper definition. Other limit/days clamp expressions are flagged when they appear in 3+ source files, signalling another shared helper candidate.
 
 _No findings._
 
@@ -94,4 +94,3 @@ _No findings._
 File-write callsites that touch alias paths listed in docs/source-of-truth.md. Writes should target the canonical path.
 
 _No findings._
-
