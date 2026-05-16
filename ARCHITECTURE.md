@@ -255,6 +255,7 @@ src/
 │   │   ├── health_api.rs
 │   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
+│   │   ├── idle_recap.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
@@ -339,10 +340,12 @@ src/
 │   │   ├── fsm.rs
 │   │   ├── order_routes.rs
 │   │   ├── phase_gate.rs
+│   │   ├── phase_gate_catalog.rs
 │   │   ├── planning.rs
 │   │   ├── query.rs
 │   │   ├── route.rs
 │   │   ├── route_generate.rs
+│   │   ├── route_request_generate.rs
 │   │   ├── route_types.rs
 │   │   ├── runtime.rs
 │   │   ├── slot_routes.rs
@@ -351,6 +354,14 @@ src/
 │   ├── automation_candidate_materializer/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
+│   ├── claude_tui/
+│   │   ├── hook_bundle.rs
+│   │   ├── hook_relay.rs
+│   │   ├── hook_server.rs
+│   │   ├── input.rs
+│   │   ├── mod.rs
+│   │   ├── session.rs
+│   │   └── transcript_tail.rs
 │   ├── cluster/
 │   │   ├── intake_router_hook.rs
 │   │   ├── intake_routing.rs
@@ -466,6 +477,8 @@ src/
 │   │   ├── health.rs
 │   │   ├── http.rs
 │   │   ├── idle_detector.rs
+│   │   ├── idle_recap.rs
+│   │   ├── idle_recap_interaction.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
 │   │   ├── mcp_credential_watcher.rs
@@ -512,6 +525,7 @@ src/
 │   │   ├── tmux_restart_handoff.rs
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
+│   │   ├── voice_background_driver.rs
 │   │   ├── voice_barge_in.rs
 │   │   └── voice_routing.rs
 │   ├── dispatches/
@@ -627,6 +641,7 @@ src/
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_exec.rs
+│   ├── provider_hosting.rs
 │   ├── provider_runtime.rs
 │   ├── queue.rs
 │   ├── qwen.rs
