@@ -124,14 +124,22 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: "no providers registered in health payload".to_string(),
             next_step: "check agentdesk.yaml provider config and restart dcserver".to_string(),
         },
-        ["global_active_counter_out_of_bounds", raw_val, provider_active, global_finalizing] => ClassifiedReason {
+        [
+            "global_active_counter_out_of_bounds",
+            raw_val,
+            provider_active,
+            global_finalizing,
+        ] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "health",
             severity: Severity::Warning,
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
-            summary: format!("global active counter out of bounds ({raw_val}, {provider_active}, {global_finalizing})"),
-            next_step: "monitor for persistent drift; usually self-corrects or restarts cleanly".to_string(),
+            summary: format!(
+                "global active counter out of bounds ({raw_val}, {provider_active}, {global_finalizing})"
+            ),
+            next_step: "monitor for persistent drift; usually self-corrects or restarts cleanly"
+                .to_string(),
         },
         ["db_unavailable"] => ClassifiedReason {
             raw: raw.to_string(),
@@ -203,16 +211,24 @@ mod tests {
         let disk = classify_degraded_reason("disk_low_free_bytes:102400");
         assert_eq!(disk.subsystem, "health");
         assert_eq!(disk.severity, super::Severity::Warning);
-        assert_eq!(disk.summary, "disk space is critically low (102400 bytes free)");
+        assert_eq!(
+            disk.summary,
+            "disk space is critically low (102400 bytes free)"
+        );
 
         let no_providers = classify_degraded_reason("no_providers_registered");
         assert_eq!(no_providers.subsystem, "provider_runtime");
         assert_eq!(no_providers.severity, super::Severity::Error);
 
-        let out_of_bounds = classify_degraded_reason("global_active_counter_out_of_bounds:raw=1000:provider_active_turns=1:global_finalizing=0");
+        let out_of_bounds = classify_degraded_reason(
+            "global_active_counter_out_of_bounds:raw=1000:provider_active_turns=1:global_finalizing=0",
+        );
         assert_eq!(out_of_bounds.subsystem, "health");
         assert_eq!(out_of_bounds.severity, super::Severity::Warning);
-        assert_eq!(out_of_bounds.summary, "global active counter out of bounds (raw=1000, provider_active_turns=1, global_finalizing=0)");
+        assert_eq!(
+            out_of_bounds.summary,
+            "global active counter out of bounds (raw=1000, provider_active_turns=1, global_finalizing=0)"
+        );
     }
 
     #[test]
