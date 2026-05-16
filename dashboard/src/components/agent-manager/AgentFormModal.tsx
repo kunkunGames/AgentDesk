@@ -118,24 +118,21 @@ export default function AgentFormModal({
                     setForm({ ...form, sprite_number: next });
                   }}
                 >
-                  <span aria-hidden="true">▲</span>
+                  ▲
                 </button>
                 <div
-                  className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0 relative"
+                  className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0"
                   style={{ border: "2px solid var(--th-input-border)" }}
                 >
-                  <span className="sr-only" aria-live="polite" aria-atomic="true">
-                    {spriteNum > 0 ? tr(`선택된 스프라이트: ${spriteNum}번`, `Selected sprite: ${spriteNum}`) : tr(`선택된 아바타: ${form.avatar_emoji || "🤖"}`, `Selected avatar: ${form.avatar_emoji || "🤖"}`)}
-                  </span>
                   {spriteNum > 0 ? (
                     <img
                       src={`/sprites/${spriteNum}-D-1.png`}
-                      alt=""
+                      alt={`sprite ${spriteNum}`}
                       className="w-full h-full object-cover"
                       style={{ imageRendering: "pixelated" }}
                     />
                   ) : (
-                    <span className="text-2xl" aria-hidden="true">{form.avatar_emoji || "🤖"}</span>
+                    <span className="text-2xl">{form.avatar_emoji || "🤖"}</span>
                   )}
                 </div>
                 <button
@@ -153,7 +150,7 @@ export default function AgentFormModal({
                     setForm({ ...form, sprite_number: next });
                   }}
                 >
-                  <span aria-hidden="true">▼</span>
+                  ▼
                 </button>
               </div>
               <div className="flex-1 min-w-0">
