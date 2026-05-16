@@ -88,6 +88,51 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("pipeline override warnings count is {count}"),
             next_step: "run config audit and inspect override report".to_string(),
         },
+        ["startup_doctor_failed", count] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Error,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("startup doctor failed with {count} checks"),
+            next_step: "run `agentdesk doctor` to inspect and repair".to_string(),
+        },
+        ["startup_doctor_warned", count] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("startup doctor warned about {count} checks"),
+            next_step: "run `agentdesk doctor` to inspect and repair".to_string(),
+        },
+        ["disk_low_free_bytes", bytes] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("disk space is critically low ({bytes} bytes free)"),
+            next_step: "free up disk space or expand volume".to_string(),
+        },
+        ["no_providers_registered"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "provider_runtime",
+            severity: Severity::Error,
+            fix_safety: FixSafety::ExplicitRestartRequired,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: "no providers registered in health payload".to_string(),
+            next_step: "check agentdesk.yaml provider config and restart dcserver".to_string(),
+        },
+        ["global_active_counter_out_of_bounds", raw_val, provider_active, global_finalizing] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "health",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: format!("global active counter out of bounds ({raw_val}, {provider_active}, {global_finalizing})"),
+            next_step: "monitor for persistent drift; usually self-corrects or restarts cleanly".to_string(),
+        },
         ["db_unavailable"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "postgres",
@@ -141,7 +186,34 @@ pub(crate) fn is_loopback_base_url(base: &str) -> bool {
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
-    use super::is_loopback_base_url;
+    use super::{classify_degraded_reason, is_loopback_base_url};
+
+    #[test]
+    fn classify_degraded_reason_handles_new_signals() {
+        let failed = classify_degraded_reason("startup_doctor_failed:3");
+        assert_eq!(failed.subsystem, "health");
+        assert_eq!(failed.severity, super::Severity::Error);
+        assert_eq!(failed.summary, "startup doctor failed with 3 checks");
+
+        let warned = classify_degraded_reason("startup_doctor_warned:2");
+        assert_eq!(warned.subsystem, "health");
+        assert_eq!(warned.severity, super::Severity::Warning);
+        assert_eq!(warned.summary, "startup doctor warned about 2 checks");
+
+        let disk = classify_degraded_reason("disk_low_free_bytes:102400");
+        assert_eq!(disk.subsystem, "health");
+        assert_eq!(disk.severity, super::Severity::Warning);
+        assert_eq!(disk.summary, "disk space is critically low (102400 bytes free)");
+
+        let no_providers = classify_degraded_reason("no_providers_registered");
+        assert_eq!(no_providers.subsystem, "provider_runtime");
+        assert_eq!(no_providers.severity, super::Severity::Error);
+
+        let out_of_bounds = classify_degraded_reason("global_active_counter_out_of_bounds:raw=1000:provider_active_turns=1:global_finalizing=0");
+        assert_eq!(out_of_bounds.subsystem, "health");
+        assert_eq!(out_of_bounds.severity, super::Severity::Warning);
+        assert_eq!(out_of_bounds.summary, "global active counter out of bounds (raw=1000, provider_active_turns=1, global_finalizing=0)");
+    }
 
     #[test]
     fn loopback_base_url_accepts_http_and_https_local_targets() {
