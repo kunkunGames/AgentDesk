@@ -1,7 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Bell,
-  BellRing,
   Building2,
   ChevronRight,
   Flame,
@@ -11,9 +10,6 @@ import {
   Home,
   LayoutDashboard,
   Menu,
-  Moon,
-  Sun,
-  Search,
   Settings,
   Sparkles,
   Target,
@@ -21,7 +17,6 @@ import {
   Users,
   WifiOff,
   Wrench,
-  X,
   Zap,
 } from "lucide-react";
 import {
@@ -54,6 +49,7 @@ import {
 import { deriveOfficeAgentState } from "../components/office-view/officeAgentState";
 import { MiniRateLimitBar } from "../components/office-view/OfficeInsightPanel";
 import OfficeSelectorBar from "../components/OfficeSelectorBar";
+import { useFocusTrap } from "../components/common/overlay";
 import { MOBILE_LAYOUT_MEDIA_QUERY } from "./breakpoints";
 import {
   DEFAULT_ROUTE_PATH,
@@ -64,6 +60,11 @@ import {
   type AppRouteId,
 } from "./routes";
 import type { DashboardTab } from "./dashboardTabs";
+import { AppMobileNavigation } from "./AppMobileNavigation";
+import { AppSidebar } from "./AppSidebar";
+import { AppShortcutHelpModal } from "./AppShortcutHelpModal";
+import { AppTopBar } from "./AppTopBar";
+import { AppTweaksPanel } from "./AppTweaksPanel";
 import {
   DEFAULT_ACCENT_PRESET,
   THEME_STORAGE_KEY,
@@ -77,11 +78,11 @@ import {
   type AccentPreset,
   type ThemePreference,
 } from "./themePreferences";
+import { formatRelativeTime, notificationColor } from "./shellFormatting";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { useLocalStorage } from "../lib/useLocalStorage";
 import {
   DailyMissions,
-  LevelRing,
   StreakCounter,
   getAgentLevelFromXp,
   getMissionResetCountdown,
@@ -119,17 +120,25 @@ interface AppShellProps {
 type AgentsPageTab = "agents" | "departments" | "backlog" | "dispatch";
 type KanbanSignalFocus = "review" | "blocked" | "requested" | "stalled";
 
-const MOBILE_TABBAR_SAFE_AREA_HEIGHT = "calc(3.5rem + env(safe-area-inset-bottom))";
+const MOBILE_TABBAR_SAFE_AREA_HEIGHT = "calc(4rem + env(safe-area-inset-bottom))";
 
-const HOME_DEFAULT_WIDGETS = [
+const HOME_PRIMARY_WIDGET_IDS = [
   "m_tokens",
   "m_cost",
   "m_progress",
   "m_rate_limit",
   "kanban",
+] as const;
+const HOME_SUPPORT_WIDGET_IDS = [
   "quality",
   "missions",
+] as const;
+const HOME_DEFAULT_WIDGETS = [
+  ...HOME_PRIMARY_WIDGET_IDS,
+  ...HOME_SUPPORT_WIDGET_IDS,
 ];
+const HOME_PRIMARY_WIDGET_SET = new Set<string>(HOME_PRIMARY_WIDGET_IDS);
+const HOME_SUPPORT_WIDGET_SET = new Set<string>(HOME_SUPPORT_WIDGET_IDS);
 const MOBILE_PRIMARY_ROUTE_IDS: AppRouteId[] = [
   "home",
   "office",
@@ -223,29 +232,6 @@ function getOperatorLevelTitle(level: number, isKo: boolean) {
   return titles[index];
 }
 
-const THEME_OPTIONS: Array<{
-  id: ThemePreference;
-  labelKo: string;
-  labelEn: string;
-}> = [
-  { id: "auto", labelKo: "자동", labelEn: "Auto" },
-  { id: "dark", labelKo: "다크", labelEn: "Dark" },
-  { id: "light", labelKo: "라이트", labelEn: "Light" },
-];
-
-const ACCENT_OPTIONS: Array<{
-  id: AccentPreset;
-  label: string;
-  token: string;
-}> = [
-  { id: "indigo", label: "Indigo", token: "--accent-indigo" },
-  { id: "violet", label: "Violet", token: "--accent-violet" },
-  { id: "amber", label: "Amber", token: "--accent-amber" },
-  { id: "rose", label: "Rose", token: "--accent-rose" },
-  { id: "cyan", label: "Cyan", token: "--accent-cyan" },
-  { id: "lime", label: "Lime", token: "--accent-lime" },
-];
-
 function assertKanbanDispatchMutationComplete(
   result: api.KanbanDispatchMutationResponse,
   label: string,
@@ -323,6 +309,7 @@ export default function AppShell({
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
   const [showTweaksPanel, setShowTweaksPanel] = useState(false);
   const [showMobileMoreMenu, setShowMobileMoreMenu] = useState(false);
+  const mobileMoreMenuRef = useFocusTrap(showMobileMoreMenu);
   const [agentsPageTab, setAgentsPageTab] = useState<AgentsPageTab>("agents");
   const [kanbanSignalFocus, setKanbanSignalFocus] =
     useState<KanbanSignalFocus | null>(null);
@@ -630,423 +617,40 @@ export default function AppShell({
       }}
     >
       {!isMobileViewport && (
-        <aside
-          data-testid="app-sidebar-nav"
-          className="flex w-[236px] shrink-0 flex-col border-r"
-          style={{
-            borderColor: "var(--th-border-subtle)",
-            background:
-              "linear-gradient(180deg, color-mix(in srgb, var(--th-nav-bg) 98%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 92%, transparent) 100%)",
-          }}
-        >
-          <div
-            className="flex h-16 shrink-0 items-center border-b px-4"
-            style={{ borderColor: "var(--th-border-subtle)" }}
-          >
-            <div className="flex items-center gap-2.5">
-              <div
-                className="flex h-9 w-9 items-center justify-center rounded-xl text-[13px] font-semibold"
-                style={{
-                  background: "var(--th-accent-primary-soft)",
-                  color: "var(--th-accent-primary)",
-                }}
-              >
-                AD
-              </div>
-              <div className="min-w-0 leading-tight">
-                <div
-                  className="truncate text-sm font-semibold"
-                  style={{ color: "var(--th-text-heading)" }}
-                >
-                  AgentDesk
-                </div>
-                <div
-                  className="truncate text-[11px]"
-                  style={{ color: "var(--th-text-muted)" }}
-                >
-                  v2.4.1
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto px-3 py-4">
-            {SIDEBAR_SECTION_ORDER.map((section) => {
-              const routes = PRIMARY_ROUTES.filter(
-                (route) => route.section === section.id,
-              );
-              return (
-                <div key={section.id} className="mb-5">
-                  <div
-                    className="px-3 pb-2 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                    style={{ color: "var(--th-text-muted)" }}
-                  >
-                    {isKo ? section.labelKo : section.labelEn}
-                  </div>
-                  <div className="space-y-1">
-                    {routes.map((route) => (
-                      <SidebarRouteButton
-                        key={route.id}
-                        route={route}
-                        currentRouteId={currentRoute?.id ?? null}
-                        isKo={isKo}
-                        badge={sidebarBadgeForRoute(route.id)}
-                        onNavigate={() => {
-                          if (route.id === "agents") {
-                            setAgentsPageTab("agents");
-                          }
-                          navigateToRoute(route.path);
-                        }}
-                      />
-                    ))}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <div
-            className="border-t px-3 py-4"
-            style={{ borderColor: "var(--th-border-subtle)" }}
-          >
-            <div className="space-y-2">
-              <div
-                className="flex items-center gap-2 rounded-2xl border px-3 py-2"
-                style={{
-                  borderColor: "var(--th-border-subtle)",
-                  background: "var(--th-overlay-subtle)",
-                  color: "var(--th-text-muted)",
-                }}
-              >
-                <span
-                  className={`h-2 w-2 rounded-full ${wsConnected ? "animate-pulse" : ""}`}
-                  style={{
-                    background: wsConnected ? "var(--th-accent-success)" : "var(--th-accent-danger)",
-                  }}
-                />
-                <span className="font-mono text-[11px]">
-                  {wsConnected
-                    ? tr("2/2 providers", "2/2 providers")
-                    : tr("0/2 providers", "0/2 providers")}
-                </span>
-              </div>
-
-              <div
-                className="flex items-center gap-3 rounded-2xl border px-3 py-3"
-                style={{
-                  borderColor: "var(--th-border-subtle)",
-                  background:
-                    "color-mix(in srgb, var(--th-card-bg) 90%, transparent)",
-                }}
-              >
-                <div className="shrink-0">
-                  <LevelRing
-                    dataTestId="sidebar-user-level-ring"
-                    value={Math.round(currentUserLevel.progress * 100)}
-                    size={40}
-                    stroke={3}
-                    color="var(--th-accent-primary)"
-                    trackColor="color-mix(in srgb, var(--th-overlay-medium) 86%, transparent)"
-                  >
-                    <div
-                      className="flex h-8 w-8 items-center justify-center rounded-full text-[11px] font-semibold"
-                      style={{
-                        background: "var(--th-overlay-subtle)",
-                        color: "var(--th-text-primary)",
-                      }}
-                    >
-                      AD
-                    </div>
-                  </LevelRing>
-                </div>
-                <div className="min-w-0">
-                  <div
-                    className="truncate text-sm font-medium"
-                    style={{ color: "var(--th-text-heading)" }}
-                  >
-                    {currentUserLabel}
-                  </div>
-                  <div
-                    className="truncate text-[11px]"
-                    style={{ color: "var(--th-text-muted)" }}
-                  >
-                    {currentUserDetail}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        </aside>
+        <AppSidebar
+          currentRouteId={currentRoute?.id ?? null}
+          currentUserDetail={currentUserDetail}
+          currentUserLabel={currentUserLabel}
+          currentUserProgress={currentUserLevel.progress}
+          iconForRoute={iconForRoute}
+          isKo={isKo}
+          navigateToRoute={navigateToRoute}
+          routeBadge={sidebarBadgeForRoute}
+          routes={PRIMARY_ROUTES}
+          sections={SIDEBAR_SECTION_ORDER}
+          setAgentsPageTab={setAgentsPageTab}
+          wsConnected={wsConnected}
+        />
       )}
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <header
-          data-testid="topbar"
-          className="relative flex min-h-16 shrink-0 items-center border-b px-4 py-2 sm:px-5"
-          style={{
-            zIndex: SHELL_HEADER_Z_INDEX,
-            borderColor: "var(--th-border-subtle)",
-            background:
-              "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 93%, transparent) 100%)",
-            backdropFilter: "blur(14px)",
-          }}
-        >
-          <div className="flex w-full flex-wrap items-center gap-2 sm:flex-nowrap">
-            <div className="min-w-0 basis-full sm:flex-1">
-              <div
-                data-testid="topbar-breadcrumb"
-                className="flex min-w-0 items-center gap-2 overflow-hidden text-[12px] font-medium"
-                style={{ color: "var(--th-text-muted)" }}
-              >
-                <span className="shrink-0">AgentDesk</span>
-                <ChevronRight size={12} className="shrink-0" />
-                <span className="truncate whitespace-nowrap">
-                  {currentRoute ? (isKo ? currentRoute.labelKo : currentRoute.labelEn) : (isKo ? "홈" : "Home")}
-                </span>
-              </div>
-            </div>
-
-            <label
-              data-testid="topbar-search"
-              className="order-3 flex min-w-0 flex-1 items-center gap-2 rounded-2xl border px-3 py-2 text-sm sm:order-none sm:max-w-[18rem]"
-              style={{
-                borderColor: "var(--th-border-subtle)",
-                background:
-                  "color-mix(in srgb, var(--th-bg-surface) 82%, transparent)",
-              }}
-            >
-              <Search size={15} style={{ color: "var(--th-text-muted)" }} />
-              <input
-                type="search"
-                readOnly
-                value=""
-                onFocus={() => setShowCommandPalette(true)}
-                onClick={() => setShowCommandPalette(true)}
-                placeholder={tr(
-                  "검색…",
-                  "Search…",
-                )}
-                className="w-full bg-transparent text-sm outline-none"
-                style={{ color: "var(--th-text-primary)" }}
-                aria-label={tr("검색 열기", "Open search")}
-              />
-              <kbd
-                className="hidden rounded-lg px-2 py-1 text-[11px] sm:inline-flex"
-                style={{
-                  background: "var(--th-overlay-subtle)",
-                  color: "var(--th-text-muted)",
-                }}
-              >
-                ⌘K
-              </kbd>
-            </label>
-
-            <div className="ml-auto flex shrink-0 items-center justify-end gap-2 sm:ml-0">
-              <button
-                type="button"
-                onClick={toggleShellTheme}
-                className="flex h-9 w-9 items-center justify-center rounded-2xl border transition-colors hover:bg-white/5"
-                style={{ borderColor: "var(--th-border-subtle)" }}
-                aria-label={tr(
-                  resolvedTheme === "dark"
-                    ? "라이트 테마로 전환"
-                    : "다크 테마로 전환",
-                  resolvedTheme === "dark"
-                    ? "Switch to light theme"
-                    : "Switch to dark theme",
-                )}
-                title={tr(
-                  resolvedTheme === "dark"
-                    ? "라이트 테마로 전환"
-                    : "다크 테마로 전환",
-                  resolvedTheme === "dark"
-                    ? "Switch to light theme"
-                    : "Switch to dark theme",
-                )}
-              >
-                {resolvedTheme === "dark" ? (
-                  <Sun size={18} />
-                ) : (
-                  <Moon size={18} />
-                )}
-              </button>
-
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setShowNotificationPanel((prev) => {
-                      if (!prev) setShowTweaksPanel(false);
-                      return !prev;
-                    })
-                  }
-                  className="relative flex h-9 w-9 items-center justify-center rounded-2xl border transition-colors hover:bg-white/5"
-                  style={{ borderColor: "var(--th-border-subtle)" }}
-                  aria-label={tr("알림 보기", "View notifications")}
-                  title={tr("알림 보기", "View notifications")}
-                >
-                  {notificationBadgeCount > 0 ? (
-                    <BellRing size={18} />
-                  ) : (
-                    <Bell size={18} />
-                  )}
-                  {notificationBadgeCount > 0 && (
-                    <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-semibold text-white">
-                      {notificationBadgeCount > 9 ? "9+" : notificationBadgeCount}
-                    </span>
-                  )}
-                </button>
-
-                {showNotificationPanel && (
-                  <div
-                    /* The bell sits on the left side of the topbar action
-                       cluster on mobile (it follows the theme toggle), so
-                       anchoring with `right-0` made the popup expand
-                       leftward off the viewport. Anchor to `left-0` so the
-                       popup grows toward the empty topbar area to the right
-                       on every breakpoint, and cap width to the actual
-                       viewport so a 22rem popup can never overflow on a
-                       narrow phone (#1253 follow-up). */
-                    className="absolute left-0 top-12 w-[min(22rem,calc(100vw-1.5rem))] max-w-[calc(100vw-1.5rem)] rounded-3xl border p-3 shadow-2xl"
-                    style={{
-                      zIndex: SHELL_POPOVER_Z_INDEX,
-                      borderColor: "var(--th-border-subtle)",
-                      background:
-                        "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 95%, transparent) 100%)",
-                    }}
-                  >
-                    <div className="flex items-center justify-between gap-3 px-1 pb-2">
-                      <div>
-                        <div
-                          className="text-sm font-semibold"
-                          style={{ color: "var(--th-text-heading)" }}
-                        >
-                          {tr("알림", "Notifications")}
-                        </div>
-                        <div
-                          className="text-xs"
-                          style={{ color: "var(--th-text-muted)" }}
-                        >
-                          {tr(
-                            "최근 이벤트와 회의 후속 상태",
-                            "Recent events and meeting follow-ups",
-                          )}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => setShowNotificationPanel(false)}
-                        className="flex h-8 w-8 items-center justify-center rounded-xl text-[var(--th-text-muted)]"
-                        aria-label={tr("알림 창 닫기", "Close notification panel")}
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
-
-                    <div className="space-y-2">
-                      <NotificationSummaryRow
-                        label={tr("미해결 회의", "Open meetings")}
-                        value={unresolvedMeetingsCount}
-                        accent="var(--th-accent-warn)"
-                      />
-                      <NotificationSummaryRow
-                        label={tr("최근 토스트", "Recent toasts")}
-                        value={recentNotifications.length}
-                        accent="var(--th-accent-info)"
-                      />
-                    </div>
-
-                    <div className="mt-3 space-y-2">
-                      {recentNotifications.length === 0 ? (
-                        <div
-                          className="rounded-2xl border px-3 py-4 text-sm"
-                          style={{
-                            borderColor: "var(--th-border-subtle)",
-                            color: "var(--th-text-muted)",
-                            background: "var(--th-overlay-subtle)",
-                          }}
-                        >
-                          {tr("새 알림이 없습니다.", "No recent notifications.")}
-                        </div>
-                      ) : (
-                        recentNotifications.map((notification) => (
-                          <div
-                            key={notification.id}
-                            className="rounded-2xl border px-3 py-3"
-                            style={{
-                              borderColor: "var(--th-border-subtle)",
-                              background: "var(--th-overlay-subtle)",
-                            }}
-                          >
-                            <div className="flex items-start gap-3">
-                              <span
-                                className="mt-1 h-2.5 w-2.5 rounded-full"
-                                style={{
-                                  background: notificationColor(notification.type),
-                                }}
-                              />
-                              <div className="min-w-0 flex-1">
-                                <div
-                                  className="text-sm leading-relaxed"
-                                  style={{ color: "var(--th-text-primary)" }}
-                                >
-                                  {notification.message}
-                                </div>
-                                <div
-                                  className="mt-1 text-[11px]"
-                                  style={{ color: "var(--th-text-muted)" }}
-                                >
-                                  {formatRelativeTime(notification.ts, isKo)}
-                                </div>
-                              </div>
-                              <button
-                                type="button"
-                                onClick={() => dismissNotification(notification.id)}
-                                className="flex h-8 w-8 items-center justify-center rounded-xl text-[var(--th-text-muted)]"
-                                aria-label={tr("알림 지우기", "Dismiss notification")}
-                              >
-                                <X size={12} />
-                              </button>
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowNotificationPanel(false);
-                        navigateToRoute("/meetings");
-                      }}
-                      className="mt-3 flex w-full items-center justify-center gap-2 rounded-2xl border px-3 py-2 text-sm font-medium transition-colors hover:bg-white/5"
-                      style={{ borderColor: "var(--th-border-subtle)" }}
-                    >
-                      <Sparkles size={15} />
-                      {tr("회의 페이지로 이동", "Open meetings page")}
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              <button
-                type="button"
-                onClick={() =>
-                  setShowTweaksPanel((prev) => {
-                    if (!prev) setShowNotificationPanel(false);
-                    return !prev;
-                  })
-                }
-                className="flex h-9 w-9 items-center justify-center rounded-2xl border transition-colors hover:bg-white/5"
-                style={{ borderColor: "var(--th-border-subtle)" }}
-                aria-label={tr("디자인 설정 열기", "Open tweaks")}
-                title={tr("디자인 설정 열기", "Open tweaks")}
-              >
-                <Settings size={18} />
-              </button>
-            </div>
-          </div>
-        </header>
+        <AppTopBar
+          currentRoute={currentRoute ?? null}
+            dismissNotification={dismissNotification}
+            headerZIndex={SHELL_HEADER_Z_INDEX}
+            isKo={isKo}
+          navigateToRoute={navigateToRoute}
+          notificationBadgeCount={notificationBadgeCount}
+          popoverZIndex={SHELL_POPOVER_Z_INDEX}
+          recentNotifications={recentNotifications}
+          resolvedTheme={resolvedTheme}
+          setShowCommandPalette={setShowCommandPalette}
+          setShowNotificationPanel={setShowNotificationPanel}
+          setShowTweaksPanel={setShowTweaksPanel}
+          showNotificationPanel={showNotificationPanel}
+          toggleShellTheme={toggleShellTheme}
+          unresolvedMeetingsCount={unresolvedMeetingsCount}
+        />
 
         {currentRoute?.showOfficeSelector && offices.length > 0 && (
           <OfficeSelectorBar
@@ -1259,11 +863,7 @@ export default function AppShell({
                 element={
                   <OpsPageView
                     wsConnected={wsConnected}
-                    offices={offices}
-                    allAgents={allAgents}
-                    selectedOfficeId={selectedOfficeId}
                     isKo={isKo}
-                    onChanged={handleOfficeChanged}
                   />
                 }
               />
@@ -1325,193 +925,21 @@ export default function AppShell({
       </div>
 
       {isMobileViewport && (
-        <>
-          <nav
-            data-testid="app-mobile-tabbar"
-            className="fixed bottom-0 left-0 right-0 flex items-start justify-around border-t"
-            style={{
-              height: MOBILE_TABBAR_SAFE_AREA_HEIGHT,
-              zIndex: SHELL_TABBAR_Z_INDEX,
-              borderColor: "var(--th-border-subtle)",
-              background:
-                "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 98%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 96%, transparent) 100%)",
-              backdropFilter: "blur(18px)",
-              boxShadow: "0 -10px 30px -20px color-mix(in srgb, black 70%, transparent)",
-              paddingBottom: "env(safe-area-inset-bottom)",
-              paddingLeft: "env(safe-area-inset-left)",
-              paddingRight: "env(safe-area-inset-right)",
-            }}
-          >
-            {mobilePrimaryRoutes.map((route) => {
-              const Icon = iconForRoute(route.id);
-              const isActive = activeMobileRouteId === route.id;
-              const badge = route.id === "kanban" ? kanbanBadgeCount || undefined : undefined;
-              return (
-                <button
-                  key={route.id}
-                  type="button"
-                  data-testid={`app-mobile-tab-${route.id}`}
-                  onClick={() => navigateToRoute(route.path)}
-                  className="relative flex h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[10px] font-medium"
-                  style={{
-                    color: isActive
-                      ? "var(--th-accent-primary)"
-                      : "var(--th-text-muted)",
-                  }}
-                >
-                  <Icon size={18} />
-                  <span>{isKo ? route.labelKo : route.labelEn}</span>
-                  {badge !== undefined && badge > 0 && (
-                    <span className="absolute right-[28%] top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-500 px-1 text-[8px] font-semibold text-white">
-                      {badge > 9 ? "9+" : badge}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-            <button
-              type="button"
-              data-testid="app-mobile-more-button"
-              onClick={() => setShowMobileMoreMenu((prev) => !prev)}
-              className="relative flex h-14 flex-1 flex-col items-center justify-center gap-0.5 text-[10px] font-medium"
-              style={{
-                color:
-                  activeMobileRouteId === "more"
-                    ? "var(--th-accent-primary)"
-                    : "var(--th-text-muted)",
-              }}
-            >
-              <Settings size={18} />
-              <span>{tr("설정", "Settings")}</span>
-              {(unresolvedMeetingsCount > 0 || unreadCount > 0) && (
-                <span className="absolute right-[28%] top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-emerald-500 px-1 text-[8px] font-semibold text-white">
-                  {unresolvedMeetingsCount + unreadCount > 9
-                    ? "9+"
-                    : unresolvedMeetingsCount + unreadCount}
-                </span>
-              )}
-            </button>
-          </nav>
-
-          {showMobileMoreMenu && (
-            <div
-              className="fixed inset-0 flex items-end justify-center"
-              style={{ zIndex: SHELL_BOTTOM_SHEET_Z_INDEX }}
-              onClick={() => setShowMobileMoreMenu(false)}
-            >
-              <div className="absolute inset-0 bg-black/55 backdrop-blur-sm" />
-              <div
-                data-testid="app-mobile-more-menu"
-                role="dialog"
-                aria-modal="true"
-                aria-label={tr("확장 메뉴", "Extensions menu")}
-                className="relative w-full max-h-[80vh] overflow-y-auto rounded-t-[2rem] border px-4 pb-4 pt-3 shadow-2xl animate-in fade-in slide-in-from-bottom-4 duration-200"
-                style={{
-                  borderColor: "var(--th-border-subtle)",
-                  background:
-                    "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 98%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 95%, transparent) 100%)",
-                  paddingBottom:
-                    "max(1rem, calc(1rem + env(safe-area-inset-bottom)))",
-                }}
-                onClick={(event) => event.stopPropagation()}
-              >
-                <div className="mx-auto mb-3 h-1.5 w-14 rounded-full bg-white/10" />
-                <div className="mb-3 flex items-center justify-between gap-3">
-                  <div>
-                    <div
-                      className="text-[11px] font-semibold uppercase tracking-[0.2em]"
-                      style={{ color: "var(--th-text-muted)" }}
-                    >
-                      {tr("확장", "Extensions")}
-                    </div>
-                    <div
-                      className="mt-1 text-base font-semibold"
-                      style={{ color: "var(--th-text-heading)" }}
-                    >
-                      {tr("숨겨진 페이지 바로가기", "Jump to secondary pages")}
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setShowMobileMoreMenu(false)}
-                    className="flex h-10 w-10 items-center justify-center rounded-xl border text-[var(--th-text-muted)]"
-                    style={{
-                      borderColor:
-                        "color-mix(in srgb, var(--th-border) 64%, transparent)",
-                      background:
-                        "color-mix(in srgb, var(--th-card-bg) 88%, transparent)",
-                    }}
-                    aria-label={tr("더보기 닫기", "Close more menu")}
-                  >
-                    <X size={16} />
-                  </button>
-                </div>
-
-                <div className="space-y-4">
-                  {mobileOverflowSections.map((section) => (
-                    <div key={section.id} className="space-y-2">
-                      <div
-                        className="px-1 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                        style={{ color: "var(--th-text-muted)" }}
-                      >
-                        {isKo ? section.labelKo : section.labelEn}
-                      </div>
-                      <div className="grid gap-2">
-                        {section.routes.map((route) => {
-                          const Icon = iconForRoute(route.id);
-                          const badge = sidebarBadgeForRoute(route.id);
-                          return (
-                            <button
-                              key={route.id}
-                              type="button"
-                              aria-label={isKo ? route.labelKo : route.labelEn}
-                              onClick={() =>
-                                navigateToRoute(
-                                  route.path,
-                                  route.id === "agents"
-                                    ? { agentsTab: "agents" }
-                                    : undefined,
-                                )
-                              }
-                              className="flex items-start gap-3 rounded-xl border px-3 py-3 text-left"
-                              style={{
-                                borderColor: "var(--th-border-subtle)",
-                                background: "var(--th-overlay-subtle)",
-                              }}
-                            >
-                              <span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--th-overlay-subtle)]">
-                                <Icon size={18} />
-                              </span>
-                              <span className="min-w-0 flex-1">
-                                <span
-                                  className="flex items-center gap-2 text-sm font-semibold"
-                                  style={{ color: "var(--th-text-heading)" }}
-                                >
-                                  {isKo ? route.labelKo : route.labelEn}
-                                  {badge !== undefined && badge > 0 && (
-                                    <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1.5 text-[10px] text-white">
-                                      {badge > 9 ? "9+" : badge}
-                                    </span>
-                                  )}
-                                </span>
-                                <span
-                                  className="mt-1 block text-xs leading-relaxed"
-                                  style={{ color: "var(--th-text-muted)" }}
-                                >
-                                  {isKo ? route.descriptionKo : route.descriptionEn}
-                                </span>
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-        </>
+        <AppMobileNavigation
+          activeRouteId={activeMobileRouteId}
+          bottomSheetZIndex={SHELL_BOTTOM_SHEET_Z_INDEX}
+          iconForRoute={iconForRoute}
+          isKo={isKo}
+          moreMenuRef={mobileMoreMenuRef}
+          moreOpen={showMobileMoreMenu}
+          moreSections={mobileOverflowSections}
+          navigateToRoute={navigateToRoute}
+          primaryRoutes={mobilePrimaryRoutes}
+          routeBadge={sidebarBadgeForRoute}
+          setMoreOpen={setShowMobileMoreMenu}
+          tabbarHeight={MOBILE_TABBAR_SAFE_AREA_HEIGHT}
+          tabbarZIndex={SHELL_TABBAR_Z_INDEX}
+        />
       )}
 
       <Suspense fallback={null}>
@@ -1571,146 +999,23 @@ export default function AppShell({
       </Suspense>
 
       {showTweaksPanel && (
-        <div
-          className="pointer-events-none fixed right-4 top-[5.25rem] w-[min(22rem,calc(100vw-2rem))]"
-          style={{ zIndex: SHELL_POPOVER_Z_INDEX }}
-        >
-          <div
-            className="pointer-events-auto rounded-[1.75rem] border p-4 shadow-2xl"
-            style={{
-              borderColor: "var(--th-border-subtle)",
-              background:
-                "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 95%, transparent) 100%)",
-            }}
-          >
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div
-                  className="text-sm font-semibold"
-                  style={{ color: "var(--th-text-heading)" }}
-                >
-                  Tweaks
-                </div>
-                <div
-                  className="mt-1 text-xs"
-                  style={{ color: "var(--th-text-muted)" }}
-                >
-                  {tr("셸 테마와 강조색을 조정합니다.", "Tune shell theme and accent.")}
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowTweaksPanel(false)}
-                className="flex h-8 w-8 items-center justify-center rounded-xl text-[var(--th-text-muted)]"
-                aria-label={tr("패널 닫기", "Close panel")}
-              >
-                <X size={14} />
-              </button>
-            </div>
-
-            <div className="mt-4 space-y-4">
-              <div>
-                <div
-                  className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                  style={{ color: "var(--th-text-muted)" }}
-                >
-                  Theme
-                </div>
-                <div
-                  className="flex items-center gap-1 rounded-full p-1"
-                  style={{ background: "var(--th-overlay-subtle)" }}
-                >
-                  {THEME_OPTIONS.map((option) => {
-                    const active = themePreference === option.id;
-                    return (
-                      <button
-                        key={option.id}
-                        type="button"
-                        onClick={() => setThemePreference(option.id)}
-                        aria-pressed={active}
-                        className="flex-1 rounded-full px-3 py-1.5 text-xs font-medium transition-colors"
-                        style={
-                          active
-                            ? {
-                                background: "var(--th-accent-primary-soft)",
-                                color: "var(--th-accent-primary)",
-                              }
-                            : { color: "var(--th-text-muted)" }
-                        }
-                      >
-                        {isKo ? option.labelKo : option.labelEn}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <div
-                  className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em]"
-                  style={{ color: "var(--th-text-muted)" }}
-                >
-                  Accent
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
-                  {ACCENT_OPTIONS.map((option) => {
-                    const active = accentPreset === option.id;
-                    return (
-                      <button
-                        key={option.id}
-                        type="button"
-                        title={option.label}
-                        aria-label={`${option.label} accent`}
-                        aria-pressed={active}
-                        data-accent-preset={option.id}
-                        onClick={() => setAccentPreset(option.id)}
-                        className="dash-accent-swatch flex h-9 w-9 items-center justify-center rounded-full transition-transform"
-                        style={{
-                          border: active
-                            ? "2px solid var(--th-text-heading)"
-                            : "1px solid color-mix(in srgb, var(--th-border-subtle) 80%, transparent)",
-                          background:
-                            "color-mix(in srgb, var(--th-card-bg) 90%, transparent)",
-                          transform: active ? "translateY(-1px)" : undefined,
-                        }}
-                      >
-                        <span
-                          className="h-4.5 w-4.5 rounded-full"
-                          style={{ background: `var(${option.token})` }}
-                        />
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div
-                className="rounded-2xl border px-3 py-3 text-xs"
-                style={{
-                  borderColor: "var(--th-border-subtle)",
-                  background: "var(--th-overlay-subtle)",
-                }}
-              >
-                <div style={{ color: "var(--th-text-muted)" }}>
-                  {tr("현재 페이지", "Current page")}
-                </div>
-                <div
-                  className="mt-1 font-mono"
-                  style={{ color: "var(--th-text-primary)" }}
-                >
-                  /{currentRoute?.id ?? "home"}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
+        <AppTweaksPanel
+          accentPreset={accentPreset}
+          isKo={isKo}
+          popoverZIndex={SHELL_POPOVER_Z_INDEX}
+          setAccentPreset={setAccentPreset}
+          setShowTweaksPanel={setShowTweaksPanel}
+          setThemePreference={setThemePreference}
+          themePreference={themePreference}
+        />
       )}
 
       <ToastOverlay notifications={notifications} onDismiss={dismissNotification} />
 
       {showShortcutHelp && (
-        <ShortcutHelpModal
+        <AppShortcutHelpModal
           isKo={isKo}
+          modalZIndex={SHELL_MODAL_Z_INDEX}
           onClose={() => setShowShortcutHelp(false)}
         />
       )}
@@ -1731,84 +1036,6 @@ export default function AppShell({
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-function SidebarRouteButton({
-  route,
-  currentRouteId,
-  isKo,
-  badge,
-  onNavigate,
-}: {
-  route: AppRouteEntry;
-  currentRouteId: AppRouteId | null;
-  isKo: boolean;
-  badge?: number;
-  onNavigate: () => void;
-}) {
-  const active = currentRouteId === route.id;
-  const Icon = iconForRoute(route.id);
-
-  return (
-    <button
-      type="button"
-      onClick={onNavigate}
-      className="group relative flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors"
-      style={{
-        background: active
-          ? "color-mix(in srgb, var(--th-accent-primary-soft) 80%, transparent)"
-          : "transparent",
-        color: active ? "var(--th-text-primary)" : "var(--th-text-secondary)",
-      }}
-      title={isKo ? route.labelKo : route.labelEn}
-    >
-      <span
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"
-        style={{
-          background: active
-            ? "color-mix(in srgb, var(--th-accent-primary) 18%, transparent)"
-            : "var(--th-overlay-subtle)",
-        }}
-      >
-        <Icon size={18} />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium">
-          {isKo ? route.labelKo : route.labelEn}
-        </span>
-      </span>
-      {badge !== undefined && badge > 0 && (
-        <span className="absolute right-3 top-3 flex h-5 min-w-5 items-center justify-center rounded-full bg-emerald-500 px-1 text-[10px] font-semibold text-white">
-          {badge > 9 ? "9+" : badge}
-        </span>
-      )}
-    </button>
-  );
-}
-
-function NotificationSummaryRow({
-  label,
-  value,
-  accent,
-}: {
-  label: string;
-  value: number;
-  accent: string;
-}) {
-  return (
-    <div
-      className="flex items-center justify-between rounded-2xl border px-3 py-2 text-sm"
-      style={{
-        borderColor: "var(--th-border-subtle)",
-        background: "var(--th-overlay-subtle)",
-      }}
-    >
-      <span style={{ color: "var(--th-text-muted)" }}>{label}</span>
-      <span className="font-semibold" style={{ color: accent }}>
-        {value}
-      </span>
     </div>
   );
 }
@@ -1841,6 +1068,10 @@ function HomeOverviewPage({
   );
   const localeTag = isKo ? "ko-KR" : "en-US";
   const [editing, setEditing] = useLocalStorage<boolean>(STORAGE_KEYS.homeEditing, false);
+  const [supportOpen, setSupportOpen] = useLocalStorage<boolean>(
+    STORAGE_KEYS.homeSupportOpen,
+    false,
+  );
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
   const [analytics, setAnalytics] = useState<TokenAnalyticsResponse | null>(
@@ -2617,6 +1848,13 @@ function HomeOverviewPage({
       localeTag,
     ],
   );
+  const primaryWidgets = widgets.filter((widgetId) => HOME_PRIMARY_WIDGET_SET.has(widgetId));
+  const supportWidgets = widgets.filter((widgetId) => HOME_SUPPORT_WIDGET_SET.has(widgetId));
+  const visibleWidgets = editing ? widgets : primaryWidgets;
+  const supportSummary = tr(
+    `품질·미션 ${supportWidgets.length}개`,
+    `${supportWidgets.length} quality/mission widgets`,
+  );
 
   return (
     <div className="mx-auto h-full w-full max-w-[92rem] overflow-auto px-4 py-6 pb-32 sm:px-6">
@@ -2685,7 +1923,7 @@ function HomeOverviewPage({
       )}
 
       <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-12">
-        {widgets.map((widgetId, index) => {
+        {visibleWidgets.map((widgetId, index) => {
           const spec = widgetSpecs[widgetId as keyof typeof widgetSpecs];
           if (!spec) return null;
           return (
@@ -2711,13 +1949,16 @@ function HomeOverviewPage({
               onDrop={(event) => {
                 if (!editing || isMobileViewport) return;
                 event.preventDefault();
-                if (dragIndex == null || dragIndex === index) {
+                const transferredIndex = Number(event.dataTransfer.getData("text/plain"));
+                const fromIndex =
+                  dragIndex ?? (Number.isInteger(transferredIndex) ? transferredIndex : null);
+                if (fromIndex == null || fromIndex === index) {
                   setDragIndex(null);
                   setOverIndex(null);
                   return;
                 }
                 const next = [...widgets];
-                const [moved] = next.splice(dragIndex, 1);
+                const [moved] = next.splice(fromIndex, 1);
                 next.splice(index, 0, moved);
                 setWidgets(next);
                 setDragIndex(null);
@@ -2747,6 +1988,62 @@ function HomeOverviewPage({
           );
         })}
       </div>
+
+      {!editing && supportWidgets.length > 0 ? (
+        <section
+          className="mt-4 rounded-[1.15rem] border"
+          style={{
+            borderColor: "var(--th-border-subtle)",
+            background: "color-mix(in srgb, var(--th-card-bg) 86%, transparent)",
+          }}
+          data-testid="home-support-section"
+        >
+          <button
+            type="button"
+            className="flex min-h-[52px] w-full items-center justify-between gap-3 px-4 py-3 text-left sm:px-5"
+            onClick={() => setSupportOpen((value) => !value)}
+            aria-expanded={supportOpen}
+            data-testid="home-support-toggle"
+          >
+            <span className="min-w-0">
+              <span
+                className="block truncate text-sm font-medium"
+                style={{ color: "var(--th-text-secondary)" }}
+              >
+                {tr("보조 위젯", "Supporting widgets")}
+              </span>
+              <span
+                className="mt-0.5 block truncate text-[11px]"
+                style={{ color: "var(--th-text-muted)" }}
+              >
+                {supportSummary}
+              </span>
+            </span>
+            <ChevronRight
+              size={16}
+              className={supportOpen ? "shrink-0 rotate-90 transition-transform" : "shrink-0 transition-transform"}
+              style={{ color: "var(--th-text-muted)" }}
+            />
+          </button>
+          {supportOpen ? (
+            <div
+              className="grid grid-cols-1 gap-4 border-t p-4 sm:p-5 lg:grid-cols-12"
+              style={{ borderColor: "var(--th-border-subtle)" }}
+              data-testid="home-support-grid"
+            >
+              {supportWidgets.map((widgetId) => {
+                const spec = widgetSpecs[widgetId as keyof typeof widgetSpecs];
+                if (!spec) return null;
+                return (
+                  <div key={widgetId} data-testid={`home-widget-${widgetId}`} className={spec.className}>
+                    {spec.render()}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+        </section>
+      ) : null}
     </div>
   );
 }
@@ -2885,99 +2182,20 @@ function HomeWidgetShell({
     >
       <div className="flex items-start justify-between gap-3 border-b px-4 py-3 sm:px-5" style={{ borderColor: "var(--th-border-subtle)" }}>
         <div className="min-w-0">
-          <div className="text-[12.5px] font-medium" style={{ color: "var(--th-text-secondary)" }}>
+          <div className="truncate text-[12.5px] font-medium" style={{ color: "var(--th-text-secondary)" }}>
             {title}
           </div>
-          <div className="mt-1 text-[11px] leading-5" style={{ color: "var(--th-text-muted)" }}>
+          <div
+            className="mt-1 line-clamp-1 text-[11px] leading-5"
+            title={subtitle}
+            style={{ color: "var(--th-text-muted)" }}
+          >
             {subtitle}
           </div>
         </div>
         {action}
       </div>
       <div className="px-4 py-4 sm:px-5">{children}</div>
-    </div>
-  );
-}
-
-function ShortcutHelpModal({
-  isKo,
-  onClose,
-}: {
-  isKo: boolean;
-  onClose: () => void;
-}) {
-  return (
-    <div
-      data-testid="shortcut-help-modal"
-      className="fixed inset-0 flex items-center justify-center px-4"
-      style={{ zIndex: SHELL_MODAL_Z_INDEX }}
-      onClick={onClose}
-    >
-      <div className="fixed inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        role="dialog"
-        aria-modal="true"
-        className="relative w-full max-w-md rounded-[2rem] border p-6 shadow-2xl"
-        style={{
-          borderColor: "var(--th-border-subtle)",
-          background:
-            "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 95%, transparent) 100%)",
-        }}
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="flex items-center justify-between">
-          <div>
-            <div
-              className="text-lg font-semibold"
-              style={{ color: "var(--th-text-heading)" }}
-            >
-              {isKo ? "키보드 단축키" : "Keyboard Shortcuts"}
-            </div>
-            <div className="mt-1 text-sm" style={{ color: "var(--th-text-muted)" }}>
-              {isKo ? "자주 쓰는 조작을 빠르게 확인하세요" : "Quick access to the controls you use most"}
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="flex h-9 w-9 items-center justify-center rounded-xl text-[var(--th-text-muted)]"
-          >
-            <X size={16} />
-          </button>
-        </div>
-
-        <div className="mt-5 space-y-3 text-sm">
-          <ShortcutRow
-            label={isKo ? "명령 팔레트" : "Command palette"}
-            combo="⌘K"
-          />
-          <ShortcutRow label={isKo ? "도움말" : "Help"} combo="?" />
-          {PRIMARY_ROUTES.map((route) => (
-            <ShortcutRow
-              key={route.id}
-              label={isKo ? route.labelKo : route.labelEn}
-              combo={`Alt+${route.shortcutKey}`}
-            />
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ShortcutRow({ label, combo }: { label: string; combo: string }) {
-  return (
-    <div className="flex items-center justify-between rounded-2xl border px-3 py-2" style={{ borderColor: "var(--th-border-subtle)" }}>
-      <span style={{ color: "var(--th-text-secondary)" }}>{label}</span>
-      <kbd
-        className="rounded-lg px-2 py-1 text-xs"
-        style={{
-          background: "var(--th-overlay-subtle)",
-          color: "var(--th-text-primary)",
-        }}
-      >
-        {combo}
-      </kbd>
     </div>
   );
 }
@@ -3014,31 +2232,6 @@ function hasUnresolvedMeetingIssues(meeting: RoundTableMeeting): boolean {
   const pending = Math.max(totalIssues - created - failed - discarded, 0);
 
   return pending > 0 || failed > 0;
-}
-
-function notificationColor(type: Notification["type"]): string {
-  switch (type) {
-    case "success":
-      return "#34d399";
-    case "warning":
-      return "#fbbf24";
-    case "error":
-      return "#f87171";
-    default:
-      return "#60a5fa";
-  }
-}
-
-function formatRelativeTime(timestamp: number, isKo: boolean): string {
-  const diffMs = Date.now() - timestamp;
-  const seconds = Math.max(1, Math.floor(diffMs / 1000));
-  if (seconds < 60) return isKo ? `${seconds}초 전` : `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return isKo ? `${minutes}분 전` : `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return isKo ? `${hours}시간 전` : `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return isKo ? `${days}일 전` : `${days}d ago`;
 }
 
 function selectedOfficeLabel(

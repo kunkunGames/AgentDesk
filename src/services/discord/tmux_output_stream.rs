@@ -432,8 +432,10 @@ pub(in crate::services::discord) fn process_watcher_lines(
                 }
                 "system" => {
                     if val.get("subtype").and_then(|s| s.as_str()) == Some("init")
-                        && let Some(session_id) =
-                            val.get("session_id").and_then(|value| value.as_str())
+                        && let Some(session_id) = val
+                            .get("session_id")
+                            .or_else(|| val.get("sessionId"))
+                            .and_then(|value| value.as_str())
                     {
                         state.last_session_id = Some(session_id.to_string());
                     }
@@ -463,6 +465,27 @@ pub(in crate::services::discord) fn process_watcher_lines(
                                 outcome.task_notification_kind,
                                 classify_task_notification_kind(&val, state),
                             );
+                        }
+                        // #2110: Claude TUI transcript signals end-of-turn
+                        // via `stop_hook_summary` instead of `type=result`.
+                        // Treat it as the turn terminator so the watcher
+                        // flushes accumulated `assistant.content[].text` to
+                        // Discord for monitor auto-restart turns and direct
+                        // tmux-typed user turns under the TUI driver.
+                        if subtype == "stop_hook_summary" {
+                            if let Some(session_id) = val
+                                .get("session_id")
+                                .or_else(|| val.get("sessionId"))
+                                .and_then(|value| value.as_str())
+                            {
+                                state.last_session_id = Some(session_id.to_string());
+                            }
+                            state.final_result = Some(String::new());
+                            outcome.found_result = true;
+                            // #1216: stop after the first turn-terminating
+                            // event so a buffer with multiple completed turns
+                            // does not merge them into a single `full_response`.
+                            break;
                         }
                     }
                 }
@@ -515,6 +538,7 @@ pub(in crate::services::discord) fn process_watcher_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::session_backend::StreamLineState;
 
     #[test]
     fn watcher_status_panel_fallback_inlines_events_without_status_message() {
@@ -534,5 +558,33 @@ mod tests {
             !watcher_placeholder_inlines_live_events(false, true, Some(MessageId::new(99))),
             "recent events stay on the dedicated status panel when that message is available"
         );
+    }
+
+    /// #2110: Claude TUI transcript jsonl uses `system/stop_hook_summary`
+    /// instead of `type=result` to terminate a turn. The watcher must treat
+    /// it as a turn-terminator so accumulated `assistant.content[].text` is
+    /// flushed to Discord for monitor auto-restart turns and direct
+    /// tmux-typed user turns.
+    #[test]
+    fn process_watcher_lines_treats_stop_hook_summary_as_turn_terminator() {
+        let mut buffer = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"tui reply\"}]},\"sessionId\":\"sess-tui\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"sessionId\":\"sess-tui\",\"hookCount\":1,\"hasOutput\":true}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"next turn\"}]},\"sessionId\":\"sess-tui\"}\n",
+        )
+        .to_string();
+        let mut state = StreamLineState::new();
+        let mut full_response = String::new();
+        let mut tool_state = WatcherToolState::new();
+
+        let outcome =
+            process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
+
+        assert!(outcome.found_result);
+        assert_eq!(full_response, "tui reply");
+        assert_eq!(state.last_session_id.as_deref(), Some("sess-tui"));
+        // #1216: stop after first terminator; the next turn's assistant
+        // line must remain in the buffer for the next watcher tick.
+        assert!(buffer.contains("next turn"));
     }
 }

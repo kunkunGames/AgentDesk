@@ -134,6 +134,9 @@
   - `src/services/discord/voice_barge_in.rs` (1783 lines; voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
     split before adding non-bugfix behavior).
+  - `src/voice/receiver.rs` (1104 lines; voice receive pipeline, utterance
+    segmentation, artifact cleanup, and retention policy surface; split before
+    adding non-bugfix behavior).
   - `src/services/discord/commands/config.rs` (1877 lines).
   - `src/services/discord/commands/inspect.rs` (1058 lines, post-#1701
     context-view manifest binding pushed it past the giant-file threshold).
@@ -204,6 +207,7 @@
 - legacy_modules: none.
 - do_not_edit_without_migration_plan (giant-file):
   - `src/cli/migrate.rs` (348 lines, retired postgres-cutover facade).
+  - `src/cli/args.rs` (1002 lines).
   - `src/cli/doctor/orchestrator.rs` (4324 lines).
   - `src/cli/migrate/apply.rs` (3142 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
@@ -321,6 +325,9 @@ The remaining giant-file modules under `src/services/` not covered above:
   `src/services/qwen.rs` (2466), `src/services/codex.rs` (1665),
   `src/services/opencode.rs` (2133), `src/services/provider.rs` (2177) —
   provider adapters.
+- `src/services/codex_tui/rollout_tail.rs` (1031) — Codex TUI rollout tail
+  parsing and resume identity surface; split before adding non-bugfix behavior
+  beyond the #2169 session identity fix.
 - `src/services/memory/memento.rs` (2479).
 - `src/services/observability/mod.rs` (1158) and
   `src/services/observability/pg_io.rs` (1312).

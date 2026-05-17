@@ -5,6 +5,24 @@ use std::path::{Path, PathBuf};
 
 use crate::services::tmux_diagnostics::clear_tmux_exit_reason;
 
+const CLAUDE_TUI_READY_SCAN_LINES: usize = 12;
+const CLAUDE_TUI_READY_BANNER: &str = "Ready for input (type message + Enter)";
+const CLAUDE_TUI_PROMPT_MARKER: &str = "\u{276f}";
+
+pub(crate) fn tmux_line_is_claude_tui_ready_prompt(line: &str) -> bool {
+    let trimmed = line.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
+    trimmed == CLAUDE_TUI_PROMPT_MARKER
+}
+
+pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -> bool {
+    capture
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(CLAUDE_TUI_READY_SCAN_LINES)
+        .any(|l| l.contains(CLAUDE_TUI_READY_BANNER) || tmux_line_is_claude_tui_ready_prompt(l))
+}
+
 /// Format a tmux session name as an exact-match target.
 ///
 /// tmux `-t` flags perform prefix matching by default: `-t foo` matches
@@ -17,6 +35,9 @@ pub fn tmux_exact_target(session_name: &str) -> String {
 
 /// Subdirectory under the runtime root where session temp files live.
 const SESSIONS_SUBDIR: &str = "runtime/sessions";
+pub(crate) const CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT: &str = "claude-tui-settings.json";
+pub(crate) const CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT: &str = "claude-tui.sh";
+pub(crate) const CODEX_TUI_HOME_TEMP_EXT: &str = "codex-tui-home";
 
 /// Returns the persistent AgentDesk sessions directory, if a runtime root
 /// is configured. This is the new canonical location for session temp files
@@ -157,11 +178,18 @@ pub fn cleanup_session_temp_files(session_name: &str) {
         "sh",
         "generation",
         "exit_reason",
+        CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
+        CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
     ];
     for ext in EXTS {
         let _ = std::fs::remove_file(session_temp_path(session_name, ext));
         let _ = std::fs::remove_file(legacy_tmp_session_path(session_name, ext));
     }
+    let _ = std::fs::remove_dir_all(session_temp_path(session_name, CODEX_TUI_HOME_TEMP_EXT));
+    let _ = std::fs::remove_dir_all(legacy_tmp_session_path(
+        session_name,
+        CODEX_TUI_HOME_TEMP_EXT,
+    ));
 }
 
 /// Get the current AgentDesk runtime root marker for tmux session ownership.
@@ -656,10 +684,9 @@ mod tests {
     // `cleanup_session_temp_files` MUST NOT delete this snapshot — otherwise
     // it would be erased microseconds after being written.
     //
-    // The deletable EXTS list (`jsonl`, `input`, `prompt`, `owner`, `sh`,
-    // `generation`, `exit_reason`) is the cleanup contract; pin its shape
-    // here so a future "let's also nuke death_pane_log" tweak fails this
-    // test instead of silently re-breaking post-mortem.
+    // The deletable EXTS list is the cleanup contract; pin its shape here so
+    // a future "let's also nuke death_pane_log" tweak fails this test instead
+    // of silently re-breaking post-mortem.
     #[test]
     fn cleanup_session_temp_files_preserves_death_pane_log_snapshot() {
         let _lock = crate::services::discord::runtime_store::lock_test_env();
@@ -687,6 +714,8 @@ mod tests {
             "sh",
             "generation",
             "exit_reason",
+            CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
+            CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
         ];
         let mut cleaned_paths = Vec::new();
         for ext in &cleaned_exts {

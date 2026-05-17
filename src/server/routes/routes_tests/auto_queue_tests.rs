@@ -10347,6 +10347,170 @@ async fn resume_run_skips_phase_gate_blocked_runs_pg_path() {
     pg_db.drop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repair_phase_gate_reevaluates_failed_terminal_dispatch_pg_path() {
+    crate::pipeline::ensure_loaded();
+
+    let db = test_db();
+    let engine = test_engine(&db);
+    let pg_db = TestPostgresDb::create().await;
+    let pg_pool = pg_db.connect_and_migrate().await;
+
+    sqlx::query("INSERT INTO github_repos (id, display_name) VALUES ($1, $1)")
+        .bind("test-repo")
+        .execute(&pg_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (id, name, provider, discord_channel_id, discord_channel_alt)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind("agent-repair-gate-pg")
+    .bind("Agent Repair Gate PG")
+    .bind("claude")
+    .bind("111")
+    .bind("222")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (
+            id, repo_id, title, status, priority, assigned_agent_id, github_issue_number
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7
+         )",
+    )
+    .bind("card-repair-gate-pg")
+    .bind("test-repo")
+    .bind("Repair gate PG")
+    .bind("review")
+    .bind("medium")
+    .bind("agent-repair-gate-pg")
+    .bind(64385_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind("run-repair-gate-pg")
+    .bind("test-repo")
+    .bind("agent-repair-gate-pg")
+    .bind("paused")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_entries (
+            id, run_id, kanban_card_id, agent_id, status, priority_rank, batch_phase
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7
+         )",
+    )
+    .bind("entry-repair-gate-pg")
+    .bind("run-repair-gate-pg")
+    .bind("card-repair-gate-pg")
+    .bind("agent-repair-gate-pg")
+    .bind("pending")
+    .bind(0_i64)
+    .bind(2_i64)
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (
+            id, kanban_card_id, to_agent_id, dispatch_type, status, title, context, result
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, CAST($7 AS jsonb), CAST($8 AS jsonb)
+         )",
+    )
+    .bind("dispatch-repair-gate-pg")
+    .bind("card-repair-gate-pg")
+    .bind("agent-repair-gate-pg")
+    .bind("phase-gate")
+    .bind("completed")
+    .bind("Repair phase gate PG")
+    .bind(
+        json!({
+            "phase_gate": {
+                "run_id": "run-repair-gate-pg",
+                "batch_phase": 1,
+                "pass_verdict": "phase_gate_passed",
+                "next_phase": 2,
+                "final_phase": false
+            }
+        })
+        .to_string(),
+    )
+    .bind(json!({"verdict": "phase_gate_passed"}).to_string())
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO auto_queue_phase_gates (
+            run_id, phase, status, verdict, dispatch_id, pass_verdict, failure_reason
+         ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7
+         )",
+    )
+    .bind("run-repair-gate-pg")
+    .bind(1_i64)
+    .bind("failed")
+    .bind("phase_gate_failed")
+    .bind("dispatch-repair-gate-pg")
+    .bind("phase_gate_passed")
+    .bind("operator patched result after failure")
+    .execute(&pg_pool)
+    .await
+    .unwrap();
+
+    let app = test_api_router_with_pg(
+        db,
+        engine,
+        crate::config::Config::default(),
+        None,
+        pg_pool.clone(),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/queue/runs/run-repair-gate-pg/phase-gates/repair")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"phase":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["candidate_dispatches"], 1);
+    assert_eq!(json["cleared_gates"], 1);
+    assert_eq!(json["blocking_gates_remaining"], 0);
+    assert_eq!(json["run_status"], "active");
+    assert_eq!(json["outcomes"][0]["outcome"], "cleared");
+    assert_eq!(json["outcomes"][0]["run_resumed"], true);
+
+    let remaining_gates = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT
+         FROM auto_queue_phase_gates
+         WHERE run_id = $1",
+    )
+    .bind("run-repair-gate-pg")
+    .fetch_one(&pg_pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_gates, 0);
+
+    pg_pool.close().await;
+    pg_db.drop().await;
+}
+
 /// Regression test for #191: onTick1min recovery must reset stuck auto-queue
 /// entries that are 'dispatched' but have orphan (NULL), phantom (missing row),
 /// or cancelled/failed dispatch_ids — while leaving valid dispatches untouched.
@@ -11583,4 +11747,214 @@ async fn auto_queue_reset_requires_agent_id_and_reset_global_requires_confirmati
     assert_eq!(pending_run_status, "completed");
     assert_eq!(active_entries, 1);
     assert_eq!(remaining_entries, 1);
+}
+
+#[tokio::test]
+async fn phase_gate_catalog_endpoint_returns_kinds_and_default() {
+    // #2125 — dashboard + agents both pull from this endpoint, so its shape is
+    // a contract. Lock down the exact field set so silent changes break here
+    // rather than at the dashboard runtime.
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/queue/phase-gates/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["default_kind"], "pr-confirm");
+
+    let kinds = json["kinds"]
+        .as_array()
+        .expect("catalog response must include kinds array");
+    assert!(
+        kinds.len() >= 2,
+        "catalog should start with at least pr-confirm and deploy-gate"
+    );
+
+    let ids: Vec<&str> = kinds
+        .iter()
+        .filter_map(|kind| kind["id"].as_str())
+        .collect();
+    assert!(ids.contains(&"pr-confirm"));
+    assert!(ids.contains(&"deploy-gate"));
+
+    let first = &kinds[0];
+    assert!(first["label"]["ko"].is_string());
+    assert!(first["label"]["en"].is_string());
+    assert!(first["description"].is_string());
+    assert!(first["checks"].is_array());
+}
+
+#[tokio::test]
+async fn request_generate_rejects_empty_issue_numbers() {
+    // #2126 — input validation must happen before reaching the Discord send
+    // path so callers get a clean 400 even in standalone test mode.
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/queue/request-generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "itismyfield/AgentDesk",
+                        "agent_id": "project-agentdesk",
+                        "issue_numbers": [],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("issue_numbers"),
+        "error must point at the offending field, got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn request_generate_rejects_unknown_allowed_gate_kind() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/queue/request-generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "itismyfield/AgentDesk",
+                        "agent_id": "project-agentdesk",
+                        "issue_numbers": [42],
+                        "allowed_gate_kinds": ["ship-it"],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("ship-it") && error.contains("phase_gate_kind"),
+        "error must name the offending kind, got: {error}"
+    );
+}
+
+#[tokio::test]
+async fn request_generate_returns_503_without_discord() {
+    // Without a HealthRegistry attached we expect a clean 503 explaining
+    // Discord is unavailable, not a panic or a misleading 500 (#2126).
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/queue/request-generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "itismyfield/AgentDesk",
+                        "agent_id": "project-agentdesk",
+                        "issue_numbers": [2120, 2121],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("discord")
+    );
+}
+
+#[tokio::test]
+async fn generate_rejects_unknown_phase_gate_kind() {
+    // #2125 — entries with a phase_gate_kind not in the catalog must fail
+    // with 400 so callers fix the value rather than silently fall back.
+    crate::pipeline::ensure_loaded();
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db.clone(), engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/queue/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "repo": "test-repo",
+                        "agent_id": "project-agentdesk",
+                        "entries": [
+                            {"issue_number": 4242, "phase_gate_kind": "ship-it"}
+                        ],
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"]
+        .as_str()
+        .expect("error message must be a string");
+    assert!(
+        error.contains("phase_gate_kind") && error.contains("ship-it"),
+        "error must name the offending field/value, got: {error}"
+    );
 }

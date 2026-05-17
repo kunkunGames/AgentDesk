@@ -36,9 +36,11 @@ use crate::services::discord::relay_health::{RelayActiveTurn, RelayStallState};
 pub(crate) use recovery::stop_provider_channel_runtime_with_policy;
 #[allow(unused_imports)]
 pub use recovery::{
-    HardStopRuntimeResult, PendingQueueSnapshot, PostCancelDrainOutcome, RuntimeTurnStopResult,
-    clear_provider_channel_runtime, force_kill_provider_channel_runtime, handle_rebind_inflight,
-    handle_relay_recovery, hard_stop_runtime_turn, resolve_tmux_session_for_cancel,
+    HardStopRuntimeResult, IdleTmuxStaleTurnRepairResult, PendingQueueSnapshot,
+    PostCancelDrainOutcome, ProviderMailboxState, RuntimeTurnStopResult,
+    clear_idle_tmux_stale_turn, clear_provider_channel_runtime,
+    force_kill_provider_channel_runtime, handle_rebind_inflight, handle_relay_recovery,
+    hard_stop_runtime_turn, provider_channel_mailbox_state, resolve_tmux_session_for_cancel,
     schedule_pending_queue_drain_after_cancel, snapshot_pending_queue_state, spawn_stall_watchdog,
     spawn_watchdog, stop_provider_channel_runtime, stop_runtime_turn_preserving_watcher,
 };
@@ -1637,6 +1639,7 @@ impl SendCallerClass {
             "slo_alerter",
             "auto-queue-monitor",
             "inventory",
+            "voice",
         ];
         const CLI_ALLOWED: &[&str] = &["agentdesk-cli", "operator"];
         const DASHBOARD_ALLOWED: &[&str] = &["dashboard"];
@@ -1678,6 +1681,7 @@ mod send_source_tests {
         assert!(is_allowed_send_source("slo_alerter"));
         assert!(is_allowed_send_source("auto-queue-monitor"));
         assert!(is_allowed_send_source("inventory"));
+        assert!(is_allowed_send_source("voice"));
         assert!(!is_allowed_send_source("not-a-real-source"));
     }
 

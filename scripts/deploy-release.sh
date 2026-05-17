@@ -687,8 +687,11 @@ EOF
     echo "      success: ═══ Deploy Complete ═══"
     echo "      failure: ═══ DEPLOY FAILED (exit=N) ═══"
     echo ""
-    echo "    One-shot wait command:"
-    echo "      tail -n +1 -F $log_path | grep -m1 -E '═══ Deploy Complete ═══|═══ DEPLOY FAILED'"
+    echo "    One-shot wait command (polling loop — self-terminates after match):"
+    echo "      LOG=$log_path; until [ -f \"\$LOG\" ] && grep -qm1 -E '═══ Deploy Complete ═══|═══ DEPLOY FAILED' \"\$LOG\"; do sleep 3; done; grep -E '═══ Deploy Complete ═══|═══ DEPLOY FAILED' \"\$LOG\" | tail -1"
+    echo ""
+    echo "    ⚠ DO NOT use 'tail -F | grep -m1' — grep -m1 exits on match but tail -F stays alive"
+    echo "      on inotify wait, leaving the bash task hung past helper completion."
     echo ""
     echo "    On failure: read the log tail, diagnose the root cause (e.g. freshness gate,"
     echo "    codesign, health timeout), fix it in this same turn, and re-run deploy-release.sh."
@@ -987,6 +990,19 @@ mv -f "$STAGED_BINARY" "$ADK_REL/bin/agentdesk"
 STAGED_BINARY=""
 # Lock binary to prevent unsigned overwrites
 chflags uchg "$ADK_REL/bin/agentdesk"
+
+if [ "$PLIST_REL" = "com.agentdesk.release" ]; then
+    echo "▸ Regenerating release launchd plist..."
+    mkdir -p "$HOME/Library/LaunchAgents"
+    "$ADK_REL/bin/agentdesk" emit-launchd-plist \
+        --flavor release \
+        --home "$HOME" \
+        --root-dir "$ADK_REL" \
+        --agentdesk-bin "$ADK_REL/bin/agentdesk" \
+        --output "$HOME/Library/LaunchAgents/$PLIST_REL.plist"
+else
+    echo "⚠ Skipping launchd plist regeneration for custom label: $PLIST_REL"
+fi
 
 # Atomic swap: old → .old, staged → dist, cleanup
 if [ ! -d "$DIST_STAGED" ]; then

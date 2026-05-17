@@ -191,6 +191,17 @@ pub(crate) async fn run(
         crate::db::cancel_tombstones::set_global_pool(pool.clone());
     }
     crate::services::observability::init_observability(pg_pool.clone());
+    let _claude_tui_hook_endpoint =
+        if crate::services::provider_hosting::any_requested_tui_hosting_driver_available(&config) {
+            let endpoint = config.server.local_base_url();
+            tracing::info!(
+                endpoint,
+                "claude_tui hook receiver published on dcserver HTTP port"
+            );
+            Some(crate::services::claude_tui::hook_server::publish_hook_endpoint(endpoint))
+        } else {
+            None
+        };
     let cluster_runtime = cluster::bootstrap(&config, pg_pool.clone()).await;
     let cluster_instance_id = cluster_runtime.instance_id().to_string();
     if let Some(pool) = pg_pool.clone() {
@@ -265,7 +276,7 @@ pub(crate) async fn run(
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(dashboard_dir.join("index.html")));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/ws", get(ws::ws_handler).with_state(broadcast_tx.clone()))
         .nest(
             "/api",
@@ -278,12 +289,16 @@ pub(crate) async fn run(
                 pg_pool,
                 Some(cluster_instance_id),
             ),
-        )
-        .fallback_service(dashboard_service);
+        );
+    if _claude_tui_hook_endpoint.is_some() {
+        app = app.merge(crate::services::claude_tui::hook_server::hook_receiver_router());
+    }
+    let app = app.fallback_service(dashboard_service);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("HTTP server listening on {addr}");
+    routes::audit_explicit_auth_routes_on_boot(&config);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -303,6 +318,7 @@ async fn policy_tick_loop(
     engine: PolicyEngine,
     pg_pool: Option<Arc<PgPool>>,
     cluster_runtime: Option<cluster::ClusterRuntime>,
+    shutdown: Option<Arc<AtomicBool>>,
 ) {
     tracing::info!("[policy-tick] 3-tier tick started: 30s / 1min / 5min");
 
@@ -315,6 +331,14 @@ async fn policy_tick_loop(
     loop {
         interval_30s.tick().await;
         count += 1;
+
+        if shutdown
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            tracing::info!("[policy-tick] shutdown requested");
+            break;
+        }
 
         if let Some(runtime) = cluster_runtime.as_ref()
             && !runtime.is_leader()
@@ -375,6 +399,26 @@ async fn policy_tick_loop(
         if is_five_min_policy_tick(count) {
             fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick5min", "5min").await;
             refresh_memory_health_for_five_min_tick().await;
+            // #2257 concern 5: sweep expired idempotency_keys rows so the
+            // table stays bounded. The endpoint defaults are 24h TTL; one
+            // 5-min sweep is plenty even under heavy use.
+            if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
+                match crate::db::idempotency::gc_expired(pool).await {
+                    Ok(0) => {}
+                    Ok(deleted) => {
+                        tracing::info!(
+                            deleted,
+                            "[policy-tick] idempotency_keys GC swept expired rows"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "[policy-tick] idempotency_keys GC failed"
+                        );
+                    }
+                }
+            }
             if let Err(error) = crate::services::api_friction::process_api_friction_patterns(
                 pg_pool.as_deref().or_else(|| engine.pg_pool()),
                 None,
@@ -1212,6 +1256,7 @@ mod tests {
             wake_word: None,
             voice_enabled: true,
             sensitivity_mode: None,
+            voice: crate::config::AgentVoiceConfig::default(),
             provider: "claude".to_string(),
             channels: crate::config::AgentChannels::default(),
             keywords: Vec::new(),
@@ -1264,6 +1309,7 @@ mod tests {
             wake_word: None,
             voice_enabled: true,
             sensitivity_mode: None,
+            voice: crate::config::AgentVoiceConfig::default(),
             provider: "claude".to_string(),
             channels: crate::config::AgentChannels::default(),
             keywords: Vec::new(),

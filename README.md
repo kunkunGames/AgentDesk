@@ -47,20 +47,24 @@ cargo build --release
 
 AgentDesk intentionally keeps a separate `target/` directory per worktree. Sharing `CARGO_TARGET_DIR` across always-parallel worktrees causes Cargo lock contention, so the supported acceleration path is a shared `sccache` rustc cache instead.
 
-- `.cargo/config.toml` enables `build.rustc-wrapper = "sccache"`
-- worktree builds use the documented env default `SCCACHE_CACHE_SIZE=10G`; export another value before building to override it
-- plain `cargo build` / `cargo test` reuse the same cache automatically once `sccache` is on `PATH`
+- `.cargo/config.toml` no longer hard-codes `rustc-wrapper`, so bare `cargo build` / `cargo test` / `cargo check` works on every machine regardless of whether `sccache` is installed. No more `RUSTC_WRAPPER=` workaround for agents or subagents.
+- to actually get caching, opt in via the environment: `export RUSTC_WRAPPER=sccache` (e.g. in `~/.zshrc` / `~/.bashrc` / PowerShell profile) after installing `sccache`.
+- release/deploy scripts (`scripts/build-release.sh`, `scripts/deploy-release.sh`) call `setup_sccache_env` from `scripts/_defaults.sh`, which conditionally exports `RUSTC_WRAPPER` only when `sccache` is found — those scripts always do the right thing automatically.
+- CI exports `RUSTC_WRAPPER: sccache` at the workflow `env:` level and the `mozilla-actions/sccache-action` installs the binary, so no per-developer setup is needed for CI builds.
+- worktree builds use the documented env default `SCCACHE_CACHE_SIZE=10G`; export another value before building to override it.
 
-Install `sccache` before building:
+Install `sccache` to actually engage caching:
 
 ```bash
 brew install sccache
 # or, if a package manager is unavailable:
 cargo install sccache --locked
+export RUSTC_WRAPPER=sccache   # add to shell rc for persistence
 ```
 
 ```powershell
 winget install Mozilla.sccache
+$env:RUSTC_WRAPPER = "sccache"   # add to PowerShell profile for persistence
 ```
 
 Quick verification / troubleshooting:
@@ -68,11 +72,11 @@ Quick verification / troubleshooting:
 ```bash
 sccache --stop-server || true
 sccache --zero-stats || true
-cargo build --bin agentdesk
+RUSTC_WRAPPER=sccache cargo build --bin agentdesk
 sccache --show-stats
 ```
 
-If Cargo fails with `No such file or directory (os error 2)` for `sccache`, install it and ensure the binary is available on `PATH` (`/opt/homebrew/bin` on Apple Silicon Homebrew).
+The historical `No such file or directory (os error 2)` failure mode no longer applies because `.cargo/config.toml` does not force the wrapper.
 
 ### Dawn LaunchDaemon Operations (macOS)
 
@@ -126,6 +130,11 @@ After entering and validating each bot token, the wizard generates OAuth2 invite
 
 ### Step 2: Provider Verification
 The wizard checks whether Claude Code or Codex CLI is installed and authenticated on your machine. If not, it provides installation and login instructions. Provider setup is **not required** to complete onboarding — you can configure it later.
+
+#### Claude TUI Hosting Security Note
+When AgentDesk hosts Claude Code through the Claude TUI session path, it starts the CLI with `--dangerously-skip-permissions` so the Discord relay can drive the interactive TUI without repeated local permission prompts. Treat the configured working directory as the security boundary for that hosted process: use a dedicated worktree or workspace for each task, and do not point hosted sessions at broad home, credential, or operator directories.
+
+Prompt submission also rejects terminal control characters before it writes to the TUI. Newline, carriage return, and tab are allowed for normal prompt text, but escape sequences such as bracketed paste markers (`\x1b[200~` / `\x1b[201~`), DEL, and C1 controls are blocked before literal send or tmux paste-buffer paths can relay them.
 
 ### Step 3: Agent Selection
 Choose from three built-in role presets or compose a custom team:

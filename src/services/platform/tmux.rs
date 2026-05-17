@@ -4,6 +4,7 @@
 //! Callers in async contexts should use `tokio::task::spawn_blocking`.
 
 use super::binary_resolver;
+use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 /// Format session name as an exact-match target (prefix with `=`, suffix with
@@ -187,6 +188,55 @@ pub fn send_keys(session_name: &str, keys: &[&str]) -> Result<Output, String> {
         .map_err(|e| format!("tmux send-keys failed: {e}"))
 }
 
+/// Send literal text to a tmux session without interpreting tmux key names.
+pub fn send_literal(session_name: &str, text: &str) -> Result<Output, String> {
+    let target = exact_target(session_name);
+    tmux_command()
+        .args(["send-keys", "-t", &target, "-l", "--", text])
+        .output()
+        .map_err(|e| format!("tmux send-keys -l failed: {e}"))
+}
+
+/// Load literal text into a named tmux buffer via stdin.
+pub fn load_buffer(buffer_name: &str, text: &str) -> Result<Output, String> {
+    let mut child = tmux_command()
+        .args(["load-buffer", "-b", buffer_name, "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("tmux load-buffer failed: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("tmux load-buffer stdin failed: {e}"))?;
+    }
+    child
+        .wait_with_output()
+        .map_err(|e| format!("tmux load-buffer wait failed: {e}"))
+}
+
+/// Paste a named tmux buffer to the active pane.
+pub fn paste_buffer(session_name: &str, buffer_name: &str, delete: bool) -> Result<Output, String> {
+    let target = exact_target(session_name);
+    let args = paste_buffer_args(buffer_name, &target, delete);
+    tmux_command()
+        .args(&args)
+        .output()
+        .map_err(|e| format!("tmux paste-buffer failed: {e}"))
+}
+
+fn paste_buffer_args<'a>(buffer_name: &'a str, target: &'a str, delete: bool) -> Vec<&'a str> {
+    // `-p` requests bracketed paste and `-r` keeps LF as LF instead of tmux's
+    // default LF -> CR replacement, which can look like Enter in TUIs.
+    let mut args = vec!["paste-buffer", "-p", "-r"];
+    if delete {
+        args.push("-d");
+    }
+    args.extend(["-b", buffer_name, "-t", target]);
+    args
+}
+
 /// Return the PID of the active pane process for a tmux session.
 #[cfg(unix)]
 pub fn pane_pid(session_name: &str) -> Option<u32> {
@@ -299,6 +349,28 @@ mod tests {
         assert_eq!(
             exact_target("AgentDesk-claude-adk-cc"),
             "=AgentDesk-claude-adk-cc:"
+        );
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    #[test]
+    fn paste_buffer_args_request_bracketed_lf_preserving_paste() {
+        assert_eq!(
+            paste_buffer_args("agentdesk-buffer", "=AgentDesk-claude-adk-cc:", true),
+            vec![
+                "paste-buffer",
+                "-p",
+                "-r",
+                "-d",
+                "-b",
+                "agentdesk-buffer",
+                "-t",
+                "=AgentDesk-claude-adk-cc:"
+            ]
         );
     }
 }

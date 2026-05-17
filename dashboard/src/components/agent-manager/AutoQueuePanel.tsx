@@ -19,6 +19,8 @@ import {
   normalizeAutoQueueStatus,
   shouldClearSuppressedAutoQueueRun,
 } from "./auto-queue-panel-state";
+import { buildRequestGenerateGroups } from "./auto-queue-actions";
+import type { ReadyAutoQueueEntry } from "./auto-queue-actions";
 import { buildDiscordThreadLinks } from "./discord-routing";
 import { buildGitHubIssueUrl } from "./kanban-utils";
 
@@ -28,9 +30,34 @@ interface Props {
   agents: Agent[];
   selectedRepo: string;
   selectedAgentId?: string | null;
+  /**
+   * #2128: ready 카드(requested 컬럼) 중 assignee와 GH 이슈 번호가 있는 항목들.
+   * "큐 생성" 버튼이 이 목록을 (agentId)로 group by 해서 agent별 별도 요청을 보냄.
+   */
+  readyEntries?: ReadyAutoQueueEntry[];
 }
 
+interface RequestProgress {
+  startedAt: number;
+  baselineEntryIds: Set<string>;
+  pendingGroups: Set<string>;
+  satisfiedGroups: Set<string>;
+  errors: { groupKey: string; message: string }[];
+}
+
+const REQUEST_GENERATE_TIMEOUT_MS = 5 * 60 * 1000;
+const REQUEST_GENERATE_POLL_MS = 30 * 1000;
+const REQUEST_GROUP_KEY_SEPARATOR = "\u0000";
+
 type ViewMode = "all" | "agent" | "thread";
+
+function requestGroupKey(repo: string, agentId: string): string {
+  return `${repo}${REQUEST_GROUP_KEY_SEPARATOR}${agentId}`;
+}
+
+function formatRequestGroupKey(key: string): string {
+  return key.split(REQUEST_GROUP_KEY_SEPARATOR).join("/");
+}
 
 function formatTs(
   value: number | null | undefined,
@@ -643,6 +670,7 @@ export default function AutoQueuePanel({
   agents,
   selectedRepo,
   selectedAgentId,
+  readyEntries = [],
 }: Props) {
   const [status, setStatus] = useState<AutoQueueStatus | null>(null);
   const [expanded, setExpanded] = useLocalStorage<boolean>(STORAGE_KEYS.kanbanAutoQueueOpen, true);
@@ -651,6 +679,8 @@ export default function AutoQueuePanel({
   const [error, setError] = useState<string | null>(null);
   const [noReadyCards, setNoReadyCards] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("thread");
+  const [requestProgress, setRequestProgress] = useState<RequestProgress | null>(null);
+  const requestTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const agentMap = new Map(agents.map((a) => [a.id, a]));
   const suppressedRunIdRef = useRef<string | null>(null);
@@ -690,63 +720,172 @@ export default function AutoQueuePanel({
     return agent ? localeName(locale, agent) : agentId.slice(0, 8);
   };
 
-  const handleGenerate = async () => {
-    setGenerating(true);
-    setError(null);
-    try {
-      suppressedRunIdRef.current = null;
-      if (!resetAgentId) {
-        throw new Error("agent_id is required for reset");
-      }
-      await api.resetAutoQueue({
-        runId: status?.run?.id ?? null,
-        repo: selectedRepo || null,
-        agentId: resetAgentId,
-      });
-      const result = await api.generateAutoQueue(
-        selectedRepo || null,
-        selectedAgentId,
-      ) as Record<string, unknown>;
-      if (result.entries && Array.isArray(result.entries) && result.entries.length === 0) {
-        const counts = result.counts as Record<string, number> | undefined;
-        const backlog = counts?.backlog ?? 0;
-        const hint =
-          backlog > 0
-            ? tr(
-                `준비됨 상태의 카드가 없습니다. 백로그에 ${backlog}개 카드가 있습니다 — 준비됨으로 이동하세요.`,
-                `No ready cards. ${backlog} cards in backlog — move them to ready first.`,
-              )
-            : tr("준비됨 상태의 카드가 없습니다.", "No ready cards found.");
-        setError(hint);
-        setNoReadyCards(true);
-        setGenerating(false);
-        return; // Don't fetchStatus — it would reset noReadyCards
-      }
-      await fetchStatus();
-    } catch (e) {
-      setError(
-        e instanceof Error
-          ? e.message
-          : tr("큐 생성 실패", "Queue generation failed"),
-      );
-    } finally {
-      setGenerating(false);
+  // #2128: 결정론 smart-planner 대신 ready 카드를 (repo × agent)로 그룹핑해서 각
+  // agent에게 /api/queue/request-generate로 위임. agent가 자체 판단으로 /generate
+  // 호출하면 dashboard는 5분 polling으로 새 entries 감지.
+  const stopRequestPolling = () => {
+    if (requestTimerRef.current) {
+      clearInterval(requestTimerRef.current);
+      requestTimerRef.current = null;
     }
   };
+
+  useEffect(() => () => stopRequestPolling(), []);
+
+  const handleGenerate = async () => {
+    if (!selectedRepo) return;
+    if (generating || requestProgress) return;
+    const groups = buildRequestGenerateGroups(readyEntries, selectedRepo);
+    if (groups.length === 0) {
+      setError(
+        tr(
+          "준비됨 카드가 없습니다 (assignee + GitHub 이슈 필요).",
+          "No ready cards (need assignee + GitHub issue).",
+        ),
+      );
+      setNoReadyCards(true);
+      return;
+    }
+
+    setGenerating(true);
+    setError(null);
+    setNoReadyCards(false);
+    suppressedRunIdRef.current = null;
+
+    const baselineEntryIds = new Set(
+      (status?.entries ?? []).map((entry) => entry.id),
+    );
+
+    const pendingGroups = new Set<string>();
+    const errors: { groupKey: string; message: string }[] = [];
+    await Promise.all(
+      groups.map(async ({ repo, agentId, issueNumbers }) => {
+        const groupKey = requestGroupKey(repo, agentId);
+        try {
+          await api.requestGenerateAutoQueue({
+            repo,
+            agentId,
+            issueNumbers,
+          });
+          pendingGroups.add(groupKey);
+        } catch (e) {
+          errors.push({
+            groupKey,
+            message: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }),
+    );
+
+    setGenerating(false);
+
+    if (pendingGroups.size === 0) {
+      setError(
+        tr(
+          `큐 생성 요청이 모두 거부됐습니다 (${errors.length}건).`,
+          `All queue requests rejected (${errors.length}).`,
+        ),
+      );
+      return;
+    }
+    if (errors.length > 0) {
+      const failed = errors
+        .map((error) => `${formatRequestGroupKey(error.groupKey)}: ${error.message}`)
+        .join(", ");
+      setError(
+        tr(
+          `일부 큐 생성 요청이 실패했습니다: ${failed}`,
+          `Some queue requests failed: ${failed}`,
+        ),
+      );
+    }
+
+    setRequestProgress({
+      startedAt: Date.now(),
+      baselineEntryIds,
+      pendingGroups,
+      satisfiedGroups: new Set<string>(),
+      errors,
+    });
+  };
+
+  // request-generate polling: 30초마다 status 새로고침. 새 entry로 잡힌 agent는
+  // satisfied로 이동. 모두 만족하거나 5분 경과 시 종료.
+  useEffect(() => {
+    if (!requestProgress) {
+      stopRequestPolling();
+      return;
+    }
+    void fetchStatus();
+    requestTimerRef.current = setInterval(() => void fetchStatus(), REQUEST_GENERATE_POLL_MS);
+    return () => stopRequestPolling();
+  }, [requestProgress?.startedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!requestProgress) return;
+    const newlyAppearedGroups = new Set<string>();
+    for (const entry of status?.entries ?? []) {
+      if (requestProgress.baselineEntryIds.has(entry.id)) continue;
+      if (!entry.agent_id) continue;
+      const repo = entry.github_repo || selectedRepo || "";
+      newlyAppearedGroups.add(requestGroupKey(repo, entry.agent_id));
+    }
+
+    let changed = false;
+    const nextPending = new Set(requestProgress.pendingGroups);
+    const nextSatisfied = new Set(requestProgress.satisfiedGroups);
+    for (const groupKey of requestProgress.pendingGroups) {
+      if (newlyAppearedGroups.has(groupKey)) {
+        nextPending.delete(groupKey);
+        nextSatisfied.add(groupKey);
+        changed = true;
+      }
+    }
+
+    const elapsed = Date.now() - requestProgress.startedAt;
+    const timedOut = elapsed >= REQUEST_GENERATE_TIMEOUT_MS;
+
+    if (nextPending.size === 0 || timedOut) {
+      stopRequestPolling();
+      if (timedOut && nextPending.size > 0) {
+        const missing = [...nextPending].map(formatRequestGroupKey).join(", ");
+        setError(
+          tr(
+            `5분 안에 응답하지 않은 에이전트: ${missing}`,
+            `Agents did not respond within 5 min: ${missing}`,
+          ),
+        );
+      }
+      setRequestProgress(null);
+      return;
+    }
+
+    if (changed) {
+      setRequestProgress({ ...requestProgress, pendingGroups: nextPending, satisfiedGroups: nextSatisfied });
+    }
+  }, [selectedRepo, status, requestProgress, tr]);
 
   const handleReset = async () => {
     setError(null);
     setNoReadyCards(false);
     suppressedRunIdRef.current = status?.run?.id ?? null;
     try {
-      if (!resetAgentId) {
-        throw new Error("agent_id is required for reset");
+      const targets = resolveResetAgentTargets();
+      if (targets.length === 0) {
+        throw new Error(
+          tr(
+            "초기화할 에이전트를 찾지 못했습니다. 상단 필터에서 에이전트를 선택하세요.",
+            "No agent to reset. Select an agent from the filter above.",
+          ),
+        );
       }
-      await api.resetAutoQueue({
-        runId: status?.run?.id ?? null,
-        repo: selectedRepo || null,
-        agentId: resetAgentId,
-      });
+      for (const agentId of targets) {
+        await api.resetAutoQueue({
+          runId: status?.run?.id ?? null,
+          repo: selectedRepo || null,
+          agentId,
+        });
+      }
       resetPanelState();
     } catch (e) {
       suppressedRunIdRef.current = null;
@@ -841,6 +980,15 @@ export default function AutoQueuePanel({
   const phaseGates = status?.phase_gates ?? [];
   const deployPhases = new Set(run?.deploy_phases ?? []);
   const resetAgentId = selectedAgentId ?? run?.agent_id ?? null;
+  const resolveResetAgentTargets = (): string[] => {
+    if (resetAgentId) return [resetAgentId];
+    const fromEntries = Array.from(
+      new Set(entries.map((e) => e.agent_id).filter((id): id is string => Boolean(id))),
+    );
+    if (fromEntries.length > 0) return fromEntries;
+    const fromStats = Object.keys(status?.agents ?? {});
+    return fromStats;
+  };
   const gatesByPhase = new Map<number, PhaseGateInfo[]>();
   for (const gate of phaseGates) {
     const list = gatesByPhase.get(gate.phase) ?? [];
@@ -1222,37 +1370,51 @@ export default function AutoQueuePanel({
               </button>
             </>
           )}
-          {primaryAction === "generate" && (
-            <>
+          {primaryAction === "generate" && (() => {
+            const eligibleGroupCount = buildRequestGenerateGroups(readyEntries, selectedRepo).length;
+            const disabledByReady = eligibleGroupCount === 0;
+            const disabled = generating || disabledByReady || Boolean(requestProgress);
+            const pendingCountDisplay = requestProgress?.pendingGroups.size ?? 0;
+            return (
               <button
                 onClick={() => void handleGenerate()}
-                disabled={generating || noReadyCards}
+                disabled={disabled}
                 className="text-xs px-2.5 py-1 rounded-lg border font-medium"
                 style={{
-                  borderColor: noReadyCards
+                  borderColor: disabled
                     ? "rgba(148,163,184,0.2)"
                     : "rgba(16,185,129,0.4)",
-                  color: noReadyCards ? "var(--th-text-muted)" : "#10b981",
-                  backgroundColor: noReadyCards
+                  color: disabled ? "var(--th-text-muted)" : "#10b981",
+                  backgroundColor: disabled
                     ? "rgba(148,163,184,0.05)"
                     : "rgba(16,185,129,0.1)",
-                  cursor: noReadyCards ? "not-allowed" : undefined,
+                  cursor: disabled ? "not-allowed" : undefined,
                 }}
                 title={
-                  noReadyCards
+                  disabledByReady
                     ? tr(
-                        "준비됨 상태의 카드가 없습니다",
-                        "No ready cards available",
+                        "준비됨 카드가 없습니다 (assignee + GitHub 이슈 필요)",
+                        "No ready cards available (need assignee + GitHub issue)",
                       )
-                    : undefined
+                    : requestProgress
+                      ? tr(
+                          `${pendingCountDisplay}개 큐 그룹 응답 대기 중`,
+                          `Waiting on ${pendingCountDisplay} queue group(s)`,
+                        )
+                      : tr(
+                          `${eligibleGroupCount}개 큐 생성 요청`,
+                          `Request ${eligibleGroupCount} queue group(s)`,
+                        )
                 }
               >
-                {generating
-                  ? tr("분석 중…", "Analyzing…")
-                  : tr("큐 생성", "Generate")}
+                {requestProgress
+                  ? tr(`요청 중… (${pendingCountDisplay})`, `Requesting… (${pendingCountDisplay})`)
+                  : generating
+                    ? tr("요청 전송 중…", "Dispatching…")
+                    : tr("큐 생성", "Generate")}
               </button>
-            </>
-          )}
+            );
+          })()}
           {run && (
             <button
               onClick={() => void handleReset()}

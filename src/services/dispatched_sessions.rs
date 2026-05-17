@@ -46,6 +46,7 @@ async fn hook_session_pg(
         body.name.as_deref(),
         thread_channel_id.as_deref(),
         body.dispatch_id.as_deref(),
+        body.channel_id.as_deref(),
     )
     .await;
 
@@ -242,6 +243,12 @@ pub struct HookSessionBody {
     pub thread_channel_id: Option<String>,
     pub claude_session_id: Option<String>,
     pub session_id: Option<String>,
+    /// Numeric Discord channel id of the originating channel (#2097). Lets
+    /// the upsert resolve `sessions.agent_id` by matching `agents.discord_channel_*`
+    /// directly, which the session_key-derived channel *name* path can never
+    /// satisfy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1783,6 +1790,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -1805,6 +1813,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -1897,6 +1906,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -1919,6 +1929,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2008,6 +2019,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2030,6 +2042,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2108,6 +2121,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2130,6 +2144,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2151,6 +2166,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2173,6 +2189,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2230,6 +2247,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2285,6 +2303,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2423,6 +2442,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2476,6 +2496,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2547,6 +2568,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2609,6 +2631,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2663,6 +2686,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2736,6 +2760,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2789,6 +2814,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: Some("1485506232256168011".to_string()),
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -2842,6 +2868,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -3127,6 +3154,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;
@@ -3166,6 +3194,7 @@ mod tests {
                 claude_session_id: Some("sess-abc".to_string()),
                 thread_channel_id: None,
                 session_id: Some("raw-xyz".to_string()),
+                channel_id: None,
             }),
         )
         .await;
@@ -3207,6 +3236,7 @@ mod tests {
                 claude_session_id: None,
                 thread_channel_id: None,
                 session_id: None,
+                channel_id: None,
             }),
         )
         .await;

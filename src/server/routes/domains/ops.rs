@@ -20,6 +20,11 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route("/health/detail", get(health_api::health_detail_handler))
             .route(
+                "/dispatch-outbox/failed",
+                get(health_api::list_dispatch_outbox_failures_handler)
+                    .post(health_api::ack_dispatch_outbox_failures_handler),
+            )
+            .route(
                 "/doctor/startup/latest",
                 get(health_api::startup_doctor_latest_handler),
             )
@@ -234,11 +239,23 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 post(routines::kill_routine_session),
             )
             .route("/queue/generate", post(auto_queue::generate))
+            .route(
+                "/queue/request-generate",
+                post(auto_queue::request_generate),
+            )
+            .route(
+                "/queue/phase-gates/catalog",
+                get(auto_queue::phase_gate_catalog),
+            )
             .route("/queue/dispatch-next", post(auto_queue::activate))
             .route("/queue/status", get(auto_queue::status))
             .route("/queue/history", get(auto_queue::history))
             .route("/queue/entries/{id}", patch(auto_queue::update_entry))
             .route("/queue/runs/{id}/restore", post(auto_queue::restore_run))
+            .route(
+                "/queue/runs/{id}/phase-gates/repair",
+                post(auto_queue::repair_phase_gates),
+            )
             .route("/queue/runs/{id}/entries", post(auto_queue::add_run_entry))
             .route("/queue/entries/{id}/skip", patch(auto_queue::skip_entry))
             .route("/queue/runs/{id}", patch(auto_queue::update_run))
@@ -265,6 +282,15 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/channels/{id}/relay-recovery",
                 post(health_api::relay_recovery_handler),
+            )
+            .route(
+                "/channels/{channel_id}/monitoring",
+                post(super::super::monitoring::upsert_monitoring)
+                    .get(super::super::monitoring::list_monitoring),
+            )
+            .route(
+                "/channels/{channel_id}/monitoring/{key}",
+                delete(super::super::monitoring::remove_monitoring),
             )
             .route(
                 "/dispatches/pending",

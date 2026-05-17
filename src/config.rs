@@ -11,6 +11,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub discord: DiscordConfig,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
     pub voice: VoiceConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +137,40 @@ pub struct DiscordConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub owner_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    #[serde(default, alias = "tuiHosting", skip_serializing_if = "Option::is_none")]
+    pub tui_hosting: Option<bool>,
+}
+
+pub fn default_provider_tui_hosting(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "claude" | "codex"
+    )
+}
+
+impl Config {
+    pub fn provider_tui_hosting_enabled(&self, provider: &str) -> bool {
+        let key = provider.trim().to_ascii_lowercase();
+        self.providers
+            .get(&key)
+            .and_then(|config| config.tui_hosting)
+            .unwrap_or_else(|| default_provider_tui_hosting(&key))
+    }
+
+    pub fn any_provider_tui_hosting_requested(&self) -> bool {
+        crate::services::provider::supported_provider_ids()
+            .iter()
+            .any(|provider| self.provider_tui_hosting_enabled(provider))
+            || self
+                .providers
+                .values()
+                .any(|provider| provider.tui_hosting == Some(true))
+    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -264,6 +300,8 @@ pub struct AgentDef {
     pub voice_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensitivity_mode: Option<BargeInSensitivity>,
+    #[serde(default, skip_serializing_if = "AgentVoiceConfig::is_default")]
+    pub voice: AgentVoiceConfig,
     #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default, skip_serializing_if = "AgentChannels::is_empty")]
@@ -274,6 +312,46 @@ pub struct AgentDef {
     pub department: Option<String>,
     #[serde(default)]
     pub avatar_emoji: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentVoiceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "AgentVoiceForegroundConfig::is_default"
+    )]
+    pub foreground: AgentVoiceForegroundConfig,
+}
+
+impl AgentVoiceConfig {
+    pub fn is_default(&self) -> bool {
+        self.channel_id.as_deref().unwrap_or("").trim().is_empty() && self.foreground.is_default()
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentVoiceForegroundConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl AgentVoiceForegroundConfig {
+    pub fn is_default(&self) -> bool {
+        self.provider.as_deref().unwrap_or("").trim().is_empty()
+            && self.model.as_deref().unwrap_or("").trim().is_empty()
+            && self.max_chars.is_none()
+            && self.timeout_ms.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1758,6 +1836,7 @@ impl Default for Config {
         Self {
             server: ServerConfig::default(),
             discord: DiscordConfig::default(),
+            providers: std::collections::BTreeMap::new(),
             voice: VoiceConfig::default(),
             shared_prompt: None,
             mcp_servers: std::collections::BTreeMap::new(),
@@ -2376,6 +2455,7 @@ routines:
             wake_word: None,
             voice_enabled: true,
             sensitivity_mode: None,
+            voice: crate::config::AgentVoiceConfig::default(),
             provider: "codex".to_string(),
             channels: AgentChannels {
                 claude: Some("123456789012345678".into()),

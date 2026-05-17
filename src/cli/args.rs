@@ -267,6 +267,9 @@ pub(crate) enum Commands {
         /// Working directory (defaults to ".")
         #[arg(long, default_value = ".")]
         cwd: String,
+        /// Additional directory writable alongside the primary workspace
+        #[arg(long = "add-dir")]
+        add_dirs: Vec<String>,
         /// Input mode: fifo (default) or pipe
         #[arg(long, value_enum, default_value_t = InputModeArg::Fifo)]
         input_mode: InputModeArg,
@@ -304,6 +307,36 @@ pub(crate) enum Commands {
         /// Input mode: fifo (default) or pipe
         #[arg(long, value_enum, default_value_t = InputModeArg::Fifo)]
         input_mode: InputModeArg,
+    },
+    /// Relay Claude Code hook stdin JSON to the AgentDesk TUI hook receiver
+    ClaudeHookRelay {
+        /// Hook receiver base endpoint, e.g. http://127.0.0.1:49152
+        #[arg(long)]
+        endpoint: String,
+        /// Provider id, e.g. claude
+        #[arg(long)]
+        provider: String,
+        /// Claude hook event name, e.g. Stop or PreToolUse
+        #[arg(long)]
+        event: String,
+        /// TUI session id assigned by AgentDesk
+        #[arg(long = "session-id")]
+        session_id: String,
+    },
+    /// Relay Codex hook stdin JSON to the AgentDesk TUI hook receiver
+    CodexHookRelay {
+        /// Hook receiver base endpoint, e.g. http://127.0.0.1:49152
+        #[arg(long)]
+        endpoint: String,
+        /// Provider id, e.g. codex
+        #[arg(long)]
+        provider: String,
+        /// Codex hook event name, e.g. Stop or PreToolUse
+        #[arg(long)]
+        event: String,
+        /// TUI session id assigned by AgentDesk
+        #[arg(long = "session-id")]
+        session_id: String,
     },
     /// Kill all AgentDesk-* tmux sessions and clean temp files
     ResetTmux,

@@ -30,7 +30,15 @@ const CLAUDE_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 const CODEX_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 const FALLBACK_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
 
-const TMUX_SCROLLBACK_LINES: i64 = 500;
+/// Lines of tmux scrollback captured for the opencode recap summary. Earlier
+/// 500-line snapshots routinely overran the 20s OPENCODE_SUMMARY_TIMEOUT when
+/// the configured opencode model is the local Gemma 27B build. Empirical
+/// timing on that model (2026-05-14): 500 → ~20s+ (timeout fires),
+/// 200 → ~29s (still over), 100 → ~8s, 50 → ~5s. 100 is the smallest cap
+/// that still covers a turn pair (user + assistant) plus the surrounding
+/// chrome, so it is the chosen balance between context coverage and headroom
+/// under the 20s timeout for the slowest-supported local model.
+const TMUX_SCROLLBACK_LINES: i64 = 100;
 const OPENCODE_SUMMARY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Custom-id prefix for the `[새 세션 시작]` button on a recap card. The
@@ -219,7 +227,7 @@ pub(crate) async fn summarize_with_opencode(scrollback: &str) -> Option<String> 
         return None;
     }
     let prompt = format!(
-        "다음은 AI 코딩 에이전트와 사용자의 마지막 대화 ~500줄입니다. \
+        "다음은 AI 코딩 에이전트와 사용자의 마지막 대화 ~100줄입니다. \
          사용자가 지금 다시 돌아왔을 때 \"어떤 작업을 하던 중이었는지\"를 \
          즉시 기억할 수 있도록 1-2문장으로 한국어 요약을 만드세요. \
          도구 호출 / 스크롤 / 진행 표시 같은 노이즈는 무시하고 \

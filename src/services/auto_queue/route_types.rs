@@ -9,6 +9,10 @@ pub struct GenerateEntryBody {
     pub issue_number: i64,
     pub batch_phase: Option<i64>,
     pub thread_group: Option<i64>,
+    /// User-facing phase-gate kind id (#2125). Must match one of the ids
+    /// in `/api/queue/phase-gates/catalog`. When omitted, the catalog's
+    /// `default_kind` is used at status-response time.
+    pub phase_gate_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +88,12 @@ pub struct UpdateEntryBody {
 pub struct RebindSlotBody {
     pub run_id: String,
     pub thread_group: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RepairPhaseGateBody {
+    pub phase: Option<i64>,
+    pub dispatch_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

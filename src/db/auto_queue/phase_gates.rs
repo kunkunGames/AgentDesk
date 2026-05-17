@@ -1,5 +1,6 @@
 use serde_json::Value;
 use sqlx::{PgPool, Row as SqlxRow};
+use thiserror::Error;
 
 pub async fn current_batch_phase_pg(
     pool: &PgPool,
@@ -480,6 +481,43 @@ pub(crate) async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx(
     dispatch_context_json: Option<&str>,
     dispatch_result_json: Option<&str>,
 ) -> Result<PhaseGateReconciliation, String> {
+    reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
+        tx,
+        dispatch_id,
+        dispatch_status,
+        dispatch_context_json,
+        dispatch_result_json,
+        false,
+    )
+    .await
+}
+
+async fn repair_phase_gate_for_terminal_dispatch_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch_id: &str,
+    dispatch_status: &str,
+    dispatch_context_json: Option<&str>,
+    dispatch_result_json: Option<&str>,
+) -> Result<PhaseGateReconciliation, String> {
+    reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
+        tx,
+        dispatch_id,
+        dispatch_status,
+        dispatch_context_json,
+        dispatch_result_json,
+        true,
+    )
+    .await
+}
+
+async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    dispatch_id: &str,
+    dispatch_status: &str,
+    dispatch_context_json: Option<&str>,
+    dispatch_result_json: Option<&str>,
+    allow_failed_repair: bool,
+) -> Result<PhaseGateReconciliation, String> {
     let Some(gate) = parse_phase_gate_context(dispatch_context_json) else {
         return Ok(PhaseGateReconciliation::NoContext);
     };
@@ -493,7 +531,7 @@ pub(crate) async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx(
         return Ok(PhaseGateReconciliation::StaleRow);
     };
 
-    if gate_row.status == "failed" {
+    if gate_row.status == "failed" && !allow_failed_repair {
         return Ok(PhaseGateReconciliation::AlreadyFailed);
     }
 
@@ -628,6 +666,466 @@ pub(crate) async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx(
         run_resumed,
         run_finalized,
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhaseGateRepairOptions {
+    pub phase: Option<i64>,
+    pub dispatch_id: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum PhaseGateRepairError {
+    #[error("{message}")]
+    InvalidRequest { message: String },
+    #[error("{message}")]
+    NotFound { message: String },
+    #[error("{message}")]
+    Database { message: String },
+    #[error("{message}")]
+    Decode { message: String },
+    #[error("{message}")]
+    Reconcile { message: String },
+}
+
+impl PhaseGateRepairError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::NotFound { .. } => "not_found",
+            Self::Database { .. } => "database_error",
+            Self::Decode { .. } => "decode_error",
+            Self::Reconcile { .. } => "reconcile_error",
+        }
+    }
+
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound {
+            message: message.into(),
+        }
+    }
+
+    fn database(message: impl Into<String>) -> Self {
+        Self::Database {
+            message: message.into(),
+        }
+    }
+
+    fn decode(message: impl Into<String>) -> Self {
+        Self::Decode {
+            message: message.into(),
+        }
+    }
+
+    fn reconcile(message: impl Into<String>) -> Self {
+        Self::Reconcile {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhaseGateRepairSummary {
+    pub run_id: String,
+    pub phase_filter: Option<i64>,
+    pub dispatch_id_filter: Option<String>,
+    pub candidate_dispatches: usize,
+    pub cleared_gates: usize,
+    pub failed_gates: usize,
+    pub awaiting_siblings: usize,
+    pub stale_dispatches: usize,
+    pub no_context_dispatches: usize,
+    /// #2257: gates that match the filter but have `dispatch_id IS NULL`.
+    /// The repair candidate query skips them (it requires a JOIN onto
+    /// `task_dispatches`), but operators need to see they exist so they
+    /// can decide whether to delete or hand-patch them separately.
+    pub orphan_gates_skipped: usize,
+    pub blocking_gates_remaining: i64,
+    pub run_status: Option<String>,
+    pub outcomes: Vec<PhaseGateRepairOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseGateRepairOutcome {
+    pub dispatch_id: String,
+    pub phase: i64,
+    pub outcome: String,
+    pub run_resumed: bool,
+    pub run_finalized: bool,
+    pub pending_count: Option<i64>,
+    pub failed_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PhaseGateRepairCandidate {
+    phase: i64,
+    dispatch_id: String,
+    dispatch_status: String,
+    dispatch_context: Option<String>,
+    dispatch_result: Option<String>,
+}
+
+const PHASE_GATE_REPAIR_CANDIDATE_PHASES_SQL: &str = "\
+SELECT DISTINCT pg.phase
+FROM auto_queue_phase_gates pg
+JOIN task_dispatches td ON td.id = pg.dispatch_id
+WHERE pg.run_id = $1
+  AND pg.status IN ('pending', 'failed')
+  AND pg.dispatch_id IS NOT NULL
+  AND td.status NOT IN ('pending', 'dispatched')
+  AND ($2::BIGINT IS NULL OR pg.phase = $2)
+  AND ($3::TEXT IS NULL OR pg.dispatch_id = $3)
+ORDER BY pg.phase";
+
+const PHASE_GATE_REPAIR_CANDIDATES_FOR_UPDATE_SQL: &str = "\
+SELECT pg.phase,
+       pg.dispatch_id,
+       td.status        AS dispatch_status,
+       td.context::TEXT AS dispatch_context,
+       td.result::TEXT  AS dispatch_result
+FROM auto_queue_phase_gates pg
+JOIN task_dispatches td ON td.id = pg.dispatch_id
+WHERE pg.run_id = $1
+  AND pg.status IN ('pending', 'failed')
+  AND pg.dispatch_id IS NOT NULL
+  AND td.status NOT IN ('pending', 'dispatched')
+  AND ($2::BIGINT IS NULL OR pg.phase = $2)
+  AND ($3::TEXT IS NULL OR pg.dispatch_id = $3)
+ORDER BY pg.phase, pg.dispatch_id
+FOR UPDATE OF pg";
+
+/// #2257 concern 4: lock the candidate `task_dispatches` rows themselves
+/// BEFORE the per-phase advisory lock or the `phase_gates` row locks. The
+/// regular PATCH completion path takes `task_dispatches` first (implicit
+/// row lock on its `UPDATE`) and only then takes the same advisory +
+/// phase_gates locks the repair path uses. Keeping the same lock order
+/// across both paths is what prevents deadlock between a concurrent
+/// repair and PATCH on the same dispatch.
+///
+/// `ORDER BY td.id` makes acquisition deterministic when two concurrent
+/// repairs target overlapping dispatch sets — they line up on the same
+/// id sequence instead of fighting in arbitrary order.
+const PHASE_GATE_REPAIR_LOCK_DISPATCH_ROWS_SQL: &str = "\
+SELECT td.id
+FROM task_dispatches td
+JOIN auto_queue_phase_gates pg ON pg.dispatch_id = td.id
+WHERE pg.run_id = $1
+  AND pg.status IN ('pending', 'failed')
+  AND pg.dispatch_id IS NOT NULL
+  AND td.status NOT IN ('pending', 'dispatched')
+  AND ($2::BIGINT IS NULL OR pg.phase = $2)
+  AND ($3::TEXT IS NULL OR pg.dispatch_id = $3)
+ORDER BY td.id
+FOR UPDATE OF td";
+
+async fn lock_phase_gate_repair_candidate_dispatch_rows_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    phase_filter: Option<i64>,
+    dispatch_id_filter: Option<&str>,
+) -> Result<(), PhaseGateRepairError> {
+    sqlx::query_scalar::<_, String>(PHASE_GATE_REPAIR_LOCK_DISPATCH_ROWS_SQL)
+        .bind(run_id)
+        .bind(phase_filter)
+        .bind(dispatch_id_filter)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| {
+            PhaseGateRepairError::database(format!(
+                "lock task_dispatches rows for phase-gate repair on run {run_id}: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+async fn lock_phase_gate_repair_candidate_phases_on_pg_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: &str,
+    phase_filter: Option<i64>,
+    dispatch_id_filter: Option<&str>,
+) -> Result<(), PhaseGateRepairError> {
+    let phases = sqlx::query_scalar::<_, i64>(PHASE_GATE_REPAIR_CANDIDATE_PHASES_SQL)
+        .bind(run_id)
+        .bind(phase_filter)
+        .bind(dispatch_id_filter)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| {
+            PhaseGateRepairError::database(format!(
+                "load phase-gate repair candidate phases for run {run_id}: {error}"
+            ))
+        })?;
+
+    for phase in phases {
+        lock_phase_gate_state_on_pg_tx(tx, run_id, phase)
+            .await
+            .map_err(PhaseGateRepairError::database)?;
+    }
+
+    Ok(())
+}
+
+/// Re-evaluate terminal phase-gate dispatches for one run, including rows
+/// already marked `failed`. This is an operator repair path for cases where a
+/// dispatch result was patched or persisted after the normal completion hook
+/// already marked the gate failed.
+pub async fn repair_phase_gates_for_run_on_pg(
+    pool: &PgPool,
+    run_id: &str,
+    options: PhaseGateRepairOptions,
+) -> Result<PhaseGateRepairSummary, PhaseGateRepairError> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Err(PhaseGateRepairError::invalid_request("run_id is required"));
+    }
+    if let Some(phase) = options.phase
+        && phase < 0
+    {
+        return Err(PhaseGateRepairError::invalid_request("phase must be >= 0"));
+    }
+    let dispatch_id = normalize_optional_text(options.dispatch_id.as_deref());
+
+    let mut tx = pool.begin().await.map_err(|error| {
+        PhaseGateRepairError::database(format!(
+            "begin postgres phase-gate repair for run {run_id}: {error}"
+        ))
+    })?;
+
+    let run_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM auto_queue_runs WHERE id = $1)")
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                PhaseGateRepairError::database(format!(
+                    "check postgres auto-queue run {run_id}: {error}"
+                ))
+            })?;
+    if !run_exists {
+        return Err(PhaseGateRepairError::not_found(format!(
+            "auto-queue run not found: {run_id}"
+        )));
+    }
+
+    // #2257 concern 4: lock task_dispatches FIRST (matching PATCH's order),
+    // then advisory locks, then phase_gates FOR UPDATE. Any concurrent
+    // dispatch PATCH on the same dispatch waits at step 1; we then see its
+    // committed status/result in the candidate read below.
+    lock_phase_gate_repair_candidate_dispatch_rows_on_pg_tx(
+        &mut tx,
+        run_id,
+        options.phase,
+        dispatch_id.as_deref(),
+    )
+    .await?;
+
+    lock_phase_gate_repair_candidate_phases_on_pg_tx(
+        &mut tx,
+        run_id,
+        options.phase,
+        dispatch_id.as_deref(),
+    )
+    .await?;
+
+    let candidate_rows = sqlx::query(PHASE_GATE_REPAIR_CANDIDATES_FOR_UPDATE_SQL)
+        .bind(run_id)
+        .bind(options.phase)
+        .bind(dispatch_id.as_deref())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            PhaseGateRepairError::database(format!(
+                "load phase-gate repair candidates for run {run_id}: {error}"
+            ))
+        })?;
+
+    let candidates: Vec<PhaseGateRepairCandidate> = candidate_rows
+        .into_iter()
+        .map(|row| {
+            Ok(PhaseGateRepairCandidate {
+                phase: row.try_get("phase").map_err(|error| {
+                    PhaseGateRepairError::decode(format!("decode repair candidate phase: {error}"))
+                })?,
+                dispatch_id: row.try_get("dispatch_id").map_err(|error| {
+                    PhaseGateRepairError::decode(format!(
+                        "decode repair candidate dispatch_id: {error}"
+                    ))
+                })?,
+                dispatch_status: row.try_get("dispatch_status").map_err(|error| {
+                    PhaseGateRepairError::decode(format!("decode repair candidate status: {error}"))
+                })?,
+                dispatch_context: row.try_get("dispatch_context").map_err(|error| {
+                    PhaseGateRepairError::decode(format!(
+                        "decode repair candidate context: {error}"
+                    ))
+                })?,
+                dispatch_result: row.try_get("dispatch_result").map_err(|error| {
+                    PhaseGateRepairError::decode(format!("decode repair candidate result: {error}"))
+                })?,
+            })
+        })
+        .collect::<Result<_, PhaseGateRepairError>>()?;
+
+    let mut cleared_gates = 0;
+    let mut failed_gates = 0;
+    let mut awaiting_siblings = 0;
+    let mut stale_dispatches = 0;
+    let mut no_context_dispatches = 0;
+    let mut outcomes = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        let outcome = repair_phase_gate_for_terminal_dispatch_on_pg_tx(
+            &mut tx,
+            &candidate.dispatch_id,
+            &candidate.dispatch_status,
+            candidate.dispatch_context.as_deref(),
+            candidate.dispatch_result.as_deref(),
+        )
+        .await
+        .map_err(PhaseGateRepairError::reconcile)?;
+        let mut repair_outcome = PhaseGateRepairOutcome {
+            dispatch_id: candidate.dispatch_id,
+            phase: candidate.phase,
+            outcome: "unknown".to_string(),
+            run_resumed: false,
+            run_finalized: false,
+            pending_count: None,
+            failed_reason: None,
+        };
+        match outcome {
+            PhaseGateReconciliation::NoContext => {
+                no_context_dispatches += 1;
+                repair_outcome.outcome = "no_context".to_string();
+            }
+            PhaseGateReconciliation::AlreadyFailed => {
+                failed_gates += 1;
+                repair_outcome.outcome = "already_failed".to_string();
+            }
+            PhaseGateReconciliation::StaleRow => {
+                stale_dispatches += 1;
+                repair_outcome.outcome = "stale".to_string();
+            }
+            PhaseGateReconciliation::MarkedFailed { failed_reason, .. } => {
+                failed_gates += 1;
+                repair_outcome.outcome = "failed".to_string();
+                repair_outcome.failed_reason = Some(failed_reason);
+            }
+            PhaseGateReconciliation::AwaitingSiblings { pending_count, .. } => {
+                awaiting_siblings += 1;
+                repair_outcome.outcome = "awaiting_siblings".to_string();
+                repair_outcome.pending_count = Some(pending_count);
+            }
+            PhaseGateReconciliation::Cleared {
+                run_resumed,
+                run_finalized,
+                ..
+            } => {
+                cleared_gates += 1;
+                repair_outcome.outcome = "cleared".to_string();
+                repair_outcome.run_resumed = run_resumed;
+                repair_outcome.run_finalized = run_finalized;
+            }
+        }
+        outcomes.push(repair_outcome);
+    }
+
+    let blocking_gates_remaining = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT
+         FROM auto_queue_phase_gates
+         WHERE run_id = $1
+           AND status IN ('pending', 'failed')
+           AND ($2::BIGINT IS NULL OR phase = $2)
+           AND ($3::TEXT IS NULL OR dispatch_id = $3)",
+    )
+    .bind(run_id)
+    .bind(options.phase)
+    .bind(dispatch_id.as_deref())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| {
+        PhaseGateRepairError::database(format!(
+            "count remaining blocking phase gates for run {run_id}: {error}"
+        ))
+    })?;
+
+    // #2257: surface the count of orphan gates (no dispatch row) so operators
+    // know the candidate query intentionally skipped them. Without this they
+    // get no signal that hand-cleanup may still be required.
+    let orphan_gates_skipped = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)::BIGINT
+         FROM auto_queue_phase_gates
+         WHERE run_id = $1
+           AND status IN ('pending', 'failed')
+           AND dispatch_id IS NULL
+           AND ($2::BIGINT IS NULL OR phase = $2)",
+    )
+    .bind(run_id)
+    .bind(options.phase)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|error| {
+        PhaseGateRepairError::database(format!(
+            "count orphan phase gates for run {run_id}: {error}"
+        ))
+    })? as usize;
+
+    let run_status =
+        sqlx::query_scalar::<_, Option<String>>("SELECT status FROM auto_queue_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| {
+                PhaseGateRepairError::database(format!(
+                    "load repaired run status for {run_id}: {error}"
+                ))
+            })?;
+
+    // #2257: build the summary before commit so we can emit it on
+    // commit-failure too. Without this, a commit error swallows all
+    // per-candidate context and operators see a generic 500 with no record
+    // of which gates were attempted.
+    let summary = PhaseGateRepairSummary {
+        run_id: run_id.to_string(),
+        phase_filter: options.phase,
+        dispatch_id_filter: dispatch_id,
+        candidate_dispatches: outcomes.len(),
+        cleared_gates,
+        failed_gates,
+        awaiting_siblings,
+        stale_dispatches,
+        no_context_dispatches,
+        orphan_gates_skipped,
+        blocking_gates_remaining,
+        run_status,
+        outcomes,
+    };
+
+    if let Err(error) = tx.commit().await {
+        tracing::warn!(
+            run_id = %summary.run_id,
+            candidate_dispatches = summary.candidate_dispatches,
+            cleared_gates = summary.cleared_gates,
+            failed_gates = summary.failed_gates,
+            awaiting_siblings = summary.awaiting_siblings,
+            stale_dispatches = summary.stale_dispatches,
+            no_context_dispatches = summary.no_context_dispatches,
+            orphan_gates_skipped = summary.orphan_gates_skipped,
+            error = %error,
+            "[auto-queue] phase-gate repair commit failed; rolled back — reporting attempted-but-not-applied summary"
+        );
+        return Err(PhaseGateRepairError::database(format!(
+            "commit postgres phase-gate repair for run {}: {error}",
+            summary.run_id
+        )));
+    }
+
+    Ok(summary)
 }
 
 #[derive(Debug, Clone)]
@@ -849,7 +1347,8 @@ async fn load_phase_gate_row_for_dispatch_on_pg_tx(
         "SELECT status
          FROM auto_queue_phase_gates
          WHERE run_id = $1 AND phase = $2 AND dispatch_id = $3
-         LIMIT 1",
+         LIMIT 1
+         FOR UPDATE",
     )
     .bind(run_id)
     .bind(phase)
@@ -1319,13 +1818,16 @@ mod current_batch_phase_pg_tests {
 #[cfg(test)]
 mod reconcile_phase_gate_pg_tests {
     use super::{
-        PhaseGateReconciliation, PhaseGateStateWrite, infer_phase_gate_pass_verdict,
-        parse_phase_gate_context, reconcile_phase_gate_for_terminal_dispatch_on_pg_tx,
+        PhaseGateReconciliation, PhaseGateRepairOptions, PhaseGateStateWrite,
+        infer_phase_gate_pass_verdict, parse_phase_gate_context,
+        reconcile_phase_gate_for_terminal_dispatch_on_pg_tx, repair_phase_gates_for_run_on_pg,
         save_phase_gate_state_on_pg,
     };
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use serde_json::json;
     use sqlx::PgPool;
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
 
     async fn fixture(pool: &PgPool) {
         sqlx::query(
@@ -1764,6 +2266,265 @@ mod reconcile_phase_gate_pg_tests {
         assert!(matches!(outcome, PhaseGateReconciliation::AlreadyFailed));
         assert_eq!(gate_status(&pool, "run-pg-test", 0).await, "failed");
         assert_eq!(run_status(&pool, "run-pg-test").await, "paused");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repair_failed_gate_is_idempotent_after_clear() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-next-phase-repair", 1).await;
+
+        insert_dispatch(
+            &pool,
+            "dsp-repair-idempotent",
+            "completed",
+            gate_context(),
+            Some(json!({"verdict":"phase_gate_passed"})),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "failed".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-repair-idempotent".into()],
+                next_phase: Some(1),
+                final_phase: false,
+                failure_reason: Some("stale failed verdict".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed failed gate state");
+        sqlx::query("UPDATE auto_queue_runs SET status='paused' WHERE id='run-pg-test'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let first = repair_phase_gates_for_run_on_pg(
+            &pool,
+            "run-pg-test",
+            PhaseGateRepairOptions::default(),
+        )
+        .await
+        .expect("first repair");
+        assert_eq!(first.candidate_dispatches, 1);
+        assert_eq!(first.cleared_gates, 1);
+        assert_eq!(first.blocking_gates_remaining, 0);
+        assert_eq!(first.run_status.as_deref(), Some("active"));
+        assert_eq!(first.outcomes[0].outcome, "cleared");
+        assert!(first.outcomes[0].run_resumed);
+
+        let second = repair_phase_gates_for_run_on_pg(
+            &pool,
+            "run-pg-test",
+            PhaseGateRepairOptions::default(),
+        )
+        .await
+        .expect("second repair");
+        assert_eq!(second.candidate_dispatches, 0);
+        assert_eq!(second.cleared_gates, 0);
+        assert_eq!(second.blocking_gates_remaining, 0);
+        assert_eq!(second.run_status.as_deref(), Some("active"));
+        assert_eq!(gate_count(&pool, "run-pg-test", 0).await, 0);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_repair_calls_clear_failed_gate_once() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-next-phase-concurrent", 1).await;
+
+        insert_dispatch(
+            &pool,
+            "dsp-repair-concurrent",
+            "completed",
+            gate_context(),
+            Some(json!({"verdict":"phase_gate_passed"})),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "failed".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-repair-concurrent".into()],
+                next_phase: Some(1),
+                final_phase: false,
+                failure_reason: Some("stale failed verdict".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed failed gate state");
+        sqlx::query("UPDATE auto_queue_runs SET status='paused' WHERE id='run-pg-test'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let left_pool = pool.clone();
+        let left_barrier = Arc::clone(&barrier);
+        let left = tokio::spawn(async move {
+            left_barrier.wait().await;
+            repair_phase_gates_for_run_on_pg(
+                &left_pool,
+                "run-pg-test",
+                PhaseGateRepairOptions::default(),
+            )
+            .await
+        });
+        let right_pool = pool.clone();
+        let right_barrier = Arc::clone(&barrier);
+        let right = tokio::spawn(async move {
+            right_barrier.wait().await;
+            repair_phase_gates_for_run_on_pg(
+                &right_pool,
+                "run-pg-test",
+                PhaseGateRepairOptions::default(),
+            )
+            .await
+        });
+        barrier.wait().await;
+
+        let left = left.await.expect("left task").expect("left repair");
+        let right = right.await.expect("right task").expect("right repair");
+        let summaries = [left, right];
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.cleared_gates)
+                .sum::<usize>(),
+            1,
+            "only one repair call may clear the same gate"
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .flat_map(|summary| summary.outcomes.iter())
+                .filter(|outcome| outcome.run_resumed)
+                .count(),
+            1,
+            "only one repair call may resume the paused run"
+        );
+        assert_eq!(gate_count(&pool, "run-pg-test", 0).await, 0);
+        assert_eq!(run_status(&pool, "run-pg-test").await, "active");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// #2257 concern 4 regression: a concurrent direct UPDATE on
+    /// `task_dispatches.status` (which is what `PATCH /api/dispatches/{id}`
+    /// runs through `set_dispatch_status_on_pg_with_sync`) acquires the
+    /// same `task_dispatches` row lock the repair path now takes. The two
+    /// paths must serialize on the dispatch row without deadlock and the
+    /// final phase_gate state must reflect the post-PATCH dispatch state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repair_serializes_with_concurrent_dispatch_update_without_deadlock() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        fixture(&pool).await;
+        seed_pending_entry(&pool, "run-pg-test", "entry-next-phase-deadlock", 1).await;
+
+        insert_dispatch(
+            &pool,
+            "dsp-repair-vs-patch",
+            "completed",
+            gate_context(),
+            Some(json!({"verdict":"phase_gate_passed"})),
+        )
+        .await;
+        save_phase_gate_state_on_pg(
+            &pool,
+            "run-pg-test",
+            0,
+            &PhaseGateStateWrite {
+                status: "failed".into(),
+                pass_verdict: "phase_gate_passed".into(),
+                dispatch_ids: vec!["dsp-repair-vs-patch".into()],
+                next_phase: Some(1),
+                final_phase: false,
+                failure_reason: Some("stale failed verdict".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed failed gate state");
+        sqlx::query("UPDATE auto_queue_runs SET status='paused' WHERE id='run-pg-test'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let repair_pool = pool.clone();
+        let repair_barrier = Arc::clone(&barrier);
+        let repair_task = tokio::spawn(async move {
+            repair_barrier.wait().await;
+            repair_phase_gates_for_run_on_pg(
+                &repair_pool,
+                "run-pg-test",
+                PhaseGateRepairOptions::default(),
+            )
+            .await
+        });
+        // Simulate PATCH /api/dispatches/{id}: open its own tx, lock the
+        // same task_dispatches row, mutate, commit. Mirrors the lock
+        // order that `set_dispatch_status_on_pg_with_sync` takes
+        // (task_dispatches first via UPDATE row lock).
+        let patch_pool = pool.clone();
+        let patch_barrier = Arc::clone(&barrier);
+        let patch_task = tokio::spawn(async move {
+            patch_barrier.wait().await;
+            let mut tx = patch_pool.begin().await.expect("begin patch-simulation tx");
+            sqlx::query(
+                "UPDATE task_dispatches
+                 SET result = CAST($1 AS jsonb), updated_at = NOW()
+                 WHERE id = 'dsp-repair-vs-patch'",
+            )
+            .bind(r#"{"verdict":"phase_gate_passed","note":"post-patch"}"#)
+            .execute(&mut *tx)
+            .await
+            .expect("patch task_dispatches");
+            // Hold the row lock briefly to maximize lock-order overlap
+            // with the repair task — exposes deadlock if the two paths
+            // ever drift to opposite orders.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tx.commit().await.expect("commit patch-simulation tx");
+        });
+        barrier.wait().await;
+
+        // Bounded wait so a regression that re-introduces the deadlock
+        // fails fast instead of hanging the test runner.
+        let repair = tokio::time::timeout(std::time::Duration::from_secs(15), repair_task)
+            .await
+            .expect("repair task did not deadlock")
+            .expect("repair task panicked");
+        let _patch = tokio::time::timeout(std::time::Duration::from_secs(15), patch_task)
+            .await
+            .expect("patch task did not deadlock")
+            .expect("patch task panicked");
+        let summary = repair.expect("repair returned Ok");
+
+        // The repair eventually cleared the gate (one of the two orderings
+        // — either it read post-PATCH state and cleared, or pre-PATCH and
+        // still cleared because the existing verdict was already a pass).
+        // The invariant we care about is no deadlock + final consistent
+        // state: the gate row is gone, run resumed.
+        assert_eq!(summary.cleared_gates + summary.failed_gates, 1);
+        assert_eq!(gate_count(&pool, "run-pg-test", 0).await, 0);
 
         pool.close().await;
         pg_db.drop().await;

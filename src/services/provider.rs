@@ -81,8 +81,8 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         },
         default_behavior: ProviderDefaultBehavior {
             resume_without_reset: true,
-            runtime_model: Some("default"),
-            source_label: "Claude default alias",
+            runtime_model: None,
+            source_label: "Claude provider default",
         },
         default_context_window: 1_000_000,
         managed_tmux_backend: true,
@@ -717,14 +717,42 @@ fn tmux_session_alive(tmux_session_name: &str) -> bool {
     crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
 }
 
-#[cfg(unix)]
 pub(crate) fn tmux_capture_indicates_ready_for_input(capture: &str) -> bool {
-    capture
-        .lines()
-        .rev()
-        .filter(|l| !l.trim().is_empty())
-        .take(3)
-        .any(|l| l.contains("Ready for input (type message + Enter)"))
+    crate::services::tmux_common::tmux_capture_indicates_claude_tui_ready_for_input(capture)
+}
+
+#[cfg(all(test, unix))]
+mod ready_input_prompt_tests {
+    #[test]
+    fn detects_ready_banner() {
+        let capture = "\
+build logs\n\
+Ready for input (type message + Enter)\n\
+> ";
+        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+    }
+
+    #[test]
+    fn detects_claude_tui_prompt_above_footer() {
+        let capture = "\
+output recap\n\
+─────────────────────────────────────────────────────────────────────────────\n\
+❯\u{00a0}\n\
+─────────────────────────────────────────────────────────────────────────────\n\
+  🤖 Opus(H) │ ██░░░░░░░░ │ 24%\n\
+  📁 agentdesk (main*) │ Todos: -\n\
+  ⏵⏵ bypass permissions on";
+        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+    }
+
+    #[test]
+    fn rejects_non_ready_capture() {
+        let capture = "\
+build logs\n\
+waiting for tool output\n\
+still running";
+        assert!(!super::tmux_capture_indicates_ready_for_input(capture));
+    }
 }
 
 #[cfg(unix)]
@@ -880,6 +908,11 @@ where
         if std::fs::metadata(output_path).is_ok() {
             break;
         }
+        if !is_alive() {
+            return Ok(ReadOutputResult::SessionDied {
+                offset: start_offset,
+            });
+        }
         if wait_start.elapsed() > Duration::from_secs(30) {
             return Err("Timeout waiting for output file".to_string());
         }
@@ -893,6 +926,10 @@ where
             Duration::from_millis((wait_interval.as_millis() as f64 * 1.5) as u64),
             max_wait_interval,
         );
+    }
+
+    if start_offset > 0 {
+        emit_output_offset(start_offset);
     }
 
     let mut file = std::fs::File::open(output_path)
@@ -1101,6 +1138,76 @@ mod cancel_token_tests {
             .cancelled
             .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(cancel_requested(Some(&token)));
+    }
+}
+
+#[cfg(test)]
+mod poll_output_file_tests {
+    use super::{ReadOutputResult, poll_output_file_until_result};
+
+    #[test]
+    fn missing_output_file_reports_session_died_when_process_already_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing.jsonl");
+        let mut state = ();
+
+        let result = poll_output_file_until_result(
+            missing_path.to_str().unwrap(),
+            12,
+            None,
+            &mut state,
+            || false,
+            || false,
+            |_| {},
+            |_, _| true,
+            |_| false,
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(result, ReadOutputResult::SessionDied { offset: 12 });
+    }
+
+    #[test]
+    fn existing_output_file_emits_start_offset_before_new_bytes() {
+        #[derive(Default)]
+        struct TestState {
+            saw_done: bool,
+            lines: Vec<String>,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("stream.jsonl");
+        let previous = "old\n";
+        std::fs::write(&output_path, format!("{previous}DONE\n")).unwrap();
+        let start_offset = previous.len() as u64;
+
+        let mut state = TestState::default();
+        let mut offsets = Vec::new();
+        let result = poll_output_file_until_result(
+            output_path.to_str().unwrap(),
+            start_offset,
+            None,
+            &mut state,
+            || true,
+            || false,
+            |offset| offsets.push(offset),
+            |line: &str, state| {
+                state.lines.push(line.to_string());
+                state.saw_done = line == "DONE";
+                true
+            },
+            |state| state.saw_done,
+            |_| true,
+            |_| {},
+        )
+        .unwrap();
+
+        let file_len = std::fs::metadata(&output_path).unwrap().len();
+        assert_eq!(result, ReadOutputResult::Completed { offset: file_len });
+        assert_eq!(state.lines, vec!["DONE".to_string()]);
+        assert_eq!(offsets, vec![start_offset, file_len]);
     }
 }
 
@@ -2123,6 +2230,20 @@ mod tests {
 build logs\n\
 Ready for input (type message + Enter)\n\
 > ";
+        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_tmux_capture_indicates_ready_for_input_detects_claude_tui_prompt() {
+        let capture = "\
+output recap\n\
+─────────────────────────────────────────────────────────────────────────────\n\
+❯\u{00a0}\n\
+─────────────────────────────────────────────────────────────────────────────\n\
+  🤖 Opus(H) │ ██░░░░░░░░ │ 24%\n\
+  📁 agentdesk (main*) │ Todos: -\n\
+  ⏵⏵ bypass permissions on";
         assert!(super::tmux_capture_indicates_ready_for_input(capture));
     }
 

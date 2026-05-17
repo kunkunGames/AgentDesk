@@ -19,6 +19,10 @@ pub(crate) const DEFAULT_BARGE_IN_ACKNOWLEDGEMENT: &str =
     "그동안 말씀하신 거 같이 정리해서 작업할게요.";
 pub(crate) const DEFAULT_BARGE_IN_TTL_SECS: u64 = 15 * 60;
 pub(crate) const DEFAULT_ACTIVE_AGENT_TTL_SECS: u64 = 180;
+pub(crate) const DEFAULT_FOREGROUND_PROVIDER: &str = "claude";
+pub(crate) const DEFAULT_FOREGROUND_MODEL: &str = "sonnet";
+pub(crate) const DEFAULT_FOREGROUND_MAX_CHARS: usize = 220;
+pub(crate) const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 3_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -35,8 +39,15 @@ pub(crate) struct VoiceConfig {
     pub allowed_user_ids: Vec<String>,
     pub lobby_channel_id: Option<String>,
     pub active_agent_ttl_seconds: u64,
+    pub foreground: VoiceForegroundConfig,
+    pub spoken_result: VoiceSpokenResultConfig,
     pub default_sensitivity_mode: BargeInSensitivity,
     pub auto_join_channel_ids: Vec<String>,
+    /// `false` (기본값) 이면 utterance / segment wav 와 transcript sidecar 를
+    /// STT 직후 삭제하고, 시작 시 기존 누적분도 GC 한다 (#2156). 디버그/품질
+    /// 분석 목적으로 보존하려면 `true` 로 두거나 환경변수 `ADK_VOICE_KEEP_WAV=1`
+    /// 을 설정하면 보존된다.
+    pub keep_recordings: bool,
 }
 
 impl Default for VoiceConfig {
@@ -54,8 +65,11 @@ impl Default for VoiceConfig {
             allowed_user_ids: Vec::new(),
             lobby_channel_id: None,
             active_agent_ttl_seconds: DEFAULT_ACTIVE_AGENT_TTL_SECS,
+            foreground: VoiceForegroundConfig::default(),
+            spoken_result: VoiceSpokenResultConfig::default(),
             default_sensitivity_mode: BargeInSensitivity::Normal,
             auto_join_channel_ids: Vec::new(),
+            keep_recordings: false,
         }
     }
 }
@@ -95,6 +109,20 @@ impl VoiceConfig {
         })
     }
 
+    /// `keep_recordings` 또는 환경변수 `ADK_VOICE_KEEP_WAV` 에 따라 utterance wav /
+    /// segment / transcript sidecar 를 보존할지 결정한다 (#2156). 환경변수가 명시적으로
+    /// 설정된 경우 config 값을 덮어쓴다.
+    pub(crate) fn keep_voice_recordings(&self) -> bool {
+        if let Some(env_value) = std::env::var("ADK_VOICE_KEEP_WAV")
+            .ok()
+            .as_deref()
+            .and_then(parse_bool_env)
+        {
+            return env_value;
+        }
+        self.keep_recordings
+    }
+
     pub(crate) fn auto_join_channel_ids_with_lobby(&self) -> Vec<String> {
         let mut channel_ids = Vec::new();
         if let Some(lobby_channel_id) = self
@@ -123,6 +151,40 @@ fn parse_bool_env(value: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct VoiceForegroundConfig {
+    pub provider: String,
+    pub model: String,
+    pub max_chars: usize,
+    pub timeout_ms: u64,
+}
+
+impl Default for VoiceForegroundConfig {
+    fn default() -> Self {
+        Self {
+            provider: DEFAULT_FOREGROUND_PROVIDER.to_string(),
+            model: DEFAULT_FOREGROUND_MODEL.to_string(),
+            max_chars: DEFAULT_FOREGROUND_MAX_CHARS,
+            timeout_ms: DEFAULT_FOREGROUND_TIMEOUT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct VoiceSpokenResultConfig {
+    pub max_chars: usize,
+}
+
+impl Default for VoiceSpokenResultConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: crate::voice::sanitizer::DEFAULT_SPOKEN_RESULT_CHAR_LIMIT,
+        }
     }
 }
 
@@ -292,6 +354,8 @@ mod tests {
         assert_eq!(config.stt.model_path, PathBuf::from(DEFAULT_STT_MODEL_PATH));
         assert_eq!(config.stt.language, DEFAULT_STT_LANGUAGE);
         assert_eq!(config.tts.backend, VoiceTtsBackendKind::Edge);
+        assert_eq!(config.foreground, VoiceForegroundConfig::default());
+        assert_eq!(config.spoken_result, VoiceSpokenResultConfig::default());
         assert_eq!(
             config.tts.progress_cache_dir,
             PathBuf::from(DEFAULT_PROGRESS_TTS_CACHE_DIR)
@@ -327,6 +391,13 @@ lobby_channel_id: "1509999999999999999"
 active_agent_ttl_seconds: 240
 auto_join_channel_ids:
   - "1500000000000000000"
+foreground:
+  provider: codex
+  model: gpt-5.5-instant
+  max_chars: 180
+  timeout_ms: 2500
+spoken_result:
+  max_chars: 720
 "#,
         )
         .unwrap();
@@ -364,6 +435,11 @@ auto_join_channel_ids:
             config.auto_join_channel_ids_with_lobby(),
             vec!["1509999999999999999", "1500000000000000000"]
         );
+        assert_eq!(config.foreground.provider, "codex");
+        assert_eq!(config.foreground.model, "gpt-5.5-instant");
+        assert_eq!(config.foreground.max_chars, 180);
+        assert_eq!(config.foreground.timeout_ms, 2_500);
+        assert_eq!(config.spoken_result.max_chars, 720);
     }
 
     #[test]

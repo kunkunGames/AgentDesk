@@ -1189,25 +1189,35 @@ pub(in crate::services::discord) async fn handle_event(
                 .map(|(parent_id, _)| parent_id)
                 .unwrap_or(channel_id);
             let settings_snapshot = { data.shared.settings.read().await.clone() };
-            if validate_live_channel_routing_with_dm_hint(
-                ctx,
-                &data.provider,
-                &settings_snapshot,
-                channel_id,
-                Some(is_dm),
-            )
-            .await
-            .is_err()
+            let announce_bot_id = super::super::resolve_announce_bot_user_id(&data.shared).await;
+            let is_voice_transcript_announcement = announce_bot_id == Some(user_id.get())
+                && (crate::voice::announce_meta::global_store().contains(new_message.id)
+                    || crate::voice::prompt::parse_voice_transcript_announcement(
+                        &new_message.content,
+                    )
+                    .is_some());
+            if !is_voice_transcript_announcement
+                && validate_live_channel_routing_with_dm_hint(
+                    ctx,
+                    &data.provider,
+                    &settings_snapshot,
+                    channel_id,
+                    Some(is_dm),
+                )
+                .await
+                .is_err()
             {
                 return Ok(());
             }
-            if should_skip_for_missing_required_mention(
-                &settings_snapshot,
-                effective_channel_id,
-                is_dm,
-                &new_message.content,
-                ctx.cache.current_user().id,
-            ) {
+            if !is_voice_transcript_announcement
+                && should_skip_for_missing_required_mention(
+                    &settings_snapshot,
+                    effective_channel_id,
+                    is_dm,
+                    &new_message.content,
+                    ctx.cache.current_user().id,
+                )
+            {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
                     "  [{ts}] ⏭ MENTION-GUARD: skipping message {} in channel {} (effective {}) because bot mention is required",
@@ -1217,7 +1227,20 @@ pub(in crate::services::discord) async fn handle_event(
                 );
                 return Ok(());
             }
-            if !is_dm {
+            if !is_voice_transcript_announcement
+                && data
+                    .shared
+                    .voice_barge_in
+                    .try_handle_voice_channel_text_reply(
+                        &ctx.http,
+                        channel_id,
+                        &new_message.content,
+                    )
+                    .await
+            {
+                return Ok(());
+            }
+            if !is_dm && !is_voice_transcript_announcement {
                 match resolve_runtime_channel_binding_status(&ctx.http, effective_channel_id).await
                 {
                     RuntimeChannelBindingStatus::Owned => {}
@@ -1265,7 +1288,6 @@ pub(in crate::services::discord) async fn handle_event(
             let (sanitized_text, has_monitor_auto_turn_origin) =
                 super::super::strip_monitor_auto_turn_origin(raw_text);
             let text = sanitized_text.trim();
-            let announce_bot_id = super::super::resolve_announce_bot_user_id(&data.shared).await;
 
             let is_allowed_bot_sender = settings_snapshot.allowed_bot_ids.contains(&user_id.get())
                 || announce_bot_id.is_some_and(|id| id == user_id.get());

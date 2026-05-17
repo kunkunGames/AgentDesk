@@ -11,8 +11,8 @@ use crate::services::auto_queue::route;
 #[allow(unused_imports)]
 pub use route::{
     ActivateBody, AddRunEntryBody, CancelQuery, GenerateBody, GenerateEntryBody, HistoryQuery,
-    OrderBody, PauseBody, RebindSlotBody, ReorderBody, ResetBody, ResetGlobalBody, StatusQuery,
-    UpdateEntryBody, UpdateRunBody,
+    OrderBody, PauseBody, RebindSlotBody, ReorderBody, RepairPhaseGateBody, ResetBody,
+    ResetGlobalBody, StatusQuery, UpdateEntryBody, UpdateRunBody,
 };
 
 #[allow(unused_imports)]
@@ -127,6 +127,15 @@ pub async fn resume_run(state: State<AppState>) -> (StatusCode, Json<serde_json:
     route::resume_run(state).await
 }
 
+pub async fn repair_phase_gates(
+    state: State<AppState>,
+    id: Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    route::repair_phase_gates(state, id, headers, body).await
+}
+
 pub async fn cancel(
     state: State<AppState>,
     query: Query<CancelQuery>,
@@ -148,4 +157,26 @@ pub async fn submit_order(
     body: Json<OrderBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     route::submit_order(state, id, headers, body).await
+}
+
+/// GET /api/queue/phase-gates/catalog (#2125)
+///
+/// Returns the user-facing phase-gate kind catalog so dashboard and agents
+/// share a single vocabulary for `phase_gate_kind` values used in
+/// `/api/queue/generate` entries.
+pub async fn phase_gate_catalog(state: State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    route::phase_gate_catalog(state).await
+}
+
+/// POST /api/queue/request-generate (#2126)
+///
+/// Dashboard-facing: send a standardized "build a queue from these issues"
+/// instruction to an agent's Discord channel. The backend owns both the
+/// instruction text and channel routing so the dashboard stays decoupled
+/// from prompt evolution.
+pub async fn request_generate(
+    state: State<AppState>,
+    body: Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    route::request_generate(state, body).await
 }

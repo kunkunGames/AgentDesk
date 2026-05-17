@@ -81,6 +81,21 @@ impl ClusterRuntime {
         !self.enabled || self.leader_active.load(Ordering::Acquire)
     }
 
+    /// Test-only constructor that builds an `enabled=true` runtime backed by a
+    /// caller-provided `leader_active` flag. Lets tests flip leadership at will
+    /// to exercise supervised workers across lease takeovers without standing
+    /// up a real cluster. See `worker_registry::tests`.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_leader(leader_active: Arc<AtomicBool>) -> Self {
+        Self {
+            enabled: true,
+            instance_id: "test-node".to_string(),
+            configured_role: ClusterRole::Auto,
+            effective_role: ClusterRole::Worker,
+            leader_active,
+        }
+    }
+
     pub(crate) fn instance_id(&self) -> &str {
         &self.instance_id
     }
@@ -92,6 +107,18 @@ impl ClusterRuntime {
         }
         loop {
             if !self.is_leader() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    pub(crate) async fn wait_until_leader(&self) {
+        if !self.enabled {
+            return;
+        }
+        loop {
+            if self.is_leader() {
                 return;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -932,12 +959,14 @@ fn parse_last_heartbeat(node: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClusterRole, explain_capability_match, resolve_instance_id, select_capability_route,
-        should_wake_wait_queue_after_node_join,
+        ClusterRole, ClusterRuntime, explain_capability_match, resolve_instance_id,
+        select_capability_route, should_wake_wait_queue_after_node_join,
     };
     use crate::config::ClusterConfig;
     use serde_json::json;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn cluster_role_parses_known_values_and_defaults_to_auto() {
@@ -962,6 +991,30 @@ mod tests {
 
         leader.store(false, Ordering::Release);
         assert!(!should_wake_wait_queue_after_node_join(&leader));
+    }
+
+    #[tokio::test]
+    async fn wait_until_leader_follows_late_leadership_transition() {
+        let leader_active = Arc::new(AtomicBool::new(false));
+        let runtime = ClusterRuntime {
+            enabled: true,
+            instance_id: "test-node".to_string(),
+            configured_role: ClusterRole::Auto,
+            effective_role: ClusterRole::Worker,
+            leader_active: leader_active.clone(),
+        };
+        let wait = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.wait_until_leader().await }
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!wait.is_finished());
+        leader_active.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("wait_until_leader should observe leadership")
+            .expect("wait task should not panic");
     }
 
     #[test]

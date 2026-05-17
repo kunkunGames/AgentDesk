@@ -37,12 +37,16 @@ mod fsm;
 mod order_routes;
 #[path = "phase_gate.rs"]
 mod phase_gate;
+#[path = "phase_gate_catalog.rs"]
+mod phase_gate_catalog;
 #[path = "planning.rs"]
 mod planning;
 #[path = "query.rs"]
 mod query;
 #[path = "route_generate.rs"]
 mod route_generate;
+#[path = "route_request_generate.rs"]
+mod route_request_generate;
 #[path = "route_types.rs"]
 mod route_types;
 #[path = "slot_routes.rs"]
@@ -54,14 +58,17 @@ mod view_admin_routes;
 
 pub use activate_route::activate;
 pub use control_routes::{
-    cancel, pause, reorder, reset, reset_global, reset_slot_thread, resume_run, update_run,
+    cancel, pause, reorder, repair_phase_gates, reset, reset_global, reset_slot_thread, resume_run,
+    update_run,
 };
 pub use order_routes::{OrderBody, submit_order};
+pub use phase_gate_catalog::{DEFAULT_PHASE_GATE_KIND, catalog as phase_gate_catalog};
 pub use route_generate::generate;
+pub use route_request_generate::request_generate;
 pub use route_types::{
     ActivateBody, AddRunEntryBody, CancelQuery, GenerateBody, GenerateEntryBody, HistoryQuery,
-    PauseBody, RebindSlotBody, ReorderBody, ResetBody, ResetGlobalBody, StatusQuery,
-    UpdateEntryBody, UpdateRunBody,
+    PauseBody, RebindSlotBody, ReorderBody, RepairPhaseGateBody, ResetBody, ResetGlobalBody,
+    StatusQuery, UpdateEntryBody, UpdateRunBody,
 };
 pub use slot_routes::{rebind_slot, skip_entry};
 pub use view_admin_routes::{add_run_entry, history, restore_run, status, update_entry};

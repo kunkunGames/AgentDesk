@@ -16,7 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::InflightRestartMode;
 use super::runtime_store::{atomic_write, discord_inflight_root};
 use crate::dispatch::Source;
-use crate::services::agent_protocol::TaskNotificationKind;
+use crate::services::agent_protocol::{RuntimeHandoffKind, TaskNotificationKind};
 use crate::services::provider::ProviderKind;
 
 const INFLIGHT_STATE_VERSION: u32 = 7;
@@ -71,6 +71,8 @@ pub(super) struct InflightTurnState {
     pub tmux_session_name: Option<String>,
     pub output_path: Option<String>,
     pub input_fifo_path: Option<String>,
+    #[serde(default)]
+    pub runtime_kind: Option<RuntimeHandoffKind>,
     #[serde(default)]
     pub worktree_path: Option<String>,
     #[serde(default)]
@@ -189,6 +191,10 @@ impl InflightTurnState {
         last_offset: u64,
     ) -> Self {
         let now = now_string();
+        let runtime_kind = input_fifo_path
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .map(|_| RuntimeHandoffKind::LegacyTmuxWrapper);
         Self {
             version: INFLIGHT_STATE_VERSION,
             provider: provider.as_str().to_string(),
@@ -208,6 +214,7 @@ impl InflightTurnState {
             tmux_session_name,
             output_path,
             input_fifo_path,
+            runtime_kind,
             worktree_path: None,
             worktree_branch: None,
             base_commit: None,
@@ -251,6 +258,32 @@ impl InflightTurnState {
     pub fn clear_restart_mode(&mut self) {
         self.restart_mode = None;
         self.restart_generation = None;
+    }
+
+    pub(in crate::services::discord) fn runtime_kind_for_recovery(&self) -> RuntimeHandoffKind {
+        if let Some(kind) = self.runtime_kind {
+            return kind;
+        }
+        if self
+            .input_fifo_path
+            .as_deref()
+            .is_some_and(|path| !path.is_empty())
+        {
+            return RuntimeHandoffKind::LegacyTmuxWrapper;
+        }
+        if self.provider == ProviderKind::Claude.as_str()
+            && self
+                .tmux_session_name
+                .as_deref()
+                .is_some_and(|name| !name.is_empty())
+            && self
+                .output_path
+                .as_deref()
+                .is_some_and(|path| !path.is_empty())
+        {
+            return RuntimeHandoffKind::ClaudeTui;
+        }
+        RuntimeHandoffKind::ProcessBackend
     }
 
     pub fn set_worktree_context(
@@ -617,6 +650,24 @@ pub(crate) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) -> 
     fs::remove_file(path).is_ok()
 }
 
+fn inflight_state_allows_idle_tmux_repair_state(state: &InflightTurnState) -> bool {
+    state.full_response.trim().is_empty()
+        && state.response_sent_offset == 0
+        && state.last_watcher_relayed_offset.is_none()
+        && state.dispatch_id.as_deref().is_none_or(str::is_empty)
+        && state.current_tool_line.is_none()
+        && state.last_tool_name.is_none()
+        && !state.long_running_placeholder_active
+}
+
+pub(crate) fn inflight_state_allows_idle_tmux_repair(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Option<bool> {
+    load_inflight_state(provider, channel_id)
+        .map(|state| inflight_state_allows_idle_tmux_repair_state(&state))
+}
+
 pub(super) fn inflight_state_file_exists(provider: &ProviderKind, channel_id: u64) -> bool {
     let Some(root) = inflight_runtime_root() else {
         return false;
@@ -838,9 +889,11 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
 #[cfg(test)]
 mod stall_recovery_tests {
     use super::{
-        INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState, inflight_state_is_stale,
+        INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState,
+        inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale,
         load_inflight_states_from_root, save_inflight_state_in_root,
     };
+    use crate::services::agent_protocol::RuntimeHandoffKind;
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
     use tempfile::TempDir;
@@ -901,6 +954,40 @@ mod stall_recovery_tests {
     }
 
     #[test]
+    fn idle_tmux_repair_only_allows_empty_unclaimed_inflight() {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            888,
+            Some("adk-cc".to_string()),
+            1,
+            2,
+            3,
+            "user prompt".to_string(),
+            None,
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+
+        assert!(inflight_state_allows_idle_tmux_repair_state(&state));
+
+        state.current_msg_len = "⠋ Processing...".len();
+        assert!(inflight_state_allows_idle_tmux_repair_state(&state));
+
+        state.full_response = "partial".to_string();
+        assert!(!inflight_state_allows_idle_tmux_repair_state(&state));
+        state.full_response.clear();
+
+        state.last_watcher_relayed_offset = Some(10);
+        assert!(!inflight_state_allows_idle_tmux_repair_state(&state));
+        state.last_watcher_relayed_offset = None;
+
+        state.dispatch_id = Some("dispatch-1".to_string());
+        assert!(!inflight_state_allows_idle_tmux_repair_state(&state));
+    }
+
+    #[test]
     fn status_message_id_round_trips_for_status_panel_resume() {
         let temp = TempDir::new().unwrap();
         let mut state = InflightTurnState::new(
@@ -925,6 +1012,38 @@ mod stall_recovery_tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].status_message_id, Some(123_456));
         assert_eq!(loaded[0].current_msg_id, 99);
+    }
+
+    #[test]
+    fn runtime_kind_round_trips_and_direct_tui_has_no_fifo_requirement() {
+        let temp = TempDir::new().unwrap();
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            77,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/claude-transcript.jsonl".to_string()),
+            None,
+            12,
+        );
+        state.runtime_kind = Some(RuntimeHandoffKind::ClaudeTui);
+
+        save_inflight_state_in_root(temp.path(), &state).expect("save inflight state");
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].runtime_kind, Some(RuntimeHandoffKind::ClaudeTui));
+        assert_eq!(
+            loaded[0].runtime_kind_for_recovery(),
+            RuntimeHandoffKind::ClaudeTui
+        );
+        assert!(loaded[0].input_fifo_path.is_none());
+        assert!(!loaded[0].runtime_kind_for_recovery().requires_input_fifo());
     }
 
     #[test]

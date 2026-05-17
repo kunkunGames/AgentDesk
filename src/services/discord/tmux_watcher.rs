@@ -30,6 +30,7 @@ async fn persist_watcher_provider_session_id(
         session_id,
         Some(session_id),
         provider,
+        channel_id,
         shared.api_port,
     )
     .await;
@@ -843,12 +844,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                             "⚠️ 작업 후 `Ready for input` 상태에서 멈춰 dispatch를 실패 처리합니다.\n사유: {READY_FOR_INPUT_STUCK_REASON}"
                                         ));
                                     } else {
-                                        tracing::warn!(
-                                            "  [{ts}] ⚠ watcher detected post-work Ready-for-input stall for {} but could not resolve a dispatched task",
+                                        tracing::info!(
+                                            "  [{ts}] 👁 watcher detected post-work Ready-for-input idle for {} with no dispatch; suppressing dispatch-failure notice",
                                             tmux_session_name
-                                        );
-                                        ready_for_input_failure_notice = Some(
-                                            "⚠️ 작업 후 `Ready for input` 상태에서 멈췄지만 연결된 dispatch를 찾지 못해 자동 실패 처리하지 못했습니다.".to_string(),
                                         );
                                     }
                                     full_response.clear();
@@ -2952,6 +2950,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 None,
                 None,
                 thread_channel_id,
+                Some(channel_id),
                 agent_id.as_deref(),
                 shared.api_port,
             )
@@ -3219,6 +3218,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             None, // cwd
             None, // dispatch_id
             thread_channel_id,
+            Some(channel_id),
             agent_id.as_deref(),
             api_port,
         )
