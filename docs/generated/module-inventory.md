@@ -348,13 +348,13 @@
 | `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 798 |  |
 | `services::cluster::intake_routing` | `src/services/cluster/intake_routing.rs` | 356 |  |
 | `services::cluster::intake_worker` | `src/services/cluster/intake_worker.rs` | 417 |  |
-| `services::cluster::registry_adapter_sink` | `src/services/cluster/registry_adapter_sink.rs` | 348 |  |
+| `services::cluster::registry_adapter_sink` | `src/services/cluster/registry_adapter_sink.rs` | 352 |  |
 | `services::cluster::relay_producer_registry` | `src/services/cluster/relay_producer_registry.rs` | 208 |  |
 | `services::cluster::session_discovery` | `src/services/cluster/session_discovery.rs` | 939 |  |
 | `services::cluster::session_matcher` | `src/services/cluster/session_matcher.rs` | 866 |  |
 | `services::cluster::session_registry` | `src/services/cluster/session_registry.rs` | 572 |  |
-| `services::cluster::stream_relay` | `src/services/cluster/stream_relay.rs` | 691 |  |
-| `services::cluster::watcher_supervisor` | `src/services/cluster/watcher_supervisor.rs` | 743 |  |
+| `services::cluster::stream_relay` | `src/services/cluster/stream_relay.rs` | 874 |  |
+| `services::cluster::watcher_supervisor` | `src/services/cluster/watcher_supervisor.rs` | 858 |  |
 | `services::codex` | `src/services/codex.rs` | 3276 | giant-file |
 | `services::codex_remote_policy` | `src/services/codex_remote_policy.rs` | 49 |  |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 744 |  |

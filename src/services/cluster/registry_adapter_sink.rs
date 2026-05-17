@@ -109,6 +109,8 @@ impl RelaySink for RegistryAdapterSink {
         // off.
         tracing::trace!(
             session = %frame.session_name,
+            channel_id = %frame.binding.channel_id,
+            provider = frame.binding.provider.as_str(),
             sequence = frame.sequence,
             "registry-adapter-sink: observed frame (delivery deferred to legacy watcher)"
         );
@@ -146,8 +148,10 @@ mod tests {
     #[tokio::test]
     async fn deliver_counts_per_session() {
         let sink = Arc::new(RegistryAdapterSink::new());
+        let m = matched("c1");
         let frame = StreamFrame {
-            session_name: "AgentDesk-claude-c1".into(),
+            session_name: m.expected_session_name.clone(),
+            binding: m.clone(),
             payload: "{}".into(),
             sequence: 7,
         };
@@ -155,9 +159,9 @@ mod tests {
         sink.deliver(&frame).await.expect("infallible");
 
         assert_eq!(sink.frames_total(), 2);
-        assert_eq!(sink.frames_for("AgentDesk-claude-c1"), 2);
+        assert_eq!(sink.frames_for(&m.expected_session_name), 2);
         let snap = sink.snapshot();
-        assert_eq!(snap.get("AgentDesk-claude-c1").unwrap().last_sequence, 7);
+        assert_eq!(snap.get(&m.expected_session_name).unwrap().last_sequence, 7);
     }
 
     #[tokio::test]
