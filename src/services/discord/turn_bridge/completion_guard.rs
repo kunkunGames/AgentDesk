@@ -168,7 +168,6 @@ async fn submit_review_decision_fallback(
             decision: decision.to_string(),
             comment: Some(comment),
             commit_sha,
-            out_of_scope: None,
         },
     )
     .await
@@ -1443,12 +1442,11 @@ async fn fail_dispatch_with_policy(
                 .collect()
         }),
     };
-    use crate::services::discord::internal_api::DispatchUpdateOutcome;
     for attempt in 1..=3 {
         match crate::services::discord::internal_api::update_dispatch(dispatch_id, payload.clone())
             .await
         {
-            Ok(DispatchUpdateOutcome::Updated(_)) => {
+            Ok(_) => {
                 tracing::warn!("marked dispatch as failed");
                 if reset_auto_queue_entries {
                     if !runtime_pg_reset_linked_auto_queue_entries(dispatch_id) {
@@ -1461,18 +1459,6 @@ async fn fail_dispatch_with_policy(
                         "failed dispatch auto-queue terminal update skipped or affected no rows"
                     );
                 }
-                return;
-            }
-            Ok(DispatchUpdateOutcome::Conflict { body }) => {
-                // #2194 follow-up: dispatch is already in a terminal status
-                // (completed/cancelled/failed). Do NOT overwrite via DB fallback.
-                // Trust the existing terminal state — reconciliation hooks own
-                // the auto-queue transition.
-                tracing::info!(
-                    dispatch_id = %dispatch_id,
-                    response = %body,
-                    "fail_dispatch: dispatch already terminal (409 conflict); skipping DB fallback"
-                );
                 return;
             }
             _ => {
@@ -1751,7 +1737,6 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
             result: Some(update_result),
             allowed_from: None,
         };
-        use crate::services::discord::internal_api::DispatchUpdateOutcome;
         for attempt in 1..=3u8 {
             match crate::services::discord::internal_api::update_dispatch(
                 dispatch_id,
@@ -1759,31 +1744,13 @@ pub(super) async fn complete_work_dispatch_on_turn_end(
             )
             .await
             {
-                Ok(DispatchUpdateOutcome::Updated(_)) => {
+                Ok(_) => {
                     tracing::info!(dispatch_type = %snapshot.dispatch_type, "explicitly completed dispatch via API");
                     let _ = queue_dispatch_followup_with_handles(
                         None::<&crate::db::Db>,
                         shared.pg_pool.as_ref(),
                         dispatch_id,
                         "turn_bridge_explicit_api",
-                    )
-                    .await;
-                    return;
-                }
-                Ok(DispatchUpdateOutcome::Conflict { body }) => {
-                    // #2194 follow-up: dispatch already terminal. Skip DB
-                    // fallback so we don't clobber the existing result.
-                    tracing::info!(
-                        dispatch_id = %dispatch_id,
-                        dispatch_type = %snapshot.dispatch_type,
-                        response = %body,
-                        "explicit completion: dispatch already terminal (409); enqueueing followup only"
-                    );
-                    let _ = queue_dispatch_followup_with_handles(
-                        None::<&crate::db::Db>,
-                        shared.pg_pool.as_ref(),
-                        dispatch_id,
-                        "turn_bridge_explicit_api_conflict",
                     )
                     .await;
                     return;

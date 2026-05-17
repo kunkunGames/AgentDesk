@@ -929,34 +929,6 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         &voice_config,
     ));
 
-    // #2274: rehydrate the process-local voice-background handoff store
-    // from the durable PG side table. Long background turns may have been
-    // in flight when this process last exited; their markers will live in
-    // PG and need to be reinstated in memory before terminal-delivery
-    // callbacks consult the hot path. Best-effort — a PG error here is
-    // logged and the terminal-delivery path falls back to a per-call
-    // `load_handoff_durable` lookup.
-    if let Some(pool) = pg_pool.as_ref() {
-        match crate::voice::announce_meta::rehydrate_handoffs_from_pg(pool).await {
-            Ok(count) => {
-                if count > 0 {
-                    tracing::info!(
-                        rehydrated = count,
-                        "voice_background_handoff_meta rehydrated from durable PG store"
-                    );
-                } else {
-                    tracing::debug!("voice_background_handoff_meta rehydrate found no live rows");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "voice_background_handoff_meta rehydrate failed; terminal-delivery will fall back to per-call durable load"
-                );
-            }
-        }
-    }
-
     // Cleanup stale Discord uploads on process start
     cleanup_old_uploads(UPLOAD_MAX_AGE);
 
@@ -1097,10 +1069,6 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         engine,
         health_registry: Arc::downgrade(&health_registry),
         known_slash_commands: tokio::sync::OnceCell::new(),
-        // #2448: capacity 256 gives ~hundreds of in-flight turns headroom
-        // before a slow listener triggers `RecvError::Lagged`. The standby
-        // relay subscriber falls back to file polling on lag.
-        inflight_signals: tokio::sync::broadcast::channel(256).0,
     });
 
     // Phase 5.2 of intake-node-routing (issue #2009): populate
@@ -1720,32 +1688,6 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                             stale_cards_to_delete = filter_outcome.stale_cards;
                         }
 
-                        // #2437 (#2427 C wire) boot-time generation
-                        // invalidate. Remove non-planned-restart inflight
-                        // rows whose `restart_generation` does not match
-                        // the current generation so recovery does not
-                        // revive a row whose tmux session no longer
-                        // exists. Must run BEFORE `restore_inflight_turns`
-                        // — otherwise recovery would attempt to revive
-                        // ghost rows and the placeholder sweeper would
-                        // eventually have to time-guess them at 1800s.
-                        // Planned-restart / hot-swap rows survive (their
-                        // generation gate in `stale_removal_reason`
-                        // already handles them with longer retention).
-                        let invalidated = super::inflight::invalidate_stale_generation(
-                            &provider_for_restore,
-                            shared_for_tmux2.current_generation,
-                        );
-                        if invalidated > 0 {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            tracing::info!(
-                                "  [{ts}] 🧹 inflight: invalidated {} stale-generation row(s) for {} (current generation {}) — #2437",
-                                invalidated,
-                                provider_for_restore.as_str(),
-                                shared_for_tmux2.current_generation,
-                            );
-                        }
-
                         restore_inflight_turns(
                             &http_for_tmux,
                             &shared_for_tmux2,
@@ -1885,21 +1827,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 // whose owning turn task is stuck or dead. Edits Discord
                 // messages into stalled / abandoned states based on the
                 // inflight state file mtime.
-                //
-                // #2438 (#2427 final): thresholds relaxed to safety-net
-                // tone (stall 300s, abandon 1800s, initial 180s) after
-                // the four explicit-signal wires landed.
                 super::placeholder_sweeper::spawn_placeholder_sweeper(
                     ctx.http.clone(),
-                    shared_clone.clone(),
-                    provider_for_setup.clone(),
-                );
-
-                // #2436 (#2427 B wire): heartbeat-gap → explicit
-                // inflight cleanup. Faster cadence than the placeholder
-                // sweeper so a silently hung watcher loop is evicted
-                // before the time-based safety net has to act.
-                super::inflight_heartbeat_sweeper::spawn_heartbeat_sweeper(
                     shared_clone.clone(),
                     provider_for_setup.clone(),
                 );
@@ -2584,7 +2513,6 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: true,
-            voice_announcement: None,
         };
 
         // Build a minimal persistence context — mailbox actor requires it
@@ -3028,7 +2956,6 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: true,
-            voice_announcement: None,
         }
     }
 

@@ -405,7 +405,7 @@ function EntryRow({
                       key={key}
                       href={href}
                       target="_blank"
-                      rel="noopener noreferrer"
+                      rel="noreferrer"
                       onClick={(event) => event.stopPropagation()}
                       className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium transition-colors hover:brightness-110"
                       style={{

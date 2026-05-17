@@ -21,30 +21,12 @@ const DEFAULT_HOME_WIDGET_ORDER = [
   "m_progress",
   "m_rate_limit",
   "kanban",
-  "routines",
   "quality",
   "missions",
-];
-const DEFAULT_HOME_PRIMARY_WIDGET_ORDER = [
-  "m_tokens",
-  "m_cost",
-  "m_progress",
-  "m_rate_limit",
-  "kanban",
-  "routines",
 ];
 const CUSTOM_HOME_WIDGET_ORDER = [
   "missions",
   "quality",
-  "routines",
-  "kanban",
-  "m_rate_limit",
-  "m_progress",
-  "m_cost",
-  "m_tokens",
-];
-const CUSTOM_HOME_PRIMARY_WIDGET_ORDER = [
-  "routines",
   "kanban",
   "m_rate_limit",
   "m_progress",
@@ -52,14 +34,13 @@ const CUSTOM_HOME_PRIMARY_WIDGET_ORDER = [
   "m_tokens",
 ];
 const DRAGGED_HOME_WIDGET_ORDER = [
-  "kanban",
   "m_tokens",
   "m_cost",
   "m_progress",
-  "m_rate_limit",
-  "routines",
-  "quality",
   "missions",
+  "m_rate_limit",
+  "kanban",
+  "quality",
 ];
 const PIPELINE_VISUAL_CACHE_KEY = "agentdesk.settings.pipeline.visual-cache.v1";
 
@@ -176,63 +157,6 @@ const MOCK_SKILLS = [
     description_ko: "읽기 전용 회의 + 스킬 허브 레이아웃",
     total_calls: 7,
     last_used_at: 1760919300000,
-  },
-];
-
-const MOCK_ROUTINES = [
-  {
-    id: "routine-late",
-    agent_id: "family-counsel",
-    script_ref: "family-profile-probe-yohoejang.js",
-    name: "요회장 프로필 점검",
-    status: "enabled",
-    execution_strategy: "fresh",
-    schedule: "0 15 * * *",
-    next_due_at: "2026-05-17T06:00:00.000Z",
-    last_run_at: "2026-05-16T06:07:37.573Z",
-    last_result: null,
-    checkpoint: null,
-    discord_thread_id: "1505086366654926908",
-    timeout_secs: 600,
-    in_flight_run_id: null,
-    created_at: "2026-05-16T05:55:52.782Z",
-    updated_at: "2026-05-16T06:07:37.573Z",
-  },
-  {
-    id: "routine-soon",
-    agent_id: "family-counsel",
-    script_ref: "family-profile-probe-obujang.js",
-    name: "오부장 프로필 점검",
-    status: "enabled",
-    execution_strategy: "fresh",
-    schedule: "0 13 * * *",
-    next_due_at: "2026-05-17T04:00:00.000Z",
-    last_run_at: null,
-    last_result: null,
-    checkpoint: null,
-    discord_thread_id: "1505086338448363660",
-    timeout_secs: 600,
-    in_flight_run_id: null,
-    created_at: "2026-05-16T05:55:46.055Z",
-    updated_at: "2026-05-16T05:55:46.437Z",
-  },
-  {
-    id: "routine-manual",
-    agent_id: "codex",
-    script_ref: "manual-review.js",
-    name: "수동 리뷰",
-    status: "paused",
-    execution_strategy: "persistent",
-    schedule: null,
-    next_due_at: null,
-    last_run_at: "2026-05-15T01:00:00.000Z",
-    last_result: "ok",
-    checkpoint: null,
-    discord_thread_id: null,
-    timeout_secs: null,
-    in_flight_run_id: null,
-    created_at: "2026-05-14T05:00:00.000Z",
-    updated_at: "2026-05-15T01:00:00.000Z",
   },
 ];
 
@@ -1278,19 +1202,6 @@ async function mockDashboardBootstrap(page: Page) {
     });
   });
 
-  await page.route(/\/api\/routines(?:\?.*)?$/, async (route) => {
-    const requestUrl = new URL(route.request().url());
-    const status = requestUrl.searchParams.get("status");
-    const routines = status
-      ? MOCK_ROUTINES.filter((routine) => routine.status === status)
-      : MOCK_ROUTINES;
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({ routines }),
-    });
-  });
-
   await page.route(/\/api\/round-table-meetings\/channels$/, async (route) => {
     await route.fulfill({
       status: 200,
@@ -1387,53 +1298,6 @@ async function mockSettingsPipelineEditorApis(page: Page) {
       status: 200,
       contentType: "application/json",
       body: JSON.stringify({ stages: MOCK_SETTINGS_PIPELINE_STAGES }),
-    });
-  });
-}
-
-async function mockSettingsVoiceConfigApi(page: Page) {
-  await page.route(/\/api\/voice\/config$/, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        version: "voice-smoke-v1",
-        source_path: "/internal/not-shown.yaml",
-        global: {
-          lobby_channel_id: "1503294653313712169",
-          active_agent_ttl_seconds: 180,
-          default_sensitivity_mode: "normal",
-        },
-        agents: [
-          {
-            id: "codex",
-            name: "Codex",
-            name_ko: "코덱스",
-            voice_enabled: true,
-            wake_word: "",
-            aliases: ["코덱스야"],
-            sensitivity_mode: "normal",
-          },
-          {
-            id: "claude",
-            name: "Claude",
-            name_ko: "클로드",
-            voice_enabled: false,
-            wake_word: "",
-            aliases: ["클로드야"],
-            sensitivity_mode: "conservative",
-          },
-          {
-            id: "dashboard",
-            name: "Dashboard",
-            name_ko: "대시보드",
-            voice_enabled: true,
-            wake_word: "대시보드",
-            aliases: ["대시보드 에이전트"],
-            sensitivity_mode: "normal",
-          },
-        ],
-      }),
     });
   });
 }
@@ -1549,30 +1413,6 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 
-  test("command palette searches routes and closes accessibly", async ({ page }, testInfo) => {
-    test.skip(testInfo.project.name === "mobile", "Desktop keyboard shortcut coverage");
-    await page.goto("/home");
-
-    await page.getByLabel(/검색 열기|Open search/).click();
-    const palette = page.getByRole("dialog", {
-      name: /명령 팔레트|Command Palette/,
-    });
-    await expect(palette).toBeVisible();
-
-    const search = palette.getByPlaceholder(/검색|Search/);
-    await expect(search).toBeFocused();
-    await search.fill("stats");
-    await expect(palette.getByText(/통계|Stats/)).toBeVisible();
-
-    await page.keyboard.press("Enter");
-    await expect(page).toHaveURL(/\/stats$/);
-
-    await page.getByLabel(/검색 열기|Open search/).click();
-    await expect(palette).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(palette).toHaveCount(0);
-  });
-
   test("desktop: sidebar renders at the full shell width", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "mobile", "Desktop-only test");
     await page.goto("/home");
@@ -1613,28 +1453,6 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.getByTestId("app-mobile-tab-kanban")).toBeVisible();
     await expect(page.getByTestId("app-mobile-tab-stats")).toBeVisible();
 
-    const tabMetrics = await bottomNav.locator("button").evaluateAll((buttons) =>
-      buttons.map((button) => {
-        const node = button as HTMLElement;
-        const box = node.getBoundingClientRect();
-        const iconBox = node.querySelector("svg")?.getBoundingClientRect();
-        const label = node.querySelector("span:not([class*='absolute'])") as HTMLElement | null;
-        return {
-          height: box.height,
-          fontSize: Number.parseFloat(window.getComputedStyle(node).fontSize),
-          iconWidth: iconBox?.width ?? 0,
-          labelClientWidth: label?.clientWidth ?? 0,
-          labelScrollWidth: label?.scrollWidth ?? 0,
-        };
-      }),
-    );
-    for (const metric of tabMetrics) {
-      expect(metric.height).toBeGreaterThanOrEqual(44);
-      expect(metric.fontSize).toBeGreaterThanOrEqual(11);
-      expect(metric.iconWidth).toBeGreaterThanOrEqual(20);
-      expect(metric.labelScrollWidth).toBeLessThanOrEqual(metric.labelClientWidth + 1);
-    }
-
     const tabbarZIndex = await bottomNav.evaluate((element) =>
       Number(window.getComputedStyle(element as HTMLElement).zIndex),
     );
@@ -1648,12 +1466,8 @@ test.describe("Dashboard smoke tests", () => {
 
     const moreMenu = page.getByTestId("app-mobile-more-menu");
     await expect(moreMenu).toBeVisible();
-    await expect(
-      moreMenu.getByRole("button", { name: /더보기 닫기|Close more menu/ }),
-    ).toBeFocused();
     await expect(moreMenu.getByRole("button", { name: /에이전트|Agents/ })).toBeVisible();
     await expect(moreMenu.getByRole("button", { name: /운영|Ops/ })).toBeVisible();
-    await expect(moreMenu.getByRole("button", { name: /루틴|Routines/ })).toBeVisible();
     await expect(moreMenu.getByRole("button", { name: /회의|Meetings/ })).toBeVisible();
     await expect(moreMenu.getByRole("button", { name: /업적|Achievements/ })).toBeVisible();
     await expect(moreMenu.getByRole("button", { name: /설정|Settings/ })).toBeVisible();
@@ -1678,10 +1492,6 @@ test.describe("Dashboard smoke tests", () => {
     expect(tabbarStyles.paddingBottom).toContain("env(safe-area-inset-bottom)");
     expect(tabbarStyles.paddingLeft).toContain("env(safe-area-inset-left)");
     expect(tabbarStyles.paddingRight).toContain("env(safe-area-inset-right)");
-
-    await page.keyboard.press("Escape");
-    await expect(moreMenu).toHaveCount(0);
-    await expect(page.getByTestId("app-mobile-more-button")).toBeFocused();
   });
 
   test("responsive: mobile topbar keeps breadcrumb on a dedicated row", async ({ page }, testInfo) => {
@@ -1759,31 +1569,9 @@ test.describe("Dashboard smoke tests", () => {
 
     await page.getByTestId("app-mobile-more-button").click();
     await expect(page.getByTestId("app-mobile-more-menu")).toBeVisible({ timeout: 15000 });
-    await page.getByTestId("app-mobile-more-menu").getByRole("button", { name: /루틴|Routines/ }).click();
-    await expect(page).toHaveURL(/\/routines$/);
-    await expectNoHorizontalOverflow(page);
-
-    await page.getByTestId("app-mobile-more-button").click();
-    await expect(page.getByTestId("app-mobile-more-menu")).toBeVisible({ timeout: 15000 });
     await page.getByTestId("app-mobile-more-menu").getByRole("button", { name: /설정|Settings/ }).click();
     await expect(page).toHaveURL(/\/settings$/);
     await expectNoHorizontalOverflow(page);
-  });
-
-  test("office: desktop spatial scene exposes an accessible summary", async ({ page }, testInfo) => {
-    test.skip(testInfo.project.name === "mobile", "Desktop-only test");
-    await page.goto("/office");
-
-    const officeScene = page.getByRole("img", { name: /오피스 공간 보기|Spatial office view/ });
-    await expect(officeScene).toBeVisible({ timeout: 15000 });
-    await expect(page.locator("#office-scene-status-summary")).toContainText(/Ada Dashboard|아다 대시보드/);
-    await expect(officeScene.locator("canvas")).toHaveAttribute("aria-hidden", "true");
-
-    const [mainBox, sceneBox] = await Promise.all([
-      page.getByTestId("app-main-scroll").boundingBox(),
-      officeScene.boundingBox(),
-    ]);
-    expect((sceneBox?.x ?? 0) - (mainBox?.x ?? 0)).toBeLessThan(80);
   });
 
   test("home: widget order persists from storage and reset restores defaults", async ({ page }, testInfo) => {
@@ -1796,11 +1584,10 @@ test.describe("Dashboard smoke tests", () => {
     await page.goto("/home");
 
     await expect(page.getByTestId("home-widget-kanban")).toBeVisible({ timeout: 15000 });
-    await expect(await getHomeWidgetOrder(page)).toEqual(CUSTOM_HOME_PRIMARY_WIDGET_ORDER);
+    await expect(await getHomeWidgetOrder(page)).toEqual(CUSTOM_HOME_WIDGET_ORDER);
 
     await page.getByTestId("home-edit-toggle").click();
     await expect(page.getByTestId("home-reset-order")).toBeVisible();
-    await expect(await getHomeWidgetOrder(page)).toEqual(CUSTOM_HOME_WIDGET_ORDER);
     await page.getByTestId("home-reset-order").click();
 
     await expect.poll(() => getHomeWidgetOrder(page)).toEqual(DEFAULT_HOME_WIDGET_ORDER);
@@ -1816,26 +1603,11 @@ test.describe("Dashboard smoke tests", () => {
 
     await page.goto("/home");
 
-    await expect(page.getByTestId("home-widget-kanban")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByTestId("home-widget-quality")).toHaveCount(0);
+    // PR #1258: office widget no longer in default; quality is in its place.
+    await expect(page.getByTestId("home-widget-quality")).toBeVisible({ timeout: 15000 });
     await page.getByTestId("home-edit-toggle").click();
-    await expect(page.getByTestId("home-widget-quality")).toBeVisible();
 
-    const sourceBox = await page.getByTestId("home-drag-handle-kanban").boundingBox();
-    const targetBox = await page.getByTestId("home-widget-m_tokens").boundingBox();
-    expect(sourceBox).not.toBeNull();
-    expect(targetBox).not.toBeNull();
-
-    const sourceX = sourceBox!.x + sourceBox!.width / 2;
-    const sourceY = sourceBox!.y + sourceBox!.height / 2;
-    const targetX = targetBox!.x + targetBox!.width / 2;
-    const targetY = targetBox!.y + targetBox!.height / 2;
-
-    await page.mouse.move(sourceX, sourceY);
-    await page.mouse.down();
-    await page.mouse.move(sourceX, sourceY - 32, { steps: 6 });
-    await page.mouse.move(targetX, targetY, { steps: 24 });
-    await page.mouse.up();
+    await page.getByTestId("home-widget-missions").dragTo(page.getByTestId("home-widget-m_rate_limit"));
 
     await expect.poll(() => getHomeWidgetOrder(page)).toEqual(DRAGGED_HOME_WIDGET_ORDER);
     await expect
@@ -1845,28 +1617,18 @@ test.describe("Dashboard smoke tests", () => {
       .toEqual(DRAGGED_HOME_WIDGET_ORDER);
   });
 
-  test("home: renders primary snapshot widgets and folds supporting widgets", async ({ page }, testInfo) => {
+  test("home: renders all handoff widgets and shared gamification blocks", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "mobile", "Desktop-only test");
 
     await page.goto("/home");
 
-    for (const widgetId of DEFAULT_HOME_PRIMARY_WIDGET_ORDER) {
+    for (const widgetId of DEFAULT_HOME_WIDGET_ORDER) {
       await expect(page.getByTestId(`home-widget-${widgetId}`)).toBeVisible({ timeout: 15000 });
     }
-    await expect(await getHomeWidgetOrder(page)).toEqual(DEFAULT_HOME_PRIMARY_WIDGET_ORDER);
 
     await expect(page.getByTestId("sidebar-user-level-ring")).toBeVisible();
     // PR #1258: home-streak-counter widget removed from default home IA.
     // The streak surface still exists on the Achievements page.
-    await expect(page.getByTestId("home-widget-quality")).toHaveCount(0);
-    await expect(page.getByTestId("home-widget-missions")).toHaveCount(0);
-    await expect(page.getByTestId("home-support-toggle")).toBeVisible();
-    await expect(page.getByTestId("home-support-toggle")).toHaveAttribute("aria-expanded", "false");
-
-    await page.getByTestId("home-support-toggle").click();
-    await expect(page.getByTestId("home-support-toggle")).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByTestId("home-widget-quality")).toBeVisible();
-    await expect(page.getByTestId("home-widget-missions")).toBeVisible();
     await expect(page.getByTestId("home-daily-missions")).toBeVisible();
     await expect(page.getByTestId("home-daily-mission-dispatches_today")).toBeVisible();
     await expect(page.getByTestId("home-daily-mission-dispatches_today")).toContainText(
@@ -1905,18 +1667,13 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.getByTestId("achievements-streak")).toBeVisible();
     await expect(page.getByTestId("achievements-ranking")).toBeVisible();
 
-    const earnedCard = page.getByTestId("achievement-card-earned-achievement-first-task-ada");
-    await earnedCard.click();
+    await page.getByTestId("achievement-card-earned-achievement-first-task-ada").click();
     await expect(page.getByTestId("achievements-drawer")).toBeVisible();
     await expect(page.getByTestId("achievements-details")).toBeVisible();
     await expect(page.getByTestId("achievements-timeline")).toBeVisible();
-
-    await page.keyboard.press("Escape");
-    await expect(page.getByTestId("achievements-drawer")).toHaveCount(0);
-    await expect(earnedCard).toBeFocused();
   });
 
-  test("achievements: mobile stacks badge cards without text clipping", async ({ page }, testInfo) => {
+  test("achievements: mobile keeps the badge grid in two columns", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "desktop", "Mobile-only test");
 
     await page.goto("/achievements");
@@ -1941,7 +1698,7 @@ test.describe("Dashboard smoke tests", () => {
 
         return Math.abs(firstCard.y - secondCard.y);
       })
-      .toBeGreaterThan(24);
+      .toBeLessThan(6);
 
     await expect
       .poll(async () => {
@@ -1956,15 +1713,9 @@ test.describe("Dashboard smoke tests", () => {
           }),
         ]);
 
-        return Math.abs(secondCard.x - firstCard.x);
+        return secondCard.x - firstCard.x;
       })
-      .toBeLessThan(6);
-
-    const clippedCards = await lockedCards.evaluateAll((cards) =>
-      cards.filter((card) => card.scrollWidth > card.clientWidth + 2).length,
-    );
-    expect(clippedCards).toBe(0);
-    await expectNoHorizontalOverflow(page);
+      .toBeGreaterThan(24);
   });
 
   test("gamification: operational routes keep home and achievements widgets out of the content area", async ({ page }) => {
@@ -2040,8 +1791,8 @@ test.describe("Dashboard smoke tests", () => {
 
     await expect(page.getByTestId("stats-page")).toBeVisible({ timeout: 15000 });
     await expect(page.getByTestId("stats-range-controls")).toBeVisible();
-    await expect(page.getByTestId("stats-range-7d")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByTestId("stats-range-30d")).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("stats-range-7d")).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("stats-range-30d")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("stats-range-90d")).toHaveAttribute("aria-pressed", "false");
 
     await expect(page.getByTestId("stats-summary-total-tokens")).toBeVisible();
@@ -2084,48 +1835,6 @@ test.describe("Dashboard smoke tests", () => {
     expect(secondBox!.y).toBeGreaterThan(firstBox!.y + firstBox!.height - 1);
   });
 
-  test("dashboard: routines timeline lists registered jobs chronologically", async ({ page }) => {
-    await page.goto("/home");
-
-    await expect(page.getByTestId("routines-timeline")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByTestId("routines-filter-controls")).toBeVisible();
-    await expect(page.getByTestId("routine-row-routine-soon")).toBeVisible({ timeout: 15000 });
-
-    const rowIds = await page
-      .getByTestId("routines-timeline-list")
-      .locator("[data-testid^='routine-row-']")
-      .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-testid")));
-
-    expect(rowIds).toEqual([
-      "routine-row-routine-soon",
-      "routine-row-routine-late",
-      "routine-row-routine-manual",
-    ]);
-    await expect(page.getByText("매일 13:00")).toBeVisible();
-    await expect(page.getByText("수동 실행")).toBeVisible();
-    await expectNoHorizontalOverflow(page);
-  });
-
-  test("routines: dedicated tab lists registered jobs chronologically", async ({ page }) => {
-    await page.goto("/routines");
-
-    await expect(page.getByTestId("routines-page")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByTestId("routines-timeline")).toBeVisible();
-    await expect(page.getByTestId("routine-row-routine-soon")).toBeVisible({ timeout: 15000 });
-
-    const rowIds = await page
-      .getByTestId("routines-timeline-list")
-      .locator("[data-testid^='routine-row-']")
-      .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-testid")));
-
-    expect(rowIds).toEqual([
-      "routine-row-routine-soon",
-      "routine-row-routine-late",
-      "routine-row-routine-manual",
-    ]);
-    await expectNoHorizontalOverflow(page);
-  });
-
   test("meetings: dedicated route renders integrated desktop layout", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "mobile", "Desktop-only test");
     await mockMeetingsHubApis(page);
@@ -2155,27 +1864,6 @@ test.describe("Dashboard smoke tests", () => {
 
     await page.getByRole("button", { name: /^회의$|^Meetings$/ }).click();
     await expect(page.getByTestId("meetings-page-timeline")).toBeVisible();
-  });
-
-  test("meetings: timeline search and status filters keep the list scoped", async ({ page }) => {
-    await mockMeetingsHubApis(page);
-    await page.goto("/meetings");
-
-    const timelinePane = page.getByTestId("meetings-page-timeline");
-    await expect(timelinePane).toBeVisible({ timeout: 15000 });
-
-    await page.getByRole("searchbox", { name: /회의 검색|Search meetings/ }).fill("read-only");
-    await expect(timelinePane.getByText(/Meetings hub read-only QA/)).toBeVisible();
-    await expect(timelinePane.getByText(/로드밸런서 경고 플로우 리뷰/)).toHaveCount(0);
-
-    await page.getByRole("button", { name: /^완료$|^Done$/ }).click();
-    await expect(timelinePane.getByText(/검색 조건에 맞는 회의가 없습니다|No meetings match/)).toBeVisible();
-
-    await page.getByRole("button", { name: /^전체$|^All$/ }).click();
-    await page.getByRole("searchbox", { name: /회의 검색|Search meetings/ }).fill("");
-    await page.getByRole("button", { name: /^진행$|^Active$/ }).click();
-    await expect(timelinePane.getByText(/Meetings hub read-only QA/)).toBeVisible();
-    await expect(timelinePane.getByText(/로드밸런서 경고 플로우 리뷰/)).toHaveCount(0);
   });
 
   test("meetings: detail drawer opens from the timeline", async ({ page }) => {
@@ -2266,9 +1954,6 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.getByTestId("ops-websocket-card")).toBeVisible();
     await expect(page.getByTestId("ops-dispatch-outbox-card")).toBeVisible();
     await expect(page.getByTestId("ops-providers-card")).toBeVisible();
-    await expect(page.getByTestId("ops-control-handoff")).toBeVisible();
-    await expect(page.getByTestId("ops-handoff-agents")).toHaveAttribute("href", "/agents");
-    await expect(page.getByTestId("ops-handoff-office")).toHaveAttribute("href", "/office");
   });
 
   test("ops: ws events resync the health snapshot", async ({ page }) => {
@@ -2342,24 +2027,6 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.getByTestId("topbar")).toContainText(/설정|Settings/);
   });
 
-  test("settings: search feedback and user-facing copy stay stable", async ({ page }) => {
-    await page.goto("/settings?settingsPanel=runtime");
-
-    await expect(page.getByTestId("settings-page")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByText("TTL").first()).toBeVisible();
-    await expect(page.getByText(/용어 빠른 정의|Quick term definitions/)).toHaveCount(0);
-    await expect(page.locator(".setting-key-token")).toHaveCount(0);
-    await expect(page.getByText("kv_meta")).toHaveCount(0);
-
-    await page.getByTestId("settings-search-input").fill("TTL");
-    await expect(page.getByTestId("settings-search-summary")).toBeVisible();
-    await expect(page.getByTestId("settings-search-summary")).toContainText(/항목 일치|matches/);
-    await expectNoHorizontalOverflow(page);
-
-    await page.getByRole("button", { name: /검색 지우기|Clear search/ }).click();
-    await expect(page.getByTestId("settings-search-summary")).toHaveCount(0);
-  });
-
   test("settings: mobile page remains scrollable", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "desktop", "Mobile-only test");
     await page.goto("/settings");
@@ -2367,32 +2034,13 @@ test.describe("Dashboard smoke tests", () => {
     const settingsPage = page.getByTestId("settings-page");
     await expect(settingsPage).toBeVisible({ timeout: 15000 });
 
-    const navMetrics = await page
-      .getByRole("tablist", { name: /설정 패널|Settings panels/ })
-      .evaluate((node) => {
-        const buttons = Array.from(node.querySelectorAll("button"));
-        return {
-          clientWidth: node.clientWidth,
-          scrollWidth: node.scrollWidth,
-          overflowX: window.getComputedStyle(node).overflowX,
-          maxButtonHeight: Math.max(
-            0,
-            ...buttons.map((button) => button.getBoundingClientRect().height),
-          ),
-        };
-      });
-    expect(navMetrics.scrollWidth).toBeGreaterThan(navMetrics.clientWidth);
-    expect(navMetrics.overflowX).toMatch(/auto|scroll/);
-    expect(navMetrics.maxButtonHeight).toBeLessThan(64);
-
     const before = await settingsPage.evaluate((node) => ({
       clientHeight: node.clientHeight,
       scrollHeight: node.scrollHeight,
       scrollTop: node.scrollTop,
     }));
 
-    expect(before.scrollHeight).toBeGreaterThanOrEqual(before.clientHeight);
-    if (before.scrollHeight <= before.clientHeight + 1) return;
+    expect(before.scrollHeight).toBeGreaterThan(before.clientHeight);
 
     await settingsPage.evaluate((node) => {
       node.scrollTop = node.scrollHeight;
@@ -2403,38 +2051,19 @@ test.describe("Dashboard smoke tests", () => {
     expect(after).toBeGreaterThan(0);
   });
 
-  test("settings: voice agent settings show one selected agent at a time", async ({ page }) => {
-    await mockSettingsVoiceConfigApi(page);
-    await page.goto("/settings?settingsPanel=voice");
-
-    await expect(page.getByTestId("settings-page")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByText(/전체 음성 설정|Global voice settings/)).toBeVisible();
-    await expect(page.getByText(/에이전트별 설정|Per-agent settings/)).toBeVisible();
-    await expect(page.getByTestId("voice-agent-selector")).toBeVisible();
-    await expect(page.getByTestId("voice-agent-card")).toHaveCount(1);
-    await expect(page.getByTestId("voice-agent-card")).toContainText(/코덱스|Codex/);
-
-    await page.getByTestId("voice-agent-selector").selectOption("claude");
-    await expect(page.getByTestId("voice-agent-card")).toHaveCount(1);
-    await expect(page.getByTestId("voice-agent-card")).toContainText(/클로드|Claude/);
-    await expect(page.getByTestId("voice-agent-card")).not.toContainText(/코덱스/);
-
-    await expect(page.getByText(/설정 버전|Config version|voice-lobby|Active agent TTL|agentdesk.yaml/)).toHaveCount(0);
-    await expectNoHorizontalOverflow(page);
-  });
-
-  test("settings: mobile pipeline editor uses the detailed editor only", async ({ page }, testInfo) => {
+  test("settings: mobile FSM editor exposes quick selection controls", async ({ page }, testInfo) => {
     test.skip(testInfo.project.name === "desktop", "Mobile-only test");
     await mockSettingsPipelineEditorApis(page);
     await page.goto("/settings?settingsPanel=pipeline");
 
     await expect(page.getByTestId("settings-page")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByText(/세부 흐름 편집기|Detailed workflow editor/).first()).toBeVisible();
-    await expect(page.getByText(/FSM 비주얼 에디터|FSM visual editor/)).toHaveCount(0);
-    await expect(page.getByTestId("fsm-mobile-selector")).toHaveCount(0);
-    await expect(page.getByTestId("pipeline-flow-canvas")).toBeVisible();
-    await expect(page.getByTestId("pipeline-selection-title")).toContainText(/상태 · backlog|State · backlog/);
-    await expect(page.locator(".react-flow__controls")).toHaveCount(0);
+    await expect(page.getByTestId("fsm-mobile-selector")).toBeVisible();
+
+    await page.getByTestId("fsm-mobile-transition-button-3").click();
+    await expect(page.getByTestId("pipeline-selection-title")).toContainText("review → done");
+
+    await page.getByTestId("fsm-mobile-state-button-review").click();
+    await expect(page.getByTestId("pipeline-selection-title")).toContainText(/상태 · review|State · review/);
   });
 
   test("settings: pipeline editor keeps cached content visible while refreshing", async ({ page }) => {
@@ -2473,29 +2102,9 @@ test.describe("Dashboard smoke tests", () => {
     await page.goto("/settings?settingsPanel=pipeline");
 
     await expect(page.getByTestId("settings-page")).toBeVisible({ timeout: 15000 });
-    await expect(page.getByTestId("pipeline-selection-title")).toBeVisible({ timeout: 1500 });
+    await expect(page.getByTestId("pipeline-selection-title")).toBeVisible({ timeout: 400 });
     await expect(page.getByTestId("pipeline-refresh-indicator")).toBeVisible();
-    await expect(page.getByTestId("pipeline-selection-title")).toContainText(/상태 · backlog|State · backlog/);
-    await expect(page.locator(".react-flow__controls")).toHaveCount(0);
-
-    const canvas = page.getByTestId("pipeline-flow-canvas");
-    const viewport = page.locator(".react-flow__viewport").first();
-    const beforeWheelTransform = await viewport.evaluate((node) =>
-      node.getAttribute("transform") ?? window.getComputedStyle(node).transform,
-    );
-    const canvasBox = await canvas.boundingBox();
-    expect(canvasBox).not.toBeNull();
-    await page.mouse.move(canvasBox!.x + canvasBox!.width / 2, canvasBox!.y + canvasBox!.height / 2);
-    await page.mouse.wheel(0, 500);
-    await page.waitForTimeout(120);
-    const afterWheelTransform = await viewport.evaluate((node) =>
-      node.getAttribute("transform") ?? window.getComputedStyle(node).transform,
-    );
-    expect(afterWheelTransform).toBe(beforeWheelTransform);
-
-    await expect(page.getByTestId("settings-audit-notes")).toHaveCount(0);
-    await expect(page.getByText(/audit 노트|Audit notes/)).toHaveCount(0);
-    await expect(page.getByText("kv_meta")).toHaveCount(0);
+    await expect(page.getByTestId("pipeline-selection-title")).toContainText("backlog → ready");
     await expect(page.getByTestId("pipeline-refresh-indicator")).toBeHidden({ timeout: 3000 });
   });
 

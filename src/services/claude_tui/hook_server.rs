@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{LazyLock, RwLock};
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
@@ -8,36 +8,12 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Notify, broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
-const CLAUDE_PROVIDER: &str = "claude";
 
 static HOOK_ENDPOINT: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
 static HOOK_SERVER_STATE: LazyLock<HookServerState> = LazyLock::new(HookServerState::new);
-static PROMPT_READY_NOTIFY: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::new()));
-
-/// Returns the global notify handle that is woken whenever a Claude hook event
-/// suggesting "prompt ready" arrives (currently `Stop` / `SubagentStop`).
-///
-/// Callers that need to await prompt readiness should register a waiter via
-/// `notify.notified()` BEFORE issuing the prompt — `notify_waiters` only
-/// wakes currently-registered waiters, so signals fired before subscription
-/// are intentionally dropped to keep the channel edge-triggered.
-pub fn prompt_ready_notify() -> Arc<Notify> {
-    PROMPT_READY_NOTIFY.clone()
-}
-
-/// Internal entry point used by `receive_hook` to wake `prompt_ready_notify`
-/// waiters. Exposed (crate-visible) for unit tests that exercise the wake path
-/// without spinning up the full HTTP receiver.
-pub(crate) fn signal_prompt_ready_for_test() {
-    PROMPT_READY_NOTIFY.notify_waiters();
-}
-
-fn should_signal_prompt_ready(provider: &str, kind: &HookEventKind) -> bool {
-    provider == CLAUDE_PROVIDER && matches!(kind, HookEventKind::Stop | HookEventKind::SubagentStop)
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,10 +22,7 @@ pub enum HookEventKind {
     UserPromptSubmit,
     Stop,
     PreToolUse,
-    PermissionRequest,
     PostToolUse,
-    PreCompact,
-    PostCompact,
     Notification,
     SubagentStop,
     Unknown(String),
@@ -62,10 +35,7 @@ impl HookEventKind {
             "user_prompt_submit" => Self::UserPromptSubmit,
             "stop" => Self::Stop,
             "pre_tool_use" => Self::PreToolUse,
-            "permission_request" => Self::PermissionRequest,
             "post_tool_use" => Self::PostToolUse,
-            "pre_compact" => Self::PreCompact,
-            "post_compact" => Self::PostCompact,
             "notification" => Self::Notification,
             "subagent_stop" => Self::SubagentStop,
             other => Self::Unknown(other.to_string()),
@@ -78,10 +48,7 @@ impl HookEventKind {
             Self::UserPromptSubmit => "user_prompt_submit",
             Self::Stop => "stop",
             Self::PreToolUse => "pre_tool_use",
-            Self::PermissionRequest => "permission_request",
             Self::PostToolUse => "post_tool_use",
-            Self::PreCompact => "pre_compact",
-            Self::PostCompact => "post_compact",
             Self::Notification => "notification",
             Self::SubagentStop => "subagent_stop",
             Self::Unknown(value) => value.as_str(),
@@ -204,7 +171,7 @@ pub async fn spawn_hook_server_with_state(
             })
             .await;
         if let Err(error) = result {
-            tracing::warn!("tui hook server stopped with error: {error}");
+            tracing::warn!("claude_tui hook server stopped with error: {error}");
         }
     });
 
@@ -216,7 +183,10 @@ pub async fn spawn_hook_server_with_state(
     *HOOK_ENDPOINT
         .write()
         .unwrap_or_else(|error| error.into_inner()) = Some(handle.base_url());
-    tracing::info!(endpoint = handle.base_url(), "tui hook server started");
+    tracing::info!(
+        endpoint = handle.base_url(),
+        "claude_tui hook server started"
+    );
     Ok(handle)
 }
 
@@ -283,28 +253,12 @@ async fn receive_hook(
         payload,
     };
     let event_name = event.kind.as_str().to_string();
-    if matches!(event.kind, HookEventKind::Unknown(_)) {
-        tracing::warn!(
-            provider,
-            event = event_name,
-            session_id,
-            "unknown tui hook event accepted for provider-scoped telemetry"
-        );
-    }
-    if should_signal_prompt_ready(&event.provider, &event.kind) {
-        // Wake any task currently awaiting prompt readiness. `notify_waiters`
-        // is edge-triggered: signals fired with no current waiters are
-        // intentionally dropped so `wait_for_prompt_ready` cannot latch onto
-        // a stale Stop from a previous turn. The polling fallback in
-        // `input::wait_for_prompt_ready` handles the missed-signal race.
-        PROMPT_READY_NOTIFY.notify_waiters();
-    }
     if state.event_tx.send(event).is_err() {
         tracing::debug!(
             provider,
             event = event_name,
             session_id,
-            "tui hook event accepted with no subscribers; event discarded"
+            "claude_tui hook event accepted with no subscribers; event discarded"
         );
     }
 
@@ -371,31 +325,15 @@ mod tests {
         LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
-    fn hook_event_kind_normalizes_provider_hook_names() {
+    fn hook_event_kind_normalizes_claude_names() {
         assert_eq!(HookEventKind::from_path("Stop"), HookEventKind::Stop);
         assert_eq!(
             HookEventKind::from_path("PreToolUse"),
             HookEventKind::PreToolUse
         );
         assert_eq!(
-            HookEventKind::from_path("PermissionRequest"),
-            HookEventKind::PermissionRequest
-        );
-        assert_eq!(
-            HookEventKind::from_path("pre-compact"),
-            HookEventKind::PreCompact
-        );
-        assert_eq!(
-            HookEventKind::from_path("PostCompact"),
-            HookEventKind::PostCompact
-        );
-        assert_eq!(
             HookEventKind::from_path("subagent-stop"),
             HookEventKind::SubagentStop
-        );
-        assert_eq!(
-            HookEventKind::from_path("FutureCodexHook"),
-            HookEventKind::Unknown("future_codex_hook".to_string())
         );
     }
 
@@ -441,65 +379,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn stop_event_wakes_prompt_ready_waiter() {
-        let notify = prompt_ready_notify();
-        let waiter = tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(2), notify.notified())
-                .await
-                .map_err(|_| "timeout")
-        });
-
-        // Give the waiter a moment to register before signaling.
-        tokio::task::yield_now().await;
-        // Drive via the same code path the HTTP receiver uses.
-        let state = HookServerState::new();
-        let app = hook_receiver_router_with_state(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri("/hooks/claude/Stop?session_id=sess-wake")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"hook_event_name":"Stop"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-        waiter
-            .await
-            .expect("waiter task did not panic")
-            .expect("Stop event should wake prompt_ready_notify waiter");
-    }
-
-    // Note: a "negative wake" test against the global PROMPT_READY_NOTIFY is
-    // intentionally omitted — concurrent tests in the same process can race on
-    // the shared notify and flake the assertion. The pure-function predicate
-    // `should_signal_prompt_ready_only_for_stop_kinds` below pins the
-    // dispatch rule deterministically without touching global state.
-
-    #[test]
-    fn should_signal_prompt_ready_only_for_stop_kinds() {
-        assert!(should_signal_prompt_ready("claude", &HookEventKind::Stop));
-        assert!(should_signal_prompt_ready(
-            "claude",
-            &HookEventKind::SubagentStop
-        ));
-        // Notifications carry permission prompts etc.; conservatively skip.
-        assert!(!should_signal_prompt_ready(
-            "claude",
-            &HookEventKind::Notification
-        ));
-        assert!(!should_signal_prompt_ready(
-            "claude",
-            &HookEventKind::UserPromptSubmit
-        ));
-        // Other providers must not poke the Claude-specific notify.
-        assert!(!should_signal_prompt_ready("codex", &HookEventKind::Stop));
     }
 
     #[test]

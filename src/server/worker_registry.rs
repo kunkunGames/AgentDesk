@@ -133,8 +133,6 @@ enum ServerWorkerId {
     DmReplyRetry,
     WsBatchFlusher,
     RoutineRuntime,
-    SessionDiscovery,
-    WatcherSupervisor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,7 +231,7 @@ pub(crate) struct WorkerSpec {
     pub(crate) notes: &'static str,
 }
 
-pub(crate) const WORKER_SPECS: [WorkerSpec; 11] = [
+pub(crate) const WORKER_SPECS: [WorkerSpec; 9] = [
     WorkerSpec {
         id: ServerWorkerId::GithubSync,
         name: "github_sync_loop",
@@ -354,48 +352,6 @@ pub(crate) const WORKER_SPECS: [WorkerSpec; 11] = [
         execution_scope: WorkerExecutionScope::LeaderOnly,
         health_owner: "failed DM notification rows and retry tracing",
         notes: "Skips the immediate tick and only starts retries after the first interval",
-    },
-    WorkerSpec {
-        id: ServerWorkerId::SessionDiscovery,
-        name: "session_discovery_loop",
-        kind: WorkerKind::TokioTask,
-        target: "services::cluster::session_discovery::run_discovery_loop",
-        responsibility: "Enumerate tmux sessions, match to channel bindings, maintain SessionRegistry",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
-        start_order: 65,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::WorkerLocal,
-        health_owner: "SessionRegistry contents and /api/cluster/sessions diagnostic",
-        notes: "Worker-local because tmux is host-scoped — every node must enumerate its own \
-                sessions for the cluster registry. Reconcile is instance_id-scoped so peers \
-                cannot stomp each other's entries. Boot reconcile runs immediately; subsequent \
-                polls every 10s. External request_discovery_tick() nudges fire an immediate tick \
-                for E3 event hooks.",
-    },
-    WorkerSpec {
-        id: ServerWorkerId::WatcherSupervisor,
-        name: "watcher_supervisor_loop",
-        kind: WorkerKind::TokioTask,
-        target: "services::cluster::watcher_supervisor::run_watcher_supervisor_loop",
-        responsibility: "Spawn/teardown session-bound StreamRelay tasks in response to SessionRegistry events",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
-        start_order: 67,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::WorkerLocal,
-        health_owner: "watcher-supervisor tracing + per-relay metrics",
-        notes: "Epic #2285 / E3 (#2345), wired through E4 (#2411) and E5 (#2412). Gated by \
-                cluster.session_bound_relay_enabled (default true since E5); flipping the flag \
-                off restores the legacy turn-bound watcher as the sole delivery path. \
-                Worker-local because tmux is host-scoped — relays live next to the sessions \
-                they observe. Uses RegistryAdapterSink (observation-only) so flag-on activation \
-                does not double-deliver alongside the still-active legacy tmux watcher. E5 wires \
-                the producer side via RelayProducerRegistry so tmux_watcher pushes every chunk \
-                it reads into the supervisor-owned relay — the new path is no longer dark. A \
-                follow-up issue swaps the legacy spawn site for direct sink-driven delivery.",
     },
     WorkerSpec {
         id: ServerWorkerId::WsBatchFlusher,
@@ -693,54 +649,6 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(Some(buffer))
             }
-            ServerWorkerId::SessionDiscovery => {
-                let Some(discovery_pg_pool) = self.pg_pool.clone() else {
-                    self.log_skip(spec, "postgres pool unavailable");
-                    return Ok(None);
-                };
-                let instance_id = Some(self.cluster_runtime.instance_id().to_string());
-                let shutdown = self.shutdown.clone();
-                // Worker-local (not register_leader_tokio): tmux is host-scoped,
-                // so every node must enumerate its own sessions. The registry's
-                // reconcile_for_node is instance_id-scoped to keep peers from
-                // stomping each other's entries.
-                self.register_tokio(spec, async move {
-                    crate::services::cluster::session_discovery::run_discovery_loop(
-                        instance_id,
-                        discovery_pg_pool,
-                        crate::services::cluster::session_discovery::DiscoveryConfig::default(),
-                        shutdown,
-                    )
-                    .await;
-                });
-                Ok(None)
-            }
-            ServerWorkerId::WatcherSupervisor => {
-                if !self.config.cluster.session_bound_relay_enabled {
-                    self.log_skip(spec, "cluster.session_bound_relay_enabled=false");
-                    return Ok(None);
-                }
-                let shutdown = self.shutdown.clone();
-                // Worker-local: tmux is host-scoped, so every node supervises
-                // its own relays. No leader gating — peer hosts can't observe
-                // each other's sessions anyway.
-                self.register_tokio(spec, async move {
-                    // E4 (#2411) + E5 (#2412): the supervisor runs against
-                    // the production observation sink. Delivery still flows
-                    // through the legacy turn-bound watcher; the sink only
-                    // records frame metrics. E5 added the producer side —
-                    // `tmux_watcher` now publishes every read chunk into
-                    // the supervisor-owned relay via
-                    // `RelayProducerRegistry`, so the new path actually
-                    // receives frames in production instead of being a
-                    // dark pipe.
-                    crate::services::cluster::registry_adapter_sink::run_with_registry_adapter_sink(
-                        shutdown,
-                    )
-                    .await;
-                });
-                Ok(None)
-            }
             ServerWorkerId::RoutineRuntime => {
                 if !self.config.routines.enabled {
                     self.log_skip(spec, "routines.enabled=false");
@@ -915,104 +823,6 @@ impl Drop for SupervisedWorkerRegistry {
     }
 }
 
-// #2202 regression guard. Verifies that `supervise_leader_tokio_worker` re-spawns
-// the underlying worker future after a lease takeover (leader=true → false → true),
-// which is the contract the PR #2115 fix introduced. Without it, leader-only
-// workers like `routine-runtime` go dormant on the new leader until dcserver
-// restart.
-#[cfg(test)]
-mod leader_takeover_tests {
-    use super::{
-        LEADER_ONLY_WORKER_ACTIVE_COUNT, LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS,
-        LEADER_ONLY_WORKERS_STARTED, SupervisedWorkerRegistry, WORKER_SPECS, WorkerExecutionScope,
-    };
-    use crate::server::cluster::ClusterRuntime;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    fn leader_only_spec_for_test() -> super::WorkerSpec {
-        WORKER_SPECS
-            .iter()
-            .copied()
-            .find(|spec| spec.execution_scope == WorkerExecutionScope::LeaderOnly)
-            .expect("at least one leader-only worker spec is registered")
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn supervisor_respawns_worker_after_lease_takeover() {
-        // Reset the globals the supervisor mutates so this test stays
-        // deterministic regardless of other tests in the binary.
-        LEADER_ONLY_WORKERS_STARTED.store(false, Ordering::Release);
-        LEADER_ONLY_WORKER_ACTIVE_COUNT.store(0, Ordering::Release);
-        LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS.store(0, Ordering::Release);
-
-        let leader_active = Arc::new(AtomicBool::new(false));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let runtime = ClusterRuntime::for_test_with_leader(leader_active.clone());
-        let spawn_count = Arc::new(AtomicUsize::new(0));
-        let spec = leader_only_spec_for_test();
-
-        let supervisor_count = spawn_count.clone();
-        let supervisor = tokio::spawn(SupervisedWorkerRegistry::supervise_leader_tokio_worker(
-            spec,
-            runtime,
-            shutdown.clone(),
-            move || {
-                let counter = supervisor_count.clone();
-                async move {
-                    counter.fetch_add(1, Ordering::Release);
-                    // Park so the supervisor only re-spawns on a leader flip,
-                    // not because the worker future returned on its own.
-                    std::future::pending::<()>().await;
-                }
-            },
-        ));
-
-        // Not leader yet → supervisor blocks in wait_until_leader.
-        tokio::time::advance(Duration::from_secs(3)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(spawn_count.load(Ordering::Acquire), 0);
-
-        // Acquire leadership → supervisor must spawn the worker.
-        leader_active.store(true, Ordering::Release);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            spawn_count.load(Ordering::Acquire),
-            1,
-            "worker future should run as soon as leadership is acquired"
-        );
-        assert!(LEADER_ONLY_WORKERS_STARTED.load(Ordering::Acquire));
-        assert_eq!(LEADER_ONLY_WORKER_ACTIVE_COUNT.load(Ordering::Acquire), 1);
-
-        // Lose leadership → supervisor self-fences the worker.
-        leader_active.store(false, Ordering::Release);
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(LEADER_ONLY_WORKER_ACTIVE_COUNT.load(Ordering::Acquire), 0);
-
-        // Lease takeover: regain leadership while supervisor is in the
-        // post-loss 5s cooldown. The supervisor must re-enter the spawn loop.
-        leader_active.store(true, Ordering::Release);
-        // 5s cooldown + 1s poll interval + jitter buffer.
-        tokio::time::advance(Duration::from_secs(8)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            spawn_count.load(Ordering::Acquire),
-            2,
-            "worker must re-spawn after lease takeover (regression guard for #2202)"
-        );
-        assert_eq!(LEADER_ONLY_WORKER_ACTIVE_COUNT.load(Ordering::Acquire), 1);
-
-        shutdown.store(true, Ordering::Release);
-        // Let the supervisor observe shutdown on its next poll tick and exit.
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), supervisor).await;
-    }
-}
-
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
@@ -1033,7 +843,7 @@ mod tests {
 
     #[test]
     fn long_lived_workers_have_explicit_supervision_metadata() {
-        assert_eq!(WORKER_SPECS.len(), 11);
+        assert_eq!(WORKER_SPECS.len(), 9);
         assert!(
             WORKER_SPECS
                 .windows(2)
@@ -1044,7 +854,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.start_stage == WorkerStartStage::AfterBootReconcile)
                 .count(),
-            10
+            8
         );
         assert_eq!(
             WORKER_SPECS
@@ -1072,7 +882,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.execution_scope == WorkerExecutionScope::WorkerLocal)
                 .count(),
-            4
+            2
         );
         assert!(WORKER_SPECS.iter().all(|spec| !spec.owner.is_empty()));
         assert!(

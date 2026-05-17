@@ -5,7 +5,6 @@ export type AppRouteId =
   | "office"
   | "agents"
   | "kanban"
-  | "routines"
   | "stats"
   | "ops"
   | "meetings"
@@ -87,25 +86,14 @@ export const APP_ROUTES: AppRouteEntry[] = [
     shortcutKey: "4",
   },
   {
-    id: "routines",
-    path: "/routines",
-    section: "workspace",
-    labelKo: "루틴",
-    labelEn: "Routines",
-    descriptionKo: "예약된 자동 작업을 시간순으로 확인합니다.",
-    descriptionEn: "Review scheduled routine jobs chronologically.",
-    paletteIcon: "🗓️",
-    shortcutKey: "r",
-  },
-  {
     id: "ops",
     path: "/ops",
     aliases: ["/control"],
     section: "workspace",
     labelKo: "운영",
     labelEn: "Ops",
-    descriptionKo: "시스템 헬스와 전달 병목을 모니터링합니다.",
-    descriptionEn: "Monitor system health and delivery bottlenecks.",
+    descriptionKo: "오피스와 운영 표면을 관리합니다.",
+    descriptionEn: "Manage offices and operational surfaces.",
     paletteIcon: "🛠️",
     shortcutKey: "5",
   },

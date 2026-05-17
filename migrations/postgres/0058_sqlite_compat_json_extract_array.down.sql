@@ -1,7 +1,3 @@
--- Restore the pre-0058 json_extract(JSONB, TEXT) implementation verbatim
--- from migration 0002_sqlite_compat_functions.sql so rollback reproduces
--- the exact 0057-era DDL (literal-key navigation via #>> string_to_array,
--- IMMUTABLE volatility, no jsonpath operators).
 CREATE OR REPLACE FUNCTION json_extract(input JSONB, path TEXT)
 RETURNS TEXT
 LANGUAGE plpgsql

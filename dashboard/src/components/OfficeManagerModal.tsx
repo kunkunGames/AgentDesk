@@ -1,12 +1,8 @@
 import { useState, useCallback } from "react";
 import { X, Plus, Trash2, UserPlus, UserMinus, Settings2 } from "lucide-react";
 import type { Office, Agent } from "../types";
+import * as api from "../api/client";
 import AgentAvatar from "./AgentAvatar";
-import {
-  OFFICE_COLORS,
-  OFFICE_ICONS,
-  useOfficeManager,
-} from "./office-manager/useOfficeManager";
 import {
   SurfaceActionButton,
   SurfaceCard,
@@ -25,6 +21,12 @@ interface OfficeManagerModalProps {
 
 type ModalView = "list" | "edit" | "agents";
 
+const OFFICE_ICONS = ["🏢", "🏠", "🏭", "🏗️", "🏛️", "🍳", "🎮", "📚", "🔬", "🎨", "🛠️", "🌐"];
+const OFFICE_COLORS = [
+  "#10b981", "#14b8a6", "#06b6d4", "#3b82f6", "#84cc16",
+  "#f59e0b", "#f97316", "#ef4444", "#64748b", "#22c55e",
+];
+
 export default function OfficeManagerModal({
   offices,
   allAgents,
@@ -35,17 +37,15 @@ export default function OfficeManagerModal({
   const [view, setView] = useState<ModalView>("list");
   const [editOffice, setEditOffice] = useState<Office | null>(null);
   const [agentsOffice, setAgentsOffice] = useState<Office | null>(null);
-  const {
-    deleteOffice,
-    draft,
-    loadMembers,
-    memberIds,
-    resetDraft,
-    saveOffice,
-    saving,
-    setDraft,
-    toggleMember,
-  } = useOfficeManager({ allAgents, onChanged });
+  const [officeAgentIds, setOfficeAgentIds] = useState<Set<string>>(new Set());
+  const [saving, setSaving] = useState(false);
+
+  // Form state
+  const [formName, setFormName] = useState("");
+  const [formNameKo, setFormNameKo] = useState("");
+  const [formIcon, setFormIcon] = useState("🏢");
+  const [formColor, setFormColor] = useState("#10b981");
+  const [formDesc, setFormDesc] = useState("");
 
   const tr = useCallback(
     (ko: string, en: string) => (isKo ? ko : en),
@@ -54,49 +54,93 @@ export default function OfficeManagerModal({
 
   const openCreate = () => {
     setEditOffice(null);
-    resetDraft(null);
+    setFormName("");
+    setFormNameKo("");
+    setFormIcon("🏢");
+    setFormColor("#10b981");
+    setFormDesc("");
     setView("edit");
   };
 
   const openEdit = (o: Office) => {
     setEditOffice(o);
-    resetDraft(o);
+    setFormName(o.name);
+    setFormNameKo(o.name_ko);
+    setFormIcon(o.icon);
+    setFormColor(o.color);
+    setFormDesc(o.description ?? "");
     setView("edit");
   };
 
-  const openAgents = (o: Office) => {
+  const openAgents = async (o: Office) => {
     setAgentsOffice(o);
-    loadMembers(o.id);
+    try {
+      const agents = await api.getAgents(o.id);
+      setOfficeAgentIds(new Set(agents.map((a) => a.id)));
+    } catch {
+      setOfficeAgentIds(new Set());
+    }
     setView("agents");
   };
 
   const handleSave = async () => {
+    setSaving(true);
     try {
-      await saveOffice({ creating: !editOffice, office: editOffice });
+      const payload = {
+        name: formName.trim(),
+        name_ko: formNameKo.trim() || formName.trim(),
+        icon: formIcon,
+        color: formColor,
+        description: formDesc.trim() || null,
+      };
+      if (editOffice) {
+        await api.updateOffice(editOffice.id, payload);
+      } else {
+        await api.createOffice(payload);
+      }
+      onChanged();
       setView("list");
     } catch (e) {
       console.error("Office save failed:", e);
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleDelete = async (id: string) => {
     if (!confirm(tr("이 오피스를 삭제하시겠습니까?", "Delete this office?")))
       return;
-    const office = offices.find((item) => item.id === id);
-    if (!office) return;
+    setSaving(true);
     try {
-      await deleteOffice(office);
+      await api.deleteOffice(id);
+      onChanged();
     } catch (e) {
       console.error("Office delete failed:", e);
+    } finally {
+      setSaving(false);
     }
   };
 
   const toggleAgent = async (agentId: string) => {
     if (!agentsOffice) return;
+    setSaving(true);
     try {
-      await toggleMember(agentsOffice, agentId);
+      if (officeAgentIds.has(agentId)) {
+        await api.removeAgentFromOffice(agentsOffice.id, agentId);
+        setOfficeAgentIds((prev) => {
+          const next = new Set(prev);
+          next.delete(agentId);
+          return next;
+        });
+      } else {
+        await api.addAgentToOffice(agentsOffice.id, agentId);
+        setOfficeAgentIds((prev) => new Set(prev).add(agentId));
+      }
+      onChanged();
     } catch (e) {
       console.error("Toggle agent failed:", e);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -242,8 +286,8 @@ export default function OfficeManagerModal({
                   {tr("이름 (영문)", "Name (EN)")}
                 </label>
                 <input
-                  value={draft.name}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))}
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
                   className="w-full px-3 py-2 rounded-lg text-sm"
                   style={{
                     background: "var(--th-input-bg)",
@@ -261,8 +305,8 @@ export default function OfficeManagerModal({
                       {tr("이름 (한국어)", "Name (KO)")}
                     </label>
                     <input
-                      value={draft.name_ko}
-                      onChange={(e) => setDraft((prev) => ({ ...prev, name_ko: e.target.value }))}
+                      value={formNameKo}
+                      onChange={(e) => setFormNameKo(e.target.value)}
                       className="w-full px-3 py-2 rounded-lg text-sm"
                       style={{
                         background: "var(--th-input-bg)",
@@ -280,8 +324,8 @@ export default function OfficeManagerModal({
                       {tr("설명", "Description")}
                     </label>
                     <textarea
-                      value={draft.description}
-                      onChange={(e) => setDraft((prev) => ({ ...prev, description: e.target.value }))}
+                      value={formDesc}
+                      onChange={(e) => setFormDesc(e.target.value)}
                       className="w-full px-3 py-2 rounded-lg text-sm resize-none"
                       rows={3}
                       style={{
@@ -312,18 +356,18 @@ export default function OfficeManagerModal({
                           key={ic}
                           type="button"
                           aria-label={tr(`아이콘 ${ic}`, `Icon ${ic}`)}
-                          aria-pressed={draft.icon === ic}
-                          onClick={() => setDraft((prev) => ({ ...prev, icon: ic }))}
+                          aria-pressed={formIcon === ic}
+                          onClick={() => setFormIcon(ic)}
                           className="flex h-8 w-8 items-center justify-center rounded text-base transition-all"
                           style={{
                             color: "var(--th-text-heading)",
-                            border: draft.icon === ic
-                              ? `1px solid ${draft.color}`
+                            border: formIcon === ic
+                              ? `1px solid ${formColor}`
                               : "1px solid color-mix(in srgb, var(--th-border) 70%, transparent)",
-                            background: draft.icon === ic
-                              ? `color-mix(in srgb, ${draft.color} 16%, var(--th-bg-surface) 84%)`
+                            background: formIcon === ic
+                              ? `color-mix(in srgb, ${formColor} 16%, var(--th-bg-surface) 84%)`
                               : "color-mix(in srgb, var(--th-bg-surface) 88%, transparent)",
-                            boxShadow: draft.icon === ic ? `0 0 0 1px ${draft.color}55` : "none",
+                            boxShadow: formIcon === ic ? `0 0 0 1px ${formColor}55` : "none",
                           }}
                         >
                           {ic}
@@ -344,10 +388,10 @@ export default function OfficeManagerModal({
                           key={c}
                           type="button"
                           aria-label={`Color ${c}`}
-                          aria-pressed={draft.color === c}
-                          onClick={() => setDraft((prev) => ({ ...prev, color: c }))}
+                          aria-pressed={formColor === c}
+                          onClick={() => setFormColor(c)}
                           className={`w-7 h-7 rounded-full transition-all ${
-                            draft.color === c
+                            formColor === c
                               ? "ring-2 ring-offset-2 ring-offset-gray-900 ring-white"
                               : ""
                           }`}
@@ -358,20 +402,20 @@ export default function OfficeManagerModal({
                   </div>
                   <SurfaceCard
                     style={{
-                      borderColor: `${draft.color}55`,
-                      background: `color-mix(in srgb, ${draft.color} 12%, var(--th-card-bg) 88%)`,
+                      borderColor: `${formColor}55`,
+                      background: `color-mix(in srgb, ${formColor} 12%, var(--th-card-bg) 88%)`,
                     }}
                   >
                     <div className="flex items-center gap-3">
-                      <div className="flex h-11 w-11 items-center justify-center rounded-2xl text-2xl" style={{ background: `${draft.color}22` }}>
-                        {draft.icon}
+                      <div className="flex h-11 w-11 items-center justify-center rounded-2xl text-2xl" style={{ background: `${formColor}22` }}>
+                        {formIcon}
                       </div>
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium" style={{ color: "var(--th-text-heading)" }}>
-                          {draft.name_ko.trim() || draft.name.trim() || tr("오피스 이름", "Office Name")}
+                          {formNameKo.trim() || formName.trim() || tr("오피스 이름", "Office Name")}
                         </div>
                         <div className="truncate text-xs" style={{ color: "var(--th-text-muted)" }}>
-                          {draft.name.trim() || tr("영문 이름 미입력", "No English name yet")}
+                          {formName.trim() || tr("영문 이름 미입력", "No English name yet")}
                         </div>
                       </div>
                     </div>
@@ -395,7 +439,7 @@ export default function OfficeManagerModal({
                 </div>
               </SurfaceNotice>
               {allAgents.map((a) => {
-                const inOffice = memberIds.has(a.id);
+                const inOffice = officeAgentIds.has(a.id);
                 return (
                   <SurfaceCard
                     key={a.id}
@@ -455,7 +499,7 @@ export default function OfficeManagerModal({
           {view === "edit" && (
             <SurfaceActionButton
               onClick={handleSave}
-              disabled={saving || !draft.name.trim()}
+              disabled={saving || !formName.trim()}
               tone="accent"
             >
               {saving

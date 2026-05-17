@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(unix)]
 use std::time::Duration;
 
-use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage, is_valid_session_id};
+use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
@@ -420,7 +420,7 @@ pub fn execute_command_simple_cancellable(
     prompt: &str,
     cancel_token: Option<&CancelToken>,
 ) -> Result<String, String> {
-    execute_command_simple_with_model_and_cancel(prompt, None, cancel_token, None)
+    execute_command_simple_with_model_and_cancel(prompt, None, cancel_token)
 }
 
 /// Execute a simple Claude CLI call with optional model override (no tools, text-only response).
@@ -429,37 +429,13 @@ pub fn execute_command_simple_with_model(
     prompt: &str,
     model_override: Option<&str>,
 ) -> Result<String, String> {
-    execute_command_simple_with_model_and_cancel(prompt, model_override, None, None)
-}
-
-/// Cancel-aware variant of [`execute_command_simple_with_model`].
-///
-/// Threads the supplied `CancelToken` into the spawned Claude child so that a
-/// mid-flight cancel (e.g. voice barge-in) terminates the process tree
-/// instead of letting it run to natural exit. Required by ADR #2175 for all
-/// non-foreground entry points — call sites that hold a `CancelToken` from
-/// the surrounding turn MUST use this variant.
-///
-/// This is a blocking function — call from `tokio::task::spawn_blocking`.
-pub fn execute_command_simple_cancellable_with_model(
-    prompt: &str,
-    model_override: Option<&str>,
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
-) -> Result<String, String> {
-    let borrow = cancel_token.as_deref();
-    execute_command_simple_with_model_and_cancel(
-        prompt,
-        model_override,
-        borrow,
-        cancel_token.clone(),
-    )
+    execute_command_simple_with_model_and_cancel(prompt, model_override, None)
 }
 
 fn execute_command_simple_with_model_and_cancel(
     prompt: &str,
     model_override: Option<&str>,
     cancel_token: Option<&CancelToken>,
-    cancel_token_arc: Option<std::sync::Arc<CancelToken>>,
 ) -> Result<String, String> {
     let session_selection =
         crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
@@ -488,10 +464,6 @@ fn execute_command_simple_with_model_and_cancel(
 
     let mut command = Command::new(&claude_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
-    // #2250: put Claude in its own process group so the simple-cancel
-    // watcher can terminate any wrapper / grandchild via
-    // `kill_pid_tree(child_pid)`. Without this, descendants survive cancel.
-    crate::services::process::configure_child_process_group(&mut command);
     let mut child = command
         .args(&args)
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "4096")
@@ -502,34 +474,19 @@ fn execute_command_simple_with_model_and_cancel(
         .spawn()
         .map_err(|e| format!("Failed to start Claude: {}", e))?;
 
-    let child_pid = child.id();
-    register_child_pid(cancel_token, child_pid);
+    register_child_pid(cancel_token, child.id());
     if cancel_requested(cancel_token) {
         kill_child_tree(&mut child);
         return Err("Claude request cancelled".to_string());
     }
 
-    // Issue #2335 (d): arm the mid-flight cancel watcher BEFORE writing to
-    // stdin. Previously the watcher was spawned after the (potentially
-    // blocking) `stdin.write_all`, leaving a short window where an
-    // immediate cancel arriving between `spawn` and stdin completion would
-    // not be honoured. The Codex counterpart has no stdin so it is not
-    // affected. ADR #2175.
-    let cancel_watcher =
-        crate::services::process::spawn_simple_cancel_watcher(cancel_token_arc, child_pid);
-
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
     }
 
-    let output_result = child.wait_with_output();
-    cancel_watcher.disarm();
-    let was_cancelled = cancel_requested(cancel_token);
-    let output = output_result.map_err(|e| format!("Failed to read output: {}", e))?;
-
-    if was_cancelled {
-        return Err("Claude request cancelled".to_string());
-    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read output: {}", e))?;
 
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1159,12 +1116,8 @@ IMPORTANT: Format your responses using Markdown for better readability:
                             model, cost_usd, total_cost_usd, cache_create_tokens, cache_read_tokens
                         ));
                     }
-                    StreamMessage::TmuxReady { .. }
-                    | StreamMessage::RuntimeReady { .. }
-                    | StreamMessage::ProcessReady { .. } => {
-                        debug_log(
-                            "  >>> TmuxReady/RuntimeReady/ProcessReady (ignored in direct execution)",
-                        );
+                    StreamMessage::TmuxReady { .. } | StreamMessage::ProcessReady { .. } => {
+                        debug_log("  >>> TmuxReady/ProcessReady (ignored in direct execution)");
                     }
                     StreamMessage::OutputOffset { offset } => {
                         debug_log(&format!("  >>> OutputOffset: {offset}"));
@@ -1360,7 +1313,6 @@ enum ClaudeFollowupResult {
 }
 
 const FOLLOWUP_PARTIAL_OUTPUT_NOTICE: &str = "⚠ 세션이 응답 도중 중단되었습니다. 일부 출력이 이미 전송되어 자동 재시작하지 않았습니다. 이어서 계속하려면 같은 요청을 다시 보내며 계속해 달라고 적어 주세요.";
-const CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE: &str = "⚠ Claude TUI가 아직 이전 터미널 턴을 처리 중이라 이 메시지를 주입하지 않았습니다. 현재 응답이 끝난 뒤 다시 보내 주세요.";
 
 fn classify_followup_result(
     read_result: ReadOutputResult,
@@ -1391,51 +1343,6 @@ fn emit_followup_restart_suppressed_notice(sender: &Sender<StreamMessage>, notic
         result: String::new(),
         session_id: None,
     });
-}
-
-#[cfg(unix)]
-fn emit_claude_tui_busy_followup_notice(
-    sender: &Sender<StreamMessage>,
-    tmux_session_name: &str,
-    snapshot: &crate::services::claude_tui::input::PromptReadinessSnapshot,
-) {
-    tracing::warn!(
-        tmux_session_name,
-        prompt_marker_detected = snapshot.prompt_marker_detected,
-        previous_tui_turn_still_running = snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
-        tmux_pane_alive = snapshot.tmux_pane_alive,
-        capture_available = snapshot.capture_available,
-        pane_tail = %snapshot.pane_tail,
-        "claude_tui follow-up blocked before prompt submission because hosted TUI is busy"
-    );
-    debug_log(&format!(
-        "Claude TUI follow-up blocked before prompt submission: session={} prompt_marker_detected={} previous_tui_turn_still_running={} tmux_pane_alive={} capture_available={} pane_tail:\n{}",
-        tmux_session_name,
-        snapshot.prompt_marker_detected,
-        snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
-        snapshot.tmux_pane_alive,
-        snapshot.capture_available,
-        snapshot.pane_tail
-    ));
-    let _ = sender.send(StreamMessage::Text {
-        content: CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE.to_string(),
-    });
-    let _ = sender.send(StreamMessage::Done {
-        result: String::new(),
-        session_id: None,
-    });
-}
-
-#[cfg(unix)]
-fn claude_tui_followup_busy_before_submit(
-    tmux_session_name: &str,
-) -> Option<crate::services::claude_tui::input::PromptReadinessSnapshot> {
-    let snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
-    if snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected {
-        Some(snapshot)
-    } else {
-        None
-    }
 }
 
 #[cfg(unix)]
@@ -1598,99 +1505,14 @@ fn execute_streaming_local_tui_tmux(
 
     if session_exists && has_live_pane && resume {
         debug_log("Existing Claude TUI tmux session found — sending follow-up");
+        let start_offset = std::fs::metadata(&transcript_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
         if let Some(ref token) = cancel_token {
             *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(tmux_session_name.to_string());
         }
         let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
-        // #2416: a single busy_waited flag tells the offset-capture site below
-        // that we need to re-read transcript length after the wait succeeded,
-        // because the previous TUI turn may have appended bytes while we were
-        // waiting (otherwise the follow-up reader would treat previous-turn
-        // bytes as new-turn output).
-        let mut busy_waited = false;
-        if let Some(snapshot) = claude_tui_followup_busy_before_submit(tmux_session_name) {
-            // #2416: instead of dropping the user's message when the TUI is busy,
-            // wait for the next prompt-ready window using the existing
-            // wait_for_prompt_ready infrastructure. Only emit the busy notice if
-            // the wait times out (or otherwise fails).
-            match crate::services::claude_tui::input::wait_for_prompt_ready(
-                tmux_session_name,
-                crate::services::claude_tui::input::PromptReadinessKind::Followup,
-            ) {
-                Ok(()) => {
-                    busy_waited = true;
-                    debug_log(&format!(
-                        "Claude TUI follow-up: busy at first check, became ready after wait (session={})",
-                        tmux_session_name
-                    ));
-                }
-                Err(err) => {
-                    let timed_out =
-                        crate::services::claude_tui::input::is_prompt_ready_timeout_error(&err);
-                    debug_log(&format!(
-                        "Claude TUI follow-up wait failed after busy snapshot (session={}, timed_out={}): {}",
-                        tmux_session_name, timed_out, err
-                    ));
-                    let post_wait_snapshot =
-                        crate::services::claude_tui::input::prompt_readiness_snapshot(
-                            tmux_session_name,
-                        );
-                    emit_claude_tui_busy_followup_notice(
-                        &sender,
-                        tmux_session_name,
-                        &post_wait_snapshot,
-                    );
-                    log_producer_exit(
-                        "tui_warm_followup_busy_pre_submit",
-                        Some(&resolved_session_id),
-                        report_channel_id,
-                        0,
-                        serde_json::json!({
-                            "tmux_session_name": tmux_session_name,
-                            "transcript_path": transcript_path_string,
-                            "prompt_marker_detected": post_wait_snapshot.prompt_marker_detected,
-                            "previous_tui_turn_still_running": post_wait_snapshot.tmux_pane_alive && !post_wait_snapshot.prompt_marker_detected,
-                            "tmux_pane_alive": post_wait_snapshot.tmux_pane_alive,
-                            "capture_available": post_wait_snapshot.capture_available,
-                            "initial_busy_snapshot_prompt_marker_detected": snapshot.prompt_marker_detected,
-                            "wait_outcome": if timed_out { "timeout" } else { "error" },
-                            "wait_error": err,
-                        }),
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        // #2416: capture the transcript offset AFTER the optional busy wait so
-        // that any bytes the previous TUI turn appended while we were waiting
-        // are not replayed as part of this follow-up's output window. This
-        // closes a Codex-flagged HIGH (stale offset → duplicate / early-done
-        // delivery accounting).
-        let start_offset = std::fs::metadata(&transcript_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        // #2416: also honour cancellation that may have flipped during the
-        // up-to-45s busy wait. Without this, a user stop reaction / watchdog
-        // cancellation arriving mid-wait would still inject the prompt as
-        // soon as the TUI returns to ready. Closes a Codex-flagged HIGH.
-        if busy_waited && crate::services::provider::cancel_requested(cancel_token.as_deref()) {
-            debug_log(&format!(
-                "Claude TUI follow-up: cancellation observed after busy wait, aborting injection (session={})",
-                tmux_session_name
-            ));
-            log_producer_exit(
-                "tui_warm_followup_cancelled_after_busy_wait",
-                Some(&resolved_session_id),
-                report_channel_id,
-                0,
-                serde_json::json!({
-                    "tmux_session_name": tmux_session_name,
-                    "transcript_path": transcript_path_string,
-                }),
-            );
-            return Ok(());
-        }
         crate::services::claude_tui::input::send_followup_prompt(tmux_session_name, prompt)?;
         let hook_events_after = chrono::Utc::now();
         let read_result = read_claude_tui_transcript_until_done(
@@ -2023,12 +1845,11 @@ fn emit_claude_tui_watcher_handoff(
     let last_offset = std::fs::metadata(transcript_path)
         .map(|meta| meta.len())
         .unwrap_or(0);
-    let _ = sender.send(StreamMessage::RuntimeReady {
-        handoff: RuntimeHandoff::ClaudeTui {
-            transcript_path: transcript_path_string.to_string(),
-            tmux_session_name: tmux_session_name.to_string(),
-            last_offset,
-        },
+    let _ = sender.send(StreamMessage::TmuxReady {
+        output_path: transcript_path_string.to_string(),
+        input_fifo_path: String::new(),
+        tmux_session_name: tmux_session_name.to_string(),
+        last_offset,
     });
 }
 
@@ -2965,37 +2786,6 @@ mod local_tmux_lifecycle_tests {
             }
             other => panic!("expected TmuxReady, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn claude_tui_handoff_uses_runtime_ready_without_fifo() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(temp.path(), b"{\"type\":\"assistant\"}\n").unwrap();
-        let transcript_path = temp.path().display().to_string();
-        let (sender, receiver) = std::sync::mpsc::channel();
-
-        emit_claude_tui_watcher_handoff(&sender, &transcript_path, "claude-tui-test", temp.path());
-
-        let message = receiver.recv().unwrap();
-        match message {
-            StreamMessage::RuntimeReady {
-                handoff:
-                    RuntimeHandoff::ClaudeTui {
-                        transcript_path: actual_path,
-                        tmux_session_name,
-                        last_offset,
-                    },
-            } => {
-                assert_eq!(actual_path, transcript_path);
-                assert_eq!(tmux_session_name, "claude-tui-test");
-                assert_eq!(last_offset, std::fs::metadata(temp.path()).unwrap().len());
-            }
-            other => panic!("expected RuntimeReady ClaudeTui, got {other:?}"),
-        }
-        assert!(
-            receiver.try_recv().is_err(),
-            "Claude direct TUI handoff must not emit legacy TmuxReady with an empty FIFO"
-        );
     }
 
     #[test]

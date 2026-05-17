@@ -484,7 +484,11 @@ var autoQueue = {
       "WHERE r.status IN ('active', 'paused') " +
       "AND NOT EXISTS (" +
       "  SELECT 1 FROM auto_queue_entries e " +
-      "  WHERE e.run_id = r.id AND e.status IN ('pending', 'dispatched', 'user_cancelled')" +
+      "  WHERE e.run_id = r.id AND e.status IN ('pending', 'dispatched')" +
+      ") " +
+      "AND NOT EXISTS (" +
+      "  SELECT 1 FROM auto_queue_entries e " +
+      "  WHERE e.run_id = r.id AND e.status = 'user_cancelled'" +
       ") " +
       "AND NOT EXISTS (" +
       "  SELECT 1 FROM auto_queue_phase_gates pg " +

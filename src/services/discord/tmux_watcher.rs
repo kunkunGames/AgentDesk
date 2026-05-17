@@ -1,230 +1,5 @@
 use super::*;
 
-/// #2441 (H1) — race a fixed sleep against a `notify`-backed wake-up
-/// from `JsonlWatcher`. Returns as soon as EITHER the sleep elapses or
-/// the watcher fires its `Notify`. This is the primitive used to replace
-/// the six fixed-interval `tokio::time::sleep(200ms / 250ms)` polling
-/// sites in the watcher loop: a real wrapper write wakes us immediately
-/// while the sleep continues to bound the wake-up latency (defense in
-/// depth for environments where the notify backend silently drops
-/// events).
-async fn sleep_or_jsonl_event(
-    sleep: std::time::Duration,
-    jsonl_notify: &std::sync::Arc<tokio::sync::Notify>,
-) {
-    tokio::select! {
-        _ = tokio::time::sleep(sleep) => {}
-        _ = jsonl_notify.notified() => {}
-    }
-}
-
-/// #2442 (H3) — fast-path check for the wrapper's `ready_for_input` JSONL
-/// sentinel in the tail of the session jsonl. Reads only the last ~4 KiB
-/// so it stays O(1) regardless of jsonl size. False negatives just fall
-/// back to the existing 2s `READY_FOR_INPUT_IDLE_PROBE_INTERVAL` cadence,
-/// so partial-line / rotation edge cases are harmless.
-fn jsonl_tail_contains_ready_for_input_sentinel(output_path: &str) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-
-    const TAIL_WINDOW_BYTES: u64 = 4 * 1024;
-
-    let Ok(mut file) = std::fs::File::open(output_path) else {
-        return false;
-    };
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    let len = meta.len();
-    if len == 0 {
-        return false;
-    }
-    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return false;
-    }
-    let mut buf = Vec::with_capacity(TAIL_WINDOW_BYTES as usize);
-    if file.read_to_end(&mut buf).is_err() {
-        return false;
-    }
-    let needle = format!(
-        "\"type\":\"{}\"",
-        crate::services::tmux_common::WRAPPER_READY_FOR_INPUT_EVENT
-    );
-    String::from_utf8_lossy(&buf).contains(&needle)
-}
-
-/// #2427 D/A wires — emit an explicit-signal inflight cleanup attempt.
-///
-/// Used by the TurnCompleted broadcast and the dead-pane post-mortem
-/// path. The on-disk inflight is guarded so that:
-///   * stale signals arriving after a new turn has written its own
-///     inflight do not delete the new turn's file (Pitfall #1);
-///   * planned-restart markers (`restart_mode = Some(_)`) survive across
-///     the dcserver restart they were saved for;
-///   * `rebind_origin` rows owned by the rebind API are not touched
-///     (Pitfall #5).
-///
-/// All outcomes are logged at trace/info level so the sweeper safety-net
-/// strikes are easy to spot when this hook misses.
-pub(in crate::services::discord) fn emit_explicit_inflight_cleanup_signal(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    expected_user_msg_id: u64,
-    reason: &'static str,
-) {
-    let outcome = crate::services::discord::inflight::clear_inflight_state_if_matches(
-        provider,
-        channel_id.get(),
-        expected_user_msg_id,
-    );
-    match outcome {
-        crate::services::discord::inflight::GuardedClearOutcome::Cleared => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                user_msg_id = expected_user_msg_id,
-                reason = reason,
-                "[{ts}] 🧹 inflight cleared via explicit completion signal (#2427)"
-            );
-        }
-        crate::services::discord::inflight::GuardedClearOutcome::Missing => {
-            tracing::trace!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                reason = reason,
-                "inflight already absent — explicit signal redundant (#2427)"
-            );
-        }
-        crate::services::discord::inflight::GuardedClearOutcome::UserMsgMismatch => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                expected_user_msg_id = expected_user_msg_id,
-                reason = reason,
-                "[{ts}] ⚠ inflight user_msg_id mismatch — stale explicit signal ignored (#2427 Pitfall #1)"
-            );
-        }
-        crate::services::discord::inflight::GuardedClearOutcome::PlannedRestartSkipped => {
-            tracing::debug!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                reason = reason,
-                "skipping explicit inflight cleanup — planned-restart marker present (#2427)"
-            );
-        }
-        crate::services::discord::inflight::GuardedClearOutcome::RebindOriginSkipped => {
-            tracing::debug!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                reason = reason,
-                "skipping explicit inflight cleanup — rebind_origin row (#2427 Pitfall #5)"
-            );
-        }
-        crate::services::discord::inflight::GuardedClearOutcome::IoError => {
-            // Surfaces filesystem failures explicitly so the operator can
-            // see the sweeper's 1800s safety-net is the only thing
-            // catching the failed cleanup. Caller does not clear watcher.
-            tracing::warn!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                reason = reason,
-                "explicit inflight cleanup failed with IO error — sweeper safety-net will retry"
-            );
-        }
-    }
-}
-
-/// #2427 A wire — synchronous variant for the dead-pane post-mortem,
-/// which runs on a `spawn_blocking` thread.
-///
-/// Codex round-2 HIGH-1: a naïve "load → re-feed user_msg_id" guard is
-/// self-authenticating (a new turn's inflight matches itself). To make
-/// the guard meaningful for the pane-death path, we also require the
-/// loaded inflight to point at the *same dead tmux session* the caller
-/// witnessed. If a fresh `start_claude` respawn already replaced the
-/// inflight with one tied to a new (live) tmux name, we leave it alone
-/// — the new turn's pane is alive, and its inflight does not belong to
-/// us to clear.
-pub(in crate::services::discord) fn emit_explicit_inflight_cleanup_signal_pane_dead(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    expected_tmux_session_name: &str,
-) {
-    let Some(state) =
-        crate::services::discord::inflight::load_inflight_state(provider, channel_id.get())
-    else {
-        return;
-    };
-    if state.tmux_session_name.as_deref() != Some(expected_tmux_session_name) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::debug!(
-            provider = %provider.as_str(),
-            channel = channel_id.get(),
-            on_disk = ?state.tmux_session_name,
-            expected = expected_tmux_session_name,
-            "[{ts}] skipping pane-dead explicit cleanup — inflight points at a different tmux session (#2427 A self-auth guard)"
-        );
-        return;
-    }
-    let expected_user_msg_id = state.user_msg_id;
-    emit_explicit_inflight_cleanup_signal(provider, channel_id, expected_user_msg_id, "pane_dead");
-}
-
-/// E5 (#2412): forward a freshly-read tmux output chunk into the
-/// supervisor-owned [`StreamRelay`] (if one exists for the session). The
-/// supervisor's [`RelayProducerRegistry`] is the bridge — it hands the
-/// production tmux watcher a clonable
-/// [`crate::services::cluster::stream_relay::RelayProducer`] keyed by
-/// `tmux_session_name`. The producer's MPSC absorbs the chunk; the
-/// relay task drains it into the configured [`RelaySink`]
-/// ([`crate::services::cluster::registry_adapter_sink::RegistryAdapterSink`]
-/// in production, where it counts the frame for the
-/// `/api/cluster/sessions` diagnostic).
-///
-/// `cached_producer` caches a single producer clone to avoid taking the
-/// registry RwLock on every chunk read; it is refreshed from the registry
-/// when the cache is empty or when an attempted send observed a torn-down
-/// relay (`try_send_frame` returned `false`). When the registry has no
-/// producer for this session (flag off, supervisor not running, or this
-/// session simply not in the registry's matched set) the function is a
-/// total no-op and adds no measurable overhead vs the pre-E5 hot path.
-fn forward_chunk_to_supervisor_relay(
-    tmux_session_name: &str,
-    chunk: &[u8],
-    registry: &std::sync::Arc<
-        crate::services::cluster::relay_producer_registry::RelayProducerRegistry,
-    >,
-    cached_producer: &mut Option<crate::services::cluster::stream_relay::RelayProducer>,
-) {
-    if chunk.is_empty() {
-        return;
-    }
-    if cached_producer.is_none() {
-        *cached_producer = registry.get_producer(tmux_session_name);
-    }
-    let Some(producer) = cached_producer.as_ref() else {
-        return;
-    };
-    // The relay treats each `try_send_frame` call as one frame. We pass the
-    // chunk verbatim (UTF-8 lossy) rather than re-splitting on newlines so
-    // partial JSONL lines that split across reads stay together — the
-    // legacy reader does its own newline buffering in
-    // `process_watcher_lines`. Tmux output is JSONL, so any downstream
-    // structured-consumer the supervisor sink grows in a later issue can
-    // do the same newline buffering.
-    let payload = String::from_utf8_lossy(chunk).into_owned();
-    let still_alive = producer.try_send_frame(payload);
-    if !still_alive {
-        // Relay was torn down between our registry read and the send —
-        // drop the cache so the next chunk re-resolves. If the supervisor
-        // republishes for the same session name (Updated event), the
-        // next call will hit the new producer.
-        *cached_producer = None;
-    }
-}
-
 async fn persist_watcher_provider_session_id(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
@@ -278,14 +53,6 @@ async fn complete_watcher_status_panel_v2(
     last_status_panel_text: &mut String,
     background: bool,
 ) {
-    // #2427 D wire (Codex round 2 HIGH-1): explicit-signal inflight cleanup
-    // is intentionally NOT emitted from the watcher path. The watcher is
-    // not turn-scoped, so any user_msg_id read here would be the *current*
-    // on-disk value (possibly the next turn's). The committed-output path
-    // at L~2996 already performs the unconditional `clear_inflight_state`
-    // for the turn the watcher actually finished. Recovery-driven
-    // TurnCompleted still emits the guarded signal (see recovery_engine.rs)
-    // because its state snapshot is pinned at recovery entry.
     if !shared.status_panel_v2_enabled {
         return;
     }
@@ -323,98 +90,6 @@ async fn complete_watcher_status_panel_v2(
                 error
             );
         }
-    }
-}
-
-/// #2161 — TUI completion gate. Callers ask `run_tui_completion_gate` to
-/// confirm the underlying tmux pane has reached a `Ready for input`
-/// quiescent state before pushing `StatusEvent::TurnCompleted` to the live
-/// status panel.
-///
-/// Only `RuntimeHandoffKind::ClaudeTui` turns are gated; other runtime kinds
-/// return `NotGated` (= emit immediately) so existing completion contracts
-/// stay unchanged (see `should_gate_completion_for_tui_quiescence` in
-/// `tmux.rs` for the full matrix).
-///
-/// The wait is bounded by `TUI_COMPLETION_QUIESCENCE_TIMEOUT`. On `TimedOut`
-/// the caller MUST suppress the `TurnCompleted` emit — promoting the panel
-/// to `✅ 응답 완료` on a still-busy pane reproduces the bug this gate
-/// exists to prevent (Codex review #2161 H2). The placeholder sweeper and
-/// next-turn intake reconcile the lingering Active panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum TuiCompletionGateOutcome {
-    NotGated,
-    ConfirmedIdle,
-    TimedOut,
-}
-
-impl TuiCompletionGateOutcome {
-    /// `true` when callers should proceed with emitting the user-visible
-    /// `TurnCompleted` status event. `false` only on `TimedOut`, where
-    /// the pane is still busy past the bounded wait and emitting would
-    /// reproduce the #2161 premature-completion bug. The placeholder
-    /// sweeper / next-turn intake reconciles the still-Active panel later.
-    pub(in crate::services::discord) fn should_emit_completion(self) -> bool {
-        match self {
-            Self::NotGated | Self::ConfirmedIdle => true,
-            Self::TimedOut => false,
-        }
-    }
-}
-
-pub(in crate::services::discord) async fn run_tui_completion_gate(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    tmux_session_name: &str,
-    task_notification_kind: Option<crate::services::agent_protocol::TaskNotificationKind>,
-) -> TuiCompletionGateOutcome {
-    let inflight =
-        crate::services::discord::inflight::load_inflight_state(provider, channel_id.get());
-    let runtime_kind = inflight.as_ref().and_then(|state| state.runtime_kind);
-    let rebind_origin = inflight
-        .as_ref()
-        .map(|state| state.rebind_origin)
-        .unwrap_or(false);
-
-    if !crate::services::discord::tmux::should_gate_completion_for_tui_quiescence(
-        runtime_kind,
-        rebind_origin,
-        task_notification_kind,
-    ) {
-        return TuiCompletionGateOutcome::NotGated;
-    }
-
-    let started_at = tokio::time::Instant::now();
-    loop {
-        let session_name = tmux_session_name.to_string();
-        let ready = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || {
-                crate::services::provider::tmux_session_ready_for_input(&session_name)
-            }),
-        )
-        .await
-        .unwrap_or(Ok(false))
-        .unwrap_or(false);
-
-        if ready {
-            return TuiCompletionGateOutcome::ConfirmedIdle;
-        }
-        if started_at.elapsed() >= crate::services::discord::tmux::TUI_COMPLETION_QUIESCENCE_TIMEOUT
-        {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                provider = %provider.as_str(),
-                channel = channel_id.get(),
-                tmux_session = %tmux_session_name,
-                gate = "tui_completion_quiescence",
-                "[{ts}] \u{26a0} TUI pane was not yet idle after {:?} — suppressing turn-complete status to avoid premature completion (#2161); placeholder sweeper / next-turn intake will reconcile",
-                crate::services::discord::tmux::TUI_COMPLETION_QUIESCENCE_TIMEOUT,
-            );
-            return TuiCompletionGateOutcome::TimedOut;
-        }
-        tokio::time::sleep(crate::services::discord::tmux::TUI_COMPLETION_QUIESCENCE_POLL_INTERVAL)
-            .await;
     }
 }
 
@@ -476,24 +151,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     tracing::info!(
         "  [{ts}] 👁 tmux watcher started for #{tmux_session_name} at offset {initial_offset}"
     );
-
-    // E5 (#2412): cache the supervisor-owned StreamRelay producer for this
-    // tmux session, if the supervisor is running and has matched the
-    // session. `None` covers three legitimate cases:
-    //   1. `cluster.session_bound_relay_enabled = false` (supervisor never
-    //      spawned, registry empty).
-    //   2. SessionDiscovery hasn't yet observed this session — the cache is
-    //      refreshed below per chunk-read in that case.
-    //   3. This watcher attached to a session the registry doesn't know
-    //      (e.g. legacy session name pattern). The legacy delivery path is
-    //      unaffected; the supervisor-owned relay simply stays uninvolved.
-    let producer_registry =
-        crate::services::cluster::relay_producer_registry::global_relay_producer_registry();
-    // Cached clone so we don't take the registry RwLock on every chunk. The
-    // supervisor only ever publishes ONE producer per session name, but it
-    // CAN republish after an Updated event (channel rebind). We refresh on
-    // miss and after every send-failure (relay torn down → producer stale).
-    let mut cached_relay_producer = producer_registry.get_producer(&tmux_session_name);
 
     // #1134: mark the attach moment so `record_first_relay` (below) can compute
     // attach→first-relay latency. Single instrumentation point covers all
@@ -581,17 +238,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     let mut rotation_tick: u32 = 0;
     const ROTATION_CHECK_EVERY: u32 = 120; // ~30s at 250ms base cadence
 
-    // #2441 (H1) — spawn a single `notify`-crate-backed JsonlWatcher
-    // keyed on the session output path. Its `Notify` is awaited alongside
-    // each polling `sleep()` in this function so a real wrapper write
-    // wakes us immediately while the sleep still bounds the maximum
-    // wake-up latency. The watcher is dropped automatically when this
-    // task exits (or the wrapper rotates the file away).
-    let jsonl_watcher = crate::services::discord::jsonl_watcher::JsonlWatcher::spawn(
-        std::path::PathBuf::from(&output_path),
-    );
-    let jsonl_notify = jsonl_watcher.notify();
-
     'watcher_loop: loop {
         last_heartbeat_ts_ms.store(
             crate::services::discord::tmux_watcher_now_ms(),
@@ -643,12 +289,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 probe_tmux_session_liveness(&tmux_session_name).await,
             ) {
                 TmuxLivenessDecision::Continue => {
-                    // #2441 (H1) — graduate the fixed 200ms paused-loop
-                    // poll onto the notify-backed JsonlWatcher. A wrapper
-                    // write wakes us early; the sleep stays as the upper
-                    // bound.
-                    sleep_or_jsonl_event(tokio::time::Duration::from_millis(200), &jsonl_notify)
-                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     continue;
                 }
                 TmuxLivenessDecision::QuietStop => {
@@ -758,25 +399,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         .await;
 
         let (data, new_offset) = match read_result {
-            Ok(Ok(Ok((data, off)))) => {
-                // E5 (#2412): mirror the freshly-read chunk into the
-                // supervisor-owned StreamRelay if one exists for this
-                // session. This is the *producer* side of the supervisor
-                // pipeline — without this call, `try_send_frame` is never
-                // invoked in production and the new relay path is dark
-                // (the bug #2412 fixes). Failures are silent: legacy
-                // delivery via the rest of this function is the source of
-                // truth; the supervisor-owned path observes via
-                // `RegistryAdapterSink` until the legacy spawn site is
-                // gated off in a later epic-#2285 issue.
-                forward_chunk_to_supervisor_relay(
-                    &tmux_session_name,
-                    &data,
-                    &producer_registry,
-                    &mut cached_relay_producer,
-                );
-                (data, off)
-            }
+            Ok(Ok(Ok((data, off)))) => (data, off),
             _ => {
                 match tmux_liveness_decision(
                     cancel.load(Ordering::Relaxed),
@@ -784,13 +407,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     probe_tmux_session_liveness(&tmux_session_name).await,
                 ) {
                     TmuxLivenessDecision::Continue => {
-                        // #2441 (H1) — notify-backed wake-up for the
-                        // initial-read failure retry.
-                        sleep_or_jsonl_event(
-                            tokio::time::Duration::from_millis(250),
-                            &jsonl_notify,
-                        )
-                        .await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                         continue;
                     }
                     TmuxLivenessDecision::QuietStop => {
@@ -834,9 +451,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         match poll_decision {
             WatcherOutputPollDecision::DrainOutput => {}
             WatcherOutputPollDecision::Continue => {
-                // #2441 (H1) — notify-backed wake-up for the
-                // poll-decision "wait more" branch.
-                sleep_or_jsonl_event(tokio::time::Duration::from_millis(250), &jsonl_notify).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
                 continue;
             }
             WatcherOutputPollDecision::QuietStop => {
@@ -1053,21 +668,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 match read_more {
                     Ok(Ok(Ok((chunk, off)))) if !chunk.is_empty() => {
                         current_offset = off;
-                        // E5 (#2412): producer-side wiring for the
-                        // supervisor-owned StreamRelay. Same rationale as
-                        // the outer read site (~25 lines up in this fn) —
-                        // every chunk read off the tmux output file is also
-                        // pushed into the relay's MPSC so the new path
-                        // receives frames in production. Without this the
-                        // E3/E4 supervisor was operating on an empty pipe
-                        // and `cluster.session_bound_relay_enabled` had to
-                        // stay `false`.
-                        forward_chunk_to_supervisor_relay(
-                            &tmux_session_name,
-                            &chunk,
-                            &producer_registry,
-                            &mut cached_relay_producer,
-                        );
                         maybe_refresh_watcher_activity_heartbeat(
                             None::<&crate::db::Db>,
                             shared.pg_pool.as_ref(),
@@ -1181,52 +781,29 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 }
                             }
                         }
-                        // #2441 (H1) — notify-backed wake-up for the
-                        // "no new bytes, waiting for more" tail of the
-                        // inner streaming loop. A wrapper write wakes us
-                        // immediately; the sleep stays as the upper
-                        // bound.
-                        sleep_or_jsonl_event(
-                            tokio::time::Duration::from_millis(200),
-                            &jsonl_notify,
-                        )
-                        .await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                         let now = std::time::Instant::now();
-                        // #2442 (H3) — wrapper emits a `ready_for_input`
-                        // JSONL sentinel as soon as it transitions back to
-                        // accepting stdin. If we see the sentinel in the
-                        // tail bytes, treat it as a free readiness signal
-                        // and short-circuit the 2s probe cadence. The
-                        // legacy `should_probe_ready` cadence stays as a
-                        // fallback for the SIGKILL / sentinel-lost case.
-                        let sentinel_ready =
-                            jsonl_tail_contains_ready_for_input_sentinel(&output_path);
-                        let should_probe_ready = sentinel_ready
-                            || last_ready_probe_at
-                                .map(|last| {
-                                    now.duration_since(last) >= READY_FOR_INPUT_IDLE_PROBE_INTERVAL
-                                })
-                                .unwrap_or(true);
+                        let should_probe_ready = last_ready_probe_at
+                            .map(|last| {
+                                now.duration_since(last) >= READY_FOR_INPUT_IDLE_PROBE_INTERVAL
+                            })
+                            .unwrap_or(true);
                         if should_probe_ready {
                             last_ready_probe_at = Some(now);
-                            let ready_for_input = if sentinel_ready {
-                                true
-                            } else {
-                                tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    tokio::task::spawn_blocking({
-                                        let name = tmux_session_name.clone();
-                                        move || {
-                                            crate::services::provider::tmux_session_ready_for_input(
-                                                &name,
-                                            )
-                                        }
-                                    }),
-                                )
-                                .await
-                                .unwrap_or(Ok(false))
-                                .unwrap_or(false)
-                            };
+                            let ready_for_input = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tokio::task::spawn_blocking({
+                                    let name = tmux_session_name.clone();
+                                    move || {
+                                        crate::services::provider::tmux_session_ready_for_input(
+                                            &name,
+                                        )
+                                    }
+                                }),
+                            )
+                            .await
+                            .unwrap_or(Ok(false))
+                            .unwrap_or(false);
                             let post_work_observed = watcher_has_post_work_ready_evidence(
                                 &full_response,
                                 &tool_state,
@@ -1279,13 +856,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         }
                     }
                     _ => {
-                        // #2441 (H1) — notify-backed wake-up for the
-                        // inner-loop read-error retry path.
-                        sleep_or_jsonl_event(
-                            tokio::time::Duration::from_millis(200),
-                            &jsonl_notify,
-                        )
-                        .await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     }
                 }
 
@@ -2873,77 +2444,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let relay_suppressed = relay_decision.suppressed;
         let terminal_output_committed = relay_ok || relay_suppressed;
 
-        // #2161 TUI completion gate: ClaudeTui sessions can land a
-        // `result` JSONL event before the interactive pane is actually
-        // quiescent. Without this gate the user sees `응답 완료` on
-        // Discord while the tmux pane still shows `almost done thinking`
-        // and subsequent relay messages continue past the completion
-        // marker.
-        //
-        // On gate timeout (Codex H2) we deliberately do NOT emit
-        // `TurnCompleted` — the placeholder sweeper / next-turn intake
-        // will close the lingering Active panel rather than mark a hung
-        // pane as completed.
-        //
-        // Codex round-2 H1: the gate outcome is now also threaded into the
-        // dispatch finalization step below so a still-busy ClaudeTui pane
-        // does not drain queued turns into a busy-followup notice.
-        let watcher_tui_gate_outcome = if terminal_output_committed {
-            run_tui_completion_gate(
-                &watcher_provider,
-                channel_id,
-                &tmux_session_name,
-                task_notification_kind,
-            )
-            .await
-        } else {
-            TuiCompletionGateOutcome::NotGated
-        };
-        // #2293 H2 — single boolean threaded through every terminal side
-        // effect below. On `TimedOut` the pane is still busy past the bounded
-        // wait, so we must SKIP:
-        //   * ✅ reaction on the user message
-        //   * session transcript / turn-analytics persist (writes a row that
-        //     claims completion at this exact JSONL offset, which is wrong
-        //     while output is still being produced)
-        //   * history append into the in-memory session
-        //   * confirmed-end watermark advance (turn isn't actually done)
-        //   * `clear_inflight_state` (intake gate uses inflight presence to
-        //     decide whether to admit a new turn — wiping it lets the next
-        //     turn race the still-busy pane)
-        //   * `finish_restored_watcher_active_turn` (mailbox cancel_token
-        //     release for the same reason)
-        //   * deferred idle queue kickoff (would push backlog into the busy
-        //     pane)
-        //   * terminal-finalize stop decision (would stop the watcher while
-        //     output is still flowing)
-        // The placeholder sweeper / next watcher pass reconciles when the
-        // pane finally reports idle, mirroring the bridge-side behaviour.
-        let lifecycle_stage_paused =
-            matches!(watcher_tui_gate_outcome, TuiCompletionGateOutcome::TimedOut);
-        if lifecycle_stage_paused {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                provider = %watcher_provider.as_str(),
-                channel = channel_id.get(),
-                tmux_session = %tmux_session_name,
-                "[{ts}] ⚠ #2293: watcher lifecycle-stage paused — TUI quiescence gate timed out; skipping reaction / transcript / inflight-clear / mailbox-finish side effects until the next pass observes idle"
-            );
-        }
-
-        if terminal_output_committed && watcher_tui_gate_outcome.should_emit_completion() {
-            // #2427 D wire (Codex round 2 HIGH-1): the watcher loop is not
-            // turn-scoped — by the time we reach here a new turn may have
-            // rewritten the inflight on disk. Reading user_msg_id from that
-            // same file and feeding it back into
-            // `clear_inflight_state_if_matches` becomes self-authentication
-            // and *enables* the very Pitfall #1 race the guard was meant
-            // to prevent. We therefore drop the explicit-signal hook on
-            // the watcher D wire and rely exclusively on the unconditional
-            // `clear_inflight_state` call at L~2996 (committed-output
-            // path). The recovery_engine D wire is preserved because its
-            // `state.user_msg_id` is captured from the inflight snapshot
-            // pinned at recovery entry, not re-read at completion time.
+        if terminal_output_committed {
             complete_watcher_status_panel_v2(
                 &http,
                 &shared,
@@ -2963,12 +2464,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // Advance the shared confirmed-delivery watermark on any committed
         // direct emission or empty-turn cleanup. CAS loop ensures we only ever move the
         // watermark FORWARD, even if some other instance has raced ahead.
-        // #2293 H2 — pinning the watermark while the gate is TimedOut is what
-        // keeps the next pass's gate evaluation pointed at the same JSONL
-        // slice; advancing here would let `tmux_tail_offset` equal
-        // `confirmed_end` on the retry, falsely claiming there's nothing
-        // new to relay.
-        if terminal_output_committed && !lifecycle_stage_paused {
+        if terminal_output_committed {
             advance_watcher_confirmed_end(
                 &shared,
                 &watcher_provider,
@@ -3029,14 +2525,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // turn_analytics. The notify-bot outbox enqueue above already
         // delivered the recovered response to the user; nothing else on the
         // success path is legitimate here.
-        //
-        // #2293 H2 — also skip on `lifecycle_stage_paused`. The ✅ reaction +
-        // transcript row + analytics row all claim completion at this exact
-        // JSONL offset; while the pane is still busy past the gate timeout
-        // they would either lie about completion (✅) or write a row that
-        // gets contradicted by the next pass (transcript / analytics).
         if terminal_output_committed
-            && !lifecycle_stage_paused
             && let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin)
         {
             let user_msg_id = serenity::MessageId::new(state.user_msg_id);
@@ -3160,22 +2649,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 .and_then(|session| session.validated_path(channel_id.get()))
         };
 
-        // #2161 (Codex round-2 H1): if the TUI quiescence gate timed out
-        // above, treat the watcher dispatch finalization as "preserved":
-        // don't complete the dispatch, don't kick off queued work, and
-        // leave inflight alone so the next watcher pass / placeholder
-        // sweeper observes the still-busy pane and reconciles.
-        let dispatch_ok = if matches!(watcher_tui_gate_outcome, TuiCompletionGateOutcome::TimedOut)
-        {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                provider = %watcher_provider.as_str(),
-                channel = channel_id.get(),
-                tmux_session = %tmux_session_name,
-                "[{ts}] ⚠ watcher: dispatch finalization deferred — TUI quiescence gate timed out (#2161)"
-            );
-            false
-        } else if let Some(did) = resolved_did.as_deref() {
+        let dispatch_ok = if let Some(did) = resolved_did.as_deref() {
             let finalization =
                 crate::services::discord::streaming_finalizer::finalize_watcher_streaming_dispatch(
                     crate::services::discord::streaming_finalizer::WatcherStreamingFinalRequest {
@@ -3204,15 +2678,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // was either delivered to Discord or intentionally suppressed as an
         // internal task notification. Only genuine delivery failure preserves
         // retry/handoff state for next startup.
-        //
-        // #2293 H2 — skip the entire block on `lifecycle_stage_paused`. Wiping
-        // inflight + releasing the mailbox cancel_token while the pane is
-        // still busy is exactly the cascade the issue is filed against: the
-        // intake gate would see an empty inflight and a free mailbox and
-        // admit a new turn into a non-quiescent pane. The next watcher pass
-        // re-evaluates the gate and finishes the cleanup once the pane
-        // actually reports idle.
-        if terminal_output_committed && !lifecycle_stage_paused {
+        if terminal_output_committed {
             if has_assistant_response
                 && let Some(state) = inflight_state.as_ref().filter(|state| !state.rebind_origin)
             {
@@ -3647,39 +3113,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     }
 
     if !cleanup_plan.preserve_tmux_session {
-        // #2427 A wire: pane-death explicit inflight cleanup. The
-        // tmux pane is gone (or about to be killed below), so any
-        // inflight row still pointing at this provider/channel will
-        // never receive a normal completion hook. Without this the
-        // sweeper has to time-guess (`STALL`/`ABANDON`) before evicting,
-        // reproducing the #2415 family of "completion-missing → time
-        // heuristic" bugs.
-        //
-        // We re-check `tmux_session_has_live_pane` on the blocking
-        // thread before clearing, matching the same revalidation the
-        // kill path uses (#1261 codex P2) so a concurrent
-        // `start_claude` respawn of a fresh same-named session does not
-        // get its inflight wiped.
-        {
-            let sess_for_inflight = tmux_session_name.clone();
-            let provider_for_inflight = provider.clone();
-            let channel_id_inflight = channel_id;
-            let _ = tokio::task::spawn_blocking(move || {
-                let pane_alive = tmux_session_has_live_pane(&sess_for_inflight);
-                if pane_alive {
-                    // Pane resurrected (e.g. start_claude respawn race) —
-                    // do not touch its inflight.
-                    return;
-                }
-                emit_explicit_inflight_cleanup_signal_pane_dead(
-                    &provider_for_inflight,
-                    channel_id_inflight,
-                    &sess_for_inflight,
-                );
-            })
-            .await;
-        }
-
         // Kill dead tmux session to prevent accumulation (especially for thread sessions
         // which are created per-dispatch and would otherwise linger for 24h).
         // #145: skip kill for unified-thread sessions with active auto-queue runs.

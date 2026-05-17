@@ -53,11 +53,6 @@ impl ProviderSessionSelection {
 static PROVIDER_TUI_HOSTING: LazyLock<RwLock<BTreeMap<String, bool>>> =
     LazyLock::new(|| RwLock::new(BTreeMap::new()));
 
-/// Issue #2193 — runtime mirror of `providers.codex.remote_ssh_enabled`.
-/// Defaults to `false`; the bootstrap step hard-fails before this can be
-/// flipped on without the ADR prerequisites in place.
-static CODEX_REMOTE_SSH_ENABLED: LazyLock<RwLock<bool>> = LazyLock::new(|| RwLock::new(false));
-
 pub fn install_provider_hosting_config(config: &Config) {
     let mut values = BTreeMap::new();
     for provider_id in crate::services::provider::supported_provider_ids() {
@@ -83,29 +78,6 @@ pub fn install_provider_hosting_config(config: &Config) {
         .write()
         .unwrap_or_else(|error| error.into_inner()) = values;
     tracing::info!(summary, "provider tui_hosting config installed");
-
-    // Issue #2193 — mirror the codex remote SSH gate into a runtime cell
-    // the dispatch path can read without re-parsing the full Config.
-    let remote_ssh = config.codex_remote_ssh_enabled();
-    *CODEX_REMOTE_SSH_ENABLED
-        .write()
-        .unwrap_or_else(|error| error.into_inner()) = remote_ssh;
-    tracing::info!(
-        codex_remote_ssh_enabled = remote_ssh,
-        "codex remote SSH gate runtime mirror installed"
-    );
-}
-
-/// Issue #2193 — runtime read of the codex remote SSH gate.
-///
-/// `services::codex::execute_command_streaming` calls this on every
-/// dispatch where `remote_profile.is_some()`. Together with
-/// `services::codex_remote_policy::PREREQUISITES_SATISFIED`, this is
-/// the second line of defense beyond the bootstrap hard-fail.
-pub fn codex_remote_ssh_enabled() -> bool {
-    *CODEX_REMOTE_SSH_ENABLED
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
 }
 
 pub fn resolve_provider_session_selection(provider: &ProviderKind) -> ProviderSessionSelection {
@@ -168,7 +140,7 @@ pub fn any_requested_tui_hosting_driver_available(config: &Config) -> bool {
 }
 
 pub fn provider_tui_hosting_driver_available(provider: &ProviderKind) -> bool {
-    matches!(provider, ProviderKind::Claude | ProviderKind::Codex)
+    matches!(provider, ProviderKind::Claude)
 }
 
 #[cfg(test)]
@@ -197,14 +169,12 @@ mod tests {
             "claude".to_string(),
             ProviderConfig {
                 tui_hosting: Some(false),
-                ..ProviderConfig::default()
             },
         );
         config.providers.insert(
             "qwen".to_string(),
             ProviderConfig {
                 tui_hosting: Some(true),
-                ..ProviderConfig::default()
             },
         );
 
@@ -218,18 +188,6 @@ mod tests {
         install_provider_hosting_config(&Config::default());
 
         let selection = resolve_provider_session_selection(&ProviderKind::Claude);
-
-        assert!(selection.requested_tui_hosting);
-        assert_eq!(selection.driver, ProviderSessionDriver::TuiHosting);
-        assert_eq!(selection.fallback_reason, None);
-    }
-
-    #[test]
-    fn requested_tui_selects_codex_driver_when_available() {
-        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
-        install_provider_hosting_config(&Config::default());
-
-        let selection = resolve_provider_session_selection(&ProviderKind::Codex);
 
         assert!(selection.requested_tui_hosting);
         assert_eq!(selection.driver, ProviderSessionDriver::TuiHosting);
@@ -264,14 +222,12 @@ mod tests {
             "claude".to_string(),
             ProviderConfig {
                 tui_hosting: Some(false),
-                ..ProviderConfig::default()
             },
         );
         config.providers.insert(
             "qwen".to_string(),
             ProviderConfig {
                 tui_hosting: Some(true),
-                ..ProviderConfig::default()
             },
         );
         install_provider_hosting_config(&config);
@@ -284,35 +240,5 @@ mod tests {
             selection.fallback_reason,
             Some("tui_hosting_driver_unavailable")
         );
-    }
-
-    // Issue #2193 — gate mirror defaults to false and only flips when
-    // the operator explicitly sets the flag in `providers.codex`.
-    #[test]
-    fn codex_remote_ssh_gate_defaults_off() {
-        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
-        install_provider_hosting_config(&Config::default());
-
-        assert!(!codex_remote_ssh_enabled());
-    }
-
-    #[test]
-    fn codex_remote_ssh_gate_mirrors_explicit_true() {
-        let _guard = TEST_CONFIG_LOCK.lock().unwrap();
-        let mut config = Config::default();
-        config.providers.insert(
-            "codex".to_string(),
-            ProviderConfig {
-                remote_ssh_enabled: Some(true),
-                ..ProviderConfig::default()
-            },
-        );
-        install_provider_hosting_config(&config);
-
-        assert!(codex_remote_ssh_enabled());
-
-        // Reset for other tests.
-        install_provider_hosting_config(&Config::default());
-        assert!(!codex_remote_ssh_enabled());
     }
 }

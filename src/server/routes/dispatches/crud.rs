@@ -12,7 +12,6 @@ use crate::server::routes::AppState;
 
 const VALID_DISPATCH_STATUSES: &[&str] =
     &["pending", "dispatched", "completed", "cancelled", "failed"];
-const DISPATCH_COMPLETION_SOURCE_STATUSES: &[&str] = &["pending", "dispatched"];
 
 // ── Query / Body types ─────────────────────────────────────────
 
@@ -239,39 +238,8 @@ pub async fn update_dispatch(
         return pg_unavailable();
     };
 
-    if let Some(status) = body.status.as_deref()
-        && !VALID_DISPATCH_STATUSES.contains(&status)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(DispatchRouteResponse::error(format!(
-                "invalid dispatch status '{}' — allowed values: {}",
-                status,
-                VALID_DISPATCH_STATUSES.join(", ")
-            ))),
-        );
-    }
-    if let Some(allowed_from) = body.allowed_from.as_ref()
-        && let Some(invalid) = allowed_from
-            .iter()
-            .find(|status| !VALID_DISPATCH_STATUSES.contains(&status.as_str()))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(DispatchRouteResponse::error(format!(
-                "invalid allowed_from status '{}' — allowed values: {}",
-                invalid,
-                VALID_DISPATCH_STATUSES.join(", ")
-            ))),
-        );
-    }
-
     if body.status.as_deref() == Some("completed") {
         if let Ok(dispatch) = crate::dispatch::query_dispatch_row_pg(pool, &id).await {
-            let current_status = dispatch
-                .get("status")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
             let is_review = dispatch
                 .get("dispatch_type")
                 .and_then(|value| value.as_str())
@@ -290,10 +258,6 @@ pub async fn update_dispatch(
                     )),
                 );
             }
-            if let Some(message) = dispatch_completion_status_conflict_message(&id, current_status)
-            {
-                return dispatch_status_conflict(&id, message);
-            }
 
             // #2045 Finding 2 (P2): honor caller-supplied `allowed_from`
             // before delegating to `finalize_dispatch_with_backends`, which
@@ -302,15 +266,19 @@ pub async fn update_dispatch(
             // supervisor / recovery loop can guarantee "do not finalize a
             // dispatch that something else already cancelled."
             if let Some(allowed_from) = body.allowed_from.as_ref() {
+                let current_status = dispatch
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 let is_allowed = allowed_from
                     .iter()
                     .any(|status| status.as_str() == current_status);
                 if !is_allowed {
-                    return dispatch_status_conflict(
-                        &id,
-                        format!(
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(DispatchRouteResponse::error(format!(
                             "dispatch {id} is in status '{current_status}' which is not in allowed_from {allowed_from:?}"
-                        ),
+                        ))),
                     );
                 }
             }
@@ -339,6 +307,33 @@ pub async fn update_dispatch(
         };
     }
 
+    if let Some(status) = body.status.as_deref()
+        && !VALID_DISPATCH_STATUSES.contains(&status)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DispatchRouteResponse::error(format!(
+                "invalid dispatch status '{}' — allowed values: {}",
+                status,
+                VALID_DISPATCH_STATUSES.join(", ")
+            ))),
+        );
+    }
+    if let Some(allowed_from) = body.allowed_from.as_ref()
+        && let Some(invalid) = allowed_from
+            .iter()
+            .find(|status| !VALID_DISPATCH_STATUSES.contains(&status.as_str()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(DispatchRouteResponse::error(format!(
+                "invalid allowed_from status '{}' — allowed values: {}",
+                invalid,
+                VALID_DISPATCH_STATUSES.join(", ")
+            ))),
+        );
+    }
+
     if let Some(status) = body.status {
         let allowed_from_refs = body
             .allowed_from
@@ -359,16 +354,9 @@ pub async fn update_dispatch(
                 if allowed_from_refs.is_some()
                     && let Ok(dispatch) = crate::dispatch::query_dispatch_row_pg(pool, &id).await
                 {
-                    let current_status = dispatch
-                        .get("status")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    return dispatch_status_conflict(
-                        &id,
-                        format!(
-                            "dispatch {id} is in status '{current_status}' which is not in allowed_from {:?}",
-                            body.allowed_from.as_ref().expect("checked is_some")
-                        ),
+                    return (
+                        StatusCode::OK,
+                        Json(DispatchRouteResponse::dispatch(dispatch)),
                     );
                 }
                 return (
@@ -480,27 +468,6 @@ fn dispatch_update_error(
     } else {
         internal_error(message)
     }
-}
-
-fn dispatch_status_conflict(
-    dispatch_id: &str,
-    message: String,
-) -> (StatusCode, Json<DispatchRouteResponse>) {
-    (
-        StatusCode::CONFLICT,
-        Json(DispatchRouteResponse::dispatch_error(message, dispatch_id)),
-    )
-}
-
-fn dispatch_completion_status_conflict_message(
-    dispatch_id: &str,
-    current_status: &str,
-) -> Option<String> {
-    (!DISPATCH_COMPLETION_SOURCE_STATUSES.contains(&current_status)).then(|| {
-        format!(
-            "dispatch {dispatch_id} is in status '{current_status}' and cannot be completed; completion is allowed only from pending or dispatched"
-        )
-    })
 }
 
 async fn list_dispatches_pg(
@@ -621,34 +588,6 @@ async fn list_dispatches_pg(
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod status_conflict_tests {
-    use super::*;
-
-    #[test]
-    fn dispatch_completion_status_conflict_message_rejects_terminal_statuses() {
-        for status in ["completed", "cancelled", "failed"] {
-            let message = dispatch_completion_status_conflict_message("dispatch-1", status)
-                .expect("terminal status must conflict");
-            assert!(
-                message.contains("cannot be completed")
-                    && message.contains("pending or dispatched"),
-                "terminal completion conflict should be actionable: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn dispatch_completion_status_conflict_message_allows_active_statuses() {
-        for status in ["pending", "dispatched"] {
-            assert!(
-                dispatch_completion_status_conflict_message("dispatch-1", status).is_none(),
-                "{status} must remain a valid completion source"
-            );
-        }
-    }
 }
 
 async fn resolve_dispatch_target_agent_id_pg(

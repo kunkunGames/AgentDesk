@@ -8,6 +8,7 @@ use serde_json::Value;
 use url::Url;
 
 const RELAY_TIMEOUT: Duration = Duration::from_secs(2);
+const FAILURE_MARKER_SUBDIR: &str = "runtime/claude_tui_hook_relay_failures";
 const FAILURE_MARKER_TTL_SECS: i64 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,22 +27,6 @@ pub fn run_cli(
     event: &str,
     session_id: &str,
 ) -> Result<(), String> {
-    run_cli_with_name(
-        endpoint,
-        provider,
-        event,
-        session_id,
-        relay_cli_name(provider),
-    )
-}
-
-fn run_cli_with_name(
-    endpoint: &str,
-    provider: &str,
-    event: &str,
-    session_id: &str,
-    relay_name: &str,
-) -> Result<(), String> {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)
@@ -53,35 +38,18 @@ fn run_cli_with_name(
     };
 
     if let Err(error) = relay_hook_event(endpoint, provider, event, session_id, payload) {
-        // Provider TUI hooks must not become turn blockers. The receiver path
-        // is a boundary signal optimization; provider output capture remains
-        // the source of output truth.
-        eprintln!("agentdesk {relay_name} warning: {error}");
+        // Claude hooks must not become turn blockers. The receiver path is a
+        // boundary signal optimization; transcript tail remains the source of
+        // output truth.
+        eprintln!("agentdesk claude-hook-relay warning: {error}");
         if let Err(marker_error) =
             record_hook_relay_failure(endpoint, provider, event, session_id, &error)
         {
-            eprintln!("agentdesk {relay_name} marker warning: {marker_error}");
+            eprintln!("agentdesk claude-hook-relay marker warning: {marker_error}");
         }
     }
-    println!("{}", hook_success_stdout(provider));
+    println!(r#"{{"suppressOutput":true}}"#);
     Ok(())
-}
-
-fn relay_cli_name(provider: &str) -> &'static str {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "codex" => "codex-hook-relay",
-        _ => "claude-hook-relay",
-    }
-}
-
-fn hook_success_stdout(provider: &str) -> &'static str {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        // Codex parses suppressOutput for some events but does not implement it
-        // consistently yet; return an empty success object so managed relay
-        // hooks stay observational.
-        "codex" => "{}",
-        _ => r#"{"suppressOutput":true}"#,
-    }
 }
 
 pub fn relay_hook_event(
@@ -123,13 +91,8 @@ fn hook_url(endpoint: &str, provider: &str, event: &str, session_id: &str) -> Re
     Ok(url)
 }
 
-fn failure_marker_subdir(provider: &str) -> String {
-    let provider = marker_component(&provider.trim().to_ascii_lowercase());
-    format!("runtime/{provider}_tui_hook_relay_failures")
-}
-
-fn failure_marker_dir(provider: &str) -> Option<PathBuf> {
-    crate::config::runtime_root().map(|root| root.join(failure_marker_subdir(provider)))
+fn failure_marker_dir() -> Option<PathBuf> {
+    crate::config::runtime_root().map(|root| root.join(FAILURE_MARKER_SUBDIR))
 }
 
 fn marker_component(value: &str) -> String {
@@ -158,7 +121,7 @@ fn record_hook_relay_failure(
     error: &str,
 ) -> Result<(), String> {
     let marker_dir =
-        failure_marker_dir(provider).ok_or_else(|| "runtime root is unavailable".to_string())?;
+        failure_marker_dir().ok_or_else(|| "runtime root is unavailable".to_string())?;
     std::fs::create_dir_all(&marker_dir)
         .map_err(|err| format!("create hook relay failure marker dir: {err}"))?;
 
@@ -210,7 +173,7 @@ fn drain_hook_relay_failure_markers_at(
     session_id: &str,
     now: DateTime<Utc>,
 ) -> Vec<HookRelayFailureMarker> {
-    let Some(marker_dir) = failure_marker_dir(provider) else {
+    let Some(marker_dir) = failure_marker_dir() else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&marker_dir) else {
@@ -245,8 +208,7 @@ fn drain_hook_relay_failure_markers_at(
                 tracing::warn!(
                     path = %path.display(),
                     error = %error,
-                    provider = expected_provider,
-                    "invalid tui hook relay failure marker"
+                    "invalid claude_tui hook relay failure marker"
                 );
                 let _ = std::fs::remove_file(&path);
             }
@@ -270,31 +232,20 @@ fn marker_is_stale(marker: &HookRelayFailureMarker, now: DateTime<Utc>) -> bool 
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::MutexGuard;
+    use std::sync::{LazyLock, Mutex};
 
-    /// Guard that serializes every test mutation of `AGENTDESK_ROOT_DIR`
-    /// against the process-global lock shared with `credential.rs`, the
-    /// integration harness, and other env-touching tests. Without this
-    /// cross-module lock, concurrent tests would race on the same env var
-    /// and intermittently observe each other's tempdirs (issue #2444).
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
     }
 
     impl EnvVarGuard {
         fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            let lock = crate::config::shared_test_env_lock()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
             let previous = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
-            Self {
-                key,
-                previous,
-                _lock: lock,
-            }
+            Self { key, previous }
         }
     }
 
@@ -334,24 +285,8 @@ mod tests {
     }
 
     #[test]
-    fn hook_success_stdout_is_provider_scoped() {
-        assert_eq!(hook_success_stdout("claude"), r#"{"suppressOutput":true}"#);
-        assert_eq!(hook_success_stdout("codex"), "{}");
-    }
-
-    #[test]
-    fn relay_failure_marker_directories_are_provider_scoped() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp_dir.path());
-
-        assert_ne!(
-            failure_marker_dir("claude").unwrap(),
-            failure_marker_dir("codex").unwrap()
-        );
-    }
-
-    #[test]
     fn relay_failure_marker_round_trips_for_session() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp_dir.path());
 
@@ -378,6 +313,7 @@ mod tests {
 
     #[test]
     fn relay_failure_marker_write_publishes_only_complete_json_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp_dir.path());
 
@@ -390,7 +326,7 @@ mod tests {
         )
         .unwrap();
 
-        let marker_dir = failure_marker_dir("claude").unwrap();
+        let marker_dir = failure_marker_dir().unwrap();
         let entries = std::fs::read_dir(marker_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -406,9 +342,10 @@ mod tests {
 
     #[test]
     fn drain_prunes_stale_unmatched_markers() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp_dir.path());
-        let marker_dir = failure_marker_dir("claude").unwrap();
+        let marker_dir = failure_marker_dir().unwrap();
         std::fs::create_dir_all(&marker_dir).unwrap();
         let stale_marker = HookRelayFailureMarker {
             provider: "claude".to_string(),

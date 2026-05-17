@@ -211,10 +211,7 @@ test("timeouts review auto-accept triggers tuning aggregate once after batch ins
       return [];
     },
     httpPost(url, body, currentState) {
-      const outcomeInserts = currentState.executions.filter((e) =>
-        e.sql.includes("INSERT INTO review_tuning_outcomes")
-      );
-      assert.equal(outcomeInserts.length, 2);
+      assert.equal(currentState.executions.length, 2);
       return { ok: true };
     }
   });

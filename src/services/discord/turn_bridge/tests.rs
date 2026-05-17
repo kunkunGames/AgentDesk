@@ -30,9 +30,7 @@ use super::{
     task_notification_closes_background_child, turn_bridge_replace_outcome_committed,
 };
 use crate::db::turns::TurnTokenUsage;
-use crate::services::agent_protocol::{
-    RuntimeHandoff, RuntimeHandoffKind, StreamMessage, TaskNotificationKind,
-};
+use crate::services::agent_protocol::{StreamMessage, TaskNotificationKind};
 use crate::services::discord::ChannelId;
 use crate::services::discord::DiscordSession;
 use crate::services::discord::InflightTurnState;
@@ -490,7 +488,6 @@ async fn replace_fallback_preserves_cleanup_inflight_and_defers_queued_dispatch(
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
-            voice_announcement: None,
         },
     )
     .await;
@@ -823,117 +820,6 @@ async fn late_tmux_ready_after_done_still_claims_watcher_relay() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn claude_tui_runtime_ready_claims_watcher_without_fifo() {
-    let shared = make_shared_data_for_tests();
-    let provider = ProviderKind::Claude;
-    let channel_id = ChannelId::new(1504255405898077301);
-    let channel_name = format!("adk-cc-t{}", channel_id.get());
-    let tmux_name = provider.build_tmux_session_name(&channel_name);
-    let user_msg_id = MessageId::new(1504255405898077310);
-    let current_msg_id = MessageId::new(1504255405898077311);
-
-    assert!(super::super::tmux::try_claim_watcher(
-        &shared.tmux_watchers,
-        channel_id,
-        test_watcher_handle(&tmux_name, true),
-    ));
-
-    let gateway = Arc::new(CountingGateway::default());
-    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-    let inflight_state = InflightTurnState::new(
-        provider.clone(),
-        channel_id.get(),
-        Some(channel_name.clone()),
-        343742347365974026,
-        user_msg_id.get(),
-        current_msg_id.get(),
-        "direct tui".to_string(),
-        None,
-        Some(tmux_name.clone()),
-        Some("/tmp/claude-tui-transcript.jsonl".to_string()),
-        None,
-        0,
-    );
-
-    super::spawn_turn_bridge(
-        shared.clone(),
-        Arc::new(CancelToken::new()),
-        stream_rx,
-        super::TurnBridgeContext {
-            provider: provider.clone(),
-            gateway: gateway.clone(),
-            channel_id,
-            user_msg_id,
-            user_text_owned: "direct tui".to_string(),
-            request_owner_name: "tester".to_string(),
-            role_binding: None,
-            adk_session_key: None,
-            adk_session_name: Some(channel_name),
-            adk_session_info: None,
-            adk_cwd: None,
-            dispatch_id: None,
-            dispatch_kind: None,
-            memory_recall_usage: TokenUsage::default(),
-            context_window_tokens: provider.default_context_window(),
-            context_compact_percent: 100,
-            current_msg_id,
-            response_sent_offset: 0,
-            full_response: String::new(),
-            tmux_last_offset: Some(0),
-            new_session_id: None,
-            defer_watcher_resume: false,
-            reuse_status_panel_message: false,
-            completion_tx: Some(completion_tx),
-            inflight_state,
-        },
-    );
-
-    stream_tx
-        .send(StreamMessage::Done {
-            result: String::new(),
-            session_id: None,
-        })
-        .expect("send terminal done");
-    stream_tx
-        .send(StreamMessage::RuntimeReady {
-            handoff: RuntimeHandoff::ClaudeTui {
-                transcript_path: "/tmp/claude-tui-transcript.jsonl".to_string(),
-                tmux_session_name: tmux_name.clone(),
-                last_offset: 128,
-            },
-        })
-        .expect("send runtime ready");
-    drop(stream_tx);
-
-    tokio::time::timeout(Duration::from_secs(5), completion_rx)
-        .await
-        .expect("turn bridge should finish")
-        .expect("completion sender should complete");
-
-    assert_eq!(gateway.edit_count.load(Ordering::Relaxed), 0);
-    assert_eq!(gateway.replace_count.load(Ordering::Relaxed), 0);
-    assert_eq!(gateway.remove_reaction_count.load(Ordering::Relaxed), 0);
-
-    let saved = super::super::inflight::load_inflight_state(&provider, channel_id.get())
-        .expect("Claude TUI RuntimeReady should preserve inflight for watcher-owned relay");
-    assert!(saved.watcher_owns_live_relay);
-    assert_eq!(saved.runtime_kind, Some(RuntimeHandoffKind::ClaudeTui));
-    // #2235 one-release compat window: ClaudeTui rows must still ship a
-    // synthesized `input_fifo_path` so an old binary rolling back over them
-    // can satisfy its FIFO-required recovery branch.
-    let expected_fifo = super::tmux_runtime_paths(&tmux_name).1;
-    assert_eq!(
-        saved.input_fifo_path.as_deref(),
-        Some(expected_fifo.as_str())
-    );
-    assert_eq!(saved.last_offset, 128);
-
-    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
-    shared.tmux_watchers.remove(&channel_id);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_watcher_without_cached_context_falls_back_to_bridge_delivery() {
     let shared = make_shared_data_for_tests();
     let provider = ProviderKind::Codex;
@@ -1027,157 +913,6 @@ async fn fresh_watcher_without_cached_context_falls_back_to_bridge_delivery() {
     assert!(
         shared.tmux_watchers.get(&channel_id).is_none(),
         "failed fresh watcher spawn must not leave a reusable watcher slot"
-    );
-
-    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
-}
-
-/// #2263: on a cluster-standby node the RuntimeReady handler spawns a
-/// standalone `standby_relay` task (no tmux watcher) and persists
-/// inflight with `watcher_owns_live_relay = false` — intentionally.
-///
-/// The flag's downstream contract in
-/// `tmux::watcher_should_yield_to_inflight_state` is narrowly "the
-/// restored TMUX WATCHER itself owns delivery — do not yield to a
-/// bridge". The standby branch never spawns a watcher, so claiming
-/// watcher ownership against this state would over-claim across nodes
-/// and risk duplicate Discord delivery if a different node restored
-/// a watcher while the standby_relay was still alive (Codex
-/// adversarial review on #2263). The accepted trade-off is a brief
-/// phantom-bridge yield window on restart, which the next turn or the
-/// recovery-engine sweep clears.
-///
-/// This regression test pins that intent so a future "fix" that flips
-/// the flag to `true` here trips the assertion and forces the author to
-/// introduce a typed `relay_owner_kind` field instead.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn standby_runtime_ready_keeps_watcher_owns_live_relay_false() {
-    let shared = make_shared_data_for_tests();
-    // Force `on_standby = true` (cached_serenity_ctx empty) BUT make
-    // `serenity_http_or_token_fallback()` return Some so the branch
-    // actually spawns `run_standby_relay` and reaches the
-    // `save_inflight_state` we are validating. The dummy token never
-    // hits the network in this test because `run_standby_relay` polls
-    // a non-existent JSONL file until the bridge completes.
-    shared
-        .cached_bot_token
-        .set("test-token-for-2263".to_string())
-        .expect("cached_bot_token should be unset in a fresh test harness");
-
-    let provider = ProviderKind::Codex;
-    let channel_id = ChannelId::new(1505500000000002263);
-    let channel_name = format!("adk-cdx-t{}", channel_id.get());
-    let tmux_name = provider.build_tmux_session_name(&channel_name);
-    let user_msg_id = MessageId::new(1505500000000002264);
-    let current_msg_id = MessageId::new(1505500000000002265);
-
-    // Do NOT pre-seed `tmux_watchers` for this channel — the helper-fn
-    // must take the SpawnFresh path (`watcher_claimed=true`) to reach
-    // the standby branch we are exercising.
-    assert!(shared.tmux_watchers.get(&channel_id).is_none());
-
-    let gateway = Arc::new(CountingGateway::default());
-    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-    let inflight_state = InflightTurnState::new(
-        provider.clone(),
-        channel_id.get(),
-        Some(channel_name.clone()),
-        343742347365974026,
-        user_msg_id.get(),
-        current_msg_id.get(),
-        "standby runtime ready".to_string(),
-        None,
-        Some(tmux_name.clone()),
-        Some("/tmp/agentdesk-2263-output.jsonl".to_string()),
-        Some("/tmp/agentdesk-2263-input.fifo".to_string()),
-        0,
-    );
-
-    super::spawn_turn_bridge(
-        shared.clone(),
-        Arc::new(CancelToken::new()),
-        stream_rx,
-        super::TurnBridgeContext {
-            provider: provider.clone(),
-            gateway: gateway.clone(),
-            channel_id,
-            user_msg_id,
-            user_text_owned: "standby runtime ready".to_string(),
-            request_owner_name: "tester".to_string(),
-            role_binding: None,
-            adk_session_key: None,
-            adk_session_name: Some(channel_name),
-            adk_session_info: None,
-            adk_cwd: None,
-            dispatch_id: None,
-            dispatch_kind: None,
-            memory_recall_usage: TokenUsage::default(),
-            context_window_tokens: provider.default_context_window(),
-            context_compact_percent: 100,
-            current_msg_id,
-            response_sent_offset: 0,
-            full_response: String::new(),
-            tmux_last_offset: Some(0),
-            new_session_id: None,
-            defer_watcher_resume: false,
-            reuse_status_panel_message: false,
-            completion_tx: Some(completion_tx),
-            inflight_state,
-        },
-    );
-
-    stream_tx
-        .send(StreamMessage::Done {
-            result: String::new(),
-            session_id: None,
-        })
-        .expect("send terminal done");
-    stream_tx
-        .send(StreamMessage::RuntimeReady {
-            handoff: RuntimeHandoff::LegacyTmuxWrapper {
-                output_path: "/tmp/agentdesk-2263-output.jsonl".to_string(),
-                input_fifo_path: "/tmp/agentdesk-2263-input.fifo".to_string(),
-                tmux_session_name: tmux_name.clone(),
-                last_offset: 256,
-            },
-        })
-        .expect("send runtime ready");
-    drop(stream_tx);
-
-    tokio::time::timeout(Duration::from_secs(5), completion_rx)
-        .await
-        .expect("turn bridge should finish")
-        .expect("completion sender should complete");
-
-    let saved = super::super::inflight::load_inflight_state(&provider, channel_id.get()).expect(
-        "standby RuntimeReady must persist inflight so leader failover can recover the turn",
-    );
-    // The core invariant: the standby branch must NOT claim watcher
-    // ownership on disk, because no watcher was spawned and a future
-    // restored watcher on another node could collide with a still-alive
-    // standby_relay. See the block comment at the assignment for the
-    // full trade-off analysis.
-    assert!(
-        !saved.watcher_owns_live_relay,
-        "#2263: standby RuntimeReady must persist watcher_owns_live_relay=false \
-         — the standby_relay task is not a tmux watcher and the yield gate \
-         would over-claim ownership for any watcher restored against this \
-         state, risking duplicate Discord delivery"
-    );
-    // The handoff metadata still has to land on disk so a leader failover
-    // can pick up the turn shape (output_path, runtime_kind, last_offset).
-    assert_eq!(saved.last_offset, 256);
-    assert_eq!(
-        saved.runtime_kind,
-        Some(RuntimeHandoffKind::LegacyTmuxWrapper)
-    );
-    // The standby branch must remove the watcher slot it briefly claimed
-    // so a follow-up turn does not falsely reuse a "live" watcher that
-    // was never actually spawned.
-    assert!(
-        shared.tmux_watchers.get(&channel_id).is_none(),
-        "standby branch must release the briefly-claimed watcher slot"
     );
 
     crate::services::discord::clear_inflight_state(&provider, channel_id.get());
@@ -3442,7 +3177,6 @@ async fn watcher_does_not_kickoff_queue_when_dispatch_failed() {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
-            voice_announcement: None,
         },
     )
     .await;

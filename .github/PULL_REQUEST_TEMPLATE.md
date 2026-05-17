@@ -6,14 +6,7 @@
 ## Test plan
 <!-- Bulleted checklist: how to verify the change. -->
 
-## Risks, Rollback & Skipped checks
-- **Risk assessment**: <!-- e.g. Low risk, only updates docs -->
-- **Rollback plan**: <!-- e.g. Revert PR -->
-- **Skipped checks**: <!-- e.g. Did not run e2e tests because this is a docs change -->
-
 ## Queue hygiene & duplicate check
-- [ ] I have checked for open overlapping PRs (e.g., remote branches or `gh pr list --state open`).
-- [ ] For generated inventory refreshes, I have verified no other open refresh PR exists for the same target on a current base.
 - [ ] For no-change PRs, I have listed the exact overlapping PR numbers or branches in the PR body and verified the PR contains exactly zero changed files (`gh pr view --json files` or `git diff`).
 - [ ] I am closing or recommending closure for low-signal or stale broad branches instead of attempting to salvage them in place.
 

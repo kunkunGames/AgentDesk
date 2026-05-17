@@ -33,7 +33,6 @@ use super::turn_start::{
     session_reset_reason_for_turn, session_reset_reason_lifecycle_code,
     session_runtime_state_after_redirect, take_session_retry_context,
 };
-use crate::services::agent_protocol::RuntimeHandoffKind;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::services::git::GitCommand;
 use crate::services::memory::{
@@ -49,7 +48,6 @@ const WATCHDOG_DEADLOCK_PREALERT_MS: i64 = 5 * 60 * 1000;
 const WATCHDOG_DEADLOCK_PREALERT_BOT: &str = "announce";
 const WATCHDOG_TIMEOUT_REASON: &str = "watchdog timeout";
 const WATCHDOG_TIMEOUT_CANCEL_SOURCE: &str = "watchdog_timeout";
-const CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE: &str = "⚠ Claude TUI가 아직 이전 터미널 턴을 처리 중이라 이 메시지를 주입하지 않았습니다. 현재 응답이 끝난 뒤 다시 보내 주세요.";
 
 fn watchdog_deadlock_prealert_bot_name() -> &'static str {
     WATCHDOG_DEADLOCK_PREALERT_BOT
@@ -70,141 +68,6 @@ fn parse_watchdog_alert_channel_id(raw: &str) -> Option<serenity::ChannelId> {
         .map(serenity::ChannelId::new)
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeTuiBusyFollowupDiagnostic {
-    tmux_session_name: String,
-    prompt_marker_detected: bool,
-    previous_tui_turn_still_running: bool,
-    tmux_pane_alive: bool,
-    capture_available: bool,
-    watcher_state: &'static str,
-    watcher_owner_channel_id: Option<u64>,
-    inflight_state: &'static str,
-    pane_tail: String,
-}
-
-#[cfg(unix)]
-impl ClaudeTuiBusyFollowupDiagnostic {
-    fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "tmux_session_name": self.tmux_session_name,
-            "prompt_marker_detected": self.prompt_marker_detected,
-            "previous_tui_turn_still_running": self.previous_tui_turn_still_running,
-            "tmux_pane_alive": self.tmux_pane_alive,
-            "capture_available": self.capture_available,
-            "watcher_state": self.watcher_state,
-            "watcher_owner_channel_id": self.watcher_owner_channel_id,
-            "inflight_state": self.inflight_state,
-            "pane_tail": self.pane_tail,
-        })
-    }
-}
-
-#[cfg(unix)]
-fn classify_inflight_diagnostic_state(inflight: Option<&InflightTurnState>) -> &'static str {
-    let Some(inflight) = inflight else {
-        return "missing";
-    };
-    let Some(updated_at_unix) = super::super::inflight::parse_updated_at_unix(&inflight.updated_at)
-    else {
-        return "stale_unparseable_updated_at";
-    };
-    let age_secs = chrono::Local::now()
-        .timestamp()
-        .saturating_sub(updated_at_unix);
-    if age_secs >= super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64 {
-        "stale"
-    } else if inflight.watcher_owns_live_relay {
-        "watcher_owned"
-    } else {
-        "present"
-    }
-}
-
-#[cfg(unix)]
-fn classify_claude_tui_followup_submission(
-    snapshot: &crate::services::claude_tui::input::PromptReadinessSnapshot,
-    watcher_state: &'static str,
-    watcher_owner_channel_id: Option<u64>,
-    inflight_state: &'static str,
-    tmux_session_name: &str,
-) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
-    if snapshot.prompt_marker_detected || !snapshot.tmux_pane_alive {
-        return None;
-    }
-    Some(ClaudeTuiBusyFollowupDiagnostic {
-        tmux_session_name: tmux_session_name.to_string(),
-        prompt_marker_detected: false,
-        previous_tui_turn_still_running: true,
-        tmux_pane_alive: snapshot.tmux_pane_alive,
-        capture_available: snapshot.capture_available,
-        watcher_state,
-        watcher_owner_channel_id,
-        inflight_state,
-        pane_tail: snapshot.pane_tail.clone(),
-    })
-}
-
-#[cfg(unix)]
-fn claude_tui_busy_followup_diagnostic(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: serenity::ChannelId,
-    tmux_session_name: Option<&str>,
-    remote_profile_present: bool,
-) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
-    if provider != &ProviderKind::Claude || remote_profile_present {
-        return None;
-    }
-    let tmux_session_name = tmux_session_name?;
-    let selection =
-        crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
-            provider,
-            claude::is_tmux_available(),
-        );
-    if selection.driver != crate::services::provider_hosting::ProviderSessionDriver::TuiHosting
-        || crate::services::claude_tui::hook_server::current_hook_endpoint().is_none()
-        || !crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
-    {
-        return None;
-    }
-
-    let snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
-    let watcher_entry = shared
-        .tmux_watchers
-        .iter()
-        .find(|entry| entry.tmux_session_name == tmux_session_name);
-    let owner_channel_id = shared
-        .tmux_watchers
-        .owner_channel_for_tmux_session(tmux_session_name)
-        .map(|channel_id| channel_id.get());
-    let (watcher_state, watcher_owner_channel_id) = watcher_entry
-        .as_ref()
-        .map(|entry| {
-            let state = if entry.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                "cancelled"
-            } else if entry.heartbeat_stale() {
-                "stale"
-            } else if entry.paused.load(std::sync::atomic::Ordering::Relaxed) {
-                "paused"
-            } else {
-                "attached"
-            };
-            (state, owner_channel_id)
-        })
-        .unwrap_or(("missing", None));
-    let previous_inflight = super::super::inflight::load_inflight_state(provider, channel_id.get());
-    let inflight_state = classify_inflight_diagnostic_state(previous_inflight.as_ref());
-    classify_claude_tui_followup_submission(
-        &snapshot,
-        watcher_state,
-        watcher_owner_channel_id,
-        inflight_state,
-        tmux_session_name,
-    )
-}
-
 fn metadata_parent_channel_id(metadata: Option<&serde_json::Value>) -> Option<serenity::ChannelId> {
     metadata
         .and_then(|value| value.get("parent_channel_id"))
@@ -219,69 +82,6 @@ fn metadata_delivery_bot(metadata: Option<&serde_json::Value>) -> Option<String>
         .and_then(|value| value.get("delivery_bot"))
         .and_then(|value| value.as_str())
         .and_then(normalize_delivery_bot_name)
-}
-
-#[cfg(unix)]
-fn prelaunch_runtime_kind_for_managed_session(
-    provider: &ProviderKind,
-    remote_profile_is_none: bool,
-    has_tmux_session_name: bool,
-) -> Option<RuntimeHandoffKind> {
-    if !remote_profile_is_none
-        || !has_tmux_session_name
-        || !provider.uses_managed_tmux_backend()
-        || !claude::is_tmux_available()
-    {
-        return None;
-    }
-    let selection =
-        crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
-            provider, true,
-        );
-    if selection.driver == crate::services::provider_hosting::ProviderSessionDriver::TuiHosting {
-        return match provider {
-            ProviderKind::Claude
-                if crate::services::claude_tui::hook_server::current_hook_endpoint().is_some() =>
-            {
-                Some(RuntimeHandoffKind::ClaudeTui)
-            }
-            ProviderKind::Codex => Some(RuntimeHandoffKind::CodexTui),
-            _ => Some(RuntimeHandoffKind::LegacyTmuxWrapper),
-        };
-    }
-    Some(RuntimeHandoffKind::LegacyTmuxWrapper)
-}
-
-#[cfg(not(unix))]
-fn prelaunch_runtime_kind_for_managed_session(
-    _provider: &ProviderKind,
-    _remote_profile_is_none: bool,
-    _has_tmux_session_name: bool,
-) -> Option<RuntimeHandoffKind> {
-    None
-}
-
-fn apply_prelaunch_runtime_kind(
-    state: &mut InflightTurnState,
-    runtime_kind: Option<RuntimeHandoffKind>,
-) {
-    if let Some(kind) = runtime_kind {
-        state.runtime_kind = Some(kind);
-        // #2235 compat window (one release): keep the synthesized
-        // `input_fifo_path` populated when stamping ClaudeTui so that an old
-        // (pre-#2213) binary rolling back over inflight rows written by this
-        // binary can still satisfy its FIFO-required recovery branch. The new
-        // recovery path treats the FIFO as optional for ClaudeTui, so leaving
-        // it set has no behavioural cost on the new code. For CodexTui and
-        // ProcessBackend we still clear, since neither legacy nor current
-        // recovery uses a FIFO for those backends.
-        match kind {
-            RuntimeHandoffKind::ClaudeTui | RuntimeHandoffKind::LegacyTmuxWrapper => {}
-            RuntimeHandoffKind::CodexTui | RuntimeHandoffKind::ProcessBackend => {
-                state.input_fifo_path = None;
-            }
-        }
-    }
 }
 
 fn metadata_silent_flag(metadata: Option<&serde_json::Value>) -> bool {
@@ -1813,14 +1613,6 @@ async fn start_reserved_headless_turn_with_owner(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
-    apply_prelaunch_runtime_kind(
-        &mut inflight_state,
-        prelaunch_runtime_kind_for_managed_session(
-            &provider,
-            remote_profile.is_none(),
-            tmux_session_name.is_some(),
-        ),
-    );
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
         data.sessions
@@ -2269,45 +2061,25 @@ pub(in crate::services::discord) async fn handle_text_message(
         token,
     } = *deps;
     let original_channel_id = channel_id;
-    let stored_voice_announcement = crate::voice::announce_meta::global_store().take(user_msg_id);
-    let has_stored_voice_announcement = stored_voice_announcement.is_some();
     let parsed_voice_announcement =
         if crate::voice::prompt::is_voice_transcript_announcement_candidate(user_text) {
             crate::voice::prompt::parse_voice_transcript_announcement(user_text)
         } else {
             None
         };
-    let announce_bot_id = if has_stored_voice_announcement || parsed_voice_announcement.is_some() {
+    let announce_bot_id = if parsed_voice_announcement.is_some() {
         super::super::resolve_announce_bot_user_id(shared).await
     } else {
         None
     };
-    let voice_announcement = if announce_bot_id == Some(request_owner.get()) {
-        if has_stored_voice_announcement {
-            stored_voice_announcement
-        } else {
-            crate::voice::prompt::parse_authorized_voice_transcript_announcement(
-                user_text,
-                request_owner.get(),
-                announce_bot_id,
-            )
-        }
-    } else {
-        None
-    };
-    if has_stored_voice_announcement && announce_bot_id.is_none() {
+    let voice_announcement = crate::voice::prompt::parse_authorized_voice_transcript_announcement(
+        user_text,
+        request_owner.get(),
+        announce_bot_id,
+    );
+    if parsed_voice_announcement.is_some() && voice_announcement.is_none() {
         tracing::warn!(
             channel_id = channel_id.get(),
-            message_id = user_msg_id.get(),
-            author_id = request_owner.get(),
-            "dropping stored voice transcript announcement because announce bot user id is unavailable"
-        );
-    } else if (has_stored_voice_announcement || parsed_voice_announcement.is_some())
-        && voice_announcement.is_none()
-    {
-        tracing::warn!(
-            channel_id = channel_id.get(),
-            message_id = user_msg_id.get(),
             author_id = request_owner.get(),
             announce_bot_id = ?announce_bot_id,
             "ignoring spoofed voice transcript announcement from non-announce author"
@@ -2332,17 +2104,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             Some(&context),
         )
     });
-    // #2266: keep the original Discord author (the announce bot, for a
-    // voice-transcript announcement) so the race-loss enqueue path can
-    // attribute the queued `Intervention` to the announce bot. When the
-    // queued turn later re-enters `handle_text_message` via the
-    // dispatch/kickoff hooks, the same `announce_bot_id == Some(request_owner)`
-    // check (line ~2274) will pass and the reinserted voice payload (or
-    // the embedded copy lifted into `stored_voice_announcement`) will be
-    // honored instead of treated as spoofed. The post-rebind
-    // `request_owner` below is the voice user id, used only for the rest
-    // of the active-turn flow.
-    let original_request_owner = request_owner;
     let voice_request_owner_name;
     let request_owner = voice_announcement
         .as_ref()
@@ -2359,14 +2120,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         .as_ref()
         .map(|announcement| announcement.transcript.as_str())
         .unwrap_or(user_text);
-    if let Some(announcement) = voice_announcement.as_ref()
-        && shared
-            .voice_barge_in
-            .try_handle_voice_transcript_announcement(shared, channel_id, announcement)
-            .await
-    {
-        return Ok(());
-    }
     if !is_voice_announcement
         && shared
             .voice_barge_in
@@ -3331,28 +3084,12 @@ pub(in crate::services::discord) async fn handle_text_message(
             &bot_owner_provider,
             channel_id,
             build_race_requeued_intervention(
-                // #2266: attribute the queued `Intervention` to the original
-                // Discord author (the announce bot for voice transcripts) so
-                // the downstream `handle_text_message`
-                // `announce_bot_id == Some(request_owner)` check at line
-                // ~2274 passes when the dispatch path replays the queued
-                // turn. Passing the post-rebind voice-user id here would
-                // make the queued turn look like a non-announce author and
-                // the embedded voice payload would be discarded as spoofed.
-                original_request_owner,
+                request_owner,
                 user_msg_id,
                 user_text,
                 reply_context.clone(),
                 has_reply_boundary,
                 merge_consecutive,
-                // #2266: the per-process `voice::announce_meta` store entry
-                // was already consumed at the top of `handle_text_message`
-                // (line ~2261). Embed the in-memory announcement payload in
-                // the queued `Intervention` so `dispatch_queued_turn` can
-                // reinsert it before re-entering `handle_text_message`, which
-                // restores the voice-transcript framing instead of degrading
-                // the queued reply to plain text.
-                voice_announcement.clone(),
             ),
         )
         .await;
@@ -4456,160 +4193,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     };
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
-    // #2416: compute claude_tui busy-followup diagnostic with a wait+retry step.
-    // If the first snapshot says busy, run wait_for_prompt_ready (Followup kind,
-    // ~45s default) via spawn_blocking. If the wait succeeds AND a fresh
-    // diagnostic now says ready, fall through to normal dispatch instead of
-    // dropping the user's message. Only emit the busy notice if the wait
-    // times out / errors, or if the post-wait diagnostic is still busy.
-    #[cfg(unix)]
-    let claude_tui_busy_diagnostic = {
-        let initial = claude_tui_busy_followup_diagnostic(
-            shared,
-            &provider,
-            channel_id,
-            tmux_session_name.as_deref(),
-            remote_profile.is_some(),
-        );
-        if let Some(initial_diagnostic) = initial {
-            let wait_session_name = initial_diagnostic.tmux_session_name.clone();
-            let wait_result = tokio::task::spawn_blocking(move || {
-                crate::services::claude_tui::input::wait_for_prompt_ready(
-                    &wait_session_name,
-                    crate::services::claude_tui::input::PromptReadinessKind::Followup,
-                )
-            })
-            .await
-            .unwrap_or_else(|join_err| {
-                Err(format!("wait_for_prompt_ready join error: {join_err}"))
-            });
-            let post_wait_diagnostic = claude_tui_busy_followup_diagnostic(
-                shared,
-                &provider,
-                channel_id,
-                tmux_session_name.as_deref(),
-                remote_profile.is_some(),
-            );
-            // #2416: cancellation may have flipped during the up-to-45s wait
-            // (user stop reaction, watchdog, etc.). If it did, do NOT continue
-            // to inject the prompt — fall into the busy-notice / cleanup branch
-            // below by surfacing the initial diagnostic. Closes a Codex-flagged
-            // HIGH on the Discord path mirroring the same fix in claude.rs.
-            let cancel_observed_after_wait = cancel_token
-                .cancelled
-                .load(std::sync::atomic::Ordering::Relaxed);
-            match (
-                wait_result,
-                post_wait_diagnostic,
-                cancel_observed_after_wait,
-            ) {
-                (_, _, true) => {
-                    tracing::warn!(
-                        channel_id = channel_id.get(),
-                        user_msg_id = user_msg_id.get(),
-                        tmux_session_name = %initial_diagnostic.tmux_session_name,
-                        "claude_tui follow-up: cancellation observed after busy wait; aborting injection"
-                    );
-                    Some(initial_diagnostic)
-                }
-                (Ok(()), None, _) => {
-                    tracing::info!(
-                        channel_id = channel_id.get(),
-                        user_msg_id = user_msg_id.get(),
-                        tmux_session_name = %initial_diagnostic.tmux_session_name,
-                        "claude_tui follow-up: busy at first check, became ready after wait_for_prompt_ready"
-                    );
-                    None
-                }
-                (Ok(()), Some(diag), _) => {
-                    tracing::warn!(
-                        channel_id = channel_id.get(),
-                        user_msg_id = user_msg_id.get(),
-                        "claude_tui follow-up: wait_for_prompt_ready returned Ok but post-wait diagnostic still busy"
-                    );
-                    Some(diag)
-                }
-                (Err(err), diag_opt, _) => {
-                    let timed_out =
-                        crate::services::claude_tui::input::is_prompt_ready_timeout_error(&err);
-                    tracing::warn!(
-                        channel_id = channel_id.get(),
-                        user_msg_id = user_msg_id.get(),
-                        timed_out,
-                        error = %err,
-                        "claude_tui follow-up: wait_for_prompt_ready failed; emitting busy notice"
-                    );
-                    Some(diag_opt.unwrap_or(initial_diagnostic))
-                }
-            }
-        } else {
-            None
-        }
-    };
-    #[cfg(unix)]
-    if let Some(diagnostic) = claude_tui_busy_diagnostic {
-        let diagnostic_json = diagnostic.to_json();
-        tracing::warn!(
-            channel_id = channel_id.get(),
-            user_msg_id = user_msg_id.get(),
-            diagnostics = %diagnostic_json,
-            "claude_tui follow-up blocked before prompt submission because hosted TUI is busy"
-        );
-        crate::services::observability::emit_inflight_lifecycle_event(
-            provider.as_str(),
-            channel_id.get(),
-            dispatch_id.as_deref(),
-            adk_session_key.as_deref(),
-            Some(turn_id.as_str()),
-            "claude_tui_followup_busy_pre_submit",
-            diagnostic_json,
-        );
-        let _ = super::super::http::edit_channel_message(
-            http,
-            channel_id,
-            placeholder_msg_id,
-            CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,
-        )
-        .await;
-        super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
-        let bot_owner_provider = super::super::resolve_discord_bot_provider(token);
-        let kicked =
-            release_mailbox_after_placeholder_post_failure(shared, &bot_owner_provider, channel_id)
-                .await;
-        shared
-            .global_active
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        shared.turn_start_times.remove(&channel_id);
-        post_adk_session_status(
-            adk_session_key.as_deref(),
-            adk_session_name.as_deref(),
-            Some(provider.as_str()),
-            "awaiting_user",
-            &provider,
-            Some(&adk_session_info),
-            None,
-            Some(&current_path),
-            dispatch_id.as_deref(),
-            adk_thread_channel_id,
-            Some(channel_id),
-            role_binding
-                .as_ref()
-                .map(|binding| binding.role_id.as_str()),
-            shared.api_port,
-        )
-        .await;
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] ⏭ Claude TUI busy follow-up suppressed before prompt submission (channel {}, queue_kickoff_scheduled={})",
-            channel_id,
-            kicked
-        );
-        cancel_token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        super::super::clear_watchdog_deadline_override(channel_id.get()).await;
-        return Ok(());
-    }
 
     let (logical_channel_id, thread_id, thread_title) =
         if let Some((parent_id, _parent_name)) = thread_parent {
@@ -4633,14 +4216,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         inflight_output_path,
         inflight_input_fifo.clone(),
         inflight_offset,
-    );
-    apply_prelaunch_runtime_kind(
-        &mut inflight_state,
-        prelaunch_runtime_kind_for_managed_session(
-            &provider,
-            remote_profile.is_none(),
-            tmux_session_name.is_some(),
-        ),
     );
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
@@ -6481,118 +6056,6 @@ mod session_strategy_lifecycle_tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn claude_tui_inflight_diagnostic_state_uses_persisted_timestamp_format() {
-        let mut inflight = InflightTurnState::new(
-            ProviderKind::Claude,
-            1479671301387059200,
-            Some("adk-cc".to_string()),
-            343742347365974026,
-            1501205715878936748,
-            1501205715878936749,
-            "continue".to_string(),
-            Some("provider-session".to_string()),
-            Some("AgentDesk-claude-adk-cc".to_string()),
-            Some("/tmp/agentdesk-output.jsonl".to_string()),
-            None,
-            0,
-        );
-
-        assert_eq!(
-            classify_inflight_diagnostic_state(Some(&inflight)),
-            "present"
-        );
-
-        inflight.watcher_owns_live_relay = true;
-        assert_eq!(
-            classify_inflight_diagnostic_state(Some(&inflight)),
-            "watcher_owned"
-        );
-
-        inflight.watcher_owns_live_relay = false;
-        inflight.updated_at = (chrono::Local::now()
-            - chrono::Duration::seconds(
-                crate::services::discord::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64 + 1,
-            ))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-        assert_eq!(classify_inflight_diagnostic_state(Some(&inflight)), "stale");
-
-        inflight.updated_at = "not-a-timestamp".to_string();
-        assert_eq!(
-            classify_inflight_diagnostic_state(Some(&inflight)),
-            "stale_unparseable_updated_at"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn claude_tui_direct_busy_followup_blocks_before_prompt_submit() {
-        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
-            prompt_marker_detected: false,
-            tmux_pane_alive: true,
-            capture_available: true,
-            pane_tail: "Thinking...\nRunning tool".to_string(),
-        };
-
-        let diagnostic = classify_claude_tui_followup_submission(
-            &snapshot,
-            "attached",
-            Some(1479671301387059200),
-            "missing",
-            "AgentDesk-claude-adk-cdx-direct",
-        )
-        .expect("busy direct TUI turn should block follow-up submission");
-
-        assert!(diagnostic.previous_tui_turn_still_running);
-        assert!(!diagnostic.prompt_marker_detected);
-        assert_eq!(diagnostic.watcher_state, "attached");
-        assert_eq!(diagnostic.inflight_state, "missing");
-        assert_eq!(
-            diagnostic.watcher_owner_channel_id,
-            Some(1479671301387059200)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn claude_tui_ready_or_dead_pane_does_not_busy_block_followup() {
-        let ready = crate::services::claude_tui::input::PromptReadinessSnapshot {
-            prompt_marker_detected: true,
-            tmux_pane_alive: true,
-            capture_available: true,
-            pane_tail: ">".to_string(),
-        };
-        assert!(
-            classify_claude_tui_followup_submission(
-                &ready,
-                "attached",
-                Some(1),
-                "present",
-                "AgentDesk-claude-ready",
-            )
-            .is_none()
-        );
-
-        let dead = crate::services::claude_tui::input::PromptReadinessSnapshot {
-            prompt_marker_detected: false,
-            tmux_pane_alive: false,
-            capture_available: false,
-            pane_tail: "<capture unavailable>".to_string(),
-        };
-        assert!(
-            classify_claude_tui_followup_submission(
-                &dead,
-                "missing",
-                None,
-                "stale",
-                "AgentDesk-claude-dead",
-            )
-            .is_none()
-        );
-    }
-
     #[test]
     fn parse_dispatch_context_hints_extracts_auto_queue_retry_resume_session() {
         let hints = parse_dispatch_context_hints(
@@ -7734,13 +7197,11 @@ mod tests {
             None,
             true,
             true,
-            None,
         );
 
         assert!(queued.has_reply_boundary);
         assert!(queued.reply_context.is_none());
         assert!(queued.merge_consecutive);
-        assert!(queued.voice_announcement.is_none());
     }
 
     #[test]
@@ -7752,262 +7213,10 @@ mod tests {
             None,
             false,
             false,
-            None,
         );
 
         assert!(!queued.has_reply_boundary);
         assert!(!queued.merge_consecutive);
-        assert!(queued.voice_announcement.is_none());
-    }
-
-    // #2266: when a voice-transcript announcement loses the
-    // `mailbox_try_start_turn` race, the queued `Intervention` must carry
-    // the full `VoiceTranscriptAnnouncement` payload so the dispatch path
-    // can reinsert it into the per-process store before re-entering
-    // `handle_text_message`. Without this the dispatch path sees the entry
-    // missing (already taken by the active turn) and degrades to plain text.
-    #[test]
-    fn race_requeue_carries_voice_announcement_payload() {
-        let announcement = crate::voice::prompt::VoiceTranscriptAnnouncement {
-            transcript: "상태 알려줘".to_string(),
-            user_id: "42".to_string(),
-            utterance_id: "utt-2266".to_string(),
-            language: "ko-KR".to_string(),
-            verbose_progress: true,
-            started_at: Some("2026-05-16T10:00:00+09:00".to_string()),
-            completed_at: Some("2026-05-16T10:00:01+09:00".to_string()),
-            samples_written: Some(48_000),
-        };
-        let queued = build_race_requeued_intervention(
-            UserId::new(7),
-            MessageId::new(8),
-            "상태 알려줘",
-            None,
-            false,
-            false,
-            Some(announcement.clone()),
-        );
-
-        let carried = queued
-            .voice_announcement
-            .as_ref()
-            .expect("voice announcement must be carried through the queued intervention");
-        assert_eq!(carried.utterance_id, "utt-2266");
-        assert_eq!(carried.transcript, "상태 알려줘");
-        assert_eq!(carried.language, "ko-KR");
-        assert!(carried.verbose_progress);
-        assert_eq!(carried.samples_written, Some(48_000));
-        assert_eq!(*carried, announcement);
-    }
-
-    // #2266: simulate the busy-channel timeline end-to-end at the
-    // mailbox/announce-meta seam:
-    //   1. The active `handle_text_message` consumes the announce-meta
-    //      store entry (line ~2261).
-    //   2. `mailbox_try_start_turn` returns false → the queued
-    //      `Intervention` is built via `build_race_requeued_intervention`
-    //      with the in-memory announcement payload carried through.
-    //   3. The dispatch path (which would re-enter `handle_text_message`)
-    //      reinserts the announcement into the store keyed by the queued
-    //      `intervention.message_id`.
-    //   4. The next `handle_text_message` `take()` recovers the full voice
-    //      transcript framing instead of degrading to plain text.
-    #[test]
-    fn busy_channel_queued_voice_announcement_is_restored_for_dispatch() {
-        let user_msg_id = poise::serenity_prelude::MessageId::new(2_266_001);
-        let announcement = crate::voice::prompt::VoiceTranscriptAnnouncement {
-            transcript: "회의록 정리해줘".to_string(),
-            user_id: "555".to_string(),
-            utterance_id: "utt-busy-race".to_string(),
-            language: "ko-KR".to_string(),
-            verbose_progress: false,
-            started_at: None,
-            completed_at: None,
-            samples_written: None,
-        };
-
-        // Step 1: active turn consumes the store entry (mirroring
-        // `handle_text_message` line ~2261).
-        let store = crate::voice::announce_meta::VoiceAnnouncementMetaStore::default();
-        store.insert(user_msg_id, announcement.clone());
-        let active_take = store
-            .take(user_msg_id)
-            .expect("active turn must consume the announcement first");
-        assert_eq!(active_take.utterance_id, "utt-busy-race");
-        assert!(
-            store.take(user_msg_id).is_none(),
-            "store entry must be drained after the active take()"
-        );
-
-        // Step 2: mailbox_try_start_turn==false → race-loss enqueue carries
-        // the announcement through the Intervention payload.
-        let queued = build_race_requeued_intervention(
-            UserId::new(555),
-            user_msg_id,
-            "회의록 정리해줘",
-            None,
-            false,
-            false,
-            Some(active_take.clone()),
-        );
-        assert!(queued.voice_announcement.is_some());
-
-        // Step 3: dispatch path reinserts before re-entering
-        // handle_text_message. (The production hook lives in
-        // `gateway::dispatch_queued_turn` and writes to the global store;
-        // here we drive the same store directly to validate the contract.)
-        if let Some(payload) = queued.voice_announcement.as_ref() {
-            store.insert(queued.message_id, payload.clone());
-        }
-
-        // Step 4: dispatched handle_text_message recovers the full payload.
-        let dispatched = store
-            .take(queued.message_id)
-            .expect("dispatched take() must recover the voice announcement");
-        assert_eq!(dispatched, announcement);
-    }
-
-    // #2266 (Codex round-2 finding [high] — live queued dispatch must
-    // re-authorize the embedded voice payload against the announce bot,
-    // not against the previous turn's owner):
-    //   - The race-loss enqueue path stamps `Intervention.author_id` with
-    //     the ORIGINAL Discord author (the announce bot for voice transcripts)
-    //     rather than the post-rebind voice-user id, so the subsequent
-    //     queued dispatch can replay the same announce_bot authorization
-    //     check at line ~2274 of `handle_text_message`.
-    //   - This regression locks in the contract: a queued voice
-    //     `Intervention` carries `author_id == announce_bot_user_id`.
-    #[test]
-    fn race_requeue_attributes_voice_intervention_to_announce_bot() {
-        let announce_bot_id = UserId::new(999_111);
-        let voice_user_id = UserId::new(42);
-        let user_msg_id = poise::serenity_prelude::MessageId::new(2_266_007);
-        let announcement = crate::voice::prompt::VoiceTranscriptAnnouncement {
-            transcript: "회의록 정리해줘".to_string(),
-            user_id: voice_user_id.get().to_string(),
-            utterance_id: "utt-author".to_string(),
-            language: "ko-KR".to_string(),
-            verbose_progress: false,
-            started_at: None,
-            completed_at: None,
-            samples_written: None,
-        };
-
-        // The race-loss enqueue path uses `original_request_owner`, which is
-        // the Discord author of the raw message (the announce bot), NOT the
-        // voice-user id that `handle_text_message` rebinds to for the rest
-        // of the active-turn flow.
-        let queued = build_race_requeued_intervention(
-            announce_bot_id,
-            user_msg_id,
-            &announcement.transcript,
-            None,
-            false,
-            false,
-            Some(announcement.clone()),
-        );
-
-        assert_eq!(
-            queued.author_id, announce_bot_id,
-            "queued voice intervention must be attributed to the announce bot so the\n             dispatch path's authorization check `announce_bot_id == Some(request_owner)`\n             still passes when the embedded payload is reinserted",
-        );
-        assert_ne!(
-            queued.author_id, voice_user_id,
-            "queued voice intervention author_id must NOT be the voice-user id,\n             which would make handle_text_message treat the embedded announcement\n             as spoofed and discard it",
-        );
-    }
-
-    // #2266 (Codex finding [high] — intake-gate must not consume the store):
-    // the intake-gate path peeks the announce_meta store via peek_clone so
-    // the active dispatch path still finds the entry. After embedding the
-    // payload in the queued Intervention, the original store entry must
-    // still be readable for the active handle_text_message take().
-    #[test]
-    fn intake_gate_peek_clone_does_not_consume_store_entry() {
-        let user_msg_id = poise::serenity_prelude::MessageId::new(2_266_002);
-        let announcement = crate::voice::prompt::VoiceTranscriptAnnouncement {
-            transcript: "hello".to_string(),
-            user_id: "1".to_string(),
-            utterance_id: "utt-peek".to_string(),
-            language: "en-US".to_string(),
-            verbose_progress: false,
-            started_at: None,
-            completed_at: None,
-            samples_written: None,
-        };
-
-        let store = crate::voice::announce_meta::VoiceAnnouncementMetaStore::default();
-        store.insert(user_msg_id, announcement.clone());
-
-        // Intake-gate snapshot via peek_clone for the queued Intervention.
-        let peeked = store
-            .peek_clone(user_msg_id)
-            .expect("peek_clone must return the stored announcement");
-        assert_eq!(peeked, announcement);
-
-        // After peek, the active dispatch path's take() must still succeed.
-        let active = store
-            .take(user_msg_id)
-            .expect("peek_clone must not consume the entry");
-        assert_eq!(active, announcement);
-        // And the next take() (e.g. the queued dispatch path before
-        // reinsert) reports None — confirming peek/take semantics are
-        // intact.
-        assert!(store.take(user_msg_id).is_none());
-    }
-
-    // #2266 (Codex finding [high] — durable on-disk queue must round-trip
-    // the voice metadata): serialize an Intervention through the
-    // PendingQueueItem-derived JSON shape with the announcement embedded,
-    // then restore via `pending_queue_item_to_intervention` and verify the
-    // payload survives. Covers the post-restart hydrate timeline where
-    // the in-memory store has already been wiped.
-    #[test]
-    fn durable_queue_round_trips_voice_announcement_for_restart() {
-        let announcement = crate::voice::prompt::VoiceTranscriptAnnouncement {
-            transcript: "회의록 정리해줘".to_string(),
-            user_id: "555".to_string(),
-            utterance_id: "utt-durable".to_string(),
-            language: "ko-KR".to_string(),
-            verbose_progress: true,
-            started_at: Some("2026-05-16T10:00:00+09:00".to_string()),
-            completed_at: Some("2026-05-16T10:00:01+09:00".to_string()),
-            samples_written: Some(48_000),
-        };
-        let item = crate::services::turn_orchestrator::PendingQueueItem {
-            author_id: 555,
-            message_id: 2_266_003,
-            source_message_ids: vec![2_266_003],
-            text: "회의록 정리해줘".to_string(),
-            reply_context: None,
-            has_reply_boundary: false,
-            merge_consecutive: false,
-            channel_id: Some(42),
-            channel_name: None,
-            override_channel_id: None,
-            voice_announcement: Some(announcement.clone()),
-        };
-
-        // Round-trip through JSON to mirror the on-disk format.
-        let json = serde_json::to_string(&item).expect("serialize");
-        let restored: crate::services::turn_orchestrator::PendingQueueItem =
-            serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored.voice_announcement.as_ref(), Some(&announcement));
-
-        // Older queue files (no voice_announcement field) must still load.
-        let legacy_json = serde_json::json!({
-            "author_id": 1,
-            "message_id": 2,
-            "source_message_ids": [2u64],
-            "text": "plain",
-            "reply_context": null,
-            "has_reply_boundary": false,
-            "merge_consecutive": false,
-        })
-        .to_string();
-        let legacy: crate::services::turn_orchestrator::PendingQueueItem =
-            serde_json::from_str(&legacy_json).expect("legacy deserialize");
-        assert!(legacy.voice_announcement.is_none());
     }
 
     #[test]
@@ -8328,7 +7537,6 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
-                voice_announcement: None,
             },
         )
         .await;
@@ -8486,7 +7694,6 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
-                voice_announcement: None,
             },
         )
         .await;

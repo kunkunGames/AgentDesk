@@ -271,7 +271,6 @@ pub(crate) const TOP_40_PAIRED_PATHS: &[(&str, &str)] = &[
     ("GET", "/api/queue/status"),
     ("POST", "/api/queue/pause"),
     ("POST", "/api/queue/resume"),
-    ("POST", "/api/queue/runs/{id}/phase-gates/repair"),
     ("POST", "/api/queue/cancel"),
     ("PATCH", "/api/queue/reorder"),
     ("GET", "/api/queue/phase-gates/catalog"),
@@ -723,30 +722,6 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"error": "postgres unavailable"}),
         )
         .with_curl("curl http://localhost:8787/api/cluster/nodes"),
-        ep(
-            "GET",
-            "/api/cluster/sessions",
-            "cluster",
-            "Protected diagnostic readout of the in-memory SessionRegistry populated by SessionDiscovery (Epic #2285 / E2 / #2344).",
-        )
-        .with_example(
-            json!({}),
-            json!({
-                "count": 1,
-                "sessions": [{
-                    "matched": {
-                        "channel_id": "1234",
-                        "agent_id": "td",
-                        "provider": "codex",
-                        "expected_session_name": "AgentDesk-codex-1234",
-                        "expected_rollout_path": "/tmp/agentdesk-AgentDesk-codex-1234.jsonl"
-                    },
-                    "first_seen_at": "2026-05-17T03:00:00Z",
-                    "last_seen_at": "2026-05-17T03:01:10Z"
-                }]
-            }),
-        )
-        .with_curl("curl http://localhost:8787/api/cluster/sessions"),
         ep(
             "GET",
             "/api/cluster/routing-diagnostics",
@@ -2182,7 +2157,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/kanban-cards/{id}/transition",
             "kanban",
-            "Transition a single card with administrative force-transition semantics. Canonical runtime path is /transition; both the old /api/kanban-cards/{id}/force-transition path and the bulk /api/kanban-cards/batch-transition endpoint are fully removed (no alias, no redirect) — those paths now return 404/405. Migrate per-card to this endpoint. Auth requirements: (1) Authorization: Bearer <token> when config.server.auth_token is set; (2) X-Channel-Id: <kanban_manager_channel_id> when config.kanban.manager_channel_id is set — missing or mismatched X-Channel-Id returns 401 'force-transition requires PMD channel authorization'. Discover the expected channel id via `agentdesk config get kanban.manager_channel_id` or the /api/agents endpoint. Single-call complete: do NOT chain /redispatch, /retry, or /queue/generate after it (#1442). Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint in the response. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
+            "Transition a single card with administrative force-transition semantics. Canonical runtime path is /transition; the old /force-transition path is removed. Requires explicit Bearer auth. Single-call complete: do NOT chain /redispatch, /retry, or /queue/generate after it (#1442). Inspect cancelled_dispatch_ids, created_dispatch_id, and next_action_hint in the response. See /api/docs/card-lifecycle-ops for the full decision tree (#1443).",
         )
         .with_params([
             ("id", path_param("Kanban card ID")),
@@ -2716,7 +2691,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "PATCH",
             "/api/dispatches/{id}",
             "dispatches",
-            "Update dispatch lifecycle state or result. Allowed status values are pending, dispatched, completed, cancelled, and failed. status=completed uses the dispatch completion finalizer and is allowed only from pending or dispatched; already-terminal dispatches return 409 instead of a silent no-op. Review-type dispatches (`dispatch_type=review`) require an explicit `verdict` or `decision` string inside `result` at completion or the request fails 400 — the canonical path for review completion is POST /api/reviews/verdict. The response `result_summary` is derived in priority from these result/context keys: `summary`, `work_summary`, `result_summary`, `task_summary`, `completion_summary`, `message`, `final_message`, `decision`, `comment`, `verdict`, `reason`, `completion_source`, `work_outcome`, `noop_reason`, `pm_decision`, `notes`, `content`. allowed_from is a status precondition; when the dispatch exists but its current status is outside this set, the request returns 409. Non-completed status changes and result-only updates refresh updated_at. Completed responses include result_summary and completed_at; legacy completed rows without completed_at mirror updated_at in the response.",
+            "Update dispatch lifecycle state or result. Allowed status values are pending, dispatched, completed, cancelled, and failed. status=completed uses the dispatch completion finalizer; review dispatches require a verdict and callers should use POST /api/reviews/verdict. Non-completed status changes and result-only updates refresh updated_at. Completed responses include result_summary and completed_at; legacy completed rows without completed_at mirror updated_at in the response.",
         )
         .with_params([
             ("id", path_param("Dispatch ID")),
@@ -2743,7 +2718,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
                 body_param(
                     "array<string>",
                     false,
-                    "Optional status precondition; when the dispatch exists but its current status is outside this set, the request returns 409 and does not mutate the dispatch",
+                    "Optional status precondition for non-completed lifecycle updates; when the dispatch exists but its current status is outside this set, the request is a no-op and returns the current dispatch",
                 ),
             ),
         ])
@@ -2752,9 +2727,9 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             json!({"dispatch": {"id": "dispatch-1", "status": "completed", "result": {"summary": "done"}, "result_summary": "done", "updated_at": "2026-05-03 01:23:45+00", "completed_at": "2026-05-03 01:23:45+00"}}),
         )
         .with_error_example(
-            409,
-            json!({"path": {"id": "dispatch-1"}, "body": {"status": "completed"}}),
-            json!({"error": "dispatch dispatch-1 is in status 'completed' and cannot be completed; completion is allowed only from pending or dispatched", "dispatch_id": "dispatch-1"}),
+            400,
+            json!({"path": {"id": "dispatch-1"}, "body": {"status": "done"}}),
+            json!({"error": "invalid dispatch status 'done' — allowed values: pending, dispatched, completed, cancelled, failed"}),
         )
         .with_curl("curl -X PATCH http://localhost:8787/api/dispatches/dispatch-1 -H 'Content-Type: application/json' -d '{\"status\":\"completed\"}'"),
         ep(
@@ -2889,7 +2864,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/github/issues/create",
             "github",
-            "Create a GitHub issue with server-enforced issue markdown format. Successful creation returns HTTP 201 Created (not 200) with the issue payload. dry_run returns 200 OK with rendered_body and no side effects.",
+            "Create a GitHub issue with server-enforced issue markdown format",
         )
         .with_params([
             (
@@ -3544,43 +3519,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/session-termination-events",
             "sessions",
-            "List recorded session termination events",
-        )
-        .with_params([
-            (
-                "dispatch_id",
-                query_param("string", false, "Filter events by task dispatch id"),
-            ),
-            (
-                "card_id",
-                query_param("string", false, "Filter events by linked kanban card id"),
-            ),
-            (
-                "session_key",
-                query_param("string", false, "Filter events by host-qualified session key"),
-            ),
-            (
-                "limit",
-                query_param("integer", false, "Maximum events to return (capped at 500)")
-                    .with_default(50),
-            ),
-        ])
-        .with_example(
-            json!({"query": {"dispatch_id": "dispatch-1", "limit": 1}}),
-            json!({
-                "events": [{
-                    "id": 862,
-                    "session_key": "mac-mini:AgentDesk-codex-adk-cdx",
-                    "dispatch_id": "dispatch-1",
-                    "killer_component": "tmux_watcher",
-                    "reason_code": "dead_after_turn",
-                    "reason_text": "watcher cleanup: dead session after turn",
-                    "probe_snapshot": null,
-                    "last_offset": null,
-                    "tmux_alive": false,
-                    "created_at": "2026-05-16T04:15:48.151Z"
-                }]
-            }),
+            "List recorded session termination events // TODO: example",
         ),
         ep("GET", "/api/messages", "messages", "List messages // TODO: example"),
         ep("POST", "/api/messages", "messages", "Create message // TODO: example"),
@@ -3594,42 +3533,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/discord/channels/{id}/messages",
             "discord",
-            "Read recent messages from a Discord channel or thread (proxy to Discord REST v10). The {id} accepts both regular channels and threads, but the channel/thread must be present in the role-map (agentdesk_config / org_schema / role_map.json). Thread ids are NOT auto-resolved to their parent's binding — bind the thread explicitly if it is not in the role-map, or the request returns 403. See src/server/routes/discord.rs::channel_messages.",
-        )
-        .with_params([
-            ("id", path_param("Discord channel or thread ID (snowflake)")),
-            (
-                "limit",
-                query_param("integer", false, "Number of messages to return (1..=100)")
-                    .with_default(10),
-            ),
-            (
-                "before",
-                query_param(
-                    "string",
-                    false,
-                    "Discord snowflake — return messages before this id. Digits only.",
-                ),
-            ),
-            (
-                "after",
-                query_param(
-                    "string",
-                    false,
-                    "Discord snowflake — return messages after this id. Digits only.",
-                ),
-            ),
-        ])
-        .with_example(
-            json!({"path": {"id": "1473922824350601297"}, "query": {"limit": 5}}),
-            json!({"messages": [{"id": "1500000000000000000", "content": "hello", "author": {"id": "100", "username": "bot"}}]}),
-        )
-        .with_error_example(
-            403,
-            json!({"path": {"id": "1473922824350601297"}}),
-            json!({"error": "channel not in role-map"}),
-        )
-        .with_curl("curl 'http://localhost:8787/api/discord/channels/1473922824350601297/messages?limit=5'"),
+            "Read channel or thread messages // TODO: example",
+        ),
         ep(
             "GET",
             "/api/discord/channels/{id}",
@@ -4406,48 +4311,6 @@ fn all_endpoints() -> Vec<EndpointDoc> {
         .with_curl("curl -X POST http://localhost:8787/api/queue/resume"),
         ep(
             "POST",
-            "/api/queue/runs/{id}/phase-gates/repair",
-            "auto-queue",
-            "Re-evaluate terminal phase-gate dispatch results for a paused run, including gates already marked failed. Use this before /api/queue/resume when blocked_runs indicates a pending/failed phase gate and the dispatch result has been repaired or persisted late.",
-        )
-        .with_params([
-            ("id", path_param("Auto-queue run ID")),
-            (
-                "phase",
-                body_param("number", false, "Restrict repair to one batch phase"),
-            ),
-            (
-                "dispatch_id",
-                body_param(
-                    "string",
-                    false,
-                    "Restrict repair to one terminal phase-gate dispatch",
-                ),
-            ),
-        ])
-        .with_example(
-            json!({"path": {"id": "run-1"}, "body": {"phase": 1}}),
-            json!({
-                "ok": true,
-                "run_id": "run-1",
-                "phase_filter": 1,
-                "dispatch_id_filter": null,
-                "candidate_dispatches": 1,
-                "cleared_gates": 1,
-                "failed_gates": 0,
-                "blocking_gates_remaining": 0,
-                "run_status": "active",
-                "outcomes": [{"dispatch_id": "dispatch-gate-1", "phase": 1, "outcome": "cleared", "run_resumed": true, "run_finalized": false}]
-            }),
-        )
-        .with_error_example(
-            404,
-            json!({"path": {"id": "run-ghost"}}),
-            json!({"error": "auto-queue run not found: run-ghost"}),
-        )
-        .with_curl("curl -X POST http://localhost:8787/api/queue/runs/run-1/phase-gates/repair -H 'Content-Type: application/json' -d '{\"phase\":1}'"),
-        ep(
-            "POST",
             "/api/queue/runs/{id}/restore",
             "auto-queue",
             "Restore a cancelled or restoring run by re-evaluating skipped entries. Paused runs are rejected; use /api/queue/resume unless the run is cancelled/restoring.",
@@ -4685,53 +4548,8 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/turns/{channel_id}/cancel",
             "queue",
-            "Cancel the active turn in a channel. Default (force=false) requests the preserve path: drain the channel mailbox while leaving the live tmux session and tool subprocesses (cargo, claude CLI, …) alone — the usual meaning of 'queue 정리'. NOTE: this is best-effort, not a hard guarantee. The underlying C-c → SIGKILL → child cleanup can still take the tmux session down as a side effect (e.g. the Claude TUI wrapper exits when `claude` exits). The authoritative side-effect signal is `tmux_killed=true` in the response; treat that flag as the source of truth regardless of `lifecycle_path` (canonical, runtime-fallback, and direct-fallback paths can all report `tmux_killed=true` on the preserve route — `lifecycle_path` only describes which cleanup route ran, not whether tmux survived). force=true tears the tmux session down and SIGKILLs the entire child PID tree; the turn will not complete gracefully. Reserve force=true for explicit recovery (#1196). Always inspect `tmux_killed`, `lifecycle_path`, `queue_preserved`, and `inflight_cleared` to learn what actually happened. `dispatch_cancelled` reports the *attempted* dispatch id (the one this cancel-turn correlated to); the underlying postgres dispatch cancel is best-effort and logs warnings on failure rather than aborting the response, so do not treat a non-null `dispatch_cancelled` as proof the dispatch row reached a terminal state — verify via `/api/dispatches/{id}` if certainty is required. See src/server/routes/queue_api.rs::cancel_turn and src/services/queue.rs::QueueService::cancel_turn.",
-        )
-        .with_params([
-            ("channel_id", path_param("Discord channel ID hosting the live turn")),
-            (
-                "force",
-                query_param(
-                    "boolean",
-                    false,
-                    "false (default): drain mailbox and request the preserve path (live tmux session + tool subprocesses kept alive on a best-effort basis; `tmux_killed=true` in the response indicates the session died as a side effect). true: SIGKILL the tmux session and child PID tree; in-flight cargo/claude subprocesses are terminated.",
-                )
-                .with_default(false),
-            ),
-        ])
-        .with_example(
-            json!({"path": {"channel_id": "1473922824350601297"}}),
-            json!({
-                "ok": true,
-                "channel_id": "1473922824350601297",
-                "agent_id": "agent-cc",
-                "requested_provider": "claude",
-                "exact_channel_match": true,
-                "session_key": "claude:1473922824350601297:agentdesk-claude-channel-1473922824350601297",
-                "tmux_session": "agentdesk-claude-channel-1473922824350601297",
-                "tmux_killed": false,
-                "lifecycle_path": "canonical",
-                "queued_remaining": 0,
-                "queued_before": 0,
-                "queue_preserved": true,
-                "queue_disk_present_before": false,
-                "queue_disk_present_after": false,
-                "inflight_cleared": false,
-                "dispatch_cancelled": null,
-                "turn_status": "cancelled",
-                "turn_completed_at": "2026-05-17T03:00:00+00:00"
-            }),
-        )
-        .with_error_example(
-            404,
-            json!({"path": {"channel_id": "1473922824350601297"}}),
-            json!({
-                "error": "no active turn found for this channel",
-                "code": "queue",
-                "context": {"channel_id": "1473922824350601297"}
-            }),
-        )
-        .with_curl("curl -X POST 'http://localhost:8787/api/turns/1473922824350601297/cancel?force=false'"),
+            "Cancel a live turn by channel // TODO: example",
+        ),
         ep(
             "POST",
             "/api/turns/{channel_id}/extend-timeout",
@@ -5851,12 +5669,6 @@ mod tests {
             .expect("PATCH /api/dispatches/{id} must be documented");
         assert!(
             patch.description.contains("Allowed status values")
-                && patch
-                    .description
-                    .contains("already-terminal dispatches return 409")
-                && patch
-                    .description
-                    .contains("allowed_from is a status precondition")
                 && patch.description.contains("result_summary")
                 && patch.description.contains("completed_at"),
             "PATCH dispatch docs must describe lifecycle response semantics: {}",
@@ -5884,19 +5696,7 @@ mod tests {
                 .error_example
                 .as_ref()
                 .and_then(|example| example.status),
-            Some(409)
-        );
-        let error_response = &patch
-            .error_example
-            .as_ref()
-            .expect("PATCH dispatch docs must include an error response example")
-            .response;
-        assert_eq!(error_response["dispatch_id"], "dispatch-1");
-        assert!(
-            error_response["error"]
-                .as_str()
-                .is_some_and(|message| message.contains("cannot be completed")),
-            "PATCH dispatch docs must show terminal completion conflict: {error_response}"
+            Some(400)
         );
 
         let cancel = endpoints
@@ -6178,44 +5978,5 @@ mod tests {
         assert_eq!(example_body["target"], "channel:1473922824350601297");
         assert_eq!(example_body["content"], "hello");
         assert_eq!(example_body["source"], "system");
-    }
-
-    #[test]
-    fn session_termination_events_docs_include_filters_and_response_shape() {
-        let endpoints = all_endpoints();
-        let endpoint = endpoints
-            .iter()
-            .find(|endpoint| {
-                endpoint.method == "GET" && endpoint.path == "/api/session-termination-events"
-            })
-            .expect("GET /api/session-termination-events must be documented");
-
-        for param in ["dispatch_id", "card_id", "session_key", "limit"] {
-            assert!(
-                endpoint.params.contains_key(param),
-                "termination event docs must include {param}"
-            );
-        }
-        assert_eq!(
-            endpoint
-                .params
-                .get("limit")
-                .expect("limit should be documented")
-                .default,
-            Some(json!(50))
-        );
-        assert!(
-            !endpoint.description.contains("TODO"),
-            "termination event docs should not be a placeholder"
-        );
-
-        let event = &endpoint
-            .example
-            .as_ref()
-            .expect("termination event docs must include an example")
-            .response["events"][0];
-        assert_eq!(event["tmux_alive"], false);
-        assert_eq!(event["last_offset"], Value::Null);
-        assert_eq!(event["created_at"], "2026-05-16T04:15:48.151Z");
     }
 }

@@ -34,14 +34,7 @@ jobs:
 
   full_macos:
     name: Full tests (macos-latest)
-    # Opt-in self-hosted macOS runner. Set repo variable MACOS_RUNNER to
-    # a JSON array of labels (e.g.
-    # '["self-hosted","macOS","arm64","agentdesk-mac-mini"]') to route
-    # this job to a self-hosted host. Default (variable unset) is
-    # macos-latest. This workflow is schedule + workflow_dispatch only,
-    # so there is no fork-PR exposure here.
-    # See docs/ci-self-hosted-runner.md.
-    runs-on: ${{ fromJSON(vars.MACOS_RUNNER != '' && vars.MACOS_RUNNER || '"macos-latest"') }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -62,15 +55,13 @@ jobs:
         if: runner.os != 'macOS'
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # `target/` is intentionally NOT cached — see docs/ci/sccache-setup.md
-      # §4.2. sccache GHA backend handles compiled rustc output; caching
-      # `target/` here starved the 10GB quota and collapsed the Rust hit rate.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-nightly-
@@ -79,10 +70,6 @@ jobs:
         run: cargo test --all-targets -- --skip _pg_ --skip postgres_
         env:
           RUST_BACKTRACE: 1
-
-      - name: sccache stats
-        if: always() && runner.os != 'macOS'
-        run: sccache --show-stats || true
 
   full_windows:
     name: Full tests (windows-latest)
@@ -98,13 +85,13 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # See `full_macos` for rationale.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-nightly-
@@ -113,11 +100,6 @@ jobs:
         run: cargo test --all-targets -- --skip _pg_ --skip postgres_
         env:
           RUST_BACKTRACE: 1
-
-      - name: sccache stats
-        if: always()
-        shell: bash
-        run: sccache --show-stats || true
 
   postgres_full:
     name: PostgreSQL full tests
@@ -156,13 +138,13 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # See `full_macos` for rationale.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-postgres-nightly-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-postgres-nightly-
@@ -174,10 +156,6 @@ jobs:
       - name: cargo test (PG routes)
         timeout-minutes: 15
         run: cargo test _pg_ -- --nocapture --test-threads=1
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
 
   multinode_regression:
     name: Multinode regression lane
@@ -221,13 +199,13 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # See `full_macos` for rationale.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-multinode-nightly-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-multinode-nightly-
@@ -238,10 +216,6 @@ jobs:
 
       - name: Merge gate policy invariants
         run: node --test policies/__tests__/merge-automation.test.js
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
 
   high_risk_recovery_full:
     name: High-risk recovery full
@@ -280,23 +254,19 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # See `full_macos` for rationale.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-recovery-nightly-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-recovery-nightly-
 
       - name: High-risk recovery lane
         run: "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
 
   scripts:
     name: Script checks nightly
@@ -383,13 +353,13 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
-      # See `full_macos` for rationale.
-      - name: Cache cargo registry & git
+      - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: ${{ runner.os }}-cargo-cli-nightly-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-cli-nightly-
@@ -398,7 +368,3 @@ jobs:
         run: cargo run --quiet -- --help
         env:
           AGENTDESK_ROOT_DIR: ${{ runner.temp }}/adk-smoke
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true

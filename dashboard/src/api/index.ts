@@ -59,7 +59,6 @@ export {
   getPromptManifestRetention,
   getTokenAnalytics,
   getCachedTokenAnalytics,
-  getCachedSkillRanking,
   getDiscordBindings,
   getDiscordChannelInfo,
   getCronJobs,
@@ -80,7 +79,6 @@ export {
   createRoundTableIssues,
   startRoundTableMeeting,
   getSkillCatalog,
-  getCachedSkillCatalog,
   generateAutoQueue,
   activateAutoQueue,
   getAutoQueueStatus,
@@ -128,9 +126,6 @@ export {
   getHomeKpiTrends,
   getPhaseGateCatalog,
   requestGenerateAutoQueue,
-  getRoutines,
-  getRoutineRuns,
-  getRoutineMetrics,
 } from "./client";
 
 export type {
@@ -209,10 +204,6 @@ export type {
   HomeKpiSeries,
   HomeKpiRateLimit,
   HomeKpiRateLimitProvider,
-  RoutineRecord,
-  RoutineRunRecord,
-  RoutineStatus,
-  RoutineMetrics,
 } from "./client";
 
 // ── Error type guard ──
