@@ -11,7 +11,7 @@
 //! 1. The owning [`WatcherSupervisor`] told us the session disappeared
 //!    (graceful shutdown via [`StreamRelayHandle::shutdown`]).
 //! 2. The relay's runtime shutdown flag flipped.
-//! 3. The upstream frame source returned None (channel closed).
+//! 3. The upstream frame source returned None (queue closed).
 //!
 //! ## Provider-agnostic
 //!
@@ -31,8 +31,8 @@
 //!
 //! Discord delivery is comparatively slow. The relay must NEVER block the
 //! upstream watcher — a stuck Discord side would silently freeze observation
-//! of the live tmux session. We therefore use a bounded MPSC channel between
-//! the producer and the relay task; when the channel is full, the oldest
+//! of the live tmux session. We therefore use a bounded in-memory queue between
+//! the producer and the relay task; when the queue is full, the oldest
 //! frame is dropped and a counter increments. The watcher API is purely
 //! non-blocking ([`StreamRelayHandle::try_send_frame`]).
 //!
@@ -44,16 +44,17 @@
 //! the (much larger) Discord-side modules can compose them in E4 without
 //! creating an import cycle.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::session_matcher::MatchedChannel;
 
-/// Default size of the producer → relay channel. Generous enough to absorb a
+/// Default size of the producer → relay queue. Generous enough to absorb a
 /// burst of provider output (e.g. a long planning block dumping thousands of
 /// lines at once) without losing data, bounded so a stuck consumer cannot
 /// exhaust memory — we drop the oldest frame and bump
@@ -72,6 +73,10 @@ pub struct StreamFrame {
     /// The tmux session name this frame originated from. Used by sinks that
     /// multiplex frames from many sessions onto a single delivery worker.
     pub session_name: String,
+    /// Routing snapshot captured when the frame was enqueued. Sinks must not
+    /// re-parse `session_name` or consult mutable registry state to route
+    /// already-queued frames.
+    pub binding: MatchedChannel,
     /// Raw frame bytes (typically a JSONL line). Sink chooses formatting.
     pub payload: String,
     /// Monotonic sequence number assigned by the relay. Useful for sinks that
@@ -144,13 +149,13 @@ impl RelaySink for DiscardSink {
 /// disappears from the [`super::session_registry::SessionRegistry`].
 pub struct StreamRelayHandle {
     matched: MatchedChannel,
-    tx: mpsc::Sender<StreamFrame>,
+    queue: Arc<RelayFrameQueue>,
     shutdown: Arc<AtomicBool>,
     /// Receiver-side cancellation. The relay loop selects on this alongside
     /// `rx.recv()` so a shutdown forces the loop to exit even if cached
     /// [`RelayProducer`] clones (held outside the supervisor's
     /// `StreamRelayHandle`, e.g. in the tmux watcher) are still alive — they
-    /// would otherwise keep the channel open and wedge `recv().await` forever.
+    /// would otherwise keep the queue alive and wedge `recv().await` forever.
     /// E5 (#2412) hardening: see the supervisor `Removed`/`Updated` paths.
     shutdown_notify: Arc<Notify>,
     metrics: Arc<RelayMetrics>,
@@ -163,13 +168,13 @@ pub struct StreamRelayHandle {
 /// production tmux frame producer (`tmux_watcher`) can `try_send_frame`
 /// without holding the supervisor-owned [`StreamRelayHandle`] (which owns the
 /// [`JoinHandle`] and cannot be cloned). The producer shares the same
-/// underlying `tx`, `shutdown`, `metrics`, and `sequence` atomics — so a
+/// underlying queue, `shutdown`, `metrics`, and `sequence` atomics — so a
 /// shutdown initiated by the supervisor is immediately visible to every
 /// producer attempt (E5 #2412).
 #[derive(Clone)]
 pub struct RelayProducer {
-    session_name: String,
-    tx: mpsc::Sender<StreamFrame>,
+    matched: MatchedChannel,
+    queue: Arc<RelayFrameQueue>,
     shutdown: Arc<AtomicBool>,
     metrics: Arc<RelayMetrics>,
     sequence: Arc<AtomicU64>,
@@ -177,7 +182,7 @@ pub struct RelayProducer {
 
 impl RelayProducer {
     pub fn session_name(&self) -> &str {
-        &self.session_name
+        &self.matched.expected_session_name
     }
 
     pub fn metrics(&self) -> &Arc<RelayMetrics> {
@@ -190,8 +195,8 @@ impl RelayProducer {
     /// point — the producer registry hands out clones of this struct.
     pub fn try_send_frame(&self, payload: String) -> bool {
         try_send_frame_inner(
-            &self.session_name,
-            &self.tx,
+            &self.matched,
+            &self.queue,
             &self.shutdown,
             &self.metrics,
             &self.sequence,
@@ -203,15 +208,114 @@ impl RelayProducer {
 impl std::fmt::Debug for RelayProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RelayProducer")
-            .field("session", &self.session_name)
+            .field("session", &self.matched.expected_session_name)
             .field("metrics", &self.metrics.snapshot())
             .finish()
     }
 }
 
+enum QueuePushResult {
+    Enqueued,
+    DroppedOldest,
+    Closed,
+}
+
+enum QueuePopResult {
+    Frame(StreamFrame),
+    Empty,
+    Closed,
+}
+
+struct RelayFrameQueue {
+    inner: Mutex<RelayFrameQueueInner>,
+    notify: Notify,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct RelayFrameQueueInner {
+    frames: VecDeque<StreamFrame>,
+    closed: bool,
+}
+
+impl RelayFrameQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(RelayFrameQueueInner::default()),
+            notify: Notify::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    fn push_drop_oldest(&self, frame: StreamFrame) -> QueuePushResult {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.closed {
+            return QueuePushResult::Closed;
+        }
+        let dropped = if inner.frames.len() >= self.capacity {
+            inner.frames.pop_front();
+            true
+        } else {
+            false
+        };
+        inner.frames.push_back(frame);
+        drop(inner);
+        self.notify.notify_one();
+        if dropped {
+            QueuePushResult::DroppedOldest
+        } else {
+            QueuePushResult::Enqueued
+        }
+    }
+
+    fn pop_or_state(&self) -> QueuePopResult {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(frame) = inner.frames.pop_front() {
+            QueuePopResult::Frame(frame)
+        } else if inner.closed {
+            QueuePopResult::Closed
+        } else {
+            QueuePopResult::Empty
+        }
+    }
+
+    async fn recv(&self) -> Option<StreamFrame> {
+        loop {
+            match self.pop_or_state() {
+                QueuePopResult::Frame(frame) => return Some(frame),
+                QueuePopResult::Closed => return None,
+                QueuePopResult::Empty => self.notify.notified().await,
+            }
+        }
+    }
+
+    fn try_pop(&self) -> Option<StreamFrame> {
+        match self.pop_or_state() {
+            QueuePopResult::Frame(frame) => Some(frame),
+            QueuePopResult::Empty | QueuePopResult::Closed => None,
+        }
+    }
+
+    fn close(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.closed = true;
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+}
+
 fn try_send_frame_inner(
-    session_name: &str,
-    tx: &mpsc::Sender<StreamFrame>,
+    matched: &MatchedChannel,
+    queue: &Arc<RelayFrameQueue>,
     shutdown: &Arc<AtomicBool>,
     metrics: &Arc<RelayMetrics>,
     sequence: &Arc<AtomicU64>,
@@ -222,22 +326,19 @@ fn try_send_frame_inner(
     }
     let seq = sequence.fetch_add(1, Ordering::AcqRel);
     let frame = StreamFrame {
-        session_name: session_name.to_string(),
+        session_name: matched.expected_session_name.clone(),
+        binding: matched.clone(),
         payload,
         sequence: seq,
     };
     metrics.frames_received.fetch_add(1, Ordering::AcqRel);
-    match tx.try_send(frame) {
-        Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(frame)) => {
-            // Drop-oldest semantics: tokio mpsc has no sender-side pop, so we
-            // discard the NEW frame and bump the counter. Production
-            // operators see the loss via /api/cluster/sessions.
+    match queue.push_drop_oldest(frame) {
+        QueuePushResult::Enqueued => true,
+        QueuePushResult::DroppedOldest => {
             metrics.dropped_frames.fetch_add(1, Ordering::AcqRel);
-            drop(frame);
             true
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        QueuePushResult::Closed => false,
     }
 }
 
@@ -251,27 +352,27 @@ impl StreamRelayHandle {
     }
 
     /// Return a clonable [`RelayProducer`] sharing the relay's underlying
-    /// channel and atomics. Used by E5 (#2412) to expose `try_send_frame` to
+    /// queue and atomics. Used by E5 (#2412) to expose `try_send_frame` to
     /// the production tmux frame producer via
     /// [`super::relay_producer_registry::RelayProducerRegistry`].
     pub fn producer(&self) -> RelayProducer {
         RelayProducer {
-            session_name: self.matched.expected_session_name.clone(),
-            tx: self.tx.clone(),
+            matched: self.matched.clone(),
+            queue: self.queue.clone(),
             shutdown: self.shutdown.clone(),
             metrics: self.metrics.clone(),
             sequence: self.sequence.clone(),
         }
     }
 
-    /// Non-blocking enqueue. If the channel is full, the oldest queued frame
+    /// Non-blocking enqueue. If the queue is full, the oldest queued frame
     /// is dropped (we drain one then enqueue) and the dropped counter
     /// increments. Returns `false` only if the relay task has already exited
     /// — the upstream caller should then treat the relay as dead.
     pub fn try_send_frame(&self, payload: String) -> bool {
         try_send_frame_inner(
-            &self.matched.expected_session_name,
-            &self.tx,
+            &self.matched,
+            &self.queue,
             &self.shutdown,
             &self.metrics,
             &self.sequence,
@@ -282,17 +383,16 @@ impl StreamRelayHandle {
     /// Initiate graceful shutdown. Sets the shutdown flag, fires the
     /// receiver-side notify so the relay loop exits even when sender clones
     /// outside this handle (E5 #2412: `RelayProducer` clones cached by the
-    /// production tmux watcher) keep the channel open, then drops the
-    /// supervisor-owned sender and awaits task completion.
+    /// production tmux watcher) keep producer clones alive, then closes the
+    /// supervisor-owned queue and awaits task completion.
     ///
-    /// Without the notify, dropping `tx` was the only signal — and that
-    /// signal cannot unblock `rx.recv().await` while any other sender clone
-    /// is still alive. Cached producer clones in idle tmux watchers were the
-    /// concrete wedge that motivated the explicit receiver-side cancellation.
+    /// Without the notify, an idle relay could remain parked in `recv().await`
+    /// while cached producer clones in tmux watchers stayed alive. That wedge
+    /// motivated the explicit receiver-side cancellation.
     /// Safe to call only once — the handle is consumed.
     pub async fn shutdown(self) {
         let StreamRelayHandle {
-            tx,
+            queue,
             shutdown,
             shutdown_notify,
             task,
@@ -307,7 +407,7 @@ impl StreamRelayHandle {
         // `shutdown.load()` guard at the top of each loop iteration is the
         // fail-closed backstop against any residual missed-notify.
         shutdown_notify.notify_one();
-        drop(tx);
+        queue.close();
         if let Some(handle) = task {
             let _ = handle.await;
         }
@@ -344,7 +444,7 @@ pub fn spawn_stream_relay_with_buffer(
     sink: Arc<dyn RelaySink>,
     buffer: usize,
 ) -> StreamRelayHandle {
-    let (tx, rx) = mpsc::channel::<StreamFrame>(buffer.max(1));
+    let queue = Arc::new(RelayFrameQueue::new(buffer));
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
     let metrics = Arc::new(RelayMetrics::default());
@@ -354,10 +454,11 @@ pub fn spawn_stream_relay_with_buffer(
     let task_metrics = metrics.clone();
     let task_shutdown = shutdown.clone();
     let task_shutdown_notify = shutdown_notify.clone();
+    let task_queue = queue.clone();
 
     let task = tokio::spawn(async move {
         run_relay_loop(
-            rx,
+            task_queue,
             sink,
             task_metrics,
             task_shutdown,
@@ -370,7 +471,7 @@ pub fn spawn_stream_relay_with_buffer(
 
     StreamRelayHandle {
         matched,
-        tx,
+        queue,
         shutdown,
         shutdown_notify,
         metrics,
@@ -380,7 +481,7 @@ pub fn spawn_stream_relay_with_buffer(
 }
 
 async fn run_relay_loop(
-    mut rx: mpsc::Receiver<StreamFrame>,
+    queue: Arc<RelayFrameQueue>,
     sink: Arc<dyn RelaySink>,
     metrics: Arc<RelayMetrics>,
     shutdown: Arc<AtomicBool>,
@@ -404,7 +505,7 @@ async fn run_relay_loop(
                 session = %session_name,
                 "stream-relay observed shutdown flag pre-select; draining and exiting"
             );
-            drain_pending(&mut rx, &sink, &metrics, &session_name).await;
+            drain_pending(&queue, &sink, &metrics, &session_name).await;
             break;
         }
         tokio::select! {
@@ -413,17 +514,16 @@ async fn run_relay_loop(
             // `notified()` is armed (closes the pre-waiter race that
             // `notify_waiters` would have lost). Selecting on it makes the
             // loop exit even when external sender clones (E5 #2412 cached
-            // `RelayProducer` clones in `tmux_watcher`) keep the channel
-            // open.
+            // `RelayProducer` clones in `tmux_watcher`) stay alive.
             _ = shutdown_notify.notified() => {
                 tracing::debug!(
                     session = %session_name,
                     "stream-relay observed shutdown notify; draining and exiting"
                 );
-                drain_pending(&mut rx, &sink, &metrics, &session_name).await;
+                drain_pending(&queue, &sink, &metrics, &session_name).await;
                 break;
             }
-            maybe_frame = rx.recv() => {
+            maybe_frame = queue.recv() => {
                 let Some(frame) = maybe_frame else {
                     break;
                 };
@@ -437,7 +537,7 @@ async fn run_relay_loop(
                     // even during shutdown so operators see the last bytes
                     // of a dying session.
                     deliver_frame(&sink, &frame, &metrics, &session_name).await;
-                    drain_pending(&mut rx, &sink, &metrics, &session_name).await;
+                    drain_pending(&queue, &sink, &metrics, &session_name).await;
                     break;
                 }
                 deliver_frame(&sink, &frame, &metrics, &session_name).await;
@@ -456,12 +556,12 @@ async fn run_relay_loop(
 /// shutdown path so counters reflect what the upstream watcher had handed
 /// off, and so operators see the last bytes of a dying session in Discord.
 async fn drain_pending(
-    rx: &mut mpsc::Receiver<StreamFrame>,
+    queue: &Arc<RelayFrameQueue>,
     sink: &Arc<dyn RelaySink>,
     metrics: &Arc<RelayMetrics>,
     session_name: &str,
 ) {
-    while let Ok(extra) = rx.try_recv() {
+    while let Some(extra) = queue.try_pop() {
         deliver_frame(sink, &extra, metrics, session_name).await;
     }
 }
@@ -534,12 +634,22 @@ mod tests {
     }
 
     async fn flush_pending() {
-        // Yield enough times for the relay task to drain the channel under
+        // Yield enough times for the relay task to drain the queue under
         // the current-thread runtime used by `#[tokio::test]`. A few yields
         // is more reliable than a sleep across CI hosts.
         for _ in 0..32 {
             tokio::task::yield_now().await;
         }
+    }
+
+    async fn wait_until<F: FnMut() -> bool>(mut cond: F, label: &str) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("timed out waiting for: {label}");
     }
 
     #[tokio::test]
@@ -556,10 +666,53 @@ mod tests {
             assert_eq!(frame.payload, format!("frame-{i}"));
             assert_eq!(frame.sequence, i as u64);
             assert_eq!(frame.session_name, handle.matched().expected_session_name);
+            assert_eq!(&frame.binding, handle.matched());
         }
         assert_eq!(handle.metrics().snapshot().frames_delivered, 5);
         assert_eq!(handle.metrics().snapshot().dropped_frames, 0);
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frames_carry_full_binding_snapshot_without_reparsing_session_name() {
+        let sink = Arc::new(CapturingSink::default());
+        let mut m = matched_for("short-session-key");
+        m.channel_id = "1234567890123456789012345678901234567890-full-channel".to_string();
+        m.agent_id = "agent-with-full-routing-identity".to_string();
+
+        let handle = spawn_stream_relay(m.clone(), sink.clone());
+        assert!(handle.try_send_frame("bound".into()));
+        wait_until(|| sink.delivered().len() == 1, "binding snapshot delivered").await;
+
+        let delivered = sink.delivered();
+        assert_eq!(delivered[0].session_name, m.expected_session_name);
+        assert_eq!(delivered[0].binding, m);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_frames_keep_their_binding_across_rebinds() {
+        let sink = Arc::new(CapturingSink::default());
+        let old = matched_for("c-rebind");
+        let mut rebound = old.clone();
+        rebound.channel_id = "different-discord-channel-after-rebind".to_string();
+        rebound.agent_id = "different-agent-after-rebind".to_string();
+
+        let old_handle = spawn_stream_relay(old.clone(), sink.clone());
+        assert!(old_handle.try_send_frame("old-binding".into()));
+        wait_until(|| sink.delivered().len() == 1, "old binding delivered").await;
+        old_handle.shutdown().await;
+
+        let new_handle = spawn_stream_relay(rebound.clone(), sink.clone());
+        assert!(new_handle.try_send_frame("new-binding".into()));
+        wait_until(|| sink.delivered().len() == 2, "new binding delivered").await;
+
+        let delivered = sink.delivered();
+        assert_eq!(delivered[0].payload, "old-binding");
+        assert_eq!(delivered[0].binding, old);
+        assert_eq!(delivered[1].payload, "new-binding");
+        assert_eq!(delivered[1].binding, rebound);
+        new_handle.shutdown().await;
     }
 
     #[tokio::test]
@@ -629,7 +782,7 @@ mod tests {
         flush_pending().await;
 
         // Shutdown must complete promptly even though `producer_clone` is
-        // still alive holding a `tx` clone. Pre-fix this hung indefinitely.
+        // still alive holding a producer clone. Pre-fix this hung indefinitely.
         let shutdown_done = tokio::time::timeout(Duration::from_secs(2), handle.shutdown()).await;
         assert!(
             shutdown_done.is_ok(),
@@ -646,29 +799,48 @@ mod tests {
 
     #[tokio::test]
     async fn backpressure_drops_frames_when_buffer_full_without_blocking() {
-        // Block the sink so frames pile up in the channel.
+        // Block only the first delivery so queued frames pile up deterministically.
         struct BlockingSink {
+            first_started: tokio::sync::Notify,
             unblock: tokio::sync::Notify,
+            block_first: AtomicBool,
+            frames: Mutex<Vec<StreamFrame>>,
+        }
+        impl BlockingSink {
+            fn delivered(&self) -> Vec<StreamFrame> {
+                self.frames.lock().unwrap().clone()
+            }
         }
         #[async_trait]
         impl RelaySink for BlockingSink {
-            async fn deliver(&self, _frame: &StreamFrame) -> Result<(), RelaySinkError> {
-                self.unblock.notified().await;
+            async fn deliver(&self, frame: &StreamFrame) -> Result<(), RelaySinkError> {
+                if self.block_first.swap(false, Ordering::AcqRel) {
+                    self.first_started.notify_one();
+                    self.unblock.notified().await;
+                }
+                self.frames.lock().unwrap().push(frame.clone());
                 Ok(())
             }
         }
         let sink = Arc::new(BlockingSink {
+            first_started: tokio::sync::Notify::new(),
             unblock: tokio::sync::Notify::new(),
+            block_first: AtomicBool::new(true),
+            frames: Mutex::new(Vec::new()),
         });
-        // Buffer of 2: producer can fit roughly 2 frames before the relay
-        // task's first recv() unblocks. We try to push 50 → many must drop.
         let handle = spawn_stream_relay_with_buffer(
             matched_for("c-bp"),
             sink.clone() as Arc<dyn RelaySink>,
             2,
         );
+
+        assert!(handle.try_send_frame("frame-0".into()));
+        tokio::time::timeout(Duration::from_secs(1), sink.first_started.notified())
+            .await
+            .expect("first frame reaches blocked sink");
+
         let start = std::time::Instant::now();
-        for i in 0..50 {
+        for i in 1..=5 {
             // try_send_frame is non-blocking. The whole loop must complete
             // well before the relay sink ever delivers a frame.
             let _ = handle.try_send_frame(format!("frame-{i}"));
@@ -679,13 +851,24 @@ mod tests {
             "try_send_frame must be non-blocking even when the sink stalls (took {elapsed:?})"
         );
         let snap = handle.metrics().snapshot();
-        assert_eq!(snap.frames_received, 50);
+        assert_eq!(snap.frames_received, 6);
         assert!(
             snap.dropped_frames > 0,
             "expected drops when buffer is full but sink is stalled: {snap:?}"
         );
-        // Release the sink so the task can exit cleanly.
+
         sink.unblock.notify_waiters();
+        wait_until(|| sink.delivered().len() == 3, "drop-oldest queue drains").await;
+        let payloads: Vec<String> = sink
+            .delivered()
+            .iter()
+            .map(|frame| frame.payload.clone())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec!["frame-0", "frame-4", "frame-5"],
+            "the in-flight frame plus newest queued frames must survive"
+        );
         handle.shutdown().await;
     }
 }
