@@ -1136,7 +1136,10 @@ pub async fn link_dispatch_thread(
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(%error, "[dispatch] failed to read kanban_card_id from row");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() })));
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": error.to_string() })),
+                    );
                 }
             };
             let dispatch_type: Option<String> = row.try_get("dispatch_type").ok().flatten();
@@ -1144,7 +1147,10 @@ pub async fn link_dispatch_thread(
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(%error, "[dispatch] failed to read to_agent_id from row");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() })));
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": error.to_string() })),
+                    );
                 }
             };
 
@@ -1284,14 +1290,20 @@ pub async fn get_card_thread(
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(%error, "[dispatch] failed to read card_id from row");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() })));
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": error.to_string() })),
+                    );
                 }
             };
             let card_title: String = match row.try_get("card_title") {
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(%error, "[dispatch] failed to read card_title from row");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() })));
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": error.to_string() })),
+                    );
                 }
             };
             let github_issue_url: Option<String> = row.try_get("github_issue_url").ok().flatten();
@@ -1305,7 +1317,10 @@ pub async fn get_card_thread(
                 Ok(value) => value,
                 Err(error) => {
                     tracing::warn!(%error, "[dispatch] failed to read dispatch_agent_id from row");
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": error.to_string() })));
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": error.to_string() })),
+                    );
                 }
             };
             let dispatch_context: Option<String> = row.try_get("dispatch_context").ok().flatten();
