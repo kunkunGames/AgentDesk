@@ -3128,62 +3128,26 @@ fn launchagent_plist_nofile_limit(label: &str) -> Option<u64> {
 }
 
 #[cfg(target_os = "macos")]
-fn pids_from_command_output(output: &[u8]) -> Vec<u32> {
+fn tmux_server_pids() -> Vec<u32> {
+    let owner_marker = crate::services::tmux_common::current_tmux_owner_marker();
+    let sessions = match crate::services::platform::tmux::list_sessions_with_server_pid() {
+        Ok(sessions) => sessions,
+        Err(_) => return Vec::new(),
+    };
     let mut pids = BTreeSet::new();
-    for line in String::from_utf8_lossy(output).lines() {
-        if let Ok(pid) = line.trim().parse::<u32>() {
-            pids.insert(pid);
+    for session in sessions {
+        if session.server_pid == 0 || !session.session_name.starts_with("AgentDesk-") {
+            continue;
+        }
+        let owner_path = crate::services::tmux_common::tmux_owner_path(&session.session_name);
+        let belongs_to_current_runtime = std::fs::read_to_string(owner_path)
+            .map(|value| value.trim() == owner_marker)
+            .unwrap_or(false);
+        if belongs_to_current_runtime {
+            pids.insert(session.server_pid);
         }
     }
     pids.into_iter().collect()
-}
-
-#[cfg(target_os = "macos")]
-fn tmux_server_pids() -> Vec<u32> {
-    let output = match std::process::Command::new("pgrep")
-        .args(["-x", "tmux"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
-    };
-    pids_from_command_output(&output.stdout)
-}
-
-#[cfg(any(test, target_os = "macos"))]
-fn pid_has_ancestor_with(
-    mut pid: u32,
-    ancestors: &BTreeSet<u32>,
-    mut parent_pid_for: impl FnMut(u32) -> Option<u32>,
-) -> bool {
-    let mut seen = BTreeSet::new();
-    while let Some(parent_pid) = parent_pid_for(pid) {
-        if parent_pid == 0 || !seen.insert(parent_pid) {
-            return false;
-        }
-        if ancestors.contains(&parent_pid) {
-            return true;
-        }
-        pid = parent_pid;
-    }
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn parent_pid_for_pid(pid: u32) -> Option<u32> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn pid_has_ancestor(pid: u32, ancestors: &BTreeSet<u32>) -> bool {
-    pid_has_ancestor_with(pid, ancestors, parent_pid_for_pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -3336,8 +3300,8 @@ fn check_file_descriptor_headroom() -> Check {
         launchd_soft_limit
     };
     // dcserver itself is the launchd job and inherits the per-job plist limit.
-    // tmux may be an unrelated user server from `pgrep -x tmux`, so only tmux
-    // processes in dcserver's process tree can safely use that same limit.
+    // tmux server PIDs are scoped to current-runtime AgentDesk sessions, not
+    // all user tmux daemons, so they can use the same resolved limit/source.
     let resolved_limit_source = if launchd_job_loaded && plist_nofile_limit.is_some() {
         "launchd_plist"
     } else {
@@ -3345,9 +3309,7 @@ fn check_file_descriptor_headroom() -> Check {
     };
 
     let mut samples = Vec::new();
-    let dcserver_pids = dcserver::dcserver_instance_pids();
-    let dcserver_pid_set: BTreeSet<u32> = dcserver_pids.iter().copied().collect();
-    for pid in dcserver_pids {
+    for pid in dcserver::dcserver_instance_pids() {
         if let Some(open_files) = open_file_count_for_pid(pid) {
             samples.push(FdUsageSample {
                 process: "dcserver",
@@ -3360,20 +3322,12 @@ fn check_file_descriptor_headroom() -> Check {
     }
     for pid in tmux_server_pids() {
         if let Some(open_files) = open_file_count_for_pid(pid) {
-            let tmux_uses_dcserver_limit = launchd_job_loaded
-                && plist_nofile_limit.is_some()
-                && pid_has_ancestor(pid, &dcserver_pid_set);
-            let (soft_limit, limit_source) = if tmux_uses_dcserver_limit {
-                (dcserver_soft_limit, resolved_limit_source)
-            } else {
-                (launchd_soft_limit, "launchctl_maxfiles")
-            };
             samples.push(FdUsageSample {
                 process: "tmux",
                 pid,
                 open_files,
-                soft_limit,
-                limit_source,
+                soft_limit: dcserver_soft_limit,
+                limit_source: resolved_limit_source,
             });
         }
     }
@@ -4202,35 +4156,6 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
         ))
     } else {
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod fd_process_tree_tests {
-    use super::pid_has_ancestor_with;
-    use std::collections::{BTreeMap, BTreeSet};
-
-    #[test]
-    fn pid_ancestor_lookup_walks_parent_chain() {
-        let parents = BTreeMap::from([(30, 20), (20, 10), (10, 1)]);
-        let ancestors = BTreeSet::from([10]);
-
-        assert!(pid_has_ancestor_with(30, &ancestors, |pid| parents
-            .get(&pid)
-            .copied()));
-        assert!(!pid_has_ancestor_with(30, &BTreeSet::from([40]), |pid| {
-            parents.get(&pid).copied()
-        }));
-    }
-
-    #[test]
-    fn pid_ancestor_lookup_stops_on_cycles() {
-        let parents = BTreeMap::from([(30, 20), (20, 30)]);
-        let ancestors = BTreeSet::from([10]);
-
-        assert!(!pid_has_ancestor_with(30, &ancestors, |pid| parents
-            .get(&pid)
-            .copied()));
     }
 }
 
