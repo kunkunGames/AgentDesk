@@ -439,7 +439,9 @@ pub fn list_sessions_with_pane_command() -> Result<Vec<EnumeratedSession>, Strin
 
 /// List every tmux session along with its owning tmux server PID.
 pub fn list_sessions_with_server_pid() -> Result<Vec<SessionServer>, String> {
-    let out = tmux_command()
+    let mut command = tmux_command();
+    command.env_remove("TMUX");
+    let out = command
         .args(["list-sessions", "-F", "#{session_name}|#{pid}"])
         .output()
         .map_err(|e| format!("tmux list-sessions failed: {e}"))?;
