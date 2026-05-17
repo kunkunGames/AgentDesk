@@ -55,7 +55,7 @@
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 |  |
 | `cli::doctor::health` | `src/cli/doctor/health.rs` | 164 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 256 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4625 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 5036 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 375 |  |
 | `cli::init` | `src/cli/init.rs` | 1671 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 348 |  |
@@ -625,7 +625,7 @@
 | `ui` | `src/ui/mod.rs` | 1 |  |
 | `ui::ai_screen` | `src/ui/ai_screen.rs` | 155 |  |
 | `utils` | `src/utils/mod.rs` | 7 |  |
-| `utils::api` | `src/utils/api.rs` | 53 |  |
+| `utils::api` | `src/utils/api.rs` | 55 |  |
 | `utils::async_bridge` | `src/utils/async_bridge.rs` | 137 |  |
 | `utils::discord` | `src/utils/discord.rs` | 24 |  |
 | `utils::format` | `src/utils/format.rs` | 320 |  |
