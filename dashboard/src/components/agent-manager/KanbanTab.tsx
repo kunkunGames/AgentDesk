@@ -2470,7 +2470,7 @@ export default function KanbanTab({
                           <div className="text-xs" style={{ color: "var(--th-text-muted)" }}>{tr("GitHub", "GitHub")}</div>
                           <div style={{ color: "var(--th-text-primary)" }}>
                             {selectedCardGitHubIssueUrl ? (
-                              <a href={selectedCardGitHubIssueUrl} target="_blank" rel="noreferrer" className="hover:underline" style={{ color: "#93c5fd" }}>
+                              <a href={selectedCardGitHubIssueUrl} target="_blank" rel="noopener noreferrer" className="hover:underline" style={{ color: "#93c5fd" }}>
                                 #{selectedCard.github_issue_number ?? "-"}
                               </a>
                             ) : (
@@ -3825,7 +3825,7 @@ export default function KanbanTab({
               <a
                 href={selectedBacklogIssue.url}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
                 className="inline-flex items-center justify-center rounded-xl border px-4 py-2 text-sm text-center transition-colors hover:brightness-110"
                 style={{ ...SURFACE_GHOST_BUTTON_STYLE, color: "#93c5fd" }}
               >

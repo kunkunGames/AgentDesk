@@ -1135,6 +1135,17 @@ async fn start_monitor_auto_turn_when_available(
             );
         }
 
+        // #2441 (H1) — this site is the 6th polling sleep called out in
+        // the issue, but it polls on **mailbox state** (waiting for the
+        // active user turn to release the slot), not on jsonl bytes.
+        // JsonlWatcher would not give us a useful wake-up here. The
+        // deterministic graduator for this loop is the same `Notify`
+        // family we introduced for #2443 (`recovery_done`) — a future
+        // follow-up can extend that to a generic "turn finished" signal
+        // on `ChannelMailboxRegistry`. For now we leave the 200ms cadence
+        // intact; this loop only runs while a monitor_auto_turn is
+        // *waiting* on a slot, so the CPU cost is bounded by the user-turn
+        // duration (not the wrapper's stream cadence).
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 }
@@ -1215,6 +1226,10 @@ fn ensure_monitor_auto_turn_inflight(
     );
     synthetic.turn_start_offset = Some(turn_start_offset);
     synthetic.rebind_origin = true;
+    // #2285 audit trail: monitor pattern fired this turn without an
+    // originating Discord message. The session-bound relay does NOT branch
+    // on this — recorded for diagnostics only.
+    synthetic.turn_source = super::inflight::TurnSource::MonitorTriggered;
 
     match super::inflight::save_inflight_state_create_new(&synthetic) {
         Ok(()) => {
@@ -1468,6 +1483,63 @@ fn is_terminal_finalize_stop_candidate(
     terminal_output_committed && dispatch_ok && watcher_handled_mailbox_finish
 }
 
+/// #2161 TUI completion gate — decide whether the user-visible
+/// `✅ 응답 완료` / `✅ 백그라운드 완료` status event must wait for the
+/// underlying TUI pane to reach quiescence before being emitted.
+///
+/// The CLI provider session can write a terminal `result` JSONL event before
+/// the interactive TUI has finished rendering tool output, plan presentations,
+/// or trailing assistant text into its tmux pane. Without this gate the
+/// caller relays the response text, immediately marks the turn as
+/// `TurnCompleted`, and the user sees `응답 완료` on Discord while their
+/// right-side tmux pane is still actively scrolling / showing
+/// `almost done thinking`. Subsequent relay messages can then continue past
+/// the completion marker — a lifecycle bug.
+///
+/// We currently only gate `RuntimeHandoffKind::ClaudeTui`. `LegacyTmuxWrapper`
+/// drives a non-interactive wrapper script whose `result` event coincides
+/// with the script exiting, so no extra quiescence step is needed.
+/// `CodexTui` has its own completion contract and is intentionally excluded
+/// from this gate to keep the fix minimal and reviewable.
+///
+/// `task_notification_kind` is accepted but intentionally does NOT skip the
+/// gate — a Background or MonitorAutoTurn that runs inside ClaudeTui still
+/// emits a visible status transition (`✅ 백그라운드 완료`) and the user
+/// observes the same premature-completion bug on the same pane. Codex review
+/// on #2161 flagged the original task-notification skip as the H3 finding.
+#[inline]
+pub(super) fn should_gate_completion_for_tui_quiescence(
+    runtime_kind: Option<crate::services::agent_protocol::RuntimeHandoffKind>,
+    rebind_origin: bool,
+    _task_notification_kind: Option<crate::services::agent_protocol::TaskNotificationKind>,
+) -> bool {
+    // rebind_origin inflights describe an externally-launched tmux session
+    // that AgentDesk did not start — the operator (not the Discord turn)
+    // owns input cadence and the "응답 완료" marker is suppressed by other
+    // rebind-origin guards anyway. Don't add an additional wait.
+    if rebind_origin {
+        return false;
+    }
+    matches!(
+        runtime_kind,
+        Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui)
+    )
+}
+
+/// Upper bound for `should_gate_completion_for_tui_quiescence` polling.
+/// Kept short enough that a hung pane cannot stall the user-visible
+/// `응답 완료` marker for more than a few seconds — the gate is best-effort
+/// observability, not a correctness primitive.
+pub(super) const TUI_COMPLETION_QUIESCENCE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Poll interval inside the quiescence wait. Matches the existing
+/// `READY_FOR_INPUT_IDLE_PROBE_INTERVAL` cadence used elsewhere in the
+/// watcher so concurrent ticks don't fight each other on the same tmux
+/// session.
+pub(super) const TUI_COMPLETION_QUIESCENCE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
+
 #[inline]
 fn watcher_stop_decision_after_terminal_finalize(
     terminal_output_committed: bool,
@@ -1549,6 +1621,168 @@ mod terminal_finalize_liveness_tests {
             WatcherStopDecision::Continue,
             "non-committed terminal output is not a stop candidate even if liveness is gone"
         );
+    }
+}
+
+#[cfg(test)]
+mod tui_completion_gate_tests {
+    use super::should_gate_completion_for_tui_quiescence;
+    use crate::services::agent_protocol::{RuntimeHandoffKind, TaskNotificationKind};
+
+    #[test]
+    fn claude_tui_managed_turn_is_gated() {
+        assert!(should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::ClaudeTui),
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn legacy_tmux_wrapper_skips_the_gate() {
+        // Legacy wrapper's `result` event coincides with the script exiting,
+        // so the existing path already aligns with TUI quiescence.
+        assert!(!should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::LegacyTmuxWrapper),
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn process_backend_skips_the_gate() {
+        assert!(!should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::ProcessBackend),
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn codex_tui_is_excluded_for_minimal_scope() {
+        // Codex TUI has its own completion contract (#2189) and is
+        // intentionally outside the scope of this #2161 fix to keep the
+        // change focused and reviewable.
+        assert!(!should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::CodexTui),
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn missing_runtime_kind_skips_the_gate() {
+        assert!(!should_gate_completion_for_tui_quiescence(
+            None, false, None,
+        ));
+    }
+
+    #[test]
+    fn rebind_origin_inflight_skips_the_gate() {
+        // Externally-adopted tmux sessions don't drive a Discord-origin turn;
+        // the rebind path already suppresses user-visible completion markers.
+        assert!(!should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::ClaudeTui),
+            true,
+            None,
+        ));
+    }
+
+    #[test]
+    fn background_and_monitor_task_notifications_still_gated_for_tui() {
+        // Codex review on #2161 H3: Background and MonitorAutoTurn emit a
+        // visible `백그라운드 완료` marker that the user sees on the same
+        // pane, so the gate applies to them too when running on ClaudeTui.
+        // task_notification_kind is intentionally not a skip condition.
+        assert!(should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::ClaudeTui),
+            false,
+            Some(TaskNotificationKind::Background),
+        ));
+        assert!(should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::ClaudeTui),
+            false,
+            Some(TaskNotificationKind::MonitorAutoTurn),
+        ));
+        assert!(should_gate_completion_for_tui_quiescence(
+            Some(RuntimeHandoffKind::ClaudeTui),
+            false,
+            Some(TaskNotificationKind::Subagent),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tui_completion_gate_outcome_tests {
+    use super::TuiCompletionGateOutcome;
+
+    #[test]
+    fn not_gated_emits_immediately() {
+        assert!(TuiCompletionGateOutcome::NotGated.should_emit_completion());
+    }
+
+    #[test]
+    fn confirmed_idle_emits() {
+        assert!(TuiCompletionGateOutcome::ConfirmedIdle.should_emit_completion());
+    }
+
+    #[test]
+    fn timed_out_suppresses_emit() {
+        // Codex H2: timeout MUST suppress the TurnCompleted emit;
+        // placeholder sweeper / next-turn intake reconciles later.
+        assert!(!TuiCompletionGateOutcome::TimedOut.should_emit_completion());
+    }
+}
+
+/// #2293 regression coverage — the `lifecycle_stage_paused` boolean derived
+/// from `TuiCompletionGateOutcome` is what gates every TimedOut side-effect
+/// in `tmux_watcher.rs` (✅ reaction, transcript persist, history append,
+/// confirmed-end watermark, clear_inflight, finish_restored_watcher_active_turn,
+/// queue kickoff, terminal-finalize stop). Same pattern in `turn_bridge` and
+/// `recovery_engine`. The pure derivation lives in this module's
+/// `should_emit_completion` contract, but the consumers compute their flag
+/// inline via `matches!(outcome, TuiCompletionGateOutcome::TimedOut)` — these
+/// tests pin the matrix so a future refactor that adds a fourth variant
+/// cannot silently widen the "proceed" set without also updating the side-
+/// effect gates.
+#[cfg(test)]
+mod lifecycle_stage_pause_matrix_tests {
+    use super::TuiCompletionGateOutcome;
+
+    /// Mirrors the `matches!` predicate inlined at the watcher / bridge /
+    /// recovery side-effect gates. Keeping it as a tiny helper here makes
+    /// the gate matrix testable without re-implementing the consumers.
+    fn lifecycle_stage_paused(outcome: TuiCompletionGateOutcome) -> bool {
+        matches!(outcome, TuiCompletionGateOutcome::TimedOut)
+    }
+
+    #[test]
+    fn paused_only_on_timed_out() {
+        assert!(!lifecycle_stage_paused(TuiCompletionGateOutcome::NotGated));
+        assert!(!lifecycle_stage_paused(
+            TuiCompletionGateOutcome::ConfirmedIdle
+        ));
+        assert!(lifecycle_stage_paused(TuiCompletionGateOutcome::TimedOut));
+    }
+
+    #[test]
+    fn pause_matrix_is_complement_of_emit_matrix() {
+        // Every outcome where the gate DOES emit completion is also a
+        // outcome where lifecycle MUST proceed — and vice versa. If these
+        // two ever drift apart we'd either suppress the user-visible
+        // `응답 완료` while still releasing the mailbox (the original
+        // #2293 cascade) or emit completion while pausing the cleanup.
+        for outcome in [
+            TuiCompletionGateOutcome::NotGated,
+            TuiCompletionGateOutcome::ConfirmedIdle,
+            TuiCompletionGateOutcome::TimedOut,
+        ] {
+            assert_eq!(
+                outcome.should_emit_completion(),
+                !lifecycle_stage_paused(outcome),
+                "emit/pause complementarity violated for {outcome:?}",
+            );
+        }
     }
 }
 
@@ -2080,7 +2314,10 @@ async fn finish_restored_watcher_active_turn(
 /// When Claude produces output from terminal input (not Discord), relay it to Discord.
 #[path = "tmux_watcher.rs"]
 mod tmux_watcher;
-pub(super) use self::tmux_watcher::{tmux_output_watcher, tmux_output_watcher_with_restore};
+pub(super) use self::tmux_watcher::{
+    TuiCompletionGateOutcome, emit_explicit_inflight_cleanup_signal, run_tui_completion_gate,
+    tmux_output_watcher, tmux_output_watcher_with_restore,
+};
 #[path = "tmux_output_stream.rs"]
 mod tmux_output_stream;
 pub(super) use self::tmux_output_stream::{
@@ -5734,6 +5971,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                voice_announcement: None,
             },
         )
         .await;

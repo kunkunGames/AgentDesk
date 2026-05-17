@@ -97,6 +97,7 @@ src/
 │   ├── cancel_tombstones.rs
 │   ├── dispatch_semaphores.rs
 │   ├── dispatched_sessions.rs
+│   ├── idempotency.rs
 │   ├── intake_outbox.rs
 │   ├── kanban.rs
 │   ├── memento_feedback_stats.rs
@@ -255,6 +256,7 @@ src/
 │   │   ├── health_api.rs
 │   │   ├── home_metrics.rs
 │   │   ├── hooks.rs
+│   │   ├── idle_recap.rs
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
@@ -339,10 +341,12 @@ src/
 │   │   ├── fsm.rs
 │   │   ├── order_routes.rs
 │   │   ├── phase_gate.rs
+│   │   ├── phase_gate_catalog.rs
 │   │   ├── planning.rs
 │   │   ├── query.rs
 │   │   ├── route.rs
 │   │   ├── route_generate.rs
+│   │   ├── route_request_generate.rs
 │   │   ├── route_types.rs
 │   │   ├── runtime.rs
 │   │   ├── slot_routes.rs
@@ -351,11 +355,31 @@ src/
 │   ├── automation_candidate_materializer/
 │   │   ├── allowed_path_tests.rs
 │   │   └── iteration_result_tests.rs
+│   ├── claude_tui/
+│   │   ├── hook_bundle.rs
+│   │   ├── hook_relay.rs
+│   │   ├── hook_server.rs
+│   │   ├── input.rs
+│   │   ├── mod.rs
+│   │   ├── session.rs
+│   │   └── transcript_tail.rs
 │   ├── cluster/
 │   │   ├── intake_router_hook.rs
 │   │   ├── intake_routing.rs
 │   │   ├── intake_worker.rs
-│   │   └── mod.rs
+│   │   ├── mod.rs
+│   │   ├── registry_adapter_sink.rs
+│   │   ├── relay_producer_registry.rs
+│   │   ├── session_discovery.rs
+│   │   ├── session_matcher.rs
+│   │   ├── session_registry.rs
+│   │   ├── stream_relay.rs
+│   │   └── watcher_supervisor.rs
+│   ├── codex_tui/
+│   │   ├── input.rs
+│   │   ├── mod.rs
+│   │   ├── rollout_tail.rs
+│   │   └── session.rs
 │   ├── discord/
 │   │   ├── commands/
 │   │   │   ├── inspect/
@@ -466,6 +490,8 @@ src/
 │   │   ├── health.rs
 │   │   ├── http.rs
 │   │   ├── idle_detector.rs
+│   │   ├── idle_recap.rs
+│   │   ├── idle_recap_interaction.rs
 │   │   ├── inflight.rs
 │   │   ├── internal_api.rs
 │   │   ├── mcp_credential_watcher.rs
@@ -512,6 +538,7 @@ src/
 │   │   ├── tmux_restart_handoff.rs
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
+│   │   ├── voice_background_driver.rs
 │   │   ├── voice_barge_in.rs
 │   │   └── voice_routing.rs
 │   ├── dispatches/
@@ -607,6 +634,7 @@ src/
 │   ├── automation_candidate_materializer.rs
 │   ├── claude.rs
 │   ├── codex.rs
+│   ├── codex_remote_policy.rs
 │   ├── codex_tmux_wrapper.rs
 │   ├── discord_config_audit.rs
 │   ├── discord_dm_reply_store.rs
@@ -627,6 +655,7 @@ src/
 │   ├── process.rs
 │   ├── provider.rs
 │   ├── provider_exec.rs
+│   ├── provider_hosting.rs
 │   ├── provider_runtime.rs
 │   ├── queue.rs
 │   ├── qwen.rs
@@ -666,7 +695,9 @@ src/
 │   │   ├── edge.rs
 │   │   ├── mod.rs
 │   │   └── playback.rs
+│   ├── announce_meta.rs
 │   ├── barge_in.rs
+│   ├── cancel_tombstone.rs
 │   ├── commands.rs
 │   ├── config.rs
 │   ├── metrics.rs
@@ -676,6 +707,7 @@ src/
 │   ├── receiver.rs
 │   ├── sanitizer.rs
 │   ├── stt.rs
+│   ├── turn_link.rs
 │   └── utils.rs
 ├── bootstrap.rs
 ├── config.rs

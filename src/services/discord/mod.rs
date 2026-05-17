@@ -12,7 +12,9 @@ mod idle_detector;
 pub(crate) mod idle_recap;
 mod idle_recap_interaction;
 mod inflight;
+mod inflight_heartbeat_sweeper;
 pub(crate) mod internal_api;
+mod jsonl_watcher;
 mod mcp_credential_watcher;
 pub(crate) mod meeting_artifact_store;
 pub(crate) mod meeting_orchestrator;
@@ -1450,6 +1452,14 @@ pub(crate) struct SharedData {
     /// Used by the router to distinguish known slash commands from arbitrary
     /// `/`-prefixed user text that should fall through to the AI provider.
     pub(super) known_slash_commands: tokio::sync::OnceCell<std::collections::HashSet<String>>,
+    /// #2448: process-wide broadcast of explicit inflight-lifecycle signals.
+    /// turn_bridge's `CompletionGuard` publishes `InflightSignal::Completed`
+    /// on terminal drop so subscribers (currently `run_standby_relay`) can
+    /// exit immediately instead of polling against a 15min wall-clock
+    /// timeout. Capacity is intentionally generous so a brief listener
+    /// hiccup yields `RecvError::Lagged` rather than dropped channels.
+    pub(in crate::services::discord) inflight_signals:
+        tokio::sync::broadcast::Sender<inflight::InflightSignal>,
 }
 
 impl SharedData {
@@ -2154,6 +2164,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         engine: None,
         health_registry: std::sync::Weak::new(),
         known_slash_commands: tokio::sync::OnceCell::new(),
+        inflight_signals: tokio::sync::broadcast::channel(256).0,
     })
 }
 
@@ -2200,7 +2211,21 @@ async fn mailbox_cancel_active_turn_with_reason(
         .channel_binding(&channel_id)
         .map(|binding| binding.tmux_session_name)
         .or_else(|| infer_inflight_tmux_session_for_channel(channel_id));
-    let result = shared.mailbox(channel_id).cancel_active_turn().await;
+    // Issue #2374 — the reason-write and the `cancelled` flip are now
+    // performed atomically by the mailbox actor (see
+    // `ChannelMailboxMsg::CancelActiveTurnWithReason`). The previous
+    // design (introduced by PR #2373 for issue #2335) read the active
+    // token from the actor, wrote `cancel_source` on it from the caller
+    // task, then sent the actor a `CancelActiveTurn`. That kept the
+    // ordering correct for a single canceller but allowed two concurrent
+    // cancellers to both fetch the same token, race on
+    // `set_cancel_source`, and lose one of the reasons. Owning the write
+    // inside the actor serializes both transitions per channel and
+    // removes the small ordering window.
+    let result = shared
+        .mailbox(channel_id)
+        .cancel_active_turn_with_reason(reason.to_string())
+        .await;
     #[cfg(unix)]
     if result.token.is_some() {
         // #1309: in-memory publish is synchronous (instant suppression);
@@ -2211,13 +2236,22 @@ async fn mailbox_cancel_active_turn_with_reason(
     result
 }
 
-async fn mailbox_cancel_active_turn_if_current_with_reason(
+/// #2374 Codex round-1 fix (HIGH-1) — identity-guarded variant for the
+/// voice handoff cancel path. Cancels the active turn on `channel_id`
+/// ONLY when its `user_message_id` matches `handoff_message_id`. An
+/// unguarded cancel from the tombstone retry path could otherwise kill
+/// an unrelated turn that happened to start on the same target channel
+/// after the original handoff turn finalized.
+///
+/// Recording the tombstone is the caller's responsibility (see
+/// [`record_voice_handoff_cancel_tombstone`]) so a tombstone can be
+/// written even when no active turn is present (HIGH-2 fix).
+pub(crate) async fn mailbox_cancel_active_turn_if_handoff_user_message_with_reason(
     shared: &SharedData,
     channel_id: ChannelId,
-    expected_token: Arc<CancelToken>,
+    handoff_message_id: MessageId,
     reason: &str,
 ) -> CancelActiveTurnResult {
-    expected_token.set_cancel_source(reason);
     let tmux_session_name = shared
         .tmux_watchers
         .channel_binding(&channel_id)
@@ -2225,7 +2259,48 @@ async fn mailbox_cancel_active_turn_if_current_with_reason(
         .or_else(|| infer_inflight_tmux_session_for_channel(channel_id));
     let result = shared
         .mailbox(channel_id)
-        .cancel_active_turn_if_current(expected_token)
+        .cancel_active_turn_if_user_message_with_reason(handoff_message_id, reason.to_string())
+        .await;
+    #[cfg(unix)]
+    if result.token.is_some() {
+        tmux::record_recent_turn_stop(channel_id, tmux_session_name.as_deref(), reason).await;
+    }
+    result
+}
+
+/// #2374 Codex round-1 fix (HIGH-2) — record the voice handoff
+/// cancel-tombstone unconditionally when a cancel is observed for a
+/// known `handoff_message_id`. The original PR only recorded a
+/// tombstone when the target mailbox cancel returned a live token,
+/// missing the cases where the target turn had not yet started (intake
+/// race) or had already finalized. In both cases a later retry for the
+/// same handoff must still observe the tombstone and discard itself.
+pub(crate) fn record_voice_handoff_cancel_tombstone(
+    handoff_message_id: MessageId,
+    reason: impl Into<String>,
+) {
+    crate::voice::cancel_tombstone::global_store().record(handoff_message_id, reason);
+}
+
+async fn mailbox_cancel_active_turn_if_current_with_reason(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    expected_token: Arc<CancelToken>,
+    reason: &str,
+) -> CancelActiveTurnResult {
+    // Issue #2374 — actor-owned reason write. The `if_current` guard is
+    // preserved so a stale caller cannot cancel a freshly-restarted turn
+    // that happens to live on the same channel. The same
+    // already-cancelled protection PR #2373 added to the caller-side
+    // write is now enforced inside the actor handler itself.
+    let tmux_session_name = shared
+        .tmux_watchers
+        .channel_binding(&channel_id)
+        .map(|binding| binding.tmux_session_name)
+        .or_else(|| infer_inflight_tmux_session_for_channel(channel_id));
+    let result = shared
+        .mailbox(channel_id)
+        .cancel_active_turn_if_current_with_reason(expected_token, reason.to_string())
         .await;
     #[cfg(unix)]
     if result.token.is_some() {
@@ -2332,6 +2407,12 @@ async fn mailbox_recovery_kickoff(
     request_owner: UserId,
     user_message_id: MessageId,
 ) -> RecoveryKickoffResult {
+    // #2443 — reset the per-channel `recovery_done` latch BEFORE the
+    // recovery actually starts. A stale "done" flag from a previous cycle
+    // would otherwise let `watchers/lifecycle.rs` (which selects on
+    // `recovery_done.wait()`) immediately graduate the skip and race the
+    // ongoing recovery. Reset is idempotent and cheap.
+    shared.mailboxes.recovery_done(channel_id).reset();
     let result = shared
         .mailbox(channel_id)
         .recovery_kickoff(cancel_token, request_owner, user_message_id)
@@ -2389,6 +2470,13 @@ fn ensure_cancel_token_bound_from_inflight(
 
 async fn mailbox_clear_recovery_marker(shared: &SharedData, channel_id: ChannelId) {
     shared.mailbox(channel_id).clear_recovery_marker().await;
+    // #2443 — graduate the 60s `recovery_started_at < 60s` skip via a
+    // deterministic wake-up. Every exit path of the recovery engine
+    // (success / failure / cancel / stale-cleanup) funnels through this
+    // helper, so a single `mark_done()` here covers all of them. Watchers
+    // selecting on `recovery_done.wait()` proceed immediately; the 60s
+    // timeout remains as a hook-miss safety net.
+    shared.mailboxes.recovery_done(channel_id).mark_done();
 }
 
 /// Outcome of `mailbox_enqueue_intervention` — exposes both the enqueue
@@ -2711,6 +2799,7 @@ async fn enqueue_internal_followup(
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            voice_announcement: None,
         },
     )
     .await;
@@ -2854,6 +2943,13 @@ async fn mailbox_finish_turn(
         .finish_turn(queue_persistence_context(shared, provider, channel_id))
         .await;
     apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    // #2443 — finish_turn is the success-path exit for the recovery engine
+    // (recovery_engine.rs L648). Marking `recovery_done` here covers the
+    // "recovery completed normally" branch so the watcher waiting on
+    // `recovery_done.wait()` can proceed without waiting for the 60s timeout
+    // that the legacy heuristic depended on. The latch is idempotent — if
+    // `mailbox_clear_recovery_marker` already ran, this is a no-op.
+    shared.mailboxes.recovery_done(channel_id).mark_done();
     result
 }
 
@@ -2867,6 +2963,10 @@ async fn mailbox_clear_channel(
         .clear(queue_persistence_context(shared, provider, channel_id))
         .await;
     apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    // #2443 — `Clear` is the cancel/teardown exit path. Mark recovery_done so
+    // a watcher that subscribed to the recovery latch is freed even when
+    // recovery is aborted rather than completed.
+    shared.mailboxes.recovery_done(channel_id).mark_done();
     result
 }
 
@@ -3296,6 +3396,7 @@ async fn catch_up_missed_messages_inner(
                         && !text.starts_with('!')
                         && !text.starts_with('/')
                         && !text.starts_with("DISPATCH:"),
+                    voice_announcement: None,
                 },
             )
             .await;
@@ -3491,6 +3592,7 @@ async fn catch_up_missed_messages_inner(
                         && !text.starts_with('!')
                         && !text.starts_with('/')
                         && !text.starts_with("DISPATCH:"),
+                    voice_announcement: None,
                 },
             )
             .await;
@@ -3620,6 +3722,18 @@ pub(super) async fn kickoff_idle_queues(
             shared,
             token,
         };
+        // #2266: kickoff_idle_queues is the other queued-dispatch entrypoint
+        // alongside `DiscordGateway::dispatch_queued_turn`. It is reached by
+        // `schedule_deferred_idle_queue_kickoff` from the very same race-loss
+        // branch that embeds the voice payload into the queued Intervention,
+        // so we must reinsert the announcement into the per-process store
+        // before re-entering `handle_text_message`. Without this hook the
+        // race-loss path that takes the idle-kickoff branch would still
+        // degrade to plain text.
+        if let Some(announcement) = intervention.voice_announcement.as_ref() {
+            crate::voice::announce_meta::global_store()
+                .insert(intervention.message_id, announcement.clone());
+        }
         if let Err(e) = router::handle_text_message(
             &deps,
             channel_id,
@@ -4604,6 +4718,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                voice_announcement: None,
             }],
             ..Default::default()
         };
@@ -4691,6 +4806,7 @@ mod tests {
                     reply_context: None,
                     has_reply_boundary: false,
                     merge_consecutive: false,
+                    voice_announcement: None,
                 },
             )
             .await;
@@ -4897,6 +5013,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                voice_announcement: None,
             }],
             ..Default::default()
         };
@@ -4937,6 +5054,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                voice_announcement: None,
             },
         )
         .await;
@@ -5340,6 +5458,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                voice_announcement: None,
             },
             kind: QueueExitKind::Cancelled,
         };
@@ -5406,6 +5525,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                voice_announcement: None,
             },
             kind,
         };
@@ -5501,6 +5621,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: true,
+                voice_announcement: None,
             },
             kind: QueueExitKind::Superseded,
         };
@@ -5586,6 +5707,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: true,
+                voice_announcement: None,
             },
             kind: QueueExitKind::Cancelled,
         };

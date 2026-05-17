@@ -5,7 +5,7 @@ use axum::{
 
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
-    health_api, hooks, idle_recap, maintenance, messages, pipeline, prompt_manifest_retention,
+    health_api, idle_recap, maintenance, messages, pipeline, prompt_manifest_retention,
     protected_api_domain, provider_cli_api, queue_api, routines, skills_api, termination_events,
 };
 
@@ -39,6 +39,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 post(health_api::rebind_inflight_handler),
             )
             .route("/cluster/nodes", get(cluster::list_nodes))
+            .route("/cluster/sessions", get(cluster::list_sessions))
             .route(
                 "/cluster/routing-diagnostics",
                 get(cluster::routing_diagnostics),
@@ -168,12 +169,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/dispatched-sessions/webhook",
                 post(dispatched_sessions::hook_session).delete(dispatched_sessions::delete_session),
-            )
-            .route("/hook/reset-status", post(hooks::reset_status))
-            .route("/hook/skill-usage", post(hooks::skill_usage))
-            .route(
-                "/hook/session/{sessionKey}",
-                delete(hooks::disconnect_session),
             )
             .route(
                 "/dispatched-sessions/claude-session-id",

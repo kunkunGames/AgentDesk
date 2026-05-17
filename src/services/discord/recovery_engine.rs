@@ -29,6 +29,104 @@ fn tmux_session_has_live_pane(_name: &str) -> bool {
     false
 }
 
+/// #2428 H5: exponential backoff (+ jitter) for the 3-attempt recovery retry
+/// loops in this module. Replaces the previous fixed `1s` gap with an
+/// exponential schedule that *preserves the old wall-clock budget*.
+///
+/// Budget contract (Codex pass-1 review):
+/// - Old: 3 attempts × 1000ms gap → wait between attempts = 1000ms + 1000ms = **2000ms**
+///   total grace window before declaring tmux/finalize recovery failed.
+/// - New: gap schedule = `[700, 1300, 2000]` ms + 0..=100ms jitter, callers
+///   sleep on attempt 1 and 2 (`if attempt < 3`). Wait between attempts =
+///   `700 + 1300 = 2000ms +0..=200ms` (jitter only adds). **Total budget preserved** while
+///   distributing the gaps exponentially so a transient failure that resolves
+///   in <1s wakes ~300ms earlier on average.
+/// - The third slot (`2000ms`) is reachable only if a future change bumps
+///   the loop past 3 attempts; it caps the per-gap wait without exploding the
+///   total when more attempts are added.
+///
+/// `attempt` is 1-indexed and matches the loop variable: it is the attempt
+/// that *just failed*, and the returned duration is how long to wait before
+/// the next attempt. Callers should only invoke this when another attempt
+/// will actually be tried (typically `if attempt < 3`).
+pub(super) fn recovery_retry_backoff(attempt: u32) -> std::time::Duration {
+    // Gap schedule between attempts 1→2, 2→3, 3→4, …: 700ms, 1300ms, 2000ms.
+    // The 700 + 1300 = 2000ms sum is what makes the 3-attempt total grace
+    // window equal to the old fixed-1s × 3 budget. Do not adjust either of
+    // the first two values without also reviewing every caller and updating
+    // the budget contract above.
+    const SCHEDULE_MS: [u64; 3] = [700, 1300, 2000];
+    const MAX_BASE_MS: u64 = 2000;
+    let idx = attempt.saturating_sub(1) as usize;
+    let base_ms = SCHEDULE_MS
+        .get(idx)
+        .copied()
+        .unwrap_or(MAX_BASE_MS)
+        .min(MAX_BASE_MS);
+    // Add 0..=100ms uniform jitter so simultaneous retries (e.g. two
+    // channels recovering at once) do not lock-step into the same wakeup.
+    use rand::Rng;
+    let jitter_ms = rand::thread_rng().gen_range(0..=100);
+    std::time::Duration::from_millis(base_ms + jitter_ms)
+}
+
+#[cfg(test)]
+mod recovery_retry_backoff_tests {
+    use super::recovery_retry_backoff;
+    use std::time::Duration;
+
+    #[test]
+    fn backoff_attempt_1_is_in_700_to_800_ms() {
+        let d = recovery_retry_backoff(1);
+        assert!(d >= Duration::from_millis(700), "got {d:?}");
+        assert!(d <= Duration::from_millis(800), "got {d:?}");
+    }
+
+    #[test]
+    fn backoff_attempt_2_is_in_1300_to_1400_ms() {
+        let d = recovery_retry_backoff(2);
+        assert!(d >= Duration::from_millis(1300), "got {d:?}");
+        assert!(d <= Duration::from_millis(1400), "got {d:?}");
+    }
+
+    #[test]
+    fn backoff_attempt_3_is_in_2000_to_2100_ms() {
+        let d = recovery_retry_backoff(3);
+        assert!(d >= Duration::from_millis(2000), "got {d:?}");
+        assert!(d <= Duration::from_millis(2100), "got {d:?}");
+    }
+
+    #[test]
+    fn backoff_clamps_attempts_beyond_schedule() {
+        // Even if we ever extend the loop past 3, the wait must not exceed
+        // the documented cap.
+        let d = recovery_retry_backoff(7);
+        assert!(d <= Duration::from_millis(2100), "got {d:?}");
+    }
+
+    #[test]
+    fn backoff_attempt_zero_is_treated_as_first() {
+        // Defensive: a caller passing 0 should not get a divide-by-zero or
+        // a tiny instant-retry; behave like attempt 1.
+        let d = recovery_retry_backoff(0);
+        assert!(d >= Duration::from_millis(700), "got {d:?}");
+        assert!(d <= Duration::from_millis(800), "got {d:?}");
+    }
+
+    #[test]
+    fn backoff_preserves_3_attempt_total_budget() {
+        // Budget contract: 3-attempt loop with sleeps on attempts 1 and 2
+        // must equal the old fixed-1s × 3 budget (= 2000ms wait time)
+        // within the jitter envelope. This is the regression the Codex
+        // pass-1 review flagged.
+        let total = recovery_retry_backoff(1) + recovery_retry_backoff(2);
+        // Lower bound: 700 + 1300 = 2000ms with zero jitter on both calls.
+        assert!(total >= Duration::from_millis(2000), "got {total:?}");
+        // Upper bound: 800 + 1400 = 2200ms with max jitter on both calls.
+        assert!(total <= Duration::from_millis(2200), "got {total:?}");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryPhase {
     Pending,
@@ -164,6 +262,37 @@ async fn relay_recovery_terminal_notice(
     .is_ok()
 }
 
+/// Outcome of `complete_recovery_visible_turn` exposed to callers so they can
+/// short-circuit dispatch / mailbox / analytics work on a still-busy pane.
+///
+/// #2293 H3 — pre-existing callers ignored the gate outcome entirely because
+/// the helper returned `()`. They then proceeded with `persist_turn_analytics`
+/// + dispatch completion + mailbox finalize regardless of whether the
+/// `응답 완료` panel actually emitted. The new outcome lets each call site
+/// observe `LifecyclePaused` and skip the side effects, mirroring the
+/// bridge/watcher behaviour landed in the same PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RecoveryCompletionOutcome {
+    /// Visible completion emitted (or status-panel-v2 was disabled / no
+    /// status message id was wired). Callers may proceed with downstream
+    /// dispatch / analytics / mailbox finalization as before.
+    Emitted,
+    /// Recovery short-circuited because the TUI quiescence gate reported
+    /// `TimedOut`. Callers MUST skip dispatch completion, mailbox finish,
+    /// and analytics persistence — the next watcher pass / placeholder
+    /// sweeper reconciles when the pane finally reports idle.
+    LifecyclePaused,
+}
+
+impl RecoveryCompletionOutcome {
+    /// `true` when callers should proceed with downstream side effects. False
+    /// only on `LifecyclePaused`, where the gate explicitly suppressed
+    /// completion to avoid the #2161 / #2293 premature-completion cascade.
+    pub(super) fn should_proceed(self) -> bool {
+        matches!(self, RecoveryCompletionOutcome::Emitted)
+    }
+}
+
 async fn complete_recovery_visible_turn(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -171,22 +300,67 @@ async fn complete_recovery_visible_turn(
     state: &super::inflight::InflightTurnState,
     background: bool,
     source: &'static str,
-) {
+) -> RecoveryCompletionOutcome {
     let channel_id = ChannelId::new(state.channel_id);
     let user_msg_id = MessageId::new(state.user_msg_id);
+
+    // #2161 (Codex round-2 M1): recovery completes a turn based on JSONL
+    // `result` + output-file drain, not tmux pane readiness. For ClaudeTui
+    // sessions the same premature-completion bug applies — gate the
+    // user-visible `응답 완료` emit on quiescence, and on timeout skip
+    // the emit so the next watcher pass / placeholder sweeper reconciles.
+    // The gate lives in the `tmux` module (`#[cfg(unix)]`); on non-unix
+    // targets we skip it and emit completion as normal.
+    //
+    // #2293 H3 — the gate is hoisted ABOVE the ⏳ → ✅ reaction so a
+    // TimedOut outcome ALSO suppresses the reaction (was: reaction ran
+    // before the gate, lying about completion to the user). Recovery's
+    // visible side effects now follow the same ordering as the bridge and
+    // watcher paths.
+    #[cfg(unix)]
+    if let Some(tmux_session_name) = state.tmux_session_name.as_deref() {
+        let outcome = super::tmux::run_tui_completion_gate(
+            provider,
+            channel_id,
+            tmux_session_name,
+            state.task_notification_kind,
+        )
+        .await;
+        if !outcome.should_emit_completion() {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id.get(),
+                source = source,
+                "[{ts}] ⚠ #2293 recovery lifecycle-stage paused — TUI quiescence gate timed out; suppressing ⏳→✅ reaction AND downstream dispatch / analytics / mailbox finalize until the next pass observes idle"
+            );
+            return RecoveryCompletionOutcome::LifecyclePaused;
+        }
+    }
+
     super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
     super::formatting::add_reaction_raw(http, channel_id, user_msg_id, '✅').await;
 
     if !shared.status_panel_v2_enabled {
-        return;
+        return RecoveryCompletionOutcome::Emitted;
     }
     let Some(status_msg_id) = state.status_message_id.map(MessageId::new) else {
-        return;
+        return RecoveryCompletionOutcome::Emitted;
     };
 
     shared
         .placeholder_live_events
         .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
+    // #2427 D wire: explicit completion signal — most recovery paths
+    // already call `clear_inflight_state` unconditionally; this is a
+    // safety net for any branch that emits TurnCompleted without doing
+    // so. user_msg_id guard defeats Pitfall #1 (next turn race).
+    super::tmux::emit_explicit_inflight_cleanup_signal(
+        provider,
+        channel_id,
+        state.user_msg_id,
+        "turn_completed_recovery",
+    );
     let started_at_unix = super::inflight::parse_started_at_unix(&state.started_at)
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
     let panel_text =
@@ -206,6 +380,7 @@ async fn complete_recovery_visible_turn(
             error
         );
     }
+    RecoveryCompletionOutcome::Emitted
 }
 
 #[cfg(test)]
@@ -217,15 +392,38 @@ mod recovery_dispatch_gate_tests {
     }
 }
 
+#[cfg(test)]
+mod recovery_completion_outcome_tests {
+    use super::RecoveryCompletionOutcome;
+
+    #[test]
+    fn emitted_lets_callers_proceed_with_dispatch_finalize() {
+        assert!(RecoveryCompletionOutcome::Emitted.should_proceed());
+    }
+
+    #[test]
+    fn lifecycle_paused_blocks_dispatch_finalize() {
+        // #2293 H3: the three recovery callers
+        // (`completed_during_downtime`, `captured_full_response`,
+        // `output_completed`) MUST observe `false` here and `continue` the
+        // recovery loop. If this assertion ever flips to `true`, the gate
+        // would let dispatch finalize + analytics persist + mailbox finish
+        // run while the pane is still busy — the exact cascade #2293
+        // exists to prevent.
+        assert!(!RecoveryCompletionOutcome::LifecyclePaused.should_proceed());
+    }
+}
+
 /// Retry-aware tmux session check for recovery after dcserver restart.
 /// The first check can false-negative if tmux CLI hasn't fully initialized yet.
 fn tmux_session_alive_with_retry(name: &str) -> bool {
     if tmux_session_has_live_pane(name) {
         return true;
     }
-    // Retry up to 2 more times with 1-second gaps
-    for attempt in 1..=2 {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    // #2428 H5: retry up to 2 more times with exponential backoff + jitter
+    // (was a fixed 1s gap; see `recovery_retry_backoff`).
+    for attempt in 1..=2u32 {
+        std::thread::sleep(recovery_retry_backoff(attempt));
         if tmux_session_has_live_pane(name) {
             tracing::info!(
                 "  [recovery] tmux pane alive on retry {} for {}",
@@ -243,8 +441,9 @@ fn tmux_has_session_with_retry(name: &str) -> bool {
     if crate::services::platform::tmux::has_session(name) {
         return true;
     }
-    for attempt in 1..=2 {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    // #2428 H5: see `recovery_retry_backoff`.
+    for attempt in 1..=2u32 {
+        std::thread::sleep(recovery_retry_backoff(attempt));
         if crate::services::platform::tmux::has_session(name) {
             tracing::info!(
                 "  [recovery] tmux session found on retry {} for {}",
@@ -1060,6 +1259,21 @@ async fn terminal_success_output_drained_for_recovery(
         return false;
     }
 
+    // #2442 (H2) — fast-path: if the wrapper has already emitted the
+    // `terminal_end` JSONL sentinel, the pane is *definitively* done
+    // writing and we can graduate the 2s drain quiet-period immediately.
+    // The wrapper writes the sentinel as one of its very last actions
+    // before kill_child_tree/cleanup, so its presence is a strict superset
+    // of the quiet-period heuristic. We still keep the legacy 2s sleep as
+    // a fallback for SIGKILL paths that bypass the sentinel write.
+    if jsonl_tail_contains_terminal_end_sentinel(output_path) {
+        return terminal_success_watcher_stop_allowed(
+            confirmed_end,
+            before_meta.len(),
+            TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD,
+        );
+    }
+
     tokio::time::sleep(TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD).await;
 
     let tail_after = std::fs::metadata(output_path)
@@ -1071,6 +1285,48 @@ async fn terminal_success_output_drained_for_recovery(
             tail_after,
             TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD,
         )
+}
+
+/// #2442 — peek the JSONL tail (last ~4 KiB) for the wrapper's
+/// `terminal_end` sentinel. Reading the tail rather than the entire file
+/// keeps this O(1) regardless of jsonl size. False negatives (no sentinel
+/// detected when one is present) just fall back to the legacy 2s
+/// quiet-period sleep, so a partial-line edge case is harmless.
+fn jsonl_tail_contains_terminal_end_sentinel(output_path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_WINDOW_BYTES: u64 = 4 * 1024;
+
+    let Ok(mut file) = std::fs::File::open(output_path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let len = meta.len();
+    if len == 0 {
+        return false;
+    }
+    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut buf = Vec::with_capacity(TAIL_WINDOW_BYTES as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    // The sentinel is one JSONL line: {"type":"terminal_end",...}. We
+    // search for the literal `"type":"terminal_end"` token because the
+    // wrapper writes the JSON with `serde_json::Value::to_string()`, which
+    // emits this exact compact form. If a future patch switches to
+    // pretty-printing the sentinel, the search needs to be reworked — but
+    // we keep that contract in `tmux_common::emit_wrapper_sentinel`.
+    let needle = format!(
+        "\"type\":\"{}\"",
+        crate::services::tmux_common::WRAPPER_TERMINAL_END_EVENT
+    );
+    let haystack = String::from_utf8_lossy(&buf);
+    haystack.contains(&needle)
 }
 
 fn recovery_watcher_start_offset(output_path: &str, saved_last_offset: u64) -> (u64, u64, bool) {
@@ -1120,6 +1376,38 @@ pub(super) async fn restore_inflight_turns(
         }
 
         let channel_id = ChannelId::new(state.channel_id);
+
+        // #2235: silent-skip rows whose on-disk `runtime_kind` was a
+        // present-but-unknown variant string. `load_inflight_states_from_root`
+        // distinguishes this from "field absent" (legacy v7 rows) via the
+        // transient `runtime_kind_unknown_on_disk` flag, so the existing
+        // heuristic recovery path still runs for absent-field legacy rows.
+        // Belt-and-suspenders: also silent-skip when a row's persisted
+        // `version` is ahead of this binary and `runtime_kind` is missing —
+        // forward-marked rows authored by a newer binary should not be
+        // guessed at.
+        let runtime_kind_skew_detected = state.runtime_kind_unknown_on_disk
+            || (state.runtime_kind.is_none()
+                && state.version > super::inflight::inflight_state_version());
+        if runtime_kind_skew_detected {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::debug!(
+                "  [{ts}] ↩ inflight recovery silent-skip for channel {}: runtime_kind unknown/forward-marked (version={}, local={}, unknown_on_disk={})",
+                state.channel_id,
+                state.version,
+                super::inflight::inflight_state_version(),
+                state.runtime_kind_unknown_on_disk
+            );
+            finish_recovered_turn_mailbox(
+                shared,
+                provider,
+                channel_id,
+                "recovery_runtime_kind_unknown_skip",
+            )
+            .await;
+            clear_inflight_state(provider, state.channel_id);
+            continue;
+        }
         let is_dm = matches!(
             channel_id.to_channel(http).await,
             Ok(serenity::model::channel::Channel::Private(_))
@@ -1249,7 +1537,7 @@ pub(super) async fn restore_inflight_turns(
                 // delivery commits; otherwise the channel shows completion
                 // without the final assistant message.
                 let user_msg_id = MessageId::new(state.user_msg_id);
-                complete_recovery_visible_turn(
+                let visible_outcome = complete_recovery_visible_turn(
                     http,
                     shared,
                     provider,
@@ -1258,6 +1546,19 @@ pub(super) async fn restore_inflight_turns(
                     "completed_during_downtime",
                 )
                 .await;
+                if !visible_outcome.should_proceed() {
+                    // #2293 H3 — TUI quiescence gate paused recovery. Skip
+                    // dispatch finalize + analytics persist; preserve the
+                    // inflight so the next pass can retry once the pane
+                    // reports idle.
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        provider = %provider.as_str(),
+                        channel = channel_id.get(),
+                        "[{ts}] ⚠ #2293: recovery (completed_during_downtime) deferred — TUI gate paused; will retry on next watcher pass"
+                    );
+                    continue;
+                }
                 // Complete the dispatch if this was a work dispatch turn — the
                 // normal completion path was lost when dcserver restarted.
                 // #142: implementation/rework need explicit completion. Review
@@ -1366,7 +1667,11 @@ pub(super) async fn restore_inflight_turns(
                                         "  [{ts}] ⚠ recovery: finalize_dispatch failed for {did} (attempt {attempt}/3): {e}"
                                     );
                                     if attempt < 3 {
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                        // #2428 H5: exponential backoff + jitter.
+                                        tokio::time::sleep(recovery_retry_backoff(u32::from(
+                                            attempt,
+                                        )))
+                                        .await;
                                     }
                                 }
                             }
@@ -1443,7 +1748,9 @@ pub(super) async fn restore_inflight_turns(
                                 }
                             }
                             if attempt < 3 {
-                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                // #2428 H5: exponential backoff + jitter.
+                                tokio::time::sleep(recovery_retry_backoff(u32::from(attempt)))
+                                    .await;
                             }
                         }
                         // API retries exhausted — runtime-root DB fallback.
@@ -1849,7 +2156,7 @@ pub(super) async fn restore_inflight_turns(
                 );
                 continue;
             }
-            complete_recovery_visible_turn(
+            let visible_outcome = complete_recovery_visible_turn(
                 http,
                 shared,
                 provider,
@@ -1858,6 +2165,18 @@ pub(super) async fn restore_inflight_turns(
                 "captured_full_response",
             )
             .await;
+            if !visible_outcome.should_proceed() {
+                // #2293 H3 — TUI quiescence gate paused recovery. Skip
+                // dispatch finalize + analytics persist; preserve the
+                // inflight so the next pass retries once the pane is idle.
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    provider = %provider.as_str(),
+                    channel = channel_id.get(),
+                    "[{ts}] ⚠ #2293: recovery (captured_full_response) deferred — TUI gate paused"
+                );
+                continue;
+            }
 
             let recovered_dispatch_id = parse_dispatch_id(&state.user_text)
                 .or(lookup_pending_dispatch_for_thread(shared.api_port, state.channel_id).await);
@@ -1963,8 +2282,11 @@ pub(super) async fn restore_inflight_turns(
                                             "  [{ts}] ⚠ recovery: finalize_dispatch failed for {did} (attempt {attempt}/3): {e}"
                                         );
                                         if attempt < 3 {
-                                            tokio::time::sleep(std::time::Duration::from_secs(1))
-                                                .await;
+                                            // #2428 H5: exponential backoff + jitter.
+                                            tokio::time::sleep(recovery_retry_backoff(u32::from(
+                                                attempt,
+                                            )))
+                                            .await;
                                         }
                                     }
                                 }
@@ -2087,7 +2409,7 @@ pub(super) async fn restore_inflight_turns(
                 continue;
             }
             // Mark user message as completed only after Discord terminal delivery commits.
-            complete_recovery_visible_turn(
+            let visible_outcome = complete_recovery_visible_turn(
                 http,
                 shared,
                 provider,
@@ -2096,6 +2418,17 @@ pub(super) async fn restore_inflight_turns(
                 "output_completed",
             )
             .await;
+            if !visible_outcome.should_proceed() {
+                // #2293 H3 — TUI quiescence gate paused recovery. Skip
+                // downstream dispatch / analytics work; the next pass retries.
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    provider = %provider.as_str(),
+                    channel = channel_id.get(),
+                    "[{ts}] ⚠ #2293: recovery (output_completed) deferred — TUI gate paused"
+                );
+                continue;
+            }
 
             // Complete the dispatch if this was an implementation/rework turn.
             // Review dispatches require the verdict flow (review_verdict.rs)
@@ -2205,8 +2538,11 @@ pub(super) async fn restore_inflight_turns(
                                             "  [{ts}] ⚠ recovery: finalize_dispatch failed for {did} (attempt {attempt}/3): {e}"
                                         );
                                         if attempt < 3 {
-                                            tokio::time::sleep(std::time::Duration::from_secs(1))
-                                                .await;
+                                            // #2428 H5: exponential backoff + jitter.
+                                            tokio::time::sleep(recovery_retry_backoff(u32::from(
+                                                attempt,
+                                            )))
+                                            .await;
                                         }
                                     }
                                 }
@@ -2443,7 +2779,32 @@ pub(super) async fn restore_inflight_turns(
         let input_fifo_path = match recovery_input_fifo_for_runtime(runtime_kind, input_fifo_path) {
             Ok(path) => path,
             Err(reason) => {
+                // #2235: when the inflight row was written without a stamped
+                // `runtime_kind` (legacy pre-v8 row, hook-endpoint race, or a
+                // future variant this binary doesn't recognize),
+                // `runtime_kind_for_recovery` had to guess. If the guess
+                // requires a FIFO that the row never carried, surfacing a
+                // user-visible "input fifo path missing" notice misleads the
+                // operator — the right thing is to skip recovery silently and
+                // let the next turn re-establish state from scratch.
+                let runtime_kind_was_inferred = state.runtime_kind.is_none();
                 let ts = chrono::Local::now().format("%H:%M:%S");
+                if runtime_kind_was_inferred {
+                    tracing::debug!(
+                        "  [{ts}] ↩ inflight recovery silent-skip for channel {}: runtime_kind unknown/missing on-disk, inferred {} requires FIFO but row carries none",
+                        state.channel_id,
+                        runtime_kind.as_str()
+                    );
+                    finish_recovered_turn_mailbox(
+                        shared,
+                        provider,
+                        channel_id,
+                        "recovery_runtime_kind_missing_skip",
+                    )
+                    .await;
+                    clear_inflight_state(provider, state.channel_id);
+                    continue;
+                }
                 tracing::info!(
                     "  [{ts}] ⚠ clearing inflight turn for channel {}: input fifo path missing (runtime={})",
                     state.channel_id,
@@ -3273,6 +3634,15 @@ pub(crate) async fn rebind_inflight_for_channel(
             initial_offset,
         );
         state.rebind_origin = true;
+        // #2161 Part 2 / #2285 adoption: this synthetic inflight is born when
+        // `POST /api/inflight/rebind` adopts a tmux session the operator
+        // launched outside AgentDesk (e.g. `tmux new -s <expected>` + run
+        // provider manually). Tag as `ExternalAdopted` so audit logs and
+        // monitoring surfaces can distinguish "AgentDesk-launched" from
+        // "AgentDesk-discovered" sessions. The session-bound relay (epic
+        // #2285 E1–E5) routes both identically — this is pure audit
+        // metadata.
+        state.turn_source = super::inflight::TurnSource::ExternalAdopted;
 
         // Atomic create-or-fail: if a legitimate turn created its inflight file
         // between the preflight check above and this point, the write fails
@@ -4486,6 +4856,7 @@ mod tests {
             output_path: Some("/tmp/agentdesk-test.jsonl".to_string()),
             input_fifo_path: Some("/tmp/agentdesk-test.input".to_string()),
             runtime_kind: None,
+            runtime_kind_unknown_on_disk: false,
             worktree_path: None,
             worktree_branch: None,
             base_commit: None,
@@ -4514,6 +4885,7 @@ mod tests {
             rebind_origin: false,
             long_running_placeholder_active: false,
             watcher_owns_live_relay: false,
+            turn_source: crate::services::discord::inflight::TurnSource::Managed,
         };
 
         assert!(
@@ -4611,6 +4983,7 @@ mod tests {
             output_path: Some("/tmp/agentdesk-test.jsonl".to_string()),
             input_fifo_path: Some("/tmp/agentdesk-test.input".to_string()),
             runtime_kind: None,
+            runtime_kind_unknown_on_disk: false,
             worktree_path: None,
             worktree_branch: None,
             base_commit: None,
@@ -4639,6 +5012,7 @@ mod tests {
             rebind_origin: false,
             long_running_placeholder_active: false,
             watcher_owns_live_relay: false,
+            turn_source: crate::services::discord::inflight::TurnSource::Managed,
         };
 
         save_missing_session_handoff(

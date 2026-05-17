@@ -15,7 +15,7 @@ use super::outbound::result::DeliveryResult;
 use super::outbound::{DiscordOutboundClient, OutboundDeduper};
 use super::router;
 use super::router::handle_text_message;
-use super::turn_bridge::auto_retry_with_history;
+use super::turn_bridge::{auto_retry_with_history, release_retry_pending};
 use super::{
     Intervention, SharedData, formatting, rate_limit_wait, resolve_discord_bot_provider,
     validate_live_channel_routing,
@@ -66,6 +66,34 @@ pub(super) trait TurnGateway: Send + Sync {
         user_message_id: MessageId,
         user_text: &'a str,
     ) -> GatewayFuture<'a, ()>;
+
+    /// #2452 H6 graduation: variant of `schedule_retry_with_history` that
+    /// returns a `oneshot::Sender<()>` to the caller via the
+    /// `completion_tx` parameter; the implementor MUST signal completion
+    /// (success OR failure) on this channel when scheduling has finished
+    /// so the caller can release any pending-retry lockout immediately
+    /// instead of waiting on a fixed wall-clock timer.
+    ///
+    /// Default implementation delegates to `schedule_retry_with_history`
+    /// and immediately drops `completion_tx`, which causes the
+    /// `recv().await` on the matching `oneshot::Receiver` to resolve with
+    /// `Err(RecvError)` — semantically equivalent to "completion signal
+    /// arrived" for the lockout-release path. Implementors that can
+    /// observe the actual retry-turn completion edge should override this
+    /// to send `()` only after the retry truly completes.
+    fn schedule_retry_with_history_with_completion<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        user_message_id: MessageId,
+        user_text: &'a str,
+        completion_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            self.schedule_retry_with_history(channel_id, user_message_id, user_text)
+                .await;
+            let _ = completion_tx.send(());
+        })
+    }
 
     fn dispatch_queued_turn<'a>(
         &'a self,
@@ -492,6 +520,33 @@ impl TurnGateway for DiscordGateway {
         })
     }
 
+    fn schedule_retry_with_history_with_completion<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        user_message_id: MessageId,
+        user_text: &'a str,
+        completion_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            auto_retry_with_history(
+                &self.http,
+                &self.shared,
+                &self.provider,
+                channel_id,
+                user_message_id,
+                user_text,
+            )
+            .await;
+            // #2452 H6: explicit release path — once scheduling has
+            // resolved, drop the dedup lockout immediately so a
+            // subsequent stale-resume detection on the same channel can
+            // schedule another retry without waiting on the 30s sleep
+            // fallback inside `auto_retry_with_history`.
+            release_retry_pending(channel_id);
+            let _ = completion_tx.send(());
+        })
+    }
+
     fn dispatch_queued_turn<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -542,11 +597,41 @@ impl TurnGateway for DiscordGateway {
                 shared: &self.shared,
                 token: &live_turn.token,
             };
+            // #2266: if the queued intervention carries a voice-transcript
+            // announcement (race-loss enqueue from `handle_text_message`),
+            // reinsert it into the per-process `voice::announce_meta` store
+            // keyed by the intervention's HEAD `message_id` so the
+            // downstream `handle_text_message` `take()` (line ~2261)
+            // recovers the full transcript framing instead of degrading to
+            // plain text. The original entry was consumed by the active
+            // turn that won the race; this in-flight handoff is what makes
+            // the queued path self-contained against the 30s in-memory TTL.
+            let has_embedded_voice_announcement = intervention.voice_announcement.is_some();
+            if let Some(announcement) = intervention.voice_announcement.as_ref() {
+                crate::voice::announce_meta::global_store()
+                    .insert(intervention.message_id, announcement.clone());
+            }
+            // #2266: for voice-transcript queued items, the
+            // `handle_text_message` voice-author authorization check at
+            // line ~2274 requires `announce_bot_id == Some(request_owner)`.
+            // The queued `Intervention.author_id` was captured at intake or
+            // race-loss enqueue time as the ORIGINAL Discord author (the
+            // announce bot), so pass it through here instead of
+            // `live_turn.request_owner` (which is the previous turn's
+            // owner). Non-voice queued items kept the legacy behavior of
+            // routing via the live-turn owner so the user attribution does
+            // not silently swap mid-chain; we only override the
+            // request_owner when the intervention is voice-tagged.
+            let dispatch_request_owner = if has_embedded_voice_announcement {
+                intervention.author_id
+            } else {
+                live_turn.request_owner
+            };
             handle_text_message(
                 &deps,
                 channel_id,
                 intervention.message_id,
-                live_turn.request_owner,
+                dispatch_request_owner,
                 request_owner_name,
                 &intervention.text,
                 true,

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Utc};
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId, UserId};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::services::provider::{CancelToken, ProviderKind};
 
@@ -33,6 +33,16 @@ pub(crate) struct Intervention {
     pub(crate) reply_context: Option<String>,
     pub(crate) has_reply_boundary: bool,
     pub(crate) merge_consecutive: bool,
+    /// #2266: when a voice-transcript announcement loses the
+    /// `mailbox_try_start_turn` race and is enqueued for later dispatch, the
+    /// per-process `voice::announce_meta` store entry is consumed by the
+    /// original `handle_text_message` call before the race-loss branch runs.
+    /// Embedding the full announcement here keeps the queued payload
+    /// self-contained so the dispatch path (which reinserts the entry into
+    /// the store before re-entering `handle_text_message`) can reconstruct
+    /// the voice-transcript framing instead of falling back to plain text.
+    /// `None` for non-voice paths.
+    pub(crate) voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +172,12 @@ pub(crate) fn enqueue_intervention(
                 intervention.source_message_ids.into_iter(),
             );
             last.created_at = intervention.created_at;
+            // #2266: on merge, the incoming voice announcement (if any)
+            // matches the new HEAD `message_id`; the dispatch path reinserts
+            // by the HEAD id, so the latest metadata is what we keep.
+            if intervention.voice_announcement.is_some() {
+                last.voice_announcement = intervention.voice_announcement;
+            }
             return EnqueueInterventionResult {
                 enqueued: true,
                 merged: true,
@@ -281,6 +297,14 @@ pub(crate) struct PendingQueueItem {
     /// Active dispatch role override at save time (lost on restart; stored for diagnostics).
     #[serde(default)]
     pub(crate) override_channel_id: Option<u64>,
+    /// #2266: voice-transcript announcement metadata embedded in the queued
+    /// intervention so the durable on-disk queue stays in sync with the
+    /// in-memory enrichment. `#[serde(default)]` (and `skip_serializing_if`)
+    /// makes the field invisible on non-voice items and forward-compatible
+    /// with queue files written by older binaries.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 }
 
 fn pending_queue_root() -> Option<PathBuf> {
@@ -455,6 +479,12 @@ pub(crate) fn save_channel_queue(
             channel_id: Some(channel_id.get()),
             channel_name: None,
             override_channel_id: dispatch_role_override,
+            // #2266: persist the voice-transcript metadata alongside the
+            // queued intervention so post-restart hydrate restores the
+            // payload and the dispatch path can still reinsert it into the
+            // store. Older queue files (without this field) deserialize as
+            // `None` via the `#[serde(default)]` on the field declaration.
+            voice_announcement: i.voice_announcement.clone(),
         })
         .collect();
     if let Ok(json) = serde_json::to_string_pretty(&items) {
@@ -481,6 +511,13 @@ fn pending_queue_item_to_intervention(item: PendingQueueItem, now: Instant) -> I
         reply_context: item.reply_context,
         has_reply_boundary: item.has_reply_boundary,
         merge_consecutive: item.merge_consecutive,
+        // #2266: durable on-disk queue restores the voice-transcript
+        // metadata so the dispatch path on the next run can reinsert it
+        // into the per-process announce_meta store. Older queue files that
+        // predate this field deserialize as `None` (#[serde(default)]) and
+        // the queued turn degrades to plain text — same as the prior
+        // restart behavior.
+        voice_announcement: item.voice_announcement,
     }
 }
 
@@ -536,6 +573,9 @@ pub(crate) fn save_pending_queues(
                 channel_id: Some(channel_id.get()),
                 channel_name: None,
                 override_channel_id: override_id,
+                // #2266: persist voice metadata in the restart-drain
+                // bulk-save path too (matches `save_channel_queue` above).
+                voice_announcement: i.voice_announcement.clone(),
             })
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&items) {
@@ -867,6 +907,37 @@ impl ChannelMailboxHandle {
         .await
     }
 
+    /// #2374 — atomic "set cancel reason + flip cancelled" performed by
+    /// the mailbox actor. PR #2373 (#2335) set `cancel_source` from the
+    /// caller task before sending the actor a `CancelActiveTurn`; that
+    /// kept the writes ordered for the common path but left a small
+    /// reorder window where two concurrent cancellers could both fetch
+    /// the same `cancel_token`, race to call `set_cancel_source`, then
+    /// have the actor flip `cancelled` based on whichever message it
+    /// dequeued first. Moving the reason write INTO the actor makes the
+    /// reason-then-flip sequence genuinely sequential per channel and
+    /// eliminates the small ordering window the previous design left.
+    ///
+    /// Semantics:
+    ///  - If the active token is already cancelled (`already_stopping`),
+    ///    the reason is NOT overwritten — earlier attribution wins, the
+    ///    same protection PR #2373 added to the caller-side write.
+    ///  - If no active token exists, this is a no-op (returns
+    ///    `token: None`).
+    pub(crate) async fn cancel_active_turn_with_reason(
+        &self,
+        reason: String,
+    ) -> CancelActiveTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::CancelActiveTurnWithReason { reason, reply },
+            CancelActiveTurnResult {
+                token: None,
+                already_stopping: false,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn cancel_active_turn_if_current(
         &self,
         expected_token: Arc<CancelToken>,
@@ -874,6 +945,60 @@ impl ChannelMailboxHandle {
         self.request(
             |reply| ChannelMailboxMsg::CancelActiveTurnIfCurrent {
                 expected_token,
+                reply,
+            },
+            CancelActiveTurnResult {
+                token: None,
+                already_stopping: false,
+            },
+        )
+        .await
+    }
+
+    /// #2374 — see [`Self::cancel_active_turn_with_reason`]. This variant
+    /// preserves the `if_current` guard so a stale caller cannot cancel
+    /// a freshly-restarted turn that happens to live on the same channel.
+    pub(crate) async fn cancel_active_turn_if_current_with_reason(
+        &self,
+        expected_token: Arc<CancelToken>,
+        reason: String,
+    ) -> CancelActiveTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::CancelActiveTurnIfCurrentWithReason {
+                expected_token,
+                reason,
+                reply,
+            },
+            CancelActiveTurnResult {
+                token: None,
+                already_stopping: false,
+            },
+        )
+        .await
+    }
+
+    /// #2374 Codex round-1 fix (HIGH-1) — actor-owned guarded cancel
+    /// keyed by `user_message_id`. The handoff cancel-tombstone retry
+    /// path must only cancel the target-channel turn that was actually
+    /// started by the original handoff prompt; an unguarded cancel
+    /// would also kill an unrelated turn that happened to start on the
+    /// same target channel after the original handoff turn finalized.
+    /// The actor performs the identity check inline so the read of
+    /// `active_user_message_id` and the cancel flip are observed as a
+    /// single per-channel transition.
+    ///
+    /// Returns `token: None` when the active turn's `user_message_id`
+    /// does not match `expected_user_message_id` (or no active turn
+    /// exists at all).
+    pub(crate) async fn cancel_active_turn_if_user_message_with_reason(
+        &self,
+        expected_user_message_id: MessageId,
+        reason: String,
+    ) -> CancelActiveTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::CancelActiveTurnIfUserMessageWithReason {
+                expected_user_message_id,
+                reason,
                 reply,
             },
             CancelActiveTurnResult {
@@ -1165,9 +1290,81 @@ pub(crate) enum WatchdogDeadlineExtensionError {
     NoActiveTurn,
 }
 
+/// #2443 — deterministic "recovery finished" signal per channel.
+///
+/// Pairs a `tokio::sync::Notify` with a one-shot `latched` flag so a
+/// `recovery_done` event raised before a watcher subscribes is still
+/// observable. Without the latch, `Notify::notify_waiters` would lose the
+/// signal whenever recovery completes BEFORE the watcher reaches its
+/// `notified()` await, re-introducing exactly the race the 60s timeout was
+/// papering over. The latch flips on the first `mark_done` call and
+/// `wait()` short-circuits on subsequent observers — recovery sessions are
+/// monotonic per channel within the lifetime of this signal.
+///
+/// Callers reset the latch when a *new* recovery begins (so the next watcher
+/// wave doesn't see a stale "already done"). `reset()` is idempotent.
+pub(crate) struct RecoveryDoneSignal {
+    notify: Notify,
+    latched: std::sync::atomic::AtomicBool,
+}
+
+impl RecoveryDoneSignal {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+            latched: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Mark recovery as finished. Wakes all current waiters and latches the
+    /// signal so subsequent `wait()` calls return immediately until `reset()`.
+    pub(crate) fn mark_done(&self) {
+        self.latched.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Reset the latch so the next recovery cycle starts clean. Should be
+    /// called at recovery kickoff so an old "done" flag does not satisfy a
+    /// watcher waiting for the new run.
+    pub(crate) fn reset(&self) {
+        self.latched.store(false, Ordering::Release);
+    }
+
+    /// Wait until `mark_done` is observed. Returns immediately if the latch
+    /// is already set (race-free for observers that subscribe after the
+    /// notification fires).
+    pub(crate) async fn wait(&self) {
+        if self.latched.load(Ordering::Acquire) {
+            return;
+        }
+        // Subscribe BEFORE the second check to close the
+        // observe-then-subscribe window. `Notify::notified()` returns a
+        // future that registers a waiter on first poll; recheck the flag
+        // afterwards in case `mark_done` ran between the load and the
+        // subscribe.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        if self.latched.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+static GLOBAL_RECOVERY_DONE_SIGNALS: LazyLock<
+    dashmap::DashMap<ChannelId, Arc<RecoveryDoneSignal>>,
+> = LazyLock::new(dashmap::DashMap::new);
+
 #[derive(Clone, Default)]
 pub(crate) struct ChannelMailboxRegistry {
     handles: Arc<dashmap::DashMap<ChannelId, ChannelMailboxHandle>>,
+    /// #2443 — per-channel "recovery finished" signals consumed by
+    /// `watchers/lifecycle.rs` to graduate the 60s `recovery_started_at < 60s`
+    /// skip heuristic. Stored in a separate map (rather than fields on the
+    /// mailbox actor state) so both the recovery_engine producer and the
+    /// watchers/lifecycle consumer can take a clone without round-tripping
+    /// through the actor's message channel.
+    recovery_done: Arc<dashmap::DashMap<ChannelId, Arc<RecoveryDoneSignal>>>,
 }
 
 impl ChannelMailboxRegistry {
@@ -1190,6 +1387,37 @@ impl ChannelMailboxRegistry {
 
     pub(crate) fn global_handle(channel_id: ChannelId) -> Option<ChannelMailboxHandle> {
         GLOBAL_CHANNEL_MAILBOXES
+            .get(&channel_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// #2443 — fetch or create the recovery-done signal for this channel.
+    /// Cloning the `Arc` is cheap; the signal lives for the lifetime of the
+    /// registry. The same `Arc` is mirrored into `GLOBAL_RECOVERY_DONE_SIGNALS`
+    /// so callers that only have a `ChannelId` (no registry handle, e.g.
+    /// helper free functions outside `SharedData`) can resolve via
+    /// `global_recovery_done`.
+    pub(crate) fn recovery_done(&self, channel_id: ChannelId) -> Arc<RecoveryDoneSignal> {
+        if let Some(existing) = self.recovery_done.get(&channel_id) {
+            return existing.clone();
+        }
+        let signal = Arc::new(RecoveryDoneSignal::new());
+        let resolved = match self.recovery_done.entry(channel_id) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(signal.clone());
+                signal
+            }
+        };
+        GLOBAL_RECOVERY_DONE_SIGNALS.insert(channel_id, resolved.clone());
+        resolved
+    }
+
+    /// #2443 — globally resolvable variant. Returns `None` only when no
+    /// `recovery_done()` call has happened yet for this channel; callers
+    /// that need a signal regardless should use the per-instance accessor.
+    pub(crate) fn global_recovery_done(channel_id: ChannelId) -> Option<Arc<RecoveryDoneSignal>> {
+        GLOBAL_RECOVERY_DONE_SIGNALS
             .get(&channel_id)
             .map(|entry| entry.value().clone())
     }
@@ -1246,8 +1474,28 @@ enum ChannelMailboxMsg {
     CancelActiveTurn {
         reply: oneshot::Sender<CancelActiveTurnResult>,
     },
+    /// #2374 — atomic reason-write + cancel flip performed by the actor.
+    CancelActiveTurnWithReason {
+        reason: String,
+        reply: oneshot::Sender<CancelActiveTurnResult>,
+    },
     CancelActiveTurnIfCurrent {
         expected_token: Arc<CancelToken>,
+        reply: oneshot::Sender<CancelActiveTurnResult>,
+    },
+    /// #2374 — see `CancelActiveTurnWithReason`. Variant that also matches
+    /// `expected_token` so a stale caller cannot cancel a restarted turn.
+    CancelActiveTurnIfCurrentWithReason {
+        expected_token: Arc<CancelToken>,
+        reason: String,
+        reply: oneshot::Sender<CancelActiveTurnResult>,
+    },
+    /// #2374 Codex round-1 fix (HIGH-1) — identity-guarded cancel by
+    /// active `user_message_id`. See
+    /// `ChannelMailboxHandle::cancel_active_turn_if_user_message_with_reason`.
+    CancelActiveTurnIfUserMessageWithReason {
+        expected_user_message_id: MessageId,
+        reason: String,
         reply: oneshot::Sender<CancelActiveTurnResult>,
     },
     TryStartTurn {
@@ -1526,6 +1774,40 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         already_stopping,
                     });
                 }
+                ChannelMailboxMsg::CancelActiveTurnWithReason { reason, reply } => {
+                    // #2374 — atomic, actor-serialized "reason then flip"
+                    // for the active turn. The previous design (#2373)
+                    // wrote `cancel_source` from the caller task BEFORE
+                    // sending the actor a `CancelActiveTurn`. That kept
+                    // the writes ordered for the common path but two
+                    // concurrent cancellers could both observe the same
+                    // pre-flip token, race on `set_cancel_source`, then
+                    // have the actor flip `cancelled` on whichever
+                    // message it dequeued first — losing one of the
+                    // reasons. By owning the reason write here, the
+                    // mailbox actor serializes both writes per channel.
+                    //
+                    // Existing-cancellation guard mirrors #2373: do NOT
+                    // overwrite a reason once `cancelled` is set so
+                    // earlier attribution (e.g. a watchdog timeout that
+                    // already fired) wins over a later voice cancel.
+                    let token = state.cancel_token.clone();
+                    let already_stopping = token.as_ref().is_some_and(|token| {
+                        token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    if let Some(token) = token.as_ref()
+                        && !already_stopping
+                    {
+                        token.set_cancel_source(reason.clone());
+                        token
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let _ = reply.send(CancelActiveTurnResult {
+                        token,
+                        already_stopping,
+                    });
+                }
                 ChannelMailboxMsg::CancelActiveTurnIfCurrent {
                     expected_token,
                     reply,
@@ -1540,6 +1822,74 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     if let Some(token) = token.as_ref()
                         && !already_stopping
                     {
+                        token
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let _ = reply.send(CancelActiveTurnResult {
+                        token,
+                        already_stopping,
+                    });
+                }
+                ChannelMailboxMsg::CancelActiveTurnIfCurrentWithReason {
+                    expected_token,
+                    reason,
+                    reply,
+                } => {
+                    // #2374 — atomic reason-then-flip with the
+                    // `if_current` guard preserved. See the unguarded
+                    // variant above for the broader rationale.
+                    let token = state
+                        .cancel_token
+                        .clone()
+                        .filter(|token| Arc::ptr_eq(token, &expected_token));
+                    let already_stopping = token.as_ref().is_some_and(|token| {
+                        token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    if let Some(token) = token.as_ref()
+                        && !already_stopping
+                    {
+                        token.set_cancel_source(reason.clone());
+                        token
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let _ = reply.send(CancelActiveTurnResult {
+                        token,
+                        already_stopping,
+                    });
+                }
+                ChannelMailboxMsg::CancelActiveTurnIfUserMessageWithReason {
+                    expected_user_message_id,
+                    reason,
+                    reply,
+                } => {
+                    // #2374 Codex round-1 fix (HIGH-1): only cancel
+                    // when the active turn's `user_message_id` matches
+                    // the caller's expected handoff message id. The
+                    // tombstone retry path uses this so a still-later
+                    // cancel for the same handoff cannot accidentally
+                    // kill an unrelated turn that happened to start on
+                    // the same target channel after the original
+                    // handoff turn finalized. The actor performs the
+                    // identity check + cancel as a single serialized
+                    // step so no concurrent caller can swap the active
+                    // turn between the check and the flip.
+                    let identity_matches = state
+                        .active_user_message_id
+                        .is_some_and(|id| id == expected_user_message_id);
+                    let token = if identity_matches {
+                        state.cancel_token.clone()
+                    } else {
+                        None
+                    };
+                    let already_stopping = token.as_ref().is_some_and(|token| {
+                        token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    if let Some(token) = token.as_ref()
+                        && !already_stopping
+                    {
+                        token.set_cancel_source(reason.clone());
                         token
                             .cancelled
                             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1806,6 +2156,7 @@ mod actor_hydrate_regression_tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            voice_announcement: None,
         }
     }
 
@@ -1950,6 +2301,253 @@ mod actor_hydrate_regression_tests {
         assert_eq!(audits[0].action, "preserved_active");
         assert!(active_tmp.exists(), "fresh tmp writes must be preserved");
     }
+
+    /// #2374 — the mailbox actor must own the reason-write so that the
+    /// reason and the `cancelled` flip happen as one serialized
+    /// transition per channel. Verifies: after a single
+    /// `cancel_active_turn_with_reason` round trip, the returned token
+    /// is cancelled AND carries the supplied label.
+    #[tokio::test]
+    async fn cancel_active_turn_with_reason_writes_label_and_flips_atomically() {
+        let channel_id = ChannelId::new(2374001);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+
+        let cancel_token = Arc::new(CancelToken::new());
+        let started = handle
+            .try_start_turn(cancel_token.clone(), UserId::new(1), MessageId::new(11))
+            .await;
+        assert!(started, "fresh channel must accept the new turn");
+
+        let result = handle
+            .cancel_active_turn_with_reason("voice_foreground_cancel_during_handoff".to_string())
+            .await;
+
+        let returned = result.token.expect("cancel returned the active token");
+        assert!(
+            returned.cancelled.load(Ordering::Relaxed),
+            "actor must flip `cancelled` as part of the reason-owned transition"
+        );
+        assert_eq!(
+            returned.cancel_source().as_deref(),
+            Some("voice_foreground_cancel_during_handoff"),
+            "actor must write the reason label inside the same actor step \
+             (not from the caller task)"
+        );
+        assert!(
+            !result.already_stopping,
+            "first cancel must not report already_stopping"
+        );
+    }
+
+    /// #2374 — two concurrent cancellers must not trample each other's
+    /// reason. The first cancel wins both the flip and the label; a
+    /// second cancel observing `already_stopping=true` must NOT
+    /// overwrite the recorded reason. Without actor ownership of the
+    /// reason write, the caller-side `set_cancel_source` from the second
+    /// canceller could race with the first canceller's write between
+    /// the "is it already cancelled?" read and the actual store.
+    #[tokio::test]
+    async fn concurrent_cancels_do_not_trample_each_others_reason() {
+        let channel_id = ChannelId::new(2374002);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+
+        let cancel_token = Arc::new(CancelToken::new());
+        handle
+            .try_start_turn(cancel_token.clone(), UserId::new(1), MessageId::new(22))
+            .await;
+
+        // Fire two concurrent cancel attempts with different reasons.
+        // Whichever the actor dequeues first must win the attribution;
+        // the loser must observe `already_stopping=true` AND find the
+        // recorded reason unchanged.
+        let handle_a = handle.clone();
+        let handle_b = handle.clone();
+        let task_a = tokio::spawn(async move {
+            handle_a
+                .cancel_active_turn_with_reason("voice_barge_in_live_cut".to_string())
+                .await
+        });
+        let task_b = tokio::spawn(async move {
+            handle_b
+                .cancel_active_turn_with_reason("watchdog_timeout".to_string())
+                .await
+        });
+        let res_a = task_a.await.expect("task a panicked");
+        let res_b = task_b.await.expect("task b panicked");
+
+        // Exactly one of the two cancellers must observe
+        // `already_stopping=false` (the winner). The other must observe
+        // `already_stopping=true` (the loser).
+        let winner_count = [&res_a, &res_b]
+            .iter()
+            .filter(|r| !r.already_stopping)
+            .count();
+        assert_eq!(
+            winner_count, 1,
+            "exactly one canceller can win the actor's serialized flip"
+        );
+
+        // The winner's reason must be the one persisted. Since the
+        // actor is the sole writer, the winner's label is whichever
+        // task the actor dequeued first; the loser's later message
+        // must NOT mutate the label.
+        let winner_label = if !res_a.already_stopping {
+            "voice_barge_in_live_cut"
+        } else {
+            "watchdog_timeout"
+        };
+        assert_eq!(
+            cancel_token.cancel_source().as_deref(),
+            Some(winner_label),
+            "loser's reason must NOT overwrite the winner's (actor-owned write)"
+        );
+        assert!(
+            cancel_token.cancelled.load(Ordering::Relaxed),
+            "token must be cancelled after either cancel returns"
+        );
+    }
+
+    /// #2374 — `cancel_active_turn_if_current_with_reason` keeps the
+    /// stale-caller guard. A token that no longer matches the active
+    /// turn must NOT flip `cancelled` on the live turn nor write a
+    /// reason.
+    #[tokio::test]
+    async fn cancel_if_current_with_reason_rejects_stale_token() {
+        let channel_id = ChannelId::new(2374003);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+
+        let stale_token = Arc::new(CancelToken::new());
+        let live_token = Arc::new(CancelToken::new());
+        handle
+            .try_start_turn(live_token.clone(), UserId::new(1), MessageId::new(33))
+            .await;
+
+        let result = handle
+            .cancel_active_turn_if_current_with_reason(
+                stale_token.clone(),
+                "stale_caller_reason".to_string(),
+            )
+            .await;
+
+        assert!(
+            result.token.is_none(),
+            "stale `if_current` caller must not match the live turn"
+        );
+        assert!(
+            !live_token.cancelled.load(Ordering::Relaxed),
+            "live turn must NOT be cancelled by a stale caller"
+        );
+        assert!(
+            live_token.cancel_source().is_none(),
+            "live turn must NOT carry the stale caller's reason"
+        );
+    }
+
+    /// #2374 Codex round-1 fix (HIGH-1) —
+    /// `cancel_active_turn_if_user_message_with_reason` MUST cancel
+    /// only when the active turn's `user_message_id` matches.
+    #[tokio::test]
+    async fn cancel_if_user_message_matches_cancels_with_reason() {
+        let channel_id = ChannelId::new(2374004);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+
+        let live_token = Arc::new(CancelToken::new());
+        let handoff_msg = MessageId::new(987_654);
+        handle
+            .try_start_turn(live_token.clone(), UserId::new(1), handoff_msg)
+            .await;
+
+        let result = handle
+            .cancel_active_turn_if_user_message_with_reason(
+                handoff_msg,
+                "voice_foreground_cancel_during_handoff".to_string(),
+            )
+            .await;
+
+        assert!(
+            result.token.is_some(),
+            "matching user_message_id must cancel the active turn"
+        );
+        assert!(live_token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(
+            live_token.cancel_source().as_deref(),
+            Some("voice_foreground_cancel_during_handoff"),
+        );
+    }
+
+    /// #2374 Codex round-1 fix (HIGH-1) — identity-guarded cancel MUST
+    /// NOT touch the live turn when the active `user_message_id`
+    /// belongs to a DIFFERENT message id than the caller's expected
+    /// handoff id. This is the exact scenario the original PR missed:
+    /// a tombstone retry arriving after the original handoff turn
+    /// finalized and an unrelated turn started on the same target
+    /// channel.
+    #[tokio::test]
+    async fn cancel_if_user_message_rejects_unrelated_active_turn() {
+        let channel_id = ChannelId::new(2374005);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+
+        // Active turn is an UNRELATED message (e.g. the original
+        // handoff turn finalized and a new turn started).
+        let live_token = Arc::new(CancelToken::new());
+        let unrelated_msg = MessageId::new(111_111);
+        let handoff_msg = MessageId::new(999_999);
+        handle
+            .try_start_turn(live_token.clone(), UserId::new(1), unrelated_msg)
+            .await;
+
+        let result = handle
+            .cancel_active_turn_if_user_message_with_reason(
+                handoff_msg,
+                "voice_foreground_cancel_during_handoff".to_string(),
+            )
+            .await;
+
+        assert!(
+            result.token.is_none(),
+            "identity-guarded cancel must NOT match an unrelated active turn"
+        );
+        assert!(
+            !live_token.cancelled.load(Ordering::Relaxed),
+            "unrelated active turn must NOT be cancelled by a tombstone retry"
+        );
+        assert!(
+            live_token.cancel_source().is_none(),
+            "unrelated active turn must NOT carry the handoff reason"
+        );
+    }
+
+    /// #2374 Codex round-1 fix (HIGH-1) — identity-guarded cancel
+    /// returns `None` when no active turn exists. This is the
+    /// "handoff turn already finalized" case: the tombstone retry
+    /// must observe no live token AND not affect any future turn.
+    #[tokio::test]
+    async fn cancel_if_user_message_returns_none_when_no_active_turn() {
+        let channel_id = ChannelId::new(2374006);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+
+        let result = handle
+            .cancel_active_turn_if_user_message_with_reason(
+                MessageId::new(42),
+                "voice_foreground_cancel_during_handoff".to_string(),
+            )
+            .await;
+
+        assert!(
+            result.token.is_none(),
+            "no-active-turn case must return None — no work to cancel"
+        );
+        assert!(
+            !result.already_stopping,
+            "no-active-turn case must not report already_stopping"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -1994,6 +2592,7 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            voice_announcement: None,
         }
     }
 
@@ -2675,5 +3274,63 @@ mod tests {
         assert!(handle.extend_timeout(15).await.is_ok());
         handle.clear_timeout_override().await;
         assert_eq!(handle.take_timeout_override().await, None);
+    }
+}
+
+#[cfg(test)]
+mod recovery_done_signal_tests {
+    use super::*;
+
+    /// #2443 — verify the latch-then-wait race-free contract.
+    #[tokio::test]
+    async fn recovery_done_latch_short_circuits_late_subscribers() {
+        let signal = RecoveryDoneSignal::new();
+        signal.mark_done();
+        // Subscriber registers AFTER mark_done — must still complete.
+        tokio::time::timeout(std::time::Duration::from_millis(100), signal.wait())
+            .await
+            .expect("late subscriber should observe latched done state");
+    }
+
+    /// #2443 — verify the reset clears the latch so the next recovery
+    /// cycle's watcher does not see a stale signal.
+    #[tokio::test]
+    async fn recovery_done_reset_unlatches_for_next_cycle() {
+        let signal = std::sync::Arc::new(RecoveryDoneSignal::new());
+        signal.mark_done();
+        signal.reset();
+        // After reset, wait should NOT short-circuit — must time out.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), signal.wait()).await;
+        assert!(
+            result.is_err(),
+            "reset() should clear the latch so subsequent waits block until next mark_done"
+        );
+        // Now fire mark_done in a background task and confirm a fresh
+        // waiter wakes up.
+        let signal_for_task = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            signal_for_task.mark_done();
+        });
+        tokio::time::timeout(std::time::Duration::from_millis(500), signal.wait())
+            .await
+            .expect("wait after reset should resolve when mark_done fires again");
+    }
+
+    /// #2443 — global resolution path used by watchers/lifecycle.rs.
+    #[tokio::test]
+    async fn registry_recovery_done_is_globally_resolvable() {
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(99_443);
+        let signal = registry.recovery_done(channel_id);
+        let resolved =
+            ChannelMailboxRegistry::global_recovery_done(channel_id).expect("global signal");
+        // Identity check via mark_done propagation: marking one wakes
+        // the other if they point to the same underlying Arc.
+        signal.mark_done();
+        tokio::time::timeout(std::time::Duration::from_millis(50), resolved.wait())
+            .await
+            .expect("global_recovery_done should resolve to the same Arc");
     }
 }
