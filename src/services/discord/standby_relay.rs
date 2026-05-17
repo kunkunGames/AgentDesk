@@ -31,18 +31,11 @@ use serenity::model::id::{ChannelId, MessageId};
 
 use super::SharedData;
 use super::formatting;
-use super::inflight::{InflightSignal, InflightTurnState};
+use super::inflight::InflightTurnState;
 use crate::services::provider::ProviderKind;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// #2448 graduation: the 900s (15min) cap was the heuristic stop signal —
-/// "after this long the primary turn is presumed dead". Now that
-/// `CompletionGuard` broadcasts `InflightSignal::Completed` explicitly,
-/// the wall-clock deadline is demoted to a pure safety backstop: it only
-/// fires when neither the broadcast (same-node) nor the on-disk inflight
-/// poll (cross-node) ever observe completion. 30 min comfortably covers
-/// any sane long-running turn.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(900); // 15 min
 const MAX_FILE_BYTES_PER_TICK: u64 = 1_048_576; // 1 MiB safety cap
 const INFLIGHT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -66,12 +59,6 @@ pub(super) async fn run_standby_relay(
     let mut last_inflight_heartbeat = Instant::now();
     // Buffer for incomplete trailing line across reads.
     let mut tail_buf = String::new();
-    // #2448: subscribe BEFORE the first poll tick so a `Completed` broadcast
-    // emitted while we are setting up is queued instead of lost. Lag is
-    // expected on heavy load — `RecvError::Lagged` is treated as "you may
-    // have missed an exit-eligible signal" and triggers a force-poll +
-    // state re-fetch on the next tick (matches the issue pitfalls section).
-    let mut inflight_signals = shared.inflight_signals.subscribe();
     let ts_start = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
         "  [{ts_start}] 👁 standby_relay started for channel {} from offset {} (placeholder={:?})",
@@ -93,60 +80,11 @@ pub(super) async fn run_standby_relay(
         if Instant::now() > deadline {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::warn!(
-                "  [{ts}] ⚠ standby_relay deadline reached for channel {} (offset={}, no completion signal or result event observed in {}s — safety backstop)",
+                "  [{ts}] ⚠ standby_relay timeout for channel {} (offset={}, no result event)",
                 channel_id.get(),
-                current_offset,
-                timeout.as_secs()
+                current_offset
             );
             return;
-        }
-        // #2448: drain the broadcast queue NON-blocking before each poll
-        // tick. If we observe `Completed { channel_id: self }` here, the
-        // primary turn_bridge has dropped its `CompletionGuard` and any
-        // residual JSONL `result` event was either consumed by the bridge
-        // (leader path) or will land on the next file-poll tick. Either
-        // way the relay can exit promptly.
-        loop {
-            use tokio::sync::broadcast::error::TryRecvError;
-            match inflight_signals.try_recv() {
-                Ok(InflightSignal::Completed { channel_id: c }) if c == channel_id.get() => {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] 👁 standby_relay exit on InflightSignal::Completed for channel {} (offset={})",
-                        channel_id.get(),
-                        current_offset
-                    );
-                    return;
-                }
-                Ok(_) => continue, // other channels — ignore
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Lagged(_)) => {
-                    // Codex review HIGH: a bursty publisher can saturate the
-                    // 256-slot broadcast and Lag us before we observe our
-                    // own `Completed`. The previous `break` here meant we
-                    // silently fell through to the 1800s backstop — the
-                    // exact regression #2448 was meant to close. Recheck
-                    // the on-disk inflight authoritatively: if terminal
-                    // (file gone or pointing at a different output), the
-                    // turn already completed and we should exit now.
-                    if super::inflight::load_inflight_state(&provider, channel_id.get())
-                        .map(|state| {
-                            !standby_inflight_matches(&state, &output_path, placeholder_msg_id)
-                        })
-                        .unwrap_or(true)
-                    {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts}] 👁 standby_relay exit on broadcast Lag + terminal inflight for channel {} (offset={})",
-                            channel_id.get(),
-                            current_offset
-                        );
-                        return;
-                    }
-                    break;
-                }
-                Err(TryRecvError::Closed) => break, // sender dropped — keep polling
-            }
         }
         if last_inflight_heartbeat.elapsed() >= INFLIGHT_HEARTBEAT_INTERVAL {
             refresh_standby_inflight_heartbeat(
@@ -429,44 +367,5 @@ mod tests {
 
         state.current_msg_id = 0;
         assert!(standby_inflight_matches(&state, "/tmp/out.jsonl", None));
-    }
-
-    /// #2448 acceptance — confirm the relay-side broadcast filter:
-    /// `InflightSignal::Completed` for a NON-matching channel must be
-    /// ignored, while one for the OWN channel must short-circuit. We
-    /// exercise the filter shape inline because the live relay loop
-    /// requires a `serenity::http::Http` fixture not available in this
-    /// test scope.
-    #[test]
-    fn inflight_signal_filter_matches_own_channel_only() {
-        use super::InflightSignal;
-        let own = 11_111u64;
-        let other = 22_222u64;
-
-        let matches = |sig: &InflightSignal| match sig {
-            InflightSignal::Completed { channel_id } => *channel_id == own,
-        };
-
-        assert!(matches(&InflightSignal::Completed { channel_id: own }));
-        assert!(!matches(&InflightSignal::Completed { channel_id: other }));
-    }
-
-    /// #2448 acceptance — `tokio::sync::broadcast` capacity 256 must
-    /// deliver `Completed` to a subscribed receiver within one recv
-    /// iteration. The relay's poll-tick observes the queued message via
-    /// `try_recv` on the next iteration, so the broadcast latency is
-    /// bounded by the relay's `POLL_INTERVAL` (500ms) ceiling.
-    #[tokio::test]
-    async fn inflight_signal_broadcast_delivers_to_subscriber() {
-        use super::InflightSignal;
-        let (tx, mut rx) = tokio::sync::broadcast::channel::<InflightSignal>(256);
-
-        let send_result = tx.send(InflightSignal::Completed { channel_id: 42 });
-        assert!(send_result.is_ok());
-
-        let received = rx.recv().await.expect("broadcast delivered");
-        match received {
-            InflightSignal::Completed { channel_id } => assert_eq!(channel_id, 42),
-        }
     }
 }

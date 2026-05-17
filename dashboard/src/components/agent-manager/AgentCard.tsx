@@ -6,7 +6,7 @@ import { getProviderMeta } from "../../app/providerTheme";
 import AgentAvatar from "../AgentAvatar";
 import { SurfaceActionButton, SurfaceCard } from "../common/SurfacePrimitives";
 import { STATUS_DOT } from "./constants";
-import { getAgentLevel, getAgentTitle } from "./agentProgress";
+import { getAgentLevel, getAgentTitle } from "./AgentInfoCard";
 import type { Translator } from "./types";
 
 type AgentCardViewMode = "grid" | "list";

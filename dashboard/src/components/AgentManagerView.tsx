@@ -104,6 +104,7 @@ export default function AgentManagerView({
     setDeptModal,
     setDeptTab,
     setDispatchOpen,
+    setForm,
     setSearch,
     setSortMode,
     setStatusFilter,
@@ -465,6 +466,7 @@ export default function AgentManagerView({
           locale={locale}
           tr={tr}
           form={form}
+          setForm={setForm}
           departments={departments}
           isEdit={!!agentModal.editAgent}
           saving={saving}

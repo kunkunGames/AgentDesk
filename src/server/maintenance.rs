@@ -67,8 +67,6 @@ impl MaintenanceJobRegistry {
             Arc::new(QualityRegressionAlerterJob),
             Arc::new(CancelTombstonePruneJob),
             Arc::new(PromptManifestRetentionJob::new(prompt_manifest_retention)),
-            Arc::new(VoiceTurnLinkGcJob),
-            Arc::new(VoiceBackgroundHandoffMetaGcJob),
         ])
     }
 
@@ -186,47 +184,6 @@ impl MaintenanceJob for CancelTombstonePruneJob {
     }
 }
 
-/// #2362 / #2164 Voice A — hourly sweep of terminal `voice_turn_link`
-/// rows older than 24h. Active and cancelled rows are intentionally
-/// preserved because background turns can live 24h+ and the cancelled
-/// tombstones support reverse lookup during late reconciliation. The
-/// schedule mirrors the existing 30-minute cadence used by
-/// `CancelTombstonePruneJob`; staggered 25s after boot so it does not
-/// pile on top of other storage jobs.
-struct VoiceTurnLinkGcJob;
-
-/// Retention horizon for `voice_turn_link` terminal rows. 24h is long
-/// enough that any reasonable late-arriving barge-in / cancel /
-/// completion signal still finds the row.
-const VOICE_TURN_LINK_GC_RETENTION_SECS: i64 = 24 * 60 * 60;
-
-impl MaintenanceJob for VoiceTurnLinkGcJob {
-    fn name(&self) -> &'static str {
-        "voice.turn_link_gc"
-    }
-
-    fn schedule(&self) -> MaintenanceSchedule {
-        MaintenanceSchedule::every(Duration::from_secs(60 * 60), Duration::from_secs(25))
-    }
-
-    fn run<'a>(&'a self, pool: &'a PgPool) -> MaintenanceFuture<'a> {
-        Box::pin(async move {
-            let cutoff = Utc::now() - chrono::Duration::seconds(VOICE_TURN_LINK_GC_RETENTION_SECS);
-            let deleted =
-                crate::voice::turn_link::gc_terminal_voice_turn_links_pg(pool, cutoff).await?;
-            if deleted > 0 {
-                tracing::info!(
-                    job = self.name(),
-                    deleted,
-                    retention_secs = VOICE_TURN_LINK_GC_RETENTION_SECS,
-                    "[maintenance] voice_turn_link GC swept terminal rows"
-                );
-            }
-            Ok(())
-        })
-    }
-}
-
 /// #1699 — daily sweep over `prompt_manifest_layers` to enforce the
 /// retention policy from `agentdesk.yaml::prompt_manifest_retention`.
 /// Trims `full_content` for rows older than `full_content_days`, preserves
@@ -273,50 +230,6 @@ impl MaintenanceJob for PromptManifestRetentionJob {
                     trimmed = report.trimmed_full_content,
                     horizon_at = ?report.horizon_at,
                     "[maintenance] prompt_manifest_retention trimmed full content"
-                );
-            }
-            Ok(())
-        })
-    }
-}
-
-/// #2274 — leader-only GC for `voice_background_handoff_meta`. Cleans
-/// rows whose `created_at` is older than the durable handoff TTL (~1
-/// hour). Consumed rows are also removed by the same age-based filter
-/// since terminal-delivery rows are consumed within minutes; anything
-/// older almost certainly represents a turn that crashed before terminal
-/// delivery and never claimed the row. Conservative 75-second stagger
-/// keeps it sequenced after the announce-meta GC at boot.
-struct VoiceBackgroundHandoffMetaGcJob;
-
-impl MaintenanceJob for VoiceBackgroundHandoffMetaGcJob {
-    fn name(&self) -> &'static str {
-        "storage.voice_background_handoff_meta_gc"
-    }
-
-    fn schedule(&self) -> MaintenanceSchedule {
-        // 15-minute cadence matches the announce-meta GC pattern; the
-        // stagger is a touch longer so the two storage GCs do not race
-        // for the same connection on the same tick.
-        MaintenanceSchedule::every(Duration::from_secs(15 * 60), Duration::from_secs(75))
-    }
-
-    fn run<'a>(&'a self, pool: &'a PgPool) -> MaintenanceFuture<'a> {
-        Box::pin(async move {
-            let ttl = Duration::from_secs(
-                crate::voice::announce_meta::DURABLE_HANDOFF_META_TTL_SECS as u64,
-            );
-            let deleted =
-                crate::voice::announce_meta::gc_expired_voice_background_handoff_meta_pg(pool, ttl)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("voice_background_handoff_meta_gc failed: {error}")
-                    })?;
-            if deleted > 0 {
-                tracing::info!(
-                    job = self.name(),
-                    deleted,
-                    "[maintenance] voice_background_handoff_meta_gc removed expired rows"
                 );
             }
             Ok(())
@@ -1062,33 +975,5 @@ mod tests {
         pg_pool.close().await;
         pg_db.drop().await?;
         Ok(())
-    }
-}
-
-/// Registry-membership assertion (#2362 / #2164 Voice A). Lives outside
-/// the `legacy-sqlite-tests` gate so the production scheduler is checked
-/// in the normal test path.
-#[cfg(test)]
-mod registry_membership_tests {
-    use super::*;
-
-    #[test]
-    fn static_registry_includes_voice_turn_link_gc() {
-        let registry = MaintenanceJobRegistry::static_registry();
-        let names: Vec<&'static str> = registry.jobs().iter().map(|job| job.name()).collect();
-        assert!(
-            names.contains(&"voice.turn_link_gc"),
-            "voice.turn_link_gc must be registered on the production \
-             MaintenanceJobRegistry so the leader scheduler sweeps \
-             terminal voice_turn_link rows (#2362). present jobs: {names:?}"
-        );
-    }
-
-    #[test]
-    fn voice_turn_link_gc_schedule_is_hourly() {
-        let job = VoiceTurnLinkGcJob;
-        assert_eq!(job.name(), "voice.turn_link_gc");
-        let schedule = job.schedule();
-        assert_eq!(schedule.every_ms(), 60 * 60 * 1_000);
     }
 }

@@ -168,7 +168,6 @@ async fn submit_review_decision_fallback(
             decision: decision.to_string(),
             comment: Some(comment),
             commit_sha,
-            out_of_scope: None,
         },
     )
     .await

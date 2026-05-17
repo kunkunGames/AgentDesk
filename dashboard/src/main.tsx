@@ -1,9 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App";
-import { queryClient } from "./app/queryClient";
 import { OverlayProvider } from "./components/common/overlay";
 import {
   DEFAULT_ACCENT_PRESET,
@@ -13,7 +11,6 @@ import {
   resolveThemePreference,
 } from "./app/themePreferences";
 import "./styles/main.css";
-import "./styles/main.components.css";
 
 const prefersDarkScheme = window.matchMedia("(prefers-color-scheme: dark)").matches;
 const initialThemePreference = readStoredThemePreference(window.localStorage, "dark");
@@ -42,12 +39,10 @@ window.addEventListener("error", (e) => {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <OverlayProvider>
-          <App />
-        </OverlayProvider>
-      </BrowserRouter>
-    </QueryClientProvider>
+    <BrowserRouter>
+      <OverlayProvider>
+        <App />
+      </OverlayProvider>
+    </BrowserRouter>
   </React.StrictMode>,
 );

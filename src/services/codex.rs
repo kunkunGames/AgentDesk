@@ -8,14 +8,12 @@ use std::time::Duration;
 
 use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage};
 use crate::services::claude;
-use crate::services::claude_tui::hook_bundle::{
-    HookBundleConfig, codex_hook_config_overrides, run_codex_hook_launch_self_check_with_exec_path,
-};
+use crate::services::claude_tui::hook_bundle::{HookBundleConfig, codex_hook_config_overrides};
 use crate::services::claude_tui::hook_server::current_hook_endpoint;
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
-use crate::services::process::{kill_child_tree, kill_pid_tree, shell_escape};
+use crate::services::process::{kill_child_tree, shell_escape};
 use crate::services::provider::{
     CancelToken, FollowupResult, ProviderKind, SessionProbe, cancel_requested,
     fold_read_output_result, is_readonly_tool_policy, register_child_pid,
@@ -462,8 +460,6 @@ fn current_agentdesk_exe_for_hook_bundle() -> String {
 fn prepare_codex_tui_hook_overrides(
     tmux_session_name: &str,
     session_id: Option<&str>,
-    codex_bin: &str,
-    exec_path: Option<&str>,
 ) -> Vec<String> {
     let Some(endpoint) = current_hook_endpoint() else {
         tracing::debug!(
@@ -472,15 +468,6 @@ fn prepare_codex_tui_hook_overrides(
         );
         return Vec::new();
     };
-
-    // Issue #2210: re-run the hook trust hash self-check against the binary
-    // actually selected for this session. The startup-time check in
-    // `server/mod.rs` only sees `resolve_codex_path()`; per-agent registry
-    // channels / env overrides can resolve to a different binary here. The
-    // launch-time check is deduped by (canonical_path, version-or-mtime) so
-    // an in-place upgrade is still observed, and probes run with the same
-    // PATH augmentation the launch will use so npm-shim installs probe ok.
-    let _ = run_codex_hook_launch_self_check_with_exec_path(codex_bin, exec_path);
 
     let hook_session_id = session_id
         .map(str::trim)
@@ -523,154 +510,19 @@ pub fn execute_command_simple_with_model(
     )
 }
 
-/// Cancel-aware variant of [`execute_command_simple_with_model`].
-///
-/// Threads the supplied `CancelToken` into the spawned Codex child so that a
-/// mid-flight cancel (e.g. voice barge-in) terminates the process tree
-/// instead of letting it run to natural exit. Required by ADR #2175 for all
-/// non-foreground entry points — call sites that hold a `CancelToken` from
-/// the surrounding turn MUST use this variant.
-///
-/// This is a blocking function — call from `tokio::task::spawn_blocking`.
-pub fn execute_command_simple_cancellable_with_model(
-    prompt: &str,
-    model: Option<&str>,
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
-) -> Result<String, String> {
-    execute_command_simple_cancellable_with_options(
-        prompt,
-        model,
-        true,
-        Some(true),
-        Some(false),
-        cancel_token,
-    )
-}
-
-/// Execute a one-shot Codex CLI invocation with a hard timeout.
-///
-/// On timeout this mirrors `provider_exec::execute_simple_with_timeout`:
-/// the shared [`CancelToken`] is tripped (also triggering tmux cleanup),
-/// then `kill_pid_tree` is called on the registered child PID so the
-/// Codex CLI and its descendants receive SIGTERM (process group first,
-/// PID fallback), followed by SIGKILL after a short grace window. The
-/// Codex spawn is now placed in its own process group via
-/// `configure_child_process_group`, so the SIGTERM/SIGKILL reach
-/// grand-descendants too. Without this the orphaned Codex CLI would
-/// keep holding its working directory and rollout state long after the
-/// caller has moved on (issue #2249).
-///
-/// PID-reuse safety: before signalling we re-check the channel for a
-/// late natural completion (worker finished after `recv_timeout` returned
-/// but before we got here). On a hit we skip the kill entirely so we
-/// never SIGKILL a numeric PID that may already have been reaped and
-/// reused by the OS. We also clear `child_pid` from the CancelToken when
-/// the worker completes naturally, so any later cancel cannot fire a
-/// stale PID. Thread cleanup is bounded: we only `join()` the worker
-/// after observing it sent its result (or after the kill drained it),
-/// never on an indefinitely blocked thread.
 pub fn execute_command_simple_with_timeout(
     prompt: &str,
     timeout: Duration,
     label: &str,
 ) -> Result<String, String> {
     let prompt = prompt.to_string();
-    let label_owned = label.to_string();
-    let cancel_token = std::sync::Arc::new(CancelToken::new());
-    let cancel_for_worker = std::sync::Arc::clone(&cancel_token);
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let result = execute_command_simple_cancellable(&prompt, Some(&cancel_for_worker));
-        // Clear the registered child PID *before* sending the result.
-        // The Child has already been reaped by wait_with_output() inside
-        // execute_command_simple_cancellable, so the kernel may recycle
-        // this PID at any moment. Clearing here prevents a late timeout
-        // path (timer raced ahead of recv on a different timeline) from
-        // signalling a reused, unrelated PID.
-        *cancel_for_worker
-            .child_pid
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        let _ = tx.send(result);
+    std::thread::spawn(move || {
+        let _ = tx.send(execute_command_simple(&prompt));
     });
-
     match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            // Worker already finished and cleared child_pid; safe to join.
-            let _ = worker.join();
-            result
-        }
-        Err(_) => {
-            // Re-check the channel: the worker may have sent its result in
-            // the tiny window between recv_timeout returning Err and us
-            // getting here. If so, take the natural completion and skip
-            // the kill — child_pid was cleared by the worker, but the OS
-            // could already have reused the numeric PID, so signalling it
-            // would be a stray SIGKILL to an unrelated process.
-            if let Ok(result) = rx.try_recv() {
-                tracing::debug!(
-                    provider = "codex",
-                    stage = %label_owned,
-                    "codex execute_command_simple_with_timeout completed in race with timeout; skipping kill"
-                );
-                let _ = worker.join();
-                return result;
-            }
-
-            tracing::warn!(
-                provider = "codex",
-                stage = %label_owned,
-                timeout_secs = timeout.as_secs(),
-                "codex execute_command_simple_with_timeout timed out; cancelling and killing child"
-            );
-            cancel_token.cancel_with_tmux_cleanup();
-            // Snapshot under lock and clear, so any concurrent observer
-            // sees the same "no PID" state we are about to act on.
-            let child_pid = cancel_token
-                .child_pid
-                .lock()
-                .map(|mut guard| guard.take())
-                .unwrap_or(None);
-            if let Some(pid) = child_pid {
-                tracing::warn!(
-                    provider = "codex",
-                    stage = %label_owned,
-                    child_pid = pid,
-                    "codex execute_command_simple_with_timeout sending SIGTERM/SIGKILL to child process group"
-                );
-                // kill_pid_tree sends SIGTERM to the process group (or
-                // PID fallback), waits ~200ms, then escalates to SIGKILL
-                // on the still-alive target. The Codex spawn is in its
-                // own group (configure_child_process_group above), so
-                // the negative-PID path reaches grand-descendants.
-                kill_pid_tree(pid);
-            } else {
-                tracing::warn!(
-                    provider = "codex",
-                    stage = %label_owned,
-                    "codex execute_command_simple_with_timeout had no registered child PID at cancel time"
-                );
-            }
-            // Bounded drain: wait up to 3s for the worker to observe the
-            // kill, drop its sender, and let the channel close. Only
-            // join() if we actually saw the worker hand back a result;
-            // otherwise drop the JoinHandle and let the OS reap the
-            // thread when this process exits, rather than blocking the
-            // caller forever on a stuck wait_with_output.
-            if rx.recv_timeout(Duration::from_secs(3)).is_ok() {
-                let _ = worker.join();
-            } else {
-                tracing::warn!(
-                    provider = "codex",
-                    stage = %label_owned,
-                    "codex execute_command_simple_with_timeout worker did not drain within 3s; abandoning join"
-                );
-            }
-            Err(format!(
-                "{label_owned} timeout after {}s",
-                timeout.as_secs()
-            ))
-        }
+        Ok(result) => result,
+        Err(_) => Err(format!("{label} timeout after {}s", timeout.as_secs())),
     }
 }
 
@@ -678,7 +530,7 @@ pub fn execute_command_simple_cancellable(
     prompt: &str,
     cancel_token: Option<&CancelToken>,
 ) -> Result<String, String> {
-    execute_command_simple_cancellable_borrow(prompt, None, false, None, None, cancel_token)
+    execute_command_simple_cancellable_with_options(prompt, None, false, None, None, cancel_token)
 }
 
 fn execute_command_simple_cancellable_with_options(
@@ -687,54 +539,7 @@ fn execute_command_simple_cancellable_with_options(
     readonly_mode: bool,
     fast_mode_enabled: Option<bool>,
     goals_enabled: Option<bool>,
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
-) -> Result<String, String> {
-    // Arc-based variant: spawn a mid-flight watcher that polls the cancel
-    // token via the cloned Arc and kills the child PID tree on cancel.
-    let borrow = cancel_token.as_deref();
-    execute_command_simple_inner(
-        prompt,
-        model,
-        readonly_mode,
-        fast_mode_enabled,
-        goals_enabled,
-        borrow,
-        cancel_token.clone(),
-    )
-}
-
-fn execute_command_simple_cancellable_borrow(
-    prompt: &str,
-    model: Option<&str>,
-    readonly_mode: bool,
-    fast_mode_enabled: Option<bool>,
-    goals_enabled: Option<bool>,
     cancel_token: Option<&CancelToken>,
-) -> Result<String, String> {
-    // Borrow-only variant: keeps the existing pre-spawn race check and
-    // child-pid registration, but does not spawn a mid-flight watcher
-    // because we cannot promote the borrow to an `Arc` for thread-safe
-    // sharing. Callers that need mid-flight cancellation must use the
-    // `Arc<CancelToken>` API (e.g. `execute_command_simple_cancellable_with_model`).
-    execute_command_simple_inner(
-        prompt,
-        model,
-        readonly_mode,
-        fast_mode_enabled,
-        goals_enabled,
-        cancel_token,
-        None,
-    )
-}
-
-fn execute_command_simple_inner(
-    prompt: &str,
-    model: Option<&str>,
-    readonly_mode: bool,
-    fast_mode_enabled: Option<bool>,
-    goals_enabled: Option<bool>,
-    cancel_token: Option<&CancelToken>,
-    cancel_token_arc: Option<std::sync::Arc<CancelToken>>,
 ) -> Result<String, String> {
     let session_selection =
         crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
@@ -766,11 +571,6 @@ fn execute_command_simple_inner(
 
     let mut command = Command::new(&codex_bin);
     crate::services::platform::apply_binary_resolution(&mut command, &resolution);
-    // #2249 / #2250: put Codex in its own process group so kill_pid_tree(child_pid)
-    // can SIGTERM/SIGKILL the whole descendant tree on cancel/timeout. Without
-    // this, kill(-pid, ...) targets PGID = our own process group and the kill
-    // falls back to the immediate child PID only — wrappers / grandchildren leak.
-    crate::services::process::configure_child_process_group(&mut command);
     let mut child = command
         .args(&args)
         .current_dir(working_dir)
@@ -780,30 +580,15 @@ fn execute_command_simple_inner(
         .spawn()
         .map_err(|e| format!("Failed to start Codex: {}", e))?;
 
-    let child_pid = child.id();
-    register_child_pid(cancel_token, child_pid);
+    register_child_pid(cancel_token, child.id());
     if cancel_requested(cancel_token) {
         kill_child_tree(&mut child);
         return Err("Codex request cancelled".to_string());
     }
 
-    // ADR #2175: mid-flight cancel watcher. `wait_with_output` blocks the
-    // calling thread, so without a watcher the registered child PID would only
-    // be killed by an external pid-aware interrupt path (e.g. tmux turn
-    // bridge). Voice foreground/summary call sites do not have that external
-    // path, so we spawn a lightweight thread that polls the cancel token and
-    // SIGTERMs the child PID tree if a cancel arrives before natural exit.
-    let cancel_watcher =
-        crate::services::process::spawn_simple_cancel_watcher(cancel_token_arc, child_pid);
-
-    let output_result = child.wait_with_output();
-    cancel_watcher.disarm();
-    let was_cancelled = cancel_requested(cancel_token);
-    let output = output_result.map_err(|e| format!("Failed to read Codex output: {}", e))?;
-
-    if was_cancelled {
-        return Err("Codex request cancelled".to_string());
-    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read Codex output: {}", e))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -887,60 +672,35 @@ pub fn execute_command_streaming(
     let prompt = compose_codex_prompt(prompt, system_prompt, allowed_tools);
 
     if let Some(profile) = remote_profile {
-        // Issue #2193 — remote tmux is hard-refused regardless of the
-        // remote-SSH gate. `docs/codex-remote-ssh-policy.md` lists
-        // remote tmux as a non-goal: a tmux session on the remote
-        // host can outlive the SSH owner (Codex keeps running after
-        // the SSH session drops, with no AgentDesk-side cancel path),
-        // so it needs its own ADR. Refusing it here keeps the gate's
-        // PREREQUISITES_SATISFIED flip from accidentally enabling
-        // remote tmux when only direct-SSH was implemented.
         #[cfg(unix)]
         {
-            let requested_remote_tmux = tmux_session_name.is_some()
+            let use_remote_tmux = tmux_session_name.is_some()
                 && std::env::var("AGENTDESK_CODEX_REMOTE_TMUX")
                     .map(|value| {
                         let normalized = value.trim().to_ascii_lowercase();
                         normalized == "1" || normalized == "true" || normalized == "yes"
                     })
                     .unwrap_or(false);
-            if requested_remote_tmux {
-                tracing::warn!(
-                    provider = "codex",
-                    profile = %profile.name,
-                    doc = "docs/codex-remote-ssh-policy.md",
-                    "refusing Codex remote tmux dispatch: remote tmux is a \
-                     policy non-goal and requires a separate ADR (#2193)"
+            if use_remote_tmux {
+                let tmux_name = tmux_session_name.expect("checked is_some above");
+                log_codex_runtime_kind(
+                    "codex.execute_command_streaming",
+                    CodexRuntimeKind::RemoteTmux,
                 );
-                return Err("Remote tmux execution is a policy non-goal (#2193). \
-                     See docs/codex-remote-ssh-policy.md (non-goals)."
-                    .to_string());
+                return execute_streaming_remote_tmux(
+                    profile,
+                    &prompt,
+                    model,
+                    fast_mode_enabled,
+                    goals_enabled,
+                    working_dir,
+                    sender,
+                    cancel_token,
+                    tmux_name,
+                    report_channel_id,
+                    report_provider,
+                );
             }
-        }
-        // Issue #2193 — gate enforcement on the actual dispatch path.
-        // Bootstrap already hard-fails when `remote_ssh_enabled=true`
-        // and `PREREQUISITES_SATISFIED=false`, but the gate has to be
-        // checked here too: a future change that wires a real
-        // `services::remote` or starts populating `RemoteProfile` lists
-        // would otherwise reach `execute_streaming_remote_*` without
-        // the operator having opted in via `agentdesk.yaml`.
-        //
-        // The policy: both the runtime flag AND the compile-time
-        // prerequisites constant must agree. If either is false, the
-        // turn is refused before any SSH attempt.
-        if !(crate::services::provider_hosting::codex_remote_ssh_enabled()
-            && crate::services::codex_remote_policy::PREREQUISITES_SATISFIED)
-        {
-            tracing::warn!(
-                provider = "codex",
-                profile = %profile.name,
-                doc = "docs/codex-remote-ssh-policy.md",
-                "refusing Codex remote SSH dispatch: gate disabled or \
-                 prerequisites not satisfied (#2193)"
-            );
-            return Err("Remote SSH execution is disabled by policy (#2193). \
-                 See docs/codex-remote-ssh-policy.md."
-                .to_string());
         }
         log_codex_runtime_kind(
             "codex.execute_command_streaming",
@@ -1298,12 +1058,7 @@ fn execute_streaming_local_tui_tmux(
         report_provider,
     );
     let mut args = build_codex_tui_args(&launch_options);
-    let codex_hook_overrides = prepare_codex_tui_hook_overrides(
-        tmux_session_name,
-        session_id,
-        &codex_bin,
-        resolution.exec_path.as_deref(),
-    );
+    let codex_hook_overrides = prepare_codex_tui_hook_overrides(tmux_session_name, session_id);
     if !codex_hook_overrides.is_empty() {
         append_codex_config_overrides(&mut args, codex_hook_overrides);
     }
@@ -1336,12 +1091,6 @@ fn execute_streaming_local_tui_tmux(
         }
     }
 
-    // #2172 cancel boundary: keep a clone of the cancel token so that
-    // post-tail emission (RuntimeReady / SessionDied Done) and the
-    // tail-error tmux-cleanup branch can BOTH consult `cancel_requested`
-    // without re-acquiring it. The tail call itself moves its clone into
-    // the rollout-tail thread; this clone stays in the launch frame.
-    let cancel_token_for_post_tail = cancel_token.clone();
     let tail_result = if session_selection.resume {
         let rollout_path = session_selection
             .rollout_path
@@ -1371,41 +1120,10 @@ fn execute_streaming_local_tui_tmux(
             || tmux_session_has_live_pane(tmux_session_name),
         )
     };
-    let cancel_observed =
-        || crate::services::provider::cancel_requested(cancel_token_for_post_tail.as_deref());
 
     let tail_result = match tail_result {
         Ok(result) => result,
         Err(error) => {
-            // #2172 cancel boundary: a user /stop that arrives before the
-            // rollout file is discovered surfaces as an Err from the
-            // wait_for_* helpers ("cancelled waiting for Codex rollout
-            // transcript").
-            //
-            // Two consequences must be suppressed:
-            //   (a) Killing the tmux session here contradicts the
-            //       PreserveSession default for /stop — the pane
-            //       teardown is owned by stop_active_turn's
-            //       TmuxCleanupPolicy.
-            //   (b) Returning Err is converted into
-            //       `StreamMessage::Error` by the streaming-launch
-            //       caller (router/message_handler.rs spawn_blocking
-            //       wrapper) and would reach the bridge as a transport
-            //       error instead of a cancelled turn — letting the
-            //       bridge run its error-finalisation path on a
-            //       cancelled turn.
-            //
-            // Return Ok(()) with no StreamMessage emitted: the producer
-            // is silent post-cancel and the bridge's cancel arm drives
-            // finalisation.
-            if cancel_observed() {
-                tracing::info!(
-                    tmux_session = tmux_session_name,
-                    error = %error,
-                    "Codex rollout tail cancelled before transcript; suppressing tail Err and deferring tmux cleanup to cancel path"
-                );
-                return Ok(());
-            }
             // #2182 follow-up: rollout wait / tail failures used to leak the
             // tmux session because `?` propagated Err without cleaning the
             // launched session. Kill it explicitly so the worktree doesn't
@@ -1425,31 +1143,6 @@ fn execute_streaming_local_tui_tmux(
     };
 
     let read_result = tail_result.read_result.clone();
-    // #2172 cancel boundary: relay suppression is enforced at every
-    // Direct TUI StreamMessage producer, not just rollout_tail. The
-    // post-tail SessionDied Done and the RuntimeReady handoff frame
-    // must also drop on the floor when the user has cancelled — a
-    // cancelled turn must not deliver any further frame to the bridge.
-    // ReadOutputResult::Cancelled is handled explicitly: it never
-    // emits RuntimeReady (which would let the bridge mutate handoff
-    // state on a cancelled turn) and it never emits Done either.
-    if matches!(
-        read_result,
-        crate::services::provider::ReadOutputResult::Cancelled { .. }
-    ) {
-        tracing::info!(
-            tmux_session = tmux_session_name,
-            "Codex Direct TUI tail returned Cancelled; suppressing post-tail StreamMessage emission"
-        );
-        return Ok(());
-    }
-    if cancel_observed() {
-        tracing::info!(
-            tmux_session = tmux_session_name,
-            "Codex Direct TUI launch observed cancel after tail returned; suppressing post-tail StreamMessage emission"
-        );
-        return Ok(());
-    }
     if matches!(
         read_result,
         crate::services::provider::ReadOutputResult::SessionDied { .. }
@@ -1459,108 +1152,14 @@ fn execute_streaming_local_tui_tmux(
             session_id: None,
         });
     } else {
-        // #2325: gate the RuntimeReady handoff on the Codex TUI composer
-        // actually being ready for input. RuntimeReady is the signal the
-        // turn-bridge uses to publish CodexTui handoff state that
-        // downstream recovery / watcher-relay paths assume corresponds
-        // to a live, input-ready pane (see
-        // `services::discord::turn_bridge::mod::RuntimeHandoff::CodexTui`
-        // branch). If we publish RuntimeReady against a tmux session
-        // whose composer never came back up, downstream consumers will
-        // operate on a non-ready handoff.
-        //
-        // Bridge-drain race (Codex round-3 review on #2325):
-        // `rollout_tail` has already emitted `StreamMessage::Done` by
-        // the time we get here, so the bridge has started its
-        // `terminal_control_drain_until` window (250ms) before it
-        // finalises the inflight. The readiness wait MUST fit inside
-        // that window or our `RuntimeReady` / failure `Done` will be
-        // dropped after the bridge has already cleared inflight state.
-        // We use `PromptReadinessKind::PostTurnHandoff` (200ms budget)
-        // and split outcomes:
-        //   - Ready → emit RuntimeReady (handoff preserved).
-        //   - Session dead → emit failure Done; tmux death is
-        //     observable synchronously so the verdict reaches the
-        //     bridge inside the drain window.
-        //   - Composer not yet redrawn within the probe budget → emit
-        //     RuntimeReady anyway with a tracing warning. The
-        //     assistant response has already shipped via the tail
-        //     `Done`; preserving the handoff is the safe default for
-        //     recovery / watcher-relay even if the visual composer is
-        //     still settling. Making this case hard-fail would require
-        //     cross-bridge cooperation tracked separately.
-        match crate::services::codex_tui::input::wait_until_codex_tui_input_ready(
-            tmux_session_name,
-            crate::services::codex_tui::input::PromptReadinessKind::PostTurnHandoff,
-            cancel_token_for_post_tail.as_ref(),
-        ) {
-            Ok(()) => {
-                let _ = sender.send(StreamMessage::RuntimeReady {
-                    handoff: RuntimeHandoff::CodexTui {
-                        rollout_path: tail_result.rollout_path.display().to_string(),
-                        thread_id: tail_result.session_id,
-                        tmux_session_name: tmux_session_name.to_string(),
-                        last_offset: tail_result.final_offset,
-                    },
-                });
-            }
-            Err(error)
-                if crate::services::codex_tui::input::is_prompt_ready_cancelled_error(&error) =>
-            {
-                // Cancel beats deadline / session-death — match the
-                // post-tail cancel-suppression behaviour above: emit no
-                // further StreamMessage and let the bridge's cancel arm
-                // drive finalisation.
-                tracing::info!(
-                    tmux_session = tmux_session_name,
-                    "Codex TUI input readiness wait cancelled post-turn; suppressing RuntimeReady"
-                );
-                return Ok(());
-            }
-            Err(error) if crate::services::codex_tui::input::is_session_dead_error(&error) => {
-                // Session death is detected synchronously by the tmux
-                // pane-alive check, so this verdict reaches the bridge
-                // inside its drain window. Skip RuntimeReady and surface
-                // a failure Done.
-                tracing::warn!(
-                    tmux_session = tmux_session_name,
-                    error = %error,
-                    "Codex TUI session died before becoming input-ready; suppressing RuntimeReady"
-                );
-                let _ = sender.send(StreamMessage::Done {
-                    result: "⚠ Codex TUI session ended before becoming input-ready.".to_string(),
-                    session_id: tail_result.session_id.clone(),
-                });
-            }
-            Err(error) => {
-                // #2399 HIGH 2: composer did not redraw within the 200ms
-                // probe budget. The previous behaviour emitted
-                // `RuntimeReady` anyway "best-effort", which republished a
-                // CodexTui handoff against a TUI whose readiness was
-                // unknown. Downstream recovery / watcher-relay paths then
-                // operated on a non-ready session and ran into the
-                // original #2325 failure mode.
-                //
-                // Updated contract: on a readiness-timeout verdict we
-                // suppress `RuntimeReady` entirely. The bridge has already
-                // received the rollout-tail `Done` and finalised the
-                // assistant text; the only thing we *would* be publishing
-                // is the CodexTui handoff metadata. Skipping it forces the
-                // bridge to treat the next turn as a fresh session
-                // launch (or recovery), which is safer than reusing a
-                // possibly-hung pane.
-                //
-                // Session-dead and cancel cases are already handled by
-                // dedicated arms above — only the readiness-timeout path
-                // lands here, but we still log the error string verbatim
-                // so operators can correlate with the input.rs telemetry.
-                tracing::warn!(
-                    tmux_session = tmux_session_name,
-                    error = %error,
-                    "Codex TUI composer not yet input-ready inside post-turn probe budget; suppressing RuntimeReady to avoid republishing a non-ready handoff (#2399 HIGH 2)"
-                );
-            }
-        }
+        let _ = sender.send(StreamMessage::RuntimeReady {
+            handoff: RuntimeHandoff::CodexTui {
+                rollout_path: tail_result.rollout_path.display().to_string(),
+                thread_id: tail_result.session_id,
+                tmux_session_name: tmux_session_name.to_string(),
+                last_offset: tail_result.final_offset,
+            },
+        });
     }
 
     Ok(())
@@ -2998,240 +2597,5 @@ mod tests {
             }
             other => panic!("Expected Ok(RecreateSession), got {:?}", other),
         }
-    }
-
-    /// Regression test for #2249: on timeout, the spawned Codex child
-    /// AND its grandchildren must be killed via SIGTERM→SIGKILL within
-    /// the grace window, not left running as orphans. The grandchild
-    /// assertion specifically exercises the `configure_child_process_group`
-    /// path — without it, `kill_pid_tree` cannot reach descendants.
-    #[cfg(unix)]
-    #[test]
-    fn execute_command_simple_with_timeout_kills_child_on_timeout() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
-
-        let _env_guard = crate::services::discord::runtime_store::lock_test_env();
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let fake_codex = temp.path().join("fake-codex");
-        let pid_file = temp.path().join("fake-codex.pid");
-        let grandchild_pid_file = temp.path().join("fake-codex-grandchild.pid");
-
-        // Fake codex: spawn a long-lived grandchild (its own subshell
-        // sleep loop), record both PIDs, then loop forever. The
-        // grandchild inherits the codex process group, so a SIGTERM
-        // to the negative PID must reach it. If the parent spawn is
-        // not in its own group, kill_pid_tree(-codex_pid) hits our
-        // test runner's group instead and the grandchild survives —
-        // which is exactly the bug #2249 keeps reintroducing.
-        fs::write(
-            &fake_codex,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$AGENTDESK_TEST_PID_FILE\"\n( sleep 600 & printf '%s' \"$!\" > \"$AGENTDESK_TEST_GRANDCHILD_PID_FILE\"; wait ) &\nwhile :; do sleep 1; done\n",
-        )
-        .expect("write fake codex");
-        let mut perms = fs::metadata(&fake_codex).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_codex, perms).expect("set perms");
-
-        let previous_codex_path = std::env::var_os("AGENTDESK_CODEX_PATH");
-        let previous_pid_file = std::env::var_os("AGENTDESK_TEST_PID_FILE");
-        let previous_grandchild_pid_file = std::env::var_os("AGENTDESK_TEST_GRANDCHILD_PID_FILE");
-
-        // SAFETY: env mutations are serialized by lock_test_env().
-        unsafe {
-            std::env::set_var("AGENTDESK_CODEX_PATH", &fake_codex);
-            std::env::set_var("AGENTDESK_TEST_PID_FILE", &pid_file);
-            std::env::set_var("AGENTDESK_TEST_GRANDCHILD_PID_FILE", &grandchild_pid_file);
-        }
-
-        let started = Instant::now();
-        let result = super::execute_command_simple_with_timeout(
-            "ignored prompt",
-            Duration::from_secs(1),
-            "codex 2249 regression",
-        );
-        let elapsed = started.elapsed();
-
-        // Restore env before any assert can panic out of this block.
-        unsafe {
-            match previous_codex_path {
-                Some(value) => std::env::set_var("AGENTDESK_CODEX_PATH", value),
-                None => std::env::remove_var("AGENTDESK_CODEX_PATH"),
-            }
-            match previous_pid_file {
-                Some(value) => std::env::set_var("AGENTDESK_TEST_PID_FILE", value),
-                None => std::env::remove_var("AGENTDESK_TEST_PID_FILE"),
-            }
-            match previous_grandchild_pid_file {
-                Some(value) => std::env::set_var("AGENTDESK_TEST_GRANDCHILD_PID_FILE", value),
-                None => std::env::remove_var("AGENTDESK_TEST_GRANDCHILD_PID_FILE"),
-            }
-        }
-
-        let err = result.expect_err("expected timeout error");
-        assert!(
-            err.contains("codex 2249 regression timeout"),
-            "unexpected error: {err}"
-        );
-        // Grace window is ~200ms in kill_pid_tree; allow generous
-        // slack for CI scheduling but bound it well under a real
-        // child's wall-clock lifetime so we know the kill fired.
-        assert!(
-            elapsed < Duration::from_secs(6),
-            "timeout path took too long: {:?}",
-            elapsed
-        );
-
-        // Confirm both the codex child and its grandchild are gone
-        // within the SIGTERM (200ms grace) + SIGKILL window. If a PID
-        // file never appeared, the shell never reached its printf —
-        // we skip that specific assertion rather than treating a slow
-        // CI scheduler as a regression.
-        fn assert_pid_dead_within(pid_file: &std::path::Path, label: &str) {
-            let pid_deadline = Instant::now() + Duration::from_secs(2);
-            while !pid_file.exists() && Instant::now() < pid_deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !pid_file.exists() {
-                return;
-            }
-            let pid_str = std::fs::read_to_string(pid_file).expect("pid file");
-            let pid_str = pid_str.trim();
-            if pid_str.is_empty() {
-                return;
-            }
-            let kill_deadline = Instant::now() + Duration::from_secs(5);
-            let mut still_alive = true;
-            while Instant::now() < kill_deadline {
-                let alive = std::process::Command::new("kill")
-                    .args(["-0", pid_str])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !alive {
-                    still_alive = false;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            assert!(
-                !still_alive,
-                "{label} pid {pid_str} survived past SIGTERM+SIGKILL grace window"
-            );
-        }
-
-        assert_pid_dead_within(&pid_file, "codex child");
-        assert_pid_dead_within(&grandchild_pid_file, "codex grandchild");
-    }
-}
-
-#[cfg(test)]
-mod remote_dispatch_gate_tests {
-    //! Issue #2193 — regression tests for the Codex remote SSH dispatch
-    //! gate inside `execute_command_streaming`. These tests verify that:
-    //!
-    //!   1. A remote profile + tmux + `AGENTDESK_CODEX_REMOTE_TMUX=true`
-    //!      is hard-refused as a policy non-goal, regardless of the
-    //!      direct-SSH gate state.
-    //!   2. A remote profile without the env var is refused when the
-    //!      runtime gate is off (the default).
-    //!
-    //! Both refusals MUST happen before any SSH attempt, so they return
-    //! `Err` synchronously and never call into `services::remote_stub`.
-
-    use crate::services::remote::{RemoteAuth, RemoteProfile};
-    use std::sync::Mutex;
-
-    static GATE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn fixture_profile() -> RemoteProfile {
-        RemoteProfile {
-            name: "test-mac-mini".to_string(),
-            host: "mac-mini.local".to_string(),
-            port: 22,
-            user: "operator".to_string(),
-            auth: RemoteAuth::KeyFile {
-                path: "/dev/null".to_string(),
-                passphrase: None,
-            },
-            default_path: "/tmp".to_string(),
-            claude_path: None,
-        }
-    }
-
-    fn run_dispatch(
-        tmux_session_name: Option<&str>,
-        remote_tmux_env: Option<&str>,
-    ) -> Result<(), String> {
-        // Lock so the AGENTDESK_CODEX_REMOTE_TMUX env mutation and the
-        // provider_hosting runtime cell can't race with other tests.
-        let _guard = GATE_TEST_LOCK.lock().unwrap();
-
-        // Default gate: OFF. This mirrors fresh-bootstrap state.
-        crate::services::provider_hosting::install_provider_hosting_config(
-            &crate::config::Config::default(),
-        );
-
-        // Manipulate the env var the dispatch path reads.
-        match remote_tmux_env {
-            Some(v) => unsafe { std::env::set_var("AGENTDESK_CODEX_REMOTE_TMUX", v) },
-            None => unsafe { std::env::remove_var("AGENTDESK_CODEX_REMOTE_TMUX") },
-        }
-
-        let profile = fixture_profile();
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let result = super::execute_command_streaming(
-            "ignored prompt",
-            None,
-            "/tmp",
-            tx,
-            None,
-            None,
-            None,
-            Some(&profile),
-            tmux_session_name,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-        );
-
-        // Clean up the env var so we don't leak state.
-        unsafe { std::env::remove_var("AGENTDESK_CODEX_REMOTE_TMUX") };
-
-        result
-    }
-
-    /// Remote tmux is a policy non-goal and MUST be refused even if the
-    /// direct-SSH gate is later opened — i.e. the refusal does not
-    /// depend on `remote_ssh_enabled` or `PREREQUISITES_SATISFIED`.
-    #[cfg(unix)]
-    #[test]
-    fn remote_tmux_is_hard_refused_as_policy_non_goal() {
-        let err = run_dispatch(Some("test-session"), Some("true"))
-            .expect_err("remote tmux must be refused");
-        assert!(
-            err.contains("non-goal"),
-            "expected non-goal refusal, got: {err}"
-        );
-        assert!(err.contains("#2193"), "refusal must cite the issue: {err}");
-    }
-
-    /// Direct remote SSH dispatch (no tmux env) is refused while the
-    /// gate is off. This guards against a future change wiring real
-    /// `RemoteProfile` lists before flipping `remote_ssh_enabled`.
-    #[test]
-    fn remote_direct_is_refused_when_gate_off() {
-        let err = run_dispatch(None, None).expect_err("remote SSH must be refused while gate off");
-        assert!(
-            err.contains("disabled by policy"),
-            "expected policy refusal, got: {err}"
-        );
-        assert!(err.contains("#2193"), "refusal must cite the issue: {err}");
     }
 }

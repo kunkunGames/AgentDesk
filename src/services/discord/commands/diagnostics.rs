@@ -1006,7 +1006,6 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
-            voice_announcement: None,
         }
     }
 

@@ -1,7 +1,4 @@
-import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useRef } from "react";
-import { useForm } from "react-hook-form";
-import { z } from "zod";
+import { useEffect, useRef, useState } from "react";
 import type { Department } from "../../types";
 import { localeName, useI18n } from "../../i18n";
 import EmojiPicker from "./EmojiPicker";
@@ -13,27 +10,12 @@ import {
   SurfaceSubsection,
 } from "../common/SurfacePrimitives";
 
-const agentFormSchema = z.object({
-  name: z.string().trim().min(1, "required"),
-  name_ko: z.string(),
-  name_ja: z.string(),
-  name_zh: z.string(),
-  department_id: z.string(),
-  cli_provider: z.enum(["claude", "codex", "gemini", "qwen", "opencode", "copilot", "antigravity", "api"]),
-  avatar_emoji: z.string().trim().min(1, "required"),
-  sprite_number: z.number().nullable(),
-  personality: z.string(),
-  prompt_content: z.string(),
-  auto_commit: z.boolean(),
-});
-
-type AgentFormValues = z.infer<typeof agentFormSchema>;
-
 export default function AgentFormModal({
   isKo,
   locale,
   tr,
   form,
+  setForm,
   departments,
   isEdit,
   saving,
@@ -44,28 +26,16 @@ export default function AgentFormModal({
   locale: string;
   tr: (ko: string, en: string) => string;
   form: FormData;
+  setForm: (f: FormData) => void;
   departments: Department[];
   isEdit: boolean;
   saving: boolean;
-  onSave: (values: FormData) => void | Promise<void>;
+  onSave: () => void;
   onClose: () => void;
 }) {
   const { t } = useI18n();
   const overlayRef = useRef<HTMLDivElement>(null);
-  const {
-    register,
-    handleSubmit,
-    reset,
-    setValue,
-    watch,
-    formState: { errors },
-  } = useForm<AgentFormValues>({
-    resolver: zodResolver(agentFormSchema),
-    defaultValues: form,
-    mode: "onChange",
-  });
-  const formValues = watch();
-  const spriteNum = formValues.sprite_number ?? 0;
+  const [spriteNum, setSpriteNum] = useState(form.sprite_number ?? 0);
 
   // ESC 키로 닫기
   useEffect(() => {
@@ -76,10 +46,6 @@ export default function AgentFormModal({
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
 
-  useEffect(() => {
-    reset(form);
-  }, [form, reset]);
-
   const inputCls =
     "w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/40 focus:border-blue-500 transition-colors";
   const inputStyle = {
@@ -87,9 +53,6 @@ export default function AgentFormModal({
     borderColor: "var(--th-input-border)",
     color: "var(--th-text-primary)",
   };
-  const handleSave = handleSubmit(async (values) => {
-    await onSave(values);
-  });
 
   return (
     <div
@@ -104,11 +67,10 @@ export default function AgentFormModal({
         if (e.target === overlayRef.current) onClose();
       }}
     >
-      <form
+      <div
         role="dialog"
         aria-modal="true"
         aria-label={isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
-        onSubmit={handleSave}
         className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6"
         style={{
           background:
@@ -124,7 +86,7 @@ export default function AgentFormModal({
           <h3 className="text-base font-bold" style={{ color: "var(--th-text-heading)" }}>
             {isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
           </h3>
-          <SurfaceActionButton onClick={onClose} tone="neutral" compact className="h-11 w-11" style={{ padding: 0 }} aria-label={tr("닫기", "Close")}>
+          <SurfaceActionButton onClick={onClose} tone="neutral" compact className="h-11 w-11" style={{ padding: 0 }} aria-label="Close">
             ✕
           </SurfaceActionButton>
         </div>
@@ -152,7 +114,8 @@ export default function AgentFormModal({
                   }}
                   onClick={() => {
                     const next = Math.max(1, spriteNum || 0) + 1;
-                    setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    setSpriteNum(next);
+                    setForm({ ...form, sprite_number: next });
                   }}
                 >
                   ▲
@@ -169,7 +132,7 @@ export default function AgentFormModal({
                       style={{ imageRendering: "pixelated" }}
                     />
                   ) : (
-                    <span className="text-2xl">{formValues.avatar_emoji || "🤖"}</span>
+                    <span className="text-2xl">{form.avatar_emoji || "🤖"}</span>
                   )}
                 </div>
                 <button
@@ -183,7 +146,8 @@ export default function AgentFormModal({
                   }}
                   onClick={() => {
                     const next = Math.max(1, (spriteNum || 1) - 1);
-                    setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    setSpriteNum(next);
+                    setForm({ ...form, sprite_number: next });
                   }}
                 >
                   ▼
@@ -200,28 +164,17 @@ export default function AgentFormModal({
                   #{spriteNum || "—"}
                 </span>
                 <div className="mt-2">
-                  <label
-                    htmlFor="agent-name"
-                    className="block text-xs mb-1.5 font-medium"
-                    style={{ color: "var(--th-text-secondary)" }}
-                  >
+                  <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                     {tr("영문 이름", "Name")} <span className="text-red-400">*</span>
                   </label>
                   <input
-                    id="agent-name"
                     type="text"
-                    {...register("name")}
+                    value={form.name}
+                    onChange={(e) => setForm({ ...form, name: e.target.value })}
                     placeholder="DORO"
-                    aria-invalid={errors.name ? "true" : "false"}
-                    aria-describedby={errors.name ? "agent-name-error" : undefined}
                     className={inputCls}
                     style={inputStyle}
                   />
-                  {errors.name && (
-                    <p id="agent-name-error" className="mt-1 text-xs text-red-400">
-                      {tr("영문 이름을 입력해주세요.", "Enter an agent name.")}
-                    </p>
-                  )}
                 </div>
               </div>
             </div>
@@ -233,7 +186,8 @@ export default function AgentFormModal({
                 </label>
                 <input
                   type="text"
-                  {...register("name_ko")}
+                  value={form.name_ko}
+                  onChange={(e) => setForm({ ...form, name_ko: e.target.value })}
                   placeholder="도로롱"
                   className={inputCls}
                   style={inputStyle}
@@ -247,7 +201,8 @@ export default function AgentFormModal({
                 </label>
                 <input
                   type="text"
-                  {...register("name_ja")}
+                  value={form.name_ja}
+                  onChange={(e) => setForm({ ...form, name_ja: e.target.value })}
                   placeholder="ドロロン"
                   className={inputCls}
                   style={inputStyle}
@@ -261,7 +216,8 @@ export default function AgentFormModal({
                 </label>
                 <input
                   type="text"
-                  {...register("name_zh")}
+                  value={form.name_zh}
+                  onChange={(e) => setForm({ ...form, name_zh: e.target.value })}
                   placeholder="多罗隆"
                   className={inputCls}
                   style={inputStyle}
@@ -274,8 +230,8 @@ export default function AgentFormModal({
                   {tr("이모지", "Emoji")}
                 </label>
                 <EmojiPicker
-                  value={formValues.avatar_emoji}
-                  onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
+                  value={form.avatar_emoji}
+                  onChange={(emoji) => setForm({ ...form, avatar_emoji: emoji })}
                 />
               </div>
               <div>
@@ -283,7 +239,8 @@ export default function AgentFormModal({
                   {tr("소속 부서", "Department")}
                 </label>
                 <select
-                  {...register("department_id")}
+                  value={form.department_id}
+                  onChange={(e) => setForm({ ...form, department_id: e.target.value })}
                   className={`${inputCls} cursor-pointer`}
                   style={inputStyle}
                 >
@@ -312,7 +269,8 @@ export default function AgentFormModal({
                 {tr("성격 / 역할 프롬프트", "Personality / Prompt")}
               </label>
               <textarea
-                {...register("personality")}
+                value={form.personality}
+                onChange={(e) => setForm({ ...form, personality: e.target.value })}
                 rows={6}
                 placeholder={tr("전문 분야나 성격 설명...", "Expertise or personality...")}
                 className={`${inputCls} resize-none`}
@@ -328,15 +286,16 @@ export default function AgentFormModal({
                   <label className="flex items-center gap-2 text-xs" style={{ color: "var(--th-text-muted)" }}>
                     <input
                       type="checkbox"
-                      {...register("auto_commit")}
+                      checked={form.auto_commit}
+                      onChange={(event) => setForm({ ...form, auto_commit: event.target.checked })}
                     />
                     {tr("자동 커밋", "Auto commit")}
                   </label>
                 </div>
                 <AgentPromptEditor
                   label="prompt.md"
-                  value={formValues.prompt_content}
-                  onChange={(prompt_content) => setValue("prompt_content", prompt_content, { shouldDirty: true })}
+                  value={form.prompt_content}
+                  onChange={(prompt_content) => setForm({ ...form, prompt_content })}
                   minHeight={300}
                 />
               </div>
@@ -350,8 +309,8 @@ export default function AgentFormModal({
           style={{ borderTop: "1px solid color-mix(in srgb, var(--th-border) 72%, transparent)" }}
         >
           <SurfaceActionButton
-            type="submit"
-            disabled={saving || !formValues.name.trim()}
+            onClick={onSave}
+            disabled={saving || !form.name.trim()}
             tone="accent"
             className="flex-1 text-sm"
           >
@@ -369,7 +328,7 @@ export default function AgentFormModal({
             {tr("취소", "Cancel")}
           </SurfaceActionButton>
         </div>
-      </form>
+      </div>
     </div>
   );
 }

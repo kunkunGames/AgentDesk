@@ -44,8 +44,8 @@ pub(super) use completion_guard::{
     runtime_db_fallback_complete_with_result, streaming_final_complete_dispatch_with_result,
 };
 pub(super) use recovery_text::{
-    auto_retry_with_history, build_session_retry_context_from_history, release_retry_pending,
-    store_session_retry_context, take_session_retry_context_for_turn_with_audit,
+    auto_retry_with_history, build_session_retry_context_from_history, store_session_retry_context,
+    take_session_retry_context_for_turn_with_audit,
 };
 pub(super) use stale_resume::result_event_has_stale_resume_error;
 pub(crate) use tmux_runtime::TmuxCleanupPolicy;
@@ -55,46 +55,6 @@ pub(super) use tmux_runtime::cancel_token_has_tmux_session;
 pub(super) use tmux_runtime::handoff_interrupted_message;
 pub(super) use tmux_runtime::stale_inflight_message;
 pub(super) use tmux_runtime::stop_active_turn;
-
-/// #2452 H6 graduation: schedule the history-aware auto-retry via the
-/// gateway's `_with_completion` variant, then release the
-/// `RETRY_PENDING` dedup lockout AS SOON AS the gateway's completion
-/// oneshot resolves. A 120s `tokio::time::timeout` safety net guarantees
-/// the lockout cannot leak indefinitely even if the spawned scheduler
-/// panics or wedges before sending on `completion_tx`.
-///
-/// The legacy 30s sleep inside `auto_retry_with_history` is preserved as
-/// a back-compat fallback for callers that hit the trait's default
-/// `_with_completion` impl (which sends on `completion_tx` immediately
-/// after the inner `auto_retry_with_history` returns) — both paths
-/// remove the same `channel_id` from the `RETRY_PENDING` set, so a
-/// double-remove is a no-op.
-fn spawn_retry_with_history_with_release(
-    gateway: std::sync::Arc<dyn gateway::TurnGateway>,
-    channel_id: ChannelId,
-    user_msg_id: MessageId,
-    retry_text: String,
-) {
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        gateway
-            .schedule_retry_with_history_with_completion(
-                channel_id,
-                user_msg_id,
-                &retry_text,
-                completion_tx,
-            )
-            .await;
-    });
-    tokio::spawn(async move {
-        // 120s safety net: if completion_tx is dropped without a send
-        // (panic, wedged future), the recv resolves with Err and we still
-        // release. If 120s elapses with neither send nor drop, force
-        // release so the lockout cannot leak forever.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(120), completion_rx).await;
-        release_retry_pending(channel_id);
-    });
-}
 
 pub(super) fn classify_turn_finished_dispatch_kind(
     dispatch_context: Option<&str>,
@@ -132,167 +92,20 @@ fn json_any_true_flag(value: &serde_json::Value, key: &str) -> bool {
     false
 }
 
-/// Returns true when a typed voice-background handoff marker exists for
-/// this `user_msg_id`.
-///
-/// The marker is stamped by `dispatch_voice_background_handoff` at the
-/// foreground→background dispatch site (#2236) and consumed exactly once
-/// by `voice_background_completion_target` on terminal delivery. The
-/// previous implementation matched a hardcoded Korean/English prefix in
-/// the prompt body — that prefix is user-controllable (it appears in the
-/// LLM-visible prompt that any user could literally type into a mapped
-/// background channel), so the prefix match was a routing-hijack vector.
-///
-/// The legacy prefix fallback was deliberately removed in #2236 follow-up
-/// review: keeping it open during a deprecation window would have left
-/// the original spoofable path alive for new traffic, not just in-flight
-/// turns. Since voice-background routing was first merged in #2207
-/// (immediate predecessor of this fix), there are no long-running
-/// in-flight turns to migrate. The hard cutover is safe.
-fn is_voice_background_handoff_prompt(user_msg_id: MessageId, _text: &str) -> bool {
-    crate::voice::announce_meta::global_store()
-        .get_handoff(user_msg_id)
-        .is_some()
+fn is_voice_background_handoff_prompt(text: &str) -> bool {
+    let Some(first_line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return false;
+    };
+    first_line.starts_with("Voice foreground handed this request to the background agent.")
+        || first_line.starts_with("보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다.")
 }
 
-/// Resolves the foreground voice channel that should hear the spoken
-/// summary of a finished background turn.
-///
-/// #2236: delivery is bound to the typed marker stamped at dispatch time.
-/// The marker carries the original `voice_channel_id` and
-/// `background_channel_id`, so routing does NOT round-trip through the
-/// (potentially-stale, multi-agent-ambiguous) reverse lookup any more.
-///
-/// #2274: when the in-memory store misses (e.g. after a dcserver restart
-/// during a long background turn before rehydration finished, or when
-/// terminal delivery lands on a different cluster node than the dispatch
-/// node) the durable PG side store is consulted as a fallback. The atomic
-/// `UPDATE … SET consumed_at = NOW() RETURNING …` claim there guarantees
-/// exactly-once consumption across nodes.
-///
-/// - Returns `None` when no marker exists for this `user_msg_id` (this
-///   turn was not a voice-background handoff).
-/// - Returns `None` when the marker exists but the recorded
-///   `background_channel_id` does not match the channel that fired this
-///   turn (sanity-check; would only happen if a marker were stamped
-///   against the wrong message id by a buggy dispatch path).
-/// - Otherwise consumes the marker and returns the recorded voice
-///   channel id directly. `mapped_voice_channel_id` is accepted only as
-///   a cross-check parameter — if reverse lookup also resolved a voice
-///   channel and it disagrees with the marker, a warn is emitted but the
-///   marker still wins (it is the authoritative origin record).
-async fn voice_background_completion_target(
+fn voice_background_completion_target(
     mapped_voice_channel_id: Option<ChannelId>,
-    user_msg_id: MessageId,
-    _user_text: &str,
-    channel_id: ChannelId,
-    pool: Option<&sqlx::PgPool>,
+    user_text: &str,
 ) -> Option<ChannelId> {
-    let store = crate::voice::announce_meta::global_store();
-    // #2274 Codex review finding #1: when a PG pool is available the
-    // durable `UPDATE ... SET consumed_at = NOW() RETURNING ...` claim is
-    // ALWAYS authoritative for one-shot consumption, even when an
-    // in-memory marker is present. Otherwise two cluster nodes (or a
-    // pre-restart in-memory holder paired with a post-restart rehydrate)
-    // could both observe a local marker and route duplicate spoken
-    // summaries. The local store is treated as a hot cache, never as the
-    // routing gate.
-    let meta = if let Some(pool) = pool {
-        match crate::voice::announce_meta::take_handoff_durable(pool, user_msg_id).await {
-            Ok(Some(meta)) => {
-                // Drop any local copy so a parallel caller cannot see it.
-                store.forget_handoff(user_msg_id);
-                meta
-            }
-            Ok(None) => {
-                // #2274 Codex round-2 finding: a dispatch whose durable
-                // PG write failed will have flipped `local_only_fallback`
-                // on the in-memory marker. In that case the local marker
-                // is the only record of the handoff — refusing to route
-                // would silently drop the spoken summary, regressing
-                // pre-#2274 behaviour under DB unavailability. We
-                // consume the local marker (one-shot, take_handoff) and
-                // emit a `voice_background_handoff_local_only_fallback`
-                // warn so operators see persistence is failing.
-                //
-                // If the marker is present without the flag, we still
-                // refuse — that case (PG row gone but local copy lives)
-                // matches the round-1 duplicate-routing prevention.
-                if let Some(local) = store.get_handoff(user_msg_id) {
-                    if local.local_only_fallback {
-                        if let Some(consumed) = store.take_handoff(user_msg_id) {
-                            tracing::warn!(
-                                event = "voice_background_handoff_local_only_fallback",
-                                user_msg_id = user_msg_id.get(),
-                                channel_id = channel_id.get(),
-                                marker_voice_channel_id = consumed.voice_channel_id,
-                                marker_background_channel_id = consumed.background_channel_id,
-                                "durable PG row absent but local marker is flagged local-only fallback (dispatch-time persist failure); routing spoken summary from in-memory marker"
-                            );
-                            // Re-bind the surviving meta so the downstream
-                            // channel-match / reverse-lookup checks below
-                            // can operate on it uniformly.
-                            consumed
-                        } else {
-                            // Lost the race against another take_handoff
-                            // caller on the same node — be safe and drop.
-                            return None;
-                        }
-                    } else {
-                        tracing::info!(
-                            event = "voice_background_handoff_durable_already_consumed",
-                            user_msg_id = user_msg_id.get(),
-                            channel_id = channel_id.get(),
-                            "in-memory marker present but durable PG row is absent or already consumed; refusing to route to avoid duplicate spoken summary"
-                        );
-                        store.forget_handoff(user_msg_id);
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    user_msg_id = user_msg_id.get(),
-                    "voice_background_handoff durable claim failed; refusing to route spoken summary"
-                );
-                return None;
-            }
-        }
-    } else {
-        // No durable backstop available (typically: dev / no-PG mode).
-        // Preserve legacy local-only behaviour for setups that never
-        // persisted the marker in the first place. Single-node, no-PG
-        // deployments cannot duplicate routing because there is only
-        // one consumer.
-        store.take_handoff(user_msg_id)?
-    };
-    if meta.background_channel_id != channel_id.get() {
-        tracing::warn!(
-            event = "voice_background_handoff_channel_mismatch",
-            user_msg_id = user_msg_id.get(),
-            channel_id = channel_id.get(),
-            marker_background_channel_id = meta.background_channel_id,
-            marker_voice_channel_id = meta.voice_channel_id,
-            "typed handoff marker recorded a different background channel than the turn fired in; refusing to route spoken summary"
-        );
-        return None;
-    }
-    if let Some(mapped) = mapped_voice_channel_id
-        && mapped.get() != meta.voice_channel_id
-    {
-        tracing::warn!(
-            event = "voice_background_handoff_voice_channel_disagrees_with_reverse_lookup",
-            user_msg_id = user_msg_id.get(),
-            channel_id = channel_id.get(),
-            marker_voice_channel_id = meta.voice_channel_id,
-            reverse_lookup_voice_channel_id = mapped.get(),
-            "typed handoff marker disagrees with current reverse-lookup voice channel; marker wins (authoritative origin record)"
-        );
-    }
-    Some(ChannelId::new(meta.voice_channel_id))
+    let voice_channel_id = mapped_voice_channel_id?;
+    is_voice_background_handoff_prompt(user_text).then_some(voice_channel_id)
 }
 
 #[cfg(test)]
@@ -301,7 +114,7 @@ mod dispatch_kind_tests {
         classify_turn_finished_dispatch_kind, is_voice_background_handoff_prompt,
         voice_background_completion_target,
     };
-    use poise::serenity_prelude::{ChannelId, MessageId};
+    use poise::serenity_prelude::ChannelId;
 
     #[test]
     fn marks_auto_queue_context() {
@@ -353,455 +166,35 @@ mod dispatch_kind_tests {
         );
     }
 
-    /// #2236: without a typed marker, ANY user_text (including the literal
-    /// legacy prefix) must not be classified as a voice-background handoff.
-    /// The legacy prefix fallback was removed because it left the
-    /// user-controllable routing-hijack path open.
     #[test]
-    fn handoff_prompt_classification_requires_typed_marker() {
-        let user_msg_id = MessageId::new(7_000_001);
-        assert!(!is_voice_background_handoff_prompt(
-            user_msg_id,
+    fn recognizes_voice_background_handoff_prompt() {
+        assert!(is_voice_background_handoff_prompt(
             "보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다.\n\n이관 요약: 로그 확인"
         ));
-        assert!(!is_voice_background_handoff_prompt(
-            MessageId::new(7_000_002),
+        assert!(is_voice_background_handoff_prompt(
             "Voice foreground handed this request to the background agent.\n\nHandoff summary: check logs"
         ));
-        assert!(!is_voice_background_handoff_prompt(
-            MessageId::new(7_000_003),
-            "일반 텍스트 요청"
-        ));
+        assert!(!is_voice_background_handoff_prompt("일반 텍스트 요청"));
     }
 
     #[test]
-    fn recognizes_voice_background_handoff_via_typed_marker() {
-        // Stamping a typed marker is sufficient — body text is irrelevant.
-        let user_msg_id = MessageId::new(7_100_001);
-        crate::voice::announce_meta::global_store().insert_handoff(
-            user_msg_id,
-            crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-                voice_channel_id: 300,
-                background_channel_id: 200,
-                agent_id: Some("project-agentdesk".to_string()),
-                local_only_fallback: false,
-            },
-        );
-        assert!(is_voice_background_handoff_prompt(
-            user_msg_id,
-            "user-controlled body that does not match any prefix",
-        ));
-        // get_handoff does not consume; clean up to keep test isolated.
-        let _ = crate::voice::announce_meta::global_store().take_handoff(user_msg_id);
-    }
-
-    /// #2236: delivery is bound to the marker's recorded voice channel.
-    /// Reverse-lookup result is accepted only as a cross-check.
-    #[tokio::test]
-    async fn background_completion_target_returns_marker_recorded_voice_channel() {
-        let user_msg_id = MessageId::new(7_300_001);
-        crate::voice::announce_meta::global_store().insert_handoff(
-            user_msg_id,
-            crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-                voice_channel_id: 301,
-                background_channel_id: 201,
-                agent_id: None,
-                local_only_fallback: false,
-            },
-        );
-        let mapped = Some(ChannelId::new(301));
-        let channel = ChannelId::new(201);
-        assert_eq!(
-            voice_background_completion_target(
-                mapped,
-                user_msg_id,
-                "free-form user-controlled text",
-                channel,
-                None,
-            )
-            .await,
-            Some(ChannelId::new(301))
-        );
-        // Marker is consumed exactly once.
-        assert_eq!(
-            voice_background_completion_target(
-                mapped,
-                user_msg_id,
-                "free-form user-controlled text",
-                channel,
-                None,
-            )
-            .await,
-            None
-        );
-    }
-
-    /// #2236: prefix-only spoofing attempt — no marker, prefix in body — must NOT route.
-    #[tokio::test]
-    async fn background_completion_target_refuses_legacy_prefix_without_marker() {
-        let user_msg_id = MessageId::new(7_400_001);
+    fn background_completion_target_requires_mapping_and_handoff_prompt() {
         let mapped = Some(ChannelId::new(300));
-        let channel = ChannelId::new(200);
+        assert_eq!(voice_background_completion_target(mapped, "plain"), None);
         assert_eq!(
             voice_background_completion_target(
                 mapped,
-                user_msg_id,
-                "보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다.",
-                channel,
-                None,
-            )
-            .await,
-            None,
-            "user-controllable legacy prefix must no longer drive routing"
-        );
-    }
-
-    /// #2236: marker recorded against a different background channel than
-    /// the turn fired in is treated as a routing mismatch and refused.
-    #[tokio::test]
-    async fn background_completion_target_refuses_marker_with_wrong_background_channel() {
-        let user_msg_id = MessageId::new(7_500_001);
-        crate::voice::announce_meta::global_store().insert_handoff(
-            user_msg_id,
-            crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-                voice_channel_id: 301,
-                background_channel_id: 999, // not the channel below
-                agent_id: None,
-                local_only_fallback: false,
-            },
+                "보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다."
+            ),
+            Some(ChannelId::new(300))
         );
         assert_eq!(
             voice_background_completion_target(
-                Some(ChannelId::new(301)),
-                user_msg_id,
-                "irrelevant body",
-                ChannelId::new(201), // mismatched
                 None,
-            )
-            .await,
+                "보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다."
+            ),
             None
         );
-    }
-
-    /// #2236: marker is authoritative — when the reverse-lookup voice channel
-    /// disagrees with the marker, the marker still wins (with a warn).
-    #[tokio::test]
-    async fn background_completion_target_marker_wins_over_reverse_lookup_disagreement() {
-        let user_msg_id = MessageId::new(7_600_001);
-        crate::voice::announce_meta::global_store().insert_handoff(
-            user_msg_id,
-            crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-                voice_channel_id: 301,
-                background_channel_id: 201,
-                agent_id: None,
-                local_only_fallback: false,
-            },
-        );
-        // Reverse lookup says 999, but marker says 301 — marker wins.
-        assert_eq!(
-            voice_background_completion_target(
-                Some(ChannelId::new(999)),
-                user_msg_id,
-                "irrelevant body",
-                ChannelId::new(201),
-                None,
-            )
-            .await,
-            Some(ChannelId::new(301))
-        );
-    }
-
-    /// #2274: when the in-memory marker is absent but the durable PG row
-    /// exists (e.g. dcserver restarted between dispatch and terminal
-    /// delivery), the durable claim path must still resolve the voice
-    /// channel — that is the entire point of this fix.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn background_completion_target_falls_back_to_durable_pg_row() {
-        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let user_msg_id = MessageId::new(7_700_001);
-        let meta = crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-            voice_channel_id: 311,
-            background_channel_id: 211,
-            agent_id: Some("project-agentdesk".to_string()),
-            local_only_fallback: false,
-        };
-        crate::voice::announce_meta::persist_handoff_durable(&pool, user_msg_id, &meta)
-            .await
-            .expect("persist durable handoff");
-        // Intentionally do NOT insert into the in-memory store — that
-        // simulates the post-restart state before rehydration.
-
-        let resolved = voice_background_completion_target(
-            None,
-            user_msg_id,
-            "irrelevant body",
-            ChannelId::new(211),
-            Some(&pool),
-        )
-        .await;
-        assert_eq!(resolved, Some(ChannelId::new(311)));
-
-        // The durable claim is one-shot — a second call must return None.
-        let again = voice_background_completion_target(
-            None,
-            user_msg_id,
-            "irrelevant body",
-            ChannelId::new(211),
-            Some(&pool),
-        )
-        .await;
-        assert_eq!(again, None);
-
-        pool.close().await;
-        pg_db.drop().await;
-    }
-
-    /// #2274 Codex review finding #1: two concurrent terminal-delivery
-    /// callers both see the local marker (e.g. rehydrated on two nodes,
-    /// or pre-restart-in-memory plus post-restart-rehydrate on the same
-    /// node). Without PG-authoritative consumption, both would route a
-    /// spoken summary — exactly the duplicate-routing bug the durability
-    /// story is meant to prevent. With the fix, exactly one wins.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn background_completion_target_pg_authoritative_under_two_local_holders() {
-        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let user_msg_id = MessageId::new(7_800_001);
-        let meta = crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-            voice_channel_id: 321,
-            background_channel_id: 221,
-            agent_id: Some("project-agentdesk".to_string()),
-            local_only_fallback: false,
-        };
-
-        // Persist exactly one durable row.
-        crate::voice::announce_meta::persist_handoff_durable(&pool, user_msg_id, &meta)
-            .await
-            .expect("persist durable handoff");
-        // Simulate the local cache being populated on this node as well
-        // (e.g. via the foreground dispatch write-through, or via boot
-        // rehydration). On a cluster with two nodes this would happen
-        // independently on each.
-        crate::voice::announce_meta::global_store().insert_handoff(user_msg_id, meta.clone());
-
-        let pool_a = pool.clone();
-        let pool_b = pool.clone();
-        let task_a = tokio::spawn(async move {
-            voice_background_completion_target(
-                None,
-                user_msg_id,
-                "irrelevant body",
-                ChannelId::new(221),
-                Some(&pool_a),
-            )
-            .await
-        });
-        let task_b = tokio::spawn(async move {
-            voice_background_completion_target(
-                None,
-                user_msg_id,
-                "irrelevant body",
-                ChannelId::new(221),
-                Some(&pool_b),
-            )
-            .await
-        });
-        let (a, b) = tokio::try_join!(task_a, task_b).expect("join concurrent consumers");
-        let winners = [&a, &b].iter().filter(|r| r.is_some()).count();
-        assert_eq!(
-            winners, 1,
-            "exactly one terminal-delivery caller must route the spoken summary"
-        );
-
-        pool.close().await;
-        pg_db.drop().await;
-    }
-
-    /// #2274 Codex review finding #3 regression guard: after rehydration,
-    /// a row that already lived 23h in PG must NOT survive another 24h in
-    /// memory. Verify the in-memory expiry roughly matches the remaining
-    /// durable TTL rather than getting reset.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rehydrate_preserves_remaining_ttl_for_aged_rows() {
-        use crate::voice::announce_meta::{
-            DURABLE_HANDOFF_META_TTL_SECS, VoiceBackgroundHandoffMeta, persist_handoff_durable,
-            rehydrate_handoffs_from_pg,
-        };
-        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let user_msg_id = MessageId::new(7_900_001);
-        let meta = VoiceBackgroundHandoffMeta {
-            voice_channel_id: 331,
-            background_channel_id: 231,
-            agent_id: None,
-            local_only_fallback: false,
-        };
-
-        persist_handoff_durable(&pool, user_msg_id, &meta)
-            .await
-            .expect("persist durable handoff");
-        // Backdate the row to "5 minutes before TTL expiry" so the
-        // remaining lifetime should clamp to ~5 minutes, not a fresh 24h.
-        let near_ttl_age = DURABLE_HANDOFF_META_TTL_SECS - 300;
-        sqlx::query(
-            "UPDATE voice_background_handoff_meta
-             SET created_at = NOW() - make_interval(secs => $1)
-             WHERE message_id = $2",
-        )
-        .bind(near_ttl_age as f64)
-        .bind(user_msg_id.get().to_string())
-        .execute(&pool)
-        .await
-        .expect("backdate row for rehydrate ttl test");
-
-        let count = rehydrate_handoffs_from_pg(&pool)
-            .await
-            .expect("rehydrate succeeds");
-        assert!(count >= 1, "rehydrate must surface the aged row");
-        // Local marker must still be present (remaining TTL > 0 here).
-        let store = crate::voice::announce_meta::global_store();
-        assert!(store.get_handoff(user_msg_id).is_some());
-        // Drain to keep test isolation tight.
-        let _ = store.take_handoff(user_msg_id);
-
-        pool.close().await;
-        pg_db.drop().await;
-    }
-
-    /// #2274 Codex round-2 finding: a durable-write failure at dispatch
-    /// time used to drop the spoken summary, because the PG-authoritative
-    /// terminal-delivery path (added in the round-1 fix) returns
-    /// `Ok(None)` when no row exists. This regressed pre-#2274 local-only
-    /// behaviour for transient DB outages.
-    ///
-    /// The fix flips a `local_only_fallback` flag on the in-memory marker
-    /// at dispatch time when persist fails. Terminal delivery then
-    /// consumes the local marker (one-shot via `take_handoff`) and emits a
-    /// `voice_background_handoff_local_only_fallback` warn so operators
-    /// can see persistence is failing.
-    ///
-    /// This test exercises three properties together:
-    ///   1. With a flagged local marker and an empty PG table,
-    ///      `voice_background_completion_target` resolves the marker's
-    ///      voice channel (instead of silently dropping).
-    ///   2. The marker is one-shot — a second call returns `None`.
-    ///   3. The `voice_background_handoff_local_only_fallback` warn fires
-    ///      and carries the marker context.
-    #[tokio::test(flavor = "current_thread")]
-    async fn background_completion_target_uses_local_only_fallback_when_pg_persist_failed() {
-        use std::{
-            io::{self, Write},
-            sync::{Arc, Mutex},
-        };
-        use tracing_subscriber::fmt::MakeWriter;
-
-        // Captures warn logs emitted on the current thread for the
-        // duration of the test. `with_default` scopes the subscriber to
-        // exactly this thread; a `current_thread` tokio runtime keeps all
-        // awaits on the same thread, so the subscriber sees them.
-        #[derive(Clone)]
-        struct CapturingWriter {
-            buffer: Arc<Mutex<Vec<u8>>>,
-        }
-        impl Write for CapturingWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.buffer.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for CapturingWriter {
-            type Writer = CapturingWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        // Deliberately do NOT call persist_handoff_durable — this
-        // simulates the post-persist-failure state where the dispatch
-        // path inserted into the in-memory store and flagged
-        // `local_only_fallback`, but no PG row exists.
-        let user_msg_id = MessageId::new(7_950_001);
-        let store = crate::voice::announce_meta::global_store();
-        store.insert_handoff(
-            user_msg_id,
-            crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
-                voice_channel_id: 341,
-                background_channel_id: 241,
-                agent_id: Some("project-agentdesk".to_string()),
-                local_only_fallback: false,
-            },
-        );
-        assert!(
-            store.mark_handoff_local_only_fallback(user_msg_id),
-            "mark_handoff_local_only_fallback must update the freshly-inserted marker"
-        );
-
-        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let writer = CapturingWriter {
-            buffer: buffer.clone(),
-        };
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(writer)
-            .finish();
-
-        // `set_default` returns a thread-local guard. With
-        // `flavor = "current_thread"` the tokio runtime keeps every
-        // await on this same thread, so warns emitted inside the async
-        // call are routed to our capturing subscriber.
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let resolved = voice_background_completion_target(
-            None,
-            user_msg_id,
-            "irrelevant body",
-            ChannelId::new(241),
-            Some(&pool),
-        )
-        .await;
-        assert_eq!(
-            resolved,
-            Some(ChannelId::new(341)),
-            "local-only fallback marker must resolve the marker's voice channel"
-        );
-
-        // Marker is one-shot — second call returns None (the in-memory
-        // store took it, and PG never had a row).
-        let again = voice_background_completion_target(
-            None,
-            user_msg_id,
-            "irrelevant body",
-            ChannelId::new(241),
-            Some(&pool),
-        )
-        .await;
-        assert_eq!(
-            again, None,
-            "local-only fallback must consume the marker exactly once"
-        );
-
-        // Drop guard to flush the subscriber before reading the buffer.
-        drop(_guard);
-
-        // Verify the operator-visible warn fired with the expected event
-        // name. The captured bytes contain the formatted tracing event
-        // including `event = "voice_background_handoff_local_only_fallback"`.
-        let captured = String::from_utf8_lossy(&buffer.lock().unwrap().clone()).into_owned();
-        assert!(
-            captured.contains("voice_background_handoff_local_only_fallback"),
-            "expected local-only fallback warn in captured logs, got: {captured}"
-        );
-
-        pool.close().await;
-        pg_db.drop().await;
     }
 }
 
@@ -851,47 +244,6 @@ fn tmux_generation_file_mtime_ns(tmux_session_name: &str) -> i64 {
 #[cfg(not(unix))]
 fn tmux_generation_file_mtime_ns(_tmux_session_name: &str) -> i64 {
     0
-}
-
-/// #2289: classifies a stream frame as one that — if processed — would set
-/// `done = true` and so could suppress the outer cancel arm (which is
-/// gated on `!done`).
-///
-/// Currently `Done` and `Error` are the only `Ok(msg)` arms that flip
-/// `done = true` in the receive-loop body. `Disconnected` is handled
-/// separately via the `TryRecvError::Disconnected` branch and has its own
-/// re-sample.
-///
-/// IMPORTANT: when adding a new variant that sets `done = true` in the
-/// receive loop, add it here too so the post-`try_recv` cancel re-sample
-/// keeps closing the full TOCTOU window. The compiler cannot catch the
-/// miss because the loop body uses field destructuring rather than a
-/// shared classifier.
-#[inline]
-fn is_done_setting_terminal_frame(msg: &crate::services::agent_protocol::StreamMessage) -> bool {
-    use crate::services::agent_protocol::StreamMessage::*;
-    matches!(msg, Done { .. } | Error { .. })
-}
-
-/// #2289 cancel-vs-terminal-frame priority decision.
-///
-/// Models the post-`try_recv` re-sample in the relay receive loop. When a
-/// terminal frame (`Done`) or `Disconnected` is returned, we re-read the
-/// cancel flag because `/stop` may have flipped between the pre-`try_recv`
-/// guard and the receive call. If the cancel raced ahead, the cancel
-/// finalization path must claim the outcome instead of letting `done = true`
-/// be set from the frame (which would silently downgrade a user-stop into a
-/// recorded completion / empty turn).
-///
-/// Returns `true` iff the caller must drop the just-received frame and run
-/// cancel finalization.
-#[inline]
-fn should_finalize_cancel_after_recv(done: bool, cancel_requested: bool) -> bool {
-    // `!done` enforces the documented "whichever observed terminal state
-    // first wins" rule: if a previous iteration already set `done = true`
-    // (e.g. a `Done` arrived during the drain window before the user's
-    // cancel), keep that completion classification.
-    !done && cancel_requested
 }
 
 fn sync_inflight_restart_mode_from_cancel(
@@ -1872,34 +1224,8 @@ fn handle_watcher_runtime_handoff(
     inflight_state.runtime_kind = Some(runtime_kind);
     inflight_state.tmux_session_name = Some(tmux_session_name.clone());
     inflight_state.output_path = Some(output_path.clone());
-    let mut fifo_path = input_fifo_path.filter(|path| !path.is_empty());
-    // #2235 one-release compat window: ClaudeTui rows must still ship a
-    // populated `input_fifo_path` so a rollback to an old binary can satisfy
-    // its FIFO-required recovery branch. Synthesize from the canonical
-    // per-session tmux path when the caller didn't supply one.
-    if matches!(runtime_kind, RuntimeHandoffKind::ClaudeTui) && fifo_path.is_none() {
-        let (_, synthesized_fifo) = tmux_runtime_paths(&tmux_session_name);
-        if !synthesized_fifo.is_empty() {
-            fifo_path = Some(synthesized_fifo);
-        }
-    }
-    inflight_state.input_fifo_path = fifo_path;
+    inflight_state.input_fifo_path = input_fifo_path.filter(|path| !path.is_empty());
     inflight_state.last_offset = last_offset;
-    // #2235 NOTE: we deliberately do NOT durably save the row here.
-    // `watcher_owns_live_relay` is still `false` at this point and only flips
-    // to `true` after the watcher is successfully claimed and spawned (the
-    // leader-branch path below). A save before that flag is set would leak a
-    // v8 row with the new handoff shape alongside `watcher_owns_live_relay =
-    // false`, which on restart would make the restored watcher yield to a
-    // phantom bridge owner (codex adversarial review on #2235). The
-    // existing branch-specific saves at the post-flag flip points plus the
-    // centralized `state_dirty` flush already cover the durable-stamp
-    // guarantee for watcher-owned RuntimeReady paths.
-    //
-    // #2263: the standby branch is INTENTIONALLY not covered by this
-    // invariant — see the in-branch comment near the
-    // `*standby_relay_owns_output = true` assignment for why the flag
-    // stays `false` on standby and the trade-off vs duplicate delivery.
 
     // #226: Atomic claim via try_claim_watcher
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1973,61 +1299,9 @@ fn handle_watcher_runtime_handoff(
                         cancel_for_standby,
                         shared_for_standby,
                         provider_for_standby,
-                        // #2448: bumped from 900s (15min) heuristic stop
-                        // signal to a 1800s (30min) safety backstop. The
-                        // authoritative exit signal is now
-                        // `InflightSignal::Completed`, broadcast by
-                        // `CompletionGuard` on bridge drop.
-                        std::time::Duration::from_secs(1800),
+                        std::time::Duration::from_secs(900),
                     ));
                     *standby_relay_owns_output = true;
-                    // #2263: intentionally leave `watcher_owns_live_relay = false`
-                    // on the standby branch.
-                    //
-                    // The flag's downstream contract in
-                    // `tmux::watcher_should_yield_to_inflight_state` is
-                    // narrowly "the restored TMUX WATCHER itself owns
-                    // delivery for this turn — do not yield". The standby
-                    // branch never spawns a watcher (the briefly-claimed
-                    // slot was just removed at line ~1477); the
-                    // `standby_relay` task is a separate, non-persisted
-                    // delivery owner whose ownership is NOT representable
-                    // by this single boolean.
-                    //
-                    // Setting the flag to `true` here would over-claim
-                    // ownership for any watcher restored against this
-                    // state on a different node (or after failover) — it
-                    // would short-circuit the yield gate and let a
-                    // restored watcher deliver concurrently with a still-
-                    // alive standby_relay, producing duplicate Discord
-                    // posts (codex adversarial review on #2263).
-                    //
-                    // The cost of keeping it `false` is the phantom-
-                    // bridge yield window: on restart, a restored watcher
-                    // whose tmux offset overlaps `turn_start_offset` will
-                    // yield to a bridge owner that died with the original
-                    // standby process and will suppress relay for the
-                    // overlapping batch. The inflight row is then cleared
-                    // by the `INFLIGHT_STALENESS_THRESHOLD_SECS` (300s)
-                    // staleness path in `classify_inflight_diagnostic_state`
-                    // (router/message_handler.rs) and the recovery-engine
-                    // sweep, after which a follow-up user turn proceeds
-                    // normally. The completed standby_relay response that
-                    // landed before the crash is preserved on Discord (it
-                    // was posted before the process died); the failure
-                    // mode is the user-visible stall on the FOLLOW-UP
-                    // turn until staleness sweep, NOT a dropped response.
-                    //
-                    // A typed `relay_owner_kind` (Watcher / StandbyRelay
-                    // / None) plus an owner-lease timestamp would allow
-                    // distinguishing dead-standby from live-standby and
-                    // remove this stall entirely. That refactor is
-                    // tracked separately and is out of scope for #2263.
-                    //
-                    // Per-turn in-process state is still correctly tracked
-                    // by `standby_relay_owns_output = true` above; that
-                    // local flag is what gates the bridge's terminal
-                    // delivery suppression for the current turn.
                     let _ = save_inflight_state(inflight_state);
                 } else {
                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -2226,28 +1500,6 @@ pub(super) fn spawn_turn_bridge(
         let mut api_friction_reports = Vec::new();
         let mut transcript_events = Vec::<SessionTranscriptEvent>::new();
         let mut resume_failure_detected = false;
-        // #2451 H5 graduation: `StreamMessage::Init { session_id, .. }` is
-        // the explicit provider handshake — it lands as soon as the
-        // provider has a live session bound to the new turn. We use its
-        // arrival as the authoritative "resume succeeded" witness so the
-        // empty-response classification no longer has to guess from
-        // `turn_start.elapsed() < 10s`. The elapsed-time heuristic is
-        // retained only as a 30s safety backstop.
-        let mut session_handshake_seen = false;
-        // #2451: snapshot whether the channel had a prior provider
-        // session_id at turn-start time. The previous logic re-read
-        // `shared.core.sessions` at empty-response classification time,
-        // which races with `reset_session_for_auto_retry` and produces
-        // false negatives ("session was already cleared, so we never
-        // attempted resume"). Capturing this once at the top closes the
-        // race.
-        let had_prior_session_id_at_turn_start = {
-            let data = shared_owned.core.lock().await;
-            data.sessions
-                .get(&channel_id)
-                .and_then(|s| s.session_id.as_ref())
-                .is_some()
-        };
         let mut terminal_session_reset_required = false;
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
@@ -2271,35 +1523,15 @@ pub(super) fn spawn_turn_bridge(
         let completion_tx = bridge.completion_tx;
         // Guard: ensure completion_tx fires even if the task panics or
         // exits early, preventing the parent from hanging on completion_rx.
-        //
-        // #2448: also publish an explicit `InflightSignal::Completed`
-        // broadcast on drop so any per-turn relay tasks (currently the
-        // standby JSONL relay) can exit immediately instead of polling
-        // against a wall-clock deadline. The broadcast send is best-effort
-        // — if no subscriber is registered, `send` returns Err and we
-        // ignore it.
-        struct CompletionGuard {
-            tx: Option<tokio::sync::oneshot::Sender<()>>,
-            broadcaster: tokio::sync::broadcast::Sender<super::inflight::InflightSignal>,
-            channel_id: ChannelId,
-        }
+        struct CompletionGuard(Option<tokio::sync::oneshot::Sender<()>>);
         impl Drop for CompletionGuard {
             fn drop(&mut self) {
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.0.take() {
                     let _ = tx.send(());
                 }
-                let _ = self
-                    .broadcaster
-                    .send(super::inflight::InflightSignal::Completed {
-                        channel_id: self.channel_id.get(),
-                    });
             }
         }
-        let _completion_guard = CompletionGuard {
-            tx: completion_tx,
-            broadcaster: shared_owned.inflight_signals.clone(),
-            channel_id,
-        };
+        let _completion_guard = CompletionGuard(completion_tx);
 
         // Guard: ensure inflight state file is cleaned up even if the task
         // panics or exits early.  On the normal path we defuse the guard
@@ -2408,18 +1640,13 @@ pub(super) fn spawn_turn_bridge(
             }),
         );
 
-        // #2289 cancel finalization helper. Both the pre-`try_recv` guard
-        // and the post-`try_recv` re-sample funnel through this so the
-        // cancellation bookkeeping (inflight sync, `cancelled = true`,
-        // background-child abort) stays in lock step and cannot drift.
-        // Implemented as a macro so it can mutate locals owned by the
-        // surrounding `while` body without moving them into a closure that
-        // would conflict with `&mut` borrows held elsewhere. The macro
-        // performs the bookkeeping; callers must follow with `break 'outer`
-        // (or be in a position where falling through hits the outer loop
-        // boundary) so the loop exits to the cancel post-processing path.
-        macro_rules! finalize_cancel_inner {
-            () => {{
+        while !done
+            || terminal_control_drain_until
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            let mut state_dirty = false;
+
+            if cancel_requested(Some(cancel_token.as_ref())) {
                 if sync_inflight_restart_mode_from_cancel(
                     cancel_token.as_ref(),
                     &mut inflight_state,
@@ -2434,138 +1661,37 @@ pub(super) fn spawn_turn_bridge(
                     "turn cancel",
                 )
                 .await;
-            }};
-        }
-
-        'outer: while !done
-            || terminal_control_drain_until
-                .is_some_and(|deadline| std::time::Instant::now() < deadline)
-        {
-            let mut state_dirty = false;
-
-            // #2172 cancel boundary: once `done` is true the turn's
-            // terminal outcome (Completed / Done message) has already been
-            // observed; the loop continues only to drain residual control
-            // frames during `terminal_control_drain_until`. A cancel that
-            // arrives in that drain window MUST NOT reclassify the
-            // already-completed turn as cancelled (which would re-run
-            // stop_active_turn and dispatch-cancel finalisation). The
-            // documented "whichever comes first wins" priority is
-            // enforced by gating the cancel arm on `!done`. Cancels
-            // arriving during the drain window break out of the loop
-            // normally as a completed turn.
-            if !done && cancel_requested(Some(cancel_token.as_ref())) {
-                finalize_cancel_inner!();
-                break 'outer;
-            }
-            if done && cancel_requested(Some(cancel_token.as_ref())) {
-                // #2172: cancel-after-Done during terminal drain — exit
-                // the drain immediately as a completed turn instead of
-                // burning the rest of the drain window. Suppressing the
-                // reclassification still preserves the "stop after
-                // completion is a no-op" UX.
-                break 'outer;
+                break;
             }
 
-            // #2449 H3 graduation: the post-Done 50ms sleep used to be a
-            // heuristic "wait a bit for trailing control frames" guard.
-            // The authoritative signal is the explicit handoff frame
-            // (`TmuxReady` / `ProcessReady` / `RuntimeReady`); each of
-            // those handlers clears `terminal_control_drain_until` to
-            // `None`, which exits the outer `while` immediately. We keep
-            // a small wake interval here as a safety backstop so the
-            // drain window deadline can fire when no handoff is coming
-            // (handoff-ambiguous providers), but bound it tightly to
-            // remaining drain time so it never over-sleeps once the
-            // window naturally closes.
             let loop_sleep = if done {
-                let now = std::time::Instant::now();
-                let drain_remaining = terminal_control_drain_until
-                    .and_then(|deadline| deadline.checked_duration_since(now))
-                    .unwrap_or_else(|| tokio::time::Duration::from_millis(5));
-                // Cap at 5ms — small enough that a handoff arriving
-                // immediately after the wake is processed within one tick,
-                // large enough to avoid hot-spinning when the bridge truly
-                // is waiting for the drain deadline.
-                drain_remaining.min(tokio::time::Duration::from_millis(5))
+                tokio::time::Duration::from_millis(50)
             } else {
                 tokio::time::Duration::from_millis(1000)
             };
             tokio::time::sleep(loop_sleep).await;
 
-            if !done && cancel_requested(Some(cancel_token.as_ref())) {
-                finalize_cancel_inner!();
-                break 'outer;
-            }
-            if done && cancel_requested(Some(cancel_token.as_ref())) {
-                // See note above on the cancel-after-Done race.
-                break 'outer;
+            if cancel_requested(Some(cancel_token.as_ref())) {
+                if sync_inflight_restart_mode_from_cancel(
+                    cancel_token.as_ref(),
+                    &mut inflight_state,
+                ) {
+                    let _ = save_inflight_state(&inflight_state);
+                }
+                cancelled = true;
+                close_all_tracked_background_children(
+                    shared_owned.pg_pool.as_ref(),
+                    &mut active_background_child_session_ids,
+                    "aborted",
+                    "turn cancel",
+                )
+                .await;
+                break;
             }
 
             loop {
-                // #2172 cancel boundary: re-check the cancel flag between
-                // drained messages. Without this, the outer loop samples
-                // `cancel_requested` once and then drains EVERY queued
-                // StreamMessage to completion — so a cancel that flips
-                // mid-drain can let a queued `Done` set `done = true`
-                // before the outer cancel-arm runs, which then can no
-                // longer classify the turn as cancelled (the `!done`
-                // gate suppresses it). Break out of the drain on cancel
-                // so the outer cancel-arm gets first claim on the
-                // turn outcome. Frames already pulled before cancel was
-                // observed have been processed (acceptable: they
-                // happened before the user pressed stop); subsequent
-                // frames are left in `rx` and dropped by the bridge
-                // shutdown path.
-                if !done && cancel_requested(Some(cancel_token.as_ref())) {
-                    break;
-                }
                 match rx.try_recv() {
-                    Ok(msg) => {
-                        // #2289 cancel boundary: re-sample `cancel_requested`
-                        // AFTER `try_recv` returns, but ONLY for variants
-                        // that would flip `done = true` (`Done` and
-                        // `Error` today). The pre-recv guard above samples
-                        // before the receive call; if `/stop` flips the
-                        // token between that guard and `try_recv`
-                        // returning a terminal frame, letting that arm
-                        // run sets `done = true` and suppresses the outer
-                        // cancel arm — recording the turn as completed,
-                        // failed, or transport-errored when the user
-                        // actually stopped it. Drop the terminal frame
-                        // and jump to cancel-finalize so the cancel claims
-                        // the outcome.
-                        //
-                        // The gate is scoped to variants that set
-                        // `done = true` so non-terminal control/output
-                        // frames (`RuntimeReady`, `TmuxReady`,
-                        // `ProcessReady`, `OutputOffset`, `Text`,
-                        // `RetryBoundary`, …) are still processed: they
-                        // may carry handoff paths, offsets, watcher debt,
-                        // or session-reset decisions that the cancel
-                        // path expects to be applied. None of those
-                        // variants flip `done = true`, so the next outer
-                        // iteration's pre-recv cancel guard finalizes
-                        // cancel cleanly on the very next pass. When a
-                        // new terminal variant is added, it MUST be added
-                        // here too — see `is_done_setting_terminal_frame`.
-                        if is_done_setting_terminal_frame(&msg)
-                            && should_finalize_cancel_after_recv(
-                                done,
-                                cancel_requested(Some(cancel_token.as_ref())),
-                            )
-                        {
-                            // The dropped frame's bookkeeping (full_response
-                            // resolution, transcript Result/Error,
-                            // placeholder close, transport_error edge)
-                            // is intentionally skipped: the cancel path
-                            // is the authoritative finalizer for the
-                            // turn outcome and runs its own placeholder
-                            // teardown.
-                            finalize_cancel_inner!();
-                            break 'outer;
-                        }
-                        match msg {
+                    Ok(msg) => match msg {
                         StreamMessage::RetryBoundary => {
                             if provider == ProviderKind::Gemini
                                 && handle_gemini_retry_boundary(
@@ -2595,12 +1721,6 @@ pub(super) fn spawn_turn_bridge(
                             new_raw_provider_session_id =
                                 raw_session_id.or_else(|| Some(sid.clone()));
                             inflight_state.session_id = Some(sid);
-                            // #2451 H5: explicit handshake witness — the
-                            // provider has answered with a bound session.
-                            // Any subsequent empty-response classification
-                            // can rely on this instead of elapsed-time
-                            // guessing.
-                            session_handshake_seen = true;
                             state_dirty = true;
                         }
                         StreamMessage::Text { content } => {
@@ -3264,24 +2384,15 @@ pub(super) fn spawn_turn_bridge(
                             }
                             state_dirty = true;
                             done = true;
-                            // #2449 H4 graduation: only arm the 250ms drain
-                            // window when handoff is genuinely ambiguous.
-                            // If a runtime handoff has already been observed
-                            // (`tmux_handed_off` flipped or
-                            // `inflight_state.runtime_kind` stamped), the
-                            // ownership question is already settled and any
-                            // further drain just delays bridge exit by up to
-                            // 250ms. The drain remains armed for
-                            // warm-followup providers that emit `Done` before
-                            // their handoff frame — in those cases the
-                            // handoff arm clears the deadline to `None` as
-                            // soon as the frame lands.
-                            if !tmux_handed_off && inflight_state.runtime_kind.is_none() {
-                                terminal_control_drain_until = Some(
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(250),
-                                );
-                            }
+                            // Some warm-followup providers emit terminal Done
+                            // before the immediately-following TmuxReady /
+                            // ProcessReady control message. Keep draining
+                            // briefly so ownership handoff is not decided from
+                            // a partial terminal frame.
+                            terminal_control_drain_until = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(250),
+                            );
                         }
                         StreamMessage::Error {
                             message, stderr, ..
@@ -3557,26 +2668,9 @@ pub(super) fn spawn_turn_bridge(
                                                 cancel_for_standby,
                                                 shared_for_standby,
                                                 provider_for_standby,
-                                                // #2448: see TmuxReady branch
-                                                // — timeout demoted to safety
-                                                // backstop after broadcast
-                                                // exit signal landed.
-                                                std::time::Duration::from_secs(1800),
+                                                std::time::Duration::from_secs(900),
                                             ));
                                             standby_relay_owns_output = true;
-                                            // #2263: see the helper-fn
-                                            // `handle_watcher_runtime_handoff`
-                                            // standby branch — intentionally
-                                            // leave `watcher_owns_live_relay = false`
-                                            // because the standby_relay task
-                                            // is not a tmux watcher, and the
-                                            // yield-gate flag would over-claim
-                                            // ownership for a watcher restored
-                                            // by a different node, risking
-                                            // duplicate Discord delivery.
-                                            // Per-turn delivery ownership is
-                                            // already captured by
-                                            // `standby_relay_owns_output`.
                                             let _ = save_inflight_state(&inflight_state);
                                         } else {
                                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3770,13 +2864,6 @@ pub(super) fn spawn_turn_bridge(
                                 }
                                 inflight_state.last_offset = last_offset;
                                 state_dirty = true;
-                                // #2235: persist immediately after stamping
-                                // runtime_kind so a bridge crash between this
-                                // assignment and the centralized state_dirty
-                                // flush cannot leave a row whose runtime_kind
-                                // contradicts its other fields (e.g. CodexTui
-                                // semantics with a stale FIFO path).
-                                let _ = save_inflight_state(&inflight_state);
                                 if done {
                                     terminal_control_drain_until = None;
                                 }
@@ -3794,9 +2881,6 @@ pub(super) fn spawn_turn_bridge(
                                 inflight_state.input_fifo_path = None;
                                 inflight_state.last_offset = last_offset;
                                 state_dirty = true;
-                                // #2235: see CodexTui arm — durable stamp of
-                                // runtime_kind across a bridge-crash window.
-                                let _ = save_inflight_state(&inflight_state);
                                 if done {
                                     terminal_control_drain_until = None;
                                 }
@@ -3820,11 +2904,6 @@ pub(super) fn spawn_turn_bridge(
                             inflight_state.input_fifo_path = None;
                             inflight_state.last_offset = last_offset;
                             state_dirty = true;
-                            // #2235: persist runtime_kind stamp immediately —
-                            // ProcessBackend has no watcher so we want the
-                            // on-disk row to reflect the new backend before
-                            // any potential bridge crash.
-                            let _ = save_inflight_state(&inflight_state);
                             if done {
                                 terminal_control_drain_until = None;
                             }
@@ -3841,25 +2920,9 @@ pub(super) fn spawn_turn_bridge(
                             );
                             state_dirty = true;
                         }
-                        }
-                    }
+                    },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        // #2289 cancel boundary: re-sample cancel AFTER the
-                        // receiver reports disconnect. If `/stop` flipped
-                        // the token between the pre-recv guard and this
-                        // arm, letting the disconnect set `done = true`
-                        // and exit the inner loop would cause the outer
-                        // cancel arm (gated on `!done`) to skip
-                        // finalisation, leaving the turn recorded as
-                        // completed/empty instead of stopped.
-                        if should_finalize_cancel_after_recv(
-                            done,
-                            cancel_requested(Some(cancel_token.as_ref())),
-                        ) {
-                            finalize_cancel_inner!();
-                            break 'outer;
-                        }
                         rx_disconnected = true;
                         done = true;
                         terminal_control_drain_until = None;
@@ -4361,55 +3424,6 @@ pub(super) fn spawn_turn_bridge(
         shared_owned
             .global_finalizing
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // #2293 — hoist the TUI completion gate BEFORE the mailbox /
-        // active-turn cleanup so the cleanup can short-circuit on TimedOut and
-        // avoid releasing the channel mailbox while the pane is still busy
-        // (which would let intake admit a new turn into a non-quiescent
-        // pane). The value is `None` on the non-unix gate-disabled build, on
-        // paths that do not finalize via terminal delivery (cancelled /
-        // prompt_too_long / transport_error / recovery_retry), and when
-        // there is no tmux session bound to the inflight. Consumers below
-        // treat `None` as "no gate ran — proceed with legacy behaviour".
-        #[allow(unused_assignments, unused_mut)]
-        let mut bridge_tui_gate_outcome_early: Option<super::tmux::TuiCompletionGateOutcome> = None;
-        #[cfg(unix)]
-        {
-            // Reproduce the same eligibility filter the late gate already
-            // applies, but BEFORE the channel-mailbox release.
-            let eligible_for_early_gate =
-                !cancelled && !is_prompt_too_long && !transport_error && !recovery_retry;
-            if eligible_for_early_gate
-                && let Some(tmux_session_name) = inflight_state.tmux_session_name.as_deref()
-            {
-                bridge_tui_gate_outcome_early = Some(
-                    super::tmux::run_tui_completion_gate(
-                        &provider,
-                        channel_id,
-                        tmux_session_name,
-                        inflight_state.task_notification_kind,
-                    )
-                    .await,
-                );
-                if matches!(
-                    bridge_tui_gate_outcome_early,
-                    Some(super::tmux::TuiCompletionGateOutcome::TimedOut)
-                ) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!(
-                        provider = %provider.as_str(),
-                        channel = channel_id.get(),
-                        tmux_session = %tmux_session_name,
-                        "[{ts}] ⚠ #2293: bridge TUI quiescence gate timed out BEFORE mailbox release — deferring mailbox_finish_turn / stop_active_turn so a busy pane cannot admit a new turn"
-                    );
-                }
-            }
-        }
-        // Convenience: short-circuit the mailbox / active-turn cleanup sites
-        // below when the early gate timed out.
-        let bridge_early_gate_blocks_mailbox_release = matches!(
-            bridge_tui_gate_outcome_early,
-            Some(super::tmux::TuiCompletionGateOutcome::TimedOut)
-        );
         let has_queued_turns = if bridge_relay_delegated_to_watcher {
             // #1452 (Codex P1): the actual `mailbox_finalize_owed.store(true,
             // Release)` happens EARLIER, at the watcher-unpause site in the
@@ -4502,20 +3516,6 @@ pub(super) fn spawn_turn_bridge(
                     .voice_barge_in
                     .drain_deferred_after_turn(&shared_owned, &provider, channel_id)
                     .await
-            } else if bridge_early_gate_blocks_mailbox_release {
-                // #2293 — TUI completion gate timed out above. Releasing the
-                // channel mailbox here would let intake admit a new turn into
-                // a still-busy pane, racing the placeholder sweeper /
-                // next-turn watcher reconcile that closes the lingering
-                // Active panel. Skip the release; the next watcher pass
-                // observes idle and finishes the mailbox on its own.
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!(
-                    provider = %provider.as_str(),
-                    channel = channel_id.get(),
-                    "  [{ts}] ⚠ #2293: bridge mailbox_finish_turn deferred — TUI quiescence gate timed out; placeholder sweeper / next watcher pass will reconcile"
-                );
-                false
             } else {
                 let finish =
                     super::mailbox_finish_turn(&shared_owned, &provider, channel_id).await;
@@ -4567,14 +3567,6 @@ pub(super) fn spawn_turn_bridge(
         let mut preserve_inflight_for_cleanup_retry = false;
         let mut terminal_delivery_committed = false;
         let mut status_panel_terminal_committed = false;
-        // #2161 (Codex round-2 H1): hoisted into the outer scope so the
-        // bridge can run the TUI completion gate BEFORE dispatch completion
-        // and reuse the same outcome for the visible status-panel emit
-        // below. Default is "emit" for paths that don't reach the gate
-        // (e.g. cancelled, prompt_too_long, transport_error) and for
-        // non-unix targets where the tmux module is configured out.
-        #[allow(unused_mut)]
-        let mut bridge_should_emit_completion = true;
 
         // Remove ⏳ only if the bridge still owns output delivery.
         // Relay owners commit their own visible lifecycle.
@@ -4603,15 +3595,14 @@ pub(super) fn spawn_turn_bridge(
                 "recovery session died",
             )
             .await;
-            // #2452 H6: schedule the auto-retry via the explicit
-            // completion path so the dedup lockout is released as soon
-            // as scheduling resolves (≤ 120s safety net inside helper).
-            spawn_retry_with_history_with_release(
-                gateway.clone(),
-                channel_id,
-                user_msg_id,
-                user_text_owned.clone(),
-            );
+            // Auto-retry with Discord history
+            let gateway_c = gateway.clone();
+            let retry_text = user_text_owned.clone();
+            tokio::spawn(async move {
+                gateway_c
+                    .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
+                    .await;
+            });
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
             let _ = gateway
                 .edit_message(
@@ -4635,43 +3626,17 @@ pub(super) fn spawn_turn_bridge(
             // into Aborted before the rest of the cleanup machinery runs. The
             // controller's idempotent terminal transition guarantees this is
             // safe even if the ToolResult event already fired Completed.
-            // #2289 (Codex review): mirror the Done/stream-end outcome handling
-            // — only clear the persisted flag when the transition actually
-            // committed (Edited / Coalesced / AlreadyTerminal). On
-            // `EditFailed`, leave the controller entry Active and the
-            // persisted flag set so a later retry path or the placeholder
-            // sweeper can finish the teardown. Without this, dropping a
-            // raced `Done` here would silently leak a non-evictable Active
-            // controller row and clobber the sweeper's repair signal.
-            if let Some((key, snapshot, close_trigger, ack_consumed)) =
-                long_running_placeholder_active.take()
-            {
-                let outcome = shared_owned
+            if let Some((key, _, _, _)) = long_running_placeholder_active.take() {
+                let _ = shared_owned
                     .placeholder_controller
                     .transition(
                         gateway.as_ref(),
-                        key.clone(),
+                        key,
                         super::placeholder_controller::PlaceholderLifecycle::Aborted,
                     )
                     .await;
-                use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
-                    inflight_state.long_running_placeholder_active = false;
-                    let _ = save_inflight_state(&inflight_state);
-                } else {
-                    // EditFailed (or any non-committed outcome): leave the
-                    // persisted flag set AND preserve the inflight file for
-                    // cleanup retry. The placeholder sweeper relies on the
-                    // inflight file existing to discover the stuck row; if
-                    // we let the normal cancel cleanup delete it, the
-                    // sweeper would lose its repair signal and the
-                    // controller entry would stay Active forever. Force
-                    // the inflight to be preserved so the next sweeper
-                    // pass can finish the teardown.
-                    let _ = (key, snapshot, close_trigger, ack_consumed);
-                    let _ = save_inflight_state(&inflight_state);
-                    preserve_inflight_for_cleanup_retry = true;
-                }
+                inflight_state.long_running_placeholder_active = false;
+                let _ = save_inflight_state(&inflight_state);
             }
 
             let cleanup_policy = match cancel_token.restart_mode() {
@@ -4869,33 +3834,26 @@ pub(super) fn spawn_turn_bridge(
                     "resume failed in response output",
                 )
                 .await;
-                // #2452 H6: explicit completion path — see helper docs.
-                spawn_retry_with_history_with_release(
-                    gateway.clone(),
-                    channel_id,
-                    user_msg_id,
-                    user_text_owned.clone(),
-                );
+                // Auto-retry with Discord history context
+                let gateway_c = gateway.clone();
+                let retry_text = user_text_owned.clone();
+                tokio::spawn(async move {
+                    gateway_c
+                        .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
+                        .await;
+                });
                 full_response = String::new(); // Suppress error message to user
             } else if full_response.is_empty() {
-                // #2451 H5 graduation: the authoritative resume-failure
-                // witness is the absence of `StreamMessage::Init` after a
-                // turn that attempted resume. `attempted_resume` is the
-                // turn-start snapshot of the provider session_id (taken
-                // before any reset_session_for_auto_retry side effect),
-                // and `session_handshake_seen` is flipped inside the
-                // `Init` handler. The old `quick_exit < 10s` test is kept
-                // as a 30s safety backstop for providers whose `Init`
-                // emission is unreliable (e.g. gemini may not emit Init
-                // on resume success).
-                let attempted_resume = had_prior_session_id_at_turn_start;
-                let resume_likely_failed_by_handshake =
-                    attempted_resume && !session_handshake_seen && rx_disconnected;
-                // Backstop only — wider threshold to keep false positives
-                // away from healthy fast turns.
-                let quick_exit_backstop = turn_start.elapsed().as_secs() < 30;
-                let quick_empty_resume =
-                    resume_likely_failed_by_handshake || (quick_exit_backstop && rx_disconnected && attempted_resume);
+                let quick_exit = turn_start.elapsed().as_secs() < 10;
+                let quick_empty_resume = if quick_exit && rx_disconnected {
+                    let data = shared_owned.core.lock().await;
+                    data.sessions
+                        .get(&channel_id)
+                        .and_then(|s| s.session_id.as_ref())
+                        .is_some()
+                } else {
+                    false
+                };
                 // Fallback: try to extract response from tmux output file
                 if quick_empty_resume {
                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4948,13 +3906,13 @@ pub(super) fn spawn_turn_bridge(
                         "stale session_id in recovered output",
                     )
                     .await;
-                    // #2452 H6: explicit completion path — see helper docs.
-                    spawn_retry_with_history_with_release(
-                        gateway.clone(),
-                        channel_id,
-                        user_msg_id,
-                        user_text_owned.clone(),
-                    );
+                    let gateway_c = gateway.clone();
+                    let retry_text = user_text_owned.clone();
+                    tokio::spawn(async move {
+                        gateway_c
+                            .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
+                            .await;
+                    });
                     full_response = String::new();
                 } else {
                     // Check for resume failure via other methods
@@ -4984,38 +3942,30 @@ pub(super) fn spawn_turn_bridge(
                             "stale session_id in output file",
                         )
                         .await;
-                        // #2452 H6: explicit completion path — see helper.
-                        spawn_retry_with_history_with_release(
-                            gateway.clone(),
-                            channel_id,
-                            user_msg_id,
-                            user_text_owned.clone(),
-                        );
+                        let gateway_c = gateway.clone();
+                        let retry_text = user_text_owned.clone();
+                        tokio::spawn(async move {
+                            gateway_c
+                                .schedule_retry_with_history(channel_id, user_msg_id, &retry_text)
+                                .await;
+                        });
                         full_response = String::new();
                     }
-                    // #2451 H5 Method 2: authoritative resume-failure
-                    // classification via the explicit `Init` handshake
-                    // witness. The legacy `quick_exit < 10s` test now
-                    // serves only as the 30s safety backstop above. If
-                    // `attempted_resume` was true AND we never saw `Init`
-                    // AND rx disconnected, the provider almost certainly
-                    // failed to bind the prior session_id. The original
-                    // `core.sessions` re-fetch is replaced by the
-                    // turn-start snapshot so the recheck cannot race a
-                    // prior reset_session_for_auto_retry.
-                    if !resume_failed
-                        && rx_disconnected
-                        && attempted_resume
-                        && (!session_handshake_seen || quick_exit_backstop)
-                    {
-                        {
+                    // Method 2: quick exit (<10s) + empty response + had a session_id to resume
+                    if !resume_failed && quick_exit && rx_disconnected {
+                        let attempted_resume = {
+                            let data = shared_owned.core.lock().await;
+                            data.sessions
+                                .get(&channel_id)
+                                .and_then(|s| s.session_id.as_ref())
+                                .is_some()
+                        };
+                        if attempted_resume {
                             resume_failed = true;
                             resume_failure_detected = true;
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             tracing::warn!(
-                                "  [{ts}] ⚠ Empty response with no Init handshake (session_handshake_seen={}, elapsed={}s) — auto-retrying with fresh session (channel {})",
-                                session_handshake_seen,
-                                turn_start.elapsed().as_secs(),
+                                "  [{ts}] ⚠ Quick exit with empty response — auto-retrying with fresh session (channel {})",
                                 channel_id
                             );
                             reset_session_for_auto_retry(
@@ -5029,13 +3979,17 @@ pub(super) fn spawn_turn_bridge(
                                 "quick exit with empty response",
                             )
                             .await;
-                            // #2452 H6: explicit completion path.
-                            spawn_retry_with_history_with_release(
-                                gateway.clone(),
-                                channel_id,
-                                user_msg_id,
-                                user_text_owned.clone(),
-                            );
+                            let gateway_c = gateway.clone();
+                            let retry_text = user_text_owned.clone();
+                            tokio::spawn(async move {
+                                gateway_c
+                                    .schedule_retry_with_history(
+                                        channel_id,
+                                        user_msg_id,
+                                        &retry_text,
+                                    )
+                                    .await;
+                            });
                             full_response = String::new();
                         }
                     }
@@ -5187,48 +4141,14 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if terminal_delivery_committed {
-                // #2236: look up the typed handoff marker stamped at dispatch
-                // time so multi-agent setups with overlapping background
-                // channels can be disambiguated by the stored agent_id. The
-                // marker is consumed inside voice_background_completion_target
-                // below; passing the stored agent_id (cloned, not taken) here
-                // keeps both lookups consistent for this single dispatch.
-                //
-                // #2274: if the in-memory marker is absent (dcserver
-                // restarted mid-turn, or rehydration has not yet completed)
-                // fall back to the durable PG row for the agent_id lookup.
-                let pg_pool_for_handoff = shared_owned.pg_pool.as_ref();
-                let in_memory_handoff_agent_id =
-                    crate::voice::announce_meta::global_store()
-                        .get_handoff(user_msg_id)
-                        .and_then(|meta| meta.agent_id);
-                let stored_handoff_agent_id = match in_memory_handoff_agent_id {
-                    Some(agent_id) => Some(agent_id),
-                    None => match pg_pool_for_handoff {
-                        Some(pool) => crate::voice::announce_meta::load_handoff_durable(
-                            pool,
-                            user_msg_id,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|meta| meta.agent_id),
-                        None => None,
-                    },
-                };
                 let mapped_voice_channel_id = shared_owned
                     .voice_barge_in
-                    .voice_channel_for_background(channel_id, stored_handoff_agent_id.as_deref())
+                    .voice_channel_for_background(channel_id)
                     .await;
                 if let Some(voice_channel_id) = voice_background_completion_target(
                     mapped_voice_channel_id,
-                    user_msg_id,
                     &user_text_owned,
-                    channel_id,
-                    pg_pool_for_handoff,
-                )
-                .await
-                {
+                ) {
                     if !inflight_state.silent_turn {
                         let voice_barge_in = shared_owned.voice_barge_in.clone();
                         let shared_for_voice = shared_owned.clone();
@@ -5270,60 +4190,6 @@ pub(super) fn spawn_turn_bridge(
                     shared_owned
                         .voice_barge_in
                         .publish_progress(channel_id, "agent:done");
-                }
-            }
-
-            // #2161 (Codex round-2 H1): run the TUI completion gate BEFORE
-            // dispatch completion / queue drain so a still-busy ClaudeTui
-            // pane cannot advance lifecycle state ahead of pane quiescence.
-            // The same outcome is reused by the status-panel emit below.
-            // The gate lives in the `tmux` module (`#[cfg(unix)]`); on
-            // non-unix targets we skip it and emit completion as normal.
-            //
-            // #2293 — when the early gate (~line 4254, hoisted ABOVE the
-            // mailbox release) already ran for this turn, reuse its outcome
-            // here instead of polling tmux a second time. The early
-            // result is the authoritative one because it was sampled
-            // closer to the moment the mailbox would have been released;
-            // re-polling here would create a window where the pane could
-            // settle into idle AFTER we already deferred mailbox cleanup,
-            // producing inconsistent dispatch / status semantics across
-            // the two gate sites.
-            #[cfg(unix)]
-            {
-                let bridge_gate_outcome = if terminal_delivery_committed
-                    && !preserve_inflight_for_cleanup_retry
-                {
-                    if let Some(outcome) = bridge_tui_gate_outcome_early {
-                        outcome
-                    } else if let Some(tmux_session_name) =
-                        inflight_state.tmux_session_name.as_deref()
-                    {
-                        super::tmux::run_tui_completion_gate(
-                            &provider,
-                            channel_id,
-                            tmux_session_name,
-                            inflight_state.task_notification_kind,
-                        )
-                        .await
-                    } else {
-                        super::tmux::TuiCompletionGateOutcome::NotGated
-                    }
-                } else {
-                    super::tmux::TuiCompletionGateOutcome::NotGated
-                };
-
-                bridge_should_emit_completion = bridge_gate_outcome.should_emit_completion();
-
-                // On TimedOut we preserve the inflight + suppress dispatch
-                // completion so queued turns do not drain into a busy pane. The
-                // next watcher pass / placeholder sweeper reconciles when the
-                // pane finally reports idle.
-                if matches!(
-                    bridge_gate_outcome,
-                    super::tmux::TuiCompletionGateOutcome::TimedOut
-                ) {
-                    preserve_inflight_for_cleanup_retry = true;
                 }
             }
 
@@ -5383,11 +4249,7 @@ pub(super) fn spawn_turn_bridge(
                 terminal_delivery_committed && !preserve_inflight_for_cleanup_retry;
         }
 
-        if status_panel_terminal_committed && bridge_should_emit_completion {
-            // #2161 (Codex H1): the bridge-owned delivery path runs the
-            // gate ABOVE so it can also block dispatch completion on
-            // TimedOut. Here we just reuse the outcome and skip the
-            // visible `응답 완료` if the pane was still busy.
+        if status_panel_terminal_committed {
             complete_status_panel_v2(
                 shared_owned.as_ref(),
                 gateway.as_ref(),
@@ -6216,251 +5078,5 @@ mod status_panel_v2_rework_tests {
 
         assert_eq!(status_panel_msg_id, Some(MessageId::new(99)));
         assert_eq!(state.status_message_id, Some(99));
-    }
-}
-
-#[cfg(test)]
-mod cancel_recv_toctou_tests {
-    //! #2289: post-`try_recv` cancel re-sample. The relay receive loop must
-    //! drop a terminal frame and run cancel finalization when `/stop` flips
-    //! the cancel token AFTER the pre-recv guard passed but BEFORE the
-    //! receive call returned the frame.
-
-    use super::should_finalize_cancel_after_recv;
-    use crate::services::agent_protocol::StreamMessage;
-    use crate::services::provider::{CancelToken, cancel_requested};
-    use std::sync::mpsc;
-
-    #[test]
-    fn priority_helper_matches_documented_truth_table() {
-        // The documented rule:
-        //   - cancel wins iff the loop has not yet observed a terminal
-        //     completion (`done == false`)
-        //   - once `done == true` (a prior iteration set it from a `Done`
-        //     observed before cancel), the completion classification
-        //     sticks and a later cancel becomes a no-op (UX: "stop after
-        //     completion is a no-op").
-        assert!(should_finalize_cancel_after_recv(false, true));
-        assert!(!should_finalize_cancel_after_recv(false, false));
-        assert!(!should_finalize_cancel_after_recv(true, true));
-        assert!(!should_finalize_cancel_after_recv(true, false));
-    }
-
-    /// Models exactly the receive loop's post-`try_recv` checkpoint:
-    ///   1. pre-recv guard samples cancel — clear, proceed.
-    ///   2. terminal frame (`Done`) lands in the channel.
-    ///   3. user presses `/stop`; the token flips.
-    ///   4. `try_recv` returns `Ok(Done)`.
-    /// Without the fix, the bridge would handle `Done`, set `done = true`,
-    /// and the next outer cancel arm (gated on `!done`) would suppress
-    /// finalization — silently downgrading a user-stop to a recorded
-    /// completion. With the fix, the post-recv re-sample drops the frame
-    /// and routes to cancel finalization.
-    #[test]
-    fn cancel_flips_between_pre_guard_and_terminal_frame_drops_frame() {
-        let (tx, rx) = mpsc::channel::<StreamMessage>();
-        let token = CancelToken::new();
-
-        // (1) pre-recv guard passes: cancel not yet set.
-        let done = false;
-        let pre_guard_cancel = cancel_requested(Some(&token));
-        assert!(!pre_guard_cancel);
-        assert!(!should_finalize_cancel_after_recv(done, pre_guard_cancel));
-
-        // (2) terminal frame becomes available.
-        tx.send(StreamMessage::Done {
-            result: "completed".to_string(),
-            session_id: None,
-        })
-        .expect("send Done");
-
-        // (3) /stop fires — token flips AFTER pre-guard.
-        token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // (4) try_recv returns Ok(Done). The fix re-samples cancel here.
-        let msg = rx.try_recv().expect("Done frame is available");
-        assert!(matches!(msg, StreamMessage::Done { .. }));
-
-        let post_recv_cancel = cancel_requested(Some(&token));
-        assert!(post_recv_cancel, "token flipped before recv returned");
-
-        let must_finalize = should_finalize_cancel_after_recv(done, post_recv_cancel);
-        assert!(
-            must_finalize,
-            "#2289: post-recv re-sample MUST claim the outcome for cancel \
-             when cancel raced ahead of a terminal frame"
-        );
-
-        // The fix's finalize_cancel_inner! macro would now run cancel
-        // bookkeeping and `break 'outer`; we must NOT fall through to the
-        // `Done` handler that would set `done = true`. Mimic the fixed
-        // control flow: do not set `done`.
-        // (Verifying the negative: had we processed the frame, `done`
-        // would have flipped, suppressing the outer cancel arm.)
-        assert!(!done, "Done frame must be dropped, not applied");
-    }
-
-    /// Mirror scenario for the `Disconnected` arm: cancel flips between
-    /// pre-recv guard and the receiver being dropped. Without the fix the
-    /// loop sets `done = true` from the Disconnected arm and exits via the
-    /// completion path; with the fix the post-recv re-sample wins.
-    #[test]
-    fn cancel_flips_between_pre_guard_and_disconnect_drops_disconnect() {
-        let (tx, rx) = mpsc::channel::<StreamMessage>();
-        let token = CancelToken::new();
-        let done = false;
-
-        // (1) pre-recv guard passes.
-        assert!(!cancel_requested(Some(&token)));
-
-        // (2) sender drops without sending a terminal frame.
-        drop(tx);
-
-        // (3) /stop flips the token.
-        token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // (4) try_recv returns Disconnected.
-        let err = rx.try_recv().expect_err("rx must be disconnected");
-        assert!(matches!(err, mpsc::TryRecvError::Disconnected));
-
-        // Post-recv re-sample MUST route to cancel finalization, not to
-        // the Disconnected branch that would set done = true.
-        let must_finalize = should_finalize_cancel_after_recv(done, cancel_requested(Some(&token)));
-        assert!(
-            must_finalize,
-            "#2289: Disconnected during cancel race must finalize as cancel, \
-             not as completion"
-        );
-        assert!(
-            !done,
-            "Disconnected branch must NOT run when cancel won the race"
-        );
-    }
-
-    /// #2289 round-2 Codex finding: `StreamMessage::Error` also sets
-    /// `done = true` in the receive loop, so the same TOCTOU class
-    /// applies. If `/stop` flips between the pre-recv guard and `Error`
-    /// returning, the Error arm would mark the turn as a transport
-    /// failure instead of a user stop. The gate uses
-    /// `is_done_setting_terminal_frame` so both `Done` and `Error` are
-    /// covered.
-    #[test]
-    fn cancel_flips_between_pre_guard_and_terminal_error_drops_frame() {
-        use super::is_done_setting_terminal_frame;
-        let (tx, rx) = mpsc::channel::<StreamMessage>();
-        let token = CancelToken::new();
-        let done = false;
-
-        assert!(!cancel_requested(Some(&token)));
-        tx.send(StreamMessage::Error {
-            message: "provider rpc failed".to_string(),
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: None,
-        })
-        .expect("send Error");
-        token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        let msg = rx.try_recv().expect("Error frame is available");
-        assert!(is_done_setting_terminal_frame(&msg));
-        assert!(should_finalize_cancel_after_recv(
-            done,
-            cancel_requested(Some(&token))
-        ));
-        assert!(!done, "Error frame must be dropped, not applied");
-    }
-
-    /// The classifier must list every Ok variant that flips `done = true`.
-    #[test]
-    fn terminal_frame_classifier_matches_loop_done_assignments() {
-        use super::is_done_setting_terminal_frame;
-        // These two are the Ok arms that set done = true today.
-        assert!(is_done_setting_terminal_frame(&StreamMessage::Done {
-            result: String::new(),
-            session_id: None,
-        }));
-        assert!(is_done_setting_terminal_frame(&StreamMessage::Error {
-            message: String::new(),
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: None,
-        }));
-        // Sample of non-terminal variants that must NOT trip the gate.
-        assert!(!is_done_setting_terminal_frame(&StreamMessage::Text {
-            content: "hi".to_string(),
-        }));
-        assert!(!is_done_setting_terminal_frame(
-            &StreamMessage::OutputOffset { offset: 42 }
-        ));
-    }
-
-    /// #2289 Codex review follow-up: the post-recv re-sample is gated on
-    /// `StreamMessage::Done` only. Non-terminal `Ok(msg)` variants
-    /// (RuntimeReady, TmuxReady, ProcessReady, OutputOffset, Text, Error,
-    /// …) must NOT trigger the cancel finalize even when the token is
-    /// flagged, because their data (handoff paths, offsets, watcher debt,
-    /// session-reset decisions) needs to be applied before cancel runs.
-    /// The next outer-loop iteration's pre-recv cancel guard will then
-    /// finalize cleanly — none of those variants set `done = true`.
-    #[test]
-    fn cancel_after_non_terminal_ok_does_not_drop_frame_directly() {
-        let token = CancelToken::new();
-        token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // Production sites gate the post-recv re-sample on
-        // `matches!(msg, StreamMessage::Done { .. })` BEFORE calling the
-        // helper. Model that here: only `Done` proceeds to the priority
-        // check; everything else short-circuits and is processed.
-        let non_terminal = StreamMessage::Text {
-            content: "partial output".to_string(),
-        };
-        let must_finalize_now = matches!(non_terminal, StreamMessage::Done { .. })
-            && should_finalize_cancel_after_recv(false, cancel_requested(Some(&token)));
-        assert!(
-            !must_finalize_now,
-            "non-terminal Ok variants must NOT be dropped by the post-recv \
-             re-sample; their payload (handoff/offset/watcher debt) must be \
-             applied before cancel finalizes on the next iteration"
-        );
-
-        // For comparison, the same scenario with a Done frame DOES finalize.
-        let terminal = StreamMessage::Done {
-            result: "completed".to_string(),
-            session_id: None,
-        };
-        let must_finalize_terminal = matches!(terminal, StreamMessage::Done { .. })
-            && should_finalize_cancel_after_recv(false, cancel_requested(Some(&token)));
-        assert!(
-            must_finalize_terminal,
-            "Done MUST finalize: it would otherwise set done = true and \
-             suppress the outer cancel arm"
-        );
-    }
-
-    /// Negative case: if `Done` was observed and `done = true` BEFORE the
-    /// cancel arrived, the prior completion sticks even though cancel is
-    /// now flagged. This preserves the documented "whichever observed
-    /// terminal state first wins" rule and keeps `/stop` a no-op after
-    /// completion (see the matching comment in the outer loop body).
-    #[test]
-    fn cancel_after_done_observed_does_not_reclassify() {
-        let token = CancelToken::new();
-        let done = true; // a previous iteration already set this
-        token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed); // late cancel
-
-        assert!(!should_finalize_cancel_after_recv(
-            done,
-            cancel_requested(Some(&token))
-        ));
     }
 }

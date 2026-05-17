@@ -83,7 +83,7 @@ export function SettingsNavigation<TPanel extends string>({
       <div
         role="tablist"
         aria-label={tr("설정 패널", "Settings panels")}
-        className="settings-nav-items -mx-1 flex gap-2 overflow-x-auto pb-1 md:mx-0 md:block md:space-y-1 md:overflow-visible md:pb-0"
+        className="settings-nav-items space-y-1"
       >
         {items.length > 0 ? (
           items.map((item) => (
@@ -130,11 +130,9 @@ function PanelNavButton({
       id={id}
       type="button"
       onClick={onClick}
-      role="tab"
-      aria-selected={active}
       aria-current={active ? "page" : undefined}
       aria-controls={ariaControls}
-      className="settings-nav-button min-h-[44px] w-[min(46vw,176px)] shrink-0 rounded-xl px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--th-accent-primary)] focus-visible:ring-offset-2 focus-visible:ring-offset-[color:var(--th-card-bg)] md:w-full md:px-2.5"
+      className="w-full rounded-xl px-2.5 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--th-accent-primary)] focus-visible:ring-offset-2 focus-visible:ring-offset-[color:var(--th-card-bg)]"
       style={{
         borderColor: "transparent",
         background: active
@@ -142,9 +140,9 @@ function PanelNavButton({
           : "transparent",
       }}
     >
-      <div className="flex items-center gap-2 md:items-start md:gap-3">
+      <div className="flex items-start gap-3">
         <span
-          className="h-2 w-2 shrink-0 rounded-full md:mt-1"
+          className="mt-1 h-2 w-2 shrink-0 rounded-full"
           style={{
             background: active
               ? "var(--th-accent-primary)"
@@ -154,7 +152,7 @@ function PanelNavButton({
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div
-              className="truncate text-sm font-semibold md:whitespace-normal"
+              className="text-sm font-semibold"
               style={{
                 color: active
                   ? "var(--th-accent-primary)"
@@ -165,7 +163,7 @@ function PanelNavButton({
             </div>
             {count && (
               <span
-                className="settings-nav-count shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium"
+                className="shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium"
                 style={{
                   borderColor:
                     "color-mix(in srgb, var(--th-border) 72%, transparent)",
@@ -179,7 +177,7 @@ function PanelNavButton({
             )}
           </div>
           <div
-            className="settings-nav-detail mt-1 hidden text-[11px] leading-5 md:block"
+            className="mt-1 text-[11px] leading-5"
             style={{ color: "var(--th-text-muted)" }}
           >
             {detail}

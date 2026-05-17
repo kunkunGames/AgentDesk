@@ -7,7 +7,7 @@ import EmojiPicker from "./EmojiPicker";
 
 vi.mock("../../i18n", () => ({
   useI18n: () => ({
-    t: (input: { en?: string; ko?: string } | string) => {
+    t: (input: any) => {
       if (typeof input === "string") return input;
       return input.en || input.ko || "";
     },
@@ -49,7 +49,7 @@ describe("EmojiPicker", () => {
     expect(button?.getAttribute("aria-haspopup")).toBe("dialog");
   });
 
-  it("renders the dialog with a translated accessible name", async () => {
+  it("renders dialog and individual emojis with appropriate aria-labels", async () => {
     const target = await render(<EmojiPicker value="🤖" onChange={() => {}} />);
     const button = target.querySelector("button");
 
@@ -60,5 +60,9 @@ describe("EmojiPicker", () => {
     const dialog = target.querySelector('div[role="dialog"]');
     expect(dialog).not.toBeNull();
     expect(dialog?.getAttribute("aria-label")).toBe("Choose an emoji");
+
+    const emojiButton = target.querySelector('button[aria-label="Emoji 🤖"]');
+    expect(emojiButton).not.toBeNull();
+    expect(emojiButton?.getAttribute("aria-pressed")).toBe("true");
   });
 });

@@ -50,9 +50,19 @@ pub fn run(
     };
     let _ = std::fs::remove_file(prompt_file);
 
-    let expanded_dir = crate::runtime_layout::expand_user_path(working_dir)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| working_dir.to_string());
+    let expanded_dir = if working_dir.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            home.join(&working_dir[2..]).to_string_lossy().to_string()
+        } else {
+            working_dir.to_string()
+        }
+    } else if working_dir == "~" {
+        dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|| working_dir.to_string())
+    } else {
+        working_dir.to_string()
+    };
 
     let (prompt_tx, prompt_rx) = mpsc::channel::<String>();
 
@@ -130,7 +140,7 @@ pub fn run(
     };
 
     let mut thread_id = normalize_resume_session_id(resume_session_id);
-    let initial_turn = run_turn(
+    if let Err(err) = run_turn(
         &mut output,
         codex_bin,
         codex_model,
@@ -142,30 +152,14 @@ pub fn run(
         goals_enabled,
         compact_token_limit,
         add_dirs,
-    );
-    if let Err(err) = initial_turn {
+    ) {
         emit_result_error(&mut output, &err);
         let exit_reason_path = format!("{}.exit_reason", output_file);
-        let exit_str = format!("error:{err}");
-        let _ = std::fs::write(&exit_reason_path, &exit_str);
-        // #2442 (H2) — initial turn fail-fast path. Files are preserved
-        // for post-mortem so the sentinel reaches the watcher.
-        crate::services::tmux_common::emit_wrapper_sentinel(
-            output_file,
-            crate::services::tmux_common::WrapperSentinel::TerminalEnd { exit: &exit_str },
-        );
+        let _ = std::fs::write(&exit_reason_path, format!("error:{err}"));
         // Preserve output files for post-mortem on error
         eprintln!("\x1b[33m[preserving output files for post-mortem: {output_file}]\x1b[0m");
         std::process::exit(1);
     }
-
-    // #2442 (H3) — initial turn succeeded; wrapper is now back to
-    // waiting on `prompt_rx`. Emit ready_for_input so the tmux.rs probe
-    // can short-circuit without waiting for the 2s tick.
-    crate::services::tmux_common::emit_wrapper_sentinel(
-        output_file,
-        crate::services::tmux_common::WrapperSentinel::ReadyForInput { provider: "codex" },
-    );
 
     let mut followup_error: Option<String> = None;
     while let Ok(next_prompt) = prompt_rx.recv() {
@@ -186,11 +180,6 @@ pub fn run(
             followup_error = Some(err);
             break;
         }
-        // #2442 (H3) — same as above for follow-up turns.
-        crate::services::tmux_common::emit_wrapper_sentinel(
-            output_file,
-            crate::services::tmux_common::WrapperSentinel::ReadyForInput { provider: "codex" },
-        );
     }
 
     let exit_reason_path = format!("{}.exit_reason", output_file);
@@ -201,28 +190,12 @@ pub fn run(
         eprintln!("\x1b[33m[preserving output files for post-mortem: {output_file}]\x1b[0m");
         reason
     } else {
-        // Normal exit — prompt_rx closed, all turns succeeded.
-        // #2442 (H2) — emit terminal_end BEFORE `cleanup()` removes the
-        // JSONL so the sentinel actually reaches the watcher tail. The
-        // failure branch (preserve for post-mortem) emits afterwards because
-        // the file is preserved.
+        // Normal exit — prompt_rx closed, all turns succeeded
         let reason = "exit:0".to_string();
         let _ = std::fs::write(&exit_reason_path, &reason);
-        crate::services::tmux_common::emit_wrapper_sentinel(
-            output_file,
-            crate::services::tmux_common::WrapperSentinel::TerminalEnd { exit: &reason },
-        );
         cleanup(output_file, input_fifo);
         reason
     };
-    if followup_error.is_some() {
-        // Error branch: file preserved — emit the sentinel now so the
-        // recovery_engine drain can short-circuit on this case too.
-        crate::services::tmux_common::emit_wrapper_sentinel(
-            output_file,
-            crate::services::tmux_common::WrapperSentinel::TerminalEnd { exit: &exit_reason },
-        );
-    }
     eprintln!();
     eprintln!("\x1b[90m--- Session ended ({exit_reason}) ---\x1b[0m");
 }
