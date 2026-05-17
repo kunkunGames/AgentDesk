@@ -1293,6 +1293,110 @@ pub(super) struct TurnBridgeContext {
     pub(super) inflight_state: InflightTurnState,
 }
 
+struct StreamMessageReceiverAdapter {
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamMessage>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StreamMessageReceiverAdapter {
+    async fn recv(&mut self) -> Option<StreamMessage> {
+        self.rx.recv().await
+    }
+
+    fn try_recv(&mut self) -> Result<StreamMessage, tokio::sync::mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for StreamMessageReceiverAdapter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn spawn_stream_message_receiver_adapter(
+    rx: mpsc::Receiver<StreamMessage>,
+) -> StreamMessageReceiverAdapter {
+    let (tx, async_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_worker = stop.clone();
+    tokio::task::spawn_blocking(move || {
+        while !stop_worker.load(std::sync::atomic::Ordering::Acquire) {
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(message) => {
+                    if stop_worker.load(std::sync::atomic::Ordering::Acquire)
+                        || tx.send(message).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    StreamMessageReceiverAdapter { rx: async_rx, stop }
+}
+
+fn turn_bridge_stream_wait_duration(
+    done: bool,
+    terminal_control_drain_until: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    if done {
+        return terminal_control_drain_until
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or_else(|| std::time::Duration::from_millis(0));
+    }
+    std::time::Duration::from_secs(1)
+}
+
+#[cfg(test)]
+mod ready_drain_unit_tests {
+    use super::*;
+
+    #[test]
+    fn done_wait_uses_remaining_drain_window_as_safety_wake() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            turn_bridge_stream_wait_duration(
+                true,
+                Some(now + std::time::Duration::from_millis(123)),
+                now,
+            ),
+            std::time::Duration::from_millis(123)
+        );
+        assert_eq!(
+            turn_bridge_stream_wait_duration(true, None, now),
+            std::time::Duration::from_millis(0)
+        );
+        assert_eq!(
+            turn_bridge_stream_wait_duration(false, None, now),
+            std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_receiver_adapter_wakes_on_ready_frame() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut async_rx = spawn_stream_message_receiver_adapter(rx);
+        tx.send(StreamMessage::TmuxReady {
+            output_path: "/tmp/out.jsonl".to_string(),
+            input_fifo_path: "/tmp/in.fifo".to_string(),
+            tmux_session_name: "adk-test".to_string(),
+            last_offset: 12,
+        })
+        .expect("send ready frame");
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(50), async_rx.recv())
+            .await
+            .expect("ready frame should wake without a poll tick")
+            .expect("adapter should forward ready frame");
+
+        assert!(matches!(received, StreamMessage::TmuxReady { .. }));
+    }
+}
+
 fn push_transcript_event(events: &mut Vec<SessionTranscriptEvent>, event: SessionTranscriptEvent) {
     let has_payload = !event.content.trim().is_empty()
         || event
@@ -2137,6 +2241,7 @@ pub(super) fn spawn_turn_bridge(
     );
     tokio::spawn(async move {
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let mut rx = spawn_stream_message_receiver_adapter(rx);
         let channel_id = bridge.channel_id;
         let provider = bridge.provider.clone();
         let gateway = bridge.gateway.clone();
@@ -2255,6 +2360,7 @@ pub(super) fn spawn_turn_bridge(
         let mut terminal_session_reset_required = false;
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
+        let mut pending_stream_messages: VecDeque<StreamMessage> = VecDeque::new();
         let mut pending_status_tool_results: VecDeque<String> = VecDeque::new();
         // codex round-8 P1 on PR #1308: while a long-running placeholder is
         // active, bump the inflight file's mtime so the sweeper sees the turn
@@ -2264,6 +2370,7 @@ pub(super) fn spawn_turn_bridge(
         const LIVE_LONG_RUN_HEARTBEAT_INTERVAL: std::time::Duration =
             std::time::Duration::from_secs(30);
         let mut last_activity_heartbeat_at: Option<std::time::Instant> = None;
+        let mut terminal_control_ready_observed = false;
         let mut terminal_control_drain_until: Option<std::time::Instant> = None;
         let mut current_msg_id = bridge.current_msg_id;
         let mut response_sent_offset = bridge.response_sent_offset;
@@ -2471,31 +2578,26 @@ pub(super) fn spawn_turn_bridge(
                 break 'outer;
             }
 
-            // #2449 H3 graduation: the post-Done 50ms sleep used to be a
-            // heuristic "wait a bit for trailing control frames" guard.
-            // The authoritative signal is the explicit handoff frame
-            // (`TmuxReady` / `ProcessReady` / `RuntimeReady`); each of
-            // those handlers clears `terminal_control_drain_until` to
-            // `None`, which exits the outer `while` immediately. We keep
-            // a small wake interval here as a safety backstop so the
-            // drain window deadline can fire when no handoff is coming
-            // (handoff-ambiguous providers), but bound it tightly to
-            // remaining drain time so it never over-sleeps once the
-            // window naturally closes.
-            let loop_sleep = if done {
-                let now = std::time::Instant::now();
-                let drain_remaining = terminal_control_drain_until
-                    .and_then(|deadline| deadline.checked_duration_since(now))
-                    .unwrap_or_else(|| tokio::time::Duration::from_millis(5));
-                // Cap at 5ms — small enough that a handoff arriving
-                // immediately after the wake is processed within one tick,
-                // large enough to avoid hot-spinning when the bridge truly
-                // is waiting for the drain deadline.
-                drain_remaining.min(tokio::time::Duration::from_millis(5))
+            // #2426 H3/H4 graduation: wait for the next stream frame and
+            // treat the duration as a safety wake, not a pre-drain sleep.
+            // Explicit handoff frames (`TmuxReady` / `ProcessReady` /
+            // `RuntimeReady`) wake this loop immediately and clear
+            // `terminal_control_drain_until` in their handlers.
+            let stream_wait = turn_bridge_stream_wait_duration(
+                done,
+                terminal_control_drain_until,
+                std::time::Instant::now(),
+            );
+            if stream_wait.is_zero() {
+                if let Ok(msg) = rx.try_recv() {
+                    pending_stream_messages.push_back(msg);
+                }
             } else {
-                tokio::time::Duration::from_millis(1000)
-            };
-            tokio::time::sleep(loop_sleep).await;
+                match tokio::time::timeout(stream_wait, rx.recv()).await {
+                    Ok(Some(msg)) => pending_stream_messages.push_back(msg),
+                    Ok(None) | Err(_) => {}
+                }
+            }
 
             if !done && cancel_requested(Some(cancel_token.as_ref())) {
                 finalize_cancel_inner!();
@@ -2524,7 +2626,12 @@ pub(super) fn spawn_turn_bridge(
                 if !done && cancel_requested(Some(cancel_token.as_ref())) {
                     break;
                 }
-                match rx.try_recv() {
+                let next_message = if let Some(msg) = pending_stream_messages.pop_front() {
+                    Ok(msg)
+                } else {
+                    rx.try_recv()
+                };
+                match next_message {
                     Ok(msg) => {
                         // #2289 cancel boundary: re-sample `cancel_requested`
                         // AFTER `try_recv` returns, but ONLY for variants
@@ -3279,8 +3386,11 @@ pub(super) fn spawn_turn_bridge(
                             // warm-followup providers that emit `Done` before
                             // their handoff frame — in those cases the
                             // handoff arm clears the deadline to `None` as
-                            // soon as the frame lands.
-                            if !tmux_handed_off && inflight_state.runtime_kind.is_none() {
+                            // soon as the frame lands. Do not use persisted
+                            // `runtime_kind` as this signal: fresh managed
+                            // turns can be pre-stamped before the control
+                            // frame arrives.
+                            if !terminal_control_ready_observed {
                                 terminal_control_drain_until = Some(
                                     std::time::Instant::now()
                                         + std::time::Duration::from_millis(250),
@@ -3420,6 +3530,7 @@ pub(super) fn spawn_turn_bridge(
                             tmux_session_name,
                             last_offset,
                         } => {
+                            terminal_control_ready_observed = true;
                             tmux_last_offset = Some(last_offset);
                             inflight_state.runtime_kind =
                                 Some(RuntimeHandoffKind::LegacyTmuxWrapper);
@@ -3707,13 +3818,15 @@ pub(super) fn spawn_turn_bridge(
                                 terminal_control_drain_until = None;
                             }
                         }
-                        StreamMessage::RuntimeReady { handoff } => match handoff {
-                            RuntimeHandoff::LegacyTmuxWrapper {
-                                output_path,
-                                input_fifo_path,
-                                tmux_session_name,
-                                last_offset,
-                            } => {
+                        StreamMessage::RuntimeReady { handoff } => {
+                            terminal_control_ready_observed = true;
+                            match handoff {
+                                RuntimeHandoff::LegacyTmuxWrapper {
+                                    output_path,
+                                    input_fifo_path,
+                                    tmux_session_name,
+                                    last_offset,
+                                } => {
                                 handle_watcher_runtime_handoff(
                                     &shared_owned,
                                     &provider,
@@ -3809,13 +3922,15 @@ pub(super) fn spawn_turn_bridge(
                                 if done {
                                     terminal_control_drain_until = None;
                                 }
+                                }
                             }
-                        },
+                        }
                         StreamMessage::ProcessReady {
                             output_path,
                             session_name,
                             last_offset,
                         } => {
+                            terminal_control_ready_observed = true;
                             // ProcessBackend completed first turn.
                             // No tmux watcher needed — process sessions are monitored
                             // inline via SessionProbe::process during read_output_file_until_result.
@@ -3852,8 +3967,8 @@ pub(super) fn spawn_turn_bridge(
                         }
                         }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         // #2289 cancel boundary: re-sample cancel AFTER the
                         // receiver reports disconnect. If `/stop` flipped
                         // the token between the pre-recv guard and this
