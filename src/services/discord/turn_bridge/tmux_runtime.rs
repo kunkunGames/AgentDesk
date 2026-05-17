@@ -102,7 +102,11 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let tracked_child_pid = token.child_pid.lock().unwrap_or_else(|e| e.into_inner()).to_owned();
+    let tracked_child_pid = token
+        .child_pid
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .to_owned();
     let Some(tmux_session_name) = tmux_session.as_deref() else {
         tracing::error!(
             "provider turn interrupt skipped: provider={} reason={} error=cancel_token_missing_tmux_session",
@@ -299,7 +303,11 @@ pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
         );
     }
 
-    let tracked_child_pid = token.child_pid.lock().unwrap_or_else(|e| e.into_inner()).to_owned();
+    let tracked_child_pid = token
+        .child_pid
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .to_owned();
     let provider_pid = provider_cli_pid_in_tmux(tmux_session_name, provider, tracked_child_pid);
     if let Some(pid) = provider_pid {
         {
@@ -412,7 +420,11 @@ async fn hard_stop_unresponsive_provider_cli_turn(
             None
         };
 
-    let tracked_child_pid = token.child_pid.lock().unwrap_or_else(|e| e.into_inner()).to_owned();
+    let tracked_child_pid = token
+        .child_pid
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .to_owned();
     let provider_for_probe = provider.clone();
     let session_for_probe = tmux_session_name.clone();
     let probe = tokio::task::spawn_blocking(move || {
@@ -503,7 +515,11 @@ pub(in crate::services::discord) fn cancel_active_token(
     token.set_restart_mode(cleanup_policy.preserves_inflight());
     let mut termination_recorded = false;
 
-    let child_pid = token.child_pid.lock().unwrap_or_else(|e| e.into_inner()).to_owned();
+    let child_pid = token
+        .child_pid
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .to_owned();
     // `child_pid` is the wrapper PID — i.e. the foreground process of the
     // tmux pane. SIGKILL'ing it tears down the tmux session itself. For
     // `PreserveSession` / `PreserveSessionAndInflight` the caller has
@@ -1224,13 +1240,18 @@ mod tests {
     #[test]
     fn preserve_session_cancel_keeps_tmux_session_reference() {
         let token = Arc::new(CancelToken::new());
-        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) = Some("AgentDesk-codex-test".to_string());
+        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some("AgentDesk-codex-test".to_string());
 
         super::cancel_active_token(&token, TmuxCleanupPolicy::PreserveSession, "test stop");
 
         assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(
-            token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()).as_deref(),
+            token
+                .tmux_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
             Some("AgentDesk-codex-test")
         );
     }
@@ -1271,7 +1292,11 @@ mod tests {
         // PreserveSession leaves the tmux_session field intact for any
         // follow-up cleanup that needs the session name.
         assert_eq!(
-            token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()).as_deref(),
+            token
+                .tmux_session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref(),
             Some("AgentDesk-claude-stop-order-regression-1218-does-not-exist")
         );
     }
