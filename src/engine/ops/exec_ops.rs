@@ -60,6 +60,24 @@ fn clamp_exec_timeout_to_bridge_deadline(timeout_ms: u64) -> Result<u64, String>
     }
 }
 
+fn bridge_tmux_timeout_for_session_op(op_name: &str) -> Result<Option<Duration>, String> {
+    match crate::engine::loader::bridge_op_deadline_remaining() {
+        None => Ok(None),
+        Some(remaining) if remaining.is_zero() => {
+            Err(format!("bridge deadline passed before {op_name} started"))
+        }
+        Some(remaining) => Ok(Some(remaining)),
+    }
+}
+
+fn tmux_bridge_error_for_session_op(op_name: &str, error: String) -> String {
+    if error.contains("timed out") {
+        format!("bridge deadline passed during {op_name}")
+    } else {
+        error
+    }
+}
+
 #[cfg(windows)]
 fn is_powershell_script(path: &OsStr) -> bool {
     std::path::Path::new(path)
@@ -298,18 +316,28 @@ pub(super) fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                     .split_once(':')
                     .map(|(_, name)| name)
                     .unwrap_or(&session_key);
-                // #2378: short-circuit if the current JS eval's bridge-op
-                // deadline has already passed. A blocking tmux `.output()`
-                // call against a hung tmux server would otherwise hold the
-                // runtime lock indefinitely.
-                if matches!(
-                    crate::engine::loader::bridge_op_deadline_remaining(),
-                    Some(d) if d.is_zero()
-                ) {
-                    return r#"{"ok":false,"error":"bridge deadline passed before session.sendCommand started"}"#
-                        .to_string();
-                }
-                match crate::services::platform::tmux::send_keys(tmux_name, &[&command, "Enter"]) {
+                // #2378/#2404: enforce the current JS eval's bridge-op
+                // deadline for the tmux child itself. The zero-budget branch
+                // preserves the previous preflight behavior, while positive
+                // budgets prevent a hung tmux server from holding the
+                // QuickJS runtime lock past the remaining deadline.
+                let tmux_timeout = match bridge_tmux_timeout_for_session_op("session.sendCommand") {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        return format!(r#"{{"ok":false,"error":"{}"}}"#, error);
+                    }
+                };
+                let send_result = match tmux_timeout {
+                    Some(timeout) => crate::services::platform::tmux::send_keys_timeout(
+                        tmux_name,
+                        &[&command, "Enter"],
+                        timeout,
+                    ),
+                    None => {
+                        crate::services::platform::tmux::send_keys(tmux_name, &[&command, "Enter"])
+                    }
+                };
+                match send_result {
                     Ok(out) if out.status.success() => {
                         format!(
                             r#"{{"ok":true,"session":"{}","command":"{}"}}"#,
@@ -321,6 +349,7 @@ pub(super) fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                         format!(r#"{{"ok":false,"error":"tmux: {}"}}"#, stderr.trim())
                     }
                     Err(e) => {
+                        let e = tmux_bridge_error_for_session_op("session.sendCommand", e);
                         format!(r#"{{"ok":false,"error":"{}"}}"#, e)
                     }
                 }
@@ -338,17 +367,16 @@ pub(super) fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                 .split_once(':')
                 .map(|(_, name)| name)
                 .unwrap_or(&session_key);
-            // #2378: short-circuit if the current JS eval's bridge-op
-            // deadline has already passed. The audit record is intentionally
-            // skipped in this case — it would be misleading to log an
-            // attempted termination we did not actually issue.
-            if matches!(
-                crate::engine::loader::bridge_op_deadline_remaining(),
-                Some(d) if d.is_zero()
-            ) {
-                return r#"{"ok":false,"error":"bridge deadline passed before session.kill started"}"#
-                    .to_string();
-            }
+            // #2378/#2404: keep the existing zero-deadline short-circuit, and
+            // use any positive remaining deadline as the timeout for the tmux
+            // kill child. The audit record stays after the preflight so it is
+            // emitted only when we actually attempt termination.
+            let tmux_timeout = match bridge_tmux_timeout_for_session_op("session.kill") {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    return format!(r#"{{"ok":false,"error":"{}"}}"#, error);
+                }
+            };
             crate::services::termination_audit::record_termination_for_tmux(
                 tmux_name,
                 None,
@@ -357,10 +385,21 @@ pub(super) fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                 Some("force-kill via agentdesk.session.kill()"),
                 None,
             );
-            match crate::services::platform::tmux::kill_session_output_with_reason(
-                tmux_name,
-                "force-kill via agentdesk.session.kill()",
-            ) {
+            let kill_result = match tmux_timeout {
+                Some(timeout) => {
+                    crate::services::platform::tmux::kill_session_output_with_reason_timeout(
+                        tmux_name,
+                        "force-kill via agentdesk.session.kill()",
+                        timeout,
+                    )
+                }
+                None => crate::services::platform::tmux::kill_session_output_with_reason(
+                    tmux_name,
+                    "force-kill via agentdesk.session.kill()",
+                )
+                .map_err(|error| error.to_string()),
+            };
+            match kill_result {
                 Ok(out) if out.status.success() => {
                     format!(r#"{{"ok":true,"session":"{}"}}"#, session_key)
                 }
@@ -369,6 +408,7 @@ pub(super) fn register_exec_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
                     format!(r#"{{"ok":false,"error":"tmux: {}"}}"#, stderr.trim())
                 }
                 Err(e) => {
+                    let e = tmux_bridge_error_for_session_op("session.kill", e);
                     format!(r#"{{"ok":false,"error":"{}"}}"#, e)
                 }
             }
@@ -521,6 +561,40 @@ mod bridge_deadline_tests {
         assert!(
             matches!(result, Err(ref msg) if msg.contains("deadline passed")),
             "expected deadline-passed error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn session_tmux_timeout_is_unbounded_without_armed_deadline() {
+        assert_eq!(
+            bridge_tmux_timeout_for_session_op("session.sendCommand"),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn session_tmux_timeout_returns_error_after_deadline_elapses() {
+        let _scope = ScopedBridgeDeadline::new(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(40));
+        let result = bridge_tmux_timeout_for_session_op("session.kill");
+        assert!(
+            matches!(
+                result,
+                Err(ref msg) if msg == "bridge deadline passed before session.kill started"
+            ),
+            "expected zero-deadline session.kill error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn session_tmux_timeout_uses_remaining_budget_when_armed() {
+        let _scope = ScopedBridgeDeadline::new(Duration::from_millis(200));
+        let timeout = bridge_tmux_timeout_for_session_op("session.sendCommand")
+            .expect("deadline still in the future")
+            .expect("armed deadline should return a timeout");
+        assert!(
+            timeout <= Duration::from_millis(200),
+            "timeout must not exceed remaining bridge budget: {timeout:?}"
         );
     }
 }

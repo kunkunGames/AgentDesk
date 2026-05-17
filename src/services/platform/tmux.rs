@@ -4,8 +4,10 @@
 //! Callers in async contexts should use `tokio::task::spawn_blocking`.
 
 use super::binary_resolver;
+use crate::services::process::{configure_child_process_group, wait_with_output_timeout};
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 /// Format session name as an exact-match target (prefix with `=`, suffix with
 /// `:` so the target also resolves in pane-context commands).
@@ -26,6 +28,19 @@ fn tmux_command() -> Command {
     let mut cmd = Command::new("tmux");
     binary_resolver::apply_runtime_path(&mut cmd);
     cmd
+}
+
+fn wait_for_tmux_output(
+    mut command: Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    configure_child_process_group(&mut command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command
+        .spawn()
+        .map_err(|e| format!("{label} spawn failed: {e}"))?;
+    wait_with_output_timeout(child, timeout, label)
 }
 
 /// Check if tmux is available on the system.
@@ -125,6 +140,27 @@ fn kill_session_output_internal(session_name: &str, reason: &str) -> std::io::Re
     output
 }
 
+fn kill_session_output_internal_with_timeout(
+    session_name: &str,
+    reason: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
+    log_kill_request(session_name, reason);
+    let mut command = tmux_command();
+    command.args(["kill-session", "-t", &exact_target(session_name)]);
+    let output = wait_for_tmux_output(command, timeout, "tmux kill-session");
+    match &output {
+        Ok(output) => log_kill_result(session_name, reason, output),
+        Err(error) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⚠ tmux kill failed: session={session_name} reason={reason} error={error}"
+            );
+        }
+    }
+    output
+}
+
 /// Kill a tmux session. Returns true if the kill command succeeded.
 pub fn kill_session_with_reason(session_name: &str, reason: &str) -> bool {
     kill_session_output_internal(session_name, reason)
@@ -143,6 +179,15 @@ pub fn kill_session_output_with_reason(
     reason: &str,
 ) -> std::io::Result<Output> {
     kill_session_output_internal(session_name, reason)
+}
+
+/// Kill a tmux session, enforcing a caller-supplied timeout.
+pub fn kill_session_output_with_reason_timeout(
+    session_name: &str,
+    reason: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
+    kill_session_output_internal_with_timeout(session_name, reason, timeout)
 }
 
 /// Kill a tmux session, returning full Output for error inspection.
@@ -186,6 +231,20 @@ pub fn send_keys(session_name: &str, keys: &[&str]) -> Result<Output, String> {
         .args(&args)
         .output()
         .map_err(|e| format!("tmux send-keys failed: {e}"))
+}
+
+/// Send keys to a tmux session, enforcing a caller-supplied timeout.
+pub fn send_keys_timeout(
+    session_name: &str,
+    keys: &[&str],
+    timeout: Duration,
+) -> Result<Output, String> {
+    let target = exact_target(session_name);
+    let mut args = vec!["send-keys", "-t", &target];
+    args.extend(keys);
+    let mut command = tmux_command();
+    command.args(&args);
+    wait_for_tmux_output(command, timeout, "tmux send-keys")
 }
 
 /// Send literal text to a tmux session without interpreting tmux key names.
@@ -505,5 +564,111 @@ mod paste_tests {
                 "=AgentDesk-claude-adk-cc:"
             ]
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod timeout_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct PathOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl PathOverride {
+        fn prepend(path: &std::path::Path) -> Self {
+            let guard = crate::config::shared_test_env_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let previous = std::env::var_os("PATH");
+            let joined = match &previous {
+                Some(old) => {
+                    let mut paths = vec![path.to_path_buf()];
+                    paths.extend(std::env::split_paths(old));
+                    std::env::join_paths(paths).expect("join PATH")
+                }
+                None => path.as_os_str().to_os_string(),
+            };
+            unsafe { std::env::set_var("PATH", joined) };
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for PathOverride {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+        }
+    }
+
+    fn write_fake_tmux(dir: &std::path::Path, body: &str) {
+        let path = dir.join("tmux");
+        let mut file = std::fs::File::create(&path).expect("fake tmux");
+        writeln!(file, "#!/bin/sh").expect("shebang");
+        writeln!(file, "{body}").expect("body");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[test]
+    fn send_keys_timeout_reports_hung_tmux() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        write_fake_tmux(temp.path(), "sleep 5");
+        let _path = PathOverride::prepend(temp.path());
+
+        let error = send_keys_timeout(
+            "agentdesk-test",
+            &["/compact", "Enter"],
+            Duration::from_millis(20),
+        )
+        .expect_err("hung tmux should time out");
+
+        assert!(error.contains("timed out"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn send_keys_timeout_preserves_tmux_stderr_on_fast_failure() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        write_fake_tmux(temp.path(), "echo 'no such session' >&2; exit 2");
+        let _path = PathOverride::prepend(temp.path());
+
+        let output = send_keys_timeout(
+            "agentdesk-test",
+            &["/compact", "Enter"],
+            Duration::from_secs(1),
+        )
+        .expect("fake tmux should exit before timeout");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no such session"),
+            "stderr should be preserved, got: {stderr:?}"
+        );
+    }
+
+    #[test]
+    fn kill_session_timeout_reports_hung_tmux() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        write_fake_tmux(temp.path(), "sleep 5");
+        let _path = PathOverride::prepend(temp.path());
+
+        let error = kill_session_output_with_reason_timeout(
+            "agentdesk-test",
+            "test timeout",
+            Duration::from_millis(20),
+        )
+        .expect_err("hung tmux should time out");
+
+        assert!(error.contains("timed out"), "unexpected error: {error}");
     }
 }

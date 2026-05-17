@@ -145,7 +145,7 @@
 | `engine::ops::db_ops` | `src/engine/ops/db_ops.rs` | 1668 | giant-file |
 | `engine::ops::dispatch_ops` | `src/engine/ops/dispatch_ops.rs` | 600 |  |
 | `engine::ops::dm_reply_ops` | `src/engine/ops/dm_reply_ops.rs` | 534 |  |
-| `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 605 |  |
+| `engine::ops::exec_ops` | `src/engine/ops/exec_ops.rs` | 679 |  |
 | `engine::ops::http_ops` | `src/engine/ops/http_ops.rs` | 243 |  |
 | `engine::ops::kanban_ops` | `src/engine/ops/kanban_ops.rs` | 1130 | giant-file |
 | `engine::ops::kv_ops` | `src/engine/ops/kv_ops.rs` | 211 |  |
@@ -573,7 +573,7 @@
 | `services::platform::binary_resolver` | `src/services/platform/binary_resolver.rs` | 1368 | giant-file |
 | `services::platform::dump_tool` | `src/services/platform/dump_tool.rs` | 111 |  |
 | `services::platform::shell` | `src/services/platform/shell.rs` | 129 |  |
-| `services::platform::tmux` | `src/services/platform/tmux.rs` | 509 |  |
+| `services::platform::tmux` | `src/services/platform/tmux.rs` | 674 |  |
 | `services::process` | `src/services/process.rs` | 1158 | giant-file |
 | `services::provider` | `src/services/provider.rs` | 2621 | giant-file |
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 21 |  |
