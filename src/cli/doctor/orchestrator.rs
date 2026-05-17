@@ -3299,6 +3299,16 @@ fn check_file_descriptor_headroom() -> Check {
     } else {
         launchd_soft_limit
     };
+    // tmux servers are spawned as children of the launchd-managed dcserver
+    // process, so they inherit its per-job SoftResourceLimits:NumberOfFiles
+    // (the plist value) — not the global `launchctl limit maxfiles`. Evaluate
+    // dcserver and tmux against the same resolved soft limit / source so a
+    // raised plist limit does not produce spurious EMFILE warnings for tmux.
+    let resolved_limit_source = if launchd_job_loaded && plist_nofile_limit.is_some() {
+        "launchd_plist"
+    } else {
+        "launchctl_maxfiles"
+    };
 
     let mut samples = Vec::new();
     for pid in dcserver::dcserver_instance_pids() {
@@ -3308,11 +3318,7 @@ fn check_file_descriptor_headroom() -> Check {
                 pid,
                 open_files,
                 soft_limit: dcserver_soft_limit,
-                limit_source: if launchd_job_loaded && plist_nofile_limit.is_some() {
-                    "launchd_plist"
-                } else {
-                    "launchctl_maxfiles"
-                },
+                limit_source: resolved_limit_source,
             });
         }
     }
@@ -3322,8 +3328,8 @@ fn check_file_descriptor_headroom() -> Check {
                 process: "tmux",
                 pid,
                 open_files,
-                soft_limit: launchd_soft_limit,
-                limit_source: "launchctl_maxfiles",
+                soft_limit: dcserver_soft_limit,
+                limit_source: resolved_limit_source,
             });
         }
     }
