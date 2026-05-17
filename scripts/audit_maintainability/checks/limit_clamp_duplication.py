@@ -36,6 +36,10 @@ API_LIMIT_SIGNATURE = "1, 2000"
 HELPER_OPT_OUT_MARKER = "audit-allow: limit_clamp_helper_definition"
 
 
+def _normalize_signature_args(arg: str) -> str:
+    return re.sub(r"(?<=\d)_(?=\d)", "", re.sub(r"\s+", " ", arg).strip())
+
+
 def _run(allowlist: set[str]) -> Iterable[Finding]:
     from ..common import production_rust_files
 
@@ -52,7 +56,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         text = strip_rust_comments(raw)
         for match in PATTERN.finditer(text):
             ident = match.group(1)
-            arg = re.sub(r"\s+", " ", match.group(2)).strip()
+            arg = _normalize_signature_args(match.group(2))
             sig = f"{ident}::{arg}"
             by_signature[sig].append((rel, line_of(text, match.start()), match.group(0)))
 

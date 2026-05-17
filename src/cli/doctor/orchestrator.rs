@@ -3151,6 +3151,14 @@ fn tmux_server_pids() -> Vec<u32> {
 }
 
 #[cfg(target_os = "macos")]
+fn lsof_fd_column_counts_against_rlimit(fd: &str) -> bool {
+    fd.chars()
+        .next()
+        .map(|first| first.is_ascii_digit())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
 fn open_file_count_for_pid(pid: u32) -> Option<u64> {
     let output = std::process::Command::new("lsof")
         .args(["-nP", "-p", &pid.to_string()])
@@ -3163,7 +3171,11 @@ fn open_file_count_for_pid(pid: u32) -> Option<u64> {
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .skip(1)
-            .filter(|line| !line.trim().is_empty())
+            .filter(|line| {
+                line.split_whitespace()
+                    .nth(3)
+                    .is_some_and(lsof_fd_column_counts_against_rlimit)
+            })
             .count() as u64,
     )
 }
@@ -4404,6 +4416,16 @@ mod tests {
 
         assert_eq!(parsed.soft, super::FdLimitValue::Finite(256));
         assert_eq!(parsed.hard, super::FdLimitValue::Unlimited);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lsof_fd_filter_counts_only_descriptor_slots() {
+        assert!(super::lsof_fd_column_counts_against_rlimit("0u"));
+        assert!(super::lsof_fd_column_counts_against_rlimit("12r"));
+        assert!(!super::lsof_fd_column_counts_against_rlimit("cwd"));
+        assert!(!super::lsof_fd_column_counts_against_rlimit("txt"));
+        assert!(!super::lsof_fd_column_counts_against_rlimit("mem"));
     }
 
     #[cfg(target_os = "macos")]
