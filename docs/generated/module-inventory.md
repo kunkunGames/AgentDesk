@@ -261,9 +261,9 @@
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 343 |  |
 | `server::routes::resume` | `src/server/routes/resume.rs` | 1260 | giant-file |
 | `server::routes::review_verdict` | `src/server/routes/review_verdict/mod.rs` | 19 |  |
-| `server::routes::review_verdict::decision_route` | `src/server/routes/review_verdict/decision_route.rs` | 3872 | giant-file |
-| `server::routes::review_verdict::review_state_repo` | `src/server/routes/review_verdict/review_state_repo.rs` | 22 |  |
-| `server::routes::review_verdict::tuning_aggregate` | `src/server/routes/review_verdict/tuning_aggregate.rs` | 707 |  |
+| `server::routes::review_verdict::decision_route` | `src/server/routes/review_verdict/decision_route.rs` | 4681 | giant-file |
+| `server::routes::review_verdict::review_state_repo` | `src/server/routes/review_verdict/review_state_repo.rs` | 35 |  |
+| `server::routes::review_verdict::tuning_aggregate` | `src/server/routes/review_verdict/tuning_aggregate.rs` | 703 |  |
 | `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 554 |  |
 | `server::routes::reviews` | `src/server/routes/reviews.rs` | 1173 | giant-file |
 | `server::routes::routes_tests` | `src/server/routes/routes_tests/mod.rs` | 26 |  |
