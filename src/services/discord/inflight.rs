@@ -19,7 +19,15 @@ use crate::dispatch::Source;
 use crate::services::agent_protocol::{RuntimeHandoffKind, TaskNotificationKind};
 use crate::services::provider::ProviderKind;
 
-const INFLIGHT_STATE_VERSION: u32 = 7;
+// #2235 (follow-up to #2213): bump v7→v8. v7 added `runtime_kind` without a
+// version change, so rolling back from new→old binaries could read rows whose
+// FIFO synthesis was elided for ClaudeTui and reject recovery with a misleading
+// "input fifo path missing" notice. v8 marks the on-disk shape that ships the
+// compat-fixed `input_fifo_path` alongside ClaudeTui plus the silent-skip
+// recovery branch; old binaries continue to deserialize v8 rows via
+// `#[serde(default)]` and treat the new `runtime_kind` as legacy, so the
+// compat window is one release in each direction.
+const INFLIGHT_STATE_VERSION: u32 = 8;
 const INFLIGHT_MAX_AGE_SECS: u64 = 300; // 5 minutes
 const DRAIN_RESTART_MAX_AGE_SECS: u64 = 1800; // 30 minutes
 const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
@@ -34,12 +42,22 @@ const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
 /// `updated_at` is rewritten on every `save_inflight_state` call but is
 /// **not** a true heartbeat — a healthy foreground model/tool call can
 /// legitimately go silent for multiple minutes (long Bash, slow LLM
-/// stream, large Read). We therefore align the THREAD-GUARD trigger with
-/// `placeholder_sweeper::ABANDON_THRESHOLD_SECS` (300s = 5 min): by then
-/// the placeholder sweeper has *already* replaced the message with its
-/// terminal "abandoned" form, so any further "active turn" claim is
-/// definitively stale. False-positive cleanup of a live turn is much
-/// worse than slightly delayed recovery (issue #1446).
+/// stream, large Read).
+///
+/// History: this constant used to be aligned with
+/// `placeholder_sweeper::ABANDON_THRESHOLD_SECS` (then 300s) so the
+/// "definitely stale" gate fired exactly when the sweeper had already
+/// replaced the placeholder with its terminal "abandoned" form. After
+/// #2427 (#2436 / #2437 / #2438) the explicit-signal wires (pane death,
+/// heartbeat-gap inflight sweeper, generation-mismatch bulk invalidate,
+/// TurnCompleted idempotent guard) make the sweeper a pure safety net
+/// — its abandon timer was relaxed to 1800s (30 min). The 300s figure
+/// here is retained because it gates **new** user-message dispatch
+/// (THREAD-GUARD) and the stall-watchdog (#1446): both want to recover
+/// quickly once an explicit signal failed to fire, and the explicit
+/// wires above are expected to clear the cleanup hit within seconds.
+/// False-positive cleanup of a live turn is still much worse than
+/// slightly delayed recovery (issue #1446).
 pub(super) const INFLIGHT_STALENESS_THRESHOLD_SECS: u64 = 300;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,8 +89,24 @@ pub(super) struct InflightTurnState {
     pub tmux_session_name: Option<String>,
     pub output_path: Option<String>,
     pub input_fifo_path: Option<String>,
-    #[serde(default)]
+    /// #2235: deserializing through `deserialize_runtime_kind_tolerant` so a
+    /// future variant written by a newer binary collapses to `None` instead
+    /// of failing the whole row's parse (which would otherwise lose the
+    /// inflight to `inflight_malformed_json_graceful_skip`). Combined with
+    /// the silent-skip recovery branch this gives one release of forward
+    /// compat for new runtime kinds.
+    #[serde(default, deserialize_with = "deserialize_runtime_kind_tolerant")]
     pub runtime_kind: Option<RuntimeHandoffKind>,
+    /// #2235: transient sidecar populated by `load_inflight_states_from_root`
+    /// when the on-disk JSON had a `runtime_kind` field whose value was a
+    /// non-empty string this binary did not recognize (i.e. a future variant).
+    /// Distinct from `runtime_kind = None` for "field absent" (legacy v7
+    /// rows). Recovery uses this to silent-skip present-but-unknown rows
+    /// regardless of `version`, while still recovering legacy absent-field
+    /// rows via the normal heuristics. `#[serde(skip)]` keeps the flag
+    /// out of the on-disk shape — it is purely an in-memory annotation.
+    #[serde(skip)]
+    pub runtime_kind_unknown_on_disk: bool,
     #[serde(default)]
     pub worktree_path: Option<String>,
     #[serde(default)]
@@ -173,6 +207,100 @@ pub(super) struct InflightTurnState {
     /// stream or terminal-replace assistant text while this is true.
     #[serde(default)]
     pub watcher_owns_live_relay: bool,
+    /// #2285 audit trail — origin of the turn that produced this inflight.
+    /// Recorded for diagnostics; the session-bound relay does NOT branch on
+    /// this value (epic #2285 acceptance criterion E: relay is decided by
+    /// `SessionMatcher` membership, not by turn source). Defaults to
+    /// `Managed` for legacy rows that pre-date this field.
+    #[serde(default)]
+    pub turn_source: TurnSource,
+}
+
+/// Origin of a turn whose state is captured in [`InflightTurnState`]. Pure
+/// audit metadata for #2285 / #2161 — callers must not branch relay or
+/// completion semantics on this value; the session-bound relay (epic #2285
+/// E1–E5) treats every matched session uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::services::discord) enum TurnSource {
+    /// AgentDesk-launched tmux session via the normal Discord intake path.
+    /// This is the historical default for every legacy row.
+    #[default]
+    Managed,
+    /// Triggered by a Monitor pattern auto-turn synthesised on top of an
+    /// existing managed session (`TaskNotificationKind::MonitorAutoTurn`).
+    MonitorTriggered,
+    /// User typed directly into the tmux pane (SSH / local tty) while the
+    /// pane was bound to a Discord channel. Detected by the watcher when
+    /// rollout activity advances without a Discord-origin inflight in
+    /// place.
+    ExternalInput,
+    /// AgentDesk discovered a session created externally (e.g. operator ran
+    /// `tmux new -s <expected>` and started a provider) and adopted it via
+    /// `SessionDiscovery` + `SessionRegistry` (epic #2285 E2). Distinct
+    /// from `ExternalInput` (which keeps an existing Discord-bound session
+    /// running) — `ExternalAdopted` is the *first* time AgentDesk sees the
+    /// session.
+    ExternalAdopted,
+}
+
+impl TurnSource {
+    /// Stable wire representation for audit logs / metrics labels.
+    pub(in crate::services::discord) fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::MonitorTriggered => "monitor_triggered",
+            Self::ExternalInput => "external_input",
+            Self::ExternalAdopted => "external_adopted",
+        }
+    }
+}
+
+#[cfg(test)]
+mod turn_source_tests {
+    use super::TurnSource;
+
+    #[test]
+    fn default_is_managed_for_legacy_rows() {
+        // #2285 audit field is backward compatible — legacy v8 inflight rows
+        // that pre-date the field must round-trip through serde with
+        // `TurnSource::Managed` filled in via `#[serde(default)]`.
+        assert_eq!(TurnSource::default(), TurnSource::Managed);
+    }
+
+    #[test]
+    fn wire_strings_are_stable_audit_labels() {
+        // The four labels are committed to observability dashboards / metrics
+        // — renaming them silently is a downstream-breaking change.
+        assert_eq!(TurnSource::Managed.as_str(), "managed");
+        assert_eq!(TurnSource::MonitorTriggered.as_str(), "monitor_triggered");
+        assert_eq!(TurnSource::ExternalInput.as_str(), "external_input");
+        assert_eq!(TurnSource::ExternalAdopted.as_str(), "external_adopted");
+    }
+
+    #[test]
+    fn serde_round_trip_uses_snake_case() {
+        // Confirms the `rename_all = "snake_case"` attribute survives any
+        // future refactor that re-imports the enum elsewhere.
+        let json = serde_json::to_string(&TurnSource::ExternalAdopted).unwrap();
+        assert_eq!(json, "\"external_adopted\"");
+        let parsed: TurnSource = serde_json::from_str("\"monitor_triggered\"").unwrap();
+        assert_eq!(parsed, TurnSource::MonitorTriggered);
+    }
+
+    #[test]
+    fn missing_field_defaults_to_managed_when_deserialised() {
+        // The full state struct is gated behind `legacy-sqlite-tests`, so we
+        // exercise the `#[serde(default)]` contract with a small wrapper
+        // that captures the exact attribute combination used on the field.
+        #[derive(serde::Deserialize, Debug)]
+        struct Probe {
+            #[serde(default)]
+            turn_source: TurnSource,
+        }
+        let parsed: Probe = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.turn_source, TurnSource::Managed);
+    }
 }
 
 impl InflightTurnState {
@@ -215,6 +343,7 @@ impl InflightTurnState {
             output_path,
             input_fifo_path,
             runtime_kind,
+            runtime_kind_unknown_on_disk: false,
             worktree_path: None,
             worktree_branch: None,
             base_commit: None,
@@ -243,6 +372,7 @@ impl InflightTurnState {
             rebind_origin: false,
             long_running_placeholder_active: false,
             watcher_owns_live_relay: false,
+            turn_source: TurnSource::Managed,
         }
     }
 
@@ -298,6 +428,31 @@ impl InflightTurnState {
     }
 }
 
+/// #2235: tolerant deserializer for `runtime_kind`. A newer binary may write
+/// a `RuntimeHandoffKind` variant this binary does not know about; serde's
+/// default `deny_unknown_variants` posture would propagate a parse error and
+/// `load_inflight_states_from_root` would delete the entire row as malformed
+/// (`inflight_malformed_json_graceful_skip`). Instead we map unknown strings
+/// to `None`. The recovery engine consults this `None` together with the
+/// row-shape heuristic to decide whether to silent-skip recovery (issue
+/// #2235 DoD #3) instead of guessing a runtime and surfacing a misleading
+/// "input fifo path missing" notice.
+fn deserialize_runtime_kind_tolerant<'de, D>(
+    deserializer: D,
+) -> Result<Option<RuntimeHandoffKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.as_deref().and_then(|value| match value {
+        "legacy_tmux_wrapper" => Some(RuntimeHandoffKind::LegacyTmuxWrapper),
+        "claude_tui" => Some(RuntimeHandoffKind::ClaudeTui),
+        "codex_tui" => Some(RuntimeHandoffKind::CodexTui),
+        "process_backend" => Some(RuntimeHandoffKind::ProcessBackend),
+        _ => None,
+    }))
+}
+
 fn serialize_task_notification_kind<S>(
     value: &Option<TaskNotificationKind>,
     serializer: S,
@@ -323,6 +478,14 @@ where
 
 pub(super) fn inflight_runtime_root() -> Option<PathBuf> {
     discord_inflight_root()
+}
+
+/// #2235: expose the local `INFLIGHT_STATE_VERSION` so the recovery engine
+/// can decide whether an on-disk row was authored by a newer binary (i.e.
+/// `state.version > inflight_state_version()`). Read-only accessor — the
+/// constant itself stays private so we control the single bump site.
+pub(super) fn inflight_state_version() -> u32 {
+    INFLIGHT_STATE_VERSION
 }
 
 /// Load all inflight states for a provider WITHOUT the eviction side-effect
@@ -650,6 +813,141 @@ pub(crate) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) -> 
     fs::remove_file(path).is_ok()
 }
 
+/// Outcome of an explicit-signal cleanup attempt that is guarded against
+/// racing the next turn's inflight write (#2427 Pitfall #1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardedClearOutcome {
+    /// File matched the expected `user_msg_id` and was removed.
+    Cleared,
+    /// File existed but a different `user_msg_id` was on disk — the next
+    /// turn already wrote its inflight, so we leave it alone.
+    UserMsgMismatch,
+    /// File on disk is a planned-restart marker (`restart_mode` set). The
+    /// caller is an explicit cleanup signal that fired for the previous
+    /// generation, so the marker must be preserved for recovery.
+    PlannedRestartSkipped,
+    /// File on disk is a rebind origin (`rebind_origin = true`). Its
+    /// lifetime is owned by `/api/inflight/rebind`, not the watcher /
+    /// turn-bridge, so the cleanup signal does not apply.
+    RebindOriginSkipped,
+    /// No inflight file existed (already cleared by a peer / never written).
+    Missing,
+    /// Filesystem error during the final `remove_file` step. Distinguished
+    /// from `Missing` so callers can surface the cleanup failure (warn/error
+    /// log + do NOT cancel the watcher, since the inflight is still on
+    /// disk and the next sweeper tick will retry). Codex review HIGH on
+    /// PR #2460: previously these errors were silently bucketed as Missing,
+    /// hiding broken cleanup from the operator while the 1800s safety-net
+    /// did the real work.
+    IoError,
+}
+
+/// Idempotent inflight cleanup driven by an *explicit* turn-completion
+/// signal (`TurnCompleted` emit, pane death detection, etc.). This is the
+/// #2427 D / A wire — by the time we run, the regular hook on the
+/// completion path may have already cleared the file (Cleared turns into
+/// Missing). We only act when the inflight on disk still describes the
+/// turn we believe just finished.
+///
+/// Guards:
+/// * `expected_user_msg_id` — required to defeat the Pitfall #1 race where
+///   a stale `TurnCompleted` arrives after the next turn has already
+///   written its inflight. `0` is treated as "no guard available" and we
+///   refuse to delete to stay on the conservative side.
+/// * `restart_mode = Some(_)` — preserved (planned drain/hot-swap turns
+///   must survive across the dcserver restart they were saved for).
+/// * `rebind_origin = true` — preserved (Pitfall #5).
+pub(crate) fn clear_inflight_state_if_matches(
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected_user_msg_id: u64,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    clear_inflight_state_if_matches_in_root(&root, provider, channel_id, expected_user_msg_id)
+}
+
+/// Root-explicit variant for unit tests. Production callers should use
+/// [`clear_inflight_state_if_matches`].
+pub(super) fn clear_inflight_state_if_matches_in_root(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected_user_msg_id: u64,
+) -> GuardedClearOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
+        // Malformed file: treat like Missing — the loader-side eviction
+        // will GC the malformed payload on the next read.
+        return GuardedClearOutcome::Missing;
+    };
+    if state.restart_mode.is_some() {
+        return GuardedClearOutcome::PlannedRestartSkipped;
+    }
+    if state.rebind_origin {
+        return GuardedClearOutcome::RebindOriginSkipped;
+    }
+    if expected_user_msg_id == 0 || state.user_msg_id != expected_user_msg_id {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    // Codex round-2 HIGH-2: TOCTOU between the read above and remove
+    // below. The inflight save path uses an atomic write+rename
+    // (`save_inflight_state_in_root`), so a successful save between our
+    // read and remove changes the file's (dev, inode). We re-stat right
+    // before removing and bail if the identity changed — that means a
+    // newer turn has already taken ownership of the slot and we must
+    // not delete it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(pre) = fs::metadata(&path) else {
+            return GuardedClearOutcome::Missing;
+        };
+        let Ok(post) = fs::metadata(&path) else {
+            return GuardedClearOutcome::Missing;
+        };
+        if pre.dev() != post.dev() || pre.ino() != post.ino() {
+            return GuardedClearOutcome::UserMsgMismatch;
+        }
+        // Final re-read + re-validate before unlink. This is still not
+        // strictly atomic against another rename racing between the
+        // re-read and `remove_file`, but combined with the (dev, ino)
+        // check above it narrows the window to the kernel-level rename
+        // syscall window, which is the same window every other reader
+        // of this file already lives with.
+        let Ok(reread) = fs::read_to_string(&path) else {
+            return GuardedClearOutcome::Missing;
+        };
+        let Ok(restate) = serde_json::from_str::<InflightTurnState>(&reread) else {
+            return GuardedClearOutcome::Missing;
+        };
+        if restate.user_msg_id != expected_user_msg_id
+            || restate.restart_mode.is_some()
+            || restate.rebind_origin
+        {
+            return GuardedClearOutcome::UserMsgMismatch;
+        }
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => GuardedClearOutcome::Cleared,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GuardedClearOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                expected_user_msg_id = expected_user_msg_id,
+                error = %error,
+                "inflight guarded-clear remove_file failed; treating as IoError so sweeper retries"
+            );
+            GuardedClearOutcome::IoError
+        }
+    }
+}
+
 fn inflight_state_allows_idle_tmux_repair_state(state: &InflightTurnState) -> bool {
     state.full_response.trim().is_empty()
         && state.response_sent_offset == 0
@@ -724,6 +1022,92 @@ pub(super) fn mark_all_inflight_states_restart_mode(
         }
     }
     updated
+}
+
+/// #2437 (#2427 C wire) boot-time bulk invalidate. Removes inflight
+/// state files whose `restart_generation` does not match
+/// `current_generation` AND that are NOT planned-restart rows. The
+/// planned-restart gate in `stale_removal_reason` (this file, the
+/// `state.restart_mode.is_some()` branch) already handles its own
+/// generation-mismatch eviction with `DRAIN_RESTART_MAX_AGE_SECS` /
+/// `HOT_SWAP_HANDOFF_MAX_AGE_SECS` retention — do not double-evict
+/// those here or recovery will lose handoff rows from the prior
+/// generation.
+///
+/// Skips:
+///   * `state.restart_mode.is_some()` — planned restart / hot-swap.
+///   * `state.rebind_origin` — rebind API owns these, not generation.
+///   * `state.restart_generation == Some(current_generation)` — this
+///     generation's own rows.
+///
+/// Returns the number of state files removed. Intended to be called
+/// **once per provider** at dcserver boot, BEFORE
+/// `restore_inflight_turns`, so recovery does not revive a row from a
+/// generation whose tmux session no longer exists.
+pub(crate) fn invalidate_stale_generation(
+    provider: &ProviderKind,
+    current_generation: u64,
+) -> usize {
+    let Some(root) = inflight_runtime_root() else {
+        return 0;
+    };
+    let removed = invalidate_stale_generation_in_root(&root, provider, current_generation);
+    removed.len()
+}
+
+/// Test-friendly variant. Returns the list of evicted `(channel_id,
+/// row_generation)` tuples so unit tests can pin both the count and
+/// the row identities without re-loading the directory.
+fn invalidate_stale_generation_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    current_generation: u64,
+) -> Vec<(u64, Option<u64>)> {
+    let states = load_inflight_states_from_root(root, provider);
+    let mut removed = Vec::new();
+    for state in states {
+        if state.restart_mode.is_some() {
+            continue;
+        }
+        if state.rebind_origin {
+            continue;
+        }
+        // Codex review HIGH on PR #2460: normal rows are constructed with
+        // `restart_generation: None` (see `InflightTurnState::new`). The
+        // previous `Some(current_generation)` guard alone would evict every
+        // healthy current-generation row at boot. Preserve unstamped rows
+        // too so only rows explicitly stamped from a PRIOR generation are
+        // evicted. (Stale unstamped rows are still bounded by the
+        // intake-time staleness threshold path; this function is the
+        // boot-time hammer, not the long-lived cleaner.)
+        match state.restart_generation {
+            None => continue,
+            Some(row_generation) if row_generation == current_generation => continue,
+            Some(_) => {}
+        }
+        let path = inflight_state_path(root, provider, state.channel_id);
+        if fs::remove_file(&path).is_ok() {
+            // Only emit observability when called via the env wrapper —
+            // raw `_in_root` calls are unit tests and we want to keep
+            // them deterministic.
+            crate::services::observability::emit_inflight_lifecycle_event(
+                provider.as_str(),
+                state.channel_id,
+                state.dispatch_id.as_deref(),
+                None,
+                None,
+                "evict_stale_generation",
+                serde_json::json!({
+                    "reason": "generation_mismatch_boot",
+                    "row_generation": state.restart_generation,
+                    "current_generation": current_generation,
+                    "user_msg_id": state.user_msg_id,
+                }),
+            );
+            removed.push((state.channel_id, state.restart_generation));
+        }
+    }
+    removed
 }
 
 /// Load a single inflight state by provider + channel_id (returns None if missing).
@@ -824,7 +1208,7 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
             );
             continue;
         };
-        let Ok(state) = serde_json::from_str::<InflightTurnState>(&content) else {
+        let Ok(mut state) = serde_json::from_str::<InflightTurnState>(&content) else {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] ⚠ removing malformed inflight state file: {}",
@@ -833,6 +1217,26 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
             let _ = fs::remove_file(&path);
             continue;
         };
+        // #2235: the tolerant `runtime_kind` deserializer collapses both
+        // "field absent" (legacy v7 rows) and "present-but-unknown variant"
+        // (rows written by a future binary) to `runtime_kind = None`.
+        // Recovery treats these two cases differently — absent legacy rows
+        // recover via heuristics; present-unknown rows silent-skip. Re-parse
+        // the JSON as a value to disambiguate and record the verdict on the
+        // transient `runtime_kind_unknown_on_disk` flag.
+        if state.runtime_kind.is_none() {
+            if let Ok(raw_value) = serde_json::from_str::<serde_json::Value>(&content)
+                && let Some(raw_runtime) = raw_value.get("runtime_kind")
+                && let Some(raw_str) = raw_runtime.as_str()
+                && !raw_str.is_empty()
+                && !matches!(
+                    raw_str,
+                    "legacy_tmux_wrapper" | "claude_tui" | "codex_tui" | "process_backend"
+                )
+            {
+                state.runtime_kind_unknown_on_disk = true;
+            }
+        }
         if state.provider_kind().as_ref() != Some(provider) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -880,6 +1284,18 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
     states
 }
 
+/// #2448: explicit completion signal published from the turn_bridge
+/// CompletionGuard so downstream listeners (currently the standby JSONL
+/// relay) can exit promptly instead of polling against a wall-clock
+/// timeout. Variants are intentionally narrow; add cases as new
+/// listeners need them.
+#[derive(Debug, Clone)]
+pub(in crate::services::discord) enum InflightSignal {
+    /// The turn_bridge task for `channel_id` reached its terminal drop —
+    /// any per-turn relay tasks bound to this channel may now exit.
+    Completed { channel_id: u64 },
+}
+
 /// #1446 Layer 1 — `inflight_state_is_stale` is a pure helper with no
 /// filesystem or runtime dependencies, so we keep its test always-on
 /// (`#[cfg(test)]`) rather than gating it on the `legacy-sqlite-tests`
@@ -889,7 +1305,8 @@ fn load_inflight_states_from_root(root: &Path, provider: &ProviderKind) -> Vec<I
 #[cfg(test)]
 mod stall_recovery_tests {
     use super::{
-        INFLIGHT_STALENESS_THRESHOLD_SECS, InflightTurnState,
+        GuardedClearOutcome, INFLIGHT_STALENESS_THRESHOLD_SECS, InflightRestartMode,
+        InflightTurnState, clear_inflight_state_if_matches_in_root,
         inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale,
         load_inflight_states_from_root, save_inflight_state_in_root,
     };
@@ -1046,6 +1463,187 @@ mod stall_recovery_tests {
         assert!(!loaded[0].runtime_kind_for_recovery().requires_input_fifo());
     }
 
+    /// #2235 v8 compat shape: a ClaudeTui inflight row that carries both a
+    /// stamped `runtime_kind` and a populated `input_fifo_path` must
+    /// round-trip cleanly under `INFLIGHT_STATE_VERSION` = 8 so an old
+    /// (pre-#2213) binary rolling back over the file can still satisfy its
+    /// FIFO-required recovery branch.
+    #[test]
+    fn inflight_v8_claude_tui_round_trips_with_fifo_for_rollback_compat() {
+        let temp = TempDir::new().unwrap();
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            55,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/claude-transcript.jsonl".to_string()),
+            Some("/tmp/claude-fifo.input".to_string()),
+            12,
+        );
+        state.runtime_kind = Some(RuntimeHandoffKind::ClaudeTui);
+
+        save_inflight_state_in_root(temp.path(), &state).expect("save inflight state");
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].version, super::INFLIGHT_STATE_VERSION);
+        assert_eq!(loaded[0].version, 8);
+        assert_eq!(loaded[0].runtime_kind, Some(RuntimeHandoffKind::ClaudeTui));
+        assert_eq!(
+            loaded[0].input_fifo_path.as_deref(),
+            Some("/tmp/claude-fifo.input")
+        );
+        assert_eq!(
+            loaded[0].runtime_kind_for_recovery(),
+            RuntimeHandoffKind::ClaudeTui
+        );
+    }
+
+    /// #2235: rows written by a newer binary may serialize an unknown
+    /// `runtime_kind` string. `deserialize_runtime_kind_tolerant` must
+    /// collapse the unknown value to `None` so the whole inflight row isn't
+    /// tossed as malformed JSON. The recovery engine layers the
+    /// version-aware silent-skip on top of this.
+    #[test]
+    fn inflight_unknown_runtime_kind_string_deserializes_as_none() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join(ProviderKind::Claude.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Seed a JSON row whose `runtime_kind` is a variant string this
+        // binary does not know about (`"future_runtime"`). Without the
+        // tolerant deserializer this row would be deleted as malformed by
+        // `load_inflight_states_from_root`.
+        let valid_state = InflightTurnState::new(
+            ProviderKind::Claude,
+            444,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        );
+        let mut value = serde_json::to_value(&valid_state).unwrap();
+        value["runtime_kind"] = serde_json::Value::String("future_runtime".to_string());
+        // Also bump the on-disk version to simulate a row authored by a
+        // newer binary, so the recovery-engine silent-skip guard would
+        // trigger downstream of this deserialization step.
+        value["version"] =
+            serde_json::Value::Number(serde_json::Number::from(super::INFLIGHT_STATE_VERSION + 1));
+        let path = dir.join("444.json");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1, "tolerant deser must keep the row");
+        assert_eq!(loaded[0].channel_id, 444);
+        assert!(
+            loaded[0].runtime_kind.is_none(),
+            "unknown variant must collapse to None"
+        );
+        assert!(
+            loaded[0].version > super::INFLIGHT_STATE_VERSION,
+            "version stays forward-marked for the recovery silent-skip guard"
+        );
+        assert!(
+            loaded[0].runtime_kind_unknown_on_disk,
+            "present-but-unknown runtime_kind must be distinguishable from legacy absent-field None"
+        );
+    }
+
+    /// #2235: legacy v7 rows have NO `runtime_kind` field on disk at all.
+    /// These must deserialize with `runtime_kind = None` AND
+    /// `runtime_kind_unknown_on_disk = false`, so the recovery silent-skip
+    /// guard does not regress legacy recovery flows that depend on the
+    /// `runtime_kind_for_recovery` heuristic.
+    #[test]
+    fn inflight_legacy_v7_row_with_absent_runtime_kind_recovers_via_heuristic() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join(ProviderKind::Claude.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let valid_state = InflightTurnState::new(
+            ProviderKind::Claude,
+            555,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            None,
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        let mut value = serde_json::to_value(&valid_state).unwrap();
+        // Strip the runtime_kind field entirely to mimic an on-disk legacy
+        // v7 row from before #2213.
+        value.as_object_mut().unwrap().remove("runtime_kind");
+        value["version"] = serde_json::Value::Number(serde_json::Number::from(7u32));
+        let path = dir.join("555.json");
+        std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].runtime_kind.is_none());
+        assert!(
+            !loaded[0].runtime_kind_unknown_on_disk,
+            "absent-field legacy v7 rows must not look like a forward-unknown row"
+        );
+        assert_eq!(loaded[0].version, 7);
+    }
+
+    /// #2235: when an on-disk row has `runtime_kind = None` (legacy pre-v8
+    /// row or a future variant this binary doesn't know about) the
+    /// `runtime_kind_for_recovery` heuristic must still pick a deterministic
+    /// kind. The recovery engine layered on top of this then uses
+    /// `state.runtime_kind.is_none()` to switch the missing-FIFO branch to a
+    /// silent debug-skip — exercised here at the data-model layer.
+    #[test]
+    fn inflight_unknown_runtime_kind_falls_back_without_panic() {
+        let temp = TempDir::new().unwrap();
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            66,
+            Some("adk-claude".to_string()),
+            7,
+            8,
+            99,
+            "hello".to_string(),
+            None,
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        );
+        // Simulate the pre-v8 / unknown-runtime case: no stamped runtime_kind
+        // and no FIFO path. `runtime_kind_for_recovery` should fall back to
+        // ClaudeTui because tmux/output are present, allowing recovery to
+        // skip silently rather than synthesizing a missing-FIFO notice.
+        state.runtime_kind = None;
+        state.input_fifo_path = None;
+
+        save_inflight_state_in_root(temp.path(), &state).expect("save inflight state");
+
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].runtime_kind.is_none());
+        assert_eq!(
+            loaded[0].runtime_kind_for_recovery(),
+            RuntimeHandoffKind::ClaudeTui
+        );
+    }
+
     #[test]
     fn inflight_malformed_json_graceful_skip() {
         let temp = TempDir::new().unwrap();
@@ -1080,6 +1678,321 @@ mod stall_recovery_tests {
         assert_eq!(loaded[0].channel_id, 111);
         assert!(valid_path.exists());
         assert!(!malformed_path.exists());
+    }
+
+    fn build_inflight_for_guard_tests(
+        provider: ProviderKind,
+        channel_id: u64,
+        user_msg_id: u64,
+    ) -> InflightTurnState {
+        InflightTurnState::new(
+            provider,
+            channel_id,
+            Some("adk".to_string()),
+            42,
+            100,
+            user_msg_id,
+            "user prompt".to_string(),
+            None,
+            Some("AgentDesk-claude-adk".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        )
+    }
+
+    /// #2427 D/A wire — happy path. When the on-disk inflight has a
+    /// matching `user_msg_id` and is neither a planned-restart marker
+    /// nor a rebind origin, the explicit signal removes it.
+    #[test]
+    fn clear_inflight_state_if_matches_removes_matching_turn() {
+        let temp = TempDir::new().unwrap();
+        let state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 777);
+        let user_msg_id = state.user_msg_id;
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let outcome = clear_inflight_state_if_matches_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            user_msg_id,
+        );
+        assert_eq!(outcome, GuardedClearOutcome::Cleared);
+        assert!(load_inflight_states_from_root(temp.path(), &ProviderKind::Claude).is_empty());
+    }
+
+    /// #2427 Pitfall #1 — stale TurnCompleted carrying the previous
+    /// turn's `user_msg_id` must NOT delete the next turn's inflight.
+    #[test]
+    fn clear_inflight_state_if_matches_protects_next_turn_against_stale_signal() {
+        let temp = TempDir::new().unwrap();
+        let next_turn = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        save_inflight_state_in_root(temp.path(), &next_turn).unwrap();
+
+        // Stale completion for previous turn user_msg_id = 50 arrives now.
+        let outcome =
+            clear_inflight_state_if_matches_in_root(temp.path(), &ProviderKind::Claude, 321, 50);
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+
+        let still_there = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(still_there.len(), 1);
+        assert_eq!(still_there[0].user_msg_id, 100);
+    }
+
+    /// #2427 — planned-restart markers must survive the explicit-signal
+    /// hook because their lifetime is owned by the next dcserver boot's
+    /// recovery. We bypass `load_inflight_states_from_root` here (which
+    /// has its own retention-eviction side-effect) and assert directly
+    /// on the file system that the row is intact after the guarded
+    /// clear refused to touch it.
+    #[test]
+    fn clear_inflight_state_if_matches_preserves_planned_restart() {
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 555, 333);
+        state.restart_mode = Some(InflightRestartMode::DrainRestart);
+        state.restart_generation = Some(7);
+        let user_msg_id = state.user_msg_id;
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let outcome = clear_inflight_state_if_matches_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            555,
+            user_msg_id,
+        );
+        assert_eq!(outcome, GuardedClearOutcome::PlannedRestartSkipped);
+
+        let provider_dir = temp.path().join(ProviderKind::Codex.as_str());
+        let path = provider_dir.join("555.json");
+        assert!(
+            path.exists(),
+            "planned-restart marker file should survive guarded clear"
+        );
+    }
+
+    /// #2427 Pitfall #5 — rebind_origin rows are owned by the
+    /// `/api/inflight/rebind` API. The explicit signal must NOT touch
+    /// them even when user_msg_id matches.
+    #[test]
+    fn clear_inflight_state_if_matches_preserves_rebind_origin() {
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Gemini, 901, 444);
+        state.rebind_origin = true;
+        let user_msg_id = state.user_msg_id;
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let outcome = clear_inflight_state_if_matches_in_root(
+            temp.path(),
+            &ProviderKind::Gemini,
+            901,
+            user_msg_id,
+        );
+        assert_eq!(outcome, GuardedClearOutcome::RebindOriginSkipped);
+        assert_eq!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Gemini).len(),
+            1
+        );
+    }
+
+    /// `expected_user_msg_id = 0` is the "no guard available" sentinel —
+    /// refuse to clear so the helper never accidentally deletes a row
+    /// it cannot authenticate against.
+    #[test]
+    fn clear_inflight_state_if_matches_refuses_zero_guard() {
+        let temp = TempDir::new().unwrap();
+        let state = build_inflight_for_guard_tests(ProviderKind::Qwen, 8, 12_345);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let outcome =
+            clear_inflight_state_if_matches_in_root(temp.path(), &ProviderKind::Qwen, 8, 0);
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        assert_eq!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Qwen).len(),
+            1
+        );
+    }
+
+    /// No on-disk row → `Missing`. Idempotency safety net.
+    #[test]
+    fn clear_inflight_state_if_matches_missing_is_noop() {
+        let temp = TempDir::new().unwrap();
+        let outcome =
+            clear_inflight_state_if_matches_in_root(temp.path(), &ProviderKind::Claude, 42, 999);
+        assert_eq!(outcome, GuardedClearOutcome::Missing);
+    }
+}
+
+#[cfg(test)]
+mod wave_a_cleanup_tests {
+    //! #2437 (#2427 C wire) — unit tests for the boot-time generation
+    //! bulk invalidate. The B wire shares `clear_inflight_state_if_matches`
+    //! with #2427's D / A wires and is already covered by the
+    //! `clear_inflight_state_if_matches_*` tests in the parent mod.
+    use super::{
+        InflightTurnState, invalidate_stale_generation_in_root, load_inflight_states_from_root,
+        save_inflight_state_in_root,
+    };
+    use crate::services::discord::InflightRestartMode;
+    use crate::services::provider::ProviderKind;
+    use tempfile::TempDir;
+
+    fn make_state(channel_id: u64, user_msg_id: u64) -> InflightTurnState {
+        InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            7,
+            user_msg_id,
+            user_msg_id + 1000,
+            "hello".to_string(),
+            None,
+            Some(format!("AgentDesk-codex-adk-cdx-{channel_id}")),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        )
+    }
+
+    #[test]
+    fn invalidate_stale_generation_evicts_non_planned_old_generations() {
+        // C wire: a row whose `restart_generation` does not match the
+        // boot-time `current_generation` AND that is not a planned
+        // restart must be evicted before recovery runs.
+        let temp = TempDir::new().unwrap();
+
+        let mut row_old = make_state(501, 11);
+        row_old.restart_generation = Some(3);
+        save_inflight_state_in_root(temp.path(), &row_old).expect("save");
+
+        let mut row_current = make_state(502, 22);
+        row_current.restart_generation = Some(5);
+        save_inflight_state_in_root(temp.path(), &row_current).expect("save");
+
+        // Pre-condition: both rows on disk.
+        let before = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(before.len(), 2);
+
+        let removed = invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, 5);
+        assert_eq!(removed.len(), 1, "only the old-gen row should be removed");
+        assert_eq!(removed[0], (501, Some(3)));
+
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].channel_id, 502);
+    }
+
+    #[test]
+    fn invalidate_stale_generation_preserves_planned_restart_rows() {
+        // DrainRestart / HotSwapHandoff rows have their own
+        // generation-mismatch handling in `stale_removal_reason` (auto-
+        // evicts at load time with extended retention) — the C wire
+        // must defer to that path and NOT double-evict.
+        //
+        // We stamp `restart_generation = Some(0)` to match the unit-
+        // test environment's `load_generation()` reading (no generation
+        // file → 0), so the load path itself does not auto-evict the
+        // row. Then we ask `invalidate_stale_generation_in_root` to
+        // run with a different "current_generation" — the helper must
+        // still skip the row because `restart_mode.is_some()`, NOT
+        // because the generations happen to match.
+        let temp = TempDir::new().unwrap();
+
+        // Sync the row's restart_generation to whatever the process-
+        // wide `load_generation()` happens to return in this test
+        // environment (env var pointing at a sibling test's temp dir,
+        // missing file → 0, etc.). With them aligned, the load path's
+        // `stale_removal_reason` planned-restart branch hits its
+        // generation-match arm and does not auto-evict.
+        let current_runtime_gen = super::super::runtime_store::load_generation();
+
+        let mut planned = make_state(601, 33);
+        planned.set_restart_mode(InflightRestartMode::DrainRestart);
+        planned.restart_generation = Some(current_runtime_gen);
+        save_inflight_state_in_root(temp.path(), &planned).expect("save");
+
+        // Pre-condition: row survives the load path.
+        let before = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(
+            before.len(),
+            1,
+            "load must not auto-evict same-gen planned restart"
+        );
+
+        // Now ask the C wire helper to use a "current_generation"
+        // value that DEFINITELY mismatches the row's stamp. The helper
+        // must still skip the row because `restart_mode.is_some()`.
+        let mismatched_gen = current_runtime_gen.wrapping_add(9_999);
+        let removed =
+            invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, mismatched_gen);
+        assert!(
+            removed.is_empty(),
+            "planned-restart rows must NOT be evicted by C wire bulk invalidate \
+             even when their restart_generation mismatches the current generation"
+        );
+
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].restart_mode.is_some());
+    }
+
+    #[test]
+    fn invalidate_stale_generation_preserves_rebind_origin_rows() {
+        let temp = TempDir::new().unwrap();
+
+        let mut rebind = make_state(701, 44);
+        rebind.rebind_origin = true;
+        rebind.restart_generation = Some(1);
+        save_inflight_state_in_root(temp.path(), &rebind).expect("save");
+
+        let removed = invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, 9);
+        assert!(removed.is_empty());
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].rebind_origin);
+    }
+
+    #[test]
+    fn invalidate_stale_generation_preserves_current_generation_rows() {
+        let temp = TempDir::new().unwrap();
+
+        let mut fresh = make_state(801, 55);
+        fresh.restart_generation = Some(7);
+        save_inflight_state_in_root(temp.path(), &fresh).expect("save");
+
+        let removed = invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, 7);
+        assert!(
+            removed.is_empty(),
+            "rows whose restart_generation matches current_generation must NOT be evicted"
+        );
+
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_stale_generation_preserves_unstamped_rows() {
+        // Codex review HIGH on PR #2460: normal `InflightTurnState::new`
+        // sets `restart_generation = None`. Evicting unstamped rows here
+        // would clear every healthy current-generation row at boot.
+        // Unstamped rows are preserved; the intake-time staleness threshold
+        // path is what bounds genuinely abandoned legacy rows.
+        let temp = TempDir::new().unwrap();
+
+        let unstamped = make_state(901, 66);
+        assert!(unstamped.restart_generation.is_none());
+        save_inflight_state_in_root(temp.path(), &unstamped).expect("save");
+
+        let removed = invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, 4);
+        assert!(removed.is_empty());
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+    }
+
+    #[test]
+    fn invalidate_stale_generation_empty_dir_is_no_op() {
+        let temp = TempDir::new().unwrap();
+        let removed = invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, 1);
+        assert!(removed.is_empty());
     }
 }
 

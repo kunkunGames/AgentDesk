@@ -144,6 +144,24 @@ pub struct DiscordConfig {
 pub struct ProviderConfig {
     #[serde(default, alias = "tuiHosting", skip_serializing_if = "Option::is_none")]
     pub tui_hosting: Option<bool>,
+    /// Issue #2193 — Codex remote SSH runtime gate.
+    ///
+    /// Defaults to `false`. When `true`, the operator asserts that every
+    /// prerequisite in `docs/codex-remote-ssh-policy.md` is in place.
+    /// At time of writing, the ADR's follow-ups are NOT in place
+    /// (`services::remote_stub` still returns errors, the allow-list
+    /// schema is not wired, the integration test does not exist).
+    /// Bootstrap therefore **hard-fails** when this flag is `true` and
+    /// `crate::services::codex_remote_policy::PREREQUISITES_SATISFIED`
+    /// is `false`, so a warn-only gate cannot become a persisted
+    /// "enabled" signal that a partial future implementation silently
+    /// honors.
+    #[serde(
+        default,
+        alias = "remoteSshEnabled",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub remote_ssh_enabled: Option<bool>,
 }
 
 pub fn default_provider_tui_hosting(provider: &str) -> bool {
@@ -170,6 +188,18 @@ impl Config {
                 .providers
                 .values()
                 .any(|provider| provider.tui_hosting == Some(true))
+    }
+
+    /// Issue #2193 — Codex remote SSH gate accessor.
+    ///
+    /// Returns `true` only when the operator has explicitly set
+    /// `providers.codex.remote_ssh_enabled: true` in `agentdesk.yaml`.
+    /// Defaults to `false` per `docs/codex-remote-ssh-policy.md`.
+    pub fn codex_remote_ssh_enabled(&self) -> bool {
+        self.providers
+            .get("codex")
+            .and_then(|cfg| cfg.remote_ssh_enabled)
+            .unwrap_or(false)
     }
 }
 
@@ -805,6 +835,19 @@ pub struct ClusterConfig {
     pub dispatch_routing: ClusterDispatchRoutingConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub semaphores: BTreeMap<String, ClusterSemaphoreConfig>,
+    /// Epic #2285 / E3 + E4 + E5 gate. When `true` (default since E5 / #2412),
+    /// the session-bound `WatcherSupervisor` + `StreamRelay` infrastructure runs
+    /// in production against the observation-only `RegistryAdapterSink`, AND
+    /// the production tmux frame producer (`services::discord::tmux_watcher`)
+    /// pushes every chunk it reads into the supervisor-owned relay via
+    /// `RelayProducerRegistry`. The legacy per-turn tmux watcher remains the
+    /// authoritative Discord delivery path; subsequent epic #2285 issues
+    /// migrate the turn-bound spawn sites to consume from the supervisor
+    /// directly. Setting the flag to `false` skips the supervisor entirely and
+    /// the producer-side lookups become silent no-ops (the registry stays
+    /// empty), restoring pre-E5 behavior.
+    #[serde(default = "default_session_bound_relay_enabled")]
+    pub session_bound_relay_enabled: bool,
 }
 
 impl Default for ClusterConfig {
@@ -822,6 +865,7 @@ impl Default for ClusterConfig {
             blackout_windows: BTreeMap::new(),
             dispatch_routing: ClusterDispatchRoutingConfig::default(),
             semaphores: BTreeMap::new(),
+            session_bound_relay_enabled: default_session_bound_relay_enabled(),
         }
     }
 }
@@ -1595,6 +1639,18 @@ fn default_cluster_heartbeat_interval_secs() -> u64 {
 }
 fn default_cluster_lease_ttl_secs() -> u64 {
     30
+}
+fn default_session_bound_relay_enabled() -> bool {
+    // Epic #2285 / E5 (#2412): flipped to `true` now that the production
+    // tmux frame producer (`services::discord::tmux_watcher`) actually
+    // pushes frames into the supervisor-owned StreamRelay via
+    // `RelayProducerRegistry`. Before E5 the supervisor was a dark pipe —
+    // every chunk read off the tmux output file is now mirrored into the
+    // session-bound relay, the legacy turn-bound delivery still owns
+    // Discord output (`RegistryAdapterSink` is observation-only), and the
+    // `/api/cluster/sessions` diagnostic surfaces per-session frame counts
+    // so an unintended zero-frame regression is detectable.
+    true
 }
 fn default_memory_backend() -> String {
     "auto".into()

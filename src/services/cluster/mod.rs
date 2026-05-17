@@ -11,3 +11,10 @@
 pub(crate) mod intake_router_hook;
 pub(crate) mod intake_routing;
 pub(crate) mod intake_worker;
+pub mod registry_adapter_sink;
+pub mod relay_producer_registry;
+pub mod session_discovery;
+pub mod session_matcher;
+pub mod session_registry;
+pub mod stream_relay;
+pub mod watcher_supervisor;

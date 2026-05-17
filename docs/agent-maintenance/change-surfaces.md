@@ -6,7 +6,7 @@
 > [`docs/generated/module-inventory.md`](../generated/module-inventory.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-05-12 (against PR #2064 rebase onto current main and current maintainability audit baseline).
+> Last refreshed: 2026-05-17 (against PR #2369 voice/turn_link.rs + maintenance.rs giant-file registration).
 
 ## Read This First
 
@@ -63,6 +63,8 @@
   - `src/engine/transition.rs` (1309 lines, giant-file).
   - `src/engine/ops/kanban_ops.rs` (1116 lines, giant-file).
   - `src/engine/ops/db_ops.rs` (1652 lines, giant-file).
+  - `src/engine/loader.rs` (1670 lines, giant-file) — engine loader / QuickJS
+    validator surface; split before adding non-bugfix behavior.
   - `src/engine/intent.rs` (873 lines, retained migration-sensitive surface).
   - `src/pipeline.rs` (2125 lines, giant-file).
 - active_callsite_coverage: n/a (no canonical replacement yet).
@@ -111,21 +113,26 @@
     lifecycle behavior).
   - `src/services/discord/tmux.rs` (6208 lines after #1435 lifecycle
     extraction; still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (3214 lines after #1520 watcher
-    loop extraction; split loop helpers further before adding behavior).
+  - `src/services/discord/tmux_watcher.rs` (3524 lines after #1520 watcher
+    loop extraction + #2427 D/A explicit-cleanup wires; split loop helpers
+    further before adding behavior).
   - `src/services/discord/recovery_engine.rs` (4842 lines).
   - `src/services/discord/health.rs` (4880 lines after #1879 snapshot/mailbox
     extraction).
   - `src/services/discord/health/recovery.rs` (1433 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior).
   - `src/services/discord/placeholder_controller.rs` (1237 lines).
+  - `src/services/discord/placeholder_sweeper.rs` (1022 lines; placeholder
+    sweep loop and delivered-response idempotency surface — bugfix only
+    outside a split plan).
   - `src/services/discord/router/message_handler.rs` (7013 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (4267 lines).
-  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines; provider
-    stop-token/tmux binding runtime, split before adding non-bugfix behavior).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1525 lines; provider
+    stop-token/tmux binding runtime + PID-exit observation helper (#2426),
+    split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (2096 lines).
-  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1016 lines).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1525 lines).
   - `src/services/discord/formatting.rs` (3247 lines).
   - `src/services/discord/settings.rs` (2445 lines).
   - `src/services/discord/prompt_builder.rs` (2114 lines).
@@ -227,8 +234,9 @@
   `src/github/sync.rs`, `src/reconcile.rs` (periodic stale-inflight + orphan
   sweep), `src/high_risk_recovery.rs` (PG recovery harness for delivery
   outbox/notify), `src/server/task_dispatch_claims.rs` (cluster-aware
-  task-dispatch claim coordination), and `src/server/cluster.rs`
-  (cluster role/leader-failover coordination).
+  task-dispatch claim coordination), `src/server/cluster.rs`
+  (cluster role/leader-failover coordination), and `src/server/worker_registry.rs`
+  (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
   - `src/config.rs` (2601 lines).
@@ -248,6 +256,12 @@
     task-dispatch claim TTL/limit + semaphore coordination).
   - `src/server/cluster.rs` (1046 lines; cluster role detection, leader
     advisory-lock coordination, and failover wiring — bugfix only).
+  - `src/server/worker_registry.rs` (1040 lines; supervised-worker registry,
+    leader-only worker lifecycle, and per-spec restart/shutdown policy —
+    bugfix-only after #2202 regression-guard test pushed it past the threshold).
+  - `src/server/maintenance.rs` (1049 lines; periodic maintenance loops —
+    queue stale-inflight sweep, dispatch hygiene, leader-only cadence tasks;
+    crossed threshold incidentally during voice-runtime adjacent work).
 - active_callsite_coverage: n/a.
 - invariants: config precedence, runtime path generation, kanban state, receipt
   persistence, and GitHub sync must keep their existing owner-specific
@@ -328,6 +342,16 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/codex_tui/rollout_tail.rs` (1031) — Codex TUI rollout tail
   parsing and resume identity surface; split before adding non-bugfix behavior
   beyond the #2169 session identity fix.
+- `src/services/codex_tui/input.rs` (~1072) — Codex TUI input readiness
+  detector and prompt delivery surface (#2399 hardened the post-turn
+  handoff deadline). Treat as giant-file territory; split before adding
+  non-bugfix behavior beyond the readiness/cancel contract.
+- `src/services/claude_tui/hook_bundle.rs` (~1152) — Claude/Codex hook
+  bundle renderer + trust-hash canonicalization. Includes the #2210/#2259
+  startup self-check and the gated Codex-CLI integration test. Treat as
+  giant-file territory; split (e.g. extract a `codex_trust_hash` module
+  and a separate integration-test file) before adding non-bugfix hook
+  surfaces.
 - `src/services/memory/memento.rs` (2479).
 - `src/services/observability/mod.rs` (1158) and
   `src/services/observability/pg_io.rs` (1312).
@@ -351,6 +375,8 @@ The remaining giant-file modules under `src/services/` not covered above:
   (GitClient extraction).
 - `src/services/platform/binary_resolver.rs` (1377).
 - `src/services/mcp_config.rs` (1072).
+- `src/services/process.rs` (1158) — process lifecycle / PID-tree identity
+  surface. Split before adding non-bugfix behavior.
 - `src/services/routines/{store.rs (2755), loader.rs (2013),
   discord_log.rs (1056)}` — durable routine storage, script loading, and
   Discord notification plumbing. Split before broadening behavior outside the
@@ -361,6 +387,10 @@ The remaining giant-file modules under `src/services/` not covered above:
   `src/services/qwen_tmux_wrapper.rs` (1194).
 - `src/services/turn_orchestrator.rs` (2070).
 - `src/services/session_backend.rs` (1053).
+- `src/voice/turn_link.rs` (1282 lines) — VoiceTurnLink durable store + GC
+  (#2362 / #2164 voice epic A); covers per-utterance status row + advisory-lock
+  serialization + PG-backed reconciliation. Split focused helpers before adding
+  non-bugfix behavior outside the foundational store contract.
 
 Same rule: `bugfix` only without a split issue.
 

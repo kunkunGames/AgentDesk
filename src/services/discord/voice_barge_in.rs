@@ -100,6 +100,17 @@ pub(in crate::services::discord) struct VoiceProgressEvent {
     pub label: String,
 }
 
+/// #2374 — return value from `dispatch_voice_background_handoff`. The
+/// caller needs both the dispatched `turn_id` (for tracing /
+/// follow-up cancellation) AND the handoff message id so it can key
+/// the cancel-tombstone on something durable across multiple cancel
+/// attempts.
+#[derive(Debug, Clone)]
+struct VoiceBackgroundHandoffOutcome {
+    turn_id: String,
+    handoff_message_id: Option<MessageId>,
+}
+
 #[derive(Clone)]
 struct LivePlaybackSession {
     player: Arc<dyn BargeInPlayerStop>,
@@ -262,6 +273,7 @@ async fn generate_foreground_ack_text(
     transcript: &str,
     language: &str,
     foreground: &EffectiveVoiceForegroundConfig,
+    cancel_token: Arc<crate::services::provider::CancelToken>,
 ) -> Option<VoiceForegroundDecision> {
     let _fallback_for_tests_and_docs = foreground_ack_text(transcript, language);
     let prompt =
@@ -270,17 +282,25 @@ async fn generate_foreground_ack_text(
     let model = foreground.model.clone();
     let max_chars = foreground.max_chars;
     let timeout = Duration::from_millis(foreground.timeout_ms);
+    let cancel_for_blocking = cancel_token.clone();
     let result = tokio::time::timeout(
         timeout + Duration::from_millis(250),
         tokio::task::spawn_blocking(move || {
             let provider_kind = ProviderKind::from_str_or_unsupported(&provider);
             match provider_kind {
-                ProviderKind::Claude => crate::services::claude::execute_command_simple_with_model(
-                    &prompt,
-                    Some(&model),
-                ),
+                ProviderKind::Claude => {
+                    crate::services::claude::execute_command_simple_cancellable_with_model(
+                        &prompt,
+                        Some(&model),
+                        Some(cancel_for_blocking),
+                    )
+                }
                 ProviderKind::Codex => {
-                    crate::services::codex::execute_command_simple_with_model(&prompt, Some(&model))
+                    crate::services::codex::execute_command_simple_cancellable_with_model(
+                        &prompt,
+                        Some(&model),
+                        Some(cancel_for_blocking),
+                    )
                 }
                 ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => Err(format!(
                     "foreground provider {} does not support model-scoped instant call yet",
@@ -315,11 +335,20 @@ async fn generate_foreground_ack_text(
             return None;
         }
         Err(_) => {
+            // #2250: on timeout, flip the shared CancelToken so the
+            // detached spawn_blocking task's mid-flight cancel watcher
+            // terminates the spawned child instead of letting it run to
+            // natural exit. Without this, dropping the JoinHandle has no
+            // effect on the running blocking task.
+            cancel_token.set_cancel_source("voice_foreground_ack_timeout");
+            cancel_token
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 timeout_ms = foreground.timeout_ms,
                 foreground_provider = %foreground.provider,
                 foreground_model = %foreground.model,
-                "voice foreground model timed out; skipping spoken fallback"
+                "voice foreground model timed out; skipping spoken fallback (#2250: token cancelled)"
             );
             return None;
         }
@@ -403,6 +432,7 @@ async fn generate_voice_channel_text_reply(
     text: &str,
     language: &str,
     foreground: &EffectiveVoiceForegroundConfig,
+    cancel_token: Arc<crate::services::provider::CancelToken>,
 ) -> Option<String> {
     let prompt =
         crate::voice::prompt::voice_channel_text_prompt(text, language, foreground.max_chars);
@@ -410,17 +440,25 @@ async fn generate_voice_channel_text_reply(
     let model = foreground.model.clone();
     let max_chars = foreground.max_chars;
     let timeout = Duration::from_millis(foreground.timeout_ms);
+    let cancel_for_blocking = cancel_token.clone();
     let result = tokio::time::timeout(
         timeout + Duration::from_millis(250),
         tokio::task::spawn_blocking(move || {
             let provider_kind = ProviderKind::from_str_or_unsupported(&provider);
             match provider_kind {
-                ProviderKind::Claude => crate::services::claude::execute_command_simple_with_model(
-                    &prompt,
-                    Some(&model),
-                ),
+                ProviderKind::Claude => {
+                    crate::services::claude::execute_command_simple_cancellable_with_model(
+                        &prompt,
+                        Some(&model),
+                        Some(cancel_for_blocking),
+                    )
+                }
                 ProviderKind::Codex => {
-                    crate::services::codex::execute_command_simple_with_model(&prompt, Some(&model))
+                    crate::services::codex::execute_command_simple_cancellable_with_model(
+                        &prompt,
+                        Some(&model),
+                        Some(cancel_for_blocking),
+                    )
                 }
                 ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => Err(format!(
                     "voice channel text provider {} does not support model-scoped instant call yet",
@@ -455,11 +493,17 @@ async fn generate_voice_channel_text_reply(
             return None;
         }
         Err(_) => {
+            // #2250: see comment in `generate_foreground_ack_text` —
+            // signal cancel so the detached blocking child is killed.
+            cancel_token.set_cancel_source("voice_channel_text_reply_timeout");
+            cancel_token
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 timeout_ms = foreground.timeout_ms,
                 foreground_provider = %foreground.provider,
                 foreground_model = %foreground.model,
-                "voice channel text model timed out"
+                "voice channel text model timed out (#2250: token cancelled)"
             );
             return None;
         }
@@ -477,6 +521,7 @@ async fn generate_voice_background_result_summary(
     background_result: &str,
     language: &str,
     foreground: &EffectiveVoiceForegroundConfig,
+    cancel_token: Arc<crate::services::provider::CancelToken>,
 ) -> Option<String> {
     let max_chars = foreground.max_chars.max(120);
     let prompt = crate::voice::prompt::voice_background_result_summary_prompt(
@@ -487,17 +532,25 @@ async fn generate_voice_background_result_summary(
     let provider = foreground.provider.clone();
     let model = foreground.model.clone();
     let timeout = Duration::from_millis(foreground.timeout_ms);
+    let cancel_for_blocking = cancel_token.clone();
     let result = tokio::time::timeout(
         timeout + Duration::from_millis(250),
         tokio::task::spawn_blocking(move || {
             let provider_kind = ProviderKind::from_str_or_unsupported(&provider);
             match provider_kind {
-                ProviderKind::Claude => crate::services::claude::execute_command_simple_with_model(
-                    &prompt,
-                    Some(&model),
-                ),
+                ProviderKind::Claude => {
+                    crate::services::claude::execute_command_simple_cancellable_with_model(
+                        &prompt,
+                        Some(&model),
+                        Some(cancel_for_blocking),
+                    )
+                }
                 ProviderKind::Codex => {
-                    crate::services::codex::execute_command_simple_with_model(&prompt, Some(&model))
+                    crate::services::codex::execute_command_simple_cancellable_with_model(
+                        &prompt,
+                        Some(&model),
+                        Some(cancel_for_blocking),
+                    )
                 }
                 ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen => Err(format!(
                     "voice background summary provider {} does not support model-scoped instant call yet",
@@ -532,11 +585,17 @@ async fn generate_voice_background_result_summary(
             return None;
         }
         Err(_) => {
+            // #2250: see comment in `generate_foreground_ack_text` —
+            // signal cancel so the detached blocking child is killed.
+            cancel_token.set_cancel_source("voice_background_summary_timeout");
+            cancel_token
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 timeout_ms = foreground.timeout_ms,
                 foreground_provider = %foreground.provider,
                 foreground_model = %foreground.model,
-                "voice background summary model timed out"
+                "voice background summary model timed out (#2250: token cancelled)"
             );
             return None;
         }
@@ -719,6 +778,14 @@ pub(in crate::services::discord) struct VoiceBargeInRuntime {
     // F12 (#2046): voice alias collision 경고를 1회만 노출. utterance 마다 같은
     // collision 으로 warn 이 쏟아져 운영 로그가 묻히는 것을 막는다.
     alias_collision_signature: std::sync::Mutex<Option<String>>,
+    // #2250 (ADR #2175 follow-up): per-channel registry of in-flight foreground
+    // Codex/Claude calls. Each entry is the CancelToken passed to the
+    // `execute_command_simple_cancellable_with_model` invocation, so that
+    // explicit-stop barge-in, supersession by a new utterance, or shutdown
+    // can terminate the spawned child mid-flight rather than waiting for
+    // natural exit.
+    inflight_foreground_cancels:
+        dashmap::DashMap<u64, Vec<Arc<crate::services::provider::CancelToken>>>,
 }
 
 impl VoiceBargeInRuntime {
@@ -766,6 +833,7 @@ impl VoiceBargeInRuntime {
             next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
             config_cache: std::sync::Mutex::new(None),
             alias_collision_signature: std::sync::Mutex::new(None),
+            inflight_foreground_cancels: dashmap::DashMap::new(),
         }
     }
 
@@ -797,11 +865,68 @@ impl VoiceBargeInRuntime {
             next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
             config_cache: std::sync::Mutex::new(None),
             alias_collision_signature: std::sync::Mutex::new(None),
+            inflight_foreground_cancels: dashmap::DashMap::new(),
         }
     }
 
     pub(in crate::services::discord) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// #2250: register a CancelToken for an in-flight foreground/voice Codex
+    /// or Claude call so explicit-stop barge-in, supersession by a new
+    /// utterance, or runtime cleanup can terminate the spawned child.
+    fn register_inflight_foreground_cancel(
+        &self,
+        channel_id: ChannelId,
+        token: Arc<crate::services::provider::CancelToken>,
+    ) {
+        self.inflight_foreground_cancels
+            .entry(channel_id.get())
+            .or_default()
+            .push(token);
+    }
+
+    /// #2250: remove a previously registered CancelToken once the
+    /// foreground call has returned (cancelled or completed normally).
+    fn unregister_inflight_foreground_cancel(
+        &self,
+        channel_id: ChannelId,
+        token: &Arc<crate::services::provider::CancelToken>,
+    ) {
+        if let Some(mut entry) = self.inflight_foreground_cancels.get_mut(&channel_id.get()) {
+            entry.retain(|existing| !Arc::ptr_eq(existing, token));
+        }
+        self.inflight_foreground_cancels
+            .remove_if(&channel_id.get(), |_, value| value.is_empty());
+    }
+
+    /// #2250: signal cancellation on every in-flight foreground call for the
+    /// given channel. Called by explicit-stop barge-in and supersession
+    /// paths so the spawned Codex/Claude child is killed instead of running
+    /// to natural exit (ADR #2175).
+    pub(in crate::services::discord) fn cancel_inflight_foreground_calls(
+        &self,
+        channel_id: ChannelId,
+        reason: &'static str,
+    ) -> usize {
+        let Some((_, tokens)) = self.inflight_foreground_cancels.remove(&channel_id.get()) else {
+            return 0;
+        };
+        let count = tokens.len();
+        for token in tokens {
+            token.set_cancel_source(reason);
+            token.cancel_with_tmux_cleanup();
+        }
+        if count > 0 {
+            tracing::info!(
+                channel_id = channel_id.get(),
+                count,
+                reason,
+                "voice foreground inflight Codex/Claude calls cancelled (#2250)"
+            );
+        }
+        count
     }
 
     pub(in crate::services::discord) fn verbose_progress_enabled(&self) -> bool {
@@ -840,9 +965,47 @@ impl VoiceBargeInRuntime {
         let foreground = self
             .resolve_effective_foreground_config(channel_id, target_channel_id)
             .await;
-        let reply = generate_voice_channel_text_reply(text, &language, &foreground)
-            .await
-            .unwrap_or_else(|| "지금 보이스 빠른 답변 모델 응답을 만들지 못했어요.".to_string());
+        let cancel_token = Arc::new(crate::services::provider::CancelToken::new());
+        self.register_inflight_foreground_cancel(channel_id, cancel_token.clone());
+        let reply =
+            generate_voice_channel_text_reply(text, &language, &foreground, cancel_token.clone())
+                .await
+                .unwrap_or_else(|| {
+                    "지금 보이스 빠른 답변 모델 응답을 만들지 못했어요.".to_string()
+                });
+
+        // Issue #2335 (c) — Codex round 2: keep the foreground cancel token
+        // registered through the `channel_id.say` HTTP call. If a cancel
+        // arrives between generation and posting (or during the HTTP
+        // round-trip), we must suppress the now-stale reply. The
+        // unregister happens via this RAII guard on every exit path.
+        struct TextReplyGuard<'a> {
+            runtime: &'a VoiceBargeInRuntime,
+            channel_id: ChannelId,
+            token: Arc<crate::services::provider::CancelToken>,
+        }
+        impl<'a> Drop for TextReplyGuard<'a> {
+            fn drop(&mut self) {
+                self.runtime
+                    .unregister_inflight_foreground_cancel(self.channel_id, &self.token);
+            }
+        }
+        let _text_reply_guard = TextReplyGuard {
+            runtime: self,
+            channel_id,
+            token: cancel_token.clone(),
+        };
+
+        if cancel_token.cancelled.load(Ordering::Relaxed) {
+            tracing::info!(
+                channel_id = channel_id.get(),
+                cancel_source = ?cancel_token.cancel_source(),
+                cancel_source_kind = ?cancel_token.cancel_source_kind(),
+                stage = "pre_post",
+                "voice channel text reply suppressed because cancel won the race (#2335)"
+            );
+            return true;
+        }
 
         if let Err(error) = channel_id.say(http.as_ref(), reply).await {
             tracing::warn!(
@@ -1050,6 +1213,12 @@ impl VoiceBargeInRuntime {
             if let Some((_, session)) = self.spoken_result_playbacks.remove(&channel_id) {
                 session.cancellation.cancel();
             }
+            // #2250: also abort any in-flight foreground Codex/Claude call so
+            // its spawned child does not outlive the guild teardown.
+            self.cancel_inflight_foreground_calls(
+                ChannelId::new(channel_id),
+                "voice_guild_teardown",
+            );
             self.active_voice_routes.remove(&channel_id);
             self.deferred_buffers.remove(&channel_id);
         }
@@ -1341,17 +1510,37 @@ impl VoiceBargeInRuntime {
         let foreground = self
             .resolve_effective_foreground_config(voice_channel_id, background_channel_id)
             .await;
-        let summary =
-            generate_voice_background_result_summary(background_result, &language, &foreground)
-                .await
-                .unwrap_or_else(|| {
-                    fallback_voice_background_result_summary(
-                        background_result,
-                        &language,
-                        foreground.max_chars,
-                        failed,
-                    )
-                });
+        let cancel_token = Arc::new(crate::services::provider::CancelToken::new());
+        self.register_inflight_foreground_cancel(voice_channel_id, cancel_token.clone());
+        let summary_result = generate_voice_background_result_summary(
+            background_result,
+            &language,
+            &foreground,
+            cancel_token.clone(),
+        )
+        .await;
+        self.unregister_inflight_foreground_cancel(voice_channel_id, &cancel_token);
+        // #2250: if cancel won the race (e.g. user barge-in or guild
+        // teardown), suppress fallback speech and skip TTS entirely.
+        // Otherwise the user would still hear the completion summary
+        // after they explicitly stopped.
+        if cancel_token.cancelled.load(Ordering::Relaxed) {
+            tracing::info!(
+                voice_channel_id = voice_channel_id.get(),
+                background_channel_id = background_channel_id.get(),
+                cancel_source = ?cancel_token.cancel_source(),
+                "voice background completion summary suppressed because cancel won the race (#2250)"
+            );
+            return;
+        }
+        let summary = summary_result.unwrap_or_else(|| {
+            fallback_voice_background_result_summary(
+                background_result,
+                &language,
+                foreground.max_chars,
+                failed,
+            )
+        });
         if summary.trim().is_empty() {
             return;
         }
@@ -1572,7 +1761,15 @@ impl VoiceBargeInRuntime {
             return outcome;
         }
 
-        if !super::mailbox_has_active_turn(shared, channel_id).await {
+        // #2250: in-flight foreground Codex/Claude calls are also
+        // cancellable "active work" — do not bail with NoActiveTurn if the
+        // only active work is a foreground call, otherwise barge-in cannot
+        // reach the registered cancel token.
+        let has_inflight_foreground = self
+            .inflight_foreground_cancels
+            .get(&channel_id.get())
+            .is_some_and(|entry| !entry.value().is_empty());
+        if !super::mailbox_has_active_turn(shared, channel_id).await && !has_inflight_foreground {
             return VoiceBargeInTranscriptOutcome::NoActiveTurn;
         }
 
@@ -1583,6 +1780,12 @@ impl VoiceBargeInRuntime {
             .verify_processing_barge_in_after_stt(transcript);
         match decision {
             ProcessingBargeInDecision::AbortAgent => {
+                // #2250: also cancel any in-flight foreground/voice Codex
+                // call so its child process is killed mid-flight, not just
+                // the background turn.
+                let inflight_cancelled = self
+                    .cancel_inflight_foreground_calls(channel_id, "voice_barge_in_explicit_stop");
+                let _ = inflight_cancelled;
                 let result = super::mailbox_cancel_active_turn_with_reason(
                     shared,
                     channel_id,
@@ -1645,10 +1848,60 @@ impl VoiceBargeInRuntime {
             .resolve_effective_foreground_config(source_channel_id, target_channel_id)
             .await;
         self.play_processing_chime(shared, source_channel_id).await;
-        let decision =
-            generate_foreground_ack_text(&announcement.transcript, &language, &foreground)
-                .await
-                .unwrap_or(VoiceForegroundDecision::Silence);
+        let cancel_token = Arc::new(crate::services::provider::CancelToken::new());
+        self.register_inflight_foreground_cancel(source_channel_id, cancel_token.clone());
+        let decision = generate_foreground_ack_text(
+            &announcement.transcript,
+            &language,
+            &foreground,
+            cancel_token.clone(),
+        )
+        .await
+        .unwrap_or(VoiceForegroundDecision::Silence);
+
+        // Issue #2335 (c) — Codex round 2: keep the foreground cancel token
+        // REGISTERED through every suppressible side effect (synth, play,
+        // background dispatch). Previously the code unregistered right
+        // after `generate_foreground_ack_text` returned, so any cancel
+        // arriving in the window between unregister and the TTS playback /
+        // handoff dispatch could not flip this token — the stale spoken
+        // ack or background handoff would still fire. We use a RAII guard
+        // so the unregister always runs (panics, early returns, etc.) and
+        // re-check the cancel flag at each awaited boundary below.
+        struct InflightGuard<'a> {
+            runtime: &'a VoiceBargeInRuntime,
+            channel_id: ChannelId,
+            token: Arc<crate::services::provider::CancelToken>,
+        }
+        impl<'a> Drop for InflightGuard<'a> {
+            fn drop(&mut self) {
+                self.runtime
+                    .unregister_inflight_foreground_cancel(self.channel_id, &self.token);
+            }
+        }
+        let _inflight_guard = InflightGuard {
+            runtime: self,
+            channel_id: source_channel_id,
+            token: cancel_token.clone(),
+        };
+
+        let log_cancel_suppressed = |label: &'static str| {
+            tracing::info!(
+                source_channel_id = source_channel_id.get(),
+                target_channel_id = target_channel_id.get(),
+                utterance_id = %announcement.utterance_id,
+                cancel_source = ?cancel_token.cancel_source(),
+                cancel_source_kind = ?cancel_token.cancel_source_kind(),
+                stage = label,
+                "voice foreground side effect suppressed because cancel won the race (#2335)"
+            );
+        };
+
+        // First gate: cancel that arrived during ack generation.
+        if cancel_token.cancelled.load(Ordering::Relaxed) {
+            log_cancel_suppressed("post_generation");
+            return true;
+        }
 
         match decision {
             VoiceForegroundDecision::Silence => {
@@ -1663,10 +1916,18 @@ impl VoiceBargeInRuntime {
                 );
             }
             VoiceForegroundDecision::Speak(spoken) => {
+                if cancel_token.cancelled.load(Ordering::Relaxed) {
+                    log_cancel_suppressed("pre_speak_synth");
+                    return true;
+                }
                 if let Some(path) = self
                     .synthesize_acknowledgement(&spoken, source_channel_id)
                     .await
                 {
+                    if cancel_token.cancelled.load(Ordering::Relaxed) {
+                        log_cancel_suppressed("post_speak_synth");
+                        return true;
+                    }
                     self.play_acknowledgement(shared, source_channel_id, path)
                         .await;
                 }
@@ -1681,6 +1942,10 @@ impl VoiceBargeInRuntime {
                 );
             }
             VoiceForegroundDecision::HandoffBackground(summary) => {
+                if cancel_token.cancelled.load(Ordering::Relaxed) {
+                    log_cancel_suppressed("pre_background_handoff");
+                    return true;
+                }
                 match self
                     .dispatch_voice_background_handoff(
                         shared,
@@ -1691,12 +1956,142 @@ impl VoiceBargeInRuntime {
                     )
                     .await
                 {
-                    Ok(turn_id) => {
+                    Ok(handoff_outcome) => {
+                        let VoiceBackgroundHandoffOutcome {
+                            turn_id,
+                            handoff_message_id,
+                        } = handoff_outcome;
+                        // #2374 — consult the handoff cancel-tombstone
+                        // BEFORE inspecting our own in-memory cancel
+                        // flag. A retried voice utterance can re-enter
+                        // this branch for the same handoff after the
+                        // first attempt's `cancel_token` has finalized
+                        // (and therefore no longer reads `cancelled`).
+                        // Without the tombstone the second caller would
+                        // proceed to fire the spoken ack and a duplicate
+                        // background cancel, even though the user's
+                        // original cancel already terminated the work.
+                        //
+                        // Tombstones are keyed by the durable handoff
+                        // `message_id`. When the dispatch driver could
+                        // not surface a message id (rare — logged at
+                        // dispatch time), the tombstone path is
+                        // effectively a no-op and we fall back to the
+                        // legacy in-memory cancel-flag check.
+                        let tombstone = handoff_message_id.and_then(|id| {
+                            crate::voice::cancel_tombstone::global_store().lookup(id)
+                        });
+                        let local_cancel = cancel_token.cancelled.load(Ordering::Relaxed);
+                        if local_cancel || tombstone.is_some() {
+                            let observed_via_tombstone = tombstone.is_some() && !local_cancel;
+                            let cancel_reason = cancel_token
+                                .cancel_source()
+                                .or_else(|| tombstone.clone())
+                                .unwrap_or_else(|| {
+                                    "voice_foreground_cancel_during_handoff".to_string()
+                                });
+                            // `cancel_reason` is a captured String — use a
+                            // static fallback label to satisfy the
+                            // `&'static str` signature; the dynamic reason is
+                            // still written to the active turn token by the
+                            // mailbox-actor reason owner.
+                            let target_cancel_label: &'static str =
+                                "voice_foreground_cancel_during_handoff";
+                            // #2374 Codex round-1 fix (HIGH-2): record
+                            // the tombstone UNCONDITIONALLY when we
+                            // observe the cancel for a known
+                            // `handoff_message_id`, before issuing the
+                            // mailbox cancel. The original v1
+                            // implementation only recorded the
+                            // tombstone after the actor confirmed a
+                            // live token; that missed the cases where
+                            // the target turn had not yet started
+                            // (intake race) or had already finalized.
+                            // A later retry must still observe the
+                            // tombstone.
+                            if let Some(handoff_id) = handoff_message_id {
+                                super::record_voice_handoff_cancel_tombstone(
+                                    handoff_id,
+                                    target_cancel_label,
+                                );
+                            }
+                            // #2374 Codex round-1 fix (HIGH-1):
+                            // identity-guarded cancel. Only cancel the
+                            // active target-channel turn if its
+                            // `user_message_id` matches the handoff
+                            // `message_id`. Without this guard a late
+                            // retry could observe the tombstone and
+                            // cancel an UNRELATED turn that happened
+                            // to start on the same target channel
+                            // after the original handoff turn
+                            // finalized. When `handoff_message_id` is
+                            // unavailable (dispatch driver returned
+                            // none — already logged at dispatch time)
+                            // we fall back to the unguarded cancel and
+                            // only when the local cancel flag is set
+                            // — i.e. the original first cancel still
+                            // owns the turn — so we cannot kill an
+                            // unrelated turn.
+                            let result = if let Some(handoff_id) = handoff_message_id {
+                                super::mailbox_cancel_active_turn_if_handoff_user_message_with_reason(
+                                    shared,
+                                    target_channel_id,
+                                    handoff_id,
+                                    target_cancel_label,
+                                )
+                                .await
+                            } else if local_cancel {
+                                super::mailbox_cancel_active_turn_with_reason(
+                                    shared,
+                                    target_channel_id,
+                                    target_cancel_label,
+                                )
+                                .await
+                            } else {
+                                // Tombstone-only observation without a
+                                // message id to identity-guard on: do
+                                // NOT issue a blind cancel; just
+                                // suppress the foreground ack.
+                                crate::services::turn_orchestrator::CancelActiveTurnResult {
+                                    token: None,
+                                    already_stopping: false,
+                                }
+                            };
+                            tracing::info!(
+                                source_channel_id = source_channel_id.get(),
+                                target_channel_id = target_channel_id.get(),
+                                turn_id = %turn_id,
+                                target_cancelled = result.token.is_some(),
+                                already_stopping = result.already_stopping,
+                                cancel_source = %cancel_reason,
+                                observed_via_tombstone,
+                                handoff_message_id = ?handoff_message_id.map(|m| m.get()),
+                                "voice background handoff just-started turn cancelled \
+                                 because foreground cancel won the race (#2335 / #2374)"
+                            );
+                            log_cancel_suppressed("post_background_handoff_started");
+                            return true;
+                        }
                         let ack = voice_background_handoff_ack(&language);
                         if let Some(path) = self
                             .synthesize_acknowledgement(ack, source_channel_id)
                             .await
                         {
+                            // #2374 Codex round-1 fix (MEDIUM-3):
+                            // recheck the handoff tombstone after the
+                            // `synthesize_acknowledgement` await. A
+                            // concurrent cancel can record the
+                            // tombstone DURING synthesis; without
+                            // re-checking we would still play the ack.
+                            let tombstone_after_synth = handoff_message_id.and_then(|id| {
+                                crate::voice::cancel_tombstone::global_store().lookup(id)
+                            });
+                            if cancel_token.cancelled.load(Ordering::Relaxed)
+                                || tombstone_after_synth.is_some()
+                            {
+                                log_cancel_suppressed("post_background_handoff_play");
+                                return true;
+                            }
                             self.play_acknowledgement(shared, source_channel_id, path)
                                 .await;
                         }
@@ -1733,7 +2128,7 @@ impl VoiceBargeInRuntime {
         target_channel_id: ChannelId,
         announcement: &crate::voice::prompt::VoiceTranscriptAnnouncement,
         summary: &str,
-    ) -> Result<String, String> {
+    ) -> Result<VoiceBackgroundHandoffOutcome, String> {
         let background_provider = self
             .resolve_background_provider_for_target(target_channel_id)
             .await;
@@ -1755,7 +2150,86 @@ impl VoiceBargeInRuntime {
                 message_content: &prompt,
             })
             .await?;
-        Ok(outcome.turn_id)
+        // #2236: stamp a typed marker keyed by the posted message id so the
+        // turn bridge can route the background turn's spoken summary back to
+        // the foreground voice channel WITHOUT inspecting the prompt body.
+        // The previous design matched a hardcoded Korean prefix on
+        // `user_text`, which any user could type to hijack routing.
+        //
+        // #2274: also write through to the durable PG side store so the
+        // marker survives a dcserver restart while the background turn is
+        // still running. The in-memory store remains the hot read path; PG
+        // is the durable source of truth and is consulted as a fallback by
+        // terminal-delivery callers when the in-memory store misses.
+        if let Some(message_id) = outcome.message_id {
+            let agent_id = self
+                .active_voice_routes
+                .get(&source_channel_id.get())
+                .map(|entry| entry.agent_id.clone());
+            let meta = crate::voice::announce_meta::VoiceBackgroundHandoffMeta {
+                voice_channel_id: source_channel_id.get(),
+                background_channel_id: target_channel_id.get(),
+                agent_id,
+                local_only_fallback: false,
+            };
+            crate::voice::announce_meta::global_store().insert_handoff(message_id, meta.clone());
+            // #2274 Codex round-2 finding: a durable-write failure here used
+            // to leave the local marker as-is, but the terminal-delivery path
+            // (PG-authoritative since the round-1 fix) would then observe
+            // `Ok(None)` from PG and silently refuse to route the spoken
+            // summary. That is a regression vs the pre-#2274 local-only
+            // behaviour. We restore the local-only fallback by flipping the
+            // explicit `local_only_fallback` flag on the in-memory marker
+            // and emitting an operator-visible warn so persistence failures
+            // are not invisible. The flag is scoped to exactly the
+            // persist-failed case: PG-loaded / rehydrated markers always
+            // carry `local_only_fallback = false`, and once the durable
+            // claim succeeds the local copy is `forget_handoff` ed, so the
+            // fallback path cannot double-route.
+            if let Some(pool) = shared.pg_pool.as_ref() {
+                if let Err(error) =
+                    crate::voice::announce_meta::persist_handoff_durable(pool, message_id, &meta)
+                        .await
+                {
+                    tracing::warn!(
+                        error = %error,
+                        message_id = message_id.get(),
+                        source_channel_id = source_channel_id.get(),
+                        target_channel_id = target_channel_id.get(),
+                        utterance_id = %announcement.utterance_id,
+                        "voice background handoff durable persistence failed; falling back to local-only marker so the spoken summary is not dropped"
+                    );
+                    if crate::voice::announce_meta::global_store()
+                        .mark_handoff_local_only_fallback(message_id)
+                    {
+                        tracing::warn!(
+                            event = "voice_background_handoff_local_only_fallback",
+                            message_id = message_id.get(),
+                            source_channel_id = source_channel_id.get(),
+                            target_channel_id = target_channel_id.get(),
+                            utterance_id = %announcement.utterance_id,
+                            "voice background handoff marker flagged local-only fallback; terminal delivery may consume the local marker without a backing PG row"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    message_id = message_id.get(),
+                    "voice background handoff durable persistence skipped — postgres pool unavailable"
+                );
+            }
+        } else {
+            tracing::warn!(
+                source_channel_id = source_channel_id.get(),
+                target_channel_id = target_channel_id.get(),
+                utterance_id = %announcement.utterance_id,
+                "voice background handoff dispatch returned no message_id; spoken summary routing will fall back to legacy prefix detection"
+            );
+        }
+        Ok(VoiceBackgroundHandoffOutcome {
+            turn_id: outcome.turn_id,
+            handoff_message_id: outcome.message_id,
+        })
     }
 
     async fn start_voice_turn(
@@ -1961,22 +2435,120 @@ impl VoiceBargeInRuntime {
             .find_map(|agent| agent_voice_background_channel_for(agent, source_channel_id))
     }
 
+    /// Reverse lookup: given a background text channel, find the foreground
+    /// voice channel that should hear the spoken summary.
+    ///
+    /// #2236: in multi-agent setups, multiple `AgentDef` entries can map the
+    /// same background channel (either intentionally — shared workspace — or
+    /// by misconfiguration). The previous implementation silently picked the
+    /// FIRST matching agent. This is a fail-closed reverse lookup:
+    ///
+    /// 1. If a current active voice route matches the background channel,
+    ///    that route wins (runtime state is always more specific than
+    ///    config). When `expected_agent_id` is provided, prefer an active
+    ///    route whose agent matches.
+    /// 2. Otherwise, scan the config for agents whose
+    ///    `agent_voice_channel_for_background` resolves the background
+    ///    channel. If exactly one matches, return it. If multiple match,
+    ///    require `expected_agent_id` to disambiguate; if absent or no
+    ///    config agent matches by id, log a warn and return None
+    ///    (fail-closed — rather than speak into the wrong agent's voice
+    ///    channel).
     pub(in crate::services::discord) async fn voice_channel_for_background(
         &self,
         background_channel_id: ChannelId,
+        expected_agent_id: Option<&str>,
     ) -> Option<ChannelId> {
-        if let Some(entry) = self
+        let active_matches: Vec<(u64, String)> = self
             .active_voice_routes
             .iter()
-            .find(|entry| entry.value().channel_id == background_channel_id)
-        {
-            return Some(ChannelId::new(*entry.key()));
+            .filter(|entry| entry.value().channel_id == background_channel_id)
+            .map(|entry| (*entry.key(), entry.value().agent_id.clone()))
+            .collect();
+        match active_matches.len() {
+            0 => {}
+            1 => return Some(ChannelId::new(active_matches[0].0)),
+            _ => {
+                if let Some(agent_id) = expected_agent_id {
+                    if let Some((source, _)) = active_matches
+                        .iter()
+                        .find(|(_, route_agent)| route_agent == agent_id)
+                    {
+                        return Some(ChannelId::new(*source));
+                    }
+                    tracing::warn!(
+                        event = "voice_background_active_route_agent_mismatch",
+                        background_channel_id = background_channel_id.get(),
+                        expected_agent_id = %agent_id,
+                        candidate_agents = ?active_matches
+                            .iter()
+                            .map(|(_, agent)| agent.as_str())
+                            .collect::<Vec<_>>(),
+                        "multiple active voice routes share the same background channel but none match the expected agent_id; refusing to pick silently"
+                    );
+                    return None;
+                }
+                tracing::warn!(
+                    event = "voice_background_multi_active_route_no_disambiguator",
+                    background_channel_id = background_channel_id.get(),
+                    candidate_agents = ?active_matches
+                        .iter()
+                        .map(|(_, agent)| agent.as_str())
+                        .collect::<Vec<_>>(),
+                    "multiple active voice routes share the same background channel and dispatch carried no agent_id; refusing to pick silently"
+                );
+                return None;
+            }
         }
         let config = self.cached_config().await;
-        config
+        let mut matches: Vec<(String, ChannelId)> = config
             .agents
             .iter()
-            .find_map(|agent| agent_voice_channel_for_background(agent, background_channel_id))
+            .filter_map(|agent| {
+                agent_voice_channel_for_background(agent, background_channel_id)
+                    .map(|voice_channel| (agent.id.clone(), voice_channel))
+            })
+            .collect();
+        match matches.len() {
+            0 => None,
+            1 => Some(matches.remove(0).1),
+            _ => {
+                let candidate_agents: Vec<&str> = matches
+                    .iter()
+                    .map(|(agent_id, _)| agent_id.as_str())
+                    .collect();
+                if let Some(expected) = expected_agent_id {
+                    if let Some((_, voice_channel)) =
+                        matches.iter().find(|(agent_id, _)| agent_id == expected)
+                    {
+                        tracing::warn!(
+                            event = "voice_background_multi_agent_disambiguated",
+                            background_channel_id = background_channel_id.get(),
+                            expected_agent_id = %expected,
+                            candidate_agents = ?candidate_agents,
+                            "multiple config agents share the same background channel; disambiguated by dispatch agent_id"
+                        );
+                        return Some(*voice_channel);
+                    }
+                    tracing::warn!(
+                        event = "voice_background_multi_agent_unknown_id",
+                        background_channel_id = background_channel_id.get(),
+                        expected_agent_id = %expected,
+                        candidate_agents = ?candidate_agents,
+                        "dispatch agent_id does not match any config agent claiming this background channel; refusing to pick silently"
+                    );
+                    None
+                } else {
+                    tracing::warn!(
+                        event = "voice_background_multi_agent_no_disambiguator",
+                        background_channel_id = background_channel_id.get(),
+                        candidate_agents = ?candidate_agents,
+                        "multiple config agents claim the same background channel and dispatch carried no agent_id; refusing to pick silently (#2236 fail-closed)"
+                    );
+                    None
+                }
+            }
+        }
     }
 
     async fn resolve_voice_turn_target(
@@ -2194,7 +2766,16 @@ impl VoiceBargeInRuntime {
             return VoiceBargeInTranscriptOutcome::EmptyTranscript;
         }
 
-        if super::mailbox_has_active_turn(shared, channel_id).await {
+        // #2250: also treat in-flight foreground Codex/Claude calls as
+        // active work for barge-in purposes. Otherwise a barge-in arriving
+        // while we are still generating the ack / channel-text / summary
+        // would bypass `handle_processing_transcript` and never cancel the
+        // spawned child.
+        let has_inflight_foreground = self
+            .inflight_foreground_cancels
+            .get(&channel_id.get())
+            .is_some_and(|entry| !entry.value().is_empty());
+        if super::mailbox_has_active_turn(shared, channel_id).await || has_inflight_foreground {
             return self
                 .handle_processing_transcript(shared, provider, channel_id, transcript)
                 .await;
@@ -2733,6 +3314,23 @@ impl VoiceReceiveHook for DiscordVoiceBargeInHook {
             .playbacks
             .get(&channel_id.get())
             .and_then(|entry| entry.value().owner);
+        // Issue #2335 (b): the live PCM cut path is a parallel termination
+        // path that, prior to this fix, did NOT call
+        // `cancel_inflight_foreground_calls`. As a result PCM cut would
+        // silence the speaker / kill the background turn while a
+        // foreground Codex/Claude child kept running to natural exit.
+        //
+        // Codex review (round 2): perform the foreground-token cancel
+        // SYNCHRONOUSLY here, BEFORE the tokio::spawn that handles the
+        // (async) mailbox cancel. If we deferred it into the spawned task,
+        // a fast foreground call could complete and unregister its token
+        // between the cut detection and the spawn being scheduled, in
+        // which case `cancel_inflight_foreground_calls` would see an
+        // empty registry and the stale reply / ack / handoff would still
+        // proceed after the user explicitly barged in.
+        let foreground_cancelled = self
+            .runtime
+            .cancel_inflight_foreground_calls(channel_id, "voice_barge_in_live_cut");
         tokio::spawn(async move {
             let result = super::mailbox_cancel_active_turn_with_reason(
                 &shared,
@@ -2749,6 +3347,7 @@ impl VoiceReceiveHook for DiscordVoiceBargeInHook {
                 playback_owner = ?playback_owner,
                 cancelled = result.token.is_some(),
                 already_stopping = result.already_stopping,
+                foreground_cancelled,
                 "voice live barge-in cut processed"
             );
         });
@@ -2861,6 +3460,162 @@ mod tests {
         config.enabled = true;
         config.barge_in.acknowledgement_enabled = false;
         VoiceBargeInRuntime::from_voice_config(&config)
+    }
+
+    /// #2250: explicit-stop barge-in must flip the cancel flag on every
+    /// in-flight foreground Codex/Claude call registered for the channel,
+    /// so the spawned child is killed by the simple-cancel watcher rather
+    /// than running to natural exit. Verifies the registry wiring;
+    /// end-to-end child kill is covered by
+    /// `simple_cancel_watcher_tests::watcher_kills_sleeping_child_when_token_is_cancelled`.
+    #[test]
+    fn cancel_inflight_foreground_calls_flips_every_registered_token() {
+        let runtime = enabled_runtime();
+        let channel = ChannelId::new(42);
+        let token_a = Arc::new(crate::services::provider::CancelToken::new());
+        let token_b = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, token_a.clone());
+        runtime.register_inflight_foreground_cancel(channel, token_b.clone());
+        // Unrelated channel must not be affected by the cancel below.
+        let other_channel = ChannelId::new(43);
+        let token_c = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(other_channel, token_c.clone());
+
+        let count =
+            runtime.cancel_inflight_foreground_calls(channel, "voice_barge_in_explicit_stop");
+        assert_eq!(count, 2, "both tokens on the channel must be cancelled");
+        assert!(token_a.cancelled.load(Ordering::Relaxed));
+        assert!(token_b.cancelled.load(Ordering::Relaxed));
+        assert!(
+            !token_c.cancelled.load(Ordering::Relaxed),
+            "tokens on other channels must be untouched"
+        );
+        assert_eq!(
+            token_a.cancel_source().as_deref(),
+            Some("voice_barge_in_explicit_stop")
+        );
+        // Registry is drained after cancel so re-running is idempotent.
+        let zero =
+            runtime.cancel_inflight_foreground_calls(channel, "voice_barge_in_explicit_stop");
+        assert_eq!(zero, 0);
+    }
+
+    /// Issue #2335 (a): `cancel_inflight_foreground_calls` must populate the
+    /// structured `CancelSource` on every flipped token so consumers can
+    /// branch on the enum (timeout vs barge-in) without re-parsing the
+    /// free-form label.
+    #[test]
+    fn cancel_inflight_foreground_calls_classifies_cancel_source_kind() {
+        use crate::services::provider::CancelSource;
+
+        let runtime = enabled_runtime();
+        let channel = ChannelId::new(91);
+
+        let live_cut_token = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, live_cut_token.clone());
+        runtime.cancel_inflight_foreground_calls(channel, "voice_barge_in_live_cut");
+        assert_eq!(
+            live_cut_token.cancel_source_kind(),
+            Some(CancelSource::UserBargeIn),
+            "live PCM cut must classify as UserBargeIn (#2335 a)"
+        );
+
+        let teardown_token = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, teardown_token.clone());
+        runtime.cancel_inflight_foreground_calls(channel, "voice_guild_teardown");
+        assert_eq!(
+            teardown_token.cancel_source_kind(),
+            Some(CancelSource::SessionTeardown),
+            "guild teardown must classify as SessionTeardown (#2335 a)"
+        );
+
+        let explicit_token = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, explicit_token.clone());
+        runtime.cancel_inflight_foreground_calls(channel, "voice_barge_in_explicit_stop");
+        assert_eq!(
+            explicit_token.cancel_source_kind(),
+            Some(CancelSource::UserBargeIn),
+            "explicit-stop barge-in is also UserBargeIn (#2335 a)"
+        );
+    }
+
+    /// Issue #2335 (b) — Codex round 2: the PCM-cut foreground cancel MUST
+    /// run synchronously at cut detection. If it were deferred into the
+    /// spawned async task, a foreground call completing between
+    /// cut detection and the spawn being scheduled would unregister its
+    /// token first, and the user would still hear the stale ack/reply.
+    ///
+    /// We can't easily run the full `observe_pcm` hook in unit tests
+    /// (it needs a SharedData), but we *can* simulate the race: cancel
+    /// must flip BEFORE any unregister-after-completion path runs.
+    #[test]
+    fn live_pcm_cut_foreground_cancel_wins_against_immediate_unregister() {
+        let runtime = enabled_runtime();
+        let channel = ChannelId::new(2336);
+        let foreground_token = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, foreground_token.clone());
+
+        // Simulate the new ordering: cut detection cancels SYNCHRONOUSLY.
+        let count = runtime.cancel_inflight_foreground_calls(channel, "voice_barge_in_live_cut");
+        // Foreground call now tries to unregister "after completion" —
+        // but the token is already cancelled, so the unregister is a
+        // no-op observable as "registry empty for the channel".
+        runtime.unregister_inflight_foreground_cancel(channel, &foreground_token);
+
+        assert_eq!(count, 1, "cut must cancel the still-registered token");
+        assert!(
+            foreground_token.cancelled.load(Ordering::Relaxed),
+            "synchronous cut wins the race even if the foreground completes immediately after"
+        );
+    }
+
+    /// Issue #2335 (b): the live PCM cut path must propagate cancel to every
+    /// in-flight foreground Codex/Claude token registered for the channel.
+    /// Before this fix, PCM cut silenced the speaker / killed the
+    /// background turn while the foreground child kept running.
+    #[test]
+    fn live_pcm_cut_propagates_cancel_to_inflight_foreground_tokens() {
+        use crate::services::provider::CancelSource;
+
+        let runtime = enabled_runtime();
+        let channel = ChannelId::new(2335);
+        let foreground_token = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, foreground_token.clone());
+
+        // Simulate the PCM-cut tokio task call site: it must cancel the
+        // registered foreground tokens with the live-cut reason.
+        let count = runtime.cancel_inflight_foreground_calls(channel, "voice_barge_in_live_cut");
+        assert_eq!(count, 1, "registered foreground token must be cancelled");
+        assert!(
+            foreground_token.cancelled.load(Ordering::Relaxed),
+            "foreground token must be flipped to cancelled"
+        );
+        assert_eq!(
+            foreground_token.cancel_source_kind(),
+            Some(CancelSource::UserBargeIn),
+            "live cut must classify as UserBargeIn"
+        );
+    }
+
+    /// #2250: unregistering a CancelToken after a foreground call completes
+    /// must leave sibling in-flight tokens for the same channel intact.
+    #[test]
+    fn unregister_inflight_foreground_cancel_preserves_siblings() {
+        let runtime = enabled_runtime();
+        let channel = ChannelId::new(7);
+        let token_a = Arc::new(crate::services::provider::CancelToken::new());
+        let token_b = Arc::new(crate::services::provider::CancelToken::new());
+        runtime.register_inflight_foreground_cancel(channel, token_a.clone());
+        runtime.register_inflight_foreground_cancel(channel, token_b.clone());
+
+        runtime.unregister_inflight_foreground_cancel(channel, &token_a);
+        let count = runtime.cancel_inflight_foreground_calls(channel, "test");
+        assert_eq!(
+            count, 1,
+            "only the still-registered token should be cancelled"
+        );
+        assert!(!token_a.cancelled.load(Ordering::Relaxed));
+        assert!(token_b.cancelled.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -2995,7 +3750,7 @@ mod tests {
 
         assert_eq!(
             runtime
-                .voice_channel_for_background(ChannelId::new(201))
+                .voice_channel_for_background(ChannelId::new(201), None)
                 .await,
             Some(ChannelId::new(301))
         );
@@ -3010,9 +3765,126 @@ mod tests {
 
         assert_eq!(
             runtime
-                .voice_channel_for_background(ChannelId::new(200))
+                .voice_channel_for_background(ChannelId::new(200), None)
                 .await,
             Some(ChannelId::new(300))
+        );
+    }
+
+    /// #2236: when two config agents map the same background channel and the
+    /// dispatch carries no agent_id, fail closed instead of silently picking
+    /// the first match.
+    #[tokio::test]
+    async fn voice_channel_for_background_fail_closed_on_multi_agent_without_disambiguator() {
+        let runtime = enabled_runtime();
+        let mut config = crate::config::Config::default();
+        // Two agents that both claim background channel 200, but different voice channels.
+        let mut agent_a = test_agent("codex");
+        agent_a.id = "agent-a".to_string();
+        agent_a.voice.channel_id = Some("300".to_string());
+        let mut agent_b = test_agent("codex");
+        agent_b.id = "agent-b".to_string();
+        agent_b.voice.channel_id = Some("400".to_string());
+        config.agents = vec![agent_a, agent_b];
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
+
+        assert_eq!(
+            runtime
+                .voice_channel_for_background(ChannelId::new(200), None)
+                .await,
+            None,
+            "multi-agent background channel collision with no agent_id must fail closed"
+        );
+    }
+
+    /// #2236: dispatch carrying an explicit agent_id resolves to that agent's
+    /// voice channel, even when multiple config agents claim the same
+    /// background channel.
+    #[tokio::test]
+    async fn voice_channel_for_background_disambiguates_multi_agent_by_explicit_agent_id() {
+        let runtime = enabled_runtime();
+        let mut config = crate::config::Config::default();
+        let mut agent_a = test_agent("codex");
+        agent_a.id = "agent-a".to_string();
+        agent_a.voice.channel_id = Some("300".to_string());
+        let mut agent_b = test_agent("codex");
+        agent_b.id = "agent-b".to_string();
+        agent_b.voice.channel_id = Some("400".to_string());
+        config.agents = vec![agent_a, agent_b];
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
+
+        assert_eq!(
+            runtime
+                .voice_channel_for_background(ChannelId::new(200), Some("agent-b"))
+                .await,
+            Some(ChannelId::new(400))
+        );
+        assert_eq!(
+            runtime
+                .voice_channel_for_background(ChannelId::new(200), Some("agent-a"))
+                .await,
+            Some(ChannelId::new(300))
+        );
+    }
+
+    /// #2236: dispatch carrying an agent_id that does not match any agent
+    /// claiming the channel must fail closed, not silently pick.
+    #[tokio::test]
+    async fn voice_channel_for_background_fail_closed_on_multi_agent_unknown_id() {
+        let runtime = enabled_runtime();
+        let mut config = crate::config::Config::default();
+        let mut agent_a = test_agent("codex");
+        agent_a.id = "agent-a".to_string();
+        agent_a.voice.channel_id = Some("300".to_string());
+        let mut agent_b = test_agent("codex");
+        agent_b.id = "agent-b".to_string();
+        agent_b.voice.channel_id = Some("400".to_string());
+        config.agents = vec![agent_a, agent_b];
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
+
+        assert_eq!(
+            runtime
+                .voice_channel_for_background(ChannelId::new(200), Some("agent-not-here"))
+                .await,
+            None
+        );
+    }
+
+    /// #2236: when multiple active voice routes share the same background
+    /// channel (e.g. two voice sessions in different guilds routed to the
+    /// same workspace text channel), fail closed without an agent_id.
+    #[tokio::test]
+    async fn voice_channel_for_background_fail_closed_on_multi_active_route_without_disambiguator()
+    {
+        let runtime = enabled_runtime();
+        runtime.active_voice_routes.insert(
+            301,
+            ActiveVoiceRoute {
+                agent_id: "agent-a".to_string(),
+                channel_id: ChannelId::new(201),
+                updated_at: Instant::now(),
+            },
+        );
+        runtime.active_voice_routes.insert(
+            401,
+            ActiveVoiceRoute {
+                agent_id: "agent-b".to_string(),
+                channel_id: ChannelId::new(201),
+                updated_at: Instant::now(),
+            },
+        );
+
+        assert_eq!(
+            runtime
+                .voice_channel_for_background(ChannelId::new(201), None)
+                .await,
+            None
+        );
+        assert_eq!(
+            runtime
+                .voice_channel_for_background(ChannelId::new(201), Some("agent-b"))
+                .await,
+            Some(ChannelId::new(401))
         );
     }
 
