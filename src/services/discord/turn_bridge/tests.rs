@@ -794,7 +794,7 @@ async fn late_tmux_ready_after_done_still_claims_watcher_relay() {
             session_id: None,
         })
         .expect("send terminal done");
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
     stream_tx
         .send(StreamMessage::TmuxReady {
             output_path: "/tmp/agentdesk-2113-output.jsonl".to_string(),
