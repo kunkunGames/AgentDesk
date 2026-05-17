@@ -2588,6 +2588,7 @@ pub(super) fn spawn_turn_bridge(
             let response_placeholder = super::formatting::build_processing_status_block(SPINNER[0]);
             match gateway.send_message(channel_id, &response_placeholder).await {
                 Ok(response_msg_id) => {
+                    let status_panel_placeholder_msg_id = current_msg_id;
                     status_panel_msg_id = Some(current_msg_id);
                     inflight_state.status_message_id = Some(current_msg_id.get());
                     current_msg_id = response_msg_id;
@@ -2596,6 +2597,19 @@ pub(super) fn spawn_turn_bridge(
                     inflight_state.current_msg_len = last_edit_text.len();
                     inflight_state.response_sent_offset = response_sent_offset;
                     inflight_state.full_response = full_response.clone();
+                    let status_panel_pin_key = super::placeholder_controller::PlaceholderKey {
+                        provider: provider.clone(),
+                        channel_id,
+                        message_id: status_panel_placeholder_msg_id,
+                    };
+                    shared_owned
+                        .placeholder_controller
+                        .unpin_placeholder_message(
+                            gateway.as_ref(),
+                            &status_panel_pin_key,
+                            "status_panel_response_message_split",
+                        )
+                        .await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -2635,7 +2649,26 @@ pub(super) fn spawn_turn_bridge(
             inflight_state.long_running_placeholder_active = false;
         }
 
-        let _ = save_inflight_state(&inflight_state);
+        match save_inflight_state(&inflight_state) {
+            Ok(()) => {
+                let placeholder_pin_key = super::placeholder_controller::PlaceholderKey {
+                    provider: provider.clone(),
+                    channel_id,
+                    message_id: current_msg_id,
+                };
+                shared_owned
+                    .placeholder_controller
+                    .pin_placeholder_message(gateway.as_ref(), &placeholder_pin_key)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[turn_bridge] failed to persist inflight state before pinning placeholder in channel {}: {}",
+                    channel_id,
+                    error
+                );
+            }
+        }
         crate::services::observability::emit_turn_started(
             provider.as_str(),
             channel_id.get(),
@@ -2685,6 +2718,10 @@ pub(super) fn spawn_turn_bridge(
                 .await;
             }};
         }
+
+        let mut pending_placeholder_pin_transition_after_state_save = None;
+        let mut pending_long_running_open_after_state_save = None;
+        let mut pending_long_running_retarget_after_state_save = None;
 
         'outer: while !done
             || terminal_control_drain_until
@@ -3097,6 +3134,9 @@ pub(super) fn spawn_turn_bridge(
                                 shared_owned.status_panel_v2_enabled,
                             )
                                 && long_running_placeholder_active.is_none()
+                                && pending_long_running_open_after_state_save.is_none()
+                                && pending_placeholder_pin_transition_after_state_save.is_none()
+                                && pending_long_running_retarget_after_state_save.is_none()
                             {
                                 if let Some((reason, close_trigger, reason_detail)) =
                                     long_running_tool
@@ -3123,32 +3163,10 @@ pub(super) fn spawn_turn_bridge(
                                             )
                                             .await,
                                         };
-                                    let outcome = ensure_active_placeholder_card(
-                                        shared_owned.as_ref(),
-                                        gateway.as_ref(),
-                                        key.clone(),
-                                        input_payload.clone(),
-                                    )
-                                    .await;
-                                    // codex round-2 P2: only commit the active
-                                    // pointer when the controller actually
-                                    // committed (or coalesced an existing
-                                    // edit); otherwise the regular streaming
-                                    // path stays in charge so the turn isn't
-                                    // visually frozen on a transient edit
-                                    // failure.
-                                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                                    if matches!(outcome, Edited | Coalesced) {
-                                        long_running_placeholder_active = Some((
-                                            key,
-                                            input_payload,
-                                            close_trigger,
-                                            false, // ack not yet consumed
-                                        ));
-                                        inflight_state
-                                            .long_running_placeholder_active = true;
-                                        state_dirty = true;
-                                    }
+                                    pending_long_running_open_after_state_save =
+                                        Some((key, input_payload, close_trigger, false));
+                                    inflight_state.long_running_placeholder_active = true;
+                                    state_dirty = true;
                                 }
                             }
                             push_transcript_event(
@@ -3285,23 +3303,45 @@ pub(super) fn spawn_turn_bridge(
                                     } else {
                                         super::placeholder_controller::PlaceholderLifecycle::Completed
                                     };
-                                    let outcome = shared_owned
-                                        .placeholder_controller
-                                        .transition(gateway.as_ref(), key.clone(), target)
-                                        .await;
-                                    // codex round-10 P2: only clear flag on
-                                    // committed/already-terminal outcome.
-                                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                                    if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
-                                        inflight_state
-                                            .long_running_placeholder_active = false;
+                                    let pending_retarget_matches_key =
+                                        pending_long_running_retarget_after_state_save
+                                            .as_ref()
+                                            .is_some_and(|(pending_key, _, _, _, _)| {
+                                                *pending_key == key
+                                            });
+                                    if pending_retarget_matches_key {
+                                        let _ =
+                                            pending_long_running_retarget_after_state_save.take();
+                                        shared_owned.placeholder_controller.detach(&key);
+                                        shared_owned
+                                            .placeholder_controller
+                                            .unpin_placeholder_message(
+                                                gateway.as_ref(),
+                                                &key,
+                                                "terminal_before_retarget_persisted",
+                                            )
+                                            .await;
+                                        inflight_state.long_running_placeholder_active = false;
                                         state_dirty = true;
                                     } else {
-                                        // EditFailed — keep the placeholder
-                                        // active so the next event/sweeper
-                                        // can retry the terminal edit.
-                                        long_running_placeholder_active =
-                                            Some((key, snapshot, close_trigger, ack_consumed));
+                                        let outcome = shared_owned
+                                            .placeholder_controller
+                                            .transition(gateway.as_ref(), key.clone(), target)
+                                            .await;
+                                        // codex round-10 P2: only clear flag on
+                                        // committed/already-terminal outcome.
+                                        use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                        if matches!(outcome, Edited | Coalesced | AlreadyTerminal)
+                                        {
+                                            inflight_state.long_running_placeholder_active = false;
+                                            state_dirty = true;
+                                        } else {
+                                            // EditFailed — keep the placeholder
+                                            // active so the next event/sweeper
+                                            // can retry the terminal edit.
+                                            long_running_placeholder_active =
+                                                Some((key, snapshot, close_trigger, ack_consumed));
+                                        }
                                     }
                                 } else {
                                     // Successful background dispatch ack OR a
@@ -3309,12 +3349,39 @@ pub(super) fn spawn_turn_bridge(
                                     // `Done`/cancel can close the card. Mark
                                     // the ack consumed so future is_error
                                     // results from other tools don't abort us.
+                                    let active_key_for_pending_update = key.clone();
                                     long_running_placeholder_active = Some((
                                         key,
                                         snapshot,
                                         close_trigger,
                                         true,
                                     ));
+                                    if let Some((
+                                        pending_key,
+                                        _,
+                                        _,
+                                        pending_ack_consumed,
+                                        _,
+                                    )) = pending_long_running_retarget_after_state_save.as_mut()
+                                        && *pending_key == active_key_for_pending_update
+                                    {
+                                        *pending_ack_consumed = true;
+                                    }
+                                }
+                            } else if let Some((_, _, close_trigger, ack_consumed)) =
+                                pending_long_running_open_after_state_save.as_mut()
+                            {
+                                let monitor_like = matches!(
+                                    *close_trigger,
+                                    super::formatting::LongRunningCloseTrigger::MonitorLike
+                                );
+                                let is_dispatch_ack = !monitor_like && !*ack_consumed;
+                                if monitor_like || (is_dispatch_ack && is_error) {
+                                    pending_long_running_open_after_state_save = None;
+                                    inflight_state.long_running_placeholder_active = false;
+                                    state_dirty = true;
+                                } else {
+                                    *ack_consumed = true;
                                 }
                             }
                             // Reset the assistant-line summary so the next
@@ -3441,6 +3508,10 @@ pub(super) fn spawn_turn_bridge(
                                 // resumed session dies before completion.
                                 recovery_retry = true;
                             }
+                            if pending_long_running_open_after_state_save.take().is_some() {
+                                inflight_state.long_running_placeholder_active = false;
+                                let _ = save_inflight_state(&inflight_state);
+                            }
                             // #1255: turn finished while a long-running
                             // placeholder is still flagged as Active — close
                             // it now so the user does not stare at a stale
@@ -3454,22 +3525,42 @@ pub(super) fn spawn_turn_bridge(
                                 } else {
                                     super::placeholder_controller::PlaceholderLifecycle::Completed
                                 };
-                                let outcome = shared_owned
-                                    .placeholder_controller
-                                    .transition(gateway.as_ref(), key.clone(), target)
-                                    .await;
-                                // codex round-10/11 P2/P3: on `EditFailed`,
-                                // re-stash the tuple so subsequent
-                                // streaming/sweeper paths can retry the
-                                // terminal edit. Only clear the persisted
-                                // flag on a committed (or already-terminal)
-                                // transition.
-                                use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                                if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                                let pending_retarget_matches_key =
+                                    pending_long_running_retarget_after_state_save
+                                        .as_ref()
+                                        .is_some_and(|(pending_key, _, _, _, _)| {
+                                            *pending_key == key
+                                        });
+                                if pending_retarget_matches_key {
+                                    let _ = pending_long_running_retarget_after_state_save.take();
+                                    shared_owned.placeholder_controller.detach(&key);
+                                    shared_owned
+                                        .placeholder_controller
+                                        .unpin_placeholder_message(
+                                            gateway.as_ref(),
+                                            &key,
+                                            "done_before_retarget_persisted",
+                                        )
+                                        .await;
                                     inflight_state.long_running_placeholder_active = false;
                                 } else {
-                                    long_running_placeholder_active =
-                                        Some((key, snapshot, close_trigger, ack_consumed));
+                                    let outcome = shared_owned
+                                        .placeholder_controller
+                                        .transition(gateway.as_ref(), key.clone(), target)
+                                        .await;
+                                    // codex round-10/11 P2/P3: on `EditFailed`,
+                                    // re-stash the tuple so subsequent
+                                    // streaming/sweeper paths can retry the
+                                    // terminal edit. Only clear the persisted
+                                    // flag on a committed (or already-terminal)
+                                    // transition.
+                                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                    if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                                        inflight_state.long_running_placeholder_active = false;
+                                    } else {
+                                        long_running_placeholder_active =
+                                            Some((key, snapshot, close_trigger, ack_consumed));
+                                    }
                                 }
                             }
                             if let Some(resolved) = resolve_done_response(
@@ -4210,6 +4301,7 @@ pub(super) fn spawn_turn_bridge(
                     {
                         Ok(()) => match gateway.send_message(channel_id, &status_block).await {
                             Ok(next_msg_id) => {
+                                let previous_msg_id = current_msg_id;
                                 let next_response_sent_offset =
                                     response_sent_offset + plan.split_at;
                                 assert_response_sent_offset_progress(
@@ -4232,6 +4324,39 @@ pub(super) fn spawn_turn_bridge(
                                 inflight_state.response_sent_offset = response_sent_offset;
                                 inflight_state.full_response = full_response.clone();
                                 state_dirty = true;
+                                let previous_pin_key =
+                                    super::placeholder_controller::PlaceholderKey {
+                                        provider: provider.clone(),
+                                        channel_id,
+                                        message_id: previous_msg_id,
+                                    };
+                                let next_pin_key = super::placeholder_controller::PlaceholderKey {
+                                    provider: provider.clone(),
+                                    channel_id,
+                                    message_id: current_msg_id,
+                                };
+                                pending_placeholder_pin_transition_after_state_save =
+                                    Some(match pending_placeholder_pin_transition_after_state_save {
+                                        Some((first_previous_pin_key, _)) => {
+                                            (first_previous_pin_key, next_pin_key)
+                                        }
+                                        None => (previous_pin_key, next_pin_key),
+                                    });
+                                if let Some((_, _, _, _, pending_new_key)) =
+                                    pending_long_running_retarget_after_state_save.as_mut()
+                                {
+                                    *pending_new_key =
+                                        super::placeholder_controller::PlaceholderKey {
+                                            provider: provider.clone(),
+                                            channel_id,
+                                            message_id: current_msg_id,
+                                        };
+                                }
+                                if let Some((pending_key, _, _, _)) =
+                                    pending_long_running_open_after_state_save.as_mut()
+                                {
+                                    pending_key.message_id = current_msg_id;
+                                }
                                 // #1255 codex round-1 P2: rollover advanced
                                 // `current_msg_id` past the message that owned the
                                 // active long-running placeholder. The old message
@@ -4246,40 +4371,22 @@ pub(super) fn spawn_turn_bridge(
                                 // its `Active` controller entry doesn't linger as
                                 // a non-evictable row in the cap-bounded map.
                                 if let Some((old_key, snapshot, close_trigger, ack_consumed)) =
-                                    long_running_placeholder_active.take()
+                                    long_running_placeholder_active.as_ref()
                                 {
-                                    shared_owned.placeholder_controller.detach(&old_key);
                                     let new_key = super::placeholder_controller::PlaceholderKey {
                                         provider: provider.clone(),
                                         channel_id,
                                         message_id: current_msg_id,
                                     };
-                                    let outcome = ensure_active_placeholder_card(
-                                        shared_owned.as_ref(),
-                                        gateway.as_ref(),
-                                        new_key.clone(),
-                                        snapshot.clone(),
-                                    )
-                                    .await;
-                                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                                    if matches!(outcome, Edited | Coalesced) {
-                                        long_running_placeholder_active = Some((
+                                    pending_long_running_retarget_after_state_save =
+                                        Some((
+                                            old_key.clone(),
+                                            snapshot.clone(),
+                                            *close_trigger,
+                                            *ack_consumed,
                                             new_key,
-                                            snapshot,
-                                            close_trigger,
-                                            ack_consumed,
                                         ));
-                                        // Flag is already true; refresh
-                                        // updated_at-side bookkeeping by writing
-                                        // through state_dirty.
-                                        state_dirty = true;
-                                    } else {
-                                        // Retarget edit failed — drop the flag so
-                                        // the regular streaming loop and sweeper
-                                        // resume normal handling.
-                                        inflight_state.long_running_placeholder_active = false;
-                                        state_dirty = true;
-                                    }
+                                    state_dirty = true;
                                 }
                             }
                             Err(error) => {
@@ -4330,6 +4437,8 @@ pub(super) fn spawn_turn_bridge(
                     && !done
                     && last_status_edit.elapsed() >= status_interval
                     && long_running_placeholder_active.is_none()
+                    && pending_long_running_open_after_state_save.is_none()
+                    && pending_long_running_retarget_after_state_save.is_none()
                 {
                     let _ = gateway
                         .edit_message(channel_id, current_msg_id, &stable_display_text)
@@ -4367,6 +4476,9 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if state_dirty
+                || pending_placeholder_pin_transition_after_state_save.is_some()
+                || pending_long_running_open_after_state_save.is_some()
+                || pending_long_running_retarget_after_state_save.is_some()
                 || inflight_state.current_tool_line != current_tool_line
                 || inflight_state.last_tool_name != last_tool_name
                 || inflight_state.last_tool_summary != last_tool_summary
@@ -4376,7 +4488,111 @@ pub(super) fn spawn_turn_bridge(
                 inflight_state.last_tool_name = last_tool_name.clone();
                 inflight_state.last_tool_summary = last_tool_summary.clone();
                 inflight_state.prev_tool_status = prev_tool_status.clone();
-                let _ = save_inflight_state(&inflight_state);
+                match save_inflight_state(&inflight_state) {
+                    Ok(()) => {
+                        if let Some((previous_pin_key, next_pin_key)) =
+                            pending_placeholder_pin_transition_after_state_save.take()
+                        {
+                            shared_owned
+                                .placeholder_controller
+                                .pin_placeholder_message(gateway.as_ref(), &next_pin_key)
+                                .await;
+                            shared_owned
+                                .placeholder_controller
+                                .unpin_placeholder_message(
+                                    gateway.as_ref(),
+                                    &previous_pin_key,
+                                    "streaming_rollover_old_message",
+                                )
+                                .await;
+                        }
+                        if let Some((key, snapshot, close_trigger, ack_consumed)) =
+                            pending_long_running_open_after_state_save.take()
+                        {
+                            if key.message_id == current_msg_id
+                                && long_running_placeholder_active.is_none()
+                            {
+                                let outcome = ensure_active_placeholder_card(
+                                    shared_owned.as_ref(),
+                                    gateway.as_ref(),
+                                    key.clone(),
+                                    snapshot.clone(),
+                                )
+                                .await;
+                                use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                if matches!(outcome, Edited | Coalesced) {
+                                    long_running_placeholder_active =
+                                        Some((key, snapshot, close_trigger, ack_consumed));
+                                } else {
+                                    inflight_state.long_running_placeholder_active = false;
+                                    if let Err(error) = save_inflight_state(&inflight_state) {
+                                        tracing::warn!(
+                                            "[turn_bridge] failed to persist long-running placeholder open failure in channel {}: {}",
+                                            channel_id,
+                                            error
+                                        );
+                                    }
+                                }
+                            } else {
+                                inflight_state.long_running_placeholder_active = false;
+                                if let Err(error) = save_inflight_state(&inflight_state) {
+                                    tracing::warn!(
+                                        "[turn_bridge] failed to persist stale long-running placeholder open drop in channel {}: {}",
+                                        channel_id,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        if let Some((
+                            old_key,
+                            snapshot,
+                            close_trigger,
+                            ack_consumed,
+                            new_key,
+                        )) = pending_long_running_retarget_after_state_save.take()
+                        {
+                            let active_still_matches_old_key = long_running_placeholder_active
+                                .as_ref()
+                                .is_some_and(|(active_key, _, _, _)| *active_key == old_key);
+                            if active_still_matches_old_key {
+                                shared_owned.placeholder_controller.detach(&old_key);
+                                let outcome = ensure_active_placeholder_card(
+                                    shared_owned.as_ref(),
+                                    gateway.as_ref(),
+                                    new_key.clone(),
+                                    snapshot.clone(),
+                                )
+                                .await;
+                                use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                                if matches!(outcome, Edited | Coalesced) {
+                                    long_running_placeholder_active =
+                                        Some((new_key, snapshot, close_trigger, ack_consumed));
+                                } else {
+                                    // Retarget edit failed — drop the flag so the
+                                    // regular streaming loop and sweeper resume
+                                    // normal handling.
+                                    long_running_placeholder_active = None;
+                                    inflight_state.long_running_placeholder_active = false;
+                                    if let Err(error) = save_inflight_state(&inflight_state) {
+                                        tracing::warn!(
+                                            "[turn_bridge] failed to persist long-running placeholder retarget failure in channel {}: {}",
+                                            channel_id,
+                                            error
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "[turn_bridge] failed to persist inflight state before moving placeholder pin in channel {}: {}",
+                            channel_id,
+                            error
+                        );
+                    }
+                }
             }
 
             if last_adk_heartbeat.elapsed() >= std::time::Duration::from_secs(30) {
@@ -4429,6 +4645,36 @@ pub(super) fn spawn_turn_bridge(
         // continue the visible output lifecycle.
         let relay_owns_output_at_stream_end = standby_relay_owns_output
             || (rx_disconnected && tmux_handed_off && full_response.is_empty());
+        if pending_long_running_open_after_state_save.take().is_some() {
+            inflight_state.long_running_placeholder_active = false;
+            let _ = save_inflight_state(&inflight_state);
+        }
+        if !cancelled && relay_owns_output_at_stream_end {
+            let relay_owned_pending_retarget_matches_active =
+                if let Some((active_key, _, _, _)) = long_running_placeholder_active.as_ref() {
+                    pending_long_running_retarget_after_state_save
+                        .as_ref()
+                        .is_some_and(|(pending_key, _, _, _, _)| pending_key == active_key)
+                } else {
+                    false
+                };
+            if relay_owned_pending_retarget_matches_active
+                && let Some((key, _, _, _)) = long_running_placeholder_active.take()
+            {
+                let _ = pending_long_running_retarget_after_state_save.take();
+                shared_owned.placeholder_controller.detach(&key);
+                shared_owned
+                    .placeholder_controller
+                    .unpin_placeholder_message(
+                        gateway.as_ref(),
+                        &key,
+                        "relay_stream_end_before_retarget_persisted",
+                    )
+                    .await;
+                inflight_state.long_running_placeholder_active = false;
+                let _ = save_inflight_state(&inflight_state);
+            }
+        }
         if !cancelled && !relay_owns_output_at_stream_end {
             if let Some((key, _, _, _)) = long_running_placeholder_active.take() {
                 let target = if transport_error || rx_disconnected {
@@ -4436,15 +4682,32 @@ pub(super) fn spawn_turn_bridge(
                 } else {
                     super::placeholder_controller::PlaceholderLifecycle::Completed
                 };
-                let outcome = shared_owned
-                    .placeholder_controller
-                    .transition(gateway.as_ref(), key, target)
-                    .await;
-                // codex round-10 P2: keep the persisted flag on EditFailed so
-                // the sweeper can finalize the still-visible 🔄 card later.
-                use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                let pending_retarget_matches_key = pending_long_running_retarget_after_state_save
+                    .as_ref()
+                    .is_some_and(|(pending_key, _, _, _, _)| *pending_key == key);
+                if pending_retarget_matches_key {
+                    let _ = pending_long_running_retarget_after_state_save.take();
+                    shared_owned.placeholder_controller.detach(&key);
+                    shared_owned
+                        .placeholder_controller
+                        .unpin_placeholder_message(
+                            gateway.as_ref(),
+                            &key,
+                            "stream_end_before_retarget_persisted",
+                        )
+                        .await;
                     inflight_state.long_running_placeholder_active = false;
+                } else {
+                    let outcome = shared_owned
+                        .placeholder_controller
+                        .transition(gateway.as_ref(), key, target)
+                        .await;
+                    // codex round-10 P2: keep the persisted flag on EditFailed so
+                    // the sweeper can finalize the still-visible 🔄 card later.
+                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                    if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                        inflight_state.long_running_placeholder_active = false;
+                    }
                 }
                 let _ = save_inflight_state(&inflight_state);
             }
@@ -4898,6 +5161,10 @@ pub(super) fn spawn_turn_bridge(
                 "cancel cleanup",
             )
             .await;
+            if pending_long_running_open_after_state_save.take().is_some() {
+                inflight_state.long_running_placeholder_active = false;
+                let _ = save_inflight_state(&inflight_state);
+            }
             // #1255: cancelled turn → drive any active long-running placeholder
             // into Aborted before the rest of the cleanup machinery runs. The
             // controller's idempotent terminal transition guarantees this is
@@ -4913,31 +5180,49 @@ pub(super) fn spawn_turn_bridge(
             if let Some((key, snapshot, close_trigger, ack_consumed)) =
                 long_running_placeholder_active.take()
             {
-                let outcome = shared_owned
-                    .placeholder_controller
-                    .transition(
-                        gateway.as_ref(),
-                        key.clone(),
-                        super::placeholder_controller::PlaceholderLifecycle::Aborted,
-                    )
-                    .await;
-                use super::placeholder_controller::PlaceholderControllerOutcome::*;
-                if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                let pending_retarget_matches_key = pending_long_running_retarget_after_state_save
+                    .as_ref()
+                    .is_some_and(|(pending_key, _, _, _, _)| *pending_key == key);
+                if pending_retarget_matches_key {
+                    let _ = pending_long_running_retarget_after_state_save.take();
+                    shared_owned.placeholder_controller.detach(&key);
+                    shared_owned
+                        .placeholder_controller
+                        .unpin_placeholder_message(
+                            gateway.as_ref(),
+                            &key,
+                            "cancel_before_retarget_persisted",
+                        )
+                        .await;
                     inflight_state.long_running_placeholder_active = false;
                     let _ = save_inflight_state(&inflight_state);
                 } else {
-                    // EditFailed (or any non-committed outcome): leave the
-                    // persisted flag set AND preserve the inflight file for
-                    // cleanup retry. The placeholder sweeper relies on the
-                    // inflight file existing to discover the stuck row; if
-                    // we let the normal cancel cleanup delete it, the
-                    // sweeper would lose its repair signal and the
-                    // controller entry would stay Active forever. Force
-                    // the inflight to be preserved so the next sweeper
-                    // pass can finish the teardown.
-                    let _ = (key, snapshot, close_trigger, ack_consumed);
-                    let _ = save_inflight_state(&inflight_state);
-                    preserve_inflight_for_cleanup_retry = true;
+                    let outcome = shared_owned
+                        .placeholder_controller
+                        .transition(
+                            gateway.as_ref(),
+                            key.clone(),
+                            super::placeholder_controller::PlaceholderLifecycle::Aborted,
+                        )
+                        .await;
+                    use super::placeholder_controller::PlaceholderControllerOutcome::*;
+                    if matches!(outcome, Edited | Coalesced | AlreadyTerminal) {
+                        inflight_state.long_running_placeholder_active = false;
+                        let _ = save_inflight_state(&inflight_state);
+                    } else {
+                        // EditFailed (or any non-committed outcome): leave the
+                        // persisted flag set AND preserve the inflight file for
+                        // cleanup retry. The placeholder sweeper relies on the
+                        // inflight file existing to discover the stuck row; if
+                        // we let the normal cancel cleanup delete it, the
+                        // sweeper would lose its repair signal and the
+                        // controller entry would stay Active forever. Force
+                        // the inflight to be preserved so the next sweeper
+                        // pass can finish the teardown.
+                        let _ = (key, snapshot, close_trigger, ack_consumed);
+                        let _ = save_inflight_state(&inflight_state);
+                        preserve_inflight_for_cleanup_retry = true;
+                    }
                 }
             }
 
@@ -6140,6 +6425,25 @@ pub(super) fn spawn_turn_bridge(
                 "  [{ts}] ✓ Cleared restart report for channel {} (turn completed normally)",
                 channel_id
             );
+        }
+
+        if bridge_output_owner.is_none()
+            && (cancelled
+                || is_prompt_too_long
+                || terminal_delivery_committed
+                || status_panel_terminal_committed
+                || recovery_retry)
+            && current_msg_id.get() != 0
+        {
+            let pin_key = super::placeholder_controller::PlaceholderKey {
+                provider: provider.clone(),
+                channel_id,
+                message_id: current_msg_id,
+            };
+            shared_owned
+                .placeholder_controller
+                .unpin_placeholder_message(gateway.as_ref(), &pin_key, "turn_finalization")
+                .await;
         }
 
         if cancelled && cancel_token.restart_mode().is_some() {
