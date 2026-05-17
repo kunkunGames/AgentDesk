@@ -635,6 +635,11 @@ mod tests {
         let result: Result<Option<f64>> = Err(anyhow::anyhow!("db error"));
         let mapped = result.map_err(|e| anyhow::anyhow!("decode error: {e}"));
         assert!(mapped.is_err());
-        assert!(mapped.unwrap_err().to_string().contains("decode error: db error"));
+        assert!(
+            mapped
+                .unwrap_err()
+                .to_string()
+                .contains("decode error: db error")
+        );
     }
 }
