@@ -8,7 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 #[cfg(unix)]
 use std::time::Duration;
 
-use crate::services::agent_protocol::{StreamMessage, is_valid_session_id};
+use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage, is_valid_session_id};
 use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
@@ -1116,8 +1116,12 @@ IMPORTANT: Format your responses using Markdown for better readability:
                             model, cost_usd, total_cost_usd, cache_create_tokens, cache_read_tokens
                         ));
                     }
-                    StreamMessage::TmuxReady { .. } | StreamMessage::ProcessReady { .. } => {
-                        debug_log("  >>> TmuxReady/ProcessReady (ignored in direct execution)");
+                    StreamMessage::TmuxReady { .. }
+                    | StreamMessage::RuntimeReady { .. }
+                    | StreamMessage::ProcessReady { .. } => {
+                        debug_log(
+                            "  >>> TmuxReady/RuntimeReady/ProcessReady (ignored in direct execution)",
+                        );
                     }
                     StreamMessage::OutputOffset { offset } => {
                         debug_log(&format!("  >>> OutputOffset: {offset}"));
@@ -1313,6 +1317,7 @@ enum ClaudeFollowupResult {
 }
 
 const FOLLOWUP_PARTIAL_OUTPUT_NOTICE: &str = "⚠ 세션이 응답 도중 중단되었습니다. 일부 출력이 이미 전송되어 자동 재시작하지 않았습니다. 이어서 계속하려면 같은 요청을 다시 보내며 계속해 달라고 적어 주세요.";
+const CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE: &str = "⚠ Claude TUI가 아직 이전 터미널 턴을 처리 중이라 이 메시지를 주입하지 않았습니다. 현재 응답이 끝난 뒤 다시 보내 주세요.";
 
 fn classify_followup_result(
     read_result: ReadOutputResult,
@@ -1343,6 +1348,51 @@ fn emit_followup_restart_suppressed_notice(sender: &Sender<StreamMessage>, notic
         result: String::new(),
         session_id: None,
     });
+}
+
+#[cfg(unix)]
+fn emit_claude_tui_busy_followup_notice(
+    sender: &Sender<StreamMessage>,
+    tmux_session_name: &str,
+    snapshot: &crate::services::claude_tui::input::PromptReadinessSnapshot,
+) {
+    tracing::warn!(
+        tmux_session_name,
+        prompt_marker_detected = snapshot.prompt_marker_detected,
+        previous_tui_turn_still_running = snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+        tmux_pane_alive = snapshot.tmux_pane_alive,
+        capture_available = snapshot.capture_available,
+        pane_tail = %snapshot.pane_tail,
+        "claude_tui follow-up blocked before prompt submission because hosted TUI is busy"
+    );
+    debug_log(&format!(
+        "Claude TUI follow-up blocked before prompt submission: session={} prompt_marker_detected={} previous_tui_turn_still_running={} tmux_pane_alive={} capture_available={} pane_tail:\n{}",
+        tmux_session_name,
+        snapshot.prompt_marker_detected,
+        snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+        snapshot.tmux_pane_alive,
+        snapshot.capture_available,
+        snapshot.pane_tail
+    ));
+    let _ = sender.send(StreamMessage::Text {
+        content: CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE.to_string(),
+    });
+    let _ = sender.send(StreamMessage::Done {
+        result: String::new(),
+        session_id: None,
+    });
+}
+
+#[cfg(unix)]
+fn claude_tui_followup_busy_before_submit(
+    tmux_session_name: &str,
+) -> Option<crate::services::claude_tui::input::PromptReadinessSnapshot> {
+    let snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
+    if snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected {
+        Some(snapshot)
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -1513,6 +1563,24 @@ fn execute_streaming_local_tui_tmux(
                 Some(tmux_session_name.to_string());
         }
         let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
+        if let Some(snapshot) = claude_tui_followup_busy_before_submit(tmux_session_name) {
+            emit_claude_tui_busy_followup_notice(&sender, tmux_session_name, &snapshot);
+            log_producer_exit(
+                "tui_warm_followup_busy_pre_submit",
+                Some(&resolved_session_id),
+                report_channel_id,
+                0,
+                serde_json::json!({
+                    "tmux_session_name": tmux_session_name,
+                    "transcript_path": transcript_path_string,
+                    "prompt_marker_detected": snapshot.prompt_marker_detected,
+                    "previous_tui_turn_still_running": snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+                    "tmux_pane_alive": snapshot.tmux_pane_alive,
+                    "capture_available": snapshot.capture_available,
+                }),
+            );
+            return Ok(());
+        }
         crate::services::claude_tui::input::send_followup_prompt(tmux_session_name, prompt)?;
         let hook_events_after = chrono::Utc::now();
         let read_result = read_claude_tui_transcript_until_done(
@@ -1845,11 +1913,12 @@ fn emit_claude_tui_watcher_handoff(
     let last_offset = std::fs::metadata(transcript_path)
         .map(|meta| meta.len())
         .unwrap_or(0);
-    let _ = sender.send(StreamMessage::TmuxReady {
-        output_path: transcript_path_string.to_string(),
-        input_fifo_path: String::new(),
-        tmux_session_name: tmux_session_name.to_string(),
-        last_offset,
+    let _ = sender.send(StreamMessage::RuntimeReady {
+        handoff: RuntimeHandoff::ClaudeTui {
+            transcript_path: transcript_path_string.to_string(),
+            tmux_session_name: tmux_session_name.to_string(),
+            last_offset,
+        },
     });
 }
 
@@ -2786,6 +2855,37 @@ mod local_tmux_lifecycle_tests {
             }
             other => panic!("expected TmuxReady, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_tui_handoff_uses_runtime_ready_without_fifo() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"{\"type\":\"assistant\"}\n").unwrap();
+        let transcript_path = temp.path().display().to_string();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        emit_claude_tui_watcher_handoff(&sender, &transcript_path, "claude-tui-test", temp.path());
+
+        let message = receiver.recv().unwrap();
+        match message {
+            StreamMessage::RuntimeReady {
+                handoff:
+                    RuntimeHandoff::ClaudeTui {
+                        transcript_path: actual_path,
+                        tmux_session_name,
+                        last_offset,
+                    },
+            } => {
+                assert_eq!(actual_path, transcript_path);
+                assert_eq!(tmux_session_name, "claude-tui-test");
+                assert_eq!(last_offset, std::fs::metadata(temp.path()).unwrap().len());
+            }
+            other => panic!("expected RuntimeReady ClaudeTui, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "Claude direct TUI handoff must not emit legacy TmuxReady with an empty FIFO"
+        );
     }
 
     #[test]

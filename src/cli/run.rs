@@ -285,6 +285,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             fast_mode_state,
             goals_state,
             cwd,
+            add_dirs,
             input_mode,
             compact_token_limit,
         } => {
@@ -313,6 +314,7 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
                 goals_override,
                 mode,
                 compact_token_limit,
+                &add_dirs,
             );
             Ok(())
         }
@@ -346,6 +348,17 @@ pub(crate) fn execute(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::ClaudeHookRelay {
+            endpoint,
+            provider,
+            event,
+            session_id,
+        } => exit_for_cli(crate::services::claude_tui::hook_relay::run_cli(
+            &endpoint,
+            &provider,
+            &event,
+            &session_id,
+        )),
+        Commands::CodexHookRelay {
             endpoint,
             provider,
             event,

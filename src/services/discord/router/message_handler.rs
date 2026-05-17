@@ -33,6 +33,7 @@ use super::turn_start::{
     session_reset_reason_for_turn, session_reset_reason_lifecycle_code,
     session_runtime_state_after_redirect, take_session_retry_context,
 };
+use crate::services::agent_protocol::RuntimeHandoffKind;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::services::git::GitCommand;
 use crate::services::memory::{
@@ -48,6 +49,7 @@ const WATCHDOG_DEADLOCK_PREALERT_MS: i64 = 5 * 60 * 1000;
 const WATCHDOG_DEADLOCK_PREALERT_BOT: &str = "announce";
 const WATCHDOG_TIMEOUT_REASON: &str = "watchdog timeout";
 const WATCHDOG_TIMEOUT_CANCEL_SOURCE: &str = "watchdog_timeout";
+const CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE: &str = "⚠ Claude TUI가 아직 이전 터미널 턴을 처리 중이라 이 메시지를 주입하지 않았습니다. 현재 응답이 끝난 뒤 다시 보내 주세요.";
 
 fn watchdog_deadlock_prealert_bot_name() -> &'static str {
     WATCHDOG_DEADLOCK_PREALERT_BOT
@@ -68,6 +70,141 @@ fn parse_watchdog_alert_channel_id(raw: &str) -> Option<serenity::ChannelId> {
         .map(serenity::ChannelId::new)
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaudeTuiBusyFollowupDiagnostic {
+    tmux_session_name: String,
+    prompt_marker_detected: bool,
+    previous_tui_turn_still_running: bool,
+    tmux_pane_alive: bool,
+    capture_available: bool,
+    watcher_state: &'static str,
+    watcher_owner_channel_id: Option<u64>,
+    inflight_state: &'static str,
+    pane_tail: String,
+}
+
+#[cfg(unix)]
+impl ClaudeTuiBusyFollowupDiagnostic {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tmux_session_name": self.tmux_session_name,
+            "prompt_marker_detected": self.prompt_marker_detected,
+            "previous_tui_turn_still_running": self.previous_tui_turn_still_running,
+            "tmux_pane_alive": self.tmux_pane_alive,
+            "capture_available": self.capture_available,
+            "watcher_state": self.watcher_state,
+            "watcher_owner_channel_id": self.watcher_owner_channel_id,
+            "inflight_state": self.inflight_state,
+            "pane_tail": self.pane_tail,
+        })
+    }
+}
+
+#[cfg(unix)]
+fn classify_inflight_diagnostic_state(inflight: Option<&InflightTurnState>) -> &'static str {
+    let Some(inflight) = inflight else {
+        return "missing";
+    };
+    let Some(updated_at_unix) = super::super::inflight::parse_updated_at_unix(&inflight.updated_at)
+    else {
+        return "stale_unparseable_updated_at";
+    };
+    let age_secs = chrono::Local::now()
+        .timestamp()
+        .saturating_sub(updated_at_unix);
+    if age_secs >= super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64 {
+        "stale"
+    } else if inflight.watcher_owns_live_relay {
+        "watcher_owned"
+    } else {
+        "present"
+    }
+}
+
+#[cfg(unix)]
+fn classify_claude_tui_followup_submission(
+    snapshot: &crate::services::claude_tui::input::PromptReadinessSnapshot,
+    watcher_state: &'static str,
+    watcher_owner_channel_id: Option<u64>,
+    inflight_state: &'static str,
+    tmux_session_name: &str,
+) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
+    if snapshot.prompt_marker_detected || !snapshot.tmux_pane_alive {
+        return None;
+    }
+    Some(ClaudeTuiBusyFollowupDiagnostic {
+        tmux_session_name: tmux_session_name.to_string(),
+        prompt_marker_detected: false,
+        previous_tui_turn_still_running: true,
+        tmux_pane_alive: snapshot.tmux_pane_alive,
+        capture_available: snapshot.capture_available,
+        watcher_state,
+        watcher_owner_channel_id,
+        inflight_state,
+        pane_tail: snapshot.pane_tail.clone(),
+    })
+}
+
+#[cfg(unix)]
+fn claude_tui_busy_followup_diagnostic(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+    tmux_session_name: Option<&str>,
+    remote_profile_present: bool,
+) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
+    if provider != &ProviderKind::Claude || remote_profile_present {
+        return None;
+    }
+    let tmux_session_name = tmux_session_name?;
+    let selection =
+        crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
+            provider,
+            claude::is_tmux_available(),
+        );
+    if selection.driver != crate::services::provider_hosting::ProviderSessionDriver::TuiHosting
+        || crate::services::claude_tui::hook_server::current_hook_endpoint().is_none()
+        || !crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
+    {
+        return None;
+    }
+
+    let snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
+    let watcher_entry = shared
+        .tmux_watchers
+        .iter()
+        .find(|entry| entry.tmux_session_name == tmux_session_name);
+    let owner_channel_id = shared
+        .tmux_watchers
+        .owner_channel_for_tmux_session(tmux_session_name)
+        .map(|channel_id| channel_id.get());
+    let (watcher_state, watcher_owner_channel_id) = watcher_entry
+        .as_ref()
+        .map(|entry| {
+            let state = if entry.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                "cancelled"
+            } else if entry.heartbeat_stale() {
+                "stale"
+            } else if entry.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                "paused"
+            } else {
+                "attached"
+            };
+            (state, owner_channel_id)
+        })
+        .unwrap_or(("missing", None));
+    let previous_inflight = super::super::inflight::load_inflight_state(provider, channel_id.get());
+    let inflight_state = classify_inflight_diagnostic_state(previous_inflight.as_ref());
+    classify_claude_tui_followup_submission(
+        &snapshot,
+        watcher_state,
+        watcher_owner_channel_id,
+        inflight_state,
+        tmux_session_name,
+    )
+}
+
 fn metadata_parent_channel_id(metadata: Option<&serde_json::Value>) -> Option<serenity::ChannelId> {
     metadata
         .and_then(|value| value.get("parent_channel_id"))
@@ -82,6 +219,58 @@ fn metadata_delivery_bot(metadata: Option<&serde_json::Value>) -> Option<String>
         .and_then(|value| value.get("delivery_bot"))
         .and_then(|value| value.as_str())
         .and_then(normalize_delivery_bot_name)
+}
+
+#[cfg(unix)]
+fn prelaunch_runtime_kind_for_managed_session(
+    provider: &ProviderKind,
+    remote_profile_is_none: bool,
+    has_tmux_session_name: bool,
+) -> Option<RuntimeHandoffKind> {
+    if !remote_profile_is_none
+        || !has_tmux_session_name
+        || !provider.uses_managed_tmux_backend()
+        || !claude::is_tmux_available()
+    {
+        return None;
+    }
+    let selection =
+        crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
+            provider, true,
+        );
+    if selection.driver == crate::services::provider_hosting::ProviderSessionDriver::TuiHosting {
+        return match provider {
+            ProviderKind::Claude
+                if crate::services::claude_tui::hook_server::current_hook_endpoint().is_some() =>
+            {
+                Some(RuntimeHandoffKind::ClaudeTui)
+            }
+            ProviderKind::Codex => Some(RuntimeHandoffKind::CodexTui),
+            _ => Some(RuntimeHandoffKind::LegacyTmuxWrapper),
+        };
+    }
+    Some(RuntimeHandoffKind::LegacyTmuxWrapper)
+}
+
+#[cfg(not(unix))]
+fn prelaunch_runtime_kind_for_managed_session(
+    _provider: &ProviderKind,
+    _remote_profile_is_none: bool,
+    _has_tmux_session_name: bool,
+) -> Option<RuntimeHandoffKind> {
+    None
+}
+
+fn apply_prelaunch_runtime_kind(
+    state: &mut InflightTurnState,
+    runtime_kind: Option<RuntimeHandoffKind>,
+) {
+    if let Some(kind) = runtime_kind {
+        state.runtime_kind = Some(kind);
+        if !kind.requires_input_fifo() {
+            state.input_fifo_path = None;
+        }
+    }
 }
 
 fn metadata_silent_flag(metadata: Option<&serde_json::Value>) -> bool {
@@ -1613,6 +1802,14 @@ async fn start_reserved_headless_turn_with_owner(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
+    apply_prelaunch_runtime_kind(
+        &mut inflight_state,
+        prelaunch_runtime_kind_for_managed_session(
+            &provider,
+            remote_profile.is_none(),
+            tmux_session_name.is_some(),
+        ),
+    );
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
         data.sessions
@@ -2061,25 +2258,45 @@ pub(in crate::services::discord) async fn handle_text_message(
         token,
     } = *deps;
     let original_channel_id = channel_id;
+    let stored_voice_announcement = crate::voice::announce_meta::global_store().take(user_msg_id);
+    let has_stored_voice_announcement = stored_voice_announcement.is_some();
     let parsed_voice_announcement =
         if crate::voice::prompt::is_voice_transcript_announcement_candidate(user_text) {
             crate::voice::prompt::parse_voice_transcript_announcement(user_text)
         } else {
             None
         };
-    let announce_bot_id = if parsed_voice_announcement.is_some() {
+    let announce_bot_id = if has_stored_voice_announcement || parsed_voice_announcement.is_some() {
         super::super::resolve_announce_bot_user_id(shared).await
     } else {
         None
     };
-    let voice_announcement = crate::voice::prompt::parse_authorized_voice_transcript_announcement(
-        user_text,
-        request_owner.get(),
-        announce_bot_id,
-    );
-    if parsed_voice_announcement.is_some() && voice_announcement.is_none() {
+    let voice_announcement = if announce_bot_id == Some(request_owner.get()) {
+        if has_stored_voice_announcement {
+            stored_voice_announcement
+        } else {
+            crate::voice::prompt::parse_authorized_voice_transcript_announcement(
+                user_text,
+                request_owner.get(),
+                announce_bot_id,
+            )
+        }
+    } else {
+        None
+    };
+    if has_stored_voice_announcement && announce_bot_id.is_none() {
         tracing::warn!(
             channel_id = channel_id.get(),
+            message_id = user_msg_id.get(),
+            author_id = request_owner.get(),
+            "dropping stored voice transcript announcement because announce bot user id is unavailable"
+        );
+    } else if (has_stored_voice_announcement || parsed_voice_announcement.is_some())
+        && voice_announcement.is_none()
+    {
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            message_id = user_msg_id.get(),
             author_id = request_owner.get(),
             announce_bot_id = ?announce_bot_id,
             "ignoring spoofed voice transcript announcement from non-announce author"
@@ -2120,6 +2337,14 @@ pub(in crate::services::discord) async fn handle_text_message(
         .as_ref()
         .map(|announcement| announcement.transcript.as_str())
         .unwrap_or(user_text);
+    if let Some(announcement) = voice_announcement.as_ref()
+        && shared
+            .voice_barge_in
+            .try_handle_voice_transcript_announcement(shared, channel_id, announcement)
+            .await
+    {
+        return Ok(());
+    }
     if !is_voice_announcement
         && shared
             .voice_barge_in
@@ -4193,6 +4418,76 @@ pub(in crate::services::discord) async fn handle_text_message(
     };
     let watcher_tmux_name = inflight_tmux_name.clone();
     let watcher_output_path = inflight_output_path.clone();
+    #[cfg(unix)]
+    if let Some(diagnostic) = claude_tui_busy_followup_diagnostic(
+        shared,
+        &provider,
+        channel_id,
+        tmux_session_name.as_deref(),
+        remote_profile.is_some(),
+    ) {
+        let diagnostic_json = diagnostic.to_json();
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            user_msg_id = user_msg_id.get(),
+            diagnostics = %diagnostic_json,
+            "claude_tui follow-up blocked before prompt submission because hosted TUI is busy"
+        );
+        crate::services::observability::emit_inflight_lifecycle_event(
+            provider.as_str(),
+            channel_id.get(),
+            dispatch_id.as_deref(),
+            adk_session_key.as_deref(),
+            Some(turn_id.as_str()),
+            "claude_tui_followup_busy_pre_submit",
+            diagnostic_json,
+        );
+        let _ = super::super::http::edit_channel_message(
+            http,
+            channel_id,
+            placeholder_msg_id,
+            CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,
+        )
+        .await;
+        super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
+        let bot_owner_provider = super::super::resolve_discord_bot_provider(token);
+        let kicked =
+            release_mailbox_after_placeholder_post_failure(shared, &bot_owner_provider, channel_id)
+                .await;
+        shared
+            .global_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        shared.turn_start_times.remove(&channel_id);
+        post_adk_session_status(
+            adk_session_key.as_deref(),
+            adk_session_name.as_deref(),
+            Some(provider.as_str()),
+            "awaiting_user",
+            &provider,
+            Some(&adk_session_info),
+            None,
+            Some(&current_path),
+            dispatch_id.as_deref(),
+            adk_thread_channel_id,
+            Some(channel_id),
+            role_binding
+                .as_ref()
+                .map(|binding| binding.role_id.as_str()),
+            shared.api_port,
+        )
+        .await;
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] ⏭ Claude TUI busy follow-up suppressed before prompt submission (channel {}, queue_kickoff_scheduled={})",
+            channel_id,
+            kicked
+        );
+        cancel_token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        super::super::clear_watchdog_deadline_override(channel_id.get()).await;
+        return Ok(());
+    }
 
     let (logical_channel_id, thread_id, thread_title) =
         if let Some((parent_id, _parent_name)) = thread_parent {
@@ -4216,6 +4511,14 @@ pub(in crate::services::discord) async fn handle_text_message(
         inflight_output_path,
         inflight_input_fifo.clone(),
         inflight_offset,
+    );
+    apply_prelaunch_runtime_kind(
+        &mut inflight_state,
+        prelaunch_runtime_kind_for_managed_session(
+            &provider,
+            remote_profile.is_none(),
+            tmux_session_name.is_some(),
+        ),
     );
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
@@ -6053,6 +6356,118 @@ mod session_strategy_lifecycle_tests {
         assert_eq!(
             request.correlation.turn_id.as_deref(),
             Some("discord:1479671301387059200:1501205715878936748")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_inflight_diagnostic_state_uses_persisted_timestamp_format() {
+        let mut inflight = InflightTurnState::new(
+            ProviderKind::Claude,
+            1479671301387059200,
+            Some("adk-cc".to_string()),
+            343742347365974026,
+            1501205715878936748,
+            1501205715878936749,
+            "continue".to_string(),
+            Some("provider-session".to_string()),
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/agentdesk-output.jsonl".to_string()),
+            None,
+            0,
+        );
+
+        assert_eq!(
+            classify_inflight_diagnostic_state(Some(&inflight)),
+            "present"
+        );
+
+        inflight.watcher_owns_live_relay = true;
+        assert_eq!(
+            classify_inflight_diagnostic_state(Some(&inflight)),
+            "watcher_owned"
+        );
+
+        inflight.watcher_owns_live_relay = false;
+        inflight.updated_at = (chrono::Local::now()
+            - chrono::Duration::seconds(
+                crate::services::discord::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64 + 1,
+            ))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+        assert_eq!(classify_inflight_diagnostic_state(Some(&inflight)), "stale");
+
+        inflight.updated_at = "not-a-timestamp".to_string();
+        assert_eq!(
+            classify_inflight_diagnostic_state(Some(&inflight)),
+            "stale_unparseable_updated_at"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_direct_busy_followup_blocks_before_prompt_submit() {
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "Thinking...\nRunning tool".to_string(),
+        };
+
+        let diagnostic = classify_claude_tui_followup_submission(
+            &snapshot,
+            "attached",
+            Some(1479671301387059200),
+            "missing",
+            "AgentDesk-claude-adk-cdx-direct",
+        )
+        .expect("busy direct TUI turn should block follow-up submission");
+
+        assert!(diagnostic.previous_tui_turn_still_running);
+        assert!(!diagnostic.prompt_marker_detected);
+        assert_eq!(diagnostic.watcher_state, "attached");
+        assert_eq!(diagnostic.inflight_state, "missing");
+        assert_eq!(
+            diagnostic.watcher_owner_channel_id,
+            Some(1479671301387059200)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_ready_or_dead_pane_does_not_busy_block_followup() {
+        let ready = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: ">".to_string(),
+        };
+        assert!(
+            classify_claude_tui_followup_submission(
+                &ready,
+                "attached",
+                Some(1),
+                "present",
+                "AgentDesk-claude-ready",
+            )
+            .is_none()
+        );
+
+        let dead = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            tmux_pane_alive: false,
+            capture_available: false,
+            pane_tail: "<capture unavailable>".to_string(),
+        };
+        assert!(
+            classify_claude_tui_followup_submission(
+                &dead,
+                "missing",
+                None,
+                "stale",
+                "AgentDesk-claude-dead",
+            )
+            .is_none()
         );
     }
 
