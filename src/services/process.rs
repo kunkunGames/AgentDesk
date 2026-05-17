@@ -11,9 +11,9 @@ use crate::services::provider::{CancelToken, cancel_requested};
 /// Handle returned by [`spawn_simple_cancel_watcher`].
 ///
 /// Drop or call [`SimpleCancelWatcher::disarm`] once the child has been
-/// reaped to stop the polling thread; otherwise the watcher will exit on its
-/// own at most ~`poll_interval` after the child terminates because the next
-/// `kill_pid_tree` call becomes a no-op.
+/// reaped to stop the polling thread. The watcher also snapshots the child
+/// PID identity at spawn time so a late cancel after `wait_with_output` reaps
+/// the child cannot send SIGTERM to a reused PID.
 pub struct SimpleCancelWatcher {
     armed: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -58,6 +58,7 @@ pub fn spawn_simple_cancel_watcher(
 
     let armed = Arc::new(AtomicBool::new(true));
     let armed_thread = armed.clone();
+    let child_identity = ProcessIdentity::capture(child_pid);
 
     let handle = std::thread::Builder::new()
         .name("simple-cancel-watcher".to_string())
@@ -65,7 +66,9 @@ pub fn spawn_simple_cancel_watcher(
             let poll = Duration::from_millis(100);
             while armed_thread.load(Ordering::Relaxed) {
                 if cancel_requested(Some(token.as_ref())) {
-                    kill_pid_tree(child_pid);
+                    if armed_thread.load(Ordering::Relaxed) {
+                        kill_pid_tree_if_identity_matches(child_pid, child_identity);
+                    }
                     return;
                 }
                 std::thread::sleep(poll);
@@ -208,6 +211,19 @@ impl ProcessIdentity {
         }
         // Case 1: no baseline — defer to legacy behaviour.
         true
+    }
+
+    fn has_baseline(&self) -> bool {
+        self.starttime.is_some() || {
+            #[cfg(target_os = "macos")]
+            {
+                self.macos_lstart_hash.is_some()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        }
     }
 
     /// Test-only inspector for the captured snapshot. Used to verify that
@@ -353,16 +369,50 @@ fn should_escalate_process_group_after_grace(
 #[allow(unsafe_code)]
 pub fn kill_pid_tree(pid: u32) {
     #[cfg(unix)]
-    unsafe {
-        // Capture identity *before* SIGTERM so the snapshot reflects the
-        // intended target. On macOS/Linux this reads start_time (jiffies or
-        // microseconds since boot/epoch) which is monotonic per PID-instance.
+    {
         let identity = ProcessIdentity::capture(pid);
+        let _ = kill_pid_tree_with_identity(pid, identity);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = kill_pid_tree_with_identity(pid);
+    }
+}
 
+#[cfg(unix)]
+fn kill_pid_tree_if_identity_matches(pid: u32, identity: ProcessIdentity) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !identity.has_baseline() {
+        tracing::debug!(
+            pid,
+            "skip kill_pid_tree for simple cancel watcher because child PID identity was not captured"
+        );
+        return false;
+    }
+    if !identity.matches(pid) {
+        tracing::debug!(
+            pid,
+            "skip kill_pid_tree for simple cancel watcher because child PID identity no longer matches"
+        );
+        return false;
+    }
+    kill_pid_tree_with_identity(pid, identity)
+}
+
+#[cfg(not(unix))]
+fn kill_pid_tree_if_identity_matches(pid: u32, _identity: ProcessIdentity) -> bool {
+    kill_pid_tree_with_identity(pid)
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_pid_tree_with_identity(pid: u32, identity: ProcessIdentity) -> bool {
+    unsafe {
         let ret = libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+        let mut signalled = ret == 0;
         if ret != 0 {
             // No process group (single PID fallback path).
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            signalled = libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0;
             std::thread::sleep(std::time::Duration::from_millis(200));
             if identity.matches(pid) {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
@@ -384,13 +434,16 @@ pub fn kill_pid_tree(pid: u32) {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
             }
         }
+        signalled
     }
-    #[cfg(not(unix))]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
+}
+
+#[cfg(not(unix))]
+fn kill_pid_tree_with_identity(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output()
+        .is_ok()
 }
 
 /// Kill a child process and its entire process tree.
@@ -1329,6 +1382,38 @@ mod simple_cancel_watcher_tests {
         assert!(
             !bogus.matches(pid),
             "different starttime for same PID must be treated as PID reuse"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// #2385: SimpleCancelWatcher captures the child identity at spawn time
+    /// and must skip the *initial* SIGTERM when that snapshot no longer
+    /// matches the PID. This pins the PID-reuse guard before any signal is
+    /// sent; #2502 separately covers the post-SIGTERM SIGKILL escalation.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn simple_cancel_identity_guard_skips_initial_sigterm_for_mismatched_pid() {
+        use super::ProcessIdentity;
+
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("sleep should spawn");
+        let pid = child.id();
+
+        let live = ProcessIdentity::capture(pid);
+        let bogus =
+            ProcessIdentity::from_raw_for_test(live.raw_starttime().map(|s| s.wrapping_add(1)));
+
+        assert!(
+            !super::kill_pid_tree_if_identity_matches(pid, bogus),
+            "mismatched identity must skip kill_pid_tree before SIGTERM"
+        );
+        assert!(
+            process_is_running(pid),
+            "mismatched identity path must not signal the live process"
         );
 
         let _ = child.kill();
