@@ -379,10 +379,11 @@ pub(crate) async fn dispatch_delivery_event_reconcile_report_pg(
             stats.kv_notified_checked += row.notified_count.max(0) as usize;
             classify_delivery_kv_guard_mismatches(&mut stats, &mut mismatches, row);
         }
-        cursor = rows
-            .last()
-            .map(|row| row.dispatch_id.clone())
-            .unwrap_or_default();
+        if let Some(last_row) = rows.last() {
+            cursor.clone_from(&last_row.dispatch_id);
+        } else {
+            cursor.clear();
+        }
     }
 
     cursor.clear();
@@ -400,10 +401,11 @@ pub(crate) async fn dispatch_delivery_event_reconcile_report_pg(
             stats.typed_events_checked += 1;
             classify_delivery_typed_guard_mismatches(&mut stats, &mut mismatches, row);
         }
-        cursor = rows
-            .last()
-            .map(|row| row.dispatch_id.clone())
-            .unwrap_or_default();
+        if let Some(last_row) = rows.last() {
+            cursor.clone_from(&last_row.dispatch_id);
+        } else {
+            cursor.clear();
+        }
     }
 
     Ok(DispatchDeliveryEventReconcileReport { stats, mismatches })
