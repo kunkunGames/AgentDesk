@@ -351,8 +351,8 @@ class ManualJsonMappingCheck(unittest.TestCase):
 
 class LimitClampDuplicationCheck(unittest.TestCase):
     def test_flags_when_3_or_more_files_share_signature(self) -> None:
-        same = "let limit = limit.clamp(1, 100);\n"
-        unique = "let limit = limit.clamp(1, 999);\n"
+        same = "let limit = limit.clamp(1, 999);\n"
+        unique = "let limit = limit.clamp(1, 50);\n"
         with _FakeSrcTree(
             {
                 "src/server/routes/a.rs": same,
@@ -383,7 +383,7 @@ class LimitClampDuplicationCheck(unittest.TestCase):
         self.assertEqual(hits, [])
 
     def test_flags_inline_api_limit_shape_even_in_a_single_file(self) -> None:
-        body = "let limit = limit.clamp(1, 100);\n"
+        body = "let limit = limit.clamp(1, 2_000);\n"
         with _FakeSrcTree({"src/server/routes/only.rs": body}):
             hits = list(limit_clamp_duplication.CHECK.runner(set()))
         self.assertEqual(_files(hits), {"src/server/routes/only.rs"})
@@ -392,7 +392,7 @@ class LimitClampDuplicationCheck(unittest.TestCase):
         helper = (
             "// audit-allow: limit_clamp_helper_definition\n"
             "pub fn clamp_api_limit(limit: Option<usize>) -> usize {\n"
-            "    limit.unwrap_or(50).clamp(1, 100)\n"
+            "    limit.unwrap_or(50).clamp(1, 2_000)\n"
             "}\n"
         )
         with _FakeSrcTree({"src/utils/api.rs": helper}):

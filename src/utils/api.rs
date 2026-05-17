@@ -12,7 +12,7 @@ pub(crate) fn clamp_limit(limit: Option<usize>, default: usize, max: usize) -> u
 }
 
 pub(crate) fn clamp_api_limit(limit: Option<usize>) -> usize {
-    clamp_limit(limit, 50, 100)
+    clamp_limit(limit, 50, 2_000)
 }
 
 pub(crate) fn error_response(status: StatusCode, error: impl Display) -> ApiJsonResponse {
@@ -40,7 +40,9 @@ mod tests {
         assert_eq!(clamp_api_limit(None), 50);
         assert_eq!(clamp_api_limit(Some(0)), 1);
         assert_eq!(clamp_api_limit(Some(12)), 12);
-        assert_eq!(clamp_api_limit(Some(250)), 100);
+        assert_eq!(clamp_api_limit(Some(250)), 250);
+        assert_eq!(clamp_api_limit(Some(750)), 750);
+        assert_eq!(clamp_api_limit(Some(2_500)), 2_000);
     }
 
     #[test]
