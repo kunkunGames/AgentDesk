@@ -560,7 +560,11 @@ impl SupervisedWorkerRegistry {
                         .enable_all()
                         .build()
                         .unwrap_or_else(|e| {
-                            tracing::warn!(worker = spec.name, target = spec.target, "Fatal: failed to create policy-tick runtime: {e}");
+                            tracing::warn!(
+                                worker = spec.name,
+                                target = spec.target,
+                                "Fatal: failed to create policy-tick runtime: {e}"
+                            );
                             std::process::exit(1);
                         });
                     loop {
