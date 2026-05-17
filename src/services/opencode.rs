@@ -851,7 +851,7 @@ fn consume_sse(
                         // behaviour. PID is registered via
                         // `register_child_pid` during server startup.
                         if !stop.load(Ordering::Relaxed)
-                            && let Ok(guard) = cancel.child_pid.lock()
+                            && let guard = cancel.child_pid.lock().unwrap_or_else(|e| e.into_inner())
                             && let Some(pid) = *guard
                         {
                             kill_pid_tree(pid);
