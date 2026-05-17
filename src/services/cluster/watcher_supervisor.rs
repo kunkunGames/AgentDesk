@@ -65,12 +65,16 @@ pub struct SupervisorConfig {
     /// Sleep before retrying after a non-lag broadcast error (e.g. registry
     /// dropped). Keeps the loop from spinning if the registry vanishes.
     pub backoff: Duration,
+    /// Maximum time an otherwise-idle supervisor may sit in `recv()` before it
+    /// re-checks the process shutdown flag.
+    pub shutdown_poll: Duration,
 }
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
         Self {
             backoff: Duration::from_secs(1),
+            shutdown_poll: Duration::from_secs(1),
         }
     }
 }
@@ -79,6 +83,7 @@ impl SupervisorConfig {
     pub fn for_test() -> Self {
         Self {
             backoff: Duration::from_millis(1),
+            shutdown_poll: Duration::from_millis(5),
         }
     }
 }
@@ -102,6 +107,10 @@ impl ActiveRelays {
 
     fn insert(&mut self, session: String, handle: StreamRelayHandle) {
         self.by_session.insert(session, handle);
+    }
+
+    fn get(&self, session: &str) -> Option<&StreamRelayHandle> {
+        self.by_session.get(session)
     }
 
     fn remove(&mut self, session: &str) -> Option<StreamRelayHandle> {
@@ -184,9 +193,9 @@ fn spawn_if_absent(
 }
 
 /// Full-reconcile path used at startup and after a `Lagged` broadcast error.
-/// Spawns relays for every entry the registry currently lists; the supervisor
-/// trusts the registry as the source of truth, so any missing entries simply
-/// don't get a relay.
+/// Spawns relays for every entry the registry currently lists, tears down stale
+/// relays, and respawns active relays whose binding no longer matches the
+/// registry snapshot.
 fn full_reconcile(
     active: &mut ActiveRelays,
     registry: &SessionRegistry,
@@ -217,6 +226,26 @@ fn full_reconcile(
         }
     }
     for entry in &snapshot {
+        let session = entry.matched.expected_session_name.as_str();
+        let needs_rebind = active
+            .get(session)
+            .map(|handle| handle.matched() != &entry.matched)
+            .unwrap_or(false);
+        if needs_rebind {
+            producers.deregister(session);
+            if let Some(handle) = active.remove(session) {
+                tracing::info!(
+                    session = %session,
+                    old_channel_id = %handle.matched().channel_id,
+                    new_channel_id = %entry.matched.channel_id,
+                    old_agent_id = %handle.matched().agent_id,
+                    new_agent_id = %entry.matched.agent_id,
+                    provider = entry.matched.provider.as_str(),
+                    "watcher-supervisor: rebinding relay during reconcile"
+                );
+                to_shutdown.push(handle);
+            }
+        }
         spawn_if_absent(active, entry, sink, producers);
     }
     to_shutdown
@@ -292,7 +321,12 @@ pub async fn run_watcher_supervisor_loop_with_registry_and_producers(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
-        match rx.recv().await {
+        let recv_result = tokio::time::timeout(config.shutdown_poll, rx.recv()).await;
+        let change = match recv_result {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+        match change {
             Ok(change) => {
                 let to_shutdown = apply_change(&mut active, &change, &sink, &producers);
                 if let Some(handle) = to_shutdown {
@@ -595,6 +629,52 @@ mod tests {
         if let Some(handle) = prev {
             handle.shutdown().await;
         }
+        for (_session, handle) in active.drain() {
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn full_reconcile_rebinds_active_relay_when_update_was_lagged() {
+        let registry = Arc::new(SessionRegistry::new());
+        let sink: Arc<dyn RelaySink> = Arc::new(CountingSink::default());
+        let mut active = ActiveRelays::default();
+        let producers = RelayProducerRegistry::new();
+
+        let original = matched("c-lag-rebind", ProviderKind::Claude);
+        registry.upsert(original.clone(), Some("mac-mini"));
+        let initial_teardowns = full_reconcile(&mut active, &registry, &sink, &producers);
+        assert!(initial_teardowns.is_empty());
+        assert_eq!(active.len(), 1);
+        assert_eq!(producers.len(), 1);
+
+        let mut rebound = original.clone();
+        rebound.channel_id = "different-channel-after-skipped-update".to_string();
+        rebound.agent_id = "different-agent-after-skipped-update".to_string();
+        registry.upsert(rebound.clone(), Some("mac-mini"));
+
+        let teardowns = full_reconcile(&mut active, &registry, &sink, &producers);
+        assert_eq!(
+            teardowns.len(),
+            1,
+            "full reconcile must tear down stale binding after lagged Updated"
+        );
+        assert_eq!(active.len(), 1);
+        assert_eq!(producers.len(), 1);
+        assert_eq!(
+            active
+                .get(&rebound.expected_session_name)
+                .expect("relay respawned")
+                .matched(),
+            &rebound
+        );
+
+        for handle in teardowns {
+            handle.shutdown().await;
+        }
+        for (_session, handle) in active.drain() {
+            handle.shutdown().await;
+        }
     }
 
     /// E5 (#2412): the supervisor must register a clonable producer for each
@@ -739,5 +819,40 @@ mod tests {
         registry.upsert(m_unblock, Some("mac-mini"));
         let exited = tokio::time::timeout(Duration::from_secs(2), supervisor).await;
         assert!(exited.is_ok(), "supervisor exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn idle_supervisor_observes_shutdown_without_registry_event() {
+        use crate::services::cluster::relay_producer_registry::RelayProducerRegistry;
+
+        let registry = Arc::new(SessionRegistry::new());
+        let producers = Arc::new(RelayProducerRegistry::new());
+        let sink: Arc<CountingSink> = Arc::new(CountingSink::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let registry_clone = registry.clone();
+        let producers_clone = producers.clone();
+        let sink_clone: Arc<dyn RelaySink> = sink.clone();
+        let shutdown_clone = shutdown.clone();
+        let supervisor = tokio::spawn(async move {
+            run_watcher_supervisor_loop_with_registry_and_producers(
+                SupervisorConfig::for_test(),
+                sink_clone,
+                shutdown_clone,
+                registry_clone,
+                producers_clone,
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown.store(true, Ordering::Release);
+
+        let exited = tokio::time::timeout(Duration::from_secs(1), supervisor).await;
+        assert!(
+            exited.is_ok(),
+            "idle supervisor must exit without a registry event unblocking recv()"
+        );
+        assert_eq!(producers.len(), 0);
     }
 }

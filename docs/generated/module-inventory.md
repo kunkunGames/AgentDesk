@@ -348,13 +348,13 @@
 | `services::cluster::intake_router_hook` | `src/services/cluster/intake_router_hook.rs` | 798 |  |
 | `services::cluster::intake_routing` | `src/services/cluster/intake_routing.rs` | 356 |  |
 | `services::cluster::intake_worker` | `src/services/cluster/intake_worker.rs` | 417 |  |
-| `services::cluster::registry_adapter_sink` | `src/services/cluster/registry_adapter_sink.rs` | 348 |  |
+| `services::cluster::registry_adapter_sink` | `src/services/cluster/registry_adapter_sink.rs` | 352 |  |
 | `services::cluster::relay_producer_registry` | `src/services/cluster/relay_producer_registry.rs` | 208 |  |
 | `services::cluster::session_discovery` | `src/services/cluster/session_discovery.rs` | 939 |  |
 | `services::cluster::session_matcher` | `src/services/cluster/session_matcher.rs` | 866 |  |
 | `services::cluster::session_registry` | `src/services/cluster/session_registry.rs` | 572 |  |
-| `services::cluster::stream_relay` | `src/services/cluster/stream_relay.rs` | 691 |  |
-| `services::cluster::watcher_supervisor` | `src/services/cluster/watcher_supervisor.rs` | 743 |  |
+| `services::cluster::stream_relay` | `src/services/cluster/stream_relay.rs` | 874 |  |
+| `services::cluster::watcher_supervisor` | `src/services/cluster/watcher_supervisor.rs` | 858 |  |
 | `services::codex` | `src/services/codex.rs` | 3276 | giant-file |
 | `services::codex_remote_policy` | `src/services/codex_remote_policy.rs` | 49 |  |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 744 |  |
@@ -439,7 +439,7 @@
 | `services::discord::placeholder_live_events::task_panel` | `src/services/discord/placeholder_live_events/task_panel.rs` | 29 |  |
 | `services::discord::placeholder_sweeper` | `src/services/discord/placeholder_sweeper.rs` | 1200 | giant-file |
 | `services::discord::prompt_builder` | `src/services/discord/prompt_builder/mod.rs` | 372 |  |
-| `services::discord::prompt_builder::dispatch_contract` | `src/services/discord/prompt_builder/dispatch_contract.rs` | 491 |  |
+| `services::discord::prompt_builder::dispatch_contract` | `src/services/discord/prompt_builder/dispatch_contract.rs` | 496 |  |
 | `services::discord::prompt_builder::layer_rendering` | `src/services/discord/prompt_builder/layer_rendering.rs` | 187 |  |
 | `services::discord::prompt_builder::manifest` | `src/services/discord/prompt_builder/manifest.rs` | 325 |  |
 | `services::discord::prompt_builder::memory_guidance` | `src/services/discord/prompt_builder/memory_guidance.rs` | 71 |  |
@@ -491,7 +491,7 @@
 | `services::discord::tmux_watcher` | `src/services/discord/tmux_watcher.rs` | 4030 | giant-file |
 | `services::discord::tui_prompt_relay` | `src/services/discord/tui_prompt_relay.rs` | 710 |  |
 | `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 6899 | giant-file |
-| `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2458 | giant-file |
+| `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2474 | giant-file |
 | `services::discord::turn_bridge::context_window` | `src/services/discord/turn_bridge/context_window.rs` | 88 |  |
 | `services::discord::turn_bridge::memory_lifecycle` | `src/services/discord/turn_bridge/memory_lifecycle.rs` | 194 |  |
 | `services::discord::turn_bridge::output_lifecycle` | `src/services/discord/turn_bridge/output_lifecycle.rs` | 78 |  |
@@ -504,7 +504,7 @@
 | `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 1536 | giant-file |
 | `services::discord::turn_bridge::turn_analytics` | `src/services/discord/turn_bridge/turn_analytics.rs` | 150 |  |
 | `services::discord::voice_background_driver` | `src/services/discord/voice_background_driver.rs` | 359 |  |
-| `services::discord::voice_barge_in` | `src/services/discord/voice_barge_in.rs` | 4149 | giant-file |
+| `services::discord::voice_barge_in` | `src/services/discord/voice_barge_in.rs` | 4361 | giant-file |
 | `services::discord::voice_routing` | `src/services/discord/voice_routing.rs` | 160 |  |
 | `services::discord::watchers::lifecycle` | `src/services/discord/watchers/lifecycle.rs` | 1849 | giant-file |
 | `services::discord::watchers::lifecycle_decision` | `src/services/discord/watchers/lifecycle_decision.rs` | 255 |  |
