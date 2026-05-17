@@ -81,6 +81,50 @@ describe("Office manager icon picker accessibility", () => {
     expect(unselectedIcon.getAttribute("aria-pressed")).toBe("false");
   });
 
+  it("renders view color buttons as non-submit toggle buttons with localized labels", async () => {
+    const target = await render(
+      <OfficeManagerView
+        offices={[office]}
+        allAgents={[]}
+        selectedOfficeId={office.id}
+        isKo={false}
+        onChanged={() => {}}
+      />,
+    );
+
+    const selectedColor = queryIconButton(target, "Color #3b82f6");
+    expect(selectedColor.getAttribute("type")).toBe("button");
+    expect(selectedColor.getAttribute("aria-pressed")).toBe("true");
+
+    const unselectedColor = queryIconButton(target, "Color #ef4444");
+    expect(unselectedColor.getAttribute("type")).toBe("button");
+    expect(unselectedColor.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("renders modal create color buttons as non-submit toggle buttons with Korean labels", async () => {
+    const target = await render(
+      <OfficeManagerModal
+        offices={[]}
+        allAgents={[]}
+        isKo
+        onClose={() => {}}
+        onChanged={() => {}}
+      />,
+    );
+
+    const addButton = Array.from(target.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("오피스 추가"),
+    );
+    expect(addButton).toBeDefined();
+
+    await act(async () => {
+      addButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    const defaultColor = queryIconButton(target, "색상 #10b981");
+    expect(defaultColor.getAttribute("type")).toBe("button");
+    expect(defaultColor.getAttribute("aria-pressed")).toBe("true");
+  });
   it("renders modal create icon buttons as non-submit toggle buttons with Korean labels", async () => {
     const target = await render(
       <OfficeManagerModal
