@@ -82,6 +82,7 @@ struct ClaudeTuiBusyFollowupDiagnostic {
     watcher_state: &'static str,
     watcher_owner_channel_id: Option<u64>,
     inflight_state: &'static str,
+    transcript_turn_state: crate::services::tui_turn_state::TuiTurnState,
     pane_tail: String,
 }
 
@@ -97,6 +98,7 @@ impl ClaudeTuiBusyFollowupDiagnostic {
             "watcher_state": self.watcher_state,
             "watcher_owner_channel_id": self.watcher_owner_channel_id,
             "inflight_state": self.inflight_state,
+            "transcript_turn_state": self.transcript_turn_state.as_str(),
             "pane_tail": self.pane_tail,
         })
     }
@@ -139,22 +141,50 @@ fn classify_claude_tui_followup_submission(
     watcher_state: &'static str,
     watcher_owner_channel_id: Option<u64>,
     inflight_state: &'static str,
+    transcript_turn_state: crate::services::tui_turn_state::TuiTurnState,
     tmux_session_name: &str,
 ) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
-    if snapshot.prompt_marker_detected || !snapshot.tmux_pane_alive {
+    if transcript_turn_state == crate::services::tui_turn_state::TuiTurnState::Idle {
         return None;
+    }
+    if snapshot.prompt_marker_detected || !snapshot.tmux_pane_alive {
+        if !transcript_turn_state.is_busy() {
+            return None;
+        }
     }
     Some(ClaudeTuiBusyFollowupDiagnostic {
         tmux_session_name: tmux_session_name.to_string(),
-        prompt_marker_detected: false,
+        prompt_marker_detected: snapshot.prompt_marker_detected,
         previous_tui_turn_still_running: true,
         tmux_pane_alive: snapshot.tmux_pane_alive,
         capture_available: snapshot.capture_available,
         watcher_state,
         watcher_owner_channel_id,
         inflight_state,
+        transcript_turn_state,
         pane_tail: snapshot.pane_tail.clone(),
     })
+}
+
+#[cfg(unix)]
+fn observe_claude_tui_transcript_state_for_session(
+    current_path: Option<&str>,
+    session_id: Option<&str>,
+) -> crate::services::tui_turn_state::TuiTurnState {
+    let (Some(current_path), Some(session_id)) = (current_path, session_id) else {
+        return crate::services::tui_turn_state::TuiTurnState::Unknown;
+    };
+    let Ok(transcript_path) = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+        std::path::Path::new(current_path),
+        session_id,
+        None,
+    ) else {
+        return crate::services::tui_turn_state::TuiTurnState::Unknown;
+    };
+    let provider = ProviderKind::Claude;
+    let probe =
+        crate::services::tui_turn_state::JsonlTurnStateProbe::new(&provider, &transcript_path);
+    crate::services::tui_turn_state::TuiTurnStateProbe::observe(&probe)
 }
 
 #[cfg(unix)]
@@ -164,6 +194,8 @@ fn claude_tui_busy_followup_diagnostic(
     channel_id: serenity::ChannelId,
     tmux_session_name: Option<&str>,
     remote_profile_present: bool,
+    current_path: Option<&str>,
+    session_id: Option<&str>,
 ) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
     if provider != &ProviderKind::Claude || remote_profile_present {
         return None;
@@ -207,11 +239,14 @@ fn claude_tui_busy_followup_diagnostic(
         .unwrap_or(("missing", None));
     let previous_inflight = super::super::inflight::load_inflight_state(provider, channel_id.get());
     let inflight_state = classify_inflight_diagnostic_state(previous_inflight.as_ref());
+    let transcript_turn_state =
+        observe_claude_tui_transcript_state_for_session(current_path, session_id);
     classify_claude_tui_followup_submission(
         &snapshot,
         watcher_state,
         watcher_owner_channel_id,
         inflight_state,
+        transcript_turn_state,
         tmux_session_name,
     )
 }
@@ -5306,6 +5341,8 @@ pub(in crate::services::discord) async fn handle_text_message(
             channel_id,
             tmux_session_name.as_deref(),
             remote_profile.is_some(),
+            Some(&current_path),
+            session_id.as_deref(),
         );
         if let Some(initial_diagnostic) = initial {
             let wait_session_name = initial_diagnostic.tmux_session_name.clone();
@@ -5327,6 +5364,8 @@ pub(in crate::services::discord) async fn handle_text_message(
                 channel_id,
                 tmux_session_name.as_deref(),
                 remote_profile.is_some(),
+                Some(&current_path),
+                session_id.as_deref(),
             );
             // #2416: cancellation may have flipped during the up-to-45s wait
             // (user stop reaction, watchdog, etc.). If it did, do NOT continue
@@ -7403,6 +7442,7 @@ mod session_strategy_lifecycle_tests {
             "attached",
             Some(1479671301387059200),
             "missing",
+            crate::services::tui_turn_state::TuiTurnState::Unknown,
             "AgentDesk-claude-adk-cdx-direct",
         )
         .expect("busy direct TUI turn should block follow-up submission");
@@ -7432,6 +7472,7 @@ mod session_strategy_lifecycle_tests {
                 "attached",
                 Some(1),
                 "present",
+                crate::services::tui_turn_state::TuiTurnState::Unknown,
                 "AgentDesk-claude-ready",
             )
             .is_none()
@@ -7449,9 +7490,60 @@ mod session_strategy_lifecycle_tests {
                 "missing",
                 None,
                 "stale",
+                crate::services::tui_turn_state::TuiTurnState::Unknown,
                 "AgentDesk-claude-dead",
             )
             .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_transcript_idle_overrides_busy_pane_scrape() {
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "old assistant output with no visible prompt marker".to_string(),
+        };
+
+        assert!(
+            classify_claude_tui_followup_submission(
+                &snapshot,
+                "attached",
+                Some(1),
+                "missing",
+                crate::services::tui_turn_state::TuiTurnState::Idle,
+                "AgentDesk-claude-ready",
+            )
+            .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_transcript_busy_can_block_even_if_prompt_marker_is_visible() {
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "Ready for input (type message + Enter)".to_string(),
+        };
+
+        let diagnostic = classify_claude_tui_followup_submission(
+            &snapshot,
+            "attached",
+            Some(1),
+            "present",
+            crate::services::tui_turn_state::TuiTurnState::Streaming,
+            "AgentDesk-claude-streaming",
+        )
+        .expect("transcript streaming state must be authoritative over pane marker");
+
+        assert!(diagnostic.prompt_marker_detected);
+        assert_eq!(
+            diagnostic.transcript_turn_state,
+            crate::services::tui_turn_state::TuiTurnState::Streaming
         );
     }
 
