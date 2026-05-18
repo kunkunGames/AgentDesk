@@ -19,15 +19,15 @@ pub(super) async fn record_decision_tuning(
     card_id: &str,
     decision: &str,
     dispatch_id: Option<&str>,
-) {
+) -> Result<(), String> {
     let Some(pool) = pg_pool else {
         tracing::warn!(
             card_id,
             "[review-tuning] postgres pool unavailable; skipping tuning outcome record"
         );
-        return;
+        return Ok(());
     };
-    record_decision_tuning_pg(pool, card_id, decision, dispatch_id).await;
+    record_decision_tuning_pg(pool, card_id, decision, dispatch_id).await
 }
 
 async fn record_decision_tuning_pg(
@@ -35,7 +35,7 @@ async fn record_decision_tuning_pg(
     card_id: &str,
     decision: &str,
     dispatch_id: Option<&str>,
-) {
+) -> Result<(), String> {
     let (review_round, last_verdict, finding_cats) = match load_review_tuning_context_pg(
         pool, card_id,
     )
@@ -59,7 +59,7 @@ async fn record_decision_tuning_pg(
         _ => "unknown",
     };
 
-    if let Err(error) = record_tuning_outcome_pg(
+    record_tuning_outcome_pg(
         pool,
         card_id,
         dispatch_id,
@@ -70,13 +70,8 @@ async fn record_decision_tuning_pg(
         finding_cats.as_deref(),
     )
     .await
-    {
-        tracing::warn!(
-            card_id,
-            error = %error,
-            "[review-tuning] failed to record postgres tuning outcome"
-        );
-    }
+    .map_err(|error| format!("record postgres tuning outcome for {card_id}: {error}"))?;
+    Ok(())
 }
 
 async fn load_review_tuning_context_pg(
@@ -620,7 +615,8 @@ mod tests {
             "accept",
             Some("dispatch-rd-1"),
         )
-        .await;
+        .await
+        .unwrap();
 
         let row = sqlx::query(
             "SELECT review_round::BIGINT AS review_round, verdict, decision, outcome, finding_categories

@@ -255,6 +255,257 @@ async fn submit_verdict_pass_pg_marks_done_and_clears_review_status() {
 }
 
 #[tokio::test]
+async fn consume_review_decision_pg_cas_rejects_status_changed_after_lookup() {
+    let pg_db = ReviewVerdictPgDatabase::create().await;
+    let pool = pg_db.migrate().await;
+    let db = test_db();
+    seed_review_card_pg(&pool, "review-before-race").await;
+    sqlx::query(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+         title, created_at, updated_at) \
+         VALUES ('rd-race-cas', 'card-1', 'agent-1', 'review-decision', 'pending', \
+                 '[Decision] card-1', NOW(), NOW())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kanban_cards SET latest_dispatch_id = 'rd-race-cas' WHERE id = 'card-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state =
+        AppState::test_state_with_pg(db.clone(), test_engine_with_pg(pool.clone()), pool.clone());
+    let pending =
+        super::decision_route::pending_review_decision_dispatch_id_pg_first(&state, "card-1").await;
+    assert_eq!(pending.as_deref(), Some("rd-race-cas"));
+
+    sqlx::query("UPDATE task_dispatches SET status = 'cancelled' WHERE id = 'rd-race-cas'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let consumed = super::decision_route::consume_review_decision_dispatch_pg_first(
+        &state,
+        "card-1",
+        "rd-race-cas",
+        "accept",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !consumed,
+        "CAS consume must fail after a concurrent terminal status change"
+    );
+
+    let (status, result): (String, Option<String>) =
+        sqlx::query_as("SELECT status, result FROM task_dispatches WHERE id = 'rd-race-cas'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "cancelled");
+    assert_eq!(
+        result, None,
+        "failed CAS must not overwrite the concurrently changed row"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn review_decision_in_progress_completion_resumes_only_after_stale_window_pg() {
+    let pg_db = ReviewVerdictPgDatabase::create().await;
+    let pool = pg_db.migrate().await;
+    let db = test_db();
+    seed_review_card_pg(&pool, "review-before-in-progress").await;
+    let in_progress_result = serde_json::json!({
+        "decision": "accept",
+        "completion_source": "review_decision_api_in_progress",
+        "completion_state": "side_effects_pending",
+    });
+    sqlx::query(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+         title, result, completed_at, created_at, updated_at) \
+         VALUES ('rd-in-progress-proof', 'card-1', 'agent-1', 'review-decision', 'completed', \
+                 '[Decision] card-1', $1, NOW(), NOW(), NOW())",
+    )
+    .bind(in_progress_result.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state =
+        AppState::test_state_with_pg(db.clone(), test_engine_with_pg(pool.clone()), pool.clone());
+
+    let (status, body) = submit_review_decision(
+        State(state.clone()),
+        Json(ReviewDecisionBody {
+            card_id: "card-1".to_string(),
+            decision: "accept".to_string(),
+            comment: None,
+            commit_sha: None,
+            dispatch_id: Some("rd-in-progress-proof".to_string()),
+            out_of_scope: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "side-effect-pending consume must not be treated as already_finalized: {}",
+        body.0
+    );
+    assert_ne!(
+        body.0.get("outcome").and_then(|v| v.as_str()),
+        Some("already_finalized")
+    );
+    assert!(
+        body.0
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|error| error.contains("already in progress")),
+        "fresh side-effect-pending row should block duplicate work: {}",
+        body.0
+    );
+
+    sqlx::query(
+        "UPDATE task_dispatches
+         SET updated_at = NOW() - INTERVAL '5 minutes'
+         WHERE id = 'rd-in-progress-proof'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (status, body) = submit_review_decision(
+        State(state.clone()),
+        Json(ReviewDecisionBody {
+            card_id: "card-1".to_string(),
+            decision: "accept".to_string(),
+            comment: None,
+            commit_sha: None,
+            dispatch_id: Some("rd-in-progress-proof".to_string()),
+            out_of_scope: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "stale side-effect-pending row should resume and finish side effects: {}",
+        body.0
+    );
+    assert_eq!(body.0["ok"], true);
+
+    let (status, body) = submit_review_decision(
+        State(state),
+        Json(ReviewDecisionBody {
+            card_id: "card-1".to_string(),
+            decision: "accept".to_string(),
+            comment: None,
+            commit_sha: None,
+            dispatch_id: Some("rd-in-progress-proof".to_string()),
+            out_of_scope: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "completed side effects should restore idempotent already_finalized: {}",
+        body.0
+    );
+    assert_eq!(body.0["outcome"], "already_finalized");
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
+async fn review_decision_stale_side_effect_resume_claim_is_atomic_pg() {
+    let pg_db = ReviewVerdictPgDatabase::create().await;
+    let pool = pg_db.migrate().await;
+    let db = test_db();
+    seed_review_card_pg(&pool, "review-before-resume-claim").await;
+    let in_progress_result = serde_json::json!({
+        "decision": "accept",
+        "completion_source": "review_decision_api_in_progress",
+        "completion_state": "side_effects_pending",
+    });
+    sqlx::query(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+         title, result, completed_at, created_at, updated_at) \
+         VALUES ('rd-resume-claim', 'card-1', 'agent-1', 'review-decision', 'completed', \
+                 '[Decision] card-1', $1, NOW(), NOW(), NOW() - INTERVAL '5 minutes')",
+    )
+    .bind(in_progress_result.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state =
+        AppState::test_state_with_pg(db.clone(), test_engine_with_pg(pool.clone()), pool.clone());
+    let first_claim = super::decision_route::claim_review_decision_side_effects_resume_pg_first(
+        &state,
+        "card-1",
+        "rd-resume-claim",
+        "accept",
+    )
+    .await
+    .unwrap();
+    assert!(first_claim, "first stale resume must acquire the DB claim");
+
+    let second_claim = super::decision_route::claim_review_decision_side_effects_resume_pg_first(
+        &state,
+        "card-1",
+        "rd-resume-claim",
+        "accept",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !second_claim,
+        "fresh side_effects_resuming row must block a parallel stale retry"
+    );
+
+    let result: String =
+        sqlx::query_scalar("SELECT result FROM task_dispatches WHERE id = 'rd-resume-claim'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let result_json: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(
+        result_json["completion_state"].as_str(),
+        Some("side_effects_resuming")
+    );
+
+    sqlx::query(
+        "UPDATE task_dispatches
+         SET updated_at = NOW() - INTERVAL '5 minutes'
+         WHERE id = 'rd-resume-claim'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let third_claim = super::decision_route::claim_review_decision_side_effects_resume_pg_first(
+        &state,
+        "card-1",
+        "rd-resume-claim",
+        "accept",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !third_claim,
+        "side_effects_resuming rows must not be reclaimed automatically even after they age"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
+}
+
+#[tokio::test]
 #[ignore] // CI: handle_completed_dispatch_followups -> send_review_result_to_primary early-returns without ADK runtime
 async fn submit_verdict_improve_creates_review_decision_dispatch() {
     let db = test_db();
@@ -3027,6 +3278,248 @@ async fn redesign_dispute_oos_idempotent_retry_returns_200_already_finalized() {
         "must indicate idempotent already-finalized response; got: {}",
         body2.0["message"].as_str().unwrap_or("(missing message)")
     );
+}
+
+#[tokio::test]
+async fn redesign_dispute_oos_resume_refuses_missing_lifecycle_on_non_terminal_card() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let result = serde_json::json!({
+        "decision": "dispute",
+        "outcome": "scope_mismatch_closed",
+        "completion_source": "review_decision_api",
+        "review_dispatch_id": "rv-missing-lifecycle",
+        "reviewed_commit": "abc123",
+    })
+    .to_string();
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+             VALUES ('agent-missing-life', 'Missing Life', '801', '802')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, \
+             review_status, created_at, updated_at) \
+             VALUES ('card-missing-life', 'Missing lifecycle', 'review', 'agent-missing-life', \
+                     'stale-review-missing-life', 'suggestion_pending', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO card_review_state (card_id, review_round, state, review_entered_at, updated_at) \
+             VALUES ('card-missing-life', 1, 'reviewing', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+             title, created_at, updated_at) \
+             VALUES ('stale-review-missing-life', 'card-missing-life', 'agent-missing-life', 'review', \
+                     'pending', '[Review R1] stale', datetime('now'), datetime('now'))",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+             title, result, completed_at, created_at, updated_at) \
+             VALUES ('rd-missing-life', 'card-missing-life', 'agent-missing-life', 'review-decision', \
+                     'completed', '[Decision] missing lifecycle', ?1, datetime('now'), datetime('now'), datetime('now'))",
+            sqlite_params![result],
+        )
+        .unwrap();
+    }
+
+    let state = AppState::test_state(db.clone(), engine);
+    let (status_without_flag, body_without_flag) = submit_review_decision(
+        State(state.clone()),
+        Json(ReviewDecisionBody {
+            card_id: "card-missing-life".to_string(),
+            decision: "dispute".to_string(),
+            comment: Some("retry malformed proof without out_of_scope flag".to_string()),
+            commit_sha: None,
+            dispatch_id: Some("rd-missing-life".to_string()),
+            out_of_scope: None,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status_without_flag,
+        StatusCode::CONFLICT,
+        "scope_mismatch_closed proof must not be treated as a normal finalized dispute: {}",
+        body_without_flag.0
+    );
+    assert_ne!(
+        body_without_flag
+            .0
+            .get("outcome")
+            .and_then(|value| value.as_str()),
+        Some("already_finalized")
+    );
+
+    let (status, body) = submit_review_decision(
+        State(state),
+        Json(ReviewDecisionBody {
+            card_id: "card-missing-life".to_string(),
+            decision: "dispute".to_string(),
+            comment: Some("retry malformed proof".to_string()),
+            commit_sha: None,
+            dispatch_id: Some("rd-missing-life".to_string()),
+            out_of_scope: Some(true),
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "non-terminal scope_mismatch resume without lifecycle must refuse: {}",
+        body.0
+    );
+    assert_eq!(body.0["reason"], "missing_lifecycle_generation");
+
+    let conn = db.lock().unwrap();
+    let card_status: String = conn
+        .query_row(
+            "SELECT status FROM kanban_cards WHERE id = 'card-missing-life'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let stale_review_status: String = conn
+        .query_row(
+            "SELECT status FROM task_dispatches WHERE id = 'stale-review-missing-life'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(card_status, "review");
+    assert_eq!(
+        stale_review_status, "pending",
+        "malformed proof must not cancel stale reviews while refusing"
+    );
+}
+
+#[tokio::test]
+async fn redesign_dispute_oos_pg_idempotent_retry_after_terminal_cleanup() {
+    let (repo_dir, commit_sha) = init_test_git_repo_out_of_scope_2341(2356001);
+    let repo_dir_path = repo_dir.path().to_string_lossy().into_owned();
+    let pg_db = ReviewVerdictPgDatabase::create().await;
+    let pool = pg_db.migrate().await;
+    let db = test_db();
+
+    sqlx::query(
+        "INSERT INTO agents (id, name, discord_channel_id, discord_channel_alt) \
+         VALUES ('agent-pg-oos', 'PG OOS', '701', '702')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO kanban_cards (id, title, status, assigned_agent_id, latest_dispatch_id, \
+         review_status, github_issue_number, created_at, updated_at) \
+         VALUES ('card-pg-oos-idem', 'PG OOS Idempotent', 'review', 'agent-pg-oos', \
+                 'rd-pg-oos-idem', 'suggestion_pending', 2356001, NOW(), NOW())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO card_review_state (card_id, review_round, state, review_entered_at, updated_at) \
+         VALUES ('card-pg-oos-idem', 1, 'reviewing', NOW(), NOW())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+         title, context, completed_at, created_at, updated_at) \
+         VALUES ('rv-pg-oos-idem', 'card-pg-oos-idem', 'agent-pg-oos', 'review', 'completed', \
+                 '[Review R1] completed', $1, NOW(), NOW(), NOW())",
+    )
+    .bind(
+        serde_json::json!({
+            "reviewed_commit": commit_sha,
+            "target_repo": repo_dir_path,
+        })
+        .to_string(),
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, \
+         title, context, created_at, updated_at) \
+         VALUES ('rd-pg-oos-idem', 'card-pg-oos-idem', 'agent-pg-oos', 'review-decision', \
+                 'pending', '[Decision] pending', $1, NOW(), NOW())",
+    )
+    .bind(serde_json::json!({"source_review_dispatch_id": "rv-pg-oos-idem"}).to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state =
+        AppState::test_state_with_pg(db.clone(), test_engine_with_pg(pool.clone()), pool.clone());
+    let payload = ReviewDecisionBody {
+        card_id: "card-pg-oos-idem".to_string(),
+        decision: "dispute".to_string(),
+        comment: Some("PG out-of-scope close".to_string()),
+        commit_sha: None,
+        dispatch_id: Some("rd-pg-oos-idem".to_string()),
+        out_of_scope: Some(true),
+    };
+
+    let (status1, body1) =
+        submit_review_decision(State(state.clone()), Json(payload.clone())).await;
+    assert_eq!(
+        status1,
+        StatusCode::OK,
+        "first PG out_of_scope close must succeed: {}",
+        body1.0
+    );
+    assert_eq!(body1.0["outcome"], "scope_mismatch_closed");
+
+    let (card_status_after_first, latest_dispatch_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT status, latest_dispatch_id FROM kanban_cards WHERE id = 'card-pg-oos-idem'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        card_status_after_first, "done",
+        "first close should transition to terminal"
+    );
+    assert_eq!(
+        latest_dispatch_id, None,
+        "terminal cleanup should clear latest_dispatch_id before retry"
+    );
+
+    let (status2, body2) = submit_review_decision(State(state), Json(payload)).await;
+    assert_eq!(
+        status2,
+        StatusCode::OK,
+        "PG retry after terminal cleanup must be idempotent: {}",
+        body2.0
+    );
+    assert_eq!(body2.0["outcome"], "scope_mismatch_closed");
+    assert_eq!(body2.0["resumed"], serde_json::Value::Bool(false));
+
+    let rd_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_dispatches \
+         WHERE kanban_card_id = 'card-pg-oos-idem' AND dispatch_type = 'review-decision'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rd_count, 1,
+        "idempotent retry must not create a new decision dispatch"
+    );
+
+    pool.close().await;
+    pg_db.drop().await;
 }
 
 /// REGRESSION: in-scope dispute (no out_of_scope flag) must take the legacy
