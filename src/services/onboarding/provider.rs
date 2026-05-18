@@ -145,13 +145,15 @@ pub async fn generate_prompt(body: GeneratePromptBody) -> (StatusCode, Json<serd
         body.name, body.description
     );
 
-    let result = tokio::time::timeout(
+    let result = provider_exec::execute_simple_with_timeout(
+        provider,
+        instruction,
         std::time::Duration::from_secs(30),
-        provider_exec::execute_simple(provider, instruction),
+        "onboarding_generate_prompt".to_string(),
     )
     .await;
 
-    if let Ok(Ok(text)) = result {
+    if let Ok(text) = result {
         if !text.trim().is_empty() {
             return (
                 StatusCode::OK,

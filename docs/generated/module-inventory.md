@@ -565,7 +565,7 @@
 | `services::observability::worker` | `src/services/observability/worker.rs` | 289 |  |
 | `services::onboarding` | `src/services/onboarding/mod.rs` | 4946 | giant-file |
 | `services::onboarding::channel` | `src/services/onboarding/channel.rs` | 214 |  |
-| `services::onboarding::provider` | `src/services/onboarding/provider.rs` | 181 |  |
+| `services::onboarding::provider` | `src/services/onboarding/provider.rs` | 183 |  |
 | `services::opencode` | `src/services/opencode.rs` | 2731 | giant-file |
 | `services::pipeline_override` | `src/services/pipeline_override.rs` | 608 |  |
 | `services::pipeline_routes` | `src/services/pipeline_routes.rs` | 644 |  |
