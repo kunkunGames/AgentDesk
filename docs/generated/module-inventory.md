@@ -550,8 +550,8 @@
 | `services::memory::runtime_state` | `src/services/memory/runtime_state.rs` | 474 |  |
 | `services::message_outbox` | `src/services/message_outbox.rs` | 729 |  |
 | `services::observability` | `src/services/observability/mod.rs` | 1158 | giant-file |
-| `services::observability::emit` | `src/services/observability/emit.rs` | 477 |  |
-| `services::observability::events` | `src/services/observability/events.rs` | 399 |  |
+| `services::observability::emit` | `src/services/observability/emit.rs` | 667 |  |
+| `services::observability::events` | `src/services/observability/events.rs` | 410 |  |
 | `services::observability::helpers` | `src/services/observability/helpers.rs` | 188 |  |
 | `services::observability::metrics` | `src/services/observability/metrics.rs` | 391 |  |
 | `services::observability::pg_io` | `src/services/observability/pg_io.rs` | 1312 | giant-file |

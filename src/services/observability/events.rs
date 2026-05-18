@@ -188,6 +188,17 @@ pub fn record(event: StructuredEvent) {
     global().push(event);
 }
 
+pub(super) fn record_emitted(
+    event_type: &str,
+    channel_id: Option<u64>,
+    provider: Option<&str>,
+    payload: Value,
+) {
+    record(StructuredEvent::new(
+        event_type, channel_id, provider, payload,
+    ));
+}
+
 pub fn record_simple(
     event_type: &str,
     channel_id: Option<u64>,
