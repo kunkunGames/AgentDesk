@@ -454,7 +454,7 @@
 | `services::discord::restart_ctrl` | `src/services/discord/restart_ctrl.rs` | 113 |  |
 | `services::discord::restart_mode` | `src/services/discord/restart_mode.rs` | 32 |  |
 | `services::discord::restart_report` | `src/services/discord/restart_report.rs` | 499 |  |
-| `services::discord::role_map` | `src/services/discord/role_map.rs` | 860 |  |
+| `services::discord::role_map` | `src/services/discord/role_map.rs` | 857 |  |
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 28 |  |
 | `services::discord::router::authorization` | `src/services/discord/router/authorization.rs` | 48 |  |
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
