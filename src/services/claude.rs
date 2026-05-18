@@ -2241,7 +2241,12 @@ fn read_claude_tui_transcript_until_done(
                 &hook_rx_for_probe,
                 &expected_session_id,
                 hook_events_after,
-                || crate::services::provider::tmux_session_ready_for_input(&tmux_name_ready),
+                || {
+                    crate::services::provider::tmux_session_ready_for_input(
+                        &tmux_name_ready,
+                        &ProviderKind::Claude,
+                    )
+                },
             )
         },
     );
@@ -2783,7 +2788,7 @@ fn send_followup_to_tmux(
         start_offset,
         sender.clone(),
         cancel_token,
-        SessionProbe::tmux(tmux_session_name.to_string()),
+        SessionProbe::tmux(tmux_session_name.to_string(), ProviderKind::Claude),
     )?;
 
     let outcome = classify_followup_result(
@@ -3773,7 +3778,12 @@ mod tests {
     #[cfg(unix)]
     fn test_tmux_capture_detects_ready_prompt() {
         let capture = "...\n▶ Ready for input (type message + Enter)\n";
-        assert!(crate::services::provider::tmux_capture_indicates_ready_for_input(capture));
+        assert!(
+            crate::services::provider::tmux_capture_indicates_ready_for_input(
+                capture,
+                &ProviderKind::Claude
+            )
+        );
     }
 
     #[test]
@@ -3787,14 +3797,24 @@ previous output\n\
   🤖 Opus(H) │ ██░░░░░░░░ │ 24%\n\
   📁 agentdesk (main*) │ Todos: -\n\
   ⏵⏵ bypass permissions on";
-        assert!(crate::services::provider::tmux_capture_indicates_ready_for_input(capture));
+        assert!(
+            crate::services::provider::tmux_capture_indicates_ready_for_input(
+                capture,
+                &ProviderKind::Claude
+            )
+        );
     }
 
     #[test]
     #[cfg(unix)]
     fn test_tmux_capture_ignores_non_ready_prompt() {
         let capture = "Claude is still working...\n";
-        assert!(!crate::services::provider::tmux_capture_indicates_ready_for_input(capture));
+        assert!(
+            !crate::services::provider::tmux_capture_indicates_ready_for_input(
+                capture,
+                &ProviderKind::Claude
+            )
+        );
     }
 
     // ========== parse_stream_message thinking tests ==========

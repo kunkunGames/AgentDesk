@@ -215,11 +215,10 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
     let session_for_probe = tmux_session_name.to_string();
     let provider_for_probe = provider.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        let ready_for_input = if matches!(provider_for_probe, ProviderKind::Claude) {
-            crate::services::provider::tmux_session_ready_for_input(&session_for_probe)
-        } else {
-            false
-        };
+        let ready_for_input = crate::services::provider::tmux_session_ready_for_input(
+            &session_for_probe,
+            &provider_for_probe,
+        );
         let provider_pid =
             provider_cli_pid_in_tmux(&session_for_probe, &provider_for_probe, tracked_child_pid);
         (ready_for_input, provider_pid)
@@ -417,8 +416,10 @@ async fn hard_stop_unresponsive_provider_cli_turn(
     let probe = tokio::task::spawn_blocking(move || {
         let pane_pid = crate::services::platform::tmux::pane_pid(&session_for_probe);
         let session_alive = pane_pid.is_some();
-        let ready_for_input =
-            crate::services::provider::tmux_session_ready_for_input(&session_for_probe);
+        let ready_for_input = crate::services::provider::tmux_session_ready_for_input(
+            &session_for_probe,
+            &provider_for_probe,
+        );
         let current_provider_pid =
             provider_cli_pid_in_tmux(&session_for_probe, &provider_for_probe, tracked_child_pid);
         (
@@ -481,11 +482,10 @@ fn hard_stop_pid_for_unresponsive_provider(
     // TUI mode regression guard: when the provider CLI is the tmux pane
     // foreground itself, hard-killing it tears down the pane — same blast
     // radius as `CleanupSession`, which `PreserveSession*` policies forbid.
-    // After a successful SIGINT, claude TUI returns to its prompt `❯` but
-    // `tmux_session_ready_for_input` only matches the legacy wrapper text
-    // `"Ready for input (type message + Enter)"`, so it would report
-    // `ready_for_input=false` and reach this point. Skip the kill instead;
-    // the SIGINT already returned the TUI to its idle prompt.
+    // If the provider CLI is still the pane foreground, killing it would
+    // tear down a reusable TUI session. Skip the kill; either readiness
+    // was missed by the visual probe or the next intake/recovery pass can
+    // reconcile the preserved session.
     if Some(candidate) == pane_pid {
         return None;
     }

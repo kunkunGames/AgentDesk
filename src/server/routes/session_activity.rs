@@ -59,7 +59,14 @@ impl SessionActivityResolver {
                 return *cached;
             }
             #[cfg(unix)]
-            let ready = crate::services::provider::tmux_session_ready_for_input(tmux_name);
+            let ready =
+                crate::services::provider::parse_provider_and_channel_from_tmux_name(tmux_name)
+                    .map(|(provider, _)| {
+                        crate::services::provider::tmux_session_ready_for_input(
+                            tmux_name, &provider,
+                        )
+                    })
+                    .unwrap_or(false);
             #[cfg(not(unix))]
             let ready = false; // tmux not available on Windows
             ready_cache.insert(tmux_name.to_string(), ready);

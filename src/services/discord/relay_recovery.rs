@@ -533,7 +533,7 @@ async fn apply_relay_recovery_decision(
         }
         RelayRecoveryActionKind::ReattachWatcher => {
             if let Some(tmux_session) = decision.affected.tmux_session.as_deref()
-                && crate::services::provider::tmux_session_ready_for_input(tmux_session)
+                && crate::services::provider::tmux_session_ready_for_input(tmux_session, provider)
                 && super::inflight::inflight_state_allows_idle_tmux_repair(
                     provider,
                     decision.channel_id,

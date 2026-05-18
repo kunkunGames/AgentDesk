@@ -1220,7 +1220,7 @@ fn execute_streaming_local_tmux(
         0,
         sender.clone(),
         cancel_token,
-        SessionProbe::tmux(tmux_session_name.to_string()),
+        SessionProbe::tmux(tmux_session_name.to_string(), ProviderKind::Qwen),
     )?;
 
     match read_result {
@@ -1289,7 +1289,7 @@ fn send_followup_to_tmux(
         start_offset,
         sender.clone(),
         cancel_token,
-        SessionProbe::tmux(tmux_session_name.to_string()),
+        SessionProbe::tmux(tmux_session_name.to_string(), ProviderKind::Qwen),
     ) {
         Ok(read_result) => read_result,
         Err(failure) => {
@@ -1298,7 +1298,10 @@ fn send_followup_to_tmux(
             let input_exists = std::path::Path::new(input_fifo_path).exists();
             let session_alive = tmux_session_has_live_pane(tmux_session_name);
             let ready_for_input = session_alive
-                && crate::services::provider::tmux_session_ready_for_input(tmux_session_name);
+                && crate::services::provider::tmux_session_ready_for_input(
+                    tmux_session_name,
+                    &ProviderKind::Qwen,
+                );
 
             if let Some(fallback) = tmux_followup_fallback_after_read_error(
                 start_offset,

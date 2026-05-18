@@ -23,6 +23,15 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
         .any(|l| l.contains(CLAUDE_TUI_READY_BANNER) || tmux_line_is_claude_tui_ready_prompt(l))
 }
 
+pub(crate) fn tmux_capture_indicates_generic_ready_banner(capture: &str) -> bool {
+    capture
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(CLAUDE_TUI_READY_SCAN_LINES)
+        .any(|l| l.contains(CLAUDE_TUI_READY_BANNER))
+}
+
 /// Format a tmux session name as an exact-match target.
 ///
 /// tmux `-t` flags perform prefix matching by default: `-t foo` matches

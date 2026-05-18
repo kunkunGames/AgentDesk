@@ -2624,7 +2624,7 @@ pub(super) async fn restore_inflight_turns(
         let tmux_ready_without_new_output = tmux_session_name.as_deref().map_or(false, |name| {
             !output_has_new_bytes
                 && recovery_has_post_work_ready_evidence(&state)
-                && crate::services::provider::tmux_session_ready_for_input(name)
+                && crate::services::provider::tmux_session_ready_for_input(name, provider)
         });
 
         if matches!(
@@ -3217,13 +3217,17 @@ pub(super) async fn restore_inflight_turns(
         let recovery_session_id = state.session_id.clone();
         let runtime_kind_for_reader = runtime_kind;
         let retry_channel_id = channel_id.get();
+        let provider_for_reader = provider.clone();
         std::thread::spawn(move || {
             match crate::services::session_backend::read_output_file_until_result(
                 &output_for_reader,
                 start_offset,
                 tx.clone(),
                 Some(cancel_for_reader),
-                crate::services::provider::SessionProbe::tmux(tmux_for_reader.clone()),
+                crate::services::provider::SessionProbe::tmux(
+                    tmux_for_reader.clone(),
+                    provider_for_reader,
+                ),
             ) {
                 Ok(ReadOutputResult::Completed { offset })
                 | Ok(ReadOutputResult::Cancelled { offset }) => {

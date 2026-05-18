@@ -550,11 +550,11 @@ pub async fn clear_idle_tmux_stale_turn(
     tmux_session: &str,
     stop_source: &'static str,
 ) -> Option<IdleTmuxStaleTurnRepairResult> {
-    if !crate::services::provider::tmux_session_ready_for_input(tmux_session) {
+    let provider = ProviderKind::from_str(provider_name)?;
+    if !crate::services::provider::tmux_session_ready_for_input(tmux_session, &provider) {
         return None;
     }
 
-    let provider = ProviderKind::from_str(provider_name)?;
     let shared = shared_for_provider(registry, &provider).await?;
     let channel_id = ChannelId::new(channel_id);
     let finish = discord::mailbox_finish_turn(&shared, &provider, channel_id).await;

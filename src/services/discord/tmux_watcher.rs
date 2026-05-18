@@ -642,10 +642,14 @@ pub(in crate::services::discord) async fn run_tui_completion_gate(
     let started_at = tokio::time::Instant::now();
     loop {
         let session_name = tmux_session_name.to_string();
+        let provider_for_probe = provider.clone();
         let ready = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             tokio::task::spawn_blocking(move || {
-                crate::services::provider::tmux_session_ready_for_input(&session_name)
+                crate::services::provider::tmux_session_ready_for_input(
+                    &session_name,
+                    &provider_for_probe,
+                )
             }),
         )
         .await
@@ -1501,9 +1505,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     std::time::Duration::from_secs(5),
                                     tokio::task::spawn_blocking({
                                         let name = tmux_session_name.clone();
+                                        let provider = watcher_provider.clone();
                                         move || {
                                             crate::services::provider::tmux_session_ready_for_input(
-                                                &name,
+                                                &name, &provider,
                                             )
                                         }
                                     }),
