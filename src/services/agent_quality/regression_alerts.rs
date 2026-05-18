@@ -208,14 +208,23 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             .try_get("agent_id")
             .map_err(|error| anyhow!("decode agent_id: {error}"))?;
 
-        let turn_7d: Option<f64> =
-            explicit_decode_fallback(row.try_get("turn_success_rate_7d"), None, "turn_success_rate_7d")?;
-        let turn_30d: Option<f64> =
-            explicit_decode_fallback(row.try_get("turn_success_rate_30d"), None, "turn_success_rate_30d")?;
+        let turn_7d: Option<f64> = explicit_decode_fallback(
+            row.try_get("turn_success_rate_7d"),
+            None,
+            "turn_success_rate_7d",
+        )?;
+        let turn_30d: Option<f64> = explicit_decode_fallback(
+            row.try_get("turn_success_rate_30d"),
+            None,
+            "turn_success_rate_30d",
+        )?;
         let turn_s7: i64 =
             explicit_decode_fallback(row.try_get("turn_sample_size_7d"), 0, "turn_sample_size_7d")?;
-        let turn_s30: i64 =
-            explicit_decode_fallback(row.try_get("turn_sample_size_30d"), 0, "turn_sample_size_30d")?;
+        let turn_s30: i64 = explicit_decode_fallback(
+            row.try_get("turn_sample_size_30d"),
+            0,
+            "turn_sample_size_30d",
+        )?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::TurnSuccessRate,
@@ -227,14 +236,26 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             out.push(reg);
         }
 
-        let review_7d: Option<f64> =
-            explicit_decode_fallback(row.try_get("review_pass_rate_7d"), None, "review_pass_rate_7d")?;
-        let review_30d: Option<f64> =
-            explicit_decode_fallback(row.try_get("review_pass_rate_30d"), None, "review_pass_rate_30d")?;
-        let review_s7: i64 =
-            explicit_decode_fallback(row.try_get("review_sample_size_7d"), 0, "review_sample_size_7d")?;
-        let review_s30: i64 =
-            explicit_decode_fallback(row.try_get("review_sample_size_30d"), 0, "review_sample_size_30d")?;
+        let review_7d: Option<f64> = explicit_decode_fallback(
+            row.try_get("review_pass_rate_7d"),
+            None,
+            "review_pass_rate_7d",
+        )?;
+        let review_30d: Option<f64> = explicit_decode_fallback(
+            row.try_get("review_pass_rate_30d"),
+            None,
+            "review_pass_rate_30d",
+        )?;
+        let review_s7: i64 = explicit_decode_fallback(
+            row.try_get("review_sample_size_7d"),
+            0,
+            "review_sample_size_7d",
+        )?;
+        let review_s30: i64 = explicit_decode_fallback(
+            row.try_get("review_sample_size_30d"),
+            0,
+            "review_sample_size_30d",
+        )?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::ReviewPassRate,
