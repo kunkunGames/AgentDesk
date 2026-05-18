@@ -65,6 +65,9 @@
 //! and after each sleep so a `/stop` arriving while the TUI is hung
 //! (live pane, never-arriving composer) crosses the boundary inside
 //! ~one wait-interval rather than waiting out the 45s/120s budget.
+//! Prompt delivery also checks the same token between tmux input
+//! actions, so a long literal prompt split into multiple chunks can
+//! be interrupted before the next chunk is sent.
 //! Cancellation returns a distinct
 //! [`PROMPT_READY_CANCELLED_ERROR`] string so the caller can release
 //! the turn without recreating the session — this matches the cancel
@@ -634,7 +637,7 @@ fn send_prompt_with_readiness(
         session_name,
         prompt,
     );
-    match run_actions(session_name, &actions) {
+    match run_actions(session_name, &actions, cancel_token.map(Arc::as_ref)) {
         Ok(()) => Ok(()),
         Err(error) => {
             crate::services::tui_prompt_dedupe::remove_discord_originated_prompt(
@@ -648,31 +651,86 @@ fn send_prompt_with_readiness(
 }
 
 pub fn send_cancel(session_name: &str) -> Result<(), String> {
-    run_actions(session_name, &plan_cancel())
+    run_actions(session_name, &plan_cancel(), None)
 }
 
-fn run_actions(session_name: &str, actions: &[TuiInputAction]) -> Result<(), String> {
+trait TuiActionExecutor {
+    fn send_literal(&mut self, session_name: &str, text: &str) -> Result<Output, String>;
+    fn load_buffer(&mut self, buffer_name: &str, text: &str) -> Result<Output, String>;
+    fn paste_buffer(
+        &mut self,
+        session_name: &str,
+        buffer_name: &str,
+        delete: bool,
+    ) -> Result<Output, String>;
+    fn send_keys(&mut self, session_name: &str, keys: &[&str]) -> Result<Output, String>;
+}
+
+struct TmuxTuiActionExecutor;
+
+impl TuiActionExecutor for TmuxTuiActionExecutor {
+    fn send_literal(&mut self, session_name: &str, text: &str) -> Result<Output, String> {
+        crate::services::platform::tmux::send_literal(session_name, text)
+    }
+
+    fn load_buffer(&mut self, buffer_name: &str, text: &str) -> Result<Output, String> {
+        crate::services::platform::tmux::load_buffer(buffer_name, text)
+    }
+
+    fn paste_buffer(
+        &mut self,
+        session_name: &str,
+        buffer_name: &str,
+        delete: bool,
+    ) -> Result<Output, String> {
+        crate::services::platform::tmux::paste_buffer(session_name, buffer_name, delete)
+    }
+
+    fn send_keys(&mut self, session_name: &str, keys: &[&str]) -> Result<Output, String> {
+        crate::services::platform::tmux::send_keys(session_name, keys)
+    }
+}
+
+fn run_actions(
+    session_name: &str,
+    actions: &[TuiInputAction],
+    cancel_token: Option<&CancelToken>,
+) -> Result<(), String> {
+    let mut executor = TmuxTuiActionExecutor;
+    run_actions_with_executor(session_name, actions, cancel_token, &mut executor)
+}
+
+fn run_actions_with_executor(
+    session_name: &str,
+    actions: &[TuiInputAction],
+    cancel_token: Option<&CancelToken>,
+    executor: &mut impl TuiActionExecutor,
+) -> Result<(), String> {
     for action in actions {
+        check_prompt_cancel(cancel_token)?;
         let output = match action {
-            TuiInputAction::Literal(text) => {
-                crate::services::platform::tmux::send_literal(session_name, text)?
-            }
+            TuiInputAction::Literal(text) => executor.send_literal(session_name, text)?,
             TuiInputAction::PasteBuffer(text) => {
                 let buffer_name = format!("agentdesk-codex-tui-input-{}", uuid::Uuid::new_v4());
-                let load_output = crate::services::platform::tmux::load_buffer(&buffer_name, text)?;
+                let load_output = executor.load_buffer(&buffer_name, text)?;
                 ensure_tmux_success(load_output, action)?;
-                crate::services::platform::tmux::paste_buffer(session_name, &buffer_name, true)?
+                check_prompt_cancel(cancel_token)?;
+                executor.paste_buffer(session_name, &buffer_name, true)?
             }
-            TuiInputAction::Enter => {
-                crate::services::platform::tmux::send_keys(session_name, &["Enter"])?
-            }
-            TuiInputAction::Escape => {
-                crate::services::platform::tmux::send_keys(session_name, &["Escape"])?
-            }
+            TuiInputAction::Enter => executor.send_keys(session_name, &["Enter"])?,
+            TuiInputAction::Escape => executor.send_keys(session_name, &["Escape"])?,
         };
         ensure_tmux_success(output, action)?;
     }
     Ok(())
+}
+
+fn check_prompt_cancel(cancel_token: Option<&CancelToken>) -> Result<(), String> {
+    if cancel_requested(cancel_token) {
+        Err(PROMPT_READY_CANCELLED_ERROR.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_tmux_success(output: Output, action: &TuiInputAction) -> Result<(), String> {
@@ -885,6 +943,80 @@ fn split_literal_chunks(input: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    use std::sync::atomic::Ordering;
+
+    #[cfg(unix)]
+    fn successful_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn successful_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    fn successful_tmux_output() -> Output {
+        Output {
+            status: successful_exit_status(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: Vec<String>,
+        cancel_after_calls: Option<usize>,
+        cancel_token: Option<Arc<CancelToken>>,
+    }
+
+    impl RecordingExecutor {
+        fn maybe_cancel(&self) {
+            if self
+                .cancel_after_calls
+                .is_some_and(|cancel_after| self.calls.len() >= cancel_after)
+            {
+                if let Some(token) = &self.cancel_token {
+                    token.cancelled.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    impl TuiActionExecutor for RecordingExecutor {
+        fn send_literal(&mut self, _session_name: &str, text: &str) -> Result<Output, String> {
+            self.calls.push(format!("literal:{text}"));
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+
+        fn load_buffer(&mut self, _buffer_name: &str, text: &str) -> Result<Output, String> {
+            self.calls.push(format!("load-buffer:{text}"));
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+
+        fn paste_buffer(
+            &mut self,
+            _session_name: &str,
+            _buffer_name: &str,
+            _delete: bool,
+        ) -> Result<Output, String> {
+            self.calls.push("paste-buffer".to_string());
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+
+        fn send_keys(&mut self, _session_name: &str, keys: &[&str]) -> Result<Output, String> {
+            self.calls.push(format!("keys:{}", keys.join("+")));
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+    }
 
     // ------------------------------------------------------------------
     // plan_prompt_submit
@@ -956,6 +1088,73 @@ mod tests {
     #[test]
     fn cancel_uses_escape() {
         assert_eq!(plan_cancel(), vec![TuiInputAction::Escape]);
+    }
+
+    #[test]
+    fn run_actions_stops_before_first_tmux_action_when_token_is_pre_cancelled() {
+        let token = Arc::new(CancelToken::new());
+        token.cancelled.store(true, Ordering::Relaxed);
+        let mut executor = RecordingExecutor::default();
+
+        let error = run_actions_with_executor(
+            "agentdesk-codex-tui-input-test",
+            &[TuiInputAction::Escape],
+            Some(&token),
+            &mut executor,
+        )
+        .expect_err("pre-cancelled token must stop before tmux send");
+
+        assert_eq!(error, PROMPT_READY_CANCELLED_ERROR);
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn run_actions_stops_between_literal_chunks_when_token_flips() {
+        let token = Arc::new(CancelToken::new());
+        let mut executor = RecordingExecutor {
+            cancel_after_calls: Some(1),
+            cancel_token: Some(token.clone()),
+            ..RecordingExecutor::default()
+        };
+
+        let error = run_actions_with_executor(
+            "agentdesk-codex-tui-input-test",
+            &[
+                TuiInputAction::Literal("first".to_string()),
+                TuiInputAction::Literal("second".to_string()),
+                TuiInputAction::Enter,
+            ],
+            Some(&token),
+            &mut executor,
+        )
+        .expect_err("cancelled token must stop before next literal chunk");
+
+        assert_eq!(error, PROMPT_READY_CANCELLED_ERROR);
+        assert_eq!(executor.calls, vec!["literal:first"]);
+    }
+
+    #[test]
+    fn run_actions_stops_after_load_buffer_before_paste_when_token_flips() {
+        let token = Arc::new(CancelToken::new());
+        let mut executor = RecordingExecutor {
+            cancel_after_calls: Some(1),
+            cancel_token: Some(token.clone()),
+            ..RecordingExecutor::default()
+        };
+
+        let error = run_actions_with_executor(
+            "agentdesk-codex-tui-input-test",
+            &[
+                TuiInputAction::PasteBuffer("multi\nline".to_string()),
+                TuiInputAction::Enter,
+            ],
+            Some(&token),
+            &mut executor,
+        )
+        .expect_err("cancelled token must stop before paste-buffer");
+
+        assert_eq!(error, PROMPT_READY_CANCELLED_ERROR);
+        assert_eq!(executor.calls, vec!["load-buffer:multi\nline"]);
     }
 
     // ------------------------------------------------------------------
