@@ -500,7 +500,7 @@
 | `services::discord::turn_bridge::skill_usage` | `src/services/discord/turn_bridge/skill_usage.rs` | 145 |  |
 | `services::discord::turn_bridge::stale_resume` | `src/services/discord/turn_bridge/stale_resume.rs` | 295 |  |
 | `services::discord::turn_bridge::terminal_delivery` | `src/services/discord/turn_bridge/terminal_delivery.rs` | 202 |  |
-| `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 1537 | giant-file |
+| `services::discord::turn_bridge::tmux_runtime` | `src/services/discord/turn_bridge/tmux_runtime.rs` | 1562 | giant-file |
 | `services::discord::turn_bridge::turn_analytics` | `src/services/discord/turn_bridge/turn_analytics.rs` | 150 |  |
 | `services::discord::voice_background_driver` | `src/services/discord/voice_background_driver.rs` | 359 |  |
 | `services::discord::voice_barge_in` | `src/services/discord/voice_barge_in.rs` | 4149 | giant-file |
@@ -565,7 +565,7 @@
 | `services::onboarding` | `src/services/onboarding/mod.rs` | 4945 | giant-file |
 | `services::onboarding::channel` | `src/services/onboarding/channel.rs` | 214 |  |
 | `services::onboarding::provider` | `src/services/onboarding/provider.rs` | 181 |  |
-| `services::opencode` | `src/services/opencode.rs` | 2731 | giant-file |
+| `services::opencode` | `src/services/opencode.rs` | 2732 | giant-file |
 | `services::pipeline_override` | `src/services/pipeline_override.rs` | 608 |  |
 | `services::pipeline_routes` | `src/services/pipeline_routes.rs` | 644 |  |
 | `services::platform` | `src/services/platform/mod.rs` | 25 |  |
