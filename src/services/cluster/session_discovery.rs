@@ -56,7 +56,9 @@ use super::session_matcher::{
 };
 use super::session_registry::{RegistryChange, SessionRegistry, global_session_registry};
 use crate::services::platform::tmux::{EnumeratedSession, list_sessions_with_pane_command};
-use crate::services::provider::ProviderKind;
+use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
+use crate::services::provider_cli::paths::launch_artifacts_dir;
+use crate::services::provider_cli::registry::LaunchArtifact;
 
 /// Knobs for the discovery loop. Production callers use [`Self::default`].
 /// Kept as a struct (rather than a bare `Duration`) so future tuning (jitter,
@@ -104,23 +106,37 @@ pub fn request_discovery_tick() {
 pub async fn build_channel_directory_from_pg(
     pool: &PgPool,
 ) -> Result<ChannelDirectory, sqlx::Error> {
-    // load_graceful() does sync filesystem IO + yaml parse — push to a blocking
-    // thread so we don't stall the tokio runtime on every discovery tick.
-    let name_map = tokio::task::spawn_blocking(build_yaml_channel_name_map)
+    // load_graceful() and provider-cli launch artifact reads do sync filesystem
+    // IO + parse work. Push them to a blocking thread so discovery cannot stall
+    // the tokio runtime and delay intake-worker transaction cleanup.
+    let fs_snapshot = tokio::task::spawn_blocking(build_discovery_fs_snapshot)
         .await
         .unwrap_or_default();
-    build_channel_directory_from_pg_with_config(pool, name_map).await
+    build_channel_directory_from_pg_with_config(pool, fs_snapshot).await
 }
 
-/// Lookup table: `(agent_id, provider, channel_id) → channel_name`. Built once
-/// from `agentdesk.yaml` so discovery can resolve the tmux session segment
-/// (`channels.<provider>.name`) that the dispatch path uses to construct live
-/// tmux session names.
+/// Lookup table: `(agent_id, provider, channel_id) → channel names/aliases`.
+/// Built once from `agentdesk.yaml` so discovery can resolve the tmux session
+/// segment (`channels.<provider>.name` or aliases) that the dispatch path uses
+/// to construct live tmux session names.
 ///
 /// Without this, the directory keys collapse to `(provider, channel_id)` and
 /// fail to match `AgentDesk-{provider}-{channel_name}` sessions, leaving the
 /// post-restart adoption path silently broken (issue #2465).
-pub type ChannelNameMap = std::collections::HashMap<(String, ProviderKind, String), String>;
+pub type ChannelNameMap = std::collections::HashMap<(String, ProviderKind, String), Vec<String>>;
+
+#[derive(Default)]
+struct DiscoveryFsSnapshot {
+    name_map: ChannelNameMap,
+    launch_artifacts: Vec<LaunchArtifact>,
+}
+
+fn build_discovery_fs_snapshot() -> DiscoveryFsSnapshot {
+    DiscoveryFsSnapshot {
+        name_map: build_yaml_channel_name_map(),
+        launch_artifacts: load_provider_cli_launch_artifacts_for_discovery(),
+    }
+}
 
 /// Build the channel-name map from the live yaml config. Returns an empty map
 /// on any failure so discovery degrades gracefully (legacy snowflake-keyed
@@ -137,8 +153,17 @@ pub fn build_yaml_channel_name_map() -> ChannelNameMap {
             let Some(channel_id) = channel.channel_id() else {
                 continue;
             };
-            if let Some(channel_name) = channel.channel_name() {
-                map.insert((agent.id.clone(), provider, channel_id), channel_name);
+            let names = channel.aliases();
+            if names.is_empty() {
+                continue;
+            }
+            let entry = map
+                .entry((agent.id.clone(), provider, channel_id))
+                .or_default();
+            for name in names {
+                if !entry.contains(&name) {
+                    entry.push(name);
+                }
             }
         }
     }
@@ -147,41 +172,220 @@ pub fn build_yaml_channel_name_map() -> ChannelNameMap {
 
 async fn build_channel_directory_from_pg_with_config(
     pool: &PgPool,
-    name_map: ChannelNameMap,
+    fs_snapshot: DiscoveryFsSnapshot,
 ) -> Result<ChannelDirectory, sqlx::Error> {
     let all = crate::db::agents::load_all_agent_channel_bindings_pg(pool).await?;
 
     let mut directory = ChannelDirectory::new();
-    for (agent_id, bindings) in all {
+    for (agent_id, bindings) in &all {
         // For every (provider, channel_id) pair this agent owns, register a
         // ChannelBinding. The matcher's directory is keyed by the *expected
         // tmux session name*, so duplicate provider entries that map to the
         // same channel collapse naturally.
-        for (provider, channel_id) in channel_pairs_for_agent(&bindings) {
-            // Look up the yaml-declared channel name for this exact
-            // (agent, provider, channel_id) tuple. When present, the live
-            // tmux session is `AgentDesk-{provider}-{channel_name}` so the
-            // directory must key by `channel_name`; falling back to
-            // `channel_id` preserves legacy bindings without a yaml entry.
-            let tmux_segment = name_map
+        for (provider, channel_id) in channel_pairs_for_agent(bindings) {
+            // Look up yaml-declared channel names/aliases for this exact
+            // (agent, provider, channel_id) tuple. When present, live tmux
+            // sessions may be `AgentDesk-{provider}-{channel_name}`; falling
+            // back to `channel_id` preserves legacy snowflake-keyed sessions.
+            let mut tmux_segments = fs_snapshot
+                .name_map
                 .get(&(agent_id.clone(), provider.clone(), channel_id.clone()))
-                .cloned();
-            let binding = ChannelBinding {
-                channel_id,
-                agent_id: agent_id.clone(),
+                .cloned()
+                .unwrap_or_default();
+            if !tmux_segments.contains(&channel_id) {
+                tmux_segments.push(channel_id.clone());
+            }
+
+            for segment in tmux_segments {
+                let tmux_segment = (segment != channel_id).then_some(segment);
+                let binding = ChannelBinding {
+                    channel_id: channel_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: provider.clone(),
+                    tmux_segment,
+                };
+                if let Err(error) = directory.insert(binding) {
+                    tracing::warn!(
+                        ?error,
+                        agent_id = %agent_id,
+                        "session-discovery: dropping agent binding due to directory collision",
+                    );
+                }
+            }
+        }
+    }
+    add_provider_cli_launch_bindings(&mut directory, fs_snapshot.launch_artifacts);
+    Ok(directory)
+}
+
+fn load_provider_cli_launch_artifacts_for_discovery() -> Vec<LaunchArtifact> {
+    let Some(root) = crate::config::runtime_root() else {
+        return Vec::new();
+    };
+
+    let mut artifacts = Vec::new();
+    for provider in crate::services::provider::provider_registry() {
+        artifacts.extend(load_launch_artifacts_for_discovery(&root, provider.id));
+    }
+    artifacts
+}
+
+fn add_provider_cli_launch_bindings(
+    directory: &mut ChannelDirectory,
+    artifacts: Vec<LaunchArtifact>,
+) {
+    for artifact in artifacts {
+        insert_launch_artifact_binding(directory, &artifact);
+    }
+}
+
+fn load_launch_artifacts_for_discovery(
+    root: &std::path::Path,
+    provider: &str,
+) -> Vec<LaunchArtifact> {
+    let dir = launch_artifacts_dir(root);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(
                 provider,
-                tmux_segment,
-            };
-            if let Err(error) = directory.insert(binding) {
+                path = %dir.display(),
+                ?error,
+                "session-discovery: failed to read provider-cli launch artifact directory",
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            tracing::warn!(
+                provider,
+                ?entry,
+                "session-discovery: failed to read provider-cli launch artifact entry",
+            );
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
                 tracing::warn!(
+                    provider,
+                    path = %path.display(),
                     ?error,
-                    agent_id = %agent_id,
-                    "session-discovery: dropping agent binding due to directory collision",
+                    "session-discovery: failed to read provider-cli launch artifact",
+                );
+                continue;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    provider,
+                    path = %path.display(),
+                    ?error,
+                    "session-discovery: skipping malformed provider-cli launch artifact",
+                );
+                continue;
+            }
+        };
+        if value
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .is_some_and(|artifact_provider| artifact_provider != provider)
+        {
+            continue;
+        }
+
+        match serde_json::from_value::<LaunchArtifact>(value) {
+            Ok(artifact) if artifact.provider == provider => artifacts.push(artifact),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    provider,
+                    path = %path.display(),
+                    ?error,
+                    "session-discovery: skipping incomplete provider-cli launch artifact",
                 );
             }
         }
     }
-    Ok(directory)
+    artifacts
+}
+
+fn insert_launch_artifact_binding(
+    directory: &mut ChannelDirectory,
+    artifact: &LaunchArtifact,
+) -> bool {
+    let Some(agent_id) = artifact
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(channel_id) = artifact
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(tmux_session) = artifact
+        .tmux_session
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let Some(artifact_provider) = ProviderKind::from_str(artifact.provider.trim()) else {
+        return false;
+    };
+    let Some((session_provider, tmux_segment)) =
+        parse_provider_and_channel_from_tmux_name(tmux_session)
+    else {
+        return false;
+    };
+    if session_provider != artifact_provider {
+        tracing::warn!(
+            provider = %artifact.provider,
+            session_provider = %session_provider.as_str(),
+            tmux_session,
+            "session-discovery: provider-cli launch artifact provider does not match tmux session",
+        );
+        return false;
+    }
+
+    let binding = ChannelBinding {
+        channel_id: channel_id.to_string(),
+        agent_id: agent_id.to_string(),
+        provider: session_provider,
+        tmux_segment: Some(tmux_segment),
+    };
+    if let Err(error) = directory.insert(binding) {
+        tracing::warn!(
+            ?error,
+            agent_id,
+            tmux_session,
+            "session-discovery: dropping provider-cli launch binding due to directory collision",
+        );
+        return false;
+    }
+    true
 }
 
 /// Extract the `(provider, channel_id)` pairs an agent declares. Today this
@@ -510,6 +714,27 @@ mod tests {
         }
     }
 
+    fn launch_artifact(
+        provider: &str,
+        agent_id: &str,
+        channel_id: &str,
+        tmux_session: &str,
+    ) -> LaunchArtifact {
+        LaunchArtifact {
+            provider: provider.to_string(),
+            agent_id: Some(agent_id.to_string()),
+            channel_id: Some(channel_id.to_string()),
+            session_key: Some(format!("{provider}/{agent_id}/{tmux_session}")),
+            channel: "current".to_string(),
+            cli_path: "/usr/local/bin/provider-cli".to_string(),
+            canonical_path: "/usr/local/bin/provider-cli".to_string(),
+            cli_version: "test".to_string(),
+            process_id: Some(42),
+            tmux_session: Some(tmux_session.to_string()),
+            launched_at: chrono::Utc::now(),
+        }
+    }
+
     fn enumerated(session: &str, pane: &str) -> EnumeratedSession {
         EnumeratedSession {
             session_name: session.to_string(),
@@ -774,6 +999,50 @@ mod tests {
         );
 
         assert_eq!(report.matched, 1, "snowflake fallback must still match");
+    }
+
+    /// Provider CLI launch artifacts are the only durable source that connects
+    /// a survived human-readable tmux session to its Discord snowflake when the
+    /// yaml alias is missing or stale. Discovery must use them as a fallback or
+    /// restarted dcserver processes orphan live sessions as "operator" panes.
+    #[test]
+    fn provider_cli_launch_artifact_restores_exact_tmux_binding() {
+        let mut directory = ChannelDirectory::new();
+        let snowflake = "1489653074359226521";
+        let live_session =
+            expected_session_name_for(None, &ProviderKind::Codex, "--agent-game-design");
+        let artifact = launch_artifact("codex", "sdesigner", snowflake, &live_session);
+
+        assert!(insert_launch_artifact_binding(&mut directory, &artifact));
+
+        let registry = SessionRegistry::new();
+        let report = reconcile_from_enumeration(
+            Some(NODE_A),
+            vec![enumerated(&live_session, "codex")],
+            &directory,
+            &registry,
+        );
+
+        assert_eq!(report.matched, 1, "launch artifact session must match");
+        let entry = registry
+            .lookup(&live_session)
+            .expect("launch artifact session must be present in registry");
+        assert_eq!(entry.matched.channel_id, snowflake);
+        assert_eq!(entry.matched.agent_id, "sdesigner");
+    }
+
+    #[test]
+    fn provider_cli_launch_artifact_does_not_require_pg_agent_row() {
+        let mut directory = ChannelDirectory::new();
+        let live_session =
+            expected_session_name_for(None, &ProviderKind::Codex, "--restored-agent");
+        let artifact = launch_artifact("codex", "restored-agent", "1234567890", &live_session);
+
+        assert!(insert_launch_artifact_binding(&mut directory, &artifact));
+        assert!(
+            directory.binding_for_session_name(&live_session).is_some(),
+            "launch artifacts must restore sessions even when PG has not synced the agent row"
+        );
     }
 
     /// Regression for #2470: claude code 2.1.143 rewrites its process title to

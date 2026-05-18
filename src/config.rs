@@ -213,6 +213,10 @@ pub struct BotConfig {
     // the manual `Debug` impl below masks the value as `<redacted>`.
     #[serde(default, skip_serializing)]
     pub token: Option<String>,
+    /// Environment variable name containing the bot token. This stores only the
+    /// variable name, never the token value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env_var: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +231,7 @@ impl std::fmt::Debug for BotConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BotConfig")
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("token_env_var", &self.token_env_var)
             .field("description", &self.description)
             .field("provider", &self.provider)
             .field("agent", &self.agent)
@@ -802,7 +807,7 @@ pub struct DataConfig {
     pub db_name: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DatabaseConfig {
     #[serde(default)]
@@ -819,6 +824,22 @@ pub struct DatabaseConfig {
     pub password: Option<String>,
     #[serde(default = "default_database_pool_max")]
     pub pool_max: u32,
+}
+
+pub const RECOMMENDED_DATABASE_POOL_MAX: u32 = 32;
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_database_host(),
+            port: default_database_port(),
+            dbname: default_database_name(),
+            user: default_database_user(),
+            password: None,
+            pool_max: default_database_pool_max(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1645,7 +1666,7 @@ fn default_database_user() -> String {
     "agentdesk".into()
 }
 fn default_database_pool_max() -> u32 {
-    12
+    RECOMMENDED_DATABASE_POOL_MAX
 }
 fn default_cluster_role() -> String {
     "auto".into()
@@ -2542,6 +2563,7 @@ routines:
             "announce".to_string(),
             BotConfig {
                 token: Some("bot-token".to_string()),
+                token_env_var: Some("ANNOUNCE_BOT_TOKEN".to_string()),
                 description: Some("announce bot".to_string()),
                 provider: Some("codex".to_string()),
                 agent: Some("agent-1".to_string()),
@@ -2681,6 +2703,10 @@ routines:
         assert_eq!(
             loaded.discord.bots["announce"].description.as_deref(),
             Some("announce bot")
+        );
+        assert_eq!(
+            loaded.discord.bots["announce"].token_env_var.as_deref(),
+            Some("ANNOUNCE_BOT_TOKEN")
         );
         assert_eq!(
             loaded.discord.bots["announce"].provider.as_deref(),

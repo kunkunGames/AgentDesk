@@ -9,7 +9,11 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::services::agent_protocol::StreamMessage;
 use crate::services::provider::{CancelToken, ReadOutputResult, cancel_requested};
 
-const DEFAULT_ROLLOUT_WAIT_SECS: u64 = 30;
+/// Codex resume can spend tens of seconds rebuilding a large local thread
+/// before appending the next rollout entry. Keep this above that startup
+/// budget so AgentDesk does not kill a healthy resumed TUI right as it begins
+/// writing the transcript.
+const DEFAULT_ROLLOUT_WAIT_SECS: u64 = 120;
 /// Fallback EOF drain budget for rollouts that do NOT emit an explicit
 /// `event_msg/task_complete` signal (legacy Codex CLI versions or unexpected
 /// codex variants). Modern Codex CLI (>= 2026-03) emits `task_complete` per
@@ -601,6 +605,13 @@ fn wait_for_resumed_rollout_for_session(
             latest_rollout_for_cwd_and_session_since(cwd, session_id, modified_since, sessions_dir)
         {
             return Ok(path);
+        }
+        // The recursive rollout scan above can be slow on hosts with many
+        // Codex transcripts. Re-check the already selected rollout before
+        // applying the timeout so a file that grew during the scan is not
+        // misclassified as missing.
+        if rollout_file_len(previous_rollout_path).is_some_and(|len| len > previous_start_offset) {
+            return Ok(previous_rollout_path.to_path_buf());
         }
         if !is_alive() {
             return Err(

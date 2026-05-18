@@ -337,6 +337,15 @@ fn resolve_bot_token(bot_name: &str, bot: &crate::config::BotConfig) -> Option<S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+        .or_else(|| {
+            bot.token_env_var
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|env_var| std::env::var(env_var).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .or_else(|| crate::credential::read_bot_token(bot_name))
 }
 
@@ -802,6 +811,44 @@ memory:
             assert_eq!(configs.len(), 2);
             assert_eq!(configs[0].provider, ProviderKind::Claude);
             assert_eq!(configs[1].provider, ProviderKind::Codex);
+        });
+    }
+
+    #[test]
+    fn test_load_bot_launch_configs_reads_token_env_var_from_yaml() {
+        with_temp_home(|temp_home: &TempDir| {
+            write_agentdesk_yaml(
+                temp_home,
+                r#"
+server:
+  port: 8791
+discord:
+  owner_id: "343742347365974026"
+  bots:
+    command:
+      token_env_var: AGENTDESK_TEST_DISCORD_TOKEN
+      provider: "codex"
+      agent: alpha
+agents:
+  - id: alpha
+    name: "Alpha"
+    provider: codex
+    channels:
+      codex:
+        id: "1479671301387059200"
+        name: "alpha-cdx"
+"#,
+            );
+
+            with_env_vars(
+                &[("AGENTDESK_TEST_DISCORD_TOKEN", Some("env-token"))],
+                || {
+                    let configs = load_discord_bot_launch_configs();
+                    assert_eq!(configs.len(), 1);
+                    assert_eq!(configs[0].provider, ProviderKind::Codex);
+                    assert_eq!(configs[0].token, "env-token");
+                },
+            );
         });
     }
 

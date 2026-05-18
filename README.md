@@ -349,6 +349,7 @@ database:
   port: 5432
   dbname: agentdesk
   user: agentdesk
+  pool_max: 32
 
 # Optional multinode runtime identity. Nodes that share the same PostgreSQL
 # database coordinate through worker heartbeats, advisory leadership leases,

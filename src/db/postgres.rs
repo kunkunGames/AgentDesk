@@ -7,10 +7,11 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Row};
 
-use crate::config::{AgentChannel, AgentDef, Config};
+use crate::config::{AgentChannel, AgentDef, Config, RECOMMENDED_DATABASE_POOL_MAX};
 use crate::services::settings::{KvSeedAction, config_default_seed_actions};
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
+static LOW_POOL_WARNING_EMITTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 3;
 const STARTUP_PG_ACQUIRE_TIMEOUT_SECS: u64 = 60;
@@ -131,6 +132,23 @@ fn runtime_pool_settings(config: &Config) -> PoolConnectSettings {
     }
 }
 
+fn warn_if_pool_max_below_recommended(config: &Config, context: &str) {
+    let configured_pool_max = config.database.pool_max.max(1);
+    if configured_pool_max >= RECOMMENDED_DATABASE_POOL_MAX {
+        return;
+    }
+
+    let _ = LOW_POOL_WARNING_EMITTED.get_or_init(|| {
+        tracing::warn!(
+            configured_pool_max,
+            recommended_pool_max = RECOMMENDED_DATABASE_POOL_MAX,
+            context,
+            "database.pool_max is below the AgentDesk release recommendation; busy policy ticks, \
+             startup reconciliation, and provider session discovery can starve the PostgreSQL runtime pool"
+        );
+    });
+}
+
 fn startup_pool_settings(config: &Config) -> PoolConnectSettings {
     let steady_max = config.database.pool_max.max(1);
     PoolConnectSettings {
@@ -147,6 +165,7 @@ async fn connect_with_settings(
     let Some(options) = connect_options(config)? else {
         return Ok(None);
     };
+    warn_if_pool_max_below_recommended(config, context);
 
     let pool = PgPoolOptions::new()
         .max_connections(settings.max_connections)
@@ -961,7 +980,8 @@ mod tests {
         AdvisoryLockLease, POSTGRES_MIGRATOR, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, close_test_pool,
         config_database_summary, connect_options, connect_test_pool_and_migrate_config,
         create_test_database, database_enabled, database_summary, health_check,
-        run_test_postgres_sqlx_op_with_timeout, startup_pool_settings, startup_reseed,
+        run_test_postgres_sqlx_op_with_timeout, runtime_pool_settings, startup_pool_settings,
+        startup_reseed,
     };
     use sqlx::Row;
     use std::collections::BTreeMap;
@@ -1174,6 +1194,26 @@ mod tests {
             "db.internal:5433/agentdesk_dev user=agentdesk_app pool_max=16"
         );
         assert!(connect_options(&config).unwrap().is_some());
+    }
+
+    #[test]
+    fn default_database_pool_settings_match_release_recommendation() {
+        let mut config = crate::config::Config::default();
+        config.database.enabled = true;
+
+        let runtime = runtime_pool_settings(&config);
+        let startup = startup_pool_settings(&config);
+
+        assert_eq!(
+            runtime.max_connections,
+            crate::config::RECOMMENDED_DATABASE_POOL_MAX
+        );
+        assert_eq!(
+            startup.max_connections,
+            crate::config::RECOMMENDED_DATABASE_POOL_MAX
+                .saturating_mul(3)
+                .div_ceil(2)
+        );
     }
 
     #[test]
