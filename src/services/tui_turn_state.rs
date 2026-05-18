@@ -120,8 +120,7 @@ fn claude_envelope_turn_state(json: &Value) -> Option<TuiTurnState> {
         "assistant" => Some(TuiTurnState::Streaming),
         "user" => Some(TuiTurnState::UserSubmitted),
         "system" => match json.get("subtype").and_then(Value::as_str) {
-            Some("turn_duration" | "stop_hook_summary") => Some(TuiTurnState::Idle),
-            Some("init") => Some(TuiTurnState::UserSubmitted),
+            Some("turn_duration" | "stop_hook_summary" | "init") => Some(TuiTurnState::Idle),
             _ => None,
         },
         _ => None,
@@ -210,6 +209,16 @@ mod tests {
         assert_eq!(
             observe_claude_jsonl_turn_state(file.path()),
             TuiTurnState::UserSubmitted
+        );
+    }
+
+    #[test]
+    fn claude_init_without_user_envelope_is_idle() {
+        let file = write_jsonl(&[r#"{"type":"system","subtype":"init","session_id":"s"}"#]);
+
+        assert_eq!(
+            observe_claude_jsonl_turn_state(file.path()),
+            TuiTurnState::Idle
         );
     }
 

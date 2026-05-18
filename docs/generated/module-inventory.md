@@ -460,7 +460,7 @@
 | `services::discord::router::control_intent` | `src/services/discord/router/control_intent.rs` | 352 |  |
 | `services::discord::router::dispatch_trigger` | `src/services/discord/router/dispatch_trigger.rs` | 231 |  |
 | `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 2833 | giant-file |
-| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 9828 | giant-file |
+| `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 10063 | giant-file |
 | `services::discord::router::response_format` | `src/services/discord/router/response_format.rs` | 354 |  |
 | `services::discord::router::thread_binding` | `src/services/discord/router/thread_binding.rs` | 130 |  |
 | `services::discord::router::turn_start` | `src/services/discord/router/turn_start.rs` | 410 |  |
@@ -618,7 +618,7 @@
 | `services::tmux_wrapper` | `src/services/tmux_wrapper.rs` | 727 |  |
 | `services::tool_output_guard` | `src/services/tool_output_guard.rs` | 237 |  |
 | `services::tui_prompt_dedupe` | `src/services/tui_prompt_dedupe.rs` | 729 |  |
-| `services::tui_turn_state` | `src/services/tui_turn_state.rs` | 273 |  |
+| `services::tui_turn_state` | `src/services/tui_turn_state.rs` | 282 |  |
 | `services::turn_cancel_finalizer` | `src/services/turn_cancel_finalizer.rs` | 409 |  |
 | `services::turn_lifecycle` | `src/services/turn_lifecycle.rs` | 782 |  |
 | `services::turn_orchestrator` | `src/services/turn_orchestrator.rs` | 3336 | giant-file |
