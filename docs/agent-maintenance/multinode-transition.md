@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-05-18 (against #2431 SSH-direct TUI relay ownership).
+> Last refreshed: 2026-05-18 (against PR #308 AgentDesk queue recovery and intake-worker ownership audit).
 
 ## Read This First
 
@@ -66,6 +66,10 @@
 - invariants: `singleton_on_leader`, `pg_lease_backed_claim`.
 - allowed_changes: `bugfix` for existing workers. `new_feature` workers must add
   a leader-only, lease-backed, or worker-local classification in the same change.
+- 2026-05-18 refresh: intake outbox polling now starts only when
+  `ADK_INTAKE_ROUTING_MODE=enforce`. Disabled and observe modes keep the worker
+  loop stopped so standby/local bot processes do not spend PostgreSQL runtime
+  pool capacity on empty queue claims.
 - tests: leader failover, duplicate singleton worker suppression, and the #884
   chaos suite.
 - related_issues: #876, #877, #878, #884.
