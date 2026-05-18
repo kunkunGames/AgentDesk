@@ -195,7 +195,7 @@
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 |  |
 | `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 161 |  |
 | `runtime_layout::skill_sync` | `src/runtime_layout/skill_sync.rs` | 685 |  |
-| `server` | `src/server/mod.rs` | 3875 | giant-file |
+| `server` | `src/server/mod.rs` | 3878 | giant-file |
 | `server::cluster` | `src/server/cluster.rs` | 1205 | giant-file |
 | `server::cluster_session_routing` | `src/server/cluster_session_routing.rs` | 416 |  |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 92 |  |
@@ -338,7 +338,7 @@
 | `services::automation_candidate_materializer` | `src/services/automation_candidate_materializer.rs` | 844 |  |
 | `services::claude` | `src/services/claude.rs` | 4010 | giant-file |
 | `services::claude_tui` | `src/services/claude_tui/mod.rs` | 6 |  |
-| `services::claude_tui::hook_bundle` | `src/services/claude_tui/hook_bundle.rs` | 1164 | giant-file |
+| `services::claude_tui::hook_bundle` | `src/services/claude_tui/hook_bundle.rs` | 1192 | giant-file |
 | `services::claude_tui::hook_relay` | `src/services/claude_tui/hook_relay.rs` | 427 |  |
 | `services::claude_tui::hook_server` | `src/services/claude_tui/hook_server.rs` | 569 |  |
 | `services::claude_tui::input` | `src/services/claude_tui/input.rs` | 1064 | giant-file |
@@ -411,7 +411,7 @@
 | `services::discord::inflight_heartbeat_sweeper` | `src/services/discord/inflight_heartbeat_sweeper.rs` | 292 |  |
 | `services::discord::internal_api` | `src/services/discord/internal_api.rs` | 817 |  |
 | `services::discord::jsonl_watcher` | `src/services/discord/jsonl_watcher.rs` | 252 |  |
-| `services::discord::mcp_credential_watcher` | `src/services/discord/mcp_credential_watcher.rs` | 645 |  |
+| `services::discord::mcp_credential_watcher` | `src/services/discord/mcp_credential_watcher.rs` | 754 |  |
 | `services::discord::meeting_artifact_store` | `src/services/discord/meeting_artifact_store.rs` | 356 |  |
 | `services::discord::meeting_orchestrator` | `src/services/discord/meeting_orchestrator.rs` | 3780 | giant-file |
 | `services::discord::meeting_state_machine` | `src/services/discord/meeting_state_machine.rs` | 302 |  |
