@@ -172,7 +172,7 @@ pub fn resolve_codex_path() -> Option<String> {
     crate::services::platform::resolve_provider_binary("codex").resolved_path
 }
 
-fn resolve_codex_binary() -> crate::services::platform::BinaryResolution {
+pub(crate) fn resolve_codex_binary() -> crate::services::platform::BinaryResolution {
     crate::services::platform::resolve_provider_binary("codex")
 }
 

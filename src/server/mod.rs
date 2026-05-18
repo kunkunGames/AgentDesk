@@ -199,21 +199,24 @@ pub(crate) async fn run(
     // AgentDesk's verified allowlist (so the SessionStart-silently-disabled
     // failure mode is at least surfaced before users hit it on a Codex bump).
     //
-    // The probe deliberately runs against `resolve_codex_path()` — the same
-    // resolution session launches use today via `resolve_codex_binary()`. If a
-    // session ever points at a different Codex binary, the warning will be
-    // off by one binary; tracked alongside the real cross-CLI verification
-    // (#2259) as a known limitation.
+    // The probe deliberately runs against the same binary resolution session
+    // launches use today. That includes the resolver-provided PATH augmentation:
+    // Homebrew npm shims use `#!/usr/bin/env node`, and launchd's minimal PATH
+    // otherwise makes `codex --version` look like "unknown" even when the
+    // audited Codex CLI is installed.
     {
-        let codex_cli_path = crate::services::codex::resolve_codex_path();
-        let codex_cli_present = codex_cli_path.is_some();
-        let codex_cli_version = codex_cli_path
-            .as_deref()
-            .and_then(crate::services::claude_tui::hook_bundle::probe_codex_cli_version);
+        let codex_resolution = crate::services::codex::resolve_codex_binary();
+        let codex_cli_present = codex_resolution.resolved_path.is_some();
+        let codex_cli_version = codex_resolution.resolved_path.as_deref().and_then(|path| {
+            crate::services::claude_tui::hook_bundle::probe_codex_cli_version_with_path(
+                path,
+                codex_resolution.exec_path.as_deref(),
+            )
+        });
         let _ = crate::services::claude_tui::hook_bundle::run_codex_hook_startup_self_check(
             codex_cli_present,
             codex_cli_version.as_deref(),
-            codex_cli_path.as_deref(),
+            codex_resolution.resolved_path.as_deref(),
         );
     }
     let cluster_runtime = cluster::bootstrap(&config, pg_pool.clone()).await;
