@@ -231,8 +231,8 @@
 | `server::routes::docs` | `src/server/routes/docs.rs` | 6227 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 |  |
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 13 |  |
-| `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 93 |  |
-| `server::routes::domains::agents` | `src/server/routes/domains/agents.rs` | 53 |  |
+| `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 89 |  |
+| `server::routes::domains::agents` | `src/server/routes/domains/agents.rs` | 58 |  |
 | `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 67 |  |
 | `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 87 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 39 |  |
