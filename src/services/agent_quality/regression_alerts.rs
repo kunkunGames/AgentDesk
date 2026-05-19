@@ -23,6 +23,24 @@ use anyhow::{Result, anyhow};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
+/// Decode a row column safely: if it's a structural decode error (e.g. malformed type),
+/// use a graceful fallback. If it's a real database error, fail closed.
+fn explicit_decode_fallback<T>(
+    result: Result<T, sqlx::Error>,
+    fallback: T,
+    column: &str,
+) -> Result<T> {
+    match result {
+        Ok(v) => Ok(v),
+        Err(sqlx::Error::ColumnDecode { source, .. }) => {
+            tracing::warn!(column, %source, "decode fallback triggered");
+            Ok(fallback)
+        }
+        Err(e) => Err(anyhow!("decode {column}: {e}")),
+    }
+}
+
+
 use crate::services::message_outbox::{OutboxMessage, enqueue_outbox_pg};
 
 /// Minimum 7d sample window required before an alert can fire. Mirrors the
@@ -191,18 +209,23 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             .try_get("agent_id")
             .map_err(|error| anyhow!("decode agent_id: {error}"))?;
 
-        let turn_7d: Option<f64> = row
-            .try_get("turn_success_rate_7d")
-            .map_err(|error| anyhow!("decode turn_success_rate_7d: {error}"))?;
-        let turn_30d: Option<f64> = row
-            .try_get("turn_success_rate_30d")
-            .map_err(|error| anyhow!("decode turn_success_rate_30d: {error}"))?;
-        let turn_s7: i64 = row
-            .try_get("turn_sample_size_7d")
-            .map_err(|error| anyhow!("decode turn_sample_size_7d: {error}"))?;
-        let turn_s30: i64 = row
-            .try_get("turn_sample_size_30d")
-            .map_err(|error| anyhow!("decode turn_sample_size_30d: {error}"))?;
+        let turn_7d: Option<f64> = explicit_decode_fallback(
+            row.try_get("turn_success_rate_7d"),
+            None,
+            "turn_success_rate_7d",
+        )?;
+        let turn_30d: Option<f64> = explicit_decode_fallback(
+            row.try_get("turn_success_rate_30d"),
+            None,
+            "turn_success_rate_30d",
+        )?;
+        let turn_s7: i64 =
+            explicit_decode_fallback(row.try_get("turn_sample_size_7d"), 0, "turn_sample_size_7d")?;
+        let turn_s30: i64 = explicit_decode_fallback(
+            row.try_get("turn_sample_size_30d"),
+            0,
+            "turn_sample_size_30d",
+        )?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::TurnSuccessRate,
@@ -214,18 +237,26 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             out.push(reg);
         }
 
-        let review_7d: Option<f64> = row
-            .try_get("review_pass_rate_7d")
-            .map_err(|error| anyhow!("decode review_pass_rate_7d: {error}"))?;
-        let review_30d: Option<f64> = row
-            .try_get("review_pass_rate_30d")
-            .map_err(|error| anyhow!("decode review_pass_rate_30d: {error}"))?;
-        let review_s7: i64 = row
-            .try_get("review_sample_size_7d")
-            .map_err(|error| anyhow!("decode review_sample_size_7d: {error}"))?;
-        let review_s30: i64 = row
-            .try_get("review_sample_size_30d")
-            .map_err(|error| anyhow!("decode review_sample_size_30d: {error}"))?;
+        let review_7d: Option<f64> = explicit_decode_fallback(
+            row.try_get("review_pass_rate_7d"),
+            None,
+            "review_pass_rate_7d",
+        )?;
+        let review_30d: Option<f64> = explicit_decode_fallback(
+            row.try_get("review_pass_rate_30d"),
+            None,
+            "review_pass_rate_30d",
+        )?;
+        let review_s7: i64 = explicit_decode_fallback(
+            row.try_get("review_sample_size_7d"),
+            0,
+            "review_sample_size_7d",
+        )?;
+        let review_s30: i64 = explicit_decode_fallback(
+            row.try_get("review_sample_size_30d"),
+            0,
+            "review_sample_size_30d",
+        )?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::ReviewPassRate,
@@ -632,14 +663,19 @@ mod tests {
 
     #[test]
     fn compute_regressions_requires_strict_types() {
-        let result: Result<Option<f64>> = Err(anyhow::anyhow!("db error"));
-        let mapped = result.map_err(|e| anyhow::anyhow!("decode error: {e}"));
-        assert!(mapped.is_err());
-        assert!(
-            mapped
-                .unwrap_err()
-                .to_string()
-                .contains("decode error: db error")
-        );
+        // structural decode error triggers fallback
+        let decode_err = sqlx::Error::ColumnDecode {
+            index: "0".into(),
+            source: "malformed".into(),
+        };
+        let mapped_fallback = explicit_decode_fallback::<Option<f64>>(Err(decode_err), None, "col");
+        assert!(mapped_fallback.is_ok());
+        assert_eq!(mapped_fallback.unwrap(), None);
+
+        // real db error propagates
+        let db_err = sqlx::Error::RowNotFound;
+        let mapped_err = explicit_decode_fallback::<Option<f64>>(Err(db_err), None, "col");
+        assert!(mapped_err.is_err());
+        assert!(mapped_err.unwrap_err().to_string().contains("decode col: "));
     }
 }
