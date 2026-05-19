@@ -238,7 +238,7 @@
   - `src/cli/migrate.rs` (348 lines, retired postgres-cutover facade).
   - `src/cli/args.rs` (1002 lines).
   - `src/cli/doctor/orchestrator.rs` (4324 lines).
-  - `src/cli/migrate/apply.rs` (3142 lines).
+  - `src/cli/migrate/apply.rs` (3147 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1600), client.rs (1583), direct.rs (1535),
     dcserver.rs (1496)}`.
@@ -261,14 +261,14 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2601 lines).
+  - `src/config.rs` (3093 lines).
   - `src/runtime_layout/mod.rs` (1425 lines).
-  - `src/server/mod.rs` (3370 lines).
-  - `src/kanban/state_machine.rs` (3550 lines).
+  - `src/server/mod.rs` (4070 lines).
+  - `src/kanban/state_machine.rs` (64 lines).
   - `src/kanban/transition_core.rs` (1107 lines; relocated from state_machine
     via #1786 epic decompose, awaiting further split).
   - `src/receipt.rs` (2133 lines).
-  - `src/github/sync.rs` (1059 lines).
+  - `src/github/sync.rs` (1238 lines).
   - `src/reconcile.rs` (1867 lines; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
@@ -310,14 +310,14 @@
     + `reconcile_phase_gate_for_terminal_dispatch_on_pg_tx`. Split the test
     module out into a sibling `phase_gates_tests.rs` before adding new
     feature logic).
-  - `src/db/schema.rs` (3194 lines).
+  - `src/db/schema.rs` (3225 lines).
   - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
     GitHub sync lookup surface).
-  - `src/db/postgres.rs` (1536 lines).
+  - `src/db/postgres.rs` (1877 lines).
   - `src/db/dispatched_sessions.rs` (1200 lines; dispatched session
     persistence helpers).
   - `src/db/session_transcripts.rs` (877 lines, retained PG-cleanup surface).
-  - `src/db/agents.rs` (1125 lines).
+  - `src/db/agents.rs` (1166 lines).
   - `src/db/prompt_manifests.rs` (1219 lines, post-#1699 retention policy +
     write-time byte cap pushed it past the giant-file threshold).
   - `src/db/intake_outbox.rs` (~1240 lines after intake-node-routing Phase 2;
@@ -413,7 +413,7 @@ The remaining giant-file modules under `src/services/` not covered above:
   `src/services/qwen_tmux_wrapper.rs` (1194).
 - `src/services/turn_orchestrator.rs` (2070).
 - `src/services/session_backend.rs` (1053).
-- `src/voice/turn_link.rs` (1282 lines) — VoiceTurnLink durable store + GC
+- `src/voice/turn_link.rs` (2136 lines) — VoiceTurnLink durable store + GC
   (#2362 / #2164 voice epic A); covers per-utterance status row + advisory-lock
   serialization + PG-backed reconciliation. Split focused helpers before adding
   non-bugfix behavior outside the foundational store contract.
