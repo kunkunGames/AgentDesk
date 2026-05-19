@@ -5,7 +5,6 @@ mod commands;
 mod discord_io;
 pub(crate) mod formatting;
 mod gateway;
-mod handoff;
 pub(crate) mod health;
 pub(crate) mod http;
 mod idle_detector;
@@ -39,6 +38,8 @@ mod queued_placeholders_store;
 mod relay_health;
 mod relay_recovery;
 pub(crate) mod response_sanitizer;
+#[cfg(unix)]
+mod session_relay_sink;
 #[cfg(unix)]
 mod standby_relay;
 // #1074: landing zone for the future recovery-engine module split
@@ -87,6 +88,8 @@ pub(crate) use meeting_orchestrator as meeting;
 pub(in crate::services::discord) use recovery_engine as recovery;
 pub(crate) use restart_mode::InflightRestartMode;
 pub(crate) use router::HeadlessTurnStartError;
+#[cfg(unix)]
+pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
 // Phase 2-pre.3 of intake-node-routing: worker entry point. Phase 3 will
 // add the worker polling loop that imports these names; until then they
 // are intentionally exposed but unused at the crate boundary.
@@ -130,7 +133,6 @@ use formatting::{
     BUILTIN_SKILLS, extract_skill_description, format_for_discord, format_tool_input,
     send_long_message_raw, truncate_str,
 };
-use handoff::{clear_handoff, load_handoffs, update_handoff_state};
 pub(crate) use inflight::clear_inflight_state;
 use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
 use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
@@ -538,10 +540,19 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
     })
 }
 
-/// Extend the watchdog deadline for a channel and move the per-turn max cap with it.
+/// Extend the watchdog deadline for a channel and move the per-turn max cap
+/// with it.  Also refreshes the in-memory voice-background handoff marker
+/// TTL (if one exists for the active turn) so extended turns do not lose
+/// their routing metadata (#2352).
+///
+/// When `pg_pool` is `Some`, the durable PG row's `expires_at` is refreshed
+/// as well via `voice::announce_meta::refresh_handoff_ttl_durable`.  Durable
+/// refresh errors are logged and ignored so a PG hiccup cannot break the
+/// deadline extension.
 pub async fn extend_watchdog_deadline(
     channel_id: u64,
     extend_by_secs: u64,
+    pg_pool: Option<&sqlx::PgPool>,
 ) -> Result<
     crate::services::turn_orchestrator::WatchdogDeadlineExtension,
     crate::services::turn_orchestrator::WatchdogDeadlineExtensionError,
@@ -551,7 +562,29 @@ pub async fn extend_watchdog_deadline(
             crate::services::turn_orchestrator::WatchdogDeadlineExtensionError::MailboxUnavailable,
         );
     };
-    handle.extend_timeout(extend_by_secs).await
+    let extension = handle.extend_timeout(extend_by_secs).await?;
+
+    // Refresh the handoff marker TTL so a long-running turn does not lose
+    // its voice routing metadata (#2352).
+    let snapshot = handle.snapshot().await;
+    if let Some(message_id) = snapshot.active_user_message_id {
+        crate::voice::announce_meta::global_store().refresh_handoff_deadline(message_id);
+
+        if let Some(pool) = pg_pool {
+            if let Err(error) =
+                crate::voice::announce_meta::refresh_handoff_ttl_durable(pool, message_id).await
+            {
+                tracing::warn!(
+                    channel_id,
+                    message_id = message_id.get(),
+                    %error,
+                    "failed to refresh durable handoff TTL after watchdog extension"
+                );
+            }
+        }
+    }
+
+    Ok(extension)
 }
 
 /// Read and consume the deadline override for a channel (if any).
@@ -2234,9 +2267,9 @@ async fn mailbox_cancel_active_turn_with_reason(
         .await;
     #[cfg(unix)]
     if result.token.is_some() {
-        // #1309: in-memory publish is synchronous (instant suppression);
-        // PG mirror is awaited with a 500 ms cap so a quick dcserver
-        // restart cannot drop the durable copy.
+        // #2549: in-memory publish remains immediate, while the matching PG
+        // mirror is awaited before the cancel path returns so a quick
+        // dcserver restart cannot drop the durable tombstone.
         tmux::record_recent_turn_stop(channel_id, tmux_session_name.as_deref(), reason).await;
     }
     result

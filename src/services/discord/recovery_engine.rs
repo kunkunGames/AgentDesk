@@ -1653,7 +1653,6 @@ pub(super) async fn restore_inflight_turns(
                                     );
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "recovery_completed_during_downtime",
@@ -1687,7 +1686,6 @@ pub(super) async fn restore_inflight_turns(
                                 );
                             if dispatch_completed {
                                 let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                    None::<&crate::db::Db>,
                                     shared.pg_pool.as_ref(),
                                     did,
                                     "recovery_completed_during_downtime_fallback",
@@ -2269,7 +2267,6 @@ pub(super) async fn restore_inflight_turns(
                                         );
                                         let _ =
                                             super::turn_bridge::queue_dispatch_followup_with_handles(
-                                                None::<&crate::db::Db>,
                                                 shared.pg_pool.as_ref(),
                                                 did,
                                                 "recovery_captured_full_response",
@@ -2302,7 +2299,6 @@ pub(super) async fn restore_inflight_turns(
                                 if dispatch_completed {
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "recovery_captured_full_response_fallback",
@@ -2318,7 +2314,6 @@ pub(super) async fn restore_inflight_turns(
                                 );
                             if dispatch_completed {
                                 let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                    None::<&crate::db::Db>,
                                     shared.pg_pool.as_ref(),
                                     did,
                                     "recovery_captured_full_response_runtime_fallback",
@@ -2525,7 +2520,6 @@ pub(super) async fn restore_inflight_turns(
                                         );
                                         let _ =
                                             super::turn_bridge::queue_dispatch_followup_with_handles(
-                                                None::<&crate::db::Db>,
                                                 shared.pg_pool.as_ref(),
                                                 did,
                                                 "recovery_output_completed",
@@ -2558,7 +2552,6 @@ pub(super) async fn restore_inflight_turns(
                                 if dispatch_completed {
                                     let _ =
                                         super::turn_bridge::queue_dispatch_followup_with_handles(
-                                            None::<&crate::db::Db>,
                                             shared.pg_pool.as_ref(),
                                             did,
                                             "recovery_output_completed_fallback",
@@ -2574,7 +2567,6 @@ pub(super) async fn restore_inflight_turns(
                                 );
                             if dispatch_completed {
                                 let _ = super::turn_bridge::queue_dispatch_followup_with_handles(
-                                    None::<&crate::db::Db>,
                                     shared.pg_pool.as_ref(),
                                     did,
                                     "recovery_output_completed_runtime_fallback",
@@ -2624,7 +2616,7 @@ pub(super) async fn restore_inflight_turns(
         let tmux_ready_without_new_output = tmux_session_name.as_deref().map_or(false, |name| {
             !output_has_new_bytes
                 && recovery_has_post_work_ready_evidence(&state)
-                && crate::services::provider::tmux_session_ready_for_input(name)
+                && crate::services::provider::tmux_session_ready_for_input(name, provider)
         });
 
         if matches!(
@@ -3217,13 +3209,17 @@ pub(super) async fn restore_inflight_turns(
         let recovery_session_id = state.session_id.clone();
         let runtime_kind_for_reader = runtime_kind;
         let retry_channel_id = channel_id.get();
+        let provider_for_reader = provider.clone();
         std::thread::spawn(move || {
             match crate::services::session_backend::read_output_file_until_result(
                 &output_for_reader,
                 start_offset,
                 tx.clone(),
                 Some(cancel_for_reader),
-                crate::services::provider::SessionProbe::tmux(tmux_for_reader.clone()),
+                crate::services::provider::SessionProbe::tmux(
+                    tmux_for_reader.clone(),
+                    provider_for_reader,
+                ),
             ) {
                 Ok(ReadOutputResult::Completed { offset })
                 | Ok(ReadOutputResult::Cancelled { offset }) => {
@@ -5027,9 +5023,8 @@ mod tests {
             "이미 확인한 내용은 여기까지입니다. 이어서 원인과 대응을 설명하겠습니다.",
         );
 
-        let handoffs = crate::services::discord::handoff::load_handoffs(&ProviderKind::Codex);
         assert!(
-            handoffs.is_empty(),
+            !root.join("runtime").join("discord_handoff").exists(),
             "automatic post-restart handoff files must no longer be created"
         );
     }

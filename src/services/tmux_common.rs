@@ -9,9 +9,26 @@ const CLAUDE_TUI_READY_SCAN_LINES: usize = 12;
 const CLAUDE_TUI_READY_BANNER: &str = "Ready for input (type message + Enter)";
 const CLAUDE_TUI_PROMPT_MARKER: &str = "\u{276f}";
 
+fn trim_prompt_line(line: &str) -> &str {
+    line.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}')
+}
+
 pub(crate) fn tmux_line_is_claude_tui_ready_prompt(line: &str) -> bool {
-    let trimmed = line.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
-    trimmed == CLAUDE_TUI_PROMPT_MARKER
+    trim_prompt_line(line) == CLAUDE_TUI_PROMPT_MARKER
+}
+
+fn tmux_line_is_claude_tui_prompt_draft(line: &str) -> bool {
+    let Some(rest) = trim_prompt_line(line).strip_prefix(CLAUDE_TUI_PROMPT_MARKER) else {
+        return false;
+    };
+    let rest = rest.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
+    // AgentDesk injects submitted Discord turns as lines like
+    // `❯ [User: name (ID: ...)] ...`. Those are pane history, not an active
+    // composer draft, so do not block the transcript-idle readiness fallback.
+    let discord_submitted_prompt = rest
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"));
+    !rest.is_empty() && !discord_submitted_prompt
 }
 
 pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -> bool {
@@ -21,6 +38,25 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
         .filter(|l| !l.trim().is_empty())
         .take(CLAUDE_TUI_READY_SCAN_LINES)
         .any(|l| l.contains(CLAUDE_TUI_READY_BANNER) || tmux_line_is_claude_tui_ready_prompt(l))
+}
+
+pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
+    capture
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(CLAUDE_TUI_READY_SCAN_LINES)
+        .find(|line| trim_prompt_line(line).starts_with(CLAUDE_TUI_PROMPT_MARKER))
+        .is_some_and(tmux_line_is_claude_tui_prompt_draft)
+}
+
+pub(crate) fn tmux_capture_indicates_generic_ready_banner(capture: &str) -> bool {
+    capture
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(CLAUDE_TUI_READY_SCAN_LINES)
+        .any(|l| l.contains(CLAUDE_TUI_READY_BANNER))
 }
 
 /// Format a tmux session name as an exact-match target.
@@ -38,6 +74,7 @@ const SESSIONS_SUBDIR: &str = "runtime/sessions";
 pub(crate) const CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT: &str = "claude-tui-settings.json";
 pub(crate) const CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT: &str = "claude-tui.sh";
 pub(crate) const CODEX_TUI_HOME_TEMP_EXT: &str = "codex-tui-home";
+pub(crate) const TMUX_DEAD_MARKER_TEMP_EXT: &str = "pane_dead";
 
 /// Returns the persistent AgentDesk sessions directory, if a runtime root
 /// is configured. This is the new canonical location for session temp files
@@ -135,6 +172,13 @@ pub fn session_temp_path(session_name: &str, extension: &str) -> String {
     )
 }
 
+/// Canonical marker written by tmux pane/session hooks when a session's pane
+/// exits. Watchers treat this as an explicit "tmux died" wake-up; the legacy
+/// liveness probe remains as a hook-miss safety net.
+pub fn session_dead_marker_path(session_name: &str) -> String {
+    session_temp_path(session_name, TMUX_DEAD_MARKER_TEMP_EXT)
+}
+
 /// Build a path to the *legacy* `/tmp/`-based location for a session temp
 /// file. Wrappers spawned before the migration hold open fds to these files;
 /// readers must be able to still find them during the migration window.
@@ -178,6 +222,7 @@ pub fn cleanup_session_temp_files(session_name: &str) {
         "sh",
         "generation",
         "exit_reason",
+        TMUX_DEAD_MARKER_TEMP_EXT,
         CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
         CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
     ];
@@ -459,6 +504,72 @@ mod sentinel_tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains(&format!("\"type\":\"{}\"", WRAPPER_READY_FOR_INPUT_EVENT)));
         assert!(content.contains("\"provider\":\"codex\""));
+    }
+
+    #[test]
+    fn dead_marker_path_is_cleaned_with_session_temp_files() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let previous_host = std::env::var_os("HOSTNAME");
+
+        let tdir =
+            std::env::temp_dir().join(format!("adk-issue-2424-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tdir);
+
+        unsafe {
+            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
+            std::env::set_var("HOSTNAME", "issue-2424-host");
+        }
+
+        let session = format!("issue-2424-cleanup-sess-{}", std::process::id());
+        let marker_path = session_dead_marker_path(&session);
+        if let Some(parent) = std::path::Path::new(&marker_path).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&marker_path, "pane-exited").unwrap();
+
+        cleanup_session_temp_files(&session);
+
+        assert!(
+            !std::path::Path::new(&marker_path).exists(),
+            "cleanup_session_temp_files must remove pane-death marker: {marker_path}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tdir);
+        match previous_root {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+        match previous_host {
+            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
+            None => unsafe { std::env::remove_var("HOSTNAME") },
+        }
+    }
+
+    #[test]
+    fn claude_prompt_draft_detector_blocks_active_operator_draft() {
+        let capture = "\
+assistant output
+─────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}operator is still typing
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ ██░░░░░░░░ │ 24%";
+
+        assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+    }
+
+    #[test]
+    fn claude_prompt_draft_detector_ignores_submitted_discord_history_prompt() {
+        let capture = "\
+❯ [User: 0hbujang (ID: 343742347365974026)] 이전 턴
+⏺ 처리했습니다.
+✻ Baked for 2s
+  🤖 Opus(H) │ ██░░░░░░░░ │ 24%";
+
+        assert!(!tmux_capture_indicates_claude_tui_prompt_draft(capture));
     }
 }
 
@@ -822,6 +933,7 @@ mod tests {
             "sh",
             "generation",
             "exit_reason",
+            TMUX_DEAD_MARKER_TEMP_EXT,
             CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
             CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
         ];

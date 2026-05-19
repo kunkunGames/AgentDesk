@@ -57,6 +57,7 @@ pub struct ProviderRegistryEntry {
     pub default_behavior: ProviderDefaultBehavior,
     pub default_context_window: u64,
     pub managed_tmux_backend: bool,
+    pub managed_tmux_wrapper_subcommand: Option<&'static str>,
 }
 
 const CLAUDE_COUNTERPARTS: &[&str] = &["codex", "gemini", "opencode", "qwen"];
@@ -86,6 +87,7 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         },
         default_context_window: 1_000_000,
         managed_tmux_backend: true,
+        managed_tmux_wrapper_subcommand: Some("tmux-wrapper"),
     },
     ProviderRegistryEntry {
         id: "codex",
@@ -107,6 +109,7 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         },
         default_context_window: 200_000,
         managed_tmux_backend: true,
+        managed_tmux_wrapper_subcommand: Some("codex-tmux-wrapper"),
     },
     ProviderRegistryEntry {
         id: "gemini",
@@ -128,6 +131,7 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         },
         default_context_window: 1_000_000,
         managed_tmux_backend: false,
+        managed_tmux_wrapper_subcommand: None,
     },
     ProviderRegistryEntry {
         id: "opencode",
@@ -149,6 +153,7 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         },
         default_context_window: 128_000,
         managed_tmux_backend: false,
+        managed_tmux_wrapper_subcommand: None,
     },
     ProviderRegistryEntry {
         id: "qwen",
@@ -170,6 +175,7 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         },
         default_context_window: 128_000,
         managed_tmux_backend: true,
+        managed_tmux_wrapper_subcommand: Some("qwen-tmux-wrapper"),
     },
 ];
 
@@ -422,6 +428,11 @@ impl ProviderKind {
             .unwrap_or(false)
     }
 
+    pub fn managed_tmux_wrapper_subcommand(&self) -> Option<&'static str> {
+        self.registry_entry()
+            .and_then(|entry| entry.managed_tmux_wrapper_subcommand)
+    }
+
     pub fn build_tmux_session_name(&self, channel_name: &str) -> String {
         let sanitized: String = channel_name
             .chars()
@@ -565,6 +576,27 @@ mod prompt_reuse_tests {
         ProviderKind, compact_resumed_provider_turn_prompt, should_omit_repeated_system_prompt,
         system_prompt_for_provider_turn,
     };
+
+    #[test]
+    fn provider_registry_exposes_managed_tmux_wrapper_subcommands() {
+        assert_eq!(
+            ProviderKind::Claude.managed_tmux_wrapper_subcommand(),
+            Some("tmux-wrapper")
+        );
+        assert_eq!(
+            ProviderKind::Codex.managed_tmux_wrapper_subcommand(),
+            Some("codex-tmux-wrapper")
+        );
+        assert_eq!(
+            ProviderKind::Qwen.managed_tmux_wrapper_subcommand(),
+            Some("qwen-tmux-wrapper")
+        );
+        assert_eq!(ProviderKind::Gemini.managed_tmux_wrapper_subcommand(), None);
+        assert_eq!(
+            ProviderKind::OpenCode.managed_tmux_wrapper_subcommand(),
+            None
+        );
+    }
 
     #[test]
     fn codex_resume_omits_repeated_system_prompt() {
@@ -737,7 +769,7 @@ impl CancelToken {
                     &name,
                     "턴 취소에 의한 tmux 세션 정리",
                 );
-                crate::services::platform::tmux::kill_session_with_reason(
+                crate::services::platform::tmux::kill_session(
                     &name,
                     "턴 취소에 의한 tmux 세션 정리",
                 );
@@ -903,17 +935,18 @@ impl SessionProbe {
     }
 
     #[cfg(unix)]
-    pub fn tmux(session_name: String) -> Self {
+    pub fn tmux(session_name: String, provider: ProviderKind) -> Self {
         let name_alive = session_name.clone();
         let name_ready = session_name;
+        let provider_ready = provider;
         Self::new(
             move || tmux_session_alive(&name_alive),
-            move || tmux_session_ready_for_input(&name_ready),
+            move || tmux_session_ready_for_input(&name_ready, &provider_ready),
         )
     }
 
     #[cfg(not(unix))]
-    pub fn tmux(_session_name: String) -> Self {
+    pub fn tmux(_session_name: String, _provider: ProviderKind) -> Self {
         Self::new(|| false, || false)
     }
 
@@ -927,19 +960,68 @@ fn tmux_session_alive(tmux_session_name: &str) -> bool {
     crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
 }
 
-pub(crate) fn tmux_capture_indicates_ready_for_input(capture: &str) -> bool {
-    crate::services::tmux_common::tmux_capture_indicates_claude_tui_ready_for_input(capture)
+pub(crate) fn tmux_capture_indicates_ready_for_input(
+    capture: &str,
+    provider: &ProviderKind,
+) -> bool {
+    match provider {
+        ProviderKind::Claude => {
+            crate::services::tmux_common::tmux_capture_indicates_claude_tui_ready_for_input(capture)
+        }
+        ProviderKind::Codex => {
+            crate::services::codex_tui::input::pane_looks_ready_for_codex_prompt(capture)
+                || crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(
+                    capture,
+                )
+                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
+        }
+        ProviderKind::Qwen => {
+            crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
+                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
+        }
+        ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Unsupported(_) => {
+            crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
+                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
+        }
+    }
+}
+
+fn tmux_capture_contains_wrapper_ready_marker(capture: &str, provider: &ProviderKind) -> bool {
+    capture
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(12)
+        .any(|line| wrapper_ready_marker_matches_provider(line, provider))
+}
+
+fn wrapper_ready_marker_matches_provider(line: &str, provider: &ProviderKind) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return false;
+    };
+    value.get("type").and_then(|field| field.as_str())
+        == Some(crate::services::tmux_common::WRAPPER_READY_FOR_INPUT_EVENT)
+        && value.get("provider").and_then(|field| field.as_str()) == Some(provider.as_str())
 }
 
 #[cfg(all(test, unix))]
 mod ready_input_prompt_tests {
+    use super::ProviderKind;
+
     #[test]
     fn detects_ready_banner() {
         let capture = "\
 build logs\n\
 Ready for input (type message + Enter)\n\
 > ";
-        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Qwen
+        ));
     }
 
     #[test]
@@ -952,7 +1034,54 @@ output recap\n\
   🤖 Opus(H) │ ██░░░░░░░░ │ 24%\n\
   📁 agentdesk (main*) │ Todos: -\n\
   ⏵⏵ bypass permissions on";
-        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Codex
+        ));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Qwen
+        ));
+    }
+
+    #[test]
+    fn detects_codex_tui_prompt_for_codex_only() {
+        let capture = "\
+some earlier output\n\
+╭──────────────────────────────────────────────────────────────╮\n\
+│ ▌                                                            │\n\
+╰──────────────────────────────────────────────────────────────╯\n\
+  Esc to interrupt   Ctrl+J newline   ⏎ send";
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Codex
+        ));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Qwen
+        ));
+    }
+
+    #[test]
+    fn detects_provider_scoped_wrapper_ready_marker() {
+        let qwen_capture =
+            r#"{"type":"ready_for_input","provider":"qwen","ts":"2026-05-18T00:00:00Z"}"#;
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            qwen_capture,
+            &ProviderKind::Qwen
+        ));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            qwen_capture,
+            &ProviderKind::Codex
+        ));
     }
 
     #[test]
@@ -961,19 +1090,28 @@ output recap\n\
 build logs\n\
 waiting for tool output\n\
 still running";
-        assert!(!super::tmux_capture_indicates_ready_for_input(capture));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
     }
 }
 
 #[cfg(unix)]
-pub(crate) fn tmux_session_ready_for_input(tmux_session_name: &str) -> bool {
+pub(crate) fn tmux_session_ready_for_input(
+    tmux_session_name: &str,
+    provider: &ProviderKind,
+) -> bool {
     crate::services::platform::tmux::capture_pane(tmux_session_name, -80)
-        .map(|stdout| tmux_capture_indicates_ready_for_input(&stdout))
+        .map(|stdout| tmux_capture_indicates_ready_for_input(&stdout, provider))
         .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn tmux_session_ready_for_input(_tmux_session_name: &str) -> bool {
+pub(crate) fn tmux_session_ready_for_input(
+    _tmux_session_name: &str,
+    _provider: &ProviderKind,
+) -> bool {
     false
 }
 
@@ -2508,7 +2646,10 @@ mod tests {
 build logs\n\
 Ready for input (type message + Enter)\n\
 > ";
-        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
     }
 
     #[cfg(unix)]
@@ -2522,7 +2663,10 @@ output recap\n\
   🤖 Opus(H) │ ██░░░░░░░░ │ 24%\n\
   📁 agentdesk (main*) │ Todos: -\n\
   ⏵⏵ bypass permissions on";
-        assert!(super::tmux_capture_indicates_ready_for_input(capture));
+        assert!(super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
     }
 
     #[cfg(unix)]
@@ -2532,7 +2676,10 @@ output recap\n\
 build logs\n\
 waiting for tool output\n\
 still running";
-        assert!(!super::tmux_capture_indicates_ready_for_input(capture));
+        assert!(!super::tmux_capture_indicates_ready_for_input(
+            capture,
+            &ProviderKind::Claude
+        ));
     }
 
     #[test]

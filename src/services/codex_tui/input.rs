@@ -17,13 +17,20 @@
 //!
 //! ## Signal source (priority order)
 //!
-//! The wait path combines provider hook events with pane verification:
+//! The wait path combines rollout envelopes, provider hook events, and pane
+//! verification:
 //!
-//! 1. **Provider hook Stop/SubagentStop fast path.** Codex hook events wake
+//! 1. **Rollout composer-ready fast path.** `codex_tui::rollout_tail`
+//!    synthesizes an `event_msg/composer_ready` envelope after observing the
+//!    Codex rollout terminal signal for the tmux session. This is the primary
+//!    readiness signal because it comes from the JSONL turn lifecycle rather
+//!    than brittle pane scraping.
+//!
+//! 2. **Provider hook Stop/SubagentStop fast path.** Codex hook events wake
 //!    the same prompt-ready notify used by Claude. The hook only shortens the
 //!    wait; we still take a post-event pane snapshot before returning ready.
 //!
-//! 2. **Bottom-anchored composer frame.** The Codex TUI
+//! 3. **Bottom-anchored composer frame.** The Codex TUI
 //!    composer renders at the *bottom* of the pane. We require that
 //!    a composer-edge line (mostly Unicode box-drawing chars) appear
 //!    within the last [`COMPOSER_EDGE_BOTTOM_WINDOW`] non-empty lines
@@ -33,30 +40,16 @@
 //!    model-rendered table several screens up still has glyphs in
 //!    the scan tail.
 //!
-//! 3. **Adjacency.** The footer hint and the composer edge must
+//! 4. **Adjacency.** The footer hint and the composer edge must
 //!    co-occur within [`COMPOSER_FOOTER_ADJACENCY_LINES`] of each
 //!    other. A copied UI frame in assistant prose will not satisfy
 //!    this because it lacks the live footer underneath, and a real
 //!    footer never lives more than a few rows below the composer.
 //!
-//! 4. **Live pane (gate).** A dead pane cannot be ready; we fail
-//!    fast with a structured error instead of waiting out the full
-//!    timeout, so the caller can decide to recreate the session.
-//!
-//! A rollout-event-driven signal (turn-complete from
-//! `codex_tui::rollout_tail`) was considered as an explicit signal
-//! source and deliberately **not** added here. The rollout terminal
-//! event tells the bridge that the *turn* finished, but the TUI may
-//! still be repainting its composer frame for ~one tick after. The
-//! caller is expected to gate on the rollout `Done` (via the
-//! `RuntimeReady` handoff in `execute_streaming_local_tui_tmux`) and
-//! only then ask this module whether the pane is *visually* ready.
-//! Folding the rollout event into this module would couple TUI input
-//! to rollout plumbing and duplicate work. If a future PR proves the
-//! pane marker is too flaky (e.g. across Codex CLI versions that
-//! change the footer copy), add a rollout-event channel as signal
-//! #1 and demote the pane scan to corroboration — see the follow-up
-//! note in `codex_tui::rollout_tail::tail_rollout_file_until_assistant_response`.
+//! 5. **Live pane fallback gate.** When no rollout composer-ready envelope
+//!    is available, a dead pane cannot be ready; the capture fallback fails
+//!    fast with a structured error instead of waiting out the full timeout,
+//!    so the caller can decide to recreate the session.
 //!
 //! ## Cancellation contract
 //!
@@ -65,6 +58,9 @@
 //! and after each sleep so a `/stop` arriving while the TUI is hung
 //! (live pane, never-arriving composer) crosses the boundary inside
 //! ~one wait-interval rather than waiting out the 45s/120s budget.
+//! Prompt delivery also checks the same token between tmux input
+//! actions, so a long literal prompt split into multiple chunks can
+//! be interrupted before the next chunk is sent.
 //! Cancellation returns a distinct
 //! [`PROMPT_READY_CANCELLED_ERROR`] string so the caller can release
 //! the turn without recreating the session — this matches the cancel
@@ -82,8 +78,9 @@
 //! readiness timeout (caller recreates), and the rollout deadline
 //! (caller emits `Done`).
 
+use std::collections::HashSet;
 use std::process::Output;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::services::provider::{CancelToken, cancel_requested};
@@ -170,6 +167,9 @@ impl PromptReadinessKind {
 /// Outcome of the provider hook-event fast path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookFastPathOutcome {
+    /// Rollout tail observed an explicit/synthetic composer-ready envelope for
+    /// this tmux session. This is accepted without pane-capture corroboration.
+    RolloutComposerReady,
     /// Prompt marker was already visible in the subscribe-before-snapshot check.
     PreSnapshotReady,
     /// Pane disappeared before a prompt-ready event could help.
@@ -180,6 +180,53 @@ enum HookFastPathOutcome {
     Ready,
     /// No hook arrived inside the hook budget; fall back to pane polling.
     Pending,
+}
+
+struct RolloutComposerReadyState {
+    notify: Arc<Notify>,
+    ready_sessions: Mutex<HashSet<String>>,
+}
+
+static ROLLOUT_COMPOSER_READY_STATE: OnceLock<RolloutComposerReadyState> = OnceLock::new();
+
+fn rollout_composer_ready_state() -> &'static RolloutComposerReadyState {
+    ROLLOUT_COMPOSER_READY_STATE.get_or_init(|| RolloutComposerReadyState {
+        notify: Arc::new(Notify::new()),
+        ready_sessions: Mutex::new(HashSet::new()),
+    })
+}
+
+pub(crate) fn record_rollout_composer_ready(session_name: &str) {
+    if session_name.trim().is_empty() {
+        return;
+    }
+    let state = rollout_composer_ready_state();
+    state
+        .ready_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(session_name.to_string());
+    state.notify.notify_waiters();
+}
+
+fn mark_rollout_composer_busy(session_name: &str) {
+    rollout_composer_ready_state()
+        .ready_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(session_name);
+}
+
+fn rollout_composer_ready_observed(session_name: &str) -> bool {
+    rollout_composer_ready_state()
+        .ready_sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(session_name)
+}
+
+fn rollout_composer_ready_notify() -> Arc<Notify> {
+    rollout_composer_ready_state().notify.clone()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -362,6 +409,22 @@ pub fn wait_until_codex_tui_input_ready(
     );
 
     match fast_path {
+        HookFastPathOutcome::RolloutComposerReady => {
+            if let Some(err) = cancel_check() {
+                return Err(err);
+            }
+            if Instant::now() >= deadline {
+                let snapshot = prompt_readiness_snapshot(session_name);
+                return Err(timeout_error(&snapshot));
+            }
+            tracing::debug!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "codex_tui prompt ready via rollout composer_ready envelope"
+            );
+            return Ok(());
+        }
         HookFastPathOutcome::PreSnapshotReady => {
             if let Some(err) = cancel_check() {
                 return Err(err);
@@ -436,6 +499,15 @@ pub fn wait_until_codex_tui_input_ready(
         if let Some(err) = cancel_check() {
             return Err(err);
         }
+        if rollout_composer_ready_observed(session_name) {
+            tracing::debug!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "codex_tui prompt ready via rollout composer_ready envelope during fallback loop"
+            );
+            return Ok(());
+        }
         // #2399 HIGH 1: deadline check BEFORE the capture so an
         // already-elapsed budget cannot waste another ~tmux capture-pane
         // round trip on its way out.
@@ -497,12 +569,20 @@ fn run_prompt_ready_fast_path(
     cancel_token: Option<Arc<CancelToken>>,
 ) -> (HookFastPathOutcome, Option<PromptReadinessSnapshot>) {
     let fut = async move {
+        let rollout_ready_notify = rollout_composer_ready_notify();
+        let rollout_ready_notified = rollout_ready_notify.notified();
+        tokio::pin!(rollout_ready_notified);
+        rollout_ready_notified.as_mut().enable();
+
         let notified = notify.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
 
         if cancel_requested(cancel_token.as_deref()) {
             return (HookFastPathOutcome::Cancelled, None);
+        }
+        if rollout_composer_ready_observed(&session_name) {
+            return (HookFastPathOutcome::RolloutComposerReady, None);
         }
         let pre_snapshot = prompt_readiness_snapshot(&session_name);
         if cancel_requested(cancel_token.as_deref()) {
@@ -533,12 +613,22 @@ fn run_prompt_ready_fast_path(
         tokio::pin!(cancel_wait);
 
         let fast_path = tokio::select! {
+            _ = &mut rollout_ready_notified => {
+                if rollout_composer_ready_observed(&session_name) {
+                    HookFastPathOutcome::RolloutComposerReady
+                } else {
+                    HookFastPathOutcome::Pending
+                }
+            },
             _ = &mut notified => HookFastPathOutcome::Ready,
             _ = tokio::time::sleep(wait_budget) => HookFastPathOutcome::Pending,
             _ = &mut cancel_wait => HookFastPathOutcome::Cancelled,
         };
 
-        if matches!(fast_path, HookFastPathOutcome::Cancelled) {
+        if matches!(
+            fast_path,
+            HookFastPathOutcome::Cancelled | HookFastPathOutcome::RolloutComposerReady
+        ) {
             return (fast_path, None);
         }
         if matches!(fast_path, HookFastPathOutcome::Ready) {
@@ -626,6 +716,7 @@ fn send_prompt_with_readiness(
 ) -> Result<(), String> {
     let actions = plan_prompt_submit(prompt)?;
     wait_until_codex_tui_input_ready(session_name, readiness, cancel_token)?;
+    mark_rollout_composer_busy(session_name);
     if cancel_requested(cancel_token.map(Arc::as_ref)) {
         return Err(PROMPT_READY_CANCELLED_ERROR.to_string());
     }
@@ -634,7 +725,7 @@ fn send_prompt_with_readiness(
         session_name,
         prompt,
     );
-    match run_actions(session_name, &actions) {
+    match run_actions(session_name, &actions, cancel_token.map(Arc::as_ref)) {
         Ok(()) => Ok(()),
         Err(error) => {
             crate::services::tui_prompt_dedupe::remove_discord_originated_prompt(
@@ -648,31 +739,86 @@ fn send_prompt_with_readiness(
 }
 
 pub fn send_cancel(session_name: &str) -> Result<(), String> {
-    run_actions(session_name, &plan_cancel())
+    run_actions(session_name, &plan_cancel(), None)
 }
 
-fn run_actions(session_name: &str, actions: &[TuiInputAction]) -> Result<(), String> {
+trait TuiActionExecutor {
+    fn send_literal(&mut self, session_name: &str, text: &str) -> Result<Output, String>;
+    fn load_buffer(&mut self, buffer_name: &str, text: &str) -> Result<Output, String>;
+    fn paste_buffer(
+        &mut self,
+        session_name: &str,
+        buffer_name: &str,
+        delete: bool,
+    ) -> Result<Output, String>;
+    fn send_keys(&mut self, session_name: &str, keys: &[&str]) -> Result<Output, String>;
+}
+
+struct TmuxTuiActionExecutor;
+
+impl TuiActionExecutor for TmuxTuiActionExecutor {
+    fn send_literal(&mut self, session_name: &str, text: &str) -> Result<Output, String> {
+        crate::services::platform::tmux::send_literal(session_name, text)
+    }
+
+    fn load_buffer(&mut self, buffer_name: &str, text: &str) -> Result<Output, String> {
+        crate::services::platform::tmux::load_buffer(buffer_name, text)
+    }
+
+    fn paste_buffer(
+        &mut self,
+        session_name: &str,
+        buffer_name: &str,
+        delete: bool,
+    ) -> Result<Output, String> {
+        crate::services::platform::tmux::paste_buffer(session_name, buffer_name, delete)
+    }
+
+    fn send_keys(&mut self, session_name: &str, keys: &[&str]) -> Result<Output, String> {
+        crate::services::platform::tmux::send_keys(session_name, keys)
+    }
+}
+
+fn run_actions(
+    session_name: &str,
+    actions: &[TuiInputAction],
+    cancel_token: Option<&CancelToken>,
+) -> Result<(), String> {
+    let mut executor = TmuxTuiActionExecutor;
+    run_actions_with_executor(session_name, actions, cancel_token, &mut executor)
+}
+
+fn run_actions_with_executor(
+    session_name: &str,
+    actions: &[TuiInputAction],
+    cancel_token: Option<&CancelToken>,
+    executor: &mut impl TuiActionExecutor,
+) -> Result<(), String> {
     for action in actions {
+        check_prompt_cancel(cancel_token)?;
         let output = match action {
-            TuiInputAction::Literal(text) => {
-                crate::services::platform::tmux::send_literal(session_name, text)?
-            }
+            TuiInputAction::Literal(text) => executor.send_literal(session_name, text)?,
             TuiInputAction::PasteBuffer(text) => {
                 let buffer_name = format!("agentdesk-codex-tui-input-{}", uuid::Uuid::new_v4());
-                let load_output = crate::services::platform::tmux::load_buffer(&buffer_name, text)?;
+                let load_output = executor.load_buffer(&buffer_name, text)?;
                 ensure_tmux_success(load_output, action)?;
-                crate::services::platform::tmux::paste_buffer(session_name, &buffer_name, true)?
+                check_prompt_cancel(cancel_token)?;
+                executor.paste_buffer(session_name, &buffer_name, true)?
             }
-            TuiInputAction::Enter => {
-                crate::services::platform::tmux::send_keys(session_name, &["Enter"])?
-            }
-            TuiInputAction::Escape => {
-                crate::services::platform::tmux::send_keys(session_name, &["Escape"])?
-            }
+            TuiInputAction::Enter => executor.send_keys(session_name, &["Enter"])?,
+            TuiInputAction::Escape => executor.send_keys(session_name, &["Escape"])?,
         };
         ensure_tmux_success(output, action)?;
     }
     Ok(())
+}
+
+fn check_prompt_cancel(cancel_token: Option<&CancelToken>) -> Result<(), String> {
+    if cancel_requested(cancel_token) {
+        Err(PROMPT_READY_CANCELLED_ERROR.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_tmux_success(output: Output, action: &TuiInputAction) -> Result<(), String> {
@@ -885,6 +1031,80 @@ fn split_literal_chunks(input: &str, max_chars: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    use std::sync::atomic::Ordering;
+
+    #[cfg(unix)]
+    fn successful_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    #[cfg(windows)]
+    fn successful_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(0)
+    }
+
+    fn successful_tmux_output() -> Output {
+        Output {
+            status: successful_exit_status(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: Vec<String>,
+        cancel_after_calls: Option<usize>,
+        cancel_token: Option<Arc<CancelToken>>,
+    }
+
+    impl RecordingExecutor {
+        fn maybe_cancel(&self) {
+            if self
+                .cancel_after_calls
+                .is_some_and(|cancel_after| self.calls.len() >= cancel_after)
+            {
+                if let Some(token) = &self.cancel_token {
+                    token.cancelled.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    impl TuiActionExecutor for RecordingExecutor {
+        fn send_literal(&mut self, _session_name: &str, text: &str) -> Result<Output, String> {
+            self.calls.push(format!("literal:{text}"));
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+
+        fn load_buffer(&mut self, _buffer_name: &str, text: &str) -> Result<Output, String> {
+            self.calls.push(format!("load-buffer:{text}"));
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+
+        fn paste_buffer(
+            &mut self,
+            _session_name: &str,
+            _buffer_name: &str,
+            _delete: bool,
+        ) -> Result<Output, String> {
+            self.calls.push("paste-buffer".to_string());
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+
+        fn send_keys(&mut self, _session_name: &str, keys: &[&str]) -> Result<Output, String> {
+            self.calls.push(format!("keys:{}", keys.join("+")));
+            self.maybe_cancel();
+            Ok(successful_tmux_output())
+        }
+    }
 
     // ------------------------------------------------------------------
     // plan_prompt_submit
@@ -956,6 +1176,73 @@ mod tests {
     #[test]
     fn cancel_uses_escape() {
         assert_eq!(plan_cancel(), vec![TuiInputAction::Escape]);
+    }
+
+    #[test]
+    fn run_actions_stops_before_first_tmux_action_when_token_is_pre_cancelled() {
+        let token = Arc::new(CancelToken::new());
+        token.cancelled.store(true, Ordering::Relaxed);
+        let mut executor = RecordingExecutor::default();
+
+        let error = run_actions_with_executor(
+            "agentdesk-codex-tui-input-test",
+            &[TuiInputAction::Escape],
+            Some(&token),
+            &mut executor,
+        )
+        .expect_err("pre-cancelled token must stop before tmux send");
+
+        assert_eq!(error, PROMPT_READY_CANCELLED_ERROR);
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn run_actions_stops_between_literal_chunks_when_token_flips() {
+        let token = Arc::new(CancelToken::new());
+        let mut executor = RecordingExecutor {
+            cancel_after_calls: Some(1),
+            cancel_token: Some(token.clone()),
+            ..RecordingExecutor::default()
+        };
+
+        let error = run_actions_with_executor(
+            "agentdesk-codex-tui-input-test",
+            &[
+                TuiInputAction::Literal("first".to_string()),
+                TuiInputAction::Literal("second".to_string()),
+                TuiInputAction::Enter,
+            ],
+            Some(&token),
+            &mut executor,
+        )
+        .expect_err("cancelled token must stop before next literal chunk");
+
+        assert_eq!(error, PROMPT_READY_CANCELLED_ERROR);
+        assert_eq!(executor.calls, vec!["literal:first"]);
+    }
+
+    #[test]
+    fn run_actions_stops_after_load_buffer_before_paste_when_token_flips() {
+        let token = Arc::new(CancelToken::new());
+        let mut executor = RecordingExecutor {
+            cancel_after_calls: Some(1),
+            cancel_token: Some(token.clone()),
+            ..RecordingExecutor::default()
+        };
+
+        let error = run_actions_with_executor(
+            "agentdesk-codex-tui-input-test",
+            &[
+                TuiInputAction::PasteBuffer("multi\nline".to_string()),
+                TuiInputAction::Enter,
+            ],
+            Some(&token),
+            &mut executor,
+        )
+        .expect_err("cancelled token must stop before paste-buffer");
+
+        assert_eq!(error, PROMPT_READY_CANCELLED_ERROR);
+        assert_eq!(executor.calls, vec!["load-buffer:multi\nline"]);
     }
 
     // ------------------------------------------------------------------
@@ -1133,6 +1420,38 @@ The diagram shows ╭ here.\n\
         ));
         assert!(!is_prompt_ready_timeout_error(PROMPT_READY_CANCELLED_ERROR));
         assert!(!is_session_dead_error(PROMPT_READY_CANCELLED_ERROR));
+    }
+
+    #[test]
+    fn rollout_composer_ready_signal_beats_dead_pane_capture() {
+        let session = format!(
+            "agentdesk-codex-tui-rollout-ready-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        record_rollout_composer_ready(&session);
+
+        let result =
+            wait_until_codex_tui_input_ready(&session, PromptReadinessKind::PostTurnHandoff, None);
+
+        assert!(
+            result.is_ok(),
+            "explicit rollout composer_ready must be accepted before pane fallback, got {result:?}"
+        );
+        mark_rollout_composer_busy(&session);
+    }
+
+    #[test]
+    fn marking_composer_busy_clears_rollout_ready_signal() {
+        let session = format!(
+            "agentdesk-codex-tui-rollout-busy-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        record_rollout_composer_ready(&session);
+        assert!(rollout_composer_ready_observed(&session));
+
+        mark_rollout_composer_busy(&session);
+
+        assert!(!rollout_composer_ready_observed(&session));
     }
 
     // ------------------------------------------------------------------

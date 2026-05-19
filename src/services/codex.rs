@@ -508,6 +508,71 @@ fn should_reuse_existing_provider_session(
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexTmuxTerminationReason {
+    reason_code: &'static str,
+    reason_text: &'static str,
+}
+
+#[cfg(unix)]
+fn codex_tui_existing_session_termination_reason(
+    force_fresh_provider_session: bool,
+    has_live_pane: bool,
+) -> CodexTmuxTerminationReason {
+    if force_fresh_provider_session {
+        CodexTmuxTerminationReason {
+            reason_code: "fresh_provider_session_requested",
+            reason_text: "codex tui fresh provider session requested",
+        }
+    } else if has_live_pane {
+        CodexTmuxTerminationReason {
+            reason_code: "session_restart_before_direct_launch",
+            reason_text: "codex tui local session restart before direct launch",
+        }
+    } else {
+        CodexTmuxTerminationReason {
+            reason_code: "stale_session_recreate",
+            reason_text: "stale codex tui local session cleanup before recreate",
+        }
+    }
+}
+
+#[cfg(unix)]
+fn codex_wrapper_existing_session_termination_reason(
+    force_fresh_provider_session: bool,
+) -> CodexTmuxTerminationReason {
+    if force_fresh_provider_session {
+        CodexTmuxTerminationReason {
+            reason_code: "fresh_provider_session_requested",
+            reason_text: "codex fresh provider session requested",
+        }
+    } else {
+        CodexTmuxTerminationReason {
+            reason_code: "stale_session_recreate",
+            reason_text: "stale local session cleanup before recreate",
+        }
+    }
+}
+
+#[cfg(unix)]
+fn record_codex_tmux_termination(
+    tmux_session_name: &str,
+    killer_component: &str,
+    reason_code: &str,
+    reason_text: &str,
+    last_offset: Option<u64>,
+) {
+    crate::services::termination_audit::record_termination_for_tmux(
+        tmux_session_name,
+        None,
+        killer_component,
+        reason_code,
+        Some(reason_text),
+        last_offset,
+    );
+}
+
+#[cfg(unix)]
 use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
 
 pub fn execute_command_simple(prompt: &str) -> Result<String, String> {
@@ -1317,21 +1382,27 @@ fn execute_streaming_local_tui_tmux(
     let has_live_pane = tmux_session_has_live_pane(tmux_session_name);
 
     if session_exists {
-        let cleanup_reason = if force_fresh_provider_session {
-            "codex tui fresh provider session requested"
-        } else if has_live_pane {
-            "codex tui local session restart before direct launch"
-        } else {
-            "stale codex tui local session cleanup before recreate"
-        };
-        record_tmux_exit_reason(tmux_session_name, cleanup_reason);
-        crate::services::platform::tmux::kill_session_with_reason(
+        let cleanup_reason = codex_tui_existing_session_termination_reason(
+            force_fresh_provider_session,
+            has_live_pane,
+        );
+        record_codex_tmux_termination(
             tmux_session_name,
-            cleanup_reason,
+            "codex_tui_provider",
+            cleanup_reason.reason_code,
+            cleanup_reason.reason_text,
+            None,
+        );
+        record_tmux_exit_reason(tmux_session_name, cleanup_reason.reason_text);
+        crate::services::platform::tmux::kill_session(
+            tmux_session_name,
+            cleanup_reason.reason_text,
         );
     }
 
     crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
+    crate::services::codex_tui::session::CodexTuiSessionFiles::for_tmux_session(tmux_session_name)
+        .cleanup_best_effort();
     write_tmux_owner_marker(tmux_session_name)?;
     let owner_path = tmux_owner_path(tmux_session_name);
 
@@ -1481,8 +1552,15 @@ fn execute_streaming_local_tui_tmux(
                 error = %error,
                 "Codex rollout tail failed; killing tmux session to avoid leak"
             );
+            record_codex_tmux_termination(
+                tmux_session_name,
+                "codex_tui_provider",
+                "rollout_tail_failed",
+                &format!("codex rollout tail failed: {error}"),
+                None,
+            );
             record_tmux_exit_reason(tmux_session_name, &format!("rollout tail failed: {error}"));
-            crate::services::platform::tmux::kill_session_with_reason(
+            crate::services::platform::tmux::kill_session(
                 tmux_session_name,
                 "codex rollout tail failed",
             );
@@ -1516,10 +1594,14 @@ fn execute_streaming_local_tui_tmux(
         );
         return Ok(());
     }
-    if matches!(
-        read_result,
-        crate::services::provider::ReadOutputResult::SessionDied { .. }
-    ) {
+    if let crate::services::provider::ReadOutputResult::SessionDied { offset } = read_result {
+        record_codex_tmux_termination(
+            tmux_session_name,
+            "codex_tui_provider",
+            "session_died_before_response",
+            "codex tui session ended before producing a response",
+            Some(offset),
+        );
         let _ = sender.send(StreamMessage::Done {
             result: "⚠ Codex TUI session ended before producing a response.".to_string(),
             session_id: None,
@@ -1609,6 +1691,13 @@ fn execute_streaming_local_tui_tmux(
                     tmux_session = tmux_session_name,
                     error = %error,
                     "Codex TUI session died before becoming input-ready; suppressing RuntimeReady"
+                );
+                record_codex_tmux_termination(
+                    tmux_session_name,
+                    "codex_tui_provider",
+                    "session_died_before_input_ready",
+                    "codex tui session ended before becoming input-ready",
+                    Some(tail_result.final_offset),
                 );
                 let _ = sender.send(StreamMessage::Done {
                     result: "⚠ Codex TUI session ended before becoming input-ready.".to_string(),
@@ -1700,11 +1789,18 @@ fn execute_streaming_local_tmux(
         )? {
             FollowupResult::Delivered => return Ok(()),
             FollowupResult::RecreateSession { error } => {
+                record_codex_tmux_termination(
+                    tmux_session_name,
+                    "codex_provider",
+                    "followup_failed_recreate",
+                    &format!("followup failed, recreating: {error}"),
+                    None,
+                );
                 record_tmux_exit_reason(
                     tmux_session_name,
                     &format!("followup failed, recreating: {}", error),
                 );
-                crate::services::platform::tmux::kill_session_with_reason(
+                crate::services::platform::tmux::kill_session(
                     tmux_session_name,
                     &format!("followup failed, recreating: {}", error),
                 );
@@ -1712,19 +1808,25 @@ fn execute_streaming_local_tmux(
             }
         }
     } else if session_exists {
-        let cleanup_reason = if force_fresh_provider_session {
-            "codex fresh provider session requested"
-        } else {
-            "stale local session cleanup before recreate"
-        };
-        record_tmux_exit_reason(tmux_session_name, cleanup_reason);
-        crate::services::platform::tmux::kill_session_with_reason(
+        let cleanup_reason =
+            codex_wrapper_existing_session_termination_reason(force_fresh_provider_session);
+        record_codex_tmux_termination(
             tmux_session_name,
-            cleanup_reason,
+            "codex_provider",
+            cleanup_reason.reason_code,
+            cleanup_reason.reason_text,
+            None,
+        );
+        record_tmux_exit_reason(tmux_session_name, cleanup_reason.reason_text);
+        crate::services::platform::tmux::kill_session(
+            tmux_session_name,
+            cleanup_reason.reason_text,
         );
     }
 
     crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
+    crate::services::codex_tui::session::CodexTuiSessionFiles::for_tmux_session(tmux_session_name)
+        .cleanup_best_effort();
 
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
 
@@ -1814,27 +1916,34 @@ fn execute_streaming_local_tmux(
         0,
         sender.clone(),
         cancel_token.clone(),
-        SessionProbe::tmux(tmux_session_name.to_string()),
+        SessionProbe::tmux(tmux_session_name.to_string(), ProviderKind::Codex),
     )?;
 
-    fold_read_output_result(
-        read_result,
-        |offset| {
+    match read_result {
+        crate::services::provider::ReadOutputResult::Completed { offset }
+        | crate::services::provider::ReadOutputResult::Cancelled { offset } => {
             let _ = sender.send(StreamMessage::TmuxReady {
                 output_path,
                 input_fifo_path,
                 tmux_session_name: tmux_session_name.to_string(),
                 last_offset: offset,
             });
-        },
-        |_| {
+        }
+        crate::services::provider::ReadOutputResult::SessionDied { offset } => {
+            record_codex_tmux_termination(
+                tmux_session_name,
+                "codex_provider",
+                "session_died",
+                "codex tmux session ended before turn completion",
+                Some(offset),
+            );
             let _ = sender.send(StreamMessage::Done {
                 result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
                     .to_string(),
                 session_id: None,
             });
-        },
-    );
+        }
+    }
 
     Ok(())
 }
@@ -1885,7 +1994,7 @@ fn send_followup_to_tmux(
         start_offset,
         sender.clone(),
         cancel_token,
-        SessionProbe::tmux(tmux_session_name.to_string()),
+        SessionProbe::tmux(tmux_session_name.to_string(), ProviderKind::Codex),
     ) {
         Ok(read_result) => read_result,
         Err(failure) => {
@@ -1894,7 +2003,10 @@ fn send_followup_to_tmux(
             let input_exists = std::path::Path::new(input_fifo_path).exists();
             let session_alive = tmux_session_has_live_pane(tmux_session_name);
             let ready_for_input = session_alive
-                && crate::services::provider::tmux_session_ready_for_input(tmux_session_name);
+                && crate::services::provider::tmux_session_ready_for_input(
+                    tmux_session_name,
+                    &ProviderKind::Codex,
+                );
 
             if let Some(fallback) = tmux_followup_fallback_after_read_error(
                 start_offset,
@@ -2394,6 +2506,11 @@ mod tui_hosting_tests {
         build_codex_tui_args, build_tmux_launch_env_lines, direct_tui_material_fallback_reason,
         render_codex_tui_tmux_script, render_codex_wrapper_tmux_script,
     };
+    #[cfg(unix)]
+    use super::{
+        codex_tui_existing_session_termination_reason,
+        codex_wrapper_existing_session_termination_reason,
+    };
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
     };
@@ -2630,6 +2747,36 @@ mod tui_hosting_tests {
         assert!(!CodexRuntimeKind::RemoteTmux.uses_codex_exec_json());
         assert!(CodexRuntimeKind::DirectHeadless.uses_codex_exec_json());
         assert!(CodexRuntimeKind::SimpleHeadless.uses_codex_exec_json());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_tui_existing_session_audit_reasons_match_cleanup_paths() {
+        assert_eq!(
+            codex_tui_existing_session_termination_reason(true, true).reason_code,
+            "fresh_provider_session_requested"
+        );
+        assert_eq!(
+            codex_tui_existing_session_termination_reason(false, true).reason_code,
+            "session_restart_before_direct_launch"
+        );
+        assert_eq!(
+            codex_tui_existing_session_termination_reason(false, false).reason_code,
+            "stale_session_recreate"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_wrapper_existing_session_audit_reasons_match_cleanup_paths() {
+        assert_eq!(
+            codex_wrapper_existing_session_termination_reason(true).reason_code,
+            "fresh_provider_session_requested"
+        );
+        assert_eq!(
+            codex_wrapper_existing_session_termination_reason(false).reason_code,
+            "stale_session_recreate"
+        );
     }
 }
 

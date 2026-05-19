@@ -16,6 +16,8 @@
 //!   * [`lookup_voice_turn_link_by_dispatch_id_pg`] /
 //!     [`lookup_voice_turn_link_by_announce_message_id_pg`] — reverse
 //!     lookups for call sites that only know one of those ids.
+//!   * [`attach_voice_turn_link_ids_pg`] — fill announce/dispatch/turn
+//!     identifiers when downstream models learn them after link creation.
 //!   * [`mark_terminal_voice_turn_link_pg`] — flip status when the routed
 //!     turn completes (TTS done, run_completed, etc.).
 //!   * [`gc_terminal_voice_turn_links_pg`] — leader-only maintenance sweep
@@ -70,6 +72,7 @@ pub struct VoiceTurnLink {
     pub generation: i32,
     pub announce_message_id: Option<u64>,
     pub dispatch_id: Option<String>,
+    pub turn_id: Option<String>,
     pub status: VoiceTurnLinkStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -87,6 +90,44 @@ pub struct VoiceTurnLinkInsert {
     pub generation: i32,
     pub announce_message_id: Option<u64>,
     pub dispatch_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+/// Optional identifiers learned after the initial voice link row exists.
+/// Each supplied value is "attach only": it fills a NULL column or confirms
+/// an identical value, but never overwrites a different durable identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceTurnLinkIdentityPatch {
+    pub guild_id: u64,
+    pub voice_channel_id: u64,
+    pub utterance_id: String,
+    pub generation: i32,
+    pub announce_message_id: Option<u64>,
+    pub dispatch_id: Option<String>,
+    pub turn_id: Option<String>,
+}
+
+/// The result of [`attach_voice_turn_link_ids_pg`].
+///
+/// Callers that need to distinguish "nothing existed" from "something
+/// conflicted" must match on this instead of treating both as `None`.
+/// The single-ID convenience helpers (`attach_announce_message_id_…`,
+/// etc.) collapse `NotFound | Conflict` into `Ok(None)` for callers
+/// that do not need the distinction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachOutcome {
+    /// At least one NULL column was filled in; `updated_at` was bumped.
+    Attached(VoiceTurnLink),
+    /// Row found but no column needed updating — all-None patch or every
+    /// supplied value already matched the stored durable identity.
+    /// `updated_at` was **not** touched.
+    Unchanged(VoiceTurnLink),
+    /// No row exists for the supplied `(guild_id, voice_channel_id,
+    /// utterance_id, generation)` key.
+    NotFound,
+    /// The row exists but carries a different durable identity for at
+    /// least one supplied non-`None` field. The row was not modified.
+    Conflict,
 }
 
 fn u64_to_i64(value: u64) -> i64 {
@@ -120,6 +161,7 @@ fn row_to_link(row: &sqlx::postgres::PgRow) -> VoiceTurnLink {
             .get::<Option<i64>, _>("announce_message_id")
             .map(i64_to_u64),
         dispatch_id: row.get::<Option<String>, _>("dispatch_id"),
+        turn_id: row.get::<Option<String>, _>("turn_id"),
         status,
         created_at: row.get::<DateTime<Utc>, _>("created_at"),
         updated_at: row.get::<DateTime<Utc>, _>("updated_at"),
@@ -129,7 +171,8 @@ fn row_to_link(row: &sqlx::postgres::PgRow) -> VoiceTurnLink {
 /// SQL `RETURNING` projection used by every helper that yields a
 /// [`VoiceTurnLink`]. Kept centralised so column drift is impossible.
 const RETURNING_COLUMNS: &str = "id, guild_id, voice_channel_id, background_channel_id, \
-    utterance_id, generation, announce_message_id, dispatch_id, status, created_at, updated_at";
+    utterance_id, generation, announce_message_id, dispatch_id, turn_id, status, created_at, \
+    updated_at";
 
 /// Insert a new voice turn link as `active`. Idempotent on
 /// `(guild_id, voice_channel_id, utterance_id, generation)`: simple retries
@@ -201,15 +244,15 @@ pub async fn insert_voice_turn_link_pg(
     let sql = format!(
         "INSERT INTO voice_turn_link (
              guild_id, voice_channel_id, background_channel_id,
-             utterance_id, generation, announce_message_id, dispatch_id,
+             utterance_id, generation, announce_message_id, dispatch_id, turn_id,
              status, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NOW(), NOW())
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', NOW(), NOW())
          ON CONFLICT (guild_id, voice_channel_id, utterance_id, generation)
          DO NOTHING
          RETURNING {RETURNING_COLUMNS}"
     );
 
-    let row = sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(u64_to_i64(insert.guild_id))
         .bind(u64_to_i64(insert.voice_channel_id))
         .bind(u64_to_i64(insert.background_channel_id))
@@ -217,8 +260,20 @@ pub async fn insert_voice_turn_link_pg(
         .bind(insert.generation)
         .bind(insert.announce_message_id.map(u64_to_i64))
         .bind(insert.dispatch_id.as_deref())
+        .bind(insert.turn_id.as_deref())
         .fetch_optional(&mut *tx)
-        .await?;
+        .await;
+
+    // A turn_id collision with a different row is treated as a dedup: the
+    // caller gets Ok(None) rather than a propagated UniqueViolation. The tx
+    // drops here and auto-rolls back in the conflict branch.
+    let row = match result {
+        Ok(row) => row,
+        Err(sqlx::Error::Database(e)) if e.constraint() == Some("voice_turn_link_turn_id_uq") => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     tx.commit().await?;
 
@@ -336,14 +391,14 @@ pub async fn retarget_voice_turn_link_pg(
     let sql = format!(
         "INSERT INTO voice_turn_link (
              guild_id, voice_channel_id, background_channel_id,
-             utterance_id, generation, announce_message_id, dispatch_id,
+             utterance_id, generation, announce_message_id, dispatch_id, turn_id,
              status, created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', NOW(), NOW())
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', NOW(), NOW())
          ON CONFLICT (guild_id, voice_channel_id, utterance_id, generation)
          DO NOTHING
          RETURNING {RETURNING_COLUMNS}"
     );
-    let inserted = sqlx::query(&sql)
+    let result = sqlx::query(&sql)
         .bind(u64_to_i64(insert.guild_id))
         .bind(u64_to_i64(insert.voice_channel_id))
         .bind(u64_to_i64(insert.background_channel_id))
@@ -351,12 +406,282 @@ pub async fn retarget_voice_turn_link_pg(
         .bind(insert.generation)
         .bind(insert.announce_message_id.map(u64_to_i64))
         .bind(insert.dispatch_id.as_deref())
+        .bind(insert.turn_id.as_deref())
         .fetch_optional(&mut *tx)
-        .await?;
+        .await;
+
+    // A turn_id collision with a different row is treated as a dedup: the
+    // caller gets Ok(None) rather than a propagated UniqueViolation. The tx
+    // drops here and auto-rolls back in the conflict branch.
+    let inserted = match result {
+        Ok(row) => row,
+        Err(sqlx::Error::Database(e)) if e.constraint() == Some("voice_turn_link_turn_id_uq") => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     tx.commit().await?;
 
     Ok(inserted.as_ref().map(row_to_link))
+}
+
+/// Create or advance the active link for an utterance.
+///
+/// This is the C-series friendly entry point: with no existing row it creates
+/// generation 0 (or whichever generation the caller supplies); with a higher
+/// generation it cancels prior active rows and inserts the new active row; with
+/// an already-present same generation it attaches any newly learned identifiers
+/// and returns the active row. Stale or post-terminal attempts return `None`.
+///
+/// **Conflict semantics**: if the row already carries a different durable
+/// identity for any supplied non-`None` field (dispatch_id, announce_message_id,
+/// or turn_id), the call returns `Ok(None)` — the conflicting insert is
+/// rejected, not silently ignored. Callers must not treat that `None` as
+/// success; the stored link belongs to a different identity set.
+pub async fn upsert_active_voice_turn_link_pg(
+    pool: &PgPool,
+    insert: &VoiceTurnLinkInsert,
+) -> Result<Option<VoiceTurnLink>> {
+    if let Some(link) = retarget_voice_turn_link_pg(pool, insert).await? {
+        return Ok(Some(link));
+    }
+
+    let patch = VoiceTurnLinkIdentityPatch {
+        guild_id: insert.guild_id,
+        voice_channel_id: insert.voice_channel_id,
+        utterance_id: insert.utterance_id.clone(),
+        generation: insert.generation,
+        announce_message_id: insert.announce_message_id,
+        dispatch_id: insert.dispatch_id.clone(),
+        turn_id: insert.turn_id.clone(),
+    };
+    match attach_voice_turn_link_ids_pg(pool, &patch).await? {
+        AttachOutcome::Attached(link) | AttachOutcome::Unchanged(link) => {
+            if link.status == VoiceTurnLinkStatus::Active {
+                return Ok(Some(link));
+            }
+            // Row exists but is not active (cancelled/terminal) — fall through.
+        }
+        AttachOutcome::Conflict => {
+            // Caller supplied IDs that conflict with stored durable identities.
+            // Reject rather than silently returning the old link.
+            return Ok(None);
+        }
+        AttachOutcome::NotFound => {
+            // Row doesn't exist for this generation — fall through to lookup.
+        }
+    }
+
+    let active = lookup_active_voice_turn_link_by_utterance_pg(
+        pool,
+        insert.guild_id,
+        insert.voice_channel_id,
+        &insert.utterance_id,
+    )
+    .await?;
+    Ok(active.filter(|link| link.generation == insert.generation))
+}
+
+/// Attach announce/dispatch/turn identifiers to an existing durable link.
+///
+/// Returns [`AttachOutcome`] so callers can distinguish the four cases:
+///
+/// * `Attached(row)` — at least one NULL column was filled; `updated_at`
+///   was bumped.
+/// * `Unchanged(row)` — row found but nothing was written (all-None patch or
+///   every supplied value already matched the stored identity); `updated_at`
+///   was **not** touched, so route resolution order is preserved.
+/// * `NotFound` — no row exists for `(guild_id, voice_channel_id,
+///   utterance_id, generation)`.
+/// * `Conflict` — the row exists but already carries a different durable
+///   identity for at least one supplied non-`None` field; the row is
+///   unchanged.
+///
+/// The single-ID convenience helpers collapse `NotFound | Conflict` into
+/// `Ok(None)` for callers that do not need the distinction.
+pub async fn attach_voice_turn_link_ids_pg(
+    pool: &PgPool,
+    patch: &VoiceTurnLinkIdentityPatch,
+) -> Result<AttachOutcome> {
+    // Read the current row first so we can detect conflicts and no-ops
+    // without an UPDATE that would spuriously bump updated_at.
+    let select_sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE guild_id = $1
+            AND voice_channel_id = $2
+            AND utterance_id = $3
+            AND generation = $4"
+    );
+    let current_row = sqlx::query(&select_sql)
+        .bind(u64_to_i64(patch.guild_id))
+        .bind(u64_to_i64(patch.voice_channel_id))
+        .bind(&patch.utterance_id)
+        .bind(patch.generation)
+        .fetch_optional(pool)
+        .await?;
+
+    let Some(current_row) = current_row else {
+        return Ok(AttachOutcome::NotFound);
+    };
+    let current = row_to_link(&current_row);
+
+    // Detect conflicts: a supplied non-None value that differs from an
+    // already-stored non-None value. First-writer wins; the identity is
+    // durable once set.
+    if let (Some(new), Some(old)) = (patch.announce_message_id, current.announce_message_id) {
+        if new != old {
+            return Ok(AttachOutcome::Conflict);
+        }
+    }
+    if let (Some(new), Some(old)) = (&patch.dispatch_id, &current.dispatch_id) {
+        if new != old {
+            return Ok(AttachOutcome::Conflict);
+        }
+    }
+    if let (Some(new), Some(old)) = (&patch.turn_id, &current.turn_id) {
+        if new != old {
+            return Ok(AttachOutcome::Conflict);
+        }
+    }
+
+    // Determine which columns actually need to be written.
+    let needs_announce =
+        patch.announce_message_id.is_some() && current.announce_message_id.is_none();
+    let needs_dispatch = patch.dispatch_id.is_some() && current.dispatch_id.is_none();
+    let needs_turn = patch.turn_id.is_some() && current.turn_id.is_none();
+
+    if !needs_announce && !needs_dispatch && !needs_turn {
+        // Nothing to write — return the row without touching updated_at so
+        // route resolution order (ORDER BY updated_at DESC) is not disturbed.
+        return Ok(AttachOutcome::Unchanged(current));
+    }
+
+    // At least one NULL column can be filled. Do the UPDATE.  The WHERE
+    // clause is still conflict-safe for any race between the SELECT above
+    // and this UPDATE.  A concurrent writer that beat us to one of these
+    // columns will cause the UPDATE to return nothing → Conflict.
+    let update_sql = format!(
+        "UPDATE voice_turn_link
+            SET announce_message_id = COALESCE(announce_message_id, $5),
+                dispatch_id = COALESCE(dispatch_id, $6),
+                turn_id = COALESCE(turn_id, $7),
+                updated_at = NOW()
+          WHERE guild_id = $1
+            AND voice_channel_id = $2
+            AND utterance_id = $3
+            AND generation = $4
+            AND ($5::BIGINT IS NULL OR announce_message_id IS NULL OR announce_message_id = $5)
+            AND ($6::TEXT IS NULL OR dispatch_id IS NULL OR dispatch_id = $6)
+            AND ($7::TEXT IS NULL OR turn_id IS NULL OR turn_id = $7)
+          RETURNING {RETURNING_COLUMNS}"
+    );
+    let result = sqlx::query(&update_sql)
+        .bind(u64_to_i64(patch.guild_id))
+        .bind(u64_to_i64(patch.voice_channel_id))
+        .bind(&patch.utterance_id)
+        .bind(patch.generation)
+        .bind(patch.announce_message_id.map(u64_to_i64))
+        .bind(patch.dispatch_id.as_deref())
+        .bind(patch.turn_id.as_deref())
+        .fetch_optional(pool)
+        .await;
+
+    match result {
+        Ok(Some(row)) => Ok(AttachOutcome::Attached(row_to_link(&row))),
+        Ok(None) => {
+            // A concurrent writer filled in a conflicting value between our
+            // SELECT and this UPDATE.
+            Ok(AttachOutcome::Conflict)
+        }
+        Err(sqlx::Error::Database(e)) if e.constraint() == Some("voice_turn_link_turn_id_uq") => {
+            // Another row already holds this turn_id.
+            Ok(AttachOutcome::Conflict)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub async fn attach_announce_message_id_voice_turn_link_pg(
+    pool: &PgPool,
+    guild_id: u64,
+    voice_channel_id: u64,
+    utterance_id: &str,
+    generation: i32,
+    announce_message_id: u64,
+) -> Result<Option<VoiceTurnLink>> {
+    match attach_voice_turn_link_ids_pg(
+        pool,
+        &VoiceTurnLinkIdentityPatch {
+            guild_id,
+            voice_channel_id,
+            utterance_id: utterance_id.to_string(),
+            generation,
+            announce_message_id: Some(announce_message_id),
+            dispatch_id: None,
+            turn_id: None,
+        },
+    )
+    .await?
+    {
+        AttachOutcome::Attached(link) | AttachOutcome::Unchanged(link) => Ok(Some(link)),
+        AttachOutcome::NotFound | AttachOutcome::Conflict => Ok(None),
+    }
+}
+
+pub async fn attach_dispatch_id_voice_turn_link_pg(
+    pool: &PgPool,
+    guild_id: u64,
+    voice_channel_id: u64,
+    utterance_id: &str,
+    generation: i32,
+    dispatch_id: &str,
+) -> Result<Option<VoiceTurnLink>> {
+    match attach_voice_turn_link_ids_pg(
+        pool,
+        &VoiceTurnLinkIdentityPatch {
+            guild_id,
+            voice_channel_id,
+            utterance_id: utterance_id.to_string(),
+            generation,
+            announce_message_id: None,
+            dispatch_id: Some(dispatch_id.to_string()),
+            turn_id: None,
+        },
+    )
+    .await?
+    {
+        AttachOutcome::Attached(link) | AttachOutcome::Unchanged(link) => Ok(Some(link)),
+        AttachOutcome::NotFound | AttachOutcome::Conflict => Ok(None),
+    }
+}
+
+pub async fn attach_turn_id_voice_turn_link_pg(
+    pool: &PgPool,
+    guild_id: u64,
+    voice_channel_id: u64,
+    utterance_id: &str,
+    generation: i32,
+    turn_id: &str,
+) -> Result<Option<VoiceTurnLink>> {
+    match attach_voice_turn_link_ids_pg(
+        pool,
+        &VoiceTurnLinkIdentityPatch {
+            guild_id,
+            voice_channel_id,
+            utterance_id: utterance_id.to_string(),
+            generation,
+            announce_message_id: None,
+            dispatch_id: None,
+            turn_id: Some(turn_id.to_string()),
+        },
+    )
+    .await?
+    {
+        AttachOutcome::Attached(link) | AttachOutcome::Unchanged(link) => Ok(Some(link)),
+        AttachOutcome::NotFound | AttachOutcome::Conflict => Ok(None),
+    }
 }
 
 /// Derive a stable i64 advisory-lock key from the
@@ -418,6 +743,25 @@ pub async fn lookup_voice_turn_link_by_dispatch_id_pg(
     Ok(row.as_ref().map(row_to_link))
 }
 
+pub async fn lookup_active_voice_turn_link_by_dispatch_id_pg(
+    pool: &PgPool,
+    dispatch_id: &str,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE dispatch_id = $1
+            AND status = 'active'
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(dispatch_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
 /// Reverse lookup by `announce_message_id`. Same shape as the
 /// dispatch_id lookup; primarily used by barge-in cancel resolution when
 /// only the announce message anchor is available.
@@ -434,6 +778,130 @@ pub async fn lookup_voice_turn_link_by_announce_message_id_pg(
     );
     let row = sqlx::query(&sql)
         .bind(u64_to_i64(announce_message_id))
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
+pub async fn lookup_active_voice_turn_link_by_announce_message_id_pg(
+    pool: &PgPool,
+    announce_message_id: u64,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE announce_message_id = $1
+            AND status = 'active'
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(u64_to_i64(announce_message_id))
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
+pub async fn lookup_voice_turn_link_by_turn_id_pg(
+    pool: &PgPool,
+    turn_id: &str,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE turn_id = $1
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql).bind(turn_id).fetch_optional(pool).await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
+pub async fn lookup_active_voice_turn_link_by_turn_id_pg(
+    pool: &PgPool,
+    turn_id: &str,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE turn_id = $1
+            AND status = 'active'
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql).bind(turn_id).fetch_optional(pool).await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
+pub async fn lookup_active_voice_turn_link_by_utterance_pg(
+    pool: &PgPool,
+    guild_id: u64,
+    voice_channel_id: u64,
+    utterance_id: &str,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE guild_id = $1
+            AND voice_channel_id = $2
+            AND utterance_id = $3
+            AND status = 'active'
+          ORDER BY generation DESC, updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(u64_to_i64(guild_id))
+        .bind(u64_to_i64(voice_channel_id))
+        .bind(utterance_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
+/// Resolve the active background text channel for a source voice channel.
+/// If multiple utterances are active in that voice channel, the most recently
+/// updated link wins; callers with an utterance id should use
+/// [`lookup_active_voice_turn_link_by_utterance_pg`] for an exact match.
+pub async fn resolve_active_voice_turn_target_pg(
+    pool: &PgPool,
+    guild_id: u64,
+    voice_channel_id: u64,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE guild_id = $1
+            AND voice_channel_id = $2
+            AND status = 'active'
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(u64_to_i64(guild_id))
+        .bind(u64_to_i64(voice_channel_id))
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_link))
+}
+
+/// Resolve the active source voice channel for a background text channel.
+pub async fn resolve_active_voice_turn_source_pg(
+    pool: &PgPool,
+    guild_id: u64,
+    background_channel_id: u64,
+) -> Result<Option<VoiceTurnLink>> {
+    let sql = format!(
+        "SELECT {RETURNING_COLUMNS}
+           FROM voice_turn_link
+          WHERE guild_id = $1
+            AND background_channel_id = $2
+            AND status = 'active'
+          ORDER BY updated_at DESC, id DESC
+          LIMIT 1"
+    );
+    let row = sqlx::query(&sql)
+        .bind(u64_to_i64(guild_id))
+        .bind(u64_to_i64(background_channel_id))
         .fetch_optional(pool)
         .await?;
     Ok(row.as_ref().map(row_to_link))
@@ -627,6 +1095,7 @@ mod tests {
             generation,
             announce_message_id: Some(400 + generation as u64),
             dispatch_id: Some(format!("dispatch-{generation}")),
+            turn_id: Some(format!("turn-{generation}")),
         }
     }
 
@@ -648,6 +1117,7 @@ mod tests {
         assert_eq!(link.generation, 0);
         assert_eq!(link.status, VoiceTurnLinkStatus::Active);
         assert_eq!(link.dispatch_id.as_deref(), Some("dispatch-0"));
+        assert_eq!(link.turn_id.as_deref(), Some("turn-0"));
 
         // Same-key reinsert is a no-op (idempotent dedup).
         let again = insert_voice_turn_link_pg(&pool, &sample_insert(0))
@@ -758,6 +1228,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_ids_and_lookup_active_by_turn_id_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        let mut insert = sample_insert(0);
+        insert.announce_message_id = None;
+        insert.dispatch_id = None;
+        insert.turn_id = None;
+        insert_voice_turn_link_pg(&pool, &insert)
+            .await
+            .unwrap()
+            .expect("seed insert");
+
+        let attached = match attach_voice_turn_link_ids_pg(
+            &pool,
+            &VoiceTurnLinkIdentityPatch {
+                guild_id: 100,
+                voice_channel_id: 200,
+                utterance_id: "utt-42".to_string(),
+                generation: 0,
+                announce_message_id: Some(777),
+                dispatch_id: Some("dispatch-attached".to_string()),
+                turn_id: Some("turn-attached".to_string()),
+            },
+        )
+        .await
+        .unwrap()
+        {
+            AttachOutcome::Attached(link) => link,
+            other => panic!("expected Attached, got {other:?}"),
+        };
+        assert_eq!(attached.announce_message_id, Some(777));
+        assert_eq!(attached.dispatch_id.as_deref(), Some("dispatch-attached"));
+        assert_eq!(attached.turn_id.as_deref(), Some("turn-attached"));
+
+        let by_dispatch =
+            lookup_active_voice_turn_link_by_dispatch_id_pg(&pool, "dispatch-attached")
+                .await
+                .unwrap()
+                .expect("active lookup by dispatch_id");
+        assert_eq!(by_dispatch.utterance_id, "utt-42");
+
+        let by_announce = lookup_active_voice_turn_link_by_announce_message_id_pg(&pool, 777)
+            .await
+            .unwrap()
+            .expect("active lookup by announce_message_id");
+        assert_eq!(
+            by_announce.dispatch_id.as_deref(),
+            Some("dispatch-attached")
+        );
+
+        let by_turn = lookup_active_voice_turn_link_by_turn_id_pg(&pool, "turn-attached")
+            .await
+            .unwrap()
+            .expect("active lookup by turn_id");
+        assert_eq!(by_turn.voice_channel_id, 200);
+
+        let conflict = attach_dispatch_id_voice_turn_link_pg(
+            &pool,
+            100,
+            200,
+            "utt-42",
+            0,
+            "dispatch-different",
+        )
+        .await
+        .unwrap();
+        assert!(
+            conflict.is_none(),
+            "attach must not overwrite a different dispatch_id"
+        );
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    #[tokio::test]
+    async fn upsert_active_returns_existing_same_generation_with_new_ids_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        let mut seed = sample_insert(0);
+        seed.announce_message_id = None;
+        seed.dispatch_id = None;
+        seed.turn_id = None;
+        let inserted = upsert_active_voice_turn_link_pg(&pool, &seed)
+            .await
+            .unwrap()
+            .expect("initial upsert inserts");
+        assert_eq!(inserted.status, VoiceTurnLinkStatus::Active);
+
+        let mut same_generation = seed.clone();
+        same_generation.announce_message_id = Some(910);
+        same_generation.dispatch_id = Some("dispatch-upsert".to_string());
+        same_generation.turn_id = Some("turn-upsert".to_string());
+        let updated = upsert_active_voice_turn_link_pg(&pool, &same_generation)
+            .await
+            .unwrap()
+            .expect("same generation upsert returns existing active row");
+        assert_eq!(updated.id, inserted.id);
+        assert_eq!(updated.announce_message_id, Some(910));
+        assert_eq!(updated.dispatch_id.as_deref(), Some("dispatch-upsert"));
+        assert_eq!(updated.turn_id.as_deref(), Some("turn-upsert"));
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    #[tokio::test]
+    async fn active_route_resolution_is_directional_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        let mut first = sample_insert(0);
+        first.utterance_id = "utt-route-a".to_string();
+        first.background_channel_id = 300;
+        insert_voice_turn_link_pg(&pool, &first).await.unwrap();
+
+        let mut second = sample_insert(0);
+        second.utterance_id = "utt-route-b".to_string();
+        second.background_channel_id = 301;
+        second.dispatch_id = Some("dispatch-route-b".to_string());
+        second.turn_id = Some("turn-route-b".to_string());
+        insert_voice_turn_link_pg(&pool, &second).await.unwrap();
+
+        let target = resolve_active_voice_turn_target_pg(&pool, 100, 200)
+            .await
+            .unwrap()
+            .expect("source voice channel resolves to latest active target");
+        assert_eq!(target.background_channel_id, 301);
+
+        let source = resolve_active_voice_turn_source_pg(&pool, 100, 300)
+            .await
+            .unwrap()
+            .expect("background target resolves to source voice channel");
+        assert_eq!(source.voice_channel_id, 200);
+        assert_eq!(source.utterance_id, "utt-route-a");
+
+        mark_terminal_voice_turn_link_pg(&pool, 100, 200, "utt-route-a", 0)
+            .await
+            .unwrap();
+        let missing = resolve_active_voice_turn_source_pg(&pool, 100, 300)
+            .await
+            .unwrap();
+        assert!(missing.is_none(), "terminal rows are excluded");
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    #[tokio::test]
     async fn mark_terminal_updates_status_pg() {
         let Some(pg) = TestPostgresDb::try_create().await else {
             return;
@@ -795,6 +1422,7 @@ mod tests {
         let mut active = sample_insert(0);
         active.utterance_id = "utt-active".to_string();
         active.dispatch_id = Some("dispatch-active".to_string());
+        active.turn_id = Some("turn-active".to_string());
         insert_voice_turn_link_pg(&pool, &active).await.unwrap();
 
         // Cancelled row — must survive GC (long-lived background turn
@@ -802,11 +1430,13 @@ mod tests {
         let mut cancelled = sample_insert(0);
         cancelled.utterance_id = "utt-cancelled".to_string();
         cancelled.dispatch_id = Some("dispatch-cancelled".to_string());
+        cancelled.turn_id = Some("turn-cancelled".to_string());
         insert_voice_turn_link_pg(&pool, &cancelled).await.unwrap();
         let mut cancelled_next = cancelled.clone();
         cancelled_next.generation = 1;
         cancelled_next.dispatch_id = Some("dispatch-cancelled-next".to_string());
         cancelled_next.announce_message_id = Some(9991);
+        cancelled_next.turn_id = Some("turn-cancelled-next".to_string());
         retarget_voice_turn_link_pg(&pool, &cancelled_next)
             .await
             .unwrap();
@@ -815,6 +1445,7 @@ mod tests {
         let mut terminal = sample_insert(0);
         terminal.utterance_id = "utt-terminal".to_string();
         terminal.dispatch_id = Some("dispatch-terminal".to_string());
+        terminal.turn_id = Some("turn-terminal".to_string());
         insert_voice_turn_link_pg(&pool, &terminal).await.unwrap();
         mark_terminal_voice_turn_link_pg(&pool, 100, 200, "utt-terminal", 0)
             .await
@@ -869,6 +1500,7 @@ mod tests {
         let mut fresh = sample_insert(0);
         fresh.utterance_id = "utt-fresh-terminal".to_string();
         fresh.dispatch_id = Some("dispatch-fresh".to_string());
+        fresh.turn_id = Some("turn-fresh".to_string());
         insert_voice_turn_link_pg(&pool, &fresh).await.unwrap();
         mark_terminal_voice_turn_link_pg(&pool, 100, 200, "utt-fresh-terminal", 0)
             .await
@@ -1275,6 +1907,228 @@ mod tests {
             winning_generation, 2,
             "the higher generation must win regardless of commit order"
         );
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    /// all-None attach must return Unchanged and must NOT bump updated_at.
+    /// A spurious updated_at bump would reorder route resolution results
+    /// (`ORDER BY updated_at DESC`) without any semantic change.
+    #[tokio::test]
+    async fn attach_all_none_does_not_bump_updated_at_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        let mut seed = sample_insert(0);
+        seed.announce_message_id = None;
+        seed.dispatch_id = None;
+        seed.turn_id = None;
+        let inserted = insert_voice_turn_link_pg(&pool, &seed)
+            .await
+            .unwrap()
+            .expect("seed insert");
+        let original_updated_at = inserted.updated_at;
+
+        // Tiny sleep so NOW() would be strictly greater if we wrote.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let outcome = attach_voice_turn_link_ids_pg(
+            &pool,
+            &VoiceTurnLinkIdentityPatch {
+                guild_id: 100,
+                voice_channel_id: 200,
+                utterance_id: "utt-42".to_string(),
+                generation: 0,
+                announce_message_id: None,
+                dispatch_id: None,
+                turn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            AttachOutcome::Unchanged(link) => {
+                assert_eq!(
+                    link.updated_at, original_updated_at,
+                    "all-None patch must not bump updated_at"
+                );
+            }
+            other => panic!("expected Unchanged, got {other:?}"),
+        }
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    /// Same-generation conflicting dispatch_id: upsert must return None
+    /// (rejected), not silently hand back the old active link. This was
+    /// the original NOT CLEAN finding: callers could not tell a conflict
+    /// from success.
+    #[tokio::test]
+    async fn upsert_conflicting_ids_returns_none_not_old_link_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        // Establish an active row with a specific dispatch_id.
+        let mut first = sample_insert(0);
+        first.dispatch_id = Some("dispatch-first".to_string());
+        first.announce_message_id = None;
+        first.turn_id = Some("turn-first-unique".to_string());
+        let link = upsert_active_voice_turn_link_pg(&pool, &first)
+            .await
+            .unwrap()
+            .expect("initial upsert inserts");
+        assert_eq!(link.dispatch_id.as_deref(), Some("dispatch-first"));
+
+        // Same generation, different dispatch_id → conflict.
+        let mut conflict = first.clone();
+        conflict.dispatch_id = Some("dispatch-conflict".to_string());
+        let result = upsert_active_voice_turn_link_pg(&pool, &conflict)
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "upsert with conflicting dispatch_id must return None, not the old link"
+        );
+
+        // The original row must be entirely unchanged.
+        let row = lookup_active_voice_turn_link_by_dispatch_id_pg(&pool, "dispatch-first")
+            .await
+            .unwrap()
+            .expect("original dispatch_id still present");
+        assert_eq!(
+            row.dispatch_id.as_deref(),
+            Some("dispatch-first"),
+            "original row must not be mutated"
+        );
+
+        // Direct attach also returns Conflict, not Unchanged.
+        let attach_outcome = attach_voice_turn_link_ids_pg(
+            &pool,
+            &VoiceTurnLinkIdentityPatch {
+                guild_id: 100,
+                voice_channel_id: 200,
+                utterance_id: "utt-42".to_string(),
+                generation: 0,
+                announce_message_id: None,
+                dispatch_id: Some("dispatch-conflict".to_string()),
+                turn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attach_outcome,
+            AttachOutcome::Conflict,
+            "attach with conflicting dispatch_id must return Conflict"
+        );
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    /// turn_id global-unique index conflict (attach path): attaching a
+    /// turn_id that already belongs to a different row must return Conflict,
+    /// not propagate a UniqueViolation panic.
+    #[tokio::test]
+    async fn turn_id_conflict_on_attach_returns_conflict_not_error_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        // Row A owns "shared-turn".
+        let mut row_a = sample_insert(0);
+        row_a.utterance_id = "utt-turnid-attach-a".to_string();
+        row_a.turn_id = Some("shared-turn-attach".to_string());
+        row_a.dispatch_id = Some("dispatch-turnid-a".to_string());
+        row_a.announce_message_id = None;
+        insert_voice_turn_link_pg(&pool, &row_a)
+            .await
+            .unwrap()
+            .expect("insert row A");
+
+        // Row B has no turn_id yet.
+        let mut row_b = sample_insert(0);
+        row_b.utterance_id = "utt-turnid-attach-b".to_string();
+        row_b.turn_id = None;
+        row_b.dispatch_id = Some("dispatch-turnid-b".to_string());
+        row_b.announce_message_id = None;
+        insert_voice_turn_link_pg(&pool, &row_b)
+            .await
+            .unwrap()
+            .expect("insert row B");
+
+        // Trying to attach row A's turn_id to row B must return Conflict.
+        let outcome = attach_voice_turn_link_ids_pg(
+            &pool,
+            &VoiceTurnLinkIdentityPatch {
+                guild_id: 100,
+                voice_channel_id: 200,
+                utterance_id: "utt-turnid-attach-b".to_string(),
+                generation: 0,
+                announce_message_id: None,
+                dispatch_id: None,
+                turn_id: Some("shared-turn-attach".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            AttachOutcome::Conflict,
+            "turn_id already owned by another row must yield Conflict, not UniqueViolation"
+        );
+
+        pool.close().await;
+        pg.drop().await;
+    }
+
+    /// turn_id global-unique index conflict (insert path): inserting a new
+    /// utterance row whose turn_id is already held by an existing row must
+    /// return Ok(None), not propagate a UniqueViolation.
+    #[tokio::test]
+    async fn turn_id_conflict_on_insert_returns_none_not_error_pg() {
+        let Some(pg) = TestPostgresDb::try_create().await else {
+            return;
+        };
+        let pool = pg.connect_and_migrate().await;
+
+        // Insert a row that owns "shared-turn-insert".
+        let mut first = sample_insert(0);
+        first.utterance_id = "utt-turnid-insert-a".to_string();
+        first.turn_id = Some("shared-turn-insert".to_string());
+        first.dispatch_id = Some("dispatch-tii-a".to_string());
+        first.announce_message_id = None;
+        insert_voice_turn_link_pg(&pool, &first)
+            .await
+            .unwrap()
+            .expect("first insert");
+
+        // A second utterance tries to claim the same turn_id.
+        let mut second = sample_insert(0);
+        second.utterance_id = "utt-turnid-insert-b".to_string();
+        second.turn_id = Some("shared-turn-insert".to_string());
+        second.dispatch_id = Some("dispatch-tii-b".to_string());
+        second.announce_message_id = None;
+        let result = insert_voice_turn_link_pg(&pool, &second).await.unwrap();
+        assert!(
+            result.is_none(),
+            "insert with a conflicting turn_id must return Ok(None), not panic"
+        );
+
+        // The original row must still be intact.
+        let original = lookup_voice_turn_link_by_turn_id_pg(&pool, "shared-turn-insert")
+            .await
+            .unwrap()
+            .expect("original turn_id row survives");
+        assert_eq!(original.utterance_id, "utt-turnid-insert-a");
 
         pool.close().await;
         pg.drop().await;

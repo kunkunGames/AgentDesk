@@ -3,6 +3,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::voice::barge_in::BargeInSensitivity;
+use crate::voice::runtime_process::VoiceRuntimeProcessConfig;
+use crate::voice::stt_streaming::{
+    DEFAULT_STREAM_KEEP_MS, DEFAULT_STREAM_LENGTH_MS, DEFAULT_STREAM_STEP_MS,
+};
 
 // F17 (#2046): 상대경로(`.cache/...`)는 dcserver CWD 에 따라 위치가 달라져 launchd
 // 실행 시 `/` CWD 에서 권한 거부가 발생했다. STT/Receiver 와 동일하게 `~/.adk/...`
@@ -41,6 +45,7 @@ pub(crate) struct VoiceConfig {
     pub active_agent_ttl_seconds: u64,
     pub foreground: VoiceForegroundConfig,
     pub spoken_result: VoiceSpokenResultConfig,
+    pub runtime_process: VoiceRuntimeProcessConfig,
     pub default_sensitivity_mode: BargeInSensitivity,
     pub auto_join_channel_ids: Vec<String>,
     /// `false` (기본값) 이면 utterance / segment wav 와 transcript sidecar 를
@@ -67,6 +72,7 @@ impl Default for VoiceConfig {
             active_agent_ttl_seconds: DEFAULT_ACTIVE_AGENT_TTL_SECS,
             foreground: VoiceForegroundConfig::default(),
             spoken_result: VoiceSpokenResultConfig::default(),
+            runtime_process: VoiceRuntimeProcessConfig::default(),
             default_sensitivity_mode: BargeInSensitivity::Normal,
             auto_join_channel_ids: Vec::new(),
             keep_recordings: false,
@@ -191,19 +197,49 @@ impl Default for VoiceSpokenResultConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub(crate) struct VoiceSttConfig {
+    pub mode: VoiceSttMode,
     pub ffmpeg_command: String,
     pub whisper_command: String,
     pub model_path: PathBuf,
     pub language: String,
+    pub stream: VoiceSttStreamConfig,
 }
 
 impl Default for VoiceSttConfig {
     fn default() -> Self {
         Self {
+            mode: VoiceSttMode::File,
             ffmpeg_command: DEFAULT_STT_FFMPEG_COMMAND.to_string(),
             whisper_command: DEFAULT_STT_WHISPER_COMMAND.to_string(),
             model_path: PathBuf::from(DEFAULT_STT_MODEL_PATH),
             language: DEFAULT_STT_LANGUAGE.to_string(),
+            stream: VoiceSttStreamConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VoiceSttMode {
+    #[default]
+    File,
+    Stream,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub(crate) struct VoiceSttStreamConfig {
+    pub step_ms: u32,
+    pub length_ms: u32,
+    pub keep_ms: u32,
+}
+
+impl Default for VoiceSttStreamConfig {
+    fn default() -> Self {
+        Self {
+            step_ms: DEFAULT_STREAM_STEP_MS,
+            length_ms: DEFAULT_STREAM_LENGTH_MS,
+            keep_ms: DEFAULT_STREAM_KEEP_MS,
         }
     }
 }
@@ -356,6 +392,8 @@ mod tests {
         assert_eq!(config.tts.backend, VoiceTtsBackendKind::Edge);
         assert_eq!(config.foreground, VoiceForegroundConfig::default());
         assert_eq!(config.spoken_result, VoiceSpokenResultConfig::default());
+        assert!(!config.runtime_process.enabled);
+        assert!(config.runtime_process.launch_spec().is_none());
         assert_eq!(
             config.tts.progress_cache_dir,
             PathBuf::from(DEFAULT_PROGRESS_TTS_CACHE_DIR)
@@ -451,10 +489,16 @@ stt:
   whisper_command: /opt/homebrew/bin/whisper-cli
   model_path: /models/ggml-large-v3-turbo.bin
   language: ko
+  mode: stream
+  stream:
+    step_ms: 250
+    length_ms: 3000
+    keep_ms: 150
 "#,
         )
         .unwrap();
 
+        assert_eq!(config.stt.mode, VoiceSttMode::Stream);
         assert_eq!(config.stt.ffmpeg_command, "/opt/homebrew/bin/ffmpeg");
         assert_eq!(config.stt.whisper_command, "/opt/homebrew/bin/whisper-cli");
         assert_eq!(
@@ -462,6 +506,9 @@ stt:
             PathBuf::from("/models/ggml-large-v3-turbo.bin")
         );
         assert_eq!(config.stt.language, "ko");
+        assert_eq!(config.stt.stream.step_ms, 250);
+        assert_eq!(config.stt.stream.length_ms, 3_000);
+        assert_eq!(config.stt.stream.keep_ms, 150);
     }
 
     #[test]
@@ -487,6 +534,33 @@ tts:
         assert_eq!(config.tts.edge.command, "edge-tts");
         assert_eq!(config.tts.edge.voice, "ko-KR-InJoonNeural");
         assert_eq!(config.tts.edge.rate, "-10%");
+    }
+
+    #[test]
+    fn voice_config_deserializes_external_runtime_process_settings() {
+        let config: VoiceConfig = serde_yaml::from_str(
+            r#"
+runtime_process:
+  enabled: true
+  command: /usr/local/bin/agentdesk-voice-runtime
+  args:
+    - --stdio
+  env:
+    ADK_VOICE_RUNTIME: external
+"#,
+        )
+        .unwrap();
+
+        let spec = config.runtime_process.launch_spec().unwrap();
+        assert_eq!(
+            spec.executable,
+            PathBuf::from("/usr/local/bin/agentdesk-voice-runtime")
+        );
+        assert_eq!(spec.args, vec!["--stdio"]);
+        assert_eq!(
+            spec.env.get("ADK_VOICE_RUNTIME").map(String::as_str),
+            Some("external")
+        );
     }
 
     #[test]

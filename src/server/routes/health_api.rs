@@ -916,8 +916,10 @@ pub async fn stale_mailbox_repair_handler(
                     } else {
                         true
                     };
-                    let tmux_ready =
-                        crate::services::provider::tmux_session_ready_for_input(tmux_session);
+                    let tmux_ready = crate::services::provider::tmux_session_ready_for_input(
+                        tmux_session,
+                        &provider,
+                    );
                     if inflight_safe && tmux_ready {
                         health::clear_idle_tmux_stale_turn(
                             registry,

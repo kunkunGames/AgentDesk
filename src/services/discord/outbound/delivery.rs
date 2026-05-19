@@ -2,9 +2,8 @@
 //!
 //! This module consumes the v3 envelope (`message.rs`), policy (`policy.rs`),
 //! planner (`decision.rs`), and result (`result.rs`) types. The transport
-//! trait and in-process deduper still live in `legacy.rs` during the migration
-//! so existing production clients do not need to be rewritten in the same
-//! slice.
+//! trait and in-process deduper live in `transport.rs` so delivery semantics
+//! stay separate from HTTP/test plumbing.
 
 use std::borrow::Cow;
 use std::time::Duration;
@@ -14,19 +13,20 @@ use poise::serenity_prelude::ChannelId;
 use crate::server::routes::dispatches::discord_delivery::{
     DispatchMessagePostError, DispatchMessagePostErrorKind,
 };
+use crate::services::provider::{CancelToken, cancel_requested};
 
 use super::decision::{
     LengthPolicyDecision, OutboundPolicyLimits, PrimaryDeliveryTarget, ThreadFallbackDecision,
     decide_policy_with_limits,
 };
-use super::legacy::{
-    DiscordOutboundClient, OutboundDedupClaim, OutboundDedupReservation, OutboundDedupWait,
-    OutboundDeduper,
-};
 use super::message::{
     DiscordOutboundMessage, OutboundDedupKey, OutboundOperation, OutboundReferenceContext,
 };
 use super::result::{DeliveredMessage, DeliveryResult, FallbackUsed};
+use super::transport::{
+    DiscordOutboundClient, OutboundDedupClaim, OutboundDedupReservation, OutboundDedupWait,
+    OutboundDeduper,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DeliveryTransportOverrides {
@@ -46,6 +46,7 @@ pub(crate) async fn deliver_outbound<C>(
     client: &C,
     dedup: &OutboundDeduper,
     message: DiscordOutboundMessage,
+    cancel_token: Option<&CancelToken>,
 ) -> DeliveryResult
 where
     C: DiscordOutboundClient,
@@ -55,6 +56,7 @@ where
         dedup,
         message,
         DeliveryTransportOverrides::default(),
+        cancel_token,
     )
     .await
 }
@@ -64,21 +66,30 @@ pub(crate) async fn deliver_outbound_with_overrides<C>(
     dedup: &OutboundDeduper,
     message: DiscordOutboundMessage,
     overrides: DeliveryTransportOverrides,
+    cancel_token: Option<&CancelToken>,
 ) -> DeliveryResult
 where
     C: DiscordOutboundClient,
 {
+    if let Some(result) = cancelled_delivery_result(cancel_token) {
+        return result;
+    }
+
     let limits = overrides.limits.unwrap_or_default();
     let decision = decide_policy_with_limits(&message, limits);
     let dedup_key = decision.dedup_key.clone();
     let store_key = dedup_store_key(&dedup_key);
 
-    let (stored_duplicate, reservation) = if message.policy.idempotency_window > Duration::ZERO {
+    let (stored_duplicate, mut reservation) = if message.policy.idempotency_window > Duration::ZERO
+    {
         loop {
             match dedup.reserve(&store_key) {
                 OutboundDedupClaim::Duplicate(stored) => break (Some(stored), None),
                 OutboundDedupClaim::Reserved(reservation) => break (None, Some(reservation)),
                 OutboundDedupClaim::InFlight(in_flight) => {
+                    if let Some(result) = cancelled_delivery_result(cancel_token) {
+                        return result;
+                    }
                     match in_flight.wait_for_delivery(Duration::from_secs(5)).await {
                         OutboundDedupWait::Delivered(stored) => {
                             if let Some(messages) = decode_stored_delivered_messages(&stored) {
@@ -91,6 +102,9 @@ where
                         }
                         OutboundDedupWait::Released => continue,
                         OutboundDedupWait::TimedOut => {
+                            if let Some(result) = cancelled_delivery_result(cancel_token) {
+                                return result;
+                            }
                             return DeliveryResult::Skip {
                                 reason: "outbound delivery already in flight".into(),
                             };
@@ -111,11 +125,24 @@ where
         }
     }
 
+    if let Some(result) = cancelled_delivery_result(cancel_token) {
+        release_reservation(reservation.as_mut());
+        return result;
+    }
+
     let (target_channel, delivered_channel_id) =
         match resolve_primary_delivery_target(client, &decision.primary_target, &overrides).await {
             Ok(target) => target,
-            Err(reason) => return DeliveryResult::PermanentFailure { reason },
+            Err(reason) => {
+                release_reservation(reservation.as_mut());
+                return DeliveryResult::PermanentFailure { reason };
+            }
         };
+
+    if let Some(result) = cancelled_delivery_result(cancel_token) {
+        release_reservation(reservation.as_mut());
+        return result;
+    }
 
     if let Some(stored) = stored_duplicate {
         return DeliveryResult::Duplicate {
@@ -139,6 +166,7 @@ where
                 decision.thread_fallback,
                 limits,
                 reservation,
+                cancel_token,
             )
             .await
         }
@@ -158,6 +186,7 @@ where
                 decision.thread_fallback,
                 limits,
                 reservation,
+                cancel_token,
             )
             .await
         }
@@ -174,20 +203,28 @@ where
                 delivered_channel_id,
                 chunk_char_limit,
                 reservation,
+                cancel_token,
             )
             .await
         }
-        LengthPolicyDecision::FileAttachment { .. } => DeliveryResult::PermanentFailure {
-            reason: "v3 file-attachment delivery requires an attachment-capable transport".into(),
-        },
+        LengthPolicyDecision::FileAttachment { .. } => {
+            release_reservation(reservation.as_mut());
+            DeliveryResult::PermanentFailure {
+                reason: "v3 file-attachment delivery requires an attachment-capable transport"
+                    .into(),
+            }
+        }
         LengthPolicyDecision::RejectOverLimit {
             char_count,
             inline_char_limit,
-        } => DeliveryResult::PermanentFailure {
-            reason: format!(
-                "content length {char_count} exceeds inline limit {inline_char_limit} (RejectOverLimit)"
-            ),
-        },
+        } => {
+            release_reservation(reservation.as_mut());
+            DeliveryResult::PermanentFailure {
+                reason: format!(
+                    "content length {char_count} exceeds inline limit {inline_char_limit} (RejectOverLimit)"
+                ),
+            }
+        }
     }
 }
 
@@ -205,12 +242,22 @@ async fn deliver_single<C>(
     thread_fallback: ThreadFallbackDecision,
     limits: OutboundPolicyLimits,
     reservation: Option<OutboundDedupReservation>,
+    cancel_token: Option<&CancelToken>,
 ) -> DeliveryResult
 where
     C: DiscordOutboundClient,
 {
     let mut reservation = reservation;
-    match send_content(client, message, overrides, target_channel, content).await {
+    match send_content(
+        client,
+        message,
+        overrides,
+        target_channel,
+        content,
+        cancel_token,
+    )
+    .await
+    {
         Ok(raw_message_id) => {
             let messages = vec![DeliveredMessage::single_raw(
                 delivered_channel_id,
@@ -220,6 +267,10 @@ where
             delivery_success(dedup_key.clone(), messages, fallback_used)
         }
         Err(error) => {
+            if let Some(result) = cancelled_delivery_result(cancel_token) {
+                release_reservation(reservation.as_mut());
+                return result;
+            }
             if error.kind() == DispatchMessagePostErrorKind::MessageTooLong {
                 if let Some(result) = retry_minimal_fallback(
                     client,
@@ -231,6 +282,7 @@ where
                     delivered_channel_id,
                     limits,
                     reservation.as_mut(),
+                    cancel_token,
                 )
                 .await
                 {
@@ -240,7 +292,16 @@ where
 
             if let ThreadFallbackDecision::RetryParent { parent, .. } = thread_fallback {
                 let parent_target = parent.get().to_string();
-                match send_content(client, message, overrides, &parent_target, content).await {
+                match send_content(
+                    client,
+                    message,
+                    overrides,
+                    &parent_target,
+                    content,
+                    cancel_token,
+                )
+                .await
+                {
                     Ok(raw_message_id) => {
                         let messages = vec![DeliveredMessage::single_raw(parent, raw_message_id)];
                         record_success(dedup, reservation.as_mut(), dedup_key, message, &messages);
@@ -252,6 +313,11 @@ where
                         };
                     }
                     Err(parent_error) => {
+                        if let Some(result) = cancelled_delivery_result(cancel_token) {
+                            release_reservation(reservation.as_mut());
+                            return result;
+                        }
+                        release_reservation(reservation.as_mut());
                         return DeliveryResult::PermanentFailure {
                             reason: parent_error.to_string(),
                         };
@@ -259,6 +325,7 @@ where
                 }
             }
 
+            release_reservation(reservation.as_mut());
             DeliveryResult::PermanentFailure {
                 reason: error.to_string(),
             }
@@ -277,6 +344,7 @@ async fn retry_minimal_fallback<C>(
     delivered_channel_id: ChannelId,
     limits: OutboundPolicyLimits,
     reservation: Option<&mut OutboundDedupReservation>,
+    cancel_token: Option<&CancelToken>,
 ) -> Option<DeliveryResult>
 where
     C: DiscordOutboundClient,
@@ -288,7 +356,16 @@ where
     }
     let (minimal, _) = truncate_with_marker(summary, limits.compact_char_limit);
     Some(
-        match send_content(client, message, overrides, target_channel, &minimal).await {
+        match send_content(
+            client,
+            message,
+            overrides,
+            target_channel,
+            &minimal,
+            cancel_token,
+        )
+        .await
+        {
             Ok(raw_message_id) => {
                 let messages = vec![DeliveredMessage::single_raw(
                     delivered_channel_id,
@@ -309,9 +386,16 @@ where
                     fallback_used: FallbackUsed::MinimalFallback,
                 }
             }
-            Err(error) => DeliveryResult::PermanentFailure {
-                reason: error.to_string(),
-            },
+            Err(error) => {
+                if let Some(result) = cancelled_delivery_result(cancel_token) {
+                    release_reservation(reservation.as_deref_mut());
+                    return Some(result);
+                }
+                release_reservation(reservation.as_deref_mut());
+                DeliveryResult::PermanentFailure {
+                    reason: error.to_string(),
+                }
+            }
         },
     )
 }
@@ -327,12 +411,14 @@ async fn deliver_split<C>(
     delivered_channel_id: ChannelId,
     chunk_char_limit: usize,
     reservation: Option<OutboundDedupReservation>,
+    cancel_token: Option<&CancelToken>,
 ) -> DeliveryResult
 where
     C: DiscordOutboundClient,
 {
     let mut reservation = reservation;
     if matches!(message.operation, OutboundOperation::Edit { .. }) {
+        release_reservation(reservation.as_mut());
         return DeliveryResult::PermanentFailure {
             reason: "split length strategy cannot edit one message into multiple chunks".into(),
         };
@@ -342,15 +428,28 @@ where
     let chunk_count = chunks.len();
     let mut messages = Vec::with_capacity(chunk_count);
     for (index, chunk) in chunks.iter().enumerate() {
-        let raw_message_id =
-            match send_content(client, message, overrides, target_channel, chunk).await {
-                Ok(message_id) => message_id,
-                Err(error) => {
-                    return DeliveryResult::PermanentFailure {
-                        reason: error.to_string(),
-                    };
+        let raw_message_id = match send_content(
+            client,
+            message,
+            overrides,
+            target_channel,
+            chunk,
+            cancel_token,
+        )
+        .await
+        {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                if let Some(result) = cancelled_delivery_result(cancel_token) {
+                    release_reservation(reservation.as_mut());
+                    return result;
                 }
-            };
+                release_reservation(reservation.as_mut());
+                return DeliveryResult::PermanentFailure {
+                    reason: error.to_string(),
+                };
+            }
+        };
         messages.push(DeliveredMessage::chunk_raw(
             delivered_channel_id,
             raw_message_id,
@@ -374,10 +473,17 @@ async fn send_content<C>(
     overrides: &DeliveryTransportOverrides,
     target_channel: &str,
     content: &str,
+    cancel_token: Option<&CancelToken>,
 ) -> Result<String, DispatchMessagePostError>
 where
     C: DiscordOutboundClient,
 {
+    if cancel_requested(cancel_token) {
+        return Err(DispatchMessagePostError::new(
+            DispatchMessagePostErrorKind::Other,
+            "outbound delivery cancelled".into(),
+        ));
+    }
     match message.operation {
         OutboundOperation::Edit { message_id } => {
             let edit_message_id = overrides
@@ -404,6 +510,12 @@ where
             }
         }
     }
+}
+
+fn cancelled_delivery_result(cancel_token: Option<&CancelToken>) -> Option<DeliveryResult> {
+    cancel_requested(cancel_token).then(|| DeliveryResult::Skip {
+        reason: "cancelled".into(),
+    })
 }
 
 fn resolve_reference(
@@ -486,6 +598,12 @@ fn record_success(
     }
 }
 
+fn release_reservation(reservation: Option<&mut OutboundDedupReservation>) {
+    if let Some(reservation) = reservation {
+        reservation.release();
+    }
+}
+
 fn dedup_store_key(dedup_key: &OutboundDedupKey) -> String {
     serde_json::to_string(dedup_key).unwrap_or_else(|_| format!("{dedup_key:?}"))
 }
@@ -558,6 +676,7 @@ mod tests {
     use super::*;
     use crate::services::discord::outbound::message::{DiscordOutboundMessage, OutboundTarget};
     use crate::services::discord::outbound::policy::DiscordOutboundPolicy;
+    use crate::services::provider::CancelToken;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -568,6 +687,7 @@ mod tests {
         length_failures_remaining: Arc<Mutex<usize>>,
         send_failures_remaining: Arc<Mutex<usize>>,
         post_delay_ms: Arc<AtomicU64>,
+        cancel_after_post_count: Arc<Mutex<Option<(usize, Arc<CancelToken>)>>>,
     }
 
     impl MockClient {
@@ -581,6 +701,10 @@ mod tests {
 
         fn fail_next_send(&self) {
             *self.send_failures_remaining.lock().unwrap() += 1;
+        }
+
+        fn cancel_after_post_count(&self, post_count: usize, token: Arc<CancelToken>) {
+            *self.cancel_after_post_count.lock().unwrap() = Some((post_count, token));
         }
 
         fn posts(&self) -> Vec<(String, String)> {
@@ -598,10 +722,16 @@ mod tests {
             target_channel: &str,
             content: &str,
         ) -> Result<String, DispatchMessagePostError> {
-            self.posts
-                .lock()
-                .unwrap()
-                .push((target_channel.to_string(), content.to_string()));
+            let post_count = {
+                let mut posts = self.posts.lock().unwrap();
+                posts.push((target_channel.to_string(), content.to_string()));
+                posts.len()
+            };
+            if let Some((threshold, token)) = self.cancel_after_post_count.lock().unwrap().as_ref()
+                && post_count >= *threshold
+            {
+                token.cancelled.store(true, Ordering::Relaxed);
+            }
             let post_delay_ms = self.post_delay_ms.load(Ordering::SeqCst);
             if post_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(post_delay_ms)).await;
@@ -652,7 +782,7 @@ mod tests {
         )
         .with_summary("minimal fallback message");
 
-        let result = deliver_outbound(&client, &dedup, message).await;
+        let result = deliver_outbound(&client, &dedup, message, None).await;
 
         match result {
             DeliveryResult::Fallback { fallback_used, .. } => {
@@ -683,9 +813,9 @@ mod tests {
             )
         };
 
-        let first = deliver_outbound(&client, &dedup, make()).await;
+        let first = deliver_outbound(&client, &dedup, make(), None).await;
         assert!(matches!(first, DeliveryResult::Sent { .. }));
-        let second = deliver_outbound(&client, &dedup, make()).await;
+        let second = deliver_outbound(&client, &dedup, make(), None).await;
 
         match second {
             DeliveryResult::Duplicate {
@@ -717,7 +847,7 @@ mod tests {
         };
 
         let first =
-            deliver_outbound_with_overrides(&client, &dedup, make(), overrides.clone()).await;
+            deliver_outbound_with_overrides(&client, &dedup, make(), overrides.clone(), None).await;
         match first {
             DeliveryResult::Fallback {
                 messages,
@@ -737,7 +867,8 @@ mod tests {
             other => panic!("expected split fallback, got {other:?}"),
         }
 
-        let second = deliver_outbound_with_overrides(&client, &dedup, make(), overrides).await;
+        let second =
+            deliver_outbound_with_overrides(&client, &dedup, make(), overrides, None).await;
         match second {
             DeliveryResult::Duplicate {
                 existing_messages, ..
@@ -763,6 +894,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v3_cancelled_before_delivery_skips_without_posting() {
+        let client = MockClient::default();
+        let dedup = OutboundDeduper::new();
+        let token = CancelToken::new();
+        token.cancelled.store(true, Ordering::Relaxed);
+        let message = DiscordOutboundMessage::new(
+            "dispatch:cancelled",
+            "dispatch:cancelled:notify",
+            "hello",
+            OutboundTarget::Channel(ChannelId::new(123)),
+            DiscordOutboundPolicy::dispatch_outbox(),
+        );
+
+        let result = deliver_outbound(&client, &dedup, message, Some(&token)).await;
+
+        assert!(matches!(result, DeliveryResult::Skip { reason } if reason == "cancelled"));
+        assert!(client.posts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v3_split_delivery_stops_between_chunks_when_cancelled() {
+        let client = MockClient::default();
+        let dedup = OutboundDeduper::new();
+        let token = Arc::new(CancelToken::new());
+        client.cancel_after_post_count(1, token.clone());
+        let make = || {
+            DiscordOutboundMessage::new(
+                "dispatch:split-cancel",
+                "dispatch:split-cancel:notify",
+                "ABCDEFGHIJK",
+                OutboundTarget::Channel(ChannelId::new(123)),
+                DiscordOutboundPolicy::default(),
+            )
+        };
+        let overrides = DeliveryTransportOverrides {
+            limits: Some(OutboundPolicyLimits::for_tests(4)),
+            ..DeliveryTransportOverrides::default()
+        };
+
+        let result = deliver_outbound_with_overrides(
+            &client,
+            &dedup,
+            make(),
+            overrides.clone(),
+            Some(&token),
+        )
+        .await;
+
+        assert!(matches!(result, DeliveryResult::Skip { reason } if reason == "cancelled"));
+        assert_eq!(
+            client.posts(),
+            vec![("123".to_string(), "ABCD".to_string())]
+        );
+
+        let retry = deliver_outbound_with_overrides(&client, &dedup, make(), overrides, None).await;
+
+        assert!(matches!(
+            retry,
+            DeliveryResult::Fallback {
+                fallback_used: FallbackUsed::LengthSplit,
+                ..
+            }
+        ));
+        assert_eq!(
+            client.posts(),
+            vec![
+                ("123".to_string(), "ABCD".to_string()),
+                ("123".to_string(), "ABCD".to_string()),
+                ("123".to_string(), "EFGH".to_string()),
+                ("123".to_string(), "IJK".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn v3_dm_user_target_resolves_before_posting() {
         let client = MockClient::default();
         let dedup = OutboundDeduper::new();
@@ -776,7 +982,7 @@ mod tests {
             )
         };
 
-        let result = deliver_outbound(&client, &dedup, make()).await;
+        let result = deliver_outbound(&client, &dedup, make(), None).await;
 
         assert!(matches!(result, DeliveryResult::Sent { .. }));
         assert_eq!(client.dm_resolutions(), vec!["7".to_string()]);
@@ -785,12 +991,59 @@ mod tests {
             vec![("97".to_string(), "hello".to_string())]
         );
 
-        let duplicate = deliver_outbound(&client, &dedup, make()).await;
+        let duplicate = deliver_outbound(&client, &dedup, make(), None).await;
         assert!(matches!(duplicate, DeliveryResult::Duplicate { .. }));
         assert_eq!(client.dm_resolutions(), vec!["7".to_string()]);
         assert_eq!(
             client.posts(),
             vec![("97".to_string(), "hello".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_deduper_blocks_same_key_across_producers() {
+        let client = MockClient::default();
+        let dedup = crate::services::discord::outbound::shared_outbound_deduper();
+        let suffix = uuid::Uuid::new_v4();
+        let correlation_id = format!("cross-producer:{suffix}");
+        let semantic_event_id = format!("cross-producer:{suffix}:notify");
+        let producer_a = || {
+            DiscordOutboundMessage::new(
+                correlation_id.clone(),
+                semantic_event_id.clone(),
+                "from producer A",
+                OutboundTarget::Channel(ChannelId::new(123)),
+                DiscordOutboundPolicy::review_notification(),
+            )
+        };
+        let producer_b = || {
+            DiscordOutboundMessage::new(
+                correlation_id.clone(),
+                semantic_event_id.clone(),
+                "from producer B",
+                OutboundTarget::Channel(ChannelId::new(123)),
+                DiscordOutboundPolicy::review_notification(),
+            )
+        };
+
+        let first = deliver_outbound(&client, dedup, producer_a(), None).await;
+        let second = deliver_outbound(&client, dedup, producer_b(), None).await;
+
+        assert!(matches!(first, DeliveryResult::Sent { .. }));
+        match second {
+            DeliveryResult::Duplicate {
+                dedup_key,
+                existing_messages,
+            } => {
+                assert_eq!(dedup_key.correlation_id, correlation_id);
+                assert_eq!(dedup_key.semantic_event_id, semantic_event_id);
+                assert_eq!(existing_messages[0].raw_message_id, "msg-123-15");
+            }
+            other => panic!("expected duplicate, got {other:?}"),
+        }
+        assert_eq!(
+            client.posts(),
+            vec![("123".to_string(), "from producer A".to_string())]
         );
     }
 
@@ -810,8 +1063,8 @@ mod tests {
         };
 
         let (first, second) = tokio::join!(
-            deliver_outbound(&client, &dedup, make()),
-            deliver_outbound(&client, &dedup, make())
+            deliver_outbound(&client, &dedup, make(), None),
+            deliver_outbound(&client, &dedup, make(), None)
         );
 
         let sent_count = [&first, &second]
@@ -844,8 +1097,8 @@ mod tests {
         };
 
         let (first, second) = tokio::join!(
-            deliver_outbound(&client, &dedup, make()),
-            deliver_outbound(&client, &dedup, make())
+            deliver_outbound(&client, &dedup, make(), None),
+            deliver_outbound(&client, &dedup, make(), None)
         );
 
         let sent_count = [&first, &second]
@@ -858,6 +1111,29 @@ mod tests {
             .count();
         assert_eq!(sent_count, 1);
         assert_eq!(failure_count, 1);
+        assert_eq!(client.posts().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn v3_dedup_reservation_releases_after_terminal_failure_for_retry() {
+        let client = MockClient::default();
+        client.fail_next_send();
+        let dedup = OutboundDeduper::new();
+        let make = || {
+            DiscordOutboundMessage::new(
+                "dispatch:2368:terminal-fail",
+                "dispatch:2368:notify",
+                "hello",
+                OutboundTarget::Channel(ChannelId::new(123)),
+                DiscordOutboundPolicy::dispatch_outbox(),
+            )
+        };
+
+        let first = deliver_outbound(&client, &dedup, make(), None).await;
+        let second = deliver_outbound(&client, &dedup, make(), None).await;
+
+        assert!(matches!(first, DeliveryResult::PermanentFailure { .. }));
+        assert!(matches!(second, DeliveryResult::Sent { .. }));
         assert_eq!(client.posts().len(), 2);
     }
 }

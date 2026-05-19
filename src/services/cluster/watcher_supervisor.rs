@@ -36,14 +36,12 @@
 //! When `false`, the supervisor is not started by the worker registry and
 //! the legacy turn-bound relay path remains the only delivery channel —
 //! that escape hatch lets operators disable the new path if a regression
-//! surfaces. Under the default-on configuration the supervisor runs against
-//! the production observation sink
-//! ([`super::registry_adapter_sink::RegistryAdapterSink`]) and the
-//! production tmux frame producer (`services::discord::tmux_watcher`)
-//! pushes frames into the supervisor-owned relay via
-//! [`super::relay_producer_registry::RelayProducerRegistry`]. The legacy
-//! turn-bound watcher still owns Discord delivery; the new path is
-//! observation-only until a later issue swaps the legacy spawn site.
+//! surfaces. Under the default-on configuration the production worker wires a
+//! Discord sink and the production tmux frame producer
+//! (`services::discord::tmux_watcher`) pushes frames into the supervisor-owned
+//! relay via [`super::relay_producer_registry::RelayProducerRegistry`]. The
+//! metrics-only [`super::registry_adapter_sink::RegistryAdapterSink`] remains
+//! available for tests/fallback runtimes without Discord state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,7 +54,7 @@ use super::relay_producer_registry::{RelayProducerRegistry, global_relay_produce
 use super::session_registry::{
     RegisteredSession, RegistryChange, SessionRegistry, global_session_registry,
 };
-use super::stream_relay::{DiscardSink, RelaySink, StreamRelayHandle, spawn_stream_relay};
+use super::stream_relay::{RelaySink, StreamRelayHandle, spawn_stream_relay};
 
 /// Knobs for the supervisor loop. The defaults are tuned for production;
 /// tests build a custom config via [`SupervisorConfig::for_test`].
@@ -130,8 +128,8 @@ impl ActiveRelays {
 /// `producers` is the side-table that exposes a clonable
 /// [`super::stream_relay::RelayProducer`] keyed by tmux session name. The
 /// production tmux frame producer (`tmux_watcher`) looks up its session
-/// there; E5 (#2412) wires this up so the supervisor-owned relay actually
-/// receives frames instead of being a dark pipe (see issue body).
+/// there so the supervisor-owned relay receives the provider stream frames
+/// consumed by the configured sink.
 fn apply_change(
     active: &mut ActiveRelays,
     change: &RegistryChange,
@@ -261,7 +259,7 @@ fn full_reconcile(
 ///
 /// `sink` is the destination of every relayed frame. Production passes a
 /// Discord-side adapter (wired in E4 #2346). When the feature flag is on but
-/// no adapter is available yet, callers may pass [`DiscardSink`] to keep
+/// no adapter is available yet, callers may pass the stream relay discard sink to keep
 /// supervisor lifecycle wiring exercised without delivering frames anywhere.
 pub async fn run_watcher_supervisor_loop(
     config: SupervisorConfig,
@@ -279,7 +277,8 @@ pub async fn run_watcher_supervisor_loop(
 /// Test-friendly variant — accepts an explicit registry. Uses the global
 /// producer registry; tests that need their own producer registry use
 /// [`run_watcher_supervisor_loop_with_registry_and_producers`] directly.
-pub async fn run_watcher_supervisor_loop_with_registry(
+#[cfg(test)]
+pub(crate) async fn run_watcher_supervisor_loop_with_registry(
     config: SupervisorConfig,
     sink: Arc<dyn RelaySink>,
     shutdown: Arc<AtomicBool>,
@@ -369,21 +368,6 @@ pub async fn run_watcher_supervisor_loop_with_registry_and_producers(
         producers.deregister(&session);
         handle.shutdown().await;
     }
-}
-
-/// Convenience entry point used by the supervised worker registry when the
-/// `cluster.session_bound_relay_enabled` flag is true and no concrete sink
-/// has been wired yet (pre-E4). Boots the supervisor against a
-/// [`DiscardSink`] so the lifecycle path runs in production without
-/// changing user-visible delivery behaviour. E4 will replace this with a
-/// real Discord adapter.
-pub async fn run_with_discard_sink(shutdown: Arc<AtomicBool>) {
-    run_watcher_supervisor_loop(
-        SupervisorConfig::default(),
-        Arc::new(DiscardSink) as Arc<dyn RelaySink>,
-        shutdown,
-    )
-    .await;
 }
 
 #[cfg(test)]

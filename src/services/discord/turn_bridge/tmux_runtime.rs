@@ -69,9 +69,8 @@ fn provider_turn_interrupt_plan(provider: &ProviderKind) -> Option<ProviderTurnI
         // path instead; the empty key list signals "skip send-keys, go
         // straight to the SIGINT fallback".
         ProviderKind::Claude => Some(ProviderTurnInterruptPlan { keys: &[] }),
-        ProviderKind::Codex | ProviderKind::Qwen => {
-            Some(ProviderTurnInterruptPlan { keys: &["C-c"] })
-        }
+        ProviderKind::Codex => Some(ProviderTurnInterruptPlan { keys: &["Escape"] }),
+        ProviderKind::Qwen => Some(ProviderTurnInterruptPlan { keys: &["C-c"] }),
         ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Unsupported(_) => None,
     }
 }
@@ -215,11 +214,10 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
     let session_for_probe = tmux_session_name.to_string();
     let provider_for_probe = provider.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        let ready_for_input = if matches!(provider_for_probe, ProviderKind::Claude) {
-            crate::services::provider::tmux_session_ready_for_input(&session_for_probe)
-        } else {
-            false
-        };
+        let ready_for_input = crate::services::provider::tmux_session_ready_for_input(
+            &session_for_probe,
+            &provider_for_probe,
+        );
         let provider_pid =
             provider_cli_pid_in_tmux(&session_for_probe, &provider_for_probe, tracked_child_pid);
         (ready_for_input, provider_pid)
@@ -417,8 +415,10 @@ async fn hard_stop_unresponsive_provider_cli_turn(
     let probe = tokio::task::spawn_blocking(move || {
         let pane_pid = crate::services::platform::tmux::pane_pid(&session_for_probe);
         let session_alive = pane_pid.is_some();
-        let ready_for_input =
-            crate::services::provider::tmux_session_ready_for_input(&session_for_probe);
+        let ready_for_input = crate::services::provider::tmux_session_ready_for_input(
+            &session_for_probe,
+            &provider_for_probe,
+        );
         let current_provider_pid =
             provider_cli_pid_in_tmux(&session_for_probe, &provider_for_probe, tracked_child_pid);
         (
@@ -481,11 +481,10 @@ fn hard_stop_pid_for_unresponsive_provider(
     // TUI mode regression guard: when the provider CLI is the tmux pane
     // foreground itself, hard-killing it tears down the pane — same blast
     // radius as `CleanupSession`, which `PreserveSession*` policies forbid.
-    // After a successful SIGINT, claude TUI returns to its prompt `❯` but
-    // `tmux_session_ready_for_input` only matches the legacy wrapper text
-    // `"Ready for input (type message + Enter)"`, so it would report
-    // `ready_for_input=false` and reach this point. Skip the kill instead;
-    // the SIGINT already returned the TUI to its idle prompt.
+    // If the provider CLI is still the pane foreground, killing it would
+    // tear down a reusable TUI session. Skip the kill; either readiness
+    // was missed by the visual probe or the next intake/recovery pass can
+    // reconcile the preserved session.
     if Some(candidate) == pane_pid {
         return None;
     }
@@ -552,7 +551,7 @@ pub(in crate::services::discord) fn cancel_active_token(
                             termination_recorded = true;
                         }
                         record_tmux_exit_reason(&name, &format!("explicit cleanup via {reason}"));
-                        crate::services::platform::tmux::kill_session_with_reason(
+                        crate::services::platform::tmux::kill_session(
                             &name,
                             &format!("explicit cleanup via {reason}"),
                         );
@@ -1046,8 +1045,9 @@ mod tests {
     // C-c` therefore SIGINTs the wrapper and tears the session down. The
     // empty key list signals to `interrupt_provider_cli_turn` that it must
     // skip send-keys and proceed straight to the direct-SIGINT fallback.
-    // Codex/Qwen run as the PTY foreground themselves, so C-c via send-keys
-    // is still the correct primary interrupt.
+    // Codex runs as the PTY foreground itself, but its TUI advertises
+    // `Esc to interrupt`; keep the primary tmux key path aligned with
+    // `codex_tui::input::plan_cancel()`. Qwen still uses C-c.
     #[test]
     fn provider_interrupt_plan_skips_send_keys_for_claude_only() {
         assert_eq!(
@@ -1057,7 +1057,7 @@ mod tests {
         );
         assert_eq!(
             super::provider_turn_interrupt_plan(&ProviderKind::Codex).map(|plan| plan.keys),
-            Some(&["C-c"][..])
+            Some(&["Escape"][..])
         );
         assert_eq!(
             super::provider_turn_interrupt_plan(&ProviderKind::Qwen).map(|plan| plan.keys),
@@ -1341,6 +1341,41 @@ mod tests {
             resolved,
             Some(96964),
             "TUI mode: pane_pid is the claude CLI itself; stop must SIGINT it directly"
+        );
+    }
+
+    // #2172: Codex TUI direct-launch regression. Codex runs as the tmux pane
+    // foreground itself (no wrapper) in Direct TUI mode. Without the pane
+    // self-check, `descendant_processes` excludes pane_pid and the search
+    // returns None, causing stop emoji to silently SIGINT nothing while Codex
+    // keeps generating output. Mirrors the Claude TUI regression guard above.
+    #[cfg(unix)]
+    #[test]
+    fn select_provider_pid_returns_pane_pid_when_pane_is_codex_tui() {
+        let rows = vec![
+            super::ProcessRow {
+                pid: 88400,
+                ppid: 10240,
+                command: "/opt/homebrew/bin/codex --resume-session abc123".into(),
+            },
+            super::ProcessRow {
+                pid: 88450,
+                ppid: 88400,
+                command: "/bin/sh -c some-tool-invocation".into(),
+            },
+            super::ProcessRow {
+                pid: 88451,
+                ppid: 88400,
+                command: "node /opt/homebrew/lib/node_modules/codex/helper.js".into(),
+            },
+        ];
+
+        let resolved = super::select_provider_pid_in_pane(88400, &rows, &ProviderKind::Codex, None);
+
+        assert_eq!(
+            resolved,
+            Some(88400),
+            "Codex TUI direct mode: pane_pid is the codex CLI itself; interrupt must target it directly (#2172)"
         );
     }
 

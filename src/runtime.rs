@@ -94,11 +94,15 @@ impl SessionRuntime for TmuxRuntime {
             return false;
         }
         // Use the provider-specific readiness check
-        crate::services::provider::tmux_session_ready_for_input(session_name)
+        let provider =
+            crate::services::provider::parse_provider_and_channel_from_tmux_name(session_name)
+                .map(|(provider, _)| provider)
+                .unwrap_or(crate::services::provider::ProviderKind::Claude);
+        crate::services::provider::tmux_session_ready_for_input(session_name, &provider)
     }
 
     fn kill_session(&self, session_name: &str) -> Result<()> {
-        crate::services::platform::tmux::kill_session_checked_with_reason(
+        crate::services::platform::tmux::kill_session_checked(
             session_name,
             "runtime::kill_session invocation",
         )

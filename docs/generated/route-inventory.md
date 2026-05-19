@@ -48,7 +48,7 @@
 | `POST` | `/api/channels/{channel_id}/monitoring` | `super::super::monitoring::upsert_monitoring` | `src/server/routes/monitoring.rs:19` | `src/server/routes/domains/ops.rs:293` |
 | `DELETE` | `/api/channels/{channel_id}/monitoring/{key}` | `super::super::monitoring::remove_monitoring` | `src/server/routes/monitoring.rs:52` | `src/server/routes/domains/ops.rs:298` |
 | `GET` | `/api/channels/{id}/queue` | `queue_api::list_channel_queue` | `src/server/routes/queue_api.rs:19` | `src/server/routes/domains/ops.rs:284` |
-| `POST` | `/api/channels/{id}/relay-recovery` | `health_api::relay_recovery_handler` | `src/server/routes/health_api.rs:1154` | `src/server/routes/domains/ops.rs:289` |
+| `POST` | `/api/channels/{id}/relay-recovery` | `health_api::relay_recovery_handler` | `src/server/routes/health_api.rs:1156` | `src/server/routes/domains/ops.rs:289` |
 | `GET` | `/api/channels/{id}/watcher-state` | `queue_api::get_watcher_state` | `src/server/routes/queue_api.rs:207` | `src/server/routes/domains/ops.rs:285` |
 | `GET` | `/api/cluster/issue-specs` | `cluster::list_issue_specs` | `src/server/routes/cluster.rs:378` | `src/server/routes/domains/ops.rs:88` |
 | `POST` | `/api/cluster/issue-specs/upsert` | `cluster::upsert_issue_spec` | `src/server/routes/cluster.rs:394` | `src/server/routes/domains/ops.rs:89` |
@@ -75,9 +75,9 @@
 | `GET` | `/api/discord/bindings` | `discord::list_bindings` | `src/server/routes/discord.rs:18` | `src/server/routes/domains/integrations.rs:29` |
 | `GET` | `/api/discord/channels/{id}` | `discord::channel_info` | `src/server/routes/discord.rs:226` | `src/server/routes/domains/integrations.rs:34` |
 | `GET` | `/api/discord/channels/{id}/messages` | `discord::channel_messages` | `src/server/routes/discord.rs:150` | `src/server/routes/domains/integrations.rs:30` |
-| `POST` | `/api/discord/send` | `health_api::send_handler` | `src/server/routes/health_api.rs:1226` | `src/server/routes/domains/ops.rs:31` |
-| `POST` | `/api/discord/send-dm` | `health_api::senddm_handler` | `src/server/routes/health_api.rs:1336` | `src/server/routes/domains/ops.rs:36` |
-| `POST` | `/api/discord/send-to-agent` | `health_api::send_to_agent_handler` | `src/server/routes/health_api.rs:1301` | `src/server/routes/domains/ops.rs:32` |
+| `POST` | `/api/discord/send` | `health_api::send_handler` | `src/server/routes/health_api.rs:1228` | `src/server/routes/domains/ops.rs:31` |
+| `POST` | `/api/discord/send-dm` | `health_api::senddm_handler` | `src/server/routes/health_api.rs:1338` | `src/server/routes/domains/ops.rs:36` |
+| `POST` | `/api/discord/send-to-agent` | `health_api::send_to_agent_handler` | `src/server/routes/health_api.rs:1303` | `src/server/routes/domains/ops.rs:32` |
 | `GET` | `/api/dispatch-outbox/failed` | `health_api::list_dispatch_outbox_failures_handler` | `src/server/routes/health_api.rs:586` | `src/server/routes/domains/ops.rs:22` |
 | `POST` | `/api/dispatch-outbox/failed` | `health_api::ack_dispatch_outbox_failures_handler` | `src/server/routes/health_api.rs:611` | `src/server/routes/domains/ops.rs:22` |
 | `GET` | `/api/dispatched-sessions` | `dispatched_sessions::list_dispatched_sessions` | `src/server/routes/dispatched_sessions.rs:17` | `src/server/routes/domains/ops.rs:153` |
@@ -119,7 +119,7 @@
 | `POST` | `/api/hook/reset-status` | `hooks::reset_status` | `src/server/routes/hooks.rs:25` | `src/server/routes/domains/ops.rs:173` |
 | `DELETE` | `/api/hook/session/{sessionKey}` | `hooks::disconnect_session` | `src/server/routes/hooks.rs:59` | `src/server/routes/domains/ops.rs:175` |
 | `POST` | `/api/hook/skill-usage` | `hooks::skill_usage` | `src/server/routes/hooks.rs:42` | `src/server/routes/domains/ops.rs:174` |
-| `POST` | `/api/inflight/rebind` | `health_api::rebind_inflight_handler` | `src/server/routes/health_api.rs:1267` | `src/server/routes/domains/ops.rs:37` |
+| `POST` | `/api/inflight/rebind` | `health_api::rebind_inflight_handler` | `src/server/routes/health_api.rs:1269` | `src/server/routes/domains/ops.rs:37` |
 | `GET` | `/api/internal/card-thread` | `dispatches::get_card_thread` | `src/server/routes/dispatches/thread_reuse.rs:1219` | `src/server/routes/domains/ops.rs:113` |
 | `POST` | `/api/internal/escalation/emit` | `escalation::emit_escalation` | `src/server/routes/escalation.rs:1513` | `src/server/routes/domains/admin.rs:68` |
 | `POST` | `/api/internal/link-dispatch-thread` | `dispatches::link_dispatch_thread` | `src/server/routes/dispatches/thread_reuse.rs:1104` | `src/server/routes/domains/ops.rs:109` |
@@ -148,8 +148,8 @@
 | `POST` | `/api/kanban-repos` | `kanban_repos::create_repo` | `src/server/routes/kanban_repos.rs:78` | `src/server/routes/domains/kanban.rs:52` |
 | `DELETE` | `/api/kanban-repos/{owner}/{repo}` | `kanban_repos::delete_repo` | `src/server/routes/kanban_repos.rs:234` | `src/server/routes/domains/kanban.rs:56` |
 | `PATCH` | `/api/kanban-repos/{owner}/{repo}` | `kanban_repos::update_repo` | `src/server/routes/kanban_repos.rs:153` | `src/server/routes/domains/kanban.rs:56` |
-| `PATCH` | `/api/kanban-reviews/{id}/decisions` | `reviews::update_decisions` | `src/server/routes/reviews.rs:526` | `src/server/routes/domains/reviews.rs:13` |
-| `POST` | `/api/kanban-reviews/{id}/trigger-rework` | `reviews::trigger_rework` | `src/server/routes/reviews.rs:580` | `src/server/routes/domains/reviews.rs:17` |
+| `PATCH` | `/api/kanban-reviews/{id}/decisions` | `reviews::update_decisions` | `src/server/routes/reviews.rs:527` | `src/server/routes/domains/reviews.rs:13` |
+| `POST` | `/api/kanban-reviews/{id}/trigger-rework` | `reviews::trigger_rework` | `src/server/routes/reviews.rs:581` | `src/server/routes/domains/reviews.rs:17` |
 | `GET` | `/api/machine-status` | `analytics::machine_status` | `src/server/routes/analytics.rs:503` | `src/server/routes/domains/admin.rs:81` |
 | `GET` | `/api/maintenance/jobs` | `maintenance::list_jobs` | `src/server/routes/maintenance.rs:7` | `src/server/routes/domains/ops.rs:217` |
 | `POST` | `/api/memory/forget` | `memory_api::memory_forget` | `src/server/routes/memory_api.rs:245` | `src/server/routes/domains/admin.rs:90` |
@@ -219,7 +219,7 @@
 | `GET` | `/api/rate-limits` | `analytics::rate_limits` | `src/server/routes/analytics.rs:511` | `src/server/routes/domains/admin.rs:82` |
 | `GET` | `/api/receipt` | `receipt::get_receipt` | `src/server/routes/receipt.rs:170` | `src/server/routes/domains/admin.rs:83` |
 | `POST` | `/api/reviews/decision` | `review_verdict::submit_review_decision` | `src/server/routes/review_verdict/decision_route.rs:2719` | `src/server/routes/domains/reviews.rs:23` |
-| `POST` | `/api/reviews/recovery` | `reviews::recover_review_target` | `src/server/routes/reviews.rs:562` | `src/server/routes/domains/reviews.rs:21` |
+| `POST` | `/api/reviews/recovery` | `reviews::recover_review_target` | `src/server/routes/reviews.rs:563` | `src/server/routes/domains/reviews.rs:21` |
 | `POST` | `/api/reviews/tuning/aggregate` | `review_verdict::aggregate_review_tuning` | `src/server/routes/review_verdict/tuning_aggregate.rs:438` | `src/server/routes/domains/reviews.rs:27` |
 | `POST` | `/api/reviews/verdict` | `review_verdict::submit_verdict` | `src/server/routes/review_verdict/verdict_route.rs:212` | `src/server/routes/domains/reviews.rs:22` |
 | `GET` | `/api/round-table-meetings` | `meetings::list_meetings` | `src/server/routes/meetings.rs:669` | `src/server/routes/domains/integrations.rs:36` |
@@ -267,7 +267,7 @@
 | `GET` | `/api/streaks` | `analytics::streaks` | `src/server/routes/analytics.rs:416` | `src/server/routes/domains/admin.rs:77` |
 | `GET` | `/api/token-analytics` | `receipt::get_token_analytics` | `src/server/routes/receipt.rs:249` | `src/server/routes/domains/admin.rs:84` |
 | `POST` | `/api/turns/{channel_id}/cancel` | `queue_api::cancel_turn` | `src/server/routes/queue_api.rs:166` | `src/server/routes/domains/ops.rs:311` |
-| `POST` | `/api/turns/{channel_id}/extend-timeout` | `queue_api::extend_turn_timeout` | `src/server/routes/queue_api.rs:261` | `src/server/routes/domains/ops.rs:312` |
+| `POST` | `/api/turns/{channel_id}/extend-timeout` | `queue_api::extend_turn_timeout` | `src/server/routes/queue_api.rs:262` | `src/server/routes/domains/ops.rs:312` |
 | `GET` | `/api/voice/config` | `voice_config::get_voice_config` | `src/server/routes/voice_config.rs:109` | `src/server/routes/domains/admin.rs:64` |
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:117` | `src/server/routes/domains/admin.rs:64` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:161` | `src/server/mod.rs:297` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:161` | `src/server/mod.rs:413` |

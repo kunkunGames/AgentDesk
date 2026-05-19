@@ -1511,6 +1511,7 @@ fn emit_claude_tui_busy_followup_notice(
     tracing::warn!(
         tmux_session_name,
         prompt_marker_detected = snapshot.prompt_marker_detected,
+        prompt_draft_detected = snapshot.prompt_draft_detected,
         previous_tui_turn_still_running = snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
         tmux_pane_alive = snapshot.tmux_pane_alive,
         capture_available = snapshot.capture_available,
@@ -1518,9 +1519,10 @@ fn emit_claude_tui_busy_followup_notice(
         "claude_tui follow-up blocked before prompt submission because hosted TUI is busy"
     );
     debug_log(&format!(
-        "Claude TUI follow-up blocked before prompt submission: session={} prompt_marker_detected={} previous_tui_turn_still_running={} tmux_pane_alive={} capture_available={} pane_tail:\n{}",
+        "Claude TUI follow-up blocked before prompt submission: session={} prompt_marker_detected={} prompt_draft_detected={} previous_tui_turn_still_running={} tmux_pane_alive={} capture_available={} pane_tail:\n{}",
         tmux_session_name,
         snapshot.prompt_marker_detected,
+        snapshot.prompt_draft_detected,
         snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
         snapshot.tmux_pane_alive,
         snapshot.capture_available,
@@ -1735,13 +1737,14 @@ fn execute_streaming_local_tui_tmux(
             claude_tui_followup_busy_before_submit(tmux_session_name, Some(&transcript_path))
         {
             // #2416: instead of dropping the user's message when the TUI is busy,
-            // wait for the next prompt-ready window using the existing
-            // wait_for_prompt_ready infrastructure. Only emit the busy notice if
-            // the wait times out (or otherwise fails).
-            match crate::services::claude_tui::input::wait_for_prompt_ready(
+            // wait for the next prompt-ready window. The transcript-idle
+            // fallback covers Claude TUI redraws where the JSONL terminal
+            // envelope is authoritative but the prompt glyph is not visible.
+            match crate::services::claude_tui::input::wait_for_prompt_ready_or_idle_transcript(
                 tmux_session_name,
                 crate::services::claude_tui::input::PromptReadinessKind::Followup,
                 cancel_token.as_deref(),
+                &transcript_path,
             ) {
                 Ok(()) => {
                     busy_waited = true;
@@ -1792,10 +1795,12 @@ fn execute_streaming_local_tui_tmux(
                             "tmux_session_name": tmux_session_name,
                             "transcript_path": transcript_path_string,
                             "prompt_marker_detected": post_wait_snapshot.prompt_marker_detected,
+                            "prompt_draft_detected": post_wait_snapshot.prompt_draft_detected,
                             "previous_tui_turn_still_running": post_wait_snapshot.tmux_pane_alive && !post_wait_snapshot.prompt_marker_detected,
                             "tmux_pane_alive": post_wait_snapshot.tmux_pane_alive,
                             "capture_available": post_wait_snapshot.capture_available,
                             "initial_busy_snapshot_prompt_marker_detected": snapshot.prompt_marker_detected,
+                            "initial_busy_snapshot_prompt_draft_detected": snapshot.prompt_draft_detected,
                             "wait_outcome": if timed_out { "timeout" } else { "error" },
                             "wait_error": err,
                         }),
@@ -1833,11 +1838,14 @@ fn execute_streaming_local_tui_tmux(
             );
             return Ok(());
         }
-        if let Err(error) = crate::services::claude_tui::input::send_followup_prompt(
-            tmux_session_name,
-            prompt,
-            cancel_token.as_deref(),
-        ) {
+        if let Err(error) =
+            crate::services::claude_tui::input::send_followup_prompt_or_idle_transcript(
+                tmux_session_name,
+                prompt,
+                cancel_token.as_deref(),
+                &transcript_path,
+            )
+        {
             if crate::services::claude_tui::input::is_prompt_ready_cancelled_error(&error) {
                 debug_log(&format!(
                     "Claude TUI follow-up: cancellation observed during prompt submission, aborting injection (session={})",
@@ -1912,7 +1920,7 @@ fn execute_streaming_local_tui_tmux(
                     tmux_session_name,
                     &format!("claude tui follow-up failed, recreating: {}", error),
                 );
-                crate::services::platform::tmux::kill_session_with_reason(
+                crate::services::platform::tmux::kill_session(
                     tmux_session_name,
                     &format!("claude tui follow-up failed, recreating: {}", error),
                 );
@@ -1937,7 +1945,7 @@ fn execute_streaming_local_tui_tmux(
                     tmux_session_name,
                     &format!("claude tui partial follow-up output delivered: {}", error),
                 );
-                crate::services::platform::tmux::kill_session_with_reason(
+                crate::services::platform::tmux::kill_session(
                     tmux_session_name,
                     &format!("claude tui partial follow-up output delivered: {}", error),
                 );
@@ -1959,7 +1967,7 @@ fn execute_streaming_local_tui_tmux(
             tmux_session_name,
             "stale claude tui session cleanup before recreate",
         );
-        crate::services::platform::tmux::kill_session_with_reason(
+        crate::services::platform::tmux::kill_session(
             tmux_session_name,
             "stale claude tui session cleanup before recreate",
         );
@@ -2057,7 +2065,7 @@ fn execute_streaming_local_tui_tmux(
                 tmux_session_name,
                 &format!("claude tui fresh turn failed: {}", error),
             );
-            crate::services::platform::tmux::kill_session_with_reason(
+            crate::services::platform::tmux::kill_session(
                 tmux_session_name,
                 &format!("claude tui fresh turn failed: {}", error),
             );
@@ -2078,7 +2086,7 @@ fn execute_streaming_local_tui_tmux(
             tmux_session_name,
             "claude tui session died before turn completion",
         );
-        crate::services::platform::tmux::kill_session_with_reason(
+        crate::services::platform::tmux::kill_session(
             tmux_session_name,
             "claude tui session died before turn completion",
         );
@@ -2241,7 +2249,12 @@ fn read_claude_tui_transcript_until_done(
                 &hook_rx_for_probe,
                 &expected_session_id,
                 hook_events_after,
-                || crate::services::provider::tmux_session_ready_for_input(&tmux_name_ready),
+                || {
+                    crate::services::provider::tmux_session_ready_for_input(
+                        &tmux_name_ready,
+                        &ProviderKind::Claude,
+                    )
+                },
             )
         },
     );
@@ -2523,7 +2536,7 @@ fn execute_streaming_local_tmux(
                     tmux_session_name,
                     &format!("followup failed, recreating: {}", error),
                 );
-                crate::services::platform::tmux::kill_session_with_reason(
+                crate::services::platform::tmux::kill_session(
                     tmux_session_name,
                     &format!("followup failed, recreating: {}", error),
                 );
@@ -2549,7 +2562,7 @@ fn execute_streaming_local_tmux(
                     tmux_session_name,
                     &format!("partial follow-up output already delivered: {}", error),
                 );
-                crate::services::platform::tmux::kill_session_with_reason(
+                crate::services::platform::tmux::kill_session(
                     tmux_session_name,
                     &format!("partial follow-up output already delivered: {}", error),
                 );
@@ -2581,7 +2594,7 @@ fn execute_streaming_local_tmux(
             tmux_session_name,
             "stale local session cleanup before recreate",
         );
-        crate::services::platform::tmux::kill_session_with_reason(
+        crate::services::platform::tmux::kill_session(
             tmux_session_name,
             "stale local session cleanup before recreate",
         );
@@ -2783,7 +2796,7 @@ fn send_followup_to_tmux(
         start_offset,
         sender.clone(),
         cancel_token,
-        SessionProbe::tmux(tmux_session_name.to_string()),
+        SessionProbe::tmux(tmux_session_name.to_string(), ProviderKind::Claude),
     )?;
 
     let outcome = classify_followup_result(
@@ -3052,7 +3065,7 @@ pub fn terminate_local_session(session_name: &str) {
     #[cfg(unix)]
     if tmux_session_exists(session_name) {
         record_tmux_exit_reason(session_name, "model change requested fresh session");
-        let _ = crate::services::platform::tmux::kill_session_with_reason(
+        let _ = crate::services::platform::tmux::kill_session(
             session_name,
             "model change requested fresh session",
         );
@@ -3773,7 +3786,12 @@ mod tests {
     #[cfg(unix)]
     fn test_tmux_capture_detects_ready_prompt() {
         let capture = "...\n▶ Ready for input (type message + Enter)\n";
-        assert!(crate::services::provider::tmux_capture_indicates_ready_for_input(capture));
+        assert!(
+            crate::services::provider::tmux_capture_indicates_ready_for_input(
+                capture,
+                &ProviderKind::Claude
+            )
+        );
     }
 
     #[test]
@@ -3787,14 +3805,24 @@ previous output\n\
   🤖 Opus(H) │ ██░░░░░░░░ │ 24%\n\
   📁 agentdesk (main*) │ Todos: -\n\
   ⏵⏵ bypass permissions on";
-        assert!(crate::services::provider::tmux_capture_indicates_ready_for_input(capture));
+        assert!(
+            crate::services::provider::tmux_capture_indicates_ready_for_input(
+                capture,
+                &ProviderKind::Claude
+            )
+        );
     }
 
     #[test]
     #[cfg(unix)]
     fn test_tmux_capture_ignores_non_ready_prompt() {
         let capture = "Claude is still working...\n";
-        assert!(!crate::services::provider::tmux_capture_indicates_ready_for_input(capture));
+        assert!(
+            !crate::services::provider::tmux_capture_indicates_ready_for_input(
+                capture,
+                &ProviderKind::Claude
+            )
+        );
     }
 
     // ========== parse_stream_message thinking tests ==========

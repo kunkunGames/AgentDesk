@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use poise::serenity_prelude as serenity;
@@ -21,8 +21,9 @@ use crate::voice::commands::{
 };
 use crate::voice::config::DEFAULT_STT_LANGUAGE;
 use crate::voice::progress;
+use crate::voice::runtime_boundary::VoiceRuntimeConfigSnapshot;
 use crate::voice::sanitizer::{foreground_spoken_only_with_limit, spoken_result_only_with_limit};
-use crate::voice::stt::SttRuntime;
+use crate::voice::stt::{SttSessionHandle, VoiceStt, VoiceSttRuntime};
 use crate::voice::tts::{
     TtsRuntime, TtsSynthesisKind,
     playback::{DEFAULT_TTS_CHUNK_MAX_CHARS, play_chunked_with_prefetch},
@@ -97,6 +98,7 @@ pub(in crate::services::discord) enum VoiceBargeInTranscriptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::services::discord) struct VoiceProgressEvent {
     pub channel_id: u64,
+    pub playback_channel_id: Option<u64>,
     pub label: String,
 }
 
@@ -196,6 +198,12 @@ struct LivePlaybackSession {
     player: Arc<dyn BargeInPlayerStop>,
     cancellation: CancellationToken,
     owner: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StreamingSttKey {
+    channel_id: u64,
+    user_id: u64,
 }
 
 struct SpokenResultPlaybackSession {
@@ -793,6 +801,7 @@ struct DeferredBargeInDrain {
 
 struct VoiceProgressChannelState {
     active: bool,
+    playback_channel_id: Option<u64>,
     pending_events: Vec<String>,
     last_activity_at: Instant,
     next_idle_delay: Duration,
@@ -803,6 +812,7 @@ impl VoiceProgressChannelState {
     fn new(now: Instant) -> Self {
         Self {
             active: true,
+            playback_channel_id: None,
             pending_events: Vec::new(),
             last_activity_at: now,
             next_idle_delay: progress::PROGRESS_IDLE_NOTICE_INITIAL,
@@ -816,11 +826,19 @@ impl VoiceProgressChannelState {
         self.next_idle_delay = progress::PROGRESS_IDLE_NOTICE_INITIAL;
     }
 
+    fn set_playback_channel_id(&mut self, playback_channel_id: Option<u64>) {
+        self.playback_channel_id = playback_channel_id;
+    }
+
     fn mark_done(&mut self) {
         self.active = false;
         self.pending_events.clear();
         self.next_summary_at = None;
     }
+}
+
+fn progress_feedback_channel_id(channel_id: u64, playback_channel_id: Option<u64>) -> u64 {
+    playback_channel_id.unwrap_or(channel_id)
 }
 
 pub(in crate::services::discord) struct VoiceBargeInRuntime {
@@ -838,7 +856,10 @@ pub(in crate::services::discord) struct VoiceBargeInRuntime {
     voice_config_state: RwLock<VoiceConfig>,
     spoken_result_language: RwLock<String>,
     verbose_progress: AtomicBool,
-    stt: RwLock<Option<SttRuntime>>,
+    stt: RwLock<Option<VoiceSttRuntime>>,
+    streaming_stt_sessions: dashmap::DashMap<StreamingSttKey, SttSessionHandle>,
+    streaming_stt_feed_tasks:
+        dashmap::DashMap<StreamingSttKey, Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>>,
     tts: RwLock<Option<TtsRuntime>>,
     progress_tx: broadcast::Sender<VoiceProgressEvent>,
     monitors: dashmap::DashMap<u64, Arc<std::sync::Mutex<LiveBargeInMonitor>>>,
@@ -873,7 +894,7 @@ impl VoiceBargeInRuntime {
         let default_sensitivity = config.barge_in.sensitivity;
         let conservative_ttl = Duration::from_secs(config.barge_in.conservative_ttl_secs.max(1));
         let stt = if config.enabled {
-            Some(SttRuntime::from_voice_config(config))
+            Some(VoiceSttRuntime::from_voice_config(config))
         } else {
             None
         };
@@ -900,6 +921,8 @@ impl VoiceBargeInRuntime {
             spoken_result_language: RwLock::new(config.stt.language.clone()),
             verbose_progress: AtomicBool::new(config.verbose_progress),
             stt: RwLock::new(stt),
+            streaming_stt_sessions: dashmap::DashMap::new(),
+            streaming_stt_feed_tasks: dashmap::DashMap::new(),
             tts: RwLock::new(tts),
             progress_tx,
             monitors: dashmap::DashMap::new(),
@@ -932,6 +955,8 @@ impl VoiceBargeInRuntime {
             spoken_result_language: RwLock::new(DEFAULT_STT_LANGUAGE.to_string()),
             verbose_progress: AtomicBool::new(false),
             stt: RwLock::new(None),
+            streaming_stt_sessions: dashmap::DashMap::new(),
+            streaming_stt_feed_tasks: dashmap::DashMap::new(),
             tts: RwLock::new(None),
             progress_tx,
             monitors: dashmap::DashMap::new(),
@@ -951,6 +976,15 @@ impl VoiceBargeInRuntime {
 
     pub(in crate::services::discord) fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub(in crate::services::discord) async fn runtime_config_snapshot(
+        &self,
+    ) -> VoiceRuntimeConfigSnapshot {
+        let config = self.voice_config_state.read().await;
+        let mut snapshot = VoiceRuntimeConfigSnapshot::from(&*config);
+        snapshot.verbose_progress = self.verbose_progress_enabled();
+        snapshot
     }
 
     /// #2250: register a CancelToken for an in-flight foreground/voice Codex
@@ -1186,7 +1220,9 @@ impl VoiceBargeInRuntime {
         };
         *self.spoken_result_language.write().await = language;
         if self.enabled {
-            *self.stt.write().await = Some(SttRuntime::from_voice_config(&config));
+            self.streaming_stt_sessions.clear();
+            self.streaming_stt_feed_tasks.clear();
+            *self.stt.write().await = Some(VoiceSttRuntime::from_voice_config(&config));
         }
     }
 
@@ -1247,12 +1283,22 @@ impl VoiceBargeInRuntime {
         channel_id: ChannelId,
         label: impl Into<String>,
     ) {
+        self.publish_progress_for_playback(channel_id, None, label);
+    }
+
+    pub(in crate::services::discord) fn publish_progress_for_playback(
+        &self,
+        channel_id: ChannelId,
+        playback_channel_id: Option<ChannelId>,
+        label: impl Into<String>,
+    ) {
         let label = label.into();
         if label.trim().is_empty() {
             return;
         }
         let _ = self.progress_tx.send(VoiceProgressEvent {
             channel_id: channel_id.get(),
+            playback_channel_id: playback_channel_id.map(|id| id.get()),
             label,
         });
     }
@@ -1402,10 +1448,22 @@ impl VoiceBargeInRuntime {
         }
 
         let channel_id = ChannelId::new(event.channel_id);
+        let playback_channel_id = event
+            .playback_channel_id
+            .map(ChannelId::new)
+            .unwrap_or(channel_id);
         if progress::is_turn_done_event(&label) {
             if let Some(state) = states.get_mut(&event.channel_id) {
                 state.mark_done();
             }
+            self.play_processing_chime(
+                shared,
+                ChannelId::new(progress_feedback_channel_id(
+                    event.channel_id,
+                    event.playback_channel_id,
+                )),
+            )
+            .await;
             return;
         }
 
@@ -1414,6 +1472,9 @@ impl VoiceBargeInRuntime {
             .entry(event.channel_id)
             .or_insert_with(|| VoiceProgressChannelState::new(now))
             .mark_active(now);
+        if let Some(state) = states.get_mut(&event.channel_id) {
+            state.set_playback_channel_id(event.playback_channel_id);
+        }
 
         if !self.verbose_progress_enabled() {
             return;
@@ -1437,7 +1498,7 @@ impl VoiceBargeInRuntime {
             None
         };
         if let Some(events) = summary_events {
-            self.speak_progress_summary(shared, channel_id, events)
+            self.speak_progress_summary(shared, playback_channel_id, events)
                 .await;
         }
     }
@@ -1491,7 +1552,21 @@ impl VoiceBargeInRuntime {
             .collect::<Vec<_>>();
 
         for raw_channel_id in due_channels {
-            let channel_id = ChannelId::new(raw_channel_id);
+            let (channel_id, playback_channel_id) = if let Some(state) = states.get(&raw_channel_id)
+            {
+                (
+                    ChannelId::new(raw_channel_id),
+                    state
+                        .playback_channel_id
+                        .map(ChannelId::new)
+                        .unwrap_or_else(|| ChannelId::new(raw_channel_id)),
+                )
+            } else {
+                (
+                    ChannelId::new(raw_channel_id),
+                    ChannelId::new(raw_channel_id),
+                )
+            };
             if !super::mailbox_has_active_turn(shared, channel_id).await {
                 if let Some(state) = states.get_mut(&raw_channel_id) {
                     state.mark_done();
@@ -1502,7 +1577,7 @@ impl VoiceBargeInRuntime {
             let language = self.spoken_result_language().await;
             self.speak_progress_text(
                 shared,
-                channel_id,
+                playback_channel_id,
                 progress::idle_notice(&language),
                 "voice progress idle notice",
             )
@@ -1817,6 +1892,146 @@ impl VoiceBargeInRuntime {
         }
     }
 
+    pub(in crate::services::discord) fn observe_streaming_stt_pcm_i16(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        user_id: u64,
+        samples: &[i16],
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        let pcm = discord_pcm_i16_stereo_48k_to_mono_f32_16k(samples);
+        if pcm.is_empty() {
+            return;
+        }
+        let runtime = self.clone();
+        let key = StreamingSttKey {
+            channel_id: channel_id.get(),
+            user_id,
+        };
+        let task_bucket = self
+            .streaming_stt_feed_tasks
+            .entry(key)
+            .or_insert_with(|| Arc::new(StdMutex::new(Vec::new())))
+            .clone();
+        let handle = tokio::spawn(async move {
+            runtime
+                .feed_streaming_stt_pcm(channel_id, user_id, pcm)
+                .await;
+        });
+        if let Ok(mut tasks) = task_bucket.lock() {
+            tasks.push(handle);
+        } else {
+            handle.abort();
+        }
+    }
+
+    async fn feed_streaming_stt_pcm(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        user_id: u64,
+        pcm: Vec<f32>,
+    ) {
+        let Some(stt) = self.stt.read().await.clone() else {
+            return;
+        };
+        if !stt.is_streaming() {
+            return;
+        }
+
+        let key = StreamingSttKey {
+            channel_id: channel_id.get(),
+            user_id,
+        };
+        let session = match self.streaming_stt_sessions.get(&key) {
+            Some(entry) => entry.value().clone(),
+            None => {
+                let language = self.spoken_result_language().await;
+                let new_session = match stt.start_session(&language).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            channel_id = channel_id.get(),
+                            user_id,
+                            "voice streaming STT session start failed"
+                        );
+                        return;
+                    }
+                };
+                match self.streaming_stt_sessions.entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => {
+                        let existing = entry.get().clone();
+                        if let Err(error) = stt.finalize(new_session).await {
+                            tracing::debug!(
+                                error = %error,
+                                channel_id = channel_id.get(),
+                                user_id,
+                                "discarding duplicate voice streaming STT session failed"
+                            );
+                        }
+                        existing
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(new_session.clone());
+                        new_session
+                    }
+                }
+            }
+        };
+
+        if let Err(error) = stt.feed(&session, &pcm).await {
+            tracing::warn!(
+                error = %error,
+                channel_id = channel_id.get(),
+                user_id,
+                "voice streaming STT feed failed"
+            );
+            return;
+        }
+
+        match stt.poll_partial(&session).await {
+            Ok(Some(partial)) => {
+                tracing::debug!(
+                    channel_id = channel_id.get(),
+                    user_id,
+                    sequence = partial.window.as_ref().map(|window| window.sequence),
+                    chars = partial.text.chars().count(),
+                    "voice streaming STT partial updated"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    channel_id = channel_id.get(),
+                    user_id,
+                    "voice streaming STT partial poll failed"
+                );
+            }
+        }
+    }
+
+    async fn drain_streaming_stt_feed_tasks(&self, key: StreamingSttKey) {
+        let Some((_, task_bucket)) = self.streaming_stt_feed_tasks.remove(&key) else {
+            return;
+        };
+        let tasks = match task_bucket.lock() {
+            Ok(mut tasks) => tasks.drain(..).collect::<Vec<_>>(),
+            Err(error) => error.into_inner().drain(..).collect::<Vec<_>>(),
+        };
+        for task in tasks {
+            if let Err(error) = task.await {
+                tracing::debug!(
+                    ?key,
+                    %error,
+                    "voice streaming STT feed task finished with join error before finalization"
+                );
+            }
+        }
+    }
+
     pub(in crate::services::discord) async fn handle_processing_transcript(
         &self,
         shared: &Arc<SharedData>,
@@ -1849,7 +2064,10 @@ impl VoiceBargeInRuntime {
             .inflight_foreground_cancels
             .get(&channel_id.get())
             .is_some_and(|entry| !entry.value().is_empty());
-        if !super::mailbox_has_active_turn(shared, channel_id).await && !has_inflight_foreground {
+        let cancel_channel = self
+            .active_barge_in_mailbox_channel(shared, channel_id)
+            .await;
+        if cancel_channel.is_none() && !has_inflight_foreground {
             return VoiceBargeInTranscriptOutcome::NoActiveTurn;
         }
 
@@ -1866,9 +2084,10 @@ impl VoiceBargeInRuntime {
                 let inflight_cancelled = self
                     .cancel_inflight_foreground_calls(channel_id, "voice_barge_in_explicit_stop");
                 let _ = inflight_cancelled;
+                let cancel_channel = cancel_channel.unwrap_or(channel_id);
                 let result = super::mailbox_cancel_active_turn_with_reason(
                     shared,
-                    channel_id,
+                    cancel_channel,
                     "voice_barge_in_explicit_stop",
                 )
                 .await;
@@ -1878,6 +2097,7 @@ impl VoiceBargeInRuntime {
                 let playback_active = self.playbacks.contains_key(&channel_id.get());
                 tracing::info!(
                     channel_id = channel_id.get(),
+                    cancel_channel_id = cancel_channel.get(),
                     cancelled = result.token.is_some(),
                     already_stopping = result.already_stopping,
                     transcript_chars = transcript.chars().count(),
@@ -2123,10 +2343,7 @@ impl VoiceBargeInRuntime {
         announcement: &crate::voice::prompt::VoiceTranscriptAnnouncement,
         summary: &str,
     ) -> Result<VoiceBackgroundHandoffOutcome, String> {
-        let background_provider = self
-            .resolve_background_provider_for_target(target_channel_id)
-            .await;
-        let driver = select_voice_background_driver(&background_provider);
+        let driver = select_voice_background_driver();
         let guild_id = self.voice_turn_guild_id(source_channel_id, target_channel_id);
         let prompt = build_voice_background_handoff_prompt(
             &announcement.transcript,
@@ -2183,6 +2400,36 @@ impl VoiceBargeInRuntime {
             );
         }
 
+        let link_generation = generation.min(i32::MAX as u64) as i32;
+        let mut voice_turn_link_inserted = false;
+        if let (Some(pool), Some(guild_id)) = (shared.pg_pool.as_ref(), guild_id) {
+            let link = crate::voice::turn_link::VoiceTurnLinkInsert {
+                guild_id: guild_id.get(),
+                voice_channel_id: source_channel_id.get(),
+                background_channel_id: target_channel_id.get(),
+                utterance_id: announcement.utterance_id.clone(),
+                generation: link_generation,
+                announce_message_id: None,
+                dispatch_id: None,
+                turn_id: None,
+            };
+            match crate::voice::turn_link::upsert_active_voice_turn_link_pg(pool, &link).await {
+                Ok(Some(_)) => {
+                    voice_turn_link_inserted = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        source_channel_id = source_channel_id.get(),
+                        target_channel_id = target_channel_id.get(),
+                        utterance_id = %announcement.utterance_id,
+                        "voice background handoff voice_turn_link pre-publish insert failed; terminal TTS will fall back to announce metadata"
+                    );
+                }
+            }
+        }
+
         let outcome = match driver
             .start(VoiceBackgroundStartRequest {
                 guild_id,
@@ -2198,6 +2445,26 @@ impl VoiceBargeInRuntime {
             Ok(outcome) => outcome,
             Err(error) => {
                 store.cancel_handoff_reservation(&correlation_id);
+                if voice_turn_link_inserted {
+                    if let (Some(pool), Some(guild_id)) = (shared.pg_pool.as_ref(), guild_id) {
+                        if let Err(mark_error) =
+                            crate::voice::turn_link::mark_terminal_voice_turn_link_pg(
+                                pool,
+                                guild_id.get(),
+                                source_channel_id.get(),
+                                &announcement.utterance_id,
+                                link_generation,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %mark_error,
+                                correlation_id = %correlation_id,
+                                "voice_turn_link cleanup failed after background handoff publish error"
+                            );
+                        }
+                    }
+                }
                 if durable_reserved {
                     if let Some(pool) = shared.pg_pool.as_ref() {
                         if let Err(cancel_error) =
@@ -2218,6 +2485,31 @@ impl VoiceBargeInRuntime {
                 return Err(error);
             }
         };
+
+        if let (Some(pool), Some(guild_id)) = (shared.pg_pool.as_ref(), guild_id) {
+            let patch = crate::voice::turn_link::VoiceTurnLinkIdentityPatch {
+                guild_id: guild_id.get(),
+                voice_channel_id: source_channel_id.get(),
+                utterance_id: announcement.utterance_id.clone(),
+                generation: link_generation,
+                announce_message_id: outcome.message_id.map(|id| id.get()),
+                dispatch_id: None,
+                turn_id: Some(outcome.turn_id.clone()),
+            };
+            if let Err(error) =
+                crate::voice::turn_link::attach_voice_turn_link_ids_pg(pool, &patch).await
+            {
+                tracing::warn!(
+                    error = %error,
+                    source_channel_id = source_channel_id.get(),
+                    target_channel_id = target_channel_id.get(),
+                    utterance_id = %announcement.utterance_id,
+                    announce_message_id = outcome.message_id.map(|id| id.get()),
+                    turn_id = %outcome.turn_id,
+                    "voice background handoff voice_turn_link identity attach failed; terminal TTS will fall back to announce metadata"
+                );
+            }
+        }
 
         // #2236: stamp a typed marker keyed by the posted message id so the
         // turn bridge can route the background turn's spoken summary back to
@@ -2316,10 +2608,7 @@ impl VoiceBargeInRuntime {
         let foreground = self
             .resolve_effective_foreground_config(source_channel_id, target_channel_id)
             .await;
-        let background_provider = self
-            .resolve_background_provider_for_target(target_channel_id)
-            .await;
-        let driver = select_voice_background_driver(&background_provider);
+        let driver = select_voice_background_driver();
         let guild_id = self.voice_turn_guild_id(source_channel_id, target_channel_id);
         if guild_id.is_none() {
             tracing::warn!(
@@ -2480,7 +2769,6 @@ impl VoiceBargeInRuntime {
                     user_id = utterance.user_id,
                     utterance_id = %utterance.utterance_id,
                     turn_id = %outcome.turn_id,
-                    background_provider = %background_provider.as_str(),
                     background_driver = %outcome.driver_kind.as_str(),
                     foreground_provider = %foreground.provider,
                     foreground_model = %foreground.model,
@@ -2606,19 +2894,6 @@ impl VoiceBargeInRuntime {
         }
     }
 
-    async fn resolve_background_provider_for_target(
-        &self,
-        target_channel_id: ChannelId,
-    ) -> ProviderKind {
-        let config = self.cached_config().await;
-        config
-            .agents
-            .iter()
-            .find(|agent| agent_text_channel_matches(agent, target_channel_id))
-            .map(|agent| ProviderKind::from_str_or_unsupported(&agent.provider))
-            .unwrap_or_else(|| ProviderKind::Unsupported("unknown".to_string()))
-    }
-
     async fn resolve_voice_background_channel_for_source(
         &self,
         source_channel_id: ChannelId,
@@ -2631,6 +2906,26 @@ impl VoiceBargeInRuntime {
             .agents
             .iter()
             .find_map(|agent| agent_voice_background_channel_for(agent, source_channel_id))
+    }
+
+    async fn active_barge_in_mailbox_channel(
+        &self,
+        shared: &Arc<SharedData>,
+        source_channel_id: ChannelId,
+    ) -> Option<ChannelId> {
+        let routed_channel_id = self
+            .active_voice_routes
+            .get(&source_channel_id.get())
+            .map(|entry| entry.value().channel_id);
+        if let Some(channel_id) = routed_channel_id {
+            if super::mailbox_has_active_turn(shared, channel_id).await {
+                return Some(channel_id);
+            }
+        }
+        if super::mailbox_has_active_turn(shared, source_channel_id).await {
+            return Some(source_channel_id);
+        }
+        None
     }
 
     /// Reverse lookup: given a background text channel, find the foreground
@@ -2973,7 +3268,12 @@ impl VoiceBargeInRuntime {
             .inflight_foreground_cancels
             .get(&channel_id.get())
             .is_some_and(|entry| !entry.value().is_empty());
-        if super::mailbox_has_active_turn(shared, channel_id).await || has_inflight_foreground {
+        if self
+            .active_barge_in_mailbox_channel(shared, channel_id)
+            .await
+            .is_some()
+            || has_inflight_foreground
+        {
             return self
                 .handle_processing_transcript(shared, provider, channel_id, transcript)
                 .await;
@@ -3301,17 +3601,22 @@ impl VoiceBargeInRuntime {
                         .first_chunk_synthesis_ms
                         .unwrap_or(0)
                         .min(u64::MAX as u128) as u64;
-                    let play_ms = report
+                    let first_audio_out_ms = report
                         .first_audio_start_ms
                         .unwrap_or(0)
                         .min(u64::MAX as u128) as u64;
-                    crate::voice::metrics::record_tts(channel_id.get(), synth_ms, play_ms);
+                    crate::voice::metrics::record_tts(
+                        channel_id.get(),
+                        synth_ms,
+                        first_audio_out_ms,
+                    );
                     tracing::info!(
                         channel_id = channel_id.get(),
                         guild_id = guild_id.get(),
                         chunks = report.chunk_count,
                         played_chunks = report.played_chunks,
                         first_chunk_synthesis_ms = ?report.first_chunk_synthesis_ms,
+                        first_audio_out_ms,
                         first_audio_start_ms = ?report.first_audio_start_ms,
                         "voice final TTS chunked playback finished"
                     );
@@ -3336,7 +3641,48 @@ impl VoiceBargeInRuntime {
     ) -> Option<String> {
         let stt_started_at = std::time::Instant::now();
         if let Some(stt) = self.stt.read().await.clone() {
-            match stt.transcribe(&utterance.path).await {
+            if stt.is_streaming() {
+                let key = StreamingSttKey {
+                    channel_id: channel_id.get(),
+                    user_id: utterance.user_id,
+                };
+                self.drain_streaming_stt_feed_tasks(key).await;
+                if let Some((_, session)) = self.streaming_stt_sessions.remove(&key) {
+                    match stt.finalize(session).await {
+                        Ok(transcript) if !transcript.text.trim().is_empty() => {
+                            crate::voice::metrics::record_stt(
+                                channel_id.get(),
+                                Some(&utterance.utterance_id),
+                                stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            );
+                            return Some(transcript.text);
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                channel_id = channel_id.get(),
+                                utterance_id = %utterance.utterance_id,
+                                "voice streaming STT finalized empty transcript; falling back to file STT"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                channel_id = channel_id.get(),
+                                utterance_id = %utterance.utterance_id,
+                                "voice streaming STT finalize failed; falling back to file STT"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        channel_id = channel_id.get(),
+                        utterance_id = %utterance.utterance_id,
+                        "voice streaming STT had no live session for utterance; falling back to file STT"
+                    );
+                }
+            }
+
+            match stt.transcribe_file(&utterance.path).await {
                 Ok(transcript) => {
                     crate::voice::metrics::record_stt(
                         channel_id.get(),
@@ -3498,8 +3844,10 @@ impl DiscordVoiceBargeInHook {
 }
 
 impl VoiceReceiveHook for DiscordVoiceBargeInHook {
-    fn observe_pcm(&self, control_channel_id: u64, _user_id: u64, samples: &[i16]) {
+    fn observe_pcm(&self, control_channel_id: u64, user_id: u64, samples: &[i16]) {
         let channel_id = ChannelId::new(control_channel_id);
+        self.runtime
+            .observe_streaming_stt_pcm_i16(channel_id, user_id, samples);
         let Some(cut) = self.runtime.observe_live_pcm_i16(channel_id, samples) else {
             return;
         };
@@ -3529,15 +3877,21 @@ impl VoiceReceiveHook for DiscordVoiceBargeInHook {
         let foreground_cancelled = self
             .runtime
             .cancel_inflight_foreground_calls(channel_id, "voice_barge_in_live_cut");
+        let runtime = self.runtime.clone();
         tokio::spawn(async move {
+            let cancel_channel = runtime
+                .active_barge_in_mailbox_channel(&shared, channel_id)
+                .await
+                .unwrap_or(channel_id);
             let result = super::mailbox_cancel_active_turn_with_reason(
                 &shared,
-                channel_id,
+                cancel_channel,
                 "voice_barge_in_live_cut",
             )
             .await;
             tracing::info!(
                 channel_id = channel_id.get(),
+                cancel_channel_id = cancel_channel.get(),
                 mean_db = cut.levels.mean_db,
                 max_db = cut.levels.max_db,
                 sensitivity = ?cut.sensitivity,
@@ -3582,6 +3936,21 @@ fn pcm_i16_to_le_bytes(samples: &[i16]) -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
+}
+
+fn discord_pcm_i16_stereo_48k_to_mono_f32_16k(samples: &[i16]) -> Vec<f32> {
+    samples
+        .chunks_exact(6)
+        .map(|chunk| {
+            let mut sum = 0.0f32;
+            for frame in 0..3 {
+                let left = chunk[frame * 2] as f32;
+                let right = chunk[frame * 2 + 1] as f32;
+                sum += (left + right) * 0.5;
+            }
+            (sum / 3.0) / i16::MAX as f32
+        })
+        .collect()
 }
 
 /// #2156: 일반 wav/segment 삭제. NotFound 는 무시, 그 외 에러는 debug 로그.
@@ -3658,6 +4027,81 @@ mod tests {
         config.enabled = true;
         config.barge_in.acknowledgement_enabled = false;
         VoiceBargeInRuntime::from_voice_config(&config)
+    }
+
+    #[tokio::test]
+    async fn voice_runtime_uses_file_stt_by_default_and_stream_when_opted_in() {
+        let mut file_config = VoiceConfig::default();
+        file_config.enabled = true;
+        let file_runtime = VoiceBargeInRuntime::from_voice_config(&file_config);
+        assert!(
+            !file_runtime
+                .stt
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_streaming(),
+            "default STT mode must remain file"
+        );
+
+        let mut stream_config = VoiceConfig::default();
+        stream_config.enabled = true;
+        stream_config.stt.mode = crate::voice::config::VoiceSttMode::Stream;
+        let stream_runtime = VoiceBargeInRuntime::from_voice_config(&stream_config);
+        assert!(
+            stream_runtime
+                .stt
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_streaming(),
+            "stream STT must only activate when configured"
+        );
+    }
+
+    #[test]
+    fn discord_pcm_conversion_downsamples_stereo_48k_to_mono_16k() {
+        let samples = [
+            32_767, 32_767, 0, 0, -32_767, -32_767, 16_384, 16_384, 16_384, 16_384, 16_384, 16_384,
+        ];
+
+        let converted = discord_pcm_i16_stereo_48k_to_mono_f32_16k(&samples);
+
+        assert_eq!(converted.len(), 2);
+        assert!(converted[0].abs() < 0.0001);
+        assert!((converted[1] - 0.5).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn runtime_config_snapshot_reflects_mutable_voice_state() {
+        let runtime = enabled_runtime();
+
+        runtime.set_runtime_language("en".to_string()).await;
+        runtime
+            .set_runtime_tts_voice("en-US-AriaNeural".to_string())
+            .await;
+        runtime.set_verbose_progress_enabled(true);
+
+        let snapshot = runtime.runtime_config_snapshot().await;
+
+        assert!(snapshot.enabled);
+        assert!(snapshot.barge_in_enabled);
+        assert!(snapshot.verbose_progress);
+        assert_eq!(snapshot.stt_language, "en");
+        assert_eq!(snapshot.tts_voice, "en-US-AriaNeural");
+        assert_eq!(snapshot.wake_words, vec!["agentdesk"]);
+    }
+
+    #[test]
+    fn progress_feedback_channel_prefers_playback_channel() {
+        assert_eq!(progress_feedback_channel_id(10, Some(20)), 20);
+    }
+
+    #[test]
+    fn progress_feedback_channel_falls_back_to_source_channel() {
+        assert_eq!(progress_feedback_channel_id(10, None), 10);
     }
 
     fn voice_handoff_shared_for_tests() -> Arc<SharedData> {
@@ -4179,6 +4623,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_barge_in_mailbox_channel_prefers_routed_background_turn() {
+        let runtime = enabled_runtime();
+        let shared = voice_handoff_shared_for_tests();
+        let source_channel_id = ChannelId::new(301);
+        let target_channel_id = ChannelId::new(201);
+        runtime.active_voice_routes.insert(
+            source_channel_id.get(),
+            ActiveVoiceRoute {
+                agent_id: "project-agentdesk".to_string(),
+                channel_id: target_channel_id,
+                updated_at: Instant::now(),
+            },
+        );
+        let token = Arc::new(crate::services::provider::CancelToken::new());
+        assert!(
+            shared
+                .mailbox(target_channel_id)
+                .try_start_turn(token, serenity::UserId::new(7), MessageId::new(77))
+                .await
+        );
+
+        assert_eq!(
+            runtime
+                .active_barge_in_mailbox_channel(&shared, source_channel_id)
+                .await,
+            Some(target_channel_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_barge_in_cancels_routed_background_turn() {
+        let runtime = enabled_runtime();
+        let shared = voice_handoff_shared_for_tests();
+        let source_channel_id = ChannelId::new(301);
+        let target_channel_id = ChannelId::new(201);
+        runtime.active_voice_routes.insert(
+            source_channel_id.get(),
+            ActiveVoiceRoute {
+                agent_id: "project-agentdesk".to_string(),
+                channel_id: target_channel_id,
+                updated_at: Instant::now(),
+            },
+        );
+        let token = Arc::new(crate::services::provider::CancelToken::new());
+        assert!(
+            shared
+                .mailbox(target_channel_id)
+                .try_start_turn(token.clone(), serenity::UserId::new(7), MessageId::new(77))
+                .await
+        );
+
+        let outcome = runtime
+            .handle_processing_transcript(&shared, &ProviderKind::Claude, source_channel_id, "멈춰")
+            .await;
+
+        assert!(matches!(
+            outcome,
+            VoiceBargeInTranscriptOutcome::ExplicitStop {
+                cancelled: true,
+                already_stopping: false
+            }
+        ));
+        assert!(token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(
+            token.cancel_source().as_deref(),
+            Some("voice_barge_in_explicit_stop")
+        );
+    }
+
+    #[tokio::test]
     async fn voice_channel_for_background_uses_config_fallback_without_active_route() {
         let runtime = enabled_runtime();
         let mut config = crate::config::Config::default();
@@ -4383,6 +4897,24 @@ mod tests {
 
         let event = rx.recv().await.unwrap();
         assert_eq!(event.channel_id, 42);
+        assert_eq!(event.playback_channel_id, None);
+        assert_eq!(event.label, "tool:Bash");
+    }
+
+    #[tokio::test]
+    async fn progress_subscriber_receives_optional_playback_channel() {
+        let runtime = enabled_runtime();
+        let mut rx = runtime.subscribe_progress();
+
+        runtime.publish_progress_for_playback(
+            ChannelId::new(201),
+            Some(ChannelId::new(301)),
+            "tool:Bash",
+        );
+
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.channel_id, 201);
+        assert_eq!(event.playback_channel_id, Some(301));
         assert_eq!(event.label, "tool:Bash");
     }
 

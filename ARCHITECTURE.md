@@ -420,11 +420,11 @@ src/
 │   │   ├── outbound/
 │   │   │   ├── decision.rs
 │   │   │   ├── delivery.rs
-│   │   │   ├── legacy.rs
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
-│   │   │   └── result.rs
+│   │   │   ├── result.rs
+│   │   │   └── transport.rs
 │   │   ├── placeholder_live_events/
 │   │   │   ├── common.rs
 │   │   │   ├── context_panel.rs
@@ -486,7 +486,6 @@ src/
 │   │   ├── discord_io.rs
 │   │   ├── formatting.rs
 │   │   ├── gateway.rs
-│   │   ├── handoff.rs
 │   │   ├── health.rs
 │   │   ├── http.rs
 │   │   ├── idle_detector.rs
@@ -523,6 +522,7 @@ src/
 │   │   ├── runtime_bootstrap.rs
 │   │   ├── runtime_store.rs
 │   │   ├── session_identity.rs
+│   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
 │   │   ├── settings.rs
 │   │   ├── shared_memory.rs
@@ -710,8 +710,11 @@ src/
 │   ├── progress.rs
 │   ├── prompt.rs
 │   ├── receiver.rs
+│   ├── runtime_boundary.rs
+│   ├── runtime_process.rs
 │   ├── sanitizer.rs
 │   ├── stt.rs
+│   ├── stt_streaming.rs
 │   ├── turn_link.rs
 │   └── utils.rs
 ├── bootstrap.rs

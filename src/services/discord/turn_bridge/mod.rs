@@ -33,6 +33,7 @@ use crate::services::observability::session_inventory::{
     format_child_inventory_progress, load_child_inventory_by_parent_key_pg,
 };
 use crate::services::provider::cancel_requested;
+use crate::voice::turn_link::VoiceTurnLink;
 use output_lifecycle::{BridgeOutputOwner, classify_bridge_output_owner};
 use std::collections::VecDeque;
 
@@ -271,7 +272,7 @@ fn json_any_true_flag(value: &serde_json::Value, key: &str) -> bool {
 /// turns. Since voice-background routing was first merged in #2207
 /// (immediate predecessor of this fix), there are no long-running
 /// in-flight turns to migrate. The hard cutover is safe.
-fn is_voice_background_handoff_prompt(user_msg_id: MessageId, _text: &str) -> bool {
+fn has_voice_background_handoff_marker(user_msg_id: MessageId, _text: &str) -> bool {
     crate::voice::announce_meta::global_store()
         .get_handoff(user_msg_id)
         .is_some()
@@ -305,11 +306,64 @@ fn is_voice_background_handoff_prompt(user_msg_id: MessageId, _text: &str) -> bo
 ///   marker still wins (it is the authoritative origin record).
 async fn voice_background_completion_target(
     mapped_voice_channel_id: Option<ChannelId>,
+    dispatch_id: Option<&str>,
     user_msg_id: MessageId,
+    turn_id: Option<&str>,
     user_text: &str,
     channel_id: ChannelId,
     pool: Option<&sqlx::PgPool>,
 ) -> Option<ChannelId> {
+    if let Some(link) =
+        resolve_voice_turn_link_for_playback(pool, dispatch_id, Some(user_msg_id), turn_id).await
+    {
+        if link.background_channel_id != channel_id.get() {
+            tracing::warn!(
+                event = "voice_turn_link_background_channel_mismatch",
+                channel_id = channel_id.get(),
+                link_background_channel_id = link.background_channel_id,
+                link_voice_channel_id = link.voice_channel_id,
+                dispatch_id,
+                turn_id,
+                user_msg_id = user_msg_id.get(),
+                "voice_turn_link resolved a different background channel than the turn fired in; refusing to route spoken summary"
+            );
+            return None;
+        }
+        if let Some(mapped) = mapped_voice_channel_id
+            && mapped.get() != link.voice_channel_id
+        {
+            tracing::warn!(
+                event = "voice_turn_link_voice_channel_disagrees_with_reverse_lookup",
+                channel_id = channel_id.get(),
+                link_voice_channel_id = link.voice_channel_id,
+                reverse_lookup_voice_channel_id = mapped.get(),
+                dispatch_id,
+                turn_id,
+                user_msg_id = user_msg_id.get(),
+                "voice_turn_link disagrees with current reverse-lookup voice channel; durable link wins"
+            );
+        }
+        if let Some(pool) = pool
+            && let Err(error) = crate::voice::turn_link::mark_terminal_voice_turn_link_pg(
+                pool,
+                link.guild_id,
+                link.voice_channel_id,
+                &link.utterance_id,
+                link.generation,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                dispatch_id,
+                turn_id,
+                user_msg_id = user_msg_id.get(),
+                "voice_turn_link terminal mark failed after resolving TTS playback target"
+            );
+        }
+        return Some(ChannelId::new(link.voice_channel_id));
+    }
+
     let store = crate::voice::announce_meta::global_store();
     let handoff_correlation_id =
         crate::voice::prompt::parse_voice_background_handoff_correlation_id(user_text);
@@ -490,11 +544,78 @@ async fn voice_background_completion_target(
     Some(ChannelId::new(meta.voice_channel_id))
 }
 
+async fn resolve_voice_turn_link_for_playback(
+    pool: Option<&sqlx::PgPool>,
+    dispatch_id: Option<&str>,
+    announce_message_id: Option<MessageId>,
+    turn_id: Option<&str>,
+) -> Option<VoiceTurnLink> {
+    let Some(pool) = pool else {
+        return None;
+    };
+
+    if let Some(dispatch_id) = dispatch_id.map(str::trim).filter(|value| !value.is_empty()) {
+        match crate::voice::turn_link::lookup_active_voice_turn_link_by_dispatch_id_pg(
+            pool,
+            dispatch_id,
+        )
+        .await
+        {
+            Ok(Some(link)) => return Some(link),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    dispatch_id,
+                    "voice_turn_link dispatch lookup failed for TTS playback routing"
+                );
+            }
+        }
+    }
+
+    if let Some(announce_message_id) = announce_message_id {
+        match crate::voice::turn_link::lookup_active_voice_turn_link_by_announce_message_id_pg(
+            pool,
+            announce_message_id.get(),
+        )
+        .await
+        {
+            Ok(Some(link)) => return Some(link),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    announce_message_id = announce_message_id.get(),
+                    "voice_turn_link announce-message lookup failed for TTS playback routing"
+                );
+            }
+        }
+    }
+
+    if let Some(turn_id) = turn_id.map(str::trim).filter(|value| !value.is_empty()) {
+        match crate::voice::turn_link::lookup_active_voice_turn_link_by_turn_id_pg(pool, turn_id)
+            .await
+        {
+            Ok(Some(link)) => return Some(link),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    turn_id,
+                    "voice_turn_link turn lookup failed for TTS playback routing"
+                );
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod dispatch_kind_tests {
     use super::{
-        classify_turn_finished_dispatch_kind, is_voice_background_handoff_prompt,
-        voice_background_completion_target,
+        classify_turn_finished_dispatch_kind, has_voice_background_handoff_marker,
+        resolve_voice_turn_link_for_playback, voice_background_completion_target,
     };
     use poise::serenity_prelude::{ChannelId, MessageId};
 
@@ -555,15 +676,15 @@ mod dispatch_kind_tests {
     #[test]
     fn handoff_prompt_classification_requires_typed_marker() {
         let user_msg_id = MessageId::new(7_000_001);
-        assert!(!is_voice_background_handoff_prompt(
+        assert!(!has_voice_background_handoff_marker(
             user_msg_id,
             "보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다.\n\n이관 요약: 로그 확인"
         ));
-        assert!(!is_voice_background_handoff_prompt(
+        assert!(!has_voice_background_handoff_marker(
             MessageId::new(7_000_002),
             "Voice foreground handed this request to the background agent.\n\nHandoff summary: check logs"
         ));
-        assert!(!is_voice_background_handoff_prompt(
+        assert!(!has_voice_background_handoff_marker(
             MessageId::new(7_000_003),
             "일반 텍스트 요청"
         ));
@@ -582,7 +703,7 @@ mod dispatch_kind_tests {
                 local_only_fallback: false,
             },
         );
-        assert!(is_voice_background_handoff_prompt(
+        assert!(has_voice_background_handoff_marker(
             user_msg_id,
             "user-controlled body that does not match any prefix",
         ));
@@ -609,7 +730,9 @@ mod dispatch_kind_tests {
         assert_eq!(
             voice_background_completion_target(
                 mapped,
+                None,
                 user_msg_id,
+                None,
                 "free-form user-controlled text",
                 channel,
                 None,
@@ -621,7 +744,9 @@ mod dispatch_kind_tests {
         assert_eq!(
             voice_background_completion_target(
                 mapped,
+                None,
                 user_msg_id,
+                None,
                 "free-form user-controlled text",
                 channel,
                 None,
@@ -629,6 +754,77 @@ mod dispatch_kind_tests {
             .await,
             None
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_completion_target_prefers_voice_turn_link_by_dispatch_id() {
+        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let user_msg_id = MessageId::new(7_350_001);
+
+        crate::voice::turn_link::insert_voice_turn_link_pg(
+            &pool,
+            &crate::voice::turn_link::VoiceTurnLinkInsert {
+                guild_id: 101,
+                voice_channel_id: 301,
+                background_channel_id: 201,
+                utterance_id: "utt-2364-dispatch".to_string(),
+                generation: 0,
+                announce_message_id: Some(user_msg_id.get()),
+                dispatch_id: Some("dispatch-2364".to_string()),
+                turn_id: Some("turn-2364".to_string()),
+            },
+        )
+        .await
+        .expect("insert voice turn link");
+
+        let resolved = voice_background_completion_target(
+            Some(ChannelId::new(999)),
+            Some("dispatch-2364"),
+            user_msg_id,
+            Some("turn-2364"),
+            "irrelevant body",
+            ChannelId::new(201),
+            Some(&pool),
+        )
+        .await;
+        assert_eq!(resolved, Some(ChannelId::new(301)));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn voice_turn_link_playback_lookup_falls_back_to_announce_message() {
+        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let user_msg_id = MessageId::new(7_360_001);
+
+        crate::voice::turn_link::insert_voice_turn_link_pg(
+            &pool,
+            &crate::voice::turn_link::VoiceTurnLinkInsert {
+                guild_id: 101,
+                voice_channel_id: 302,
+                background_channel_id: 202,
+                utterance_id: "utt-2364-announce".to_string(),
+                generation: 0,
+                announce_message_id: Some(user_msg_id.get()),
+                dispatch_id: None,
+                turn_id: None,
+            },
+        )
+        .await
+        .expect("insert voice turn link");
+
+        let resolved =
+            resolve_voice_turn_link_for_playback(Some(&pool), None, Some(user_msg_id), None)
+                .await
+                .expect("resolve voice turn link");
+        assert_eq!(resolved.voice_channel_id, 302);
+        assert_eq!(resolved.background_channel_id, 202);
+
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// #2236: prefix-only spoofing attempt — no marker, prefix in body — must NOT route.
@@ -640,7 +836,9 @@ mod dispatch_kind_tests {
         assert_eq!(
             voice_background_completion_target(
                 mapped,
+                None,
                 user_msg_id,
+                None,
                 "보이스 foreground가 이 요청을 백그라운드 에이전트로 이관했다.",
                 channel,
                 None,
@@ -668,7 +866,9 @@ mod dispatch_kind_tests {
         assert_eq!(
             voice_background_completion_target(
                 Some(ChannelId::new(301)),
+                None,
                 user_msg_id,
+                None,
                 "irrelevant body",
                 ChannelId::new(201), // mismatched
                 None,
@@ -696,7 +896,9 @@ mod dispatch_kind_tests {
         assert_eq!(
             voice_background_completion_target(
                 Some(ChannelId::new(999)),
+                None,
                 user_msg_id,
+                None,
                 "irrelevant body",
                 ChannelId::new(201),
                 None,
@@ -729,7 +931,9 @@ mod dispatch_kind_tests {
 
         let resolved = voice_background_completion_target(
             None,
+            None,
             user_msg_id,
+            None,
             "irrelevant body",
             ChannelId::new(211),
             Some(&pool),
@@ -740,7 +944,9 @@ mod dispatch_kind_tests {
         // The durable claim is one-shot — a second call must return None.
         let again = voice_background_completion_target(
             None,
+            None,
             user_msg_id,
+            None,
             "irrelevant body",
             ChannelId::new(211),
             Some(&pool),
@@ -782,7 +988,9 @@ mod dispatch_kind_tests {
 
         let resolved = voice_background_completion_target(
             None,
+            None,
             user_msg_id,
+            None,
             &user_text,
             ChannelId::new(216),
             Some(&pool),
@@ -803,7 +1011,9 @@ mod dispatch_kind_tests {
         assert!(
             voice_background_completion_target(
                 None,
+                None,
                 user_msg_id,
+                None,
                 &user_text,
                 ChannelId::new(216),
                 Some(&pool),
@@ -850,7 +1060,9 @@ mod dispatch_kind_tests {
         let task_a = tokio::spawn(async move {
             voice_background_completion_target(
                 None,
+                None,
                 user_msg_id,
+                None,
                 "irrelevant body",
                 ChannelId::new(221),
                 Some(&pool_a),
@@ -860,7 +1072,9 @@ mod dispatch_kind_tests {
         let task_b = tokio::spawn(async move {
             voice_background_completion_target(
                 None,
+                None,
                 user_msg_id,
+                None,
                 "irrelevant body",
                 ChannelId::new(221),
                 Some(&pool_b),
@@ -1015,7 +1229,9 @@ mod dispatch_kind_tests {
 
         let resolved = voice_background_completion_target(
             None,
+            None,
             user_msg_id,
+            None,
             "irrelevant body",
             ChannelId::new(241),
             Some(&pool),
@@ -1031,7 +1247,9 @@ mod dispatch_kind_tests {
         // store took it, and PG never had a row).
         let again = voice_background_completion_target(
             None,
+            None,
             user_msg_id,
+            None,
             "irrelevant body",
             ChannelId::new(241),
             Some(&pool),
@@ -1176,6 +1394,8 @@ use completion_guard::complete_work_dispatch_on_turn_end;
 use context_window::{apply_context_token_update, persisted_context_tokens, resolve_done_response};
 use memory_lifecycle::{
     optional_metric_token_fields, plan_turn_end_memory, spawn_memory_capture_task,
+};
+pub(in crate::services::discord) use memory_lifecycle::{
     spawn_memory_reflect_task, take_memento_reflect_request,
 };
 use recall_feedback::{
@@ -1798,6 +2018,50 @@ fn response_portion_after_offset(full_response: &str, response_sent_offset: usiz
     full_response.get(response_sent_offset..).unwrap_or("")
 }
 
+fn bridge_pre_submission_tui_prompt_error(provider: &ProviderKind, full_response: &str) -> bool {
+    let Some(error_text) = full_response
+        .trim_start()
+        .strip_prefix("Error:")
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+    match provider {
+        ProviderKind::Claude => {
+            crate::services::claude_tui::input::is_prompt_ready_timeout_error(error_text)
+        }
+        ProviderKind::Codex => {
+            crate::services::codex_tui::input::is_prompt_ready_timeout_error(error_text)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod pre_submission_tui_prompt_error_tests {
+    use super::*;
+
+    #[test]
+    fn classifier_matches_wrapped_readiness_errors() {
+        assert!(bridge_pre_submission_tui_prompt_error(
+            &ProviderKind::Claude,
+            "Error: timeout waiting for claude tui follow-up prompt input readiness after 45s; reason=prompt_marker_not_detected; previous_tui_turn_still_running=true; capture_available=true",
+        ));
+        assert!(bridge_pre_submission_tui_prompt_error(
+            &ProviderKind::Codex,
+            "Error: timeout waiting for codex tui follow-up prompt input readiness after 45s; reason=composer_not_detected; previous_tui_turn_still_running=true; capture_available=true",
+        ));
+        assert!(!bridge_pre_submission_tui_prompt_error(
+            &ProviderKind::Claude,
+            "Error: claude tui session died during follow-up output reading",
+        ));
+        assert!(!bridge_pre_submission_tui_prompt_error(
+            &ProviderKind::Claude,
+            "timeout waiting for claude tui follow-up prompt input readiness after 45s",
+        ));
+    }
+}
+
 fn should_delegate_bridge_relay_to_watcher(
     watcher_owns_assistant_relay: bool,
     watcher_relay_available_for_turn: bool,
@@ -2002,6 +2266,7 @@ async fn enqueue_headless_delivery(
     session_key: Option<&str>,
     delivery_bot: Option<&str>,
     content: &str,
+    cancel_token: Option<&CancelToken>,
 ) -> Result<(), String> {
     let target = format!("channel:{}", channel_id.get());
     let bot = delivery_bot
@@ -2019,8 +2284,12 @@ async fn enqueue_headless_delivery(
         session_key,
     };
     if let Some(pool) = shared.pg_pool.as_ref() {
-        match crate::services::message_outbox::enqueue_outbox_pg_returning_id(pool, outbox_message)
-            .await
+        match crate::services::message_outbox::enqueue_outbox_pg_returning_id_with_cancel(
+            pool,
+            outbox_message,
+            cancel_token,
+        )
+        .await
         {
             Ok(Some(outbox_id)) => {
                 if let Some(session_key) =
@@ -2087,7 +2356,14 @@ async fn enqueue_headless_delivery(
                 }
                 return Ok(());
             }
-            Ok(None) => {}
+            Ok(None) => {
+                tracing::info!(
+                    channel_id = channel_id.get(),
+                    session_key,
+                    "skipped headless direct fallback after outbox enqueue returned no row"
+                );
+                return Ok(());
+            }
             Err(error) => {
                 tracing::warn!(
                     "[outbox] postgres enqueue failed for terminal response on channel {}: {}",
@@ -2096,6 +2372,15 @@ async fn enqueue_headless_delivery(
                 );
             }
         }
+    }
+
+    if cancel_requested(cancel_token) {
+        tracing::info!(
+            channel_id = channel_id.get(),
+            session_key,
+            "skipped headless direct fallback after turn cancellation"
+        );
+        return Ok(());
     }
 
     let notify_http = if let Some(registry) = shared.health_registry() {
@@ -2629,6 +2914,22 @@ pub(super) fn spawn_turn_bridge(
         let dispatch_kind = bridge.dispatch_kind.clone();
         let context_window_tokens = bridge.context_window_tokens;
         let context_compact_percent = bridge.context_compact_percent;
+        let voice_progress_playback_channel_id =
+            if bridge.inflight_state.source == crate::dispatch::Source::Voice {
+                resolve_voice_turn_link_for_playback(
+                    shared_owned.pg_pool.as_ref(),
+                    dispatch_id.as_deref(),
+                    Some(user_msg_id),
+                    Some(&turn_id),
+                )
+                .await
+                .and_then(|link| {
+                    (link.background_channel_id == channel_id.get())
+                        .then(|| ChannelId::new(link.voice_channel_id))
+                })
+            } else {
+                None
+            };
 
         let mut full_response = bridge.full_response.clone();
         let mut last_edit_text = String::new();
@@ -3134,9 +3435,11 @@ pub(super) fn spawn_turn_bridge(
                                     (content, Vec::new())
                                 };
                             for marker in progress_markers {
-                                shared_owned
-                                    .voice_barge_in
-                                    .publish_progress(channel_id, marker);
+                                shared_owned.voice_barge_in.publish_progress_for_playback(
+                                    channel_id,
+                                    voice_progress_playback_channel_id,
+                                    marker,
+                                );
                             }
                             if content.is_empty() {
                                 continue;
@@ -3194,9 +3497,11 @@ pub(super) fn spawn_turn_bridge(
                                 vec![StatusEvent::Heartbeat],
                             );
                             if inflight_state.source == crate::dispatch::Source::Voice {
-                                shared_owned
-                                    .voice_barge_in
-                                    .publish_progress(channel_id, "thinking");
+                                shared_owned.voice_barge_in.publish_progress_for_playback(
+                                    channel_id,
+                                    voice_progress_playback_channel_id,
+                                    "thinking",
+                                );
                             }
                             // #1113 implicit-terminate: a Thinking event after an
                             // unfinished ToolUse means the agent moved on without
@@ -3274,8 +3579,9 @@ pub(super) fn spawn_turn_bridge(
                             };
                             let display = format!("⚙ {}: {}", name, display_summary);
                             if inflight_state.source == crate::dispatch::Source::Voice {
-                                shared_owned.voice_barge_in.publish_progress(
+                                shared_owned.voice_barge_in.publish_progress_for_playback(
                                     channel_id,
+                                    voice_progress_playback_channel_id,
                                     format!("tool:{name}:{display_summary}"),
                                 );
                             }
@@ -3460,9 +3766,11 @@ pub(super) fn spawn_turn_bridge(
                                 } else {
                                     "tool_result:ok"
                                 };
-                                shared_owned
-                                    .voice_barge_in
-                                    .publish_progress(channel_id, label);
+                                shared_owned.voice_barge_in.publish_progress_for_playback(
+                                    channel_id,
+                                    voice_progress_playback_channel_id,
+                                    label,
+                                );
                             }
                             // #1084: flag oversize tool outputs + record metrics.
                             // Never mutates `content` — the agent and transcript
@@ -5976,6 +6284,7 @@ pub(super) fn spawn_turn_bridge(
                         adk_session_key.as_deref(),
                         inflight_state.delivery_bot.as_deref(),
                         &delivery_response,
+                        Some(cancel_token.as_ref()),
                     )
                     .await
                     {
@@ -6030,7 +6339,9 @@ pub(super) fn spawn_turn_bridge(
                     .await;
                 if let Some(voice_channel_id) = voice_background_completion_target(
                     mapped_voice_channel_id,
+                    dispatch_id.as_deref(),
                     user_msg_id,
+                    Some(&turn_id),
                     &user_text_owned,
                     channel_id,
                     pg_pool_for_handoff,
@@ -6057,12 +6368,18 @@ pub(super) fn spawn_turn_bridge(
                                     failed,
                                 )
                                 .await;
-                            voice_barge_in.publish_progress(voice_channel_id, "agent:done");
+                            voice_barge_in.publish_progress_for_playback(
+                                background_channel_id,
+                                Some(voice_channel_id),
+                                "agent:done",
+                            );
                         });
                     } else {
-                        shared_owned
-                            .voice_barge_in
-                            .publish_progress(voice_channel_id, "agent:done");
+                        shared_owned.voice_barge_in.publish_progress_for_playback(
+                            channel_id,
+                            Some(voice_channel_id),
+                            "agent:done",
+                        );
                     }
                 } else if inflight_state.source == crate::dispatch::Source::Voice {
                     if !inflight_state.silent_turn {
@@ -6099,8 +6416,11 @@ pub(super) fn spawn_turn_bridge(
             // the two gate sites.
             #[cfg(unix)]
             {
+                let pre_submission_tui_prompt_error =
+                    transport_error && bridge_pre_submission_tui_prompt_error(&provider, &full_response);
                 let bridge_gate_outcome = if terminal_delivery_committed
                     && !preserve_inflight_for_cleanup_retry
+                    && !pre_submission_tui_prompt_error
                 {
                     if let Some(outcome) = bridge_tui_gate_outcome_early {
                         outcome
@@ -6118,6 +6438,13 @@ pub(super) fn spawn_turn_bridge(
                         super::tmux::TuiCompletionGateOutcome::NotGated
                     }
                 } else {
+                    if terminal_delivery_committed && pre_submission_tui_prompt_error {
+                        tracing::info!(
+                            provider = %provider.as_str(),
+                            channel = channel_id.get(),
+                            "pre-submission TUI prompt readiness error was already delivered; skipping quiescence gate so inflight cleanup can complete"
+                        );
+                    }
                     super::tmux::TuiCompletionGateOutcome::NotGated
                 };
 

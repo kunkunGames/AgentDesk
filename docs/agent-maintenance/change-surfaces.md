@@ -6,7 +6,7 @@
 > [`docs/generated/module-inventory.md`](../generated/module-inventory.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-05-18 (against PR #308 AgentDesk queue recovery and session-discovery giant-file registration).
+> Last refreshed: 2026-05-19 (against #2158 streaming STT wiring and PR #308 AgentDesk queue recovery/session-discovery giant-file registration).
 
 ## Read This First
 
@@ -26,10 +26,11 @@
 
 ### `discord_outbound`
 
-- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery}.rs`
-  (#1006 v3 domain types, pure planner, and delivery implementation).
-- legacy_modules: `src/services/discord/outbound/legacy.rs` (`deliver_outbound`,
-  `OutboundDeduper`, `DiscordOutbound*` types).
+- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery,transport}.rs`
+  (#1006 v3 domain types, pure planner, delivery implementation, and shared
+  transport/dedup primitives).
+- legacy_modules: none; `src/services/discord/outbound/legacy.rs` was removed
+  in #2535.
 - do_not_edit_without_migration_plan:
   `src/services/discord/formatting.rs::send_long_message_raw` (line 1971,
   ordered-chunk continuation contract not yet modelled in v3).
@@ -37,14 +38,13 @@
   [`discord-outbound-migration.md`](discord-outbound-migration.md) (table is
   the authoritative coverage record).
 - invariants: every new `send` or `edit` from production code goes through
-  `outbound::deliver_outbound` (or the v3 successor) — never `channel_id.say`,
+  `outbound::delivery::deliver_outbound` — never `channel_id.say`,
   `channel_id.send_message`, or raw `http.send_message` from a route or
   worker. Interaction-token responses (`ctx.say`, `ComponentInteraction`) are
   the only allowed exception per #1175.
-- allowed_changes: `bugfix` on `legacy.rs` only when the migration table marks
-  the calling row as `legacy`; `new_feature` only on the v3 `outbound/`
-  submodules; `extraction` from `formatting.rs` requires a contract update
-  for ordered chunk metadata.
+- allowed_changes: `new_feature` only on the v3 `outbound/` submodules;
+  `extraction` from `formatting.rs` requires a contract update for ordered
+  chunk metadata.
 - tests: `src/integration_tests/discord_flow/scenarios.rs`,
   `src/integration_tests/agents_setup_e2e.rs`, plus per-module unit tests in
   `outbound/{message,policy,decision,result}.rs`.
@@ -111,10 +111,11 @@
   - `src/services/discord/watchers/lifecycle.rs` (1942 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
-  - `src/services/discord/tmux.rs` (6344 lines after #2376 relay-owner
+  - `src/services/discord/tmux.rs` (6337 lines after #2558 dead-code sweep;
     failover guard; still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (3524 lines after #1520 watcher
-    loop extraction + #2427 D/A explicit-cleanup wires; split loop helpers
+  - `src/services/discord/tmux_watcher.rs` (4200 lines after #2558
+    dead-code sweep; #1520 watcher loop extraction + #2427 D/A
+    explicit-cleanup wires; split loop helpers
     further before adding behavior).
   - `src/services/discord/recovery_engine.rs` (4842 lines).
   - `src/services/discord/health.rs` (4880 lines after #1879 snapshot/mailbox
@@ -125,6 +126,9 @@
   - `src/services/discord/placeholder_sweeper.rs` (1022 lines; placeholder
     sweep loop and delivered-response idempotency surface — bugfix only
     outside a split plan).
+  - `src/services/cluster/stream_relay.rs` (1049 lines; session-bound
+    StreamRelay queue, delivery metrics, and terminal ack sequencing surface —
+    split before adding non-bugfix behavior).
   - `src/services/discord/gateway.rs` (1006 lines; Discord gateway adapter
     and `TurnGateway` bridge for turn send/edit/pin/unpin behavior — bugfix
     only outside a split plan).
@@ -139,7 +143,8 @@
   - `src/services/discord/formatting.rs` (3247 lines).
   - `src/services/discord/settings.rs` (2445 lines).
   - `src/services/discord/prompt_builder.rs` (2114 lines).
-  - `src/services/discord/runtime_bootstrap.rs` (2844 lines).
+  - `src/services/discord/runtime_bootstrap.rs` (3235 lines after #2558
+    thread-session GC loopback shim cleanup).
   - `src/services/discord/session_runtime.rs` (1887 lines).
   - `src/services/discord/voice_barge_in.rs` (1783 lines; voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
@@ -150,6 +155,9 @@
   - `src/voice/receiver.rs` (1104 lines; voice receive pipeline, utterance
     segmentation, artifact cleanup, and retention policy surface; split before
     adding non-bugfix behavior).
+  - `src/voice/stt.rs` (1183 lines after #2158 streaming STT wiring; whisper
+    CLI STT runtime plus streaming session adapter surface, split before adding
+    non-bugfix behavior).
   - `src/services/discord/commands/config.rs` (1877 lines).
   - `src/services/discord/commands/inspect.rs` (1058 lines, post-#1701
     context-view manifest binding pushed it past the giant-file threshold).
@@ -169,6 +177,9 @@
   helpers for SSH-direct prompt relay. The migration-sensitive invariant remains
   one owner per `(tmux_session, output_path)` and separate runtime-vs-relay
   offsets for Codex rollout wrappers.
+- 2026-05-18 refresh: #2558 removed dead watcher/placeholder cleanup parameters
+  and retained a warning log for pause/epoch placeholder delete failures; no
+  new watcher ownership path was introduced.
 - tests: `src/integration_tests/tests/*` cancel/recovery suites.
 - related_issues: #964, #1112, #1138, #1222, #1223, #1283.
 

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::events;
 use super::helpers::normalize_string;
@@ -25,16 +25,6 @@ pub fn emit_turn_started(
 ) {
     // #1070: lightweight atomic counter for turn_bridge attempt entry.
     metrics::record_attempt(channel_id, provider);
-    events::record(events::StructuredEvent::new(
-        "turn_started",
-        Some(channel_id),
-        Some(provider),
-        json!({
-            "dispatch_id": dispatch_id,
-            "session_key": session_key,
-            "turn_id": turn_id,
-        }),
-    ));
     emit_event(
         "turn_started",
         Some(provider),
@@ -98,20 +88,6 @@ pub fn emit_turn_finished_with_dispatch_kind(
     } else {
         metrics::record_fail(channel_id, provider);
     }
-    events::record(events::StructuredEvent::new(
-        "turn_finished",
-        Some(channel_id),
-        Some(provider),
-        json!({
-            "dispatch_id": dispatch_id,
-            "session_key": session_key,
-            "turn_id": turn_id,
-            "outcome": normalized_outcome,
-            "duration_ms": duration_ms.max(0),
-            "tmux_handoff": tmux_handoff,
-            "dispatch_kind": dispatch_kind.as_deref(),
-        }),
-    ));
     emit_event(
         "turn_finished",
         Some(provider),
@@ -143,17 +119,6 @@ pub fn emit_guard_fired(
 ) {
     // #1070: atomic guard-fire counter.
     metrics::record_guard_fire(channel_id, provider);
-    events::record(events::StructuredEvent::new(
-        "guard_fired",
-        Some(channel_id),
-        Some(provider),
-        json!({
-            "dispatch_id": dispatch_id,
-            "session_key": session_key,
-            "turn_id": turn_id,
-            "guard_type": normalize_string(guard_type),
-        }),
-    ));
     emit_event(
         "guard_fired",
         Some(provider),
@@ -175,12 +140,6 @@ pub fn emit_guard_fired(
 pub fn emit_watcher_replaced(provider: &str, channel_id: u64, source: &str) {
     // #1070: atomic watcher-replacement counter for claim_or_replace stale cancel.
     metrics::record_watcher_replacement(channel_id, provider);
-    events::record(events::StructuredEvent::new(
-        "watcher_replaced",
-        Some(channel_id),
-        Some(provider),
-        json!({ "source": normalize_string(source) }),
-    ));
     emit_event(
         "watcher_replaced",
         Some(provider),
@@ -241,12 +200,6 @@ pub fn emit_turn_cancelled(
         fields.insert("session_key".to_string(), json!(session_key));
         fields.insert("turn_id".to_string(), json!(turn_id));
     }
-    events::record(events::StructuredEvent::new(
-        "turn_cancelled",
-        channel_id,
-        provider,
-        payload.clone(),
-    ));
     emit_event(
         "turn_cancelled",
         provider,
@@ -422,6 +375,33 @@ pub fn emit_agent_quality_event(event: AgentQualityEvent) {
         payload_json: serde_json::to_string(&event.payload).unwrap_or_else(|_| "{}".to_string()),
     };
 
+    let channel_id = queued
+        .channel_id
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok());
+    events::record_emitted(
+        "agent_quality_event",
+        channel_id,
+        queued.provider.as_deref(),
+        enrich_payload_with_correlation(
+            json!({
+                "source_event_id": queued.source_event_id.clone(),
+                "correlation_id": queued.correlation_id.clone(),
+                "agent_id": queued.agent_id.clone(),
+                "provider": queued.provider.clone(),
+                "channel_id": queued.channel_id.clone(),
+                "card_id": queued.card_id.clone(),
+                "dispatch_id": queued.dispatch_id.clone(),
+                "quality_event_type": queued.event_type.clone(),
+                "payload": event.payload,
+            }),
+            queued.dispatch_id.as_deref(),
+            None,
+            None,
+            Some(queued.event_type.as_str()),
+        ),
+    );
+
     if let Some(sender) = super::worker::worker_sender() {
         let _ = sender.send(WorkerMessage::QualityEvent(queued));
     }
@@ -438,15 +418,18 @@ pub(super) fn emit_event(
     counter_delta: CounterDelta,
     payload: Value,
 ) {
-    let event_type = normalize_string(event_type);
-    if event_type.is_none() {
+    let Some(event_type) = normalize_string(event_type) else {
         return;
-    }
+    };
 
     let provider = provider.and_then(normalize_string);
-    let channel_id = channel_id.map(|value| value.to_string());
+    let channel_id_string = channel_id.map(|value| value.to_string());
+    let dispatch_id = dispatch_id.and_then(normalize_string);
+    let session_key = session_key.and_then(normalize_string);
+    let turn_id = turn_id.and_then(normalize_string);
+    let status = status.and_then(normalize_string);
     if !counter_delta.is_zero()
-        && let (Some(provider), Some(channel_id)) = (provider.as_ref(), channel_id.as_ref())
+        && let (Some(provider), Some(channel_id)) = (provider.as_ref(), channel_id_string.as_ref())
     {
         let bucket = runtime()
             .counters
@@ -459,19 +442,226 @@ pub(super) fn emit_event(
         bucket.apply(counter_delta);
     }
 
+    events::record_emitted(
+        event_type.as_str(),
+        channel_id,
+        provider.as_deref(),
+        enrich_payload_with_correlation(
+            payload.clone(),
+            dispatch_id.as_deref(),
+            session_key.as_deref(),
+            turn_id.as_deref(),
+            status.as_deref(),
+        ),
+    );
+
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
     let queued = QueuedEvent {
-        event_type: event_type.unwrap_or_default(),
+        event_type,
         provider,
-        channel_id,
-        dispatch_id: dispatch_id.and_then(normalize_string),
-        session_key: session_key.and_then(normalize_string),
-        turn_id: turn_id.and_then(normalize_string),
-        status: status.and_then(normalize_string),
+        channel_id: channel_id_string,
+        dispatch_id,
+        session_key,
+        turn_id,
+        status,
         payload_json,
     };
 
     if let Some(sender) = super::worker::worker_sender() {
         let _ = sender.send(WorkerMessage::Event(queued));
+    }
+}
+
+fn enrich_payload_with_correlation(
+    payload: Value,
+    dispatch_id: Option<&str>,
+    session_key: Option<&str>,
+    turn_id: Option<&str>,
+    status: Option<&str>,
+) -> Value {
+    let mut fields = match payload {
+        Value::Object(fields) => fields,
+        other => {
+            let mut fields = Map::new();
+            fields.insert("payload".to_string(), other);
+            fields
+        }
+    };
+
+    insert_if_absent(&mut fields, "dispatch_id", dispatch_id);
+    insert_if_absent(&mut fields, "session_key", session_key);
+    insert_if_absent(&mut fields, "turn_id", turn_id);
+    insert_if_absent(&mut fields, "status", status);
+
+    Value::Object(fields)
+}
+
+fn insert_if_absent(fields: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if fields.contains_key(key) {
+        return;
+    }
+    if let Some(value) = value {
+        fields.insert(key.to_string(), json!(value));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_emit_surface_records_one_recent_event() {
+        let _guard = super::super::test_runtime_lock();
+        super::super::reset_for_tests();
+
+        emit_turn_started(
+            "Codex",
+            42,
+            Some("dispatch-started"),
+            Some("session-started"),
+            Some("turn-started"),
+        );
+        emit_turn_finished_with_dispatch_kind(
+            "Codex",
+            42,
+            Some("dispatch-finished"),
+            Some("session-finished"),
+            Some("turn-finished"),
+            " completed ",
+            123,
+            false,
+            Some("manual"),
+        );
+        emit_guard_fired(
+            "Codex",
+            42,
+            Some("dispatch-guard"),
+            Some("session-guard"),
+            Some("turn-guard"),
+            "placeholder_suppress",
+        );
+        emit_watcher_replaced("Codex", 42, "stale_cancel");
+        emit_recovery_fired(
+            "Codex",
+            42,
+            Some("dispatch-recovery"),
+            Some("session-recovery"),
+            "watchdog",
+        );
+        emit_turn_cancelled(
+            Some("Codex"),
+            Some(42),
+            Some("dispatch-cancelled"),
+            Some("session-cancelled"),
+            Some("turn-cancelled"),
+            turn_lifecycle::TurnCancellationDetails::new(
+                "operator stop",
+                "text_stop",
+                "mailbox_canonical",
+                true,
+                true,
+                Some(1),
+                false,
+                true,
+            ),
+        );
+        emit_inflight_lifecycle_event(
+            "Codex",
+            42,
+            Some("dispatch-inflight"),
+            Some("session-inflight"),
+            Some("turn-inflight"),
+            "delegated_to_watcher",
+            json!({"owner": "watcher"}),
+        );
+        assert!(!record_invariant_check(
+            false,
+            InvariantViolation {
+                provider: Some("Codex"),
+                channel_id: Some(42),
+                dispatch_id: Some("dispatch-invariant"),
+                session_key: Some("session-invariant"),
+                turn_id: Some("turn-invariant"),
+                invariant: "recent_ring_visibility",
+                code_location: "src/services/observability/emit.rs:test",
+                message: "test violation",
+                details: json!({"test": true}),
+            },
+        ));
+        emit_dispatch_result(
+            "dispatch-result",
+            Some("card-1"),
+            Some("implementation"),
+            Some("doing"),
+            "done",
+            "test",
+            Some(&json!({"ok": true})),
+        );
+        emit_intake_placeholder_post_failed(
+            "Codex",
+            42,
+            Some(1234),
+            "queue",
+            "message_preserved",
+            "discord unavailable",
+        );
+        emit_agent_quality_event(AgentQualityEvent {
+            source_event_id: Some("turn-quality".to_string()),
+            correlation_id: Some("dispatch-quality".to_string()),
+            agent_id: Some("agent-1".to_string()),
+            provider: Some("Codex".to_string()),
+            channel_id: Some("42".to_string()),
+            card_id: Some("card-1".to_string()),
+            dispatch_id: Some("dispatch-quality".to_string()),
+            event_type: "review_pass".to_string(),
+            payload: json!({"verdict": "pass"}),
+        });
+
+        let events = events::recent(50);
+        for expected in [
+            "turn_started",
+            "turn_finished",
+            "guard_fired",
+            "watcher_replaced",
+            "recovery_fired",
+            "turn_cancelled",
+            "inflight_lifecycle",
+            "invariant_violation",
+            "dispatch_result",
+            "intake_placeholder_post_failed",
+            "agent_quality_event",
+        ] {
+            let count = events
+                .iter()
+                .filter(|event| event.event_type == expected)
+                .count();
+            assert_eq!(count, 1, "{expected} should be recorded exactly once");
+        }
+
+        let dispatch_result = events
+            .iter()
+            .find(|event| event.event_type == "dispatch_result")
+            .expect("dispatch_result should be in recent ring");
+        assert_eq!(dispatch_result.payload["dispatch_id"], "dispatch-result");
+        assert_eq!(dispatch_result.payload["status"], "done");
+
+        let turn_finished = events
+            .iter()
+            .find(|event| event.event_type == "turn_finished")
+            .expect("turn_finished should be in recent ring");
+        assert_eq!(turn_finished.provider.as_deref(), Some("codex"));
+        assert_eq!(turn_finished.channel_id, Some(42));
+        assert_eq!(turn_finished.payload["dispatch_id"], "dispatch-finished");
+        assert_eq!(turn_finished.payload["duration_ms"], 123);
+        assert_eq!(turn_finished.payload["status"], "completed");
+
+        let quality = events
+            .iter()
+            .find(|event| event.event_type == "agent_quality_event")
+            .expect("agent_quality_event should be in recent ring");
+        assert_eq!(quality.payload["quality_event_type"], "review_pass");
+        assert_eq!(quality.payload["dispatch_id"], "dispatch-quality");
+        assert_eq!(quality.payload["source_event_id"], "turn-quality");
+        assert_eq!(quality.payload["status"], "review_pass");
     }
 }
