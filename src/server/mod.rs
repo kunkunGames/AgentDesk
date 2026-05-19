@@ -17,8 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::Router;
 use axum::routing::get;
-use sqlx::pool::PoolConnection;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{PgPool, Row};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tower_http::services::{ServeDir, ServeFile};
@@ -111,29 +110,16 @@ async fn try_acquire_pg_singleton_lock(
     pool: &PgPool,
     lock_id: i64,
     job_name: &str,
-) -> std::result::Result<Option<PoolConnection<Postgres>>, String> {
-    let mut conn = pool
-        .acquire()
-        .await
-        .map_err(|error| format!("{job_name} acquire advisory lock connection: {error}"))?;
-    let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-        .bind(lock_id)
-        .fetch_one(&mut *conn)
-        .await
-        .map_err(|error| format!("{job_name} try advisory lock: {error}"))?;
-    if acquired { Ok(Some(conn)) } else { Ok(None) }
+) -> std::result::Result<Option<crate::db::postgres::AdvisoryLockLease>, String> {
+    crate::db::postgres::AdvisoryLockLease::try_acquire(pool, lock_id, job_name).await
 }
 
 async fn release_pg_singleton_lock(
-    mut conn: PoolConnection<Postgres>,
+    conn: crate::db::postgres::AdvisoryLockLease,
     lock_id: i64,
     job_name: &str,
 ) {
-    if let Err(error) = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(lock_id)
-        .execute(&mut *conn)
-        .await
-    {
+    if let Err(error) = conn.unlock().await {
         tracing::warn!("[{job_name}] failed to release advisory lock {lock_id}: {error}");
     }
 }
@@ -307,6 +293,9 @@ pub(crate) async fn run(
         crate::db::cancel_tombstones::set_global_pool(pool.clone());
     }
     crate::services::observability::init_observability(pg_pool.clone());
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!("HTTP server listening on {addr}");
     let _claude_tui_hook_endpoint =
         if crate::services::provider_hosting::any_requested_tui_hosting_driver_available(&config) {
             let endpoint = config.server.local_base_url();
@@ -326,21 +315,24 @@ pub(crate) async fn run(
     // AgentDesk's verified allowlist (so the SessionStart-silently-disabled
     // failure mode is at least surfaced before users hit it on a Codex bump).
     //
-    // The probe deliberately runs against `resolve_codex_path()` — the same
-    // resolution session launches use today via `resolve_codex_binary()`. If a
-    // session ever points at a different Codex binary, the warning will be
-    // off by one binary; tracked alongside the real cross-CLI verification
-    // (#2259) as a known limitation.
+    // The probe deliberately runs against the same binary resolution session
+    // launches use today. That includes the resolver-provided PATH augmentation:
+    // Homebrew npm shims use `#!/usr/bin/env node`, and launchd's minimal PATH
+    // otherwise makes `codex --version` look like "unknown" even when the
+    // audited Codex CLI is installed.
     {
-        let codex_cli_path = crate::services::codex::resolve_codex_path();
-        let codex_cli_present = codex_cli_path.is_some();
-        let codex_cli_version = codex_cli_path
-            .as_deref()
-            .and_then(crate::services::claude_tui::hook_bundle::probe_codex_cli_version);
+        let codex_resolution = crate::services::codex::resolve_codex_binary();
+        let codex_cli_present = codex_resolution.resolved_path.is_some();
+        let codex_cli_version = codex_resolution.resolved_path.as_deref().and_then(|path| {
+            crate::services::claude_tui::hook_bundle::probe_codex_cli_version_with_path(
+                path,
+                codex_resolution.exec_path.as_deref(),
+            )
+        });
         let _ = crate::services::claude_tui::hook_bundle::run_codex_hook_startup_self_check(
             codex_cli_present,
             codex_cli_version.as_deref(),
-            codex_cli_path.as_deref(),
+            codex_resolution.resolved_path.as_deref(),
         );
     }
     let cluster_runtime = cluster::bootstrap(&config, pg_pool.clone()).await;
@@ -436,9 +428,6 @@ pub(crate) async fn run(
     }
     let app = app.fallback_service(dashboard_service);
 
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("HTTP server listening on {addr}");
     routes::audit_explicit_auth_routes_on_boot(&config);
     axum::serve(
         listener,

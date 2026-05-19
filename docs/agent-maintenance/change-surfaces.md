@@ -6,7 +6,7 @@
 > [`docs/generated/module-inventory.md`](../generated/module-inventory.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-05-19 (against #2158 streaming STT wiring giant-file registration).
+> Last refreshed: 2026-05-19 (against #2158 streaming STT wiring and PR #308 AgentDesk queue recovery/session-discovery giant-file registration).
 
 ## Read This First
 
@@ -368,6 +368,11 @@ The remaining giant-file modules under `src/services/` not covered above:
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
   non-bugfix behavior beyond the readiness/cancel contract.
+- `src/services/cluster/session_discovery.rs` (1208 lines) — cluster session
+  discovery, tmux-session matching, and provider-cli launch artifact adoption
+  surface. Queue/starvation bugfixes may adjust matching or recovery behavior;
+  new discovery features should split launch-artifact parsing or directory
+  construction into smaller modules first.
 - `src/services/claude_tui/input.rs` (~1049) — Claude TUI input readiness
   detector, prompt delivery, and cancellation/offset handoff surface. Treat as
   giant-file territory; split before adding non-bugfix behavior beyond the

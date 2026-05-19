@@ -308,6 +308,46 @@ pub(super) fn credential_paths_with_overrides(
     ]
 }
 
+/// Lightweight stat signature (mtime, len) used by the $HOME-rooted credential
+/// poll fallback to detect changes without an FSEvents watch on the home dir.
+fn file_stat_sig(path: &Path) -> Option<(SystemTime, u64)> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialWatchPlan {
+    watch_dirs: Vec<PathBuf>,
+    polled_paths: Vec<PathBuf>,
+}
+
+fn credential_watch_plan(paths: &[PathBuf], root_dir: Option<&Path>) -> CredentialWatchPlan {
+    let is_root_dir = |dir: &Path| root_dir.is_some_and(|root| dir == root);
+    let polled_paths = paths
+        .iter()
+        .filter(|path| {
+            path.parent()
+                .map(|parent| is_root_dir(parent))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
+    let mut watch_dirs: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|path| path.parent().map(PathBuf::from))
+        .filter(|dir| !is_root_dir(dir))
+        .collect();
+    watch_dirs.sort();
+    watch_dirs.dedup();
+
+    CredentialWatchPlan {
+        watch_dirs,
+        polled_paths,
+    }
+}
+
 /// Spawn the credential watcher. Runs forever in a dedicated background task.
 /// Safe to call once per Claude bot startup.
 pub(super) fn spawn_watcher(
@@ -325,16 +365,23 @@ pub(super) fn spawn_watcher(
     // Collect every distinct parent directory so we can watch each one non-recursively
     // (one watch per dir). Some watched files live at $HOME (.claude.json) and others
     // under $HOME/.claude/, so we may have multiple parents.
-    let watch_dirs: Vec<PathBuf> = {
-        let mut dedup: Vec<PathBuf> = paths
-            .iter()
-            .filter_map(|p| p.parent().map(PathBuf::from))
-            .collect();
-        dedup.sort();
-        dedup.dedup();
-        dedup
-    };
-    if watch_dirs.is_empty() {
+    //
+    // IMPORTANT (macOS): notify's recommended backend is FSEvents, which is
+    // recursive at the OS level — `RecursiveMode::NonRecursive` is only emulated
+    // by post-filtering delivered events. Registering a watch on the *home*
+    // directory therefore streams and rescans the entire home subtree on every
+    // change anywhere under it (including the multi-hundred-MB dcserver logs that
+    // grow every second), which pegs a notify worker, starves the runtime, and
+    // trips the health-watchdog kill loop. So we never FSEvents-watch the home
+    // directory itself: credential files that live directly in $HOME (i.e.
+    // `~/.claude.json`) are covered by a cheap mtime poll instead.
+    let home_like_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir);
+    let watch_plan = credential_watch_plan(&paths, home_like_dir.as_deref());
+    let polled_paths = watch_plan.polled_paths;
+    let watch_dirs = watch_plan.watch_dirs;
+    if watch_dirs.is_empty() && polled_paths.is_empty() {
         tracing::warn!(
             "MCP credential watcher: no parent dirs derived from credential paths; disabled"
         );
@@ -345,87 +392,121 @@ pub(super) fn spawn_watcher(
     let watch_dirs_for_thread = watch_dirs.clone();
     let paths_for_filter = paths.clone();
     let paths_for_snapshots = paths.clone();
+    let poll_tx = tx.clone();
+    let polled_paths_for_task = polled_paths.clone();
 
     // Notify watcher runs on its own OS thread (the notify crate uses sync callbacks).
-    std::thread::Builder::new()
-        .name("mcp-credential-watcher".into())
-        .spawn(move || {
-            use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+    if !watch_dirs_for_thread.is_empty() {
+        std::thread::Builder::new()
+            .name("mcp-credential-watcher".into())
+            .spawn(move || {
+                use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-            let watcher_tx = tx.clone();
-            let mut watcher: RecommendedWatcher =
-                match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                    let Ok(event) = res else {
-                        return;
-                    };
-                    if !matches!(
-                        event.kind,
-                        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-                    ) {
-                        return;
-                    }
-                    let changed_paths = event
-                        .paths
-                        .iter()
-                        .filter_map(|path| {
-                            paths_for_filter.iter().find(|target| {
-                                path.file_name() == target.file_name()
-                                    && path.parent() == target.parent()
+                let watcher_tx = tx.clone();
+                let mut watcher: RecommendedWatcher =
+                    match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        let Ok(event) = res else {
+                            return;
+                        };
+                        if !matches!(
+                            event.kind,
+                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                        ) {
+                            return;
+                        }
+                        let changed_paths = event
+                            .paths
+                            .iter()
+                            .filter_map(|path| {
+                                paths_for_filter.iter().find(|target| {
+                                    path.file_name() == target.file_name()
+                                        && path.parent() == target.parent()
+                                })
                             })
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    for path in changed_paths {
-                        let _ = watcher_tx.send(CredentialChange {
-                            path,
-                            kind: event.kind.clone(),
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for path in changed_paths {
+                            let _ = watcher_tx.send(CredentialChange {
+                                path,
+                                kind: event.kind.clone(),
+                                timestamp: SystemTime::now(),
+                            });
+                        }
+                    }) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::warn!("MCP credential watcher: failed to create watcher: {e}");
+                            return;
+                        }
+                    };
+
+                // Try to attach watches to each parent dir. For dirs that do not yet
+                // exist, retry every 30s until they appear; this avoids the previous
+                // bug where missing-at-startup dirs were silently never watched.
+                let mut pending: Vec<PathBuf> = watch_dirs_for_thread.clone();
+                loop {
+                    let mut still_pending = Vec::new();
+                    for dir in pending.drain(..) {
+                        if !dir.exists() {
+                            still_pending.push(dir);
+                            continue;
+                        }
+                        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+                            Ok(()) => {
+                                tracing::info!("MCP credential watcher: watching {}", dir.display())
+                            }
+                            Err(e) => tracing::warn!(
+                                "MCP credential watcher: cannot watch {}: {e}",
+                                dir.display()
+                            ),
+                        }
+                    }
+                    if still_pending.is_empty() {
+                        break;
+                    }
+                    pending = still_pending;
+                    tracing::debug!(
+                        "MCP credential watcher: {} dir(s) not yet present; retrying in 30s",
+                        pending.len()
+                    );
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+
+                // Keep the watcher alive forever — it owns its own background thread.
+                std::mem::forget(watcher);
+            })
+            .ok();
+    }
+
+    // $HOME-rooted credential files (e.g. ~/.claude.json) are covered here by a
+    // low-frequency mtime poll instead of an FSEvents watch on $HOME (see the
+    // watch_dirs comment above). ~20s latency is acceptable: the notification
+    // only tells the operator to run /restart to pick up rotated MCP credentials.
+    if !polled_paths_for_task.is_empty() {
+        tokio::spawn(async move {
+            let mut last: HashMap<PathBuf, Option<(SystemTime, u64)>> = polled_paths_for_task
+                .iter()
+                .map(|p| (p.clone(), file_stat_sig(p)))
+                .collect();
+            let mut tick = tokio::time::interval(Duration::from_secs(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                for path in &polled_paths_for_task {
+                    let sig = file_stat_sig(path);
+                    let changed = last.get(path).map(|prev| prev != &sig).unwrap_or(true);
+                    if changed {
+                        last.insert(path.clone(), sig);
+                        let _ = poll_tx.send(CredentialChange {
+                            path: path.clone(),
+                            kind: EventKind::Modify(notify::event::ModifyKind::Any),
                             timestamp: SystemTime::now(),
                         });
                     }
-                }) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::warn!("MCP credential watcher: failed to create watcher: {e}");
-                        return;
-                    }
-                };
-
-            // Try to attach watches to each parent dir. For dirs that do not yet
-            // exist, retry every 30s until they appear; this avoids the previous
-            // bug where missing-at-startup dirs were silently never watched.
-            let mut pending: Vec<PathBuf> = watch_dirs_for_thread.clone();
-            loop {
-                let mut still_pending = Vec::new();
-                for dir in pending.drain(..) {
-                    if !dir.exists() {
-                        still_pending.push(dir);
-                        continue;
-                    }
-                    match watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                        Ok(()) => {
-                            tracing::info!("MCP credential watcher: watching {}", dir.display())
-                        }
-                        Err(e) => tracing::warn!(
-                            "MCP credential watcher: cannot watch {}: {e}",
-                            dir.display()
-                        ),
-                    }
                 }
-                if still_pending.is_empty() {
-                    break;
-                }
-                pending = still_pending;
-                tracing::debug!(
-                    "MCP credential watcher: {} dir(s) not yet present; retrying in 30s",
-                    pending.len()
-                );
-                std::thread::sleep(Duration::from_secs(30));
             }
-
-            // Keep the watcher alive forever — it owns its own background thread.
-            std::mem::forget(watcher);
-        })
-        .ok();
+        });
+    }
 
     // Async consumer: debounce + dispatch notifications.
     let dedupe = Arc::new(CredentialNotifyDedupe::new());
@@ -545,6 +626,34 @@ mod tests {
     #[test]
     fn credential_paths_empty_when_no_home_and_no_override() {
         assert!(credential_paths_with_overrides(None, None).is_empty());
+    }
+
+    #[test]
+    fn credential_watch_plan_polls_root_config_without_watching_home() {
+        let home = PathBuf::from("/tmp/test-home");
+        let paths = credential_paths_with_overrides(None, Some(home.clone()));
+        let plan = credential_watch_plan(&paths, Some(&home));
+
+        assert_eq!(plan.polled_paths, vec![home.join(".claude.json")]);
+        assert_eq!(plan.watch_dirs, vec![home.join(".claude")]);
+        assert!(
+            !plan.watch_dirs.contains(&home),
+            "macOS FSEvents must never watch $HOME for credential changes"
+        );
+    }
+
+    #[test]
+    fn credential_watch_plan_polls_claude_config_dir_root_file() {
+        let config_dir = PathBuf::from("/tmp/custom-claude");
+        let paths = credential_paths_with_overrides(Some(config_dir.clone()), None);
+        let plan = credential_watch_plan(&paths, Some(&config_dir));
+
+        assert_eq!(plan.polled_paths, vec![config_dir.join(".claude.json")]);
+        assert_eq!(plan.watch_dirs, vec![config_dir.join(".claude")]);
+        assert!(
+            !plan.watch_dirs.contains(&config_dir),
+            "CLAUDE_CONFIG_DIR root is home-like and must be polled, not FSEvents-watched"
+        );
     }
 
     #[test]

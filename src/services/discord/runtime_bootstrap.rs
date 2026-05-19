@@ -18,6 +18,15 @@ pub(crate) struct RunBotContext {
 const DISCORD_GATEWAY_LEASE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const DISCORD_GATEWAY_LOCK_PREFIX: u64 = 0x0443_0000_0000_0000;
 
+fn should_start_intake_worker(
+    mode: crate::services::cluster::intake_router_hook::IntakeRoutingMode,
+) -> bool {
+    matches!(
+        mode,
+        crate::services::cluster::intake_router_hook::IntakeRoutingMode::Enforce
+    )
+}
+
 fn voice_auto_join_provider_map(
     cfg: &crate::config::Config,
 ) -> std::collections::HashMap<String, String> {
@@ -1131,12 +1140,10 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     voice_barge_in.spawn_progress_worker(shared.clone(), shared.shutting_down.clone());
 
     // Phase 5.1 of intake-node-routing (issue #2007): spawn the
-    // intake_worker poll loop NOW so cluster-standby nodes (whose
-    // gateway lease check below early-returns) still drain their
-    // share of `intake_outbox`. The loop is gated by
-    // `ADK_INTAKE_ROUTING_MODE`: when `disabled` (default), the leader
-    // hook never inserts rows and the worker simply polls an empty
-    // queue with the idle backoff — no production impact.
+    // intake_worker poll loop only when the global intake router is
+    // actually enforcing worker delivery. In `disabled` and `observe`
+    // modes no rows are inserted into `intake_outbox`; starting one
+    // poller per bot would burn DB connections while doing empty work.
     //
     // The worker uses `serenity::http::Http::new(token)` (REST-only,
     // no IDENTIFY) so it never contends for the gateway lease. It
@@ -1148,7 +1155,14 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // On standby today no signal handler is wired; the worker exits
     // when launchd kills the process during deploy. A follow-up could
     // add SIGTERM handling on the standby path for graceful drain.
-    if let Some(pool_for_intake_worker) = shared.pg_pool.clone() {
+    let intake_routing_mode =
+        crate::services::cluster::intake_router_hook::IntakeRoutingMode::from_env();
+    if !should_start_intake_worker(intake_routing_mode) {
+        tracing::info!(
+            mode = ?intake_routing_mode,
+            "[intake_worker] intake-node-routing not enforcing — worker not started"
+        );
+    } else if let Some(pool_for_intake_worker) = shared.pg_pool.clone() {
         let intake_worker_http = std::sync::Arc::new(serenity::http::Http::new(token));
         let intake_worker_shared = shared.clone();
         let intake_worker_token = token.to_string();
@@ -2323,6 +2337,15 @@ agents:
 
         assert_eq!(map.get("123").map(String::as_str), Some("codex"));
         assert_eq!(map.get("999").map(String::as_str), Some("codex"));
+    }
+
+    #[test]
+    fn intake_worker_starts_only_in_enforce_mode() {
+        use crate::services::cluster::intake_router_hook::IntakeRoutingMode;
+
+        assert!(!should_start_intake_worker(IntakeRoutingMode::Disabled));
+        assert!(!should_start_intake_worker(IntakeRoutingMode::Observe));
+        assert!(should_start_intake_worker(IntakeRoutingMode::Enforce));
     }
 
     #[test]

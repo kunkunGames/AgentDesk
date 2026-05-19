@@ -1126,6 +1126,15 @@ fn resolve_bot_token(bot_name: &str, bot: &BotConfig) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+        .or_else(|| {
+            bot.token_env_var
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|env_var| std::env::var(env_var).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .or_else(|| crate::credential::read_bot_token(bot_name))
 }
 
@@ -1177,12 +1186,27 @@ impl ComparableAgent {
             .as_ref()
             .and_then(AgentChannel::target);
         let discord_channel_cdx = agent.channels.codex.as_ref().and_then(AgentChannel::target);
+        let provider = normalize_provider(Some(agent.provider.as_str()))
+            .unwrap_or_else(|| "claude".to_string());
+        let provider_primary = match provider.as_str() {
+            "gemini" => agent
+                .channels
+                .gemini
+                .as_ref()
+                .and_then(AgentChannel::target),
+            "opencode" => agent
+                .channels
+                .opencode
+                .as_ref()
+                .and_then(AgentChannel::target),
+            "qwen" => agent.channels.qwen.as_ref().and_then(AgentChannel::target),
+            _ => None,
+        };
 
         Self {
             id: agent.id.clone(),
-            provider: normalize_provider(Some(agent.provider.as_str()))
-                .unwrap_or_else(|| "claude".to_string()),
-            discord_channel_id: discord_channel_cc.clone(),
+            provider,
+            discord_channel_id: provider_primary.or_else(|| discord_channel_cc.clone()),
             discord_channel_alt: discord_channel_cdx.clone(),
             discord_channel_cc,
             discord_channel_cdx,
@@ -1240,6 +1264,38 @@ fn normalized_u64s(values: &[u64]) -> Vec<u64> {
 
 fn dry_run_action_prefix(dry_run: bool) -> &'static str {
     if dry_run { "would migrate" } else { "migrated" }
+}
+
+#[cfg(test)]
+mod comparable_agent_tests {
+    use super::*;
+
+    #[test]
+    fn comparable_agent_uses_provider_specific_primary_channel() {
+        for (provider, channel_key, channel_id) in [
+            ("gemini", "gemini", "1486589336651698258"),
+            ("opencode", "opencode", "1495040912361914398"),
+            ("qwen", "qwen", "1488546844417200199"),
+        ] {
+            let agent: AgentDef = serde_yaml::from_str(&format!(
+                r#"
+id: {provider}
+name: {provider}
+provider: {provider}
+channels:
+  {channel_key}: '{channel_id}'
+"#
+            ))
+            .unwrap();
+
+            let comparable = ComparableAgent::from_yaml(&agent);
+
+            assert_eq!(comparable.provider, provider);
+            assert_eq!(comparable.discord_channel_id.as_deref(), Some(channel_id));
+            assert_eq!(comparable.discord_channel_cc, None);
+            assert_eq!(comparable.discord_channel_cdx, None);
+        }
+    }
 }
 
 #[cfg(test)]

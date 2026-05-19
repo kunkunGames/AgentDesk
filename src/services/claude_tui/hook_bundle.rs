@@ -920,6 +920,34 @@ mod tests {
     }
 
     #[test]
+    fn probe_codex_cli_version_uses_exec_path_for_env_shebang_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+
+        let fake_node = bin_dir.join("fake-node");
+        std::fs::write(&fake_node, b"#!/bin/sh\necho codex-cli 0.test\n").unwrap();
+        let mut fake_node_perms = std::fs::metadata(&fake_node).unwrap().permissions();
+        fake_node_perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_node, fake_node_perms).unwrap();
+
+        let codex_wrapper = dir.path().join("codex");
+        std::fs::write(&codex_wrapper, b"#!/usr/bin/env fake-node\n").unwrap();
+        let mut wrapper_perms = std::fs::metadata(&codex_wrapper).unwrap().permissions();
+        wrapper_perms.set_mode(0o755);
+        std::fs::set_permissions(&codex_wrapper, wrapper_perms).unwrap();
+
+        let codex_path = codex_wrapper.to_string_lossy().into_owned();
+        let exec_path = bin_dir.to_string_lossy().into_owned();
+        assert_eq!(
+            probe_codex_cli_version_with_path(&codex_path, Some(&exec_path)),
+            Some("codex-cli 0.test".to_string())
+        );
+    }
+
+    #[test]
     fn run_codex_hook_startup_self_check_warns_when_version_unknown() {
         // Codex CLI on PATH but version probe failed → still warn (don't claim
         // success on a totally unknown CLI).
