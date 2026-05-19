@@ -40,7 +40,6 @@ fn explicit_decode_fallback<T>(
     }
 }
 
-
 use crate::services::message_outbox::{OutboxMessage, enqueue_outbox_pg};
 
 /// Minimum 7d sample window required before an alert can fire. Mirrors the
