@@ -27,6 +27,7 @@ pub mod dispatch_watchdog;
 pub mod dispatched_sessions;
 pub mod dispatches;
 pub mod dispatches_followup;
+pub mod envelope_dedup;
 pub mod gemini;
 pub mod git;
 pub mod issue_announcements;
