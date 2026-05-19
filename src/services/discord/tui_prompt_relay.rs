@@ -1637,6 +1637,27 @@ mod tests {
         assert!(!output.contains('\u{1b}'));
     }
 
+    // U-4 Bare control bytes (BEL, FF, DEL, C1 NEXT LINE) in the SSH-direct
+    // notification path must be silently dropped — they would otherwise
+    // disrupt Discord rendering or terminal mirrors that re-paste the text.
+    // Newline, carriage return, and tab are preserved by design.
+    #[test]
+    fn notification_strip_drops_bare_control_bytes_but_keeps_whitespace() {
+        let raw = "\u{07}ring\u{0c}page\u{7f}del\u{85}c1\n\tkeep";
+
+        let output = format_ssh_direct_prompt_notification("claude", "tmux-1", raw);
+
+        for forbidden in ['\u{07}', '\u{0c}', '\u{7f}', '\u{85}'] {
+            assert!(
+                !output.contains(forbidden),
+                "control byte {:?} leaked into notification: {:?}",
+                forbidden,
+                output
+            );
+        }
+        assert!(output.contains("ringpagedelc1\n\tkeep"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn parses_claude_tui_launch_script_content() {
@@ -1767,7 +1788,80 @@ agents:
         );
     }
 
+    // U-11 If the transcript file does not exist yet at rehydrate time,
+    // start_offset is 0 — a new file will then be tailed from the
+    // beginning when it appears.
+    #[test]
+    fn claude_rehydrate_start_offset_returns_zero_for_missing_transcript() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("never-written.jsonl");
+        let relay_started_at = SystemTime::now();
+
+        let offset = claude_tui_rehydrate_start_offset(
+            "AgentDesk-claude-missing",
+            &missing,
+            relay_started_at,
+        );
+
+        assert_eq!(offset.start_offset, 0);
+        assert!(offset.suppress_prompt.is_none());
+    }
+
+    // U-11 A transcript whose mtime is *outside* the rehydrate grace
+    // window (older than CLAUDE_IDLE_REHYDRATE_STARTUP_REPLAY_GRACE) must
+    // jump straight to EOF — this prevents replaying turns from a
+    // long-idle session when the bot restarts hours later.
     #[cfg(unix)]
+    #[test]
+    fn claude_rehydrate_start_offset_jumps_to_eof_when_transcript_is_stale() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let transcript = dir.path().join("stale.jsonl");
+        let body = "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"s\"}\n";
+        std::fs::write(&transcript, body).expect("write transcript");
+        let file_len = std::fs::metadata(&transcript).expect("metadata").len();
+
+        // Backdate mtime well outside the grace window (≥ 30 min ago).
+        let stale_when =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 60);
+        let stale_seconds = stale_when
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs() as i64;
+        let times = [
+            libc::timespec {
+                tv_sec: stale_seconds,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: stale_seconds,
+                tv_nsec: 0,
+            },
+        ];
+        let path_cstring = std::ffi::CString::new(transcript.as_os_str().as_encoded_bytes())
+            .expect("path cstring");
+        // SAFETY: utimensat with a known-valid CString path; the timespec
+        // array is fully initialized above.
+        let result = unsafe {
+            libc::utimensat(libc::AT_FDCWD, path_cstring.as_ptr(), times.as_ptr(), 0)
+        };
+        assert_eq!(result, 0, "utimensat failed");
+        let _ = std::fs::metadata(&transcript)
+            .expect("metadata")
+            .mtime();
+
+        let relay_started_at = std::time::SystemTime::now();
+        let offset = claude_tui_rehydrate_start_offset(
+            "AgentDesk-claude-stale",
+            &transcript,
+            relay_started_at,
+        );
+
+        assert_eq!(offset.start_offset, file_len);
+        assert!(offset.suppress_prompt.is_none());
+    }
+
     #[test]
     fn claude_rehydrate_start_offset_uses_last_recent_user_prompt() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1942,6 +2036,34 @@ agents:
                 line_end_offset: prompt.len() as u64,
             }
         );
+    }
+
+    // U-17 Claude transcript scan must restart from offset 0 when the
+    // recorded offset is past the current file length — this is the
+    // /compact path, where Claude rewrites the transcript and our
+    // previously-persisted offset would otherwise leak past the EOF and
+    // skip all newly-written prompts.
+    #[test]
+    fn claude_idle_transcript_scan_restarts_when_file_shrinks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let transcript = dir.path().join("transcript.jsonl");
+        let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"after compact\"}]},\"sessionId\":\"s1\"}\n";
+        std::fs::write(&transcript, prompt).expect("write transcript");
+
+        let scan = scan_claude_idle_transcript_for_prompt(&transcript, 99_999)
+            .expect("scan shrunken transcript");
+        match scan {
+            ClaudeIdleTranscriptScan::Prompt {
+                prompt: text,
+                line_end_offset,
+                prompt_start_offset,
+            } => {
+                assert_eq!(text, "after compact");
+                assert_eq!(line_end_offset, prompt.len() as u64);
+                assert_eq!(prompt_start_offset, 0);
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
     }
 
     #[test]

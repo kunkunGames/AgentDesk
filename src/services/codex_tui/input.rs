@@ -1463,6 +1463,89 @@ mod tests {
         );
     }
 
+    // U-3+ Bare ESC / BEL / FF must all be rejected by the validator before
+    // any tmux delivery — mirrors claude_tui::input coverage.
+    #[test]
+    fn bare_control_bytes_are_rejected() {
+        for prompt in [
+            "hello\u{1b}stop", // bare ESC
+            "ring\u{07}bell",  // BEL
+            "form\u{0c}feed",  // FF
+            "hello\u{7f}",     // DEL
+            "hello\u{85}",     // C1 NEXT LINE
+        ] {
+            let error = plan_prompt_submit(prompt).unwrap_err();
+            assert_eq!(
+                error,
+                "prompt contains unsupported terminal control characters"
+            );
+        }
+    }
+
+    // U-1+ Codex codeblock-style multiline (3 lines) is delivered as one
+    // PasteBuffer + Enter.
+    #[test]
+    fn codeblock_multiline_paste_buffer() {
+        let prompt = "fn main() {\n    println!(\"hi\");\n}";
+
+        let actions = plan_prompt_submit(prompt).unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                TuiInputAction::PasteBuffer(prompt.to_string()),
+                TuiInputAction::Enter,
+            ]
+        );
+    }
+
+    // U-2+ Emoji + Korean on a single line stays in the Literal path and
+    // is not UTF-8-split.
+    #[test]
+    fn emoji_and_korean_stay_literal() {
+        let prompt = "안녕👋 코드 분석";
+
+        let actions = plan_prompt_submit(prompt).unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                TuiInputAction::Literal(prompt.to_string()),
+                TuiInputAction::Enter,
+            ]
+        );
+    }
+
+    // U-5 8 KiB single-line prompt → Literal chunks bounded by
+    // DEFAULT_LITERAL_CHUNK_CHARS, followed by Enter, reassembling
+    // to the original input.
+    #[test]
+    fn chunks_8kib_single_line_into_literals_then_enter() {
+        let prompt: String = std::iter::repeat('B').take(8 * 1024).collect();
+
+        let actions = plan_prompt_submit(&prompt).unwrap();
+
+        let (literal_actions, terminator) = actions.split_at(actions.len() - 1);
+        assert_eq!(terminator, &[TuiInputAction::Enter]);
+        assert!(!literal_actions.is_empty());
+
+        let mut reassembled = String::with_capacity(prompt.len());
+        for action in literal_actions {
+            match action {
+                TuiInputAction::Literal(chunk) => {
+                    assert!(
+                        chunk.chars().count() <= DEFAULT_LITERAL_CHUNK_CHARS,
+                        "chunk over DEFAULT_LITERAL_CHUNK_CHARS: {} chars",
+                        chunk.chars().count()
+                    );
+                    reassembled.push_str(chunk);
+                }
+                other => panic!("expected Literal chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(reassembled, prompt);
+    }
+
     #[test]
     fn split_literal_chunks_preserves_multibyte_char_boundaries() {
         let chunks = split_literal_chunks("가나다abc", 2);

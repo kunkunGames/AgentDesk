@@ -666,6 +666,151 @@ mod tests {
         *state = TuiPromptDedupeState::default();
     }
 
+    // U-14 Provider-keyed channel isolation: registering the same tmux name
+    // under both `claude` and `codex` providers must keep two independent
+    // mappings — the dedupe state must not collapse them, otherwise cc/cdx
+    // turns running side-by-side could cross-relay into each other's
+    // channels.
+    #[test]
+    fn provider_session_mapping_isolates_claude_and_codex_for_same_session_id() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        register_provider_session("claude", "session-shared", "tmux-claude");
+        register_provider_session("codex", "session-shared", "tmux-codex");
+
+        assert_eq!(
+            resolve_tmux_session_name("claude", "session-shared"),
+            Some("tmux-claude".to_string())
+        );
+        assert_eq!(
+            resolve_tmux_session_name("codex", "session-shared"),
+            Some("tmux-codex".to_string())
+        );
+
+        // Recording a Discord-originated prompt for one provider must not
+        // suppress an SSH-direct prompt the other provider observes.
+        record_discord_originated_prompt("claude", "tmux-claude", "shared-text");
+
+        assert_eq!(
+            observe_prompt_by_tmux("claude", "tmux-claude", "shared-text"),
+            PromptObservation::SuppressedDiscordDuplicate
+        );
+        // The codex pane has no pending entry, so the same text is a fresh
+        // direct-input observation, not a duplicate.
+        assert_eq!(
+            observe_prompt_by_tmux("codex", "tmux-codex", "shared-text"),
+            PromptObservation::PublishedSshDirect
+        );
+    }
+
+    // U-12 `relay_output_path` falls back to `output_path` when no dedicated
+    // relay path is configured. A blank/whitespace-only override must not
+    // shadow the primary output_path — otherwise the relay would tail an
+    // empty path and silently drop frames.
+    #[test]
+    fn relay_output_path_falls_back_to_output_path_when_unset_or_blank() {
+        let none_binding = TuiRuntimeBinding {
+            runtime_kind: RuntimeHandoffKind::ClaudeTui,
+            output_path: "/tmp/transcript.jsonl".to_string(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: None,
+            last_offset: 0,
+            relay_last_offset: None,
+        };
+        assert_eq!(none_binding.relay_output_path(), "/tmp/transcript.jsonl");
+
+        let blank_binding = TuiRuntimeBinding {
+            relay_output_path: Some("   ".to_string()),
+            ..none_binding.clone()
+        };
+        assert_eq!(blank_binding.relay_output_path(), "/tmp/transcript.jsonl");
+
+        let override_binding = TuiRuntimeBinding {
+            relay_output_path: Some("/tmp/relay.jsonl".to_string()),
+            ..none_binding.clone()
+        };
+        assert_eq!(override_binding.relay_output_path(), "/tmp/relay.jsonl");
+    }
+
+    // U-12 `relay_last_offset()` mirrors `last_offset` when the override is
+    // None — without this, the very first idle scan after a rehydrate
+    // would tail from byte 0 and replay the entire transcript.
+    #[test]
+    fn relay_last_offset_falls_back_to_last_offset_when_unset() {
+        let binding = TuiRuntimeBinding {
+            runtime_kind: RuntimeHandoffKind::ClaudeTui,
+            output_path: "/tmp/transcript.jsonl".to_string(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: None,
+            last_offset: 4096,
+            relay_last_offset: None,
+        };
+        assert_eq!(binding.relay_last_offset(), 4096);
+
+        let with_override = TuiRuntimeBinding {
+            relay_last_offset: Some(1024),
+            ..binding
+        };
+        assert_eq!(with_override.relay_last_offset(), 1024);
+    }
+
+    // U-10 `advance_tmux_runtime_binding_offset` is the cold-start entry
+    // point used by relay readers to record where they left off. Calls with
+    // a mismatched output_path that is not the configured relay override
+    // must be rejected — otherwise a sibling reader writing the wrong path
+    // could fast-forward our offset past unread frames.
+    #[test]
+    fn advance_offset_rejects_mismatched_path_when_relay_override_differs() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        register_tmux_runtime_binding(
+            "tmux-cold",
+            TuiRuntimeBinding {
+                runtime_kind: RuntimeHandoffKind::ClaudeTui,
+                output_path: "/tmp/primary.jsonl".to_string(),
+                relay_output_path: Some("/tmp/relay.jsonl".to_string()),
+                input_fifo_path: None,
+                session_id: None,
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+
+        // Primary path advances `last_offset` and (because relay override
+        // is set) leaves `relay_last_offset` alone.
+        assert!(advance_tmux_runtime_binding_offset(
+            "tmux-cold",
+            "/tmp/primary.jsonl",
+            500
+        ));
+        let after_primary = runtime_binding_for_tmux_session("tmux-cold").unwrap();
+        assert_eq!(after_primary.last_offset, 500);
+        assert!(after_primary.relay_last_offset.is_none());
+
+        // Relay override path advances `relay_last_offset`.
+        assert!(advance_tmux_runtime_binding_offset(
+            "tmux-cold",
+            "/tmp/relay.jsonl",
+            900
+        ));
+        let after_relay = runtime_binding_for_tmux_session("tmux-cold").unwrap();
+        assert_eq!(after_relay.relay_last_offset, Some(900));
+
+        // An unrelated path is rejected and does not corrupt either offset.
+        assert!(!advance_tmux_runtime_binding_offset(
+            "tmux-cold",
+            "/tmp/wrong.jsonl",
+            9999
+        ));
+        let after_wrong = runtime_binding_for_tmux_session("tmux-cold").unwrap();
+        assert_eq!(after_wrong.last_offset, 500);
+        assert_eq!(after_wrong.relay_last_offset, Some(900));
+    }
+
     #[test]
     fn suppresses_exact_pending_prompt() {
         let _guard = TEST_LOCK.lock().unwrap();

@@ -485,6 +485,71 @@ mod tests {
         );
     }
 
+    // U-6 Policy clause 3: an assistant envelope whose content array carries
+    // only a `thinking` block (no terminal `result` after it) keeps the turn
+    // in `Streaming` — thinking must never on its own be treated as
+    // turn-completion. If this regresses, the relay could close the inflight
+    // panel mid-reasoning.
+    #[test]
+    fn claude_assistant_with_only_thinking_content_stays_streaming() {
+        let file = write_jsonl(&[
+            r#"{"type":"user","message":{"content":"hello"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"reasoning"}]}}"#,
+        ]);
+
+        assert_eq!(
+            observe_claude_jsonl_turn_state(file.path()),
+            TuiTurnState::Streaming
+        );
+    }
+
+    // U-7 system/turn_duration and system/stop_hook_summary are metadata
+    // envelopes that mark the end of a turn — they must classify as Idle
+    // so cold-start probes do not mistake the trailing metadata for a
+    // mid-stream assistant response.
+    #[test]
+    fn claude_system_turn_duration_marks_idle() {
+        let file = write_jsonl(&[
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi back"}]}}"#,
+            r#"{"type":"system","subtype":"turn_duration","duration_ms":1234}"#,
+        ]);
+
+        assert_eq!(
+            observe_claude_jsonl_turn_state(file.path()),
+            TuiTurnState::Idle
+        );
+    }
+
+    #[test]
+    fn claude_system_stop_hook_summary_marks_idle() {
+        let file = write_jsonl(&[
+            r#"{"type":"result","result":"done","session_id":"s"}"#,
+            r#"{"type":"system","subtype":"stop_hook_summary","detail":"ok"}"#,
+        ]);
+
+        assert_eq!(
+            observe_claude_jsonl_turn_state(file.path()),
+            TuiTurnState::Idle
+        );
+    }
+
+    // U-7 An unknown `system` subtype must not be silently classified as
+    // Idle — that would let novel metadata envelopes spuriously close
+    // turns. The classifier walks back to the previous envelope instead.
+    #[test]
+    fn claude_unknown_system_subtype_falls_back_to_previous_envelope() {
+        let file = write_jsonl(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+            r#"{"type":"system","subtype":"future_unknown_event","note":"x"}"#,
+        ]);
+
+        assert_eq!(
+            observe_claude_jsonl_turn_state(file.path()),
+            TuiTurnState::Streaming
+        );
+    }
+
     #[test]
     fn codex_completed_agent_message_marks_idle() {
         let file = write_jsonl(&[

@@ -1621,6 +1621,75 @@ mod tests {
         rx.iter().collect()
     }
 
+    // U-8 tool_call_message must drop entries with no usable `name` field
+    // — a function_call envelope without a name is not a renderable tool
+    // event and must not surface as a placeholder ToolUse.
+    #[test]
+    fn tool_call_with_missing_name_yields_no_emit() {
+        let payload = serde_json::json!({ "arguments": "{}" });
+        assert!(tool_call_message(&payload).is_none());
+
+        let payload = serde_json::json!({ "name": "   ", "arguments": "{}" });
+        assert!(tool_call_message(&payload).is_none());
+    }
+
+    // U-8 tool_call_message accepts the modern `arguments` field and falls
+    // back to `input` then `action` for legacy variants, preserving the
+    // payload as compact JSON.
+    #[test]
+    fn tool_call_argument_fallback_order_is_preserved() {
+        let modern = serde_json::json!({ "name": "exec", "arguments": "{\"cmd\":\"ls\"}" });
+        let legacy_input = serde_json::json!({ "name": "exec", "input": {"cmd": "ls"} });
+        let legacy_action = serde_json::json!({ "name": "exec", "action": "ls" });
+
+        for payload in [&modern, &legacy_input, &legacy_action] {
+            let msg = tool_call_message(payload).expect("tool_call_message emits");
+            match msg {
+                StreamMessage::ToolUse { name, input } => {
+                    assert_eq!(name, "exec");
+                    assert!(!input.is_empty());
+                }
+                other => panic!("expected ToolUse, got {other:?}"),
+            }
+        }
+    }
+
+    // U-8 tool_result_message drops empty payloads so the relay does not
+    // emit blank result lines that the user would see as noise.
+    #[test]
+    fn tool_result_with_empty_content_yields_no_emit() {
+        let payload = serde_json::json!({ "output": "" });
+        assert!(tool_result_message(&payload).is_none());
+
+        let payload = serde_json::json!({});
+        assert!(tool_result_message(&payload).is_none());
+    }
+
+    // U-8 tool_result_message preserves the `is_error` flag from either
+    // snake_case or camelCase form, defaulting to false when neither is
+    // set.
+    #[test]
+    fn tool_result_is_error_flag_is_preserved_from_either_naming() {
+        for payload in [
+            serde_json::json!({ "output": "boom", "is_error": true }),
+            serde_json::json!({ "output": "boom", "isError": true }),
+        ] {
+            match tool_result_message(&payload).expect("tool_result_message emits") {
+                StreamMessage::ToolResult { is_error, content } => {
+                    assert!(is_error);
+                    assert_eq!(content, "boom");
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            }
+        }
+
+        let payload = serde_json::json!({ "output": "ok" });
+        match tool_result_message(&payload).expect("tool_result_message emits") {
+            StreamMessage::ToolResult { is_error, .. } => assert!(!is_error),
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
     fn write_rollout(root: &Path, relative: &str, id: &str, cwd: &Path, body: &str) -> PathBuf {
         let path = root.join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

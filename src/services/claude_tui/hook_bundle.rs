@@ -1000,6 +1000,33 @@ mod tests {
         assert!(second.starts_with("sha256:"));
     }
 
+    // U-19 #2647: For the Codex provider, changing the AgentDesk executable
+    // path or the relay endpoint must still alter the trust hash — the
+    // session-id stabilization must not also collapse legitimate command
+    // identity changes that the operator should be re-asked to trust.
+    #[test]
+    fn codex_hook_trust_hash_still_diverges_when_relay_command_identity_changes() {
+        let mut config = sample_config();
+        config.provider = "codex".to_string();
+        let baseline = codex_hook_trust_hash(&config, "Stop");
+
+        config.agentdesk_exe = "/opt/agentdesk/bin/agentdesk-next".to_string();
+        let new_exe = codex_hook_trust_hash(&config, "Stop");
+        assert_ne!(
+            baseline, new_exe,
+            "swapping the AgentDesk relay binary path should bust the trust hash"
+        );
+
+        config = sample_config();
+        config.provider = "codex".to_string();
+        config.endpoint = "http://127.0.0.1:9999".to_string();
+        let new_endpoint = codex_hook_trust_hash(&config, "Stop");
+        assert_ne!(
+            baseline, new_endpoint,
+            "swapping the relay endpoint should bust the trust hash"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // #2259: integration test that exercises a real Codex CLI to assert
     // AgentDesk's rendered hook bundle parses and is accepted by the actual
