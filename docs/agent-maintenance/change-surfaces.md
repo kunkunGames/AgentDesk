@@ -132,9 +132,9 @@
   - `src/services/discord/gateway.rs` (1006 lines; Discord gateway adapter
     and `TurnGateway` bridge for turn send/edit/pin/unpin behavior — bugfix
     only outside a split plan).
-  - `src/services/discord/router/message_handler.rs` (7013 lines).
+  - `src/services/discord/router/message_handler.rs` (10668 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
-  - `src/services/discord/turn_bridge/mod.rs` (7062 lines).
+  - `src/services/discord/turn_bridge/mod.rs` (7610 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1525 lines; provider
     stop-token/tmux binding runtime + PID-exit observation helper (#2426),
     split before adding non-bugfix behavior).
@@ -357,7 +357,7 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/dispatches/outbox_route.rs` (1074) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
-- `src/services/claude.rs` (2477), `src/services/gemini.rs` (2565),
+- `src/services/claude.rs` (4038), `src/services/gemini.rs` (2565),
   `src/services/qwen.rs` (2466), `src/services/codex.rs` (1665),
   `src/services/opencode.rs` (2133), `src/services/provider.rs` (2177) —
   provider adapters.
@@ -368,7 +368,7 @@ The remaining giant-file modules under `src/services/` not covered above:
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
   non-bugfix behavior beyond the readiness/cancel contract.
-- `src/services/claude_tui/input.rs` (~1049) — Claude TUI input readiness
+- `src/services/claude_tui/input.rs` (~1249) — Claude TUI input readiness
   detector, prompt delivery, and cancellation/offset handoff surface. Treat as
   giant-file territory; split before adding non-bugfix behavior beyond the
   readiness/cancel contract.
