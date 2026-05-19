@@ -69,9 +69,11 @@
 | U-15 multi-binder-dedupe | 7.1 | dedupe state | 동일 jsonl 1초 겹친 두 reader | 라인당 1 emit |
 | U-16 partial-line | 8.1 | `claude_partial_turn_state` | 반쪽 라인 + 다음 라인 | 완성 후 정확 분류 |
 | U-17 compact-reanchor | 8.2 | `persist_*_pending_prompt` | /compact 후 잘린 transcript | offset 재계산, 동일 라인 0 |
-| U-18 envelope-discord-mapping | 10.2 | dedupe + emit 카운터 | jsonl + 모의 emit log | 1:1 매핑, 중복/누락 0 |
+| U-18 envelope-discord-mapping | 10.2 | dedupe + emit 카운터 | jsonl + 모의 emit log | 1:1 매핑, 중복/누락 0 — **트랙 B로 이동**: 실제 Discord emit 경로(`shared.discord.send_message`)는 process-wide async 의존이 강해 unit fixture로 만들기 부적절. E2E smoke E-1/E-11에서 자연 발생적으로 검증 |
 
 **부속 트랙(이미 합의된 5건)**: 2.5 compact-burst readiness, 4.3 hook vs result race, 4.4 Codex turn.completed 누락, 9.2 fault inject 단위, **추가**: U-19 hook-hash-session-id (#2647).
+**범위 명시**: 트랙 A는 **helper-level / pure-function 단위 회귀 가드**. tmux session 복구, Discord emit, 프로세스 재기동 같은 외부 의존 흐름(예: `rehydrate_existing_claude_tui_bindings` 전체 path, `stale_resume` reconnect 흐름, U-18 envelope→Discord 1:1 mapping)은 트랙 B에서 다룬다. PR 본문도 "regression-guard at unit/helper level"로 명시.
+
 **Grade**: 모든 unit test pass + flaky 0 (50회 반복 시 변동 0). 이걸 먼저 잠근다.
 
 ## 4. 트랙 B — Python E2E Smoke (12케이스)

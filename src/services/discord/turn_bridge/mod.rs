@@ -1888,6 +1888,20 @@ mod thinking_redaction_tests {
 
         assert_eq!(line, "💭 Thinking...");
     }
+
+    // U-6 Policy clause 2 (stability): repeated calls must return the
+    // exact same marker string. The Thinking dispatch path uses this for
+    // both `current_tool_line` replacement and dedupe — if it ever drifted
+    // into a non-deterministic form (timestamp, counter, locale variant),
+    // the relay could emit multiple markers per turn or fail to match the
+    // previous one.
+    #[test]
+    fn thinking_status_line_is_stable_across_repeated_calls() {
+        let baseline = thinking_status_line();
+        for _ in 0..10 {
+            assert_eq!(thinking_status_line(), baseline);
+        }
+    }
 }
 
 pub(super) struct TurnBridgeContext {

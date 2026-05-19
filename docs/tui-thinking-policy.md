@@ -35,7 +35,7 @@
 |---|---|---|
 | 1, 2 | `src/services/discord/turn_bridge/mod.rs:1833-1835` | `thinking_status_line()` — 유일한 중립 marker |
 | 1, 4 | `src/services/discord/turn_bridge/mod.rs:1837-1846` | `redacted_thinking_transcript_event()` — summary 무시, content "" |
-| 1, 2 | `src/services/discord/turn_bridge/mod.rs:3492-3530` | `StreamMessage::Thinking` 처리 흐름 — marker 교체, transcript push |
+| 1, 2 | `src/services/discord/turn_bridge/mod.rs` 의 `StreamMessage::Thinking` 분기 (검색: `redacted_thinking_transcript_event` call site) | marker 교체, transcript push |
 | 3 | `src/services/tui_turn_state.rs:144-155` | `claude_envelope_turn_state` — thinking이 별도 Idle 분류로 매핑되지 않음 |
 
 ## 위반 사례 정의 (트랙 A U-6 assertion 근거)

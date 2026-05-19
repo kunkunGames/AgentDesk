@@ -1761,6 +1761,65 @@ mod tests {
         ));
     }
 
+    // U-8 fixture-level: a rollout with 5 paired tool_call / tool_result
+    // entries followed by a single assistant message must produce a stable
+    // sequence — every ToolUse emits, every ToolResult emits, and no
+    // tool_call is dropped or duplicated by the parser. This is the
+    // regression boundary for "tool_use 다발" relay scenarios.
+    #[test]
+    fn maps_five_tool_call_result_pairs_in_order() {
+        let mut body = String::new();
+        body.push_str(
+            r#"{"type":"session_meta","payload":{"id":"five-tools","cwd":"/tmp/repo"}}"#,
+        );
+        body.push('\n');
+        for index in 0..5 {
+            body.push_str(&format!(
+                r#"{{"type":"response_item","payload":{{"type":"function_call","name":"tool_{index}","arguments":"{{\"i\":{index}}}","call_id":"c{index}"}}}}"#,
+            ));
+            body.push('\n');
+            body.push_str(&format!(
+                r#"{{"type":"response_item","payload":{{"type":"function_call_output","call_id":"c{index}","output":"out-{index}"}}}}"#,
+            ));
+            body.push('\n');
+        }
+        body.push_str(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}}"#,
+        );
+        body.push('\n');
+
+        let messages = collect_rollout(&body, 0);
+
+        let mut tool_use_names = Vec::new();
+        let mut tool_result_outputs = Vec::new();
+        let mut text_count = 0usize;
+        for message in &messages {
+            match message {
+                StreamMessage::ToolUse { name, .. } => tool_use_names.push(name.clone()),
+                StreamMessage::ToolResult { content, .. } => {
+                    tool_result_outputs.push(content.clone())
+                }
+                StreamMessage::Text { content } => {
+                    text_count += 1;
+                    assert_eq!(content, "summary");
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            tool_use_names,
+            (0..5).map(|i| format!("tool_{i}")).collect::<Vec<_>>(),
+            "expected ToolUse emit in order tool_0..tool_4"
+        );
+        assert_eq!(
+            tool_result_outputs,
+            (0..5).map(|i| format!("out-{i}")).collect::<Vec<_>>(),
+            "expected ToolResult emit in order out-0..out-4"
+        );
+        assert_eq!(text_count, 1, "expected exactly one assistant Text emit");
+    }
+
     #[test]
     fn starts_at_known_offset_to_avoid_stale_replay() {
         let stale = concat!(
