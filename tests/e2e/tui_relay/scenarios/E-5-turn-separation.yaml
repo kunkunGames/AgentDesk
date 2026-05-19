@@ -1,0 +1,16 @@
+id: E-5
+title: 응답 직후 새 프롬프트 → 새 턴 헤더 분리 + inflight cleanup 관측 (#2625)
+channel: both
+isolation: required
+steps:
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E5:TURN-A] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E5:TURN-A]"
+    timeout_s: 240
+  - wait_idle_s: 1
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E5:TURN-B] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E5:TURN-B]"
+    timeout_s: 240
+assertions:
+  - no_duplicate_content: true
+  - text_present: "[E2E:E5:TURN-A]"
+  - text_present: "[E2E:E5:TURN-B]"

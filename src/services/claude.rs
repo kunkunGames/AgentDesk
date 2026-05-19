@@ -3801,10 +3801,23 @@ mod claude_tui_session_resolution_tests {
 
         let no_draft = crate::services::claude_tui::input::PromptReadinessSnapshot {
             prompt_draft_detected: false,
-            ..snapshot
+            ..snapshot.clone()
         };
         assert_eq!(
             claude_tui_followup_stranded_prompt_draft_state(&no_draft, &transcript_path),
+            None
+        );
+
+        // U-13 A dead tmux pane must never classify as a recoverable draft —
+        // there is nothing to recover when the pane is gone. Otherwise the
+        // recovery path would invoke send-keys on a dead session and fail
+        // with an inflight prompt forever stuck.
+        let dead_pane = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            tmux_pane_alive: false,
+            ..snapshot
+        };
+        assert_eq!(
+            claude_tui_followup_stranded_prompt_draft_state(&dead_pane, &transcript_path),
             None
         );
     }

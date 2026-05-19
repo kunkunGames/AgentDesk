@@ -1,0 +1,14 @@
+id: E-1
+title: 짧은 단일 프롬프트 → 응답 1회 relay
+channel: both
+isolation: required
+steps:
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E1:OK] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E1:OK]"
+    timeout_s: 240
+assertions:
+  - message_count_between_markers:
+      min: 1
+      max: 6
+  - no_duplicate_content: true
+  - no_control_chars: true
