@@ -48,16 +48,16 @@
 | `cli` | `src/cli/mod.rs` | 20 |  |
 | `cli::args` | `src/cli/args.rs` | 1043 | giant-file |
 | `cli::client` | `src/cli/client.rs` | 1827 | giant-file |
-| `cli::dcserver` | `src/cli/dcserver.rs` | 1526 | giant-file |
+| `cli::dcserver` | `src/cli/dcserver.rs` | 1576 | giant-file |
 | `cli::direct` | `src/cli/direct.rs` | 1635 | giant-file |
 | `cli::discord` | `src/cli/discord.rs` | 123 |  |
 | `cli::doctor` | `src/cli/doctor.rs` | 9 |  |
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 |  |
 | `cli::doctor::health` | `src/cli/doctor/health.rs` | 164 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 256 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 5026 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 5047 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 515 |  |
-| `cli::init` | `src/cli/init.rs` | 1671 | giant-file |
+| `cli::init` | `src/cli/init.rs` | 1663 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 348 |  |
 | `cli::migrate::apply` | `src/cli/migrate/apply.rs` | 3147 | giant-file |
 | `cli::migrate::plan` | `src/cli/migrate/plan.rs` | 1513 | giant-file |
@@ -359,8 +359,8 @@
 | `services::codex_remote_policy` | `src/services/codex_remote_policy.rs` | 49 |  |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 744 |  |
 | `services::codex_tui` | `src/services/codex_tui/mod.rs` | 3 |  |
-| `services::codex_tui::input` | `src/services/codex_tui/input.rs` | 1653 | giant-file |
-| `services::codex_tui::rollout_tail` | `src/services/codex_tui/rollout_tail.rs` | 3440 | giant-file |
+| `services::codex_tui::input` | `src/services/codex_tui/input.rs` | 1728 | giant-file |
+| `services::codex_tui::rollout_tail` | `src/services/codex_tui/rollout_tail.rs` | 3548 | giant-file |
 | `services::codex_tui::session` | `src/services/codex_tui/session.rs` | 496 |  |
 | `services::discord` | `src/services/discord/mod.rs` | 6537 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 910 |  |
@@ -508,7 +508,7 @@
 | `services::discord::voice_routing` | `src/services/discord/voice_routing.rs` | 160 |  |
 | `services::discord::watchers::lifecycle` | `src/services/discord/watchers/lifecycle.rs` | 1857 | giant-file |
 | `services::discord::watchers::lifecycle_decision` | `src/services/discord/watchers/lifecycle_decision.rs` | 254 |  |
-| `services::discord_config_audit` | `src/services/discord_config_audit.rs` | 1703 | giant-file |
+| `services::discord_config_audit` | `src/services/discord_config_audit.rs` | 1785 | giant-file |
 | `services::discord_dm_reply_store` | `src/services/discord_dm_reply_store.rs` | 207 |  |
 | `services::disk_monitor` | `src/services/disk_monitor.rs` | 351 |  |
 | `services::dispatch_watchdog` | `src/services/dispatch_watchdog.rs` | 254 |  |
