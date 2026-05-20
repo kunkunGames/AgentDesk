@@ -933,8 +933,11 @@ fn line_is_legacy_codex_prompt(line: &str) -> bool {
         return false;
     };
     let rest = rest.trim();
-    rest.is_empty() || rest == "Explain this codebase"
+    rest.is_empty() || CODEX_COMPACT_PLACEHOLDER_PROMPTS.contains(&rest)
 }
+
+const CODEX_COMPACT_PLACEHOLDER_PROMPTS: &[&str] =
+    &["Explain this codebase", "Summarize recent commits"];
 
 fn line_is_legacy_codex_status(line: &str) -> bool {
     let trimmed = line.trim();
@@ -1310,6 +1313,17 @@ more output\n\
 ─ Worked for 4m 03s ────────────────────────────────────────────\n\
 \n\
 › Explain this codebase\n\
+\n\
+  gpt-5.5 xhigh · ~/.adk/release/workspaces/baby";
+        assert!(pane_looks_ready_for_codex_prompt(pane));
+    }
+
+    #[test]
+    fn compact_codex_recent_commits_placeholder_is_ready() {
+        let pane = "\
+─ Worked for 1m 21s ────────────────────────────────────────────\n\
+\n\
+› Summarize recent commits\n\
 \n\
   gpt-5.5 xhigh · ~/.adk/release/workspaces/baby";
         assert!(pane_looks_ready_for_codex_prompt(pane));
