@@ -1151,9 +1151,14 @@ fn resolve_setup_path(root: &Path, raw: &str) -> PathBuf {
 }
 
 fn expand_tilde(raw: &str) -> String {
-    if raw == "~" || raw.starts_with("~/") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(raw) {
-            return expanded.to_string_lossy().into_owned();
+    if raw == "~" {
+        return dirs::home_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| raw.to_string());
+    }
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped).display().to_string();
         }
     }
     raw.to_string()
