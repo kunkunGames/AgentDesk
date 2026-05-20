@@ -1639,7 +1639,29 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let turn_data_start_offset = all_data_start_offset;
         let mut session_bound_relay_turn_fully_mirrored = all_data_fully_mirrored_to_session_relay;
         let mut state = StreamLineState::new();
-        let stream_seed = watcher_stream_seed(restored_turn.take());
+        let restored_turn_seed = restored_turn.take();
+        let discard_restored_seed = should_discard_restored_seed_for_idle_direct_prompt(
+            restored_turn_seed.is_some(),
+            crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
+                watcher_provider.as_str(),
+                &tmux_session_name,
+                channel_id.get(),
+            )
+            .is_some(),
+        );
+        if discard_restored_seed {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] 👁 watcher: discarding restored stream seed for idle SSH-direct prompt on channel {} (tmux={})",
+                channel_id.get(),
+                tmux_session_name
+            );
+        }
+        let stream_seed = watcher_stream_seed(if discard_restored_seed {
+            None
+        } else {
+            restored_turn_seed
+        });
         let restored_assistant_text_seen = !stream_seed.full_response.trim().is_empty();
         if restored_assistant_text_seen {
             // The restored response prefix came from watcher state, not from
@@ -4228,7 +4250,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 !state.rebind_origin && state.channel_id != 0 && state.current_msg_id != 0
             }) {
                 let message_id = serenity::MessageId::new(state.current_msg_id);
-                match channel_id.unpin(&http, message_id).await {
+                // `Manage Messages` lives on the announce bot in this deployment;
+                // route the unpin there to avoid a 403 storm. See
+                // `crate::services::discord::gateway::manage_messages_http`.
+                let unpin_http =
+                    crate::services::discord::gateway::manage_messages_http(&shared, &http).await;
+                match channel_id.unpin(unpin_http.as_ref(), message_id).await {
                     Ok(()) => {
                         shared.placeholder_controller.forget_placeholder_pin(
                             &provider_kind,

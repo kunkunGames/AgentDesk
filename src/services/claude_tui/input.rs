@@ -214,6 +214,19 @@ pub fn send_cancel(session_name: &str) -> Result<(), String> {
     run_actions(session_name, &plan_cancel(), None)
 }
 
+/// #2730: settle delay between a PasteBuffer action and any follow-up
+/// (typically `Enter`). Claude TUI 2.1.x parses bracketed-paste sequences
+/// byte-by-byte from the pane; without a brief settle window the Enter sent
+/// immediately after `tmux paste-buffer -p -r` can race the paste-end marker.
+/// When that happens Claude TUI commits the pre-paste input state (often a
+/// single-space placeholder) as a standalone user turn, then submits the
+/// actual paste content as a separate turn — which the Anthropic API rejects
+/// with `400 messages: text content blocks must contain non-whitespace text`
+/// because one of the blocks is whitespace-only. A short post-paste settle
+/// eliminates the race in practice; the cost is one settle per multi-line
+/// turn.
+const POST_PASTE_BUFFER_SETTLE: Duration = Duration::from_millis(200);
+
 fn run_actions(
     session_name: &str,
     actions: &[TuiInputAction],
@@ -230,7 +243,16 @@ fn run_actions(
                 let load_output = crate::services::platform::tmux::load_buffer(&buffer_name, text)?;
                 ensure_tmux_success(load_output, action)?;
                 check_prompt_cancel(cancel_token)?;
-                crate::services::platform::tmux::paste_buffer(session_name, &buffer_name, true)?
+                let paste_output = crate::services::platform::tmux::paste_buffer(
+                    session_name,
+                    &buffer_name,
+                    true,
+                )?;
+                ensure_tmux_success(paste_output, action)?;
+                // #2730 settle: see POST_PASTE_BUFFER_SETTLE rationale above.
+                std::thread::sleep(POST_PASTE_BUFFER_SETTLE);
+                check_prompt_cancel(cancel_token)?;
+                continue;
             }
             TuiInputAction::Enter => {
                 crate::services::platform::tmux::send_keys(session_name, &["Enter"])?
@@ -1262,5 +1284,90 @@ line 13";
                 "prompt contains unsupported terminal control characters"
             );
         }
+    }
+
+    // U-1+ Codeblock-style multiline (3 lines) is delivered as a single
+    // PasteBuffer with newlines preserved, so the TUI receives one atomic paste
+    // followed by Enter — not interleaved Literal chunks per line.
+    #[test]
+    fn prompt_submit_treats_codeblock_multiline_as_single_paste_buffer() {
+        let prompt = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}";
+
+        let actions = plan_prompt_submit(prompt).unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                TuiInputAction::PasteBuffer(prompt.to_string()),
+                TuiInputAction::Enter,
+            ]
+        );
+    }
+
+    // U-2+ Emoji + Korean (multi-byte UTF-8) without a newline must stay in
+    // the Literal path and not be UTF-8-split. A single chunk is expected
+    // because the input fits inside DEFAULT_LITERAL_CHUNK_CHARS.
+    #[test]
+    fn prompt_submit_preserves_emoji_and_korean_in_literal_chunk() {
+        let prompt = "안녕👋 코드 분석";
+
+        let actions = plan_prompt_submit(prompt).unwrap();
+
+        assert_eq!(
+            actions,
+            vec![
+                TuiInputAction::Literal(prompt.to_string()),
+                TuiInputAction::Enter,
+            ]
+        );
+    }
+
+    // U-3+ Bare ESC and BEL must be rejected — these can collide with the
+    // tmux paste-buffer escape state machine if passed through.
+    #[test]
+    fn prompt_rejects_bare_escape_and_bell() {
+        for prompt in [
+            "hello\u{1b}stop", // bare ESC
+            "ring\u{07}bell",  // BEL
+            "form\u{0c}feed",  // FF
+        ] {
+            let error = plan_prompt_submit(prompt).unwrap_err();
+
+            assert_eq!(
+                error,
+                "prompt contains unsupported terminal control characters"
+            );
+        }
+    }
+
+    // U-5 An 8 KiB single-line prompt is chunked into Literal segments
+    // bounded by DEFAULT_LITERAL_CHUNK_CHARS, followed by a single Enter.
+    // Concatenating the Literal payloads reproduces the original input
+    // verbatim — no truncation, reordering, or boundary corruption.
+    #[test]
+    fn prompt_submit_chunks_8kib_single_line_into_literals_then_enter() {
+        let prompt: String = std::iter::repeat('A').take(8 * 1024).collect();
+
+        let actions = plan_prompt_submit(&prompt).unwrap();
+
+        let (literal_actions, terminator) = actions.split_at(actions.len() - 1);
+        assert_eq!(terminator, &[TuiInputAction::Enter]);
+        assert!(!literal_actions.is_empty());
+
+        let mut reassembled = String::with_capacity(prompt.len());
+        for action in literal_actions {
+            match action {
+                TuiInputAction::Literal(chunk) => {
+                    assert!(
+                        chunk.chars().count() <= DEFAULT_LITERAL_CHUNK_CHARS,
+                        "chunk over DEFAULT_LITERAL_CHUNK_CHARS: {} chars",
+                        chunk.chars().count()
+                    );
+                    reassembled.push_str(chunk);
+                }
+                other => panic!("expected Literal chunk, got {other:?}"),
+            }
+        }
+        assert_eq!(reassembled, prompt);
     }
 }

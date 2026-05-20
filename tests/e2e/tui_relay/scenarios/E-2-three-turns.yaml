@@ -1,0 +1,22 @@
+id: E-2
+title: 연속 3턴 (각 응답 후 다음 프롬프트), 턴 헤더 분리 확인
+channel: both
+isolation: required
+steps:
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E2:TURN-1] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E2:TURN-1]"
+    timeout_s: 240
+  - wait_idle_s: 3
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E2:TURN-2] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E2:TURN-2]"
+    timeout_s: 240
+  - wait_idle_s: 3
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E2:TURN-3] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E2:TURN-3]"
+    timeout_s: 240
+assertions:
+  - no_duplicate_content: true
+  - text_present: "[E2E:E2:TURN-1]"
+  - text_present: "[E2E:E2:TURN-2]"
+  - text_present: "[E2E:E2:TURN-3]"
+  - no_resume_prompt_chrome: true

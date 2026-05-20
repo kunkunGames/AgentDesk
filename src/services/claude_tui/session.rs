@@ -117,9 +117,40 @@ fn write_launch_script(
         .map(|arg| shell_escape(&arg))
         .collect::<Vec<_>>()
         .join(" ");
+    // Neutralise the Claude CLI's auto-resume prompt
+    // (PY6 = "Continue from where you left off.") that gets prepended
+    // every time the TUI deserialises a transcript whose last user
+    // message ended that turn.
+    //
+    // The CLI reads this via `process.env.CLAUDE_CODE_RESUME_PROMPT || …`.
+    // Setting the variable to an empty string is silently ignored
+    // (JavaScript `||` treats `""` as falsy), so we previously used a
+    // single space (#2719) — truthy enough to bypass the fallback and
+    // visually invisible.
+    //
+    // #2730 follow-up: the single-space value backfired. Claude CLI
+    // *submits* the resume-prompt verbatim as a user turn on every
+    // resume, and the JSONL transcript records it as
+    // `{"type":"text","text":" "}`. Anthropic's API then rejects every
+    // subsequent request with `400 messages: text content blocks must
+    // contain non-whitespace text` because the cached conversation
+    // history now contains a whitespace-only block. Reproduced reliably
+    // by E-17 (SETUP turn after a `--resume` spawn always returned 400).
+    //
+    // We need a value that is (1) JS-truthy, (2) non-whitespace per the
+    // Anthropic API's content-block validator, and (3) visually minimal.
+    // Use an ASCII underscore `_` — single byte, single character,
+    // unambiguously non-whitespace.
+    //
+    // TODO(#2718-upstream): if the Claude CLI moves PY6 from `||` to
+    // nullish coalescing (`??`) or exposes a flag to skip the auto-resume
+    // prompt entirely, the placeholder semantics here should be
+    // revisited. Track upstream PY6 changes and reflect them in this
+    // comment + the unit tests.
     let script = format!(
         "#!/bin/bash\n\
          cd {cwd}\n\
+         export CLAUDE_CODE_RESUME_PROMPT=\"_\"\n\
          exec {claude_bin} {args}\n",
         cwd = shell_escape(&config.working_dir.display().to_string()),
         claude_bin = shell_escape(&config.claude_bin.display().to_string()),
@@ -216,6 +247,37 @@ mod tests {
         assert!(settings.contains("claude-hook-relay"));
         assert!(script.contains("exec '/usr/local/bin/claude'"));
         assert!(!script.contains(" -p "));
+        // Neutralise the Claude CLI's auto-resume prompt
+        // (PY6 = "Continue from where you left off.") so it does not
+        // re-prepend a steering meta user message every time the TUI
+        // deserialises its transcript at turn start.
+        //
+        // #2718: the env var must be a *truthy* placeholder. Setting it
+        // to "" is silently ignored by PY6 because of its
+        // `process.env.CLAUDE_CODE_RESUME_PROMPT || "Continue..."` pattern
+        // — empty strings are falsy in JS and the default fallback wins.
+        //
+        // #2730 follow-up: the placeholder must ALSO be non-whitespace
+        // per the Anthropic API's content-block validator. A single
+        // space (the previous choice) was truthy but whitespace-only,
+        // and Claude CLI submits the resume prompt verbatim — leaving a
+        // whitespace block in the transcript history that the API then
+        // rejects with `400 messages: text content blocks must contain
+        // non-whitespace text` on every subsequent request. Use `_` so
+        // the recorded turn satisfies both the JS truthy check and the
+        // API's non-whitespace check.
+        assert!(
+            script.contains("export CLAUDE_CODE_RESUME_PROMPT=\"_\""),
+            "launch script must export CLAUDE_CODE_RESUME_PROMPT to a JS-truthy AND non-whitespace placeholder so the API does not reject subsequent turns"
+        );
+        assert!(
+            !script.contains("export CLAUDE_CODE_RESUME_PROMPT=\"\""),
+            "empty-string placeholder is falsy and silently ignored by PY6"
+        );
+        assert!(
+            !script.contains("export CLAUDE_CODE_RESUME_PROMPT=\" \""),
+            "single-space placeholder is truthy but whitespace-only; #2730 reproduced this poisoning the API conversation history"
+        );
     }
 
     #[test]

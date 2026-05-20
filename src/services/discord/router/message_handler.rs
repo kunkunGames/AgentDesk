@@ -30,9 +30,10 @@ pub(crate) use super::turn_start::{
 use super::turn_start::{
     SessionResetReason, cli_just_spawned_for_emit, dispatch_reset_lifecycle_code,
     emit_session_strategy_lifecycle, load_session_runtime_state, log_session_strategy_diagnostic,
-    refresh_session_strategy_after_pending_reset, release_mailbox_after_placeholder_post_failure,
-    session_reset_reason_for_turn, session_reset_reason_lifecycle_code,
-    session_runtime_state_after_redirect, take_session_retry_context,
+    refresh_session_strategy_after_pending_reset, release_mailbox_after_hosted_tui_busy_pre_submit,
+    release_mailbox_after_placeholder_post_failure, session_reset_reason_for_turn,
+    session_reset_reason_lifecycle_code, session_runtime_state_after_redirect,
+    take_session_retry_context,
 };
 use crate::services::agent_protocol::RuntimeHandoffKind;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -162,7 +163,7 @@ fn classify_claude_tui_followup_submission(
     if snapshot.tmux_pane_alive
         && snapshot.prompt_draft_detected
         && transcript_turn_state == crate::services::tui_turn_state::TuiTurnState::Unknown
-        && watcher_state == "missing"
+        && matches!(watcher_state, "missing" | "cancelled")
         && inflight_state == "missing"
     {
         return None;
@@ -185,6 +186,17 @@ fn classify_claude_tui_followup_submission(
         transcript_turn_state,
         pane_tail: snapshot.pane_tail.clone(),
     })
+}
+
+#[cfg(unix)]
+fn hosted_tui_draft_should_enter_provider_recovery(
+    provider: &ProviderKind,
+    snapshot: &HostedTuiPromptReadinessSnapshot,
+) -> bool {
+    matches!(provider, ProviderKind::Codex)
+        && snapshot.tmux_pane_alive
+        && snapshot.prompt_marker_detected
+        && snapshot.prompt_draft_detected
 }
 
 #[cfg(unix)]
@@ -371,7 +383,7 @@ fn tui_busy_followup_diagnostic(
                 crate::services::codex_tui::input::prompt_readiness_snapshot(tmux_session_name);
             HostedTuiPromptReadinessSnapshot {
                 prompt_marker_detected: snapshot.composer_marker_detected,
-                prompt_draft_detected: false,
+                prompt_draft_detected: snapshot.prompt_draft_detected,
                 tmux_pane_alive: snapshot.tmux_pane_alive,
                 capture_available: snapshot.capture_available,
                 pane_tail: snapshot.pane_tail,
@@ -389,6 +401,9 @@ fn tui_busy_followup_diagnostic(
             }
         }
     };
+    if hosted_tui_draft_should_enter_provider_recovery(provider, &snapshot) {
+        return None;
+    }
     let watcher_entry = shared
         .tmux_watchers
         .iter()
@@ -5859,9 +5874,8 @@ pub(in crate::services::discord) async fn handle_text_message(
             diagnostic_json,
         );
         super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
-        let kicked =
-            release_mailbox_after_placeholder_post_failure(shared, &bot_owner_provider, channel_id)
-                .await;
+        release_mailbox_after_hosted_tui_busy_pre_submit(shared, &bot_owner_provider, channel_id)
+            .await;
         shared
             .global_active
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -5892,7 +5906,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             enqueue_outcome.merged,
             queue_depth_after_busy_enqueue,
             queued_card_rendered,
-            kicked
+            false
         );
         cancel_token
             .cancelled
@@ -7983,6 +7997,39 @@ mod session_strategy_lifecycle_tests {
             )
             .is_none(),
             "unknown transcript plus draft is a provider recovery case, not a router busy block"
+        );
+        assert!(
+            classify_claude_tui_followup_submission(
+                &snapshot,
+                "cancelled",
+                Some(1479671298497183835),
+                "missing",
+                crate::services::tui_turn_state::TuiTurnState::Unknown,
+                "AgentDesk-claude-ready",
+            )
+            .is_none(),
+            "cancelled watcher plus draft has no active relay evidence; let provider recovery handle it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_tui_visible_prompt_draft_reaches_provider_recovery() {
+        let snapshot = HostedTuiPromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            prompt_draft_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "› Run /review on my current changes\n\n  gpt-5.5 · gpt-5.5 xhigh · ~/repo · repo · main".to_string(),
+        };
+
+        assert!(hosted_tui_draft_should_enter_provider_recovery(
+            &ProviderKind::Codex,
+            &snapshot
+        ));
+        assert!(
+            !hosted_tui_draft_should_enter_provider_recovery(&ProviderKind::Claude, &snapshot),
+            "Claude keeps transcript-busy authority; only Codex compact drafts bypass router busy preflight"
         );
     }
 
@@ -10287,7 +10334,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn busy_pre_submit_requeues_active_message_before_releasing_mailbox() {
+    async fn busy_pre_submit_requeues_without_immediate_idle_kickoff() {
         use crate::services::provider::CancelToken;
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
@@ -10329,17 +10376,12 @@ mod tests {
         );
 
         let backlog_before = shared.deferred_hook_backlog.load(Ordering::Relaxed);
-        let kicked =
-            release_mailbox_after_placeholder_post_failure(&shared, &provider, channel_id).await;
+        release_mailbox_after_hosted_tui_busy_pre_submit(&shared, &provider, channel_id).await;
 
-        assert!(
-            kicked,
-            "releasing the busy active slot must schedule the queued retry"
-        );
         assert_eq!(
             shared.deferred_hook_backlog.load(Ordering::Relaxed),
-            backlog_before + 1,
-            "queued retry must arm the deferred idle drain"
+            backlog_before,
+            "hosted TUI busy pre-submit must not immediately re-kick the same queued retry"
         );
 
         let snapshot = shared.mailbox(channel_id).snapshot().await;

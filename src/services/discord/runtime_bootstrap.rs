@@ -1340,6 +1340,10 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         commands::cmd_help(),
         commands::cmd_meeting(),
         commands::cmd_restart(),
+        commands::cmd_deadlock_recover(),
+        commands::cmd_machine_flip(),
+        commands::cmd_stuck_pr_rebase(),
+        commands::cmd_adk_phase(),
     ]);
 
     let framework = poise::Framework::builder()
@@ -2109,7 +2113,11 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         })
     });
 
-    // Graceful shutdown: on SIGTERM, cancel all tmux watchers before dying
+    // Graceful shutdown: on SIGTERM, persist queue/inflight/last_message state
+    // and quick-exit. tmux/TUI processes survive — the next dcserver instance
+    // rehydrates the channel bindings (see rehydrate_existing_claude_tui_bindings;
+    // polled every CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL ≈ 5s) and resumes transcript
+    // tailing from the persisted last_offset.
     let shared_for_signal = shared.clone();
     tokio::spawn(async move {
         #[cfg(unix)]
@@ -2130,18 +2138,6 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 shared_for_signal
                     .restart_pending
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-
-                // Cancel all active tmux watchers (quiet exit, no "session ended" messages)
-                for entry in shared_for_signal.tmux_watchers.iter() {
-                    entry
-                        .value()
-                        .cancel
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-
-                // Grace period for watchers to see cancel flag and exit cleanly.
-                // Active turns may also finish during this window.
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
                 // ── Critical state persistence (MUST run before any I/O) ──
                 // Save pending queues and last_message_ids FIRST, before any

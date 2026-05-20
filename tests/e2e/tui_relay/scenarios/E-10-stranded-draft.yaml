@@ -1,0 +1,21 @@
+id: E-10
+title: composer에 send-keys (Enter 없이) → restart → 일관된 draft 처리 (#2635)
+channel: both
+isolation: required
+destructive: true
+steps:
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E10:WARMUP] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E10:WARMUP]"
+    timeout_s: 240
+  - wait_idle_s: 3
+  - send_keys_no_enter: "stranded-draft-text (E-10)"
+  - wait_idle_s: 2
+  - restart_dcserver:
+      target: dev
+  - wait_idle_s: 15
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E10:POST] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E10:POST]"
+    timeout_s: 240
+assertions:
+  - no_duplicate_content: true
+  - text_present: "[E2E:E10:POST]"
