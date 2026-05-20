@@ -22,3 +22,6 @@
 - Queue hygiene invariant:
 - Related PRs/issues checked:
 - Why this is non-overlapping:
+- Verification commands and results:
+- Skipped checks and reasons:
+- Risk and rollback notes:
