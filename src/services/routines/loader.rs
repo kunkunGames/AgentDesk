@@ -36,6 +36,7 @@ pub type RoutineScriptStore = Arc<Mutex<HashMap<String, LoadedRoutineScript>>>;
 pub struct RoutineTickContext {
     pub routine: RoutineTickRoutine,
     pub run: RoutineTickRun,
+    pub agent: Option<RoutineTickAgent>,
     pub checkpoint: Option<Value>,
     pub now: chrono::DateTime<chrono::Utc>,
 }
@@ -54,6 +55,15 @@ pub struct RoutineTickRoutine {
 pub struct RoutineTickRun {
     pub id: String,
     pub lease_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RoutineTickAgent {
+    pub id: String,
+    pub status: String,
+    pub is_idle: bool,
+    pub current_task_id: Option<String>,
+    pub current_thread_channel_id: Option<String>,
 }
 
 /// Isolated QuickJS loader for `agentdesk.routines.register({ name, tick })`.
@@ -643,6 +653,7 @@ mod tests {
                         id: "run-1".to_string(),
                         lease_expires_at: chrono::Utc::now(),
                     },
+                    agent: None,
                     checkpoint: None,
                     now: chrono::Utc::now(),
                 },
@@ -662,6 +673,96 @@ mod tests {
                 );
             }
             other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exposes_tick_agent_idle_state_to_js() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-idle.js");
+        std::fs::write(
+            &path,
+            r#"
+            agentdesk.routines.register({
+              name: "Agent Idle",
+              tick(ctx) {
+                if (!ctx.agent.is_idle) {
+                  return {
+                    action: "skip",
+                    reason: "agent not idle",
+                    result: { isIdle: ctx.agent.is_idle },
+                    lastResult: "skipped"
+                  };
+                }
+
+                return {
+                  action: "complete",
+                  result: { isIdle: ctx.agent.is_idle },
+                  lastResult: "idle"
+                };
+              }
+            });
+            "#,
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        loader.load_script(dir.path(), &path).unwrap();
+
+        let context_for = |is_idle: bool| RoutineTickContext {
+            routine: RoutineTickRoutine {
+                id: "routine-1".to_string(),
+                agent_id: Some("monitoring".to_string()),
+                script_ref: "agent-idle.js".to_string(),
+                name: "Agent Idle".to_string(),
+                execution_strategy: "fresh".to_string(),
+                fresh_context_guaranteed: false,
+            },
+            run: RoutineTickRun {
+                id: "run-1".to_string(),
+                lease_expires_at: chrono::Utc::now(),
+            },
+            agent: Some(RoutineTickAgent {
+                id: "monitoring".to_string(),
+                status: if is_idle { "idle" } else { "working" }.to_string(),
+                is_idle,
+                current_task_id: None,
+                current_thread_channel_id: None,
+            }),
+            checkpoint: None,
+            now: chrono::Utc::now(),
+        };
+
+        let idle_action = loader
+            .execute_tick("agent-idle.js", context_for(true))
+            .unwrap();
+        match idle_action {
+            crate::services::routines::RoutineAction::Complete {
+                result_json,
+                last_result,
+                ..
+            } => {
+                assert_eq!(last_result.as_deref(), Some("idle"));
+                assert_eq!(result_json.unwrap(), serde_json::json!({"isIdle": true}));
+            }
+            other => panic!("unexpected idle action: {other:?}"),
+        }
+
+        let working_action = loader
+            .execute_tick("agent-idle.js", context_for(false))
+            .unwrap();
+        match working_action {
+            crate::services::routines::RoutineAction::Skip {
+                reason,
+                result_json,
+                last_result,
+                ..
+            } => {
+                assert_eq!(reason.as_deref(), Some("agent not idle"));
+                assert_eq!(last_result.as_deref(), Some("skipped"));
+                assert_eq!(result_json.unwrap(), serde_json::json!({"isIdle": false}));
+            }
+            other => panic!("unexpected working action: {other:?}"),
         }
     }
 
@@ -702,6 +803,7 @@ mod tests {
                         id: "run-1".to_string(),
                         lease_expires_at: chrono::Utc::now(),
                     },
+                    agent: None,
                     checkpoint: None,
                     now: chrono::Utc::now(),
                 },
@@ -741,6 +843,7 @@ mod tests {
                 id: "run-1".to_string(),
                 lease_expires_at: chrono::Utc::now(),
             },
+            agent: None,
             checkpoint: None,
             now: chrono::Utc::now(),
         };

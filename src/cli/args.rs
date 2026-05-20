@@ -585,6 +585,8 @@ pub(crate) enum ConfigAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Sync runtime MCP servers into provider config files
+    SyncMcp,
 }
 
 #[derive(Clone, ValueEnum)]
