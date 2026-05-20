@@ -142,7 +142,6 @@
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1525 lines).
   - `src/services/discord/formatting.rs` (3247 lines).
   - `src/services/discord/settings.rs` (2445 lines).
-  - `src/services/discord/prompt_builder.rs` (2114 lines).
   - `src/services/discord/runtime_bootstrap.rs` (3235 lines after #2558
     thread-session GC loopback shim cleanup).
   - `src/services/discord/session_runtime.rs` (1887 lines).
@@ -158,7 +157,7 @@
   - `src/voice/stt.rs` (1183 lines after #2158 streaming STT wiring; whisper
     CLI STT runtime plus streaming session adapter surface, split before adding
     non-bugfix behavior).
-  - `src/services/discord/commands/config.rs` (1877 lines).
+  - `src/services/discord/commands/config.rs` (1900 lines).
   - `src/services/discord/commands/inspect.rs` (1058 lines, post-#1701
     context-view manifest binding pushed it past the giant-file threshold).
   - `src/services/discord/{commands/text_commands.rs, commands/diagnostics.rs,
@@ -186,7 +185,7 @@
 ### `dashboard_routes`
 
 - canonical_modules: `src/server/routes/*.rs` (per-domain route module).
-  `src/server/routes/auto_queue.rs` (151 lines) is now an HTTP-only facade;
+  `src/server/routes/auto_queue.rs` (182 lines) is now an HTTP-only facade;
   its query/command/view/FSM behavior lives under
   `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
   smaller route-delegation slices.
@@ -200,16 +199,16 @@
 - legacy_modules: none, but several routes still call `legacy_db()` against
   the SQLite compat handle (see `known-legacy.md`).
 - do_not_edit_without_migration_plan (giant-file routes):
-  - `src/server/routes/dispatches/discord_delivery.rs` (5564 lines).
-  - `src/server/routes/dispatches/crud.rs` (1009 lines).
-  - `src/server/routes/kanban.rs` (4426 lines).
-  - `src/server/routes/dispatched_sessions.rs` (4002 lines).
-  - `src/server/routes/onboarding.rs` (5271 lines).
-  - `src/server/routes/docs.rs` (4632 lines).
-  - `src/server/routes/dispatches/outbox.rs` (3294 lines).
-  - `src/server/routes/escalation.rs` (2110 lines).
-  - `src/server/routes/meetings.rs` (2158 lines).
-  - `src/server/routes/review_verdict/decision_route.rs` (1865 lines).
+  - `src/server/routes/dispatches/discord_delivery.rs` (23 lines).
+  - `src/server/routes/dispatches/crud.rs` (1070 lines).
+  - `src/server/routes/kanban.rs` (3311 lines).
+  - `src/server/routes/dispatched_sessions.rs` (123 lines).
+  - `src/server/routes/onboarding.rs` (58 lines).
+  - `src/server/routes/docs.rs` (6227 lines).
+  - `src/server/routes/dispatches/outbox.rs` (43 lines).
+  - `src/server/routes/escalation.rs` (2391 lines).
+  - `src/server/routes/meetings.rs` (2178 lines).
+  - `src/server/routes/review_verdict/decision_route.rs` (4681 lines).
   - `src/server/routes/{agents,agents_crud,agents_setup,analytics,v1,
     settings,resume,pipeline,reviews,dispatches/thread_reuse,
     dispatches/crud}.rs` (all 1000+ lines).
@@ -236,8 +235,8 @@
 - legacy_modules: none.
 - do_not_edit_without_migration_plan (giant-file):
   - `src/cli/migrate.rs` (348 lines, retired postgres-cutover facade).
-  - `src/cli/args.rs` (1002 lines).
-  - `src/cli/doctor/orchestrator.rs` (4324 lines).
+  - `src/cli/args.rs` (1043 lines).
+  - `src/cli/doctor/orchestrator.rs` (5040 lines).
   - `src/cli/migrate/apply.rs` (3147 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1600), client.rs (1583), direct.rs (1535),
@@ -357,7 +356,7 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/dispatches/outbox_route.rs` (1074) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
-- `src/services/claude.rs` (2477), `src/services/gemini.rs` (2565),
+- `src/services/claude.rs` (4451), `src/services/gemini.rs` (2565),
   `src/services/qwen.rs` (2466), `src/services/codex.rs` (1665),
   `src/services/opencode.rs` (2133), `src/services/provider.rs` (2177) —
   provider adapters.
