@@ -15,6 +15,13 @@ pub(super) fn content_has_explicit_user_mention(content: &str, user_id: serenity
     content.contains(&format!("<@{raw_id}>")) || content.contains(&format!("<@!{raw_id}>"))
 }
 
+pub(super) fn should_skip_self_authored_turn_message(
+    author_id: serenity::UserId,
+    current_bot_id: serenity::UserId,
+) -> bool {
+    author_id == current_bot_id
+}
+
 pub(super) fn should_skip_for_missing_required_mention(
     settings: &DiscordBotSettings,
     effective_channel_id: serenity::ChannelId,
@@ -1286,6 +1293,17 @@ pub(in crate::services::discord) async fn handle_event(
                 return Ok(());
             }
 
+            let current_bot_id = ctx.cache.current_user().id;
+            if should_skip_self_authored_turn_message(new_message.author.id, current_bot_id) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] ⏭ SELF-AUTHORED: skipping message {} in channel {} authored by current bot",
+                    new_message.id,
+                    new_message.channel_id
+                );
+                return Ok(());
+            }
+
             let announce_bot_id = super::super::resolve_announce_bot_user_id(&data.shared).await;
 
             // Ignore bot messages, unless they are allowed bot traffic or the
@@ -1324,11 +1342,10 @@ pub(in crate::services::discord) async fn handle_event(
             // filtering on those would silently drop legitimate replies to
             // announce/notify/codex bot messages.
             if !new_message.mentions.is_empty() {
-                let bot_id = ctx.cache.current_user().id;
                 let mentions_other_humans = new_message
                     .mentions
                     .iter()
-                    .any(|u| u.id != bot_id && !u.bot);
+                    .any(|u| u.id != current_bot_id && !u.bot);
                 if mentions_other_humans {
                     return Ok(());
                 }

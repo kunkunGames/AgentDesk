@@ -4,6 +4,7 @@ use super::intake_gate::{
     RemovedControlReaction, bot_author_allowed_for_live_intake, classify_removed_control_reaction,
     content_has_explicit_user_mention, is_model_picker_component_custom_id,
     should_process_turn_message, should_skip_for_missing_required_mention,
+    should_skip_self_authored_turn_message,
 };
 use super::message_handler::{
     TextStopLookup, TurnKind, classify_turn_kind_from_author, lookup_text_stop_token,
@@ -123,6 +124,29 @@ fn live_intake_precontent_bot_filter_allows_announce_handoffs() {
         !bot_author_allowed_for_live_intake(&allowed_bot_ids, Some(456), 789),
         "unregistered bot traffic must still be dropped before content processing"
     );
+}
+
+#[test]
+fn self_authored_announce_bot_messages_are_skipped_before_handoff_allowance() {
+    let current_bot_id = UserId::new(456);
+    let allowed_bot_ids = vec![123];
+
+    assert!(bot_author_allowed_for_live_intake(
+        &allowed_bot_ids,
+        Some(current_bot_id.get()),
+        current_bot_id.get(),
+    ));
+    assert!(crate::services::discord::is_allowed_turn_sender(
+        &allowed_bot_ids,
+        Some(current_bot_id.get()),
+        current_bot_id.get(),
+        true,
+        "No response requested.",
+    ));
+    assert!(should_skip_self_authored_turn_message(
+        current_bot_id,
+        current_bot_id
+    ));
 }
 
 #[test]
