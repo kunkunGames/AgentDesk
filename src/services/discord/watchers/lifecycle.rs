@@ -851,6 +851,10 @@ pub(super) fn should_suppress_streaming_placeholder_after_recent_stop(
     has_assistant_response && inflight_missing && recent_turn_stop
 }
 
+pub(super) fn should_skip_streaming_placeholder_without_inflight(inflight_missing: bool) -> bool {
+    inflight_missing
+}
+
 pub(super) fn should_suppress_post_terminal_output_without_inflight(
     terminal_success_seen: bool,
     inflight_missing: bool,
@@ -860,7 +864,10 @@ pub(super) fn should_suppress_post_terminal_output_without_inflight(
 
 #[cfg(test)]
 mod post_terminal_output_tests {
-    use super::should_suppress_post_terminal_output_without_inflight;
+    use super::{
+        should_skip_streaming_placeholder_without_inflight,
+        should_suppress_post_terminal_output_without_inflight,
+    };
 
     #[test]
     fn post_terminal_output_without_inflight_is_suppressed() {
@@ -875,6 +882,12 @@ mod post_terminal_output_tests {
             !should_suppress_post_terminal_output_without_inflight(true, false),
             "a newly active inflight owns subsequent output"
         );
+    }
+
+    #[test]
+    fn streaming_placeholder_without_inflight_is_skipped() {
+        assert!(should_skip_streaming_placeholder_without_inflight(true));
+        assert!(!should_skip_streaming_placeholder_without_inflight(false));
     }
 }
 

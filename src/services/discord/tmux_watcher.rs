@@ -1913,6 +1913,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let mut ready_for_input_failure_notice: Option<String> = None;
             let mut ready_for_input_stall_dispatch_id: Option<String> = None;
             let mut streaming_suppressed_by_recent_stop = false;
+            let mut streaming_suppressed_by_missing_inflight = false;
 
             while !found_result && turn_start.elapsed() < turn_timeout {
                 // The inner loop can wait for minutes while a long tool/test
@@ -2297,6 +2298,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             channel_id.get(),
                         )
                         .is_none();
+                    if should_skip_streaming_placeholder_without_inflight(
+                        inflight_missing_for_streaming,
+                    ) {
+                        if !streaming_suppressed_by_missing_inflight {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] 🛑 watcher: suppressed streaming placeholder edit for channel {} because inflight state is missing (tmux={}, range {}..{})",
+                                channel_id.get(),
+                                tmux_session_name,
+                                data_start_offset,
+                                current_offset
+                            );
+                            streaming_suppressed_by_missing_inflight = true;
+                        }
+                        continue;
+                    }
                     if should_suppress_streaming_placeholder_after_recent_stop(
                         has_assistant_response_for_streaming,
                         inflight_missing_for_streaming,

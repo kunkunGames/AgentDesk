@@ -2335,6 +2335,14 @@ fn live_watcher_registered_for_relay(shared: &SharedData, owner_channel_id: Chan
         .is_some_and(|watcher| !watcher.cancel.load(Ordering::Relaxed))
 }
 
+fn bridge_should_reclaim_relay_from_missing_watcher(
+    watcher_owns_assistant_relay: bool,
+    standby_relay_owns_output: bool,
+    live_watcher_registered: bool,
+) -> bool {
+    watcher_owns_assistant_relay && !standby_relay_owns_output && !live_watcher_registered
+}
+
 fn advance_tmux_relay_confirmed_end(
     shared: &SharedData,
     channel_id: ChannelId,
@@ -5278,6 +5286,22 @@ pub(super) fn spawn_turn_bridge(
                 ) {
                     state_dirty = true;
                 }
+            }
+
+            if bridge_should_reclaim_relay_from_missing_watcher(
+                watcher_owns_assistant_relay,
+                standby_relay_owns_output,
+                live_watcher_registered_for_relay(shared_owned.as_ref(), watcher_owner_channel_id),
+            ) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ turn_bridge reclaiming assistant relay for channel {} after watcher disappeared",
+                    channel_id.get()
+                );
+                watcher_owns_assistant_relay = false;
+                watcher_relay_available_for_turn = false;
+                inflight_state.set_relay_owner_kind(super::inflight::RelayOwnerKind::None);
+                state_dirty = true;
             }
 
             if state_dirty
