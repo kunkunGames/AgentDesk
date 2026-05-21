@@ -97,6 +97,15 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: "database is unavailable".to_string(),
             next_step: "check Postgres/SQLite availability and server logs".to_string(),
         },
+        ["no_providers_registered"] => ClassifiedReason {
+            raw: raw.to_string(),
+            subsystem: "provider_runtime",
+            severity: Severity::Warning,
+            fix_safety: FixSafety::ReadOnly,
+            security_exposure: SecurityExposure::OperationalMetadata,
+            summary: "no providers are registered".to_string(),
+            next_step: "register a provider in agentdesk.yaml or via API".to_string(),
+        },
         _ => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "health",
