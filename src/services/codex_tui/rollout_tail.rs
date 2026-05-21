@@ -1434,6 +1434,7 @@ fn response_message_items(payload: &Value, state: &mut RolloutParseState) -> Vec
     let Some(content) = payload.get("content").and_then(Value::as_array) else {
         return Vec::new();
     };
+    let commentary_phase = payload.get("phase").and_then(Value::as_str) == Some("commentary");
     content
         .iter()
         .filter_map(|item| {
@@ -1445,11 +1446,15 @@ fn response_message_items(payload: &Value, state: &mut RolloutParseState) -> Vec
             if text.is_empty() {
                 return None;
             }
-            state.saw_assistant_text = true;
-            if !state.final_text.is_empty() {
-                state.final_text.push_str("\n\n");
+            if !commentary_phase {
+                state.saw_assistant_text = true;
+                if !state.final_text.is_empty() {
+                    state.final_text.push_str("\n\n");
+                }
+                state.final_text.push_str(&text);
+            } else {
+                state.lifecycle_activity = true;
             }
-            state.final_text.push_str(&text);
             Some(StreamMessage::Text { content: text })
         })
         .collect()
@@ -2797,6 +2802,86 @@ mod tests {
         drop(tx);
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         (rx.iter().collect(), elapsed)
+    }
+
+    #[test]
+    fn commentary_phase_does_not_finalize_before_final_answer() {
+        // Codex TUI can emit an intermediate assistant message with
+        // `phase=commentary` long before the final answer. The EOF drain
+        // must not treat that progress update as the final Done payload.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"commentary-final","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working first"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let path = file.path().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            tail_rollout_file_until_assistant_response(
+                &path,
+                0,
+                None,
+                &tx,
+                None,
+                || true,
+                Duration::from_millis(100),
+                Some(Duration::from_secs(5)),
+                None,
+                true,
+                None,
+                true,
+                None,
+                None,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(350));
+        let early_messages = rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            early_messages
+                .iter()
+                .any(|message| matches!(message, StreamMessage::Text { content } if content == "working first")),
+            "commentary text should still stream: {:?}",
+            early_messages
+        );
+        assert!(
+            early_messages
+                .iter()
+                .all(|message| !matches!(message, StreamMessage::Done { .. })),
+            "commentary must not finalize the turn: {:?}",
+            early_messages
+        );
+
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(file.path())
+            .unwrap();
+        writer
+            .write_all(
+                br#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"final answer"}]}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"final answer"}}
+"#,
+            )
+            .unwrap();
+        drop(writer);
+
+        let (result, _outcome) = handle.join().unwrap().unwrap();
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        let remaining = rx.iter().collect::<Vec<_>>();
+        assert!(
+            matches!(
+                remaining.last(),
+                Some(StreamMessage::Done { result, .. }) if result == "final answer"
+            ),
+            "final Done should use final_answer text, got {:?}",
+            remaining
+        );
     }
 
     #[test]

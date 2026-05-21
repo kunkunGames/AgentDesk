@@ -1807,10 +1807,21 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     if panel_text == *last_status_panel_text {
         return;
     }
-    match gateway
-        .edit_message(channel_id, status_msg_id, &panel_text)
-        .await
-    {
+    let edit_result = if gateway.can_chain_locally() {
+        gateway
+            .edit_message(channel_id, status_msg_id, &panel_text)
+            .await
+    } else if let Some(http) = shared.serenity_http_or_token_fallback() {
+        super::http::edit_channel_message(&http, channel_id, status_msg_id, &panel_text)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        gateway
+            .edit_message(channel_id, status_msg_id, &panel_text)
+            .await
+    };
+    match edit_result {
         Ok(()) => {
             *last_status_panel_text = panel_text;
         }
@@ -1823,6 +1834,86 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
                 error
             );
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadlessPlaceholderCleanupAction {
+    Delete,
+    Edit(String),
+    Skip,
+}
+
+fn is_synthetic_headless_message_id(message_id: MessageId) -> bool {
+    message_id.get() >= 8_000_000_000_000_000_000
+}
+
+fn headless_streaming_placeholder_cleanup_action(
+    last_edit_text: &str,
+    provider: &ProviderKind,
+    status_panel_v2_enabled: bool,
+) -> HeadlessPlaceholderCleanupAction {
+    let cleaned = if status_panel_v2_enabled {
+        super::formatting::format_for_discord_with_status_panel(last_edit_text, provider)
+    } else {
+        super::formatting::format_for_discord_with_provider(last_edit_text, provider)
+    };
+    if cleaned.trim().is_empty() {
+        HeadlessPlaceholderCleanupAction::Delete
+    } else if cleaned == last_edit_text {
+        HeadlessPlaceholderCleanupAction::Skip
+    } else {
+        HeadlessPlaceholderCleanupAction::Edit(cleaned)
+    }
+}
+
+async fn cleanup_headless_streaming_placeholder_after_delivery(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    current_msg_id: MessageId,
+    status_panel_msg_id: Option<MessageId>,
+    last_edit_text: &str,
+    provider: &ProviderKind,
+) {
+    if current_msg_id.get() == 0
+        || status_panel_msg_id == Some(current_msg_id)
+        || is_synthetic_headless_message_id(current_msg_id)
+    {
+        return;
+    }
+    let Some(http) = shared.serenity_http_or_token_fallback() else {
+        return;
+    };
+    match headless_streaming_placeholder_cleanup_action(
+        last_edit_text,
+        provider,
+        shared.status_panel_v2_enabled,
+    ) {
+        HeadlessPlaceholderCleanupAction::Delete => {
+            if let Err(error) =
+                super::http::delete_channel_message(&http, channel_id, current_msg_id).await
+            {
+                tracing::warn!(
+                    "[turn_bridge] failed to delete stale headless streaming placeholder {} in channel {}: {}",
+                    current_msg_id,
+                    channel_id,
+                    error
+                );
+            }
+        }
+        HeadlessPlaceholderCleanupAction::Edit(cleaned) => {
+            if let Err(error) =
+                super::http::edit_channel_message(&http, channel_id, current_msg_id, &cleaned).await
+            {
+                tracing::warn!(
+                    "[turn_bridge] failed to clean stale headless streaming placeholder {} in channel {}: {}",
+                    current_msg_id,
+                    channel_id,
+                    error
+                );
+            }
+        }
+        HeadlessPlaceholderCleanupAction::Skip => {}
     }
 }
 
@@ -2091,8 +2182,16 @@ fn build_turn_bridge_streaming_edit_text(
     status_block: &str,
     provider: &ProviderKind,
 ) -> String {
-    if status_panel_v2_enabled && !current_portion.is_empty() {
-        super::formatting::format_for_discord_with_status_panel(current_portion, provider)
+    if status_panel_v2_enabled {
+        let formatted;
+        let current = if current_portion.is_empty() {
+            ""
+        } else {
+            formatted =
+                super::formatting::format_for_discord_with_status_panel(current_portion, provider);
+            formatted.as_str()
+        };
+        super::formatting::build_streaming_placeholder_text(current, status_block)
     } else {
         super::formatting::build_streaming_placeholder_text(current_portion, status_block)
     }
@@ -2103,7 +2202,7 @@ mod streaming_edit_text_tests {
     use super::*;
 
     #[test]
-    fn status_panel_v2_streaming_edit_omits_processing_footer_once_text_exists() {
+    fn status_panel_v2_streaming_edit_keeps_processing_footer_while_text_streams() {
         let rendered = build_turn_bridge_streaming_edit_text(
             true,
             "E2E-CODEX-1-OK\n- Working on the backend now",
@@ -2111,8 +2210,10 @@ mod streaming_edit_text_tests {
             &ProviderKind::Codex,
         );
 
-        assert_eq!(rendered, "E2E-CODEX-1-OK\n- Working on the backend now");
-        assert!(!rendered.contains("Processing"));
+        assert_eq!(
+            rendered,
+            "E2E-CODEX-1-OK\n- Working on the backend now\n\n⠙ Processing..."
+        );
     }
 
     #[test]
@@ -2137,6 +2238,31 @@ mod streaming_edit_text_tests {
         );
 
         assert_eq!(rendered, "⠙ Processing...");
+    }
+
+    #[test]
+    fn headless_cleanup_deletes_status_only_codex_placeholder() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "[Bash] /bin/zsh -lc 'cargo test'\n⠙ Processing...",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(action, HeadlessPlaceholderCleanupAction::Delete);
+    }
+
+    #[test]
+    fn headless_cleanup_edits_partial_answer_without_processing_footer() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "partial answer\n\n⠙ Processing...",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(
+            action,
+            HeadlessPlaceholderCleanupAction::Edit("partial answer".to_string())
+        );
     }
 }
 
@@ -6415,6 +6541,15 @@ pub(super) fn spawn_turn_bridge(
                     .await
                     {
                         Ok(()) => {
+                            cleanup_headless_streaming_placeholder_after_delivery(
+                                shared_owned.as_ref(),
+                                channel_id,
+                                current_msg_id,
+                                status_panel_msg_id,
+                                &last_edit_text,
+                                &provider,
+                            )
+                            .await;
                             terminal_delivery_committed = true;
                         }
                         Err(error) => {
