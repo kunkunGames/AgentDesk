@@ -11,6 +11,11 @@
 - [ ] 에이전트 아바타는 sprite 컴포넌트(`AgentAvatar`)로 표시한다. inline `${emoji} ${name}` 문자열 패턴은 sprite 또는 name-only로 대체한다 (#1251 / #1254).
 - [ ] 추가 또는 변경한 위젯이 mobile/desktop 모두에서 깨지지 않는다.
 
+## Queue Hygiene Checklist
+- [ ] **Duplicate PR check:** Verified no overlapping open PRs exist (especially for generated inventory refreshes).
+- [ ] **Clean diff:** PR only includes relevant files with no broad stale branch baggage or scratch files.
+- [ ] **No-change verification:** If this claims to be a "no-change" overlap report, I have confirmed it contains exactly zero changed files and lists the overlapping PR numbers/branches below.
+
 ## Closes
 <!-- e.g. Closes #1234 -->
 
