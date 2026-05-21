@@ -1848,16 +1848,102 @@ fn is_synthetic_headless_message_id(message_id: MessageId) -> bool {
     message_id.get() >= 8_000_000_000_000_000_000
 }
 
+fn is_codex_tool_log_marker_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some((name, _)) = rest.split_once(']') else {
+        return false;
+    };
+    const CODEX_TOOL_MARKER_NAMES: &[&str] = &[
+        "bash",
+        "read",
+        "edit",
+        "multiedit",
+        "grep",
+        "glob",
+        "ls",
+        "task",
+        "todowrite",
+        "webfetch",
+        "websearch",
+        "applypatch",
+        "notebookread",
+        "notebookedit",
+    ];
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized.starts_with("mcp__")
+        || CODEX_TOOL_MARKER_NAMES
+            .iter()
+            .any(|candidate| *candidate == normalized)
+}
+
+fn strip_headless_placeholder_artifacts(text: &str, provider: &ProviderKind) -> String {
+    let strip_codex_tool_logs = matches!(provider, ProviderKind::Codex);
+    let mut kept = Vec::new();
+    let mut pending_fence: Option<Vec<&str>> = None;
+
+    for line in text.lines() {
+        if let Some(fence) = pending_fence.as_mut() {
+            fence.push(line);
+            if line.trim_start().starts_with("```") {
+                let inner = &fence[1..fence.len().saturating_sub(1)];
+                let tool_log_only = strip_codex_tool_logs
+                    && inner
+                        .iter()
+                        .filter(|inner_line| !inner_line.trim().is_empty())
+                        .all(|inner_line| is_codex_tool_log_marker_line(inner_line));
+                if !tool_log_only {
+                    kept.extend(fence.iter().copied());
+                }
+                pending_fence = None;
+            }
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if super::formatting::is_streaming_placeholder_status_line(trimmed) {
+            continue;
+        }
+        if strip_codex_tool_logs && is_codex_tool_log_marker_line(line) {
+            continue;
+        }
+        if line.trim_start().starts_with("```") {
+            pending_fence = Some(vec![line]);
+            continue;
+        }
+        kept.push(line);
+    }
+
+    if let Some(fence) = pending_fence {
+        let inner = &fence[1..];
+        let tool_log_only = strip_codex_tool_logs
+            && inner
+                .iter()
+                .filter(|inner_line| !inner_line.trim().is_empty())
+                .all(|inner_line| is_codex_tool_log_marker_line(inner_line));
+        if !tool_log_only {
+            kept.extend(fence);
+        }
+    }
+
+    kept.join("\n").trim().to_string()
+}
+
 fn headless_streaming_placeholder_cleanup_action(
     last_edit_text: &str,
     provider: &ProviderKind,
     status_panel_v2_enabled: bool,
 ) -> HeadlessPlaceholderCleanupAction {
-    let cleaned = if status_panel_v2_enabled {
+    let mut cleaned = if status_panel_v2_enabled {
         super::formatting::format_for_discord_with_status_panel(last_edit_text, provider)
     } else {
         super::formatting::format_for_discord_with_provider(last_edit_text, provider)
     };
+    if status_panel_v2_enabled {
+        cleaned = strip_headless_placeholder_artifacts(&cleaned, provider);
+    }
     if cleaned.trim().is_empty() {
         HeadlessPlaceholderCleanupAction::Delete
     } else if cleaned == last_edit_text {
@@ -2244,6 +2330,17 @@ mod streaming_edit_text_tests {
     fn headless_cleanup_deletes_status_only_codex_placeholder() {
         let action = headless_streaming_placeholder_cleanup_action(
             "[Bash] /bin/zsh -lc 'cargo test'\n⠙ Processing...",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(action, HeadlessPlaceholderCleanupAction::Delete);
+    }
+
+    #[test]
+    fn headless_cleanup_deletes_processing_with_codex_tool_log_block() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "⠂ Processing...\n\n```\n[Bash] /bin/zsh -lc 'grep -n foo src/lib.rs'\n[Bash] /bin/zsh -lc \"sed -n '1,40p' src/lib.rs\"\n```",
             &ProviderKind::Codex,
             true,
         );
