@@ -352,10 +352,25 @@ pub fn prompt_readiness_snapshot(session_name: &str) -> PromptReadinessSnapshot 
         session_name,
         PROMPT_READY_CAPTURE_SCROLLBACK,
     );
-    let composer_marker_detected = pane
+    // Preserve ANSI attributes for Codex compact-mode prompts. Codex renders
+    // canned prompt suggestions in dim text, while user drafts are normal
+    // text. Plain capture loses that distinction and can make an idle compact
+    // prompt look like a still-running turn.
+    let pane_with_escapes = crate::services::platform::tmux::capture_pane_with_escapes(
+        session_name,
+        PROMPT_READY_CAPTURE_SCROLLBACK,
+    );
+    let composer_marker_detected = pane_with_escapes
         .as_deref()
-        .is_some_and(pane_looks_ready_for_codex_prompt);
-    let prompt_draft_detected = pane.as_deref().is_some_and(pane_has_codex_prompt_draft);
+        .is_some_and(pane_looks_ready_for_codex_prompt_with_ansi)
+        || pane
+            .as_deref()
+            .is_some_and(pane_looks_ready_for_codex_prompt);
+    let dim_placeholder_detected = pane_with_escapes
+        .as_deref()
+        .is_some_and(pane_has_dim_legacy_codex_prompt_in_pane);
+    let prompt_draft_detected =
+        !dim_placeholder_detected && pane.as_deref().is_some_and(pane_has_codex_prompt_draft);
     let pane_tail = pane
         .as_deref()
         .map(prompt_ready_debug_tail)
@@ -1074,6 +1089,27 @@ pub(crate) fn pane_looks_ready_for_codex_prompt(pane: &str) -> bool {
     e - f <= COMPOSER_FOOTER_ADJACENCY_LINES
 }
 
+fn pane_looks_ready_for_codex_prompt_with_ansi(pane: &str) -> bool {
+    // ANSI-preserving tmux capture lets us distinguish Codex's dim placeholder
+    // suggestions from real user drafts in the compact prompt.
+    if pane_has_dim_legacy_codex_prompt_in_pane(pane) {
+        return true;
+    }
+    let plain = strip_ansi_escape_sequences(pane);
+    pane_looks_ready_for_codex_prompt(&plain)
+}
+
+fn pane_has_dim_legacy_codex_prompt_in_pane(pane: &str) -> bool {
+    let recent: Vec<&str> = pane
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(PROMPT_READY_SCAN_LINES)
+        .collect();
+    pane_has_dim_legacy_codex_prompt(&recent)
+}
+
 fn pane_has_legacy_codex_prompt(recent_bottom_up: &[&str]) -> bool {
     const LEGACY_PROMPT_BOTTOM_WINDOW: usize = 4;
     const LEGACY_STATUS_BOTTOM_WINDOW: usize = 3;
@@ -1096,6 +1132,25 @@ fn pane_has_legacy_codex_prompt(recent_bottom_up: &[&str]) -> bool {
     status_idx < prompt_idx
 }
 
+fn pane_has_dim_legacy_codex_prompt(recent_bottom_up: &[&str]) -> bool {
+    const LEGACY_PROMPT_BOTTOM_WINDOW: usize = 4;
+    const LEGACY_STATUS_BOTTOM_WINDOW: usize = 3;
+
+    let prompt_idx = recent_bottom_up
+        .iter()
+        .take(LEGACY_PROMPT_BOTTOM_WINDOW)
+        .position(|line| line_is_dim_legacy_codex_prompt(line));
+    let status_idx = recent_bottom_up
+        .iter()
+        .take(LEGACY_STATUS_BOTTOM_WINDOW)
+        .position(|line| line_is_codex_status_with_ansi(line));
+    let (Some(prompt_idx), Some(status_idx)) = (prompt_idx, status_idx) else {
+        return false;
+    };
+
+    status_idx < prompt_idx
+}
+
 fn line_is_legacy_codex_prompt(line: &str) -> bool {
     let trimmed = line.trim();
     let Some(rest) = trimmed.strip_prefix('›') else {
@@ -1105,12 +1160,81 @@ fn line_is_legacy_codex_prompt(line: &str) -> bool {
     rest.is_empty() || CODEX_COMPACT_PLACEHOLDER_PROMPTS.contains(&rest)
 }
 
-const CODEX_COMPACT_PLACEHOLDER_PROMPTS: &[&str] =
-    &["Explain this codebase", "Summarize recent commits"];
+fn line_is_dim_legacy_codex_prompt(line: &str) -> bool {
+    let plain = strip_ansi_escape_sequences(line);
+    let trimmed = plain.trim();
+    let Some(rest) = trimmed.strip_prefix('›') else {
+        return false;
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return true;
+    }
+    line.find('›')
+        .map(|idx| contains_dim_sgr(&line[idx + '›'.len_utf8()..]))
+        .unwrap_or(false)
+}
+
+const CODEX_COMPACT_PLACEHOLDER_PROMPTS: &[&str] = &[
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Write tests for @filename",
+];
 
 fn line_is_legacy_codex_status(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.contains("gpt-") && trimmed.contains('·')
+}
+
+fn line_is_codex_status_with_ansi(line: &str) -> bool {
+    line_is_legacy_codex_status(&strip_ansi_escape_sequences(line))
+}
+
+fn contains_dim_sgr(input: &str) -> bool {
+    let mut rest = input;
+    while let Some(start) = rest.find("\x1b[") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('m') else {
+            return false;
+        };
+        let codes = &rest[..end];
+        if codes
+            .split(';')
+            .filter_map(|code| {
+                let code = code.trim();
+                if code.is_empty() {
+                    None
+                } else {
+                    code.parse::<u16>().ok()
+                }
+            })
+            .any(|code| code == 2)
+        {
+            return true;
+        }
+        rest = &rest[end + 1..];
+    }
+    false
+}
+
+fn strip_ansi_escape_sequences(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && matches!(chars.peek(), Some(&'[')) {
+            chars.next();
+            for code_ch in chars.by_ref() {
+                if ('@'..='~').contains(&code_ch) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch != '\r' {
+            output.push(ch);
+        }
+    }
+    output
 }
 
 fn recent_has_codex_compact_prompt(recent: &[&str]) -> bool {
@@ -1238,6 +1362,9 @@ fn codex_composer_placeholder_text(text: &str) -> bool {
             | "message"
     )
 }
+
+/// Codex TUI footer hints printed below the composer box. Matching any
+/// substring is sufficient; we keep the set narrow on purpose so model
 /// output containing these phrases verbatim is unlikely.
 const CODEX_TUI_FOOTER_HINTS: &[&str] = &[
     "Esc to interrupt",
@@ -1792,6 +1919,41 @@ The documentation example ends with:
 \n\
   gpt-5.5 xhigh · ~/.adk/release/workspaces/baby";
         assert!(pane_looks_ready_for_codex_prompt(pane));
+    }
+
+    #[test]
+    fn compact_codex_write_tests_placeholder_is_ready() {
+        let pane = "\
+─ Worked for 3m 08s ────────────────────────────────────────────\n\
+\n\
+› Write tests for @filename\n\
+\n\
+  gpt-5.5 xhigh · ~/.adk/release/workspaces/baby";
+        assert!(pane_looks_ready_for_codex_prompt(pane));
+    }
+
+    #[test]
+    fn compact_codex_dim_placeholder_is_ready_without_plain_allowlist() {
+        let pane = concat!(
+            "─ Worked for 3m 08s ────────────────────────────────────────────\n",
+            "\n",
+            "\x1b[0;1m›\x1b[0m \x1b[2mRefactor selected code\n",
+            "\n",
+            "\x1b[0m  \x1b[38;2;246;226;183mgpt-5.5 xhigh\x1b[2m\x1b[39m",
+            " · \x1b[0m\x1b[38;2;171;223;167m~/.adk/release/workspaces/baby\n",
+        );
+        assert!(pane_looks_ready_for_codex_prompt_with_ansi(pane));
+    }
+
+    #[test]
+    fn compact_codex_non_dim_unlisted_draft_is_not_ready_with_ansi() {
+        let pane = "\
+─ Worked for 3m 08s ────────────────────────────────────────────\n\
+\n\
+\x1b[0;1m›\x1b[0m run the pending draft\n\
+\n\
+\x1b[0m  \x1b[38;2;246;226;183mgpt-5.5 xhigh\x1b[2m\x1b[39m · \x1b[0m\x1b[38;2;171;223;167m~/.adk/release/workspaces/baby";
+        assert!(!pane_looks_ready_for_codex_prompt_with_ansi(pane));
     }
 
     #[test]

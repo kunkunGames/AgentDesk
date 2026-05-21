@@ -460,6 +460,29 @@ pub fn capture_pane(session_name: &str, scroll_back: i32) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
 }
 
+/// Capture pane content from a tmux session while preserving ANSI attributes.
+///
+/// `scroll_back` is the number of lines to capture (negative = from bottom).
+pub fn capture_pane_with_escapes(session_name: &str, scroll_back: i32) -> Option<String> {
+    let scroll = scroll_back.to_string();
+    tmux_command()
+        .args([
+            "capture-pane",
+            "-e",
+            "-p",
+            "-t",
+            // `capture-pane` expects a session target here, not an exact-match
+            // pane target, so pass the plain session name.
+            session_name,
+            "-S",
+            &scroll,
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+}
+
 /// List all tmux session names.
 pub fn list_session_names() -> Result<Vec<String>, String> {
     let out = tmux_command()
