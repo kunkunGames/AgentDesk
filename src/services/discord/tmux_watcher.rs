@@ -126,6 +126,30 @@ fn watcher_should_clear_stale_terminal_message_ids(
     has_assistant_response && !inflight_present && placeholder_msg_id.is_some()
 }
 
+fn discard_restored_response_seed_before_no_inflight_terminal_relay(
+    full_response: &mut String,
+    response_sent_offset: &mut usize,
+    last_edit_text: &mut String,
+    restored_response_seed: &str,
+    inflight_present: bool,
+    _fresh_assistant_text_seen: bool,
+) -> bool {
+    if inflight_present || restored_response_seed.trim().is_empty() {
+        return false;
+    }
+    if !full_response.starts_with(restored_response_seed) {
+        return false;
+    }
+    let seed_len = restored_response_seed.len();
+    full_response.replace_range(..seed_len, "");
+    *response_sent_offset = response_sent_offset.saturating_sub(seed_len);
+    while *response_sent_offset > 0 && !full_response.is_char_boundary(*response_sent_offset) {
+        *response_sent_offset -= 1;
+    }
+    last_edit_text.clear();
+    true
+}
+
 fn adopt_watcher_terminal_message_ids_from_inflight(
     placeholder_msg_id: &mut Option<serenity::MessageId>,
     placeholder_from_restored_inflight: &mut bool,
@@ -2257,7 +2281,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         } else {
             restored_turn_seed
         });
-        let restored_assistant_text_seen = !stream_seed.full_response.trim().is_empty();
+        let restored_response_seed = stream_seed.full_response.clone();
+        let restored_assistant_text_seen = !restored_response_seed.trim().is_empty();
         if restored_assistant_text_seen {
             // The restored response prefix came from watcher state, not from
             // chunks mirrored into the session-bound StreamRelay parser. Keep
@@ -2315,6 +2340,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let mut task_notification_kind = stream_seed.task_notification_kind;
         let mut assistant_text_seen =
             restored_assistant_text_seen || initial_outcome.assistant_text_seen;
+        let mut fresh_assistant_text_seen = initial_outcome.assistant_text_seen;
         if let Some(kind) = initial_outcome.task_notification_kind {
             task_notification_kind = merge_task_notification_kind(task_notification_kind, kind);
         }
@@ -2548,6 +2574,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 merge_task_notification_kind(task_notification_kind, kind);
                         }
                         assistant_text_seen |= outcome.assistant_text_seen;
+                        fresh_assistant_text_seen |= outcome.assistant_text_seen;
                         if matches!(
                             task_notification_kind,
                             Some(TaskNotificationKind::MonitorAutoTurn)
@@ -4075,12 +4102,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             full_response = String::new();
         }
 
-        let has_assistant_response = !full_response.trim().is_empty();
-        let current_response = full_response.get(response_sent_offset..).unwrap_or("");
-        let has_current_response = !current_response.trim().is_empty();
-
-        let recent_stop_for_output =
-            recent_turn_stop_for_watcher_range(channel_id, &tmux_session_name, data_start_offset);
         let prompt_anchor_present_before_relay =
             crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
                 watcher_provider.as_str(),
@@ -4111,6 +4132,29 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &tmux_session_name,
             );
         }
+        if discard_restored_response_seed_before_no_inflight_terminal_relay(
+            &mut full_response,
+            &mut response_sent_offset,
+            &mut last_edit_text,
+            &restored_response_seed,
+            inflight_before_relay.is_some(),
+            fresh_assistant_text_seen,
+        ) {
+            tracing::info!(
+                provider = %watcher_provider.as_str(),
+                channel = channel_id.get(),
+                tmux_session = %tmux_session_name,
+                restored_response_seed_len = restored_response_seed.len(),
+                fresh_response_len = full_response.len(),
+                "watcher: discarded restored response seed before no-inflight terminal relay"
+            );
+        }
+        let has_assistant_response = !full_response.trim().is_empty();
+        let current_response = full_response.get(response_sent_offset..).unwrap_or("");
+        let has_current_response = !current_response.trim().is_empty();
+
+        let recent_stop_for_output =
+            recent_turn_stop_for_watcher_range(channel_id, &tmux_session_name, data_start_offset);
         let inflight_missing_before_relay = inflight_before_relay.is_none();
         let inflight_silent_turn = inflight_before_relay
             .as_ref()
@@ -5878,9 +5922,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
 mod tests {
     use super::{
         Utf8ChunkDecoder, adopt_watcher_terminal_message_ids_from_inflight,
-        build_watcher_streaming_edit_text, discard_watcher_pending_buffer_after_suppressed_turn,
-        should_probe_tmux_liveness, terminal_event_consumed_offset,
-        watcher_direct_terminal_should_commit_session_idle,
+        build_watcher_streaming_edit_text,
+        discard_restored_response_seed_before_no_inflight_terminal_relay,
+        discard_watcher_pending_buffer_after_suppressed_turn, should_probe_tmux_liveness,
+        terminal_event_consumed_offset, watcher_direct_terminal_should_commit_session_idle,
         watcher_fallback_edit_failure_can_delete_original_placeholder,
         watcher_inflight_represents_external_input,
         watcher_should_bypass_post_terminal_no_inflight_suppress,
@@ -6142,6 +6187,71 @@ mod tests {
         assert!(!watcher_should_clear_stale_terminal_message_ids(
             false, true, None
         ));
+    }
+
+    #[test]
+    fn no_inflight_terminal_response_drops_restored_response_seed() {
+        let restored = "previous turn";
+        let mut full_response = "previous turnfresh turn".to_string();
+        let mut response_sent_offset = 0;
+        let mut last_edit_text = "previous turn".to_string();
+
+        assert!(
+            discard_restored_response_seed_before_no_inflight_terminal_relay(
+                &mut full_response,
+                &mut response_sent_offset,
+                &mut last_edit_text,
+                restored,
+                false,
+                true,
+            )
+        );
+        assert_eq!(full_response, "fresh turn");
+        assert_eq!(response_sent_offset, 0);
+        assert!(last_edit_text.is_empty());
+    }
+
+    #[test]
+    fn restored_response_seed_is_kept_for_managed_inflight() {
+        let restored = "previous turn";
+        let mut full_response = "previous turnfresh turn".to_string();
+        let mut response_sent_offset = restored.len();
+        let mut last_edit_text = "previous turn".to_string();
+
+        assert!(
+            !discard_restored_response_seed_before_no_inflight_terminal_relay(
+                &mut full_response,
+                &mut response_sent_offset,
+                &mut last_edit_text,
+                restored,
+                true,
+                true,
+            )
+        );
+        assert_eq!(full_response, "previous turnfresh turn");
+        assert_eq!(response_sent_offset, restored.len());
+    }
+
+    #[test]
+    fn no_inflight_user_boundary_without_fresh_text_drops_restored_response_seed() {
+        let restored = "previous turn";
+        let mut full_response = "previous turn".to_string();
+        let mut response_sent_offset = restored.len();
+        let mut last_edit_text = "previous turn".to_string();
+
+        assert!(
+            discard_restored_response_seed_before_no_inflight_terminal_relay(
+                &mut full_response,
+                &mut response_sent_offset,
+                &mut last_edit_text,
+                restored,
+                false,
+                false,
+            )
+        );
+        assert_eq!(full_response, "");
+        assert_eq!(response_sent_offset, 0);
+        assert!(last_edit_text.is_empty());
     }
 
     #[test]
