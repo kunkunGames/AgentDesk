@@ -68,6 +68,29 @@ diag_status() {
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status","unknown"))'
 }
 
+wait_channel_idle() {
+  local channel="$1"
+  local deadline=$((SECONDS + 90))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    [ "$(diag_status "$channel")" = "idle" ] && return 0
+    sleep 2
+  done
+  echo "timeout waiting for channel $channel to become idle" >&2
+  "$AGENTDESK_BIN" diag "$channel" --json >&2 || true
+  return 1
+}
+
+assert_channel_stable_idle() {
+  local channel="$1"
+  wait_channel_idle "$channel"
+  sleep 10
+  if [ "$(diag_status "$channel")" != "idle" ]; then
+    echo "channel $channel re-entered non-idle state after relay settle window" >&2
+    "$AGENTDESK_BIN" diag "$channel" --json >&2 || true
+    return 1
+  fi
+}
+
 message_probe() {
   local channel="$1"
   local after_id="$2"
@@ -335,6 +358,8 @@ run_turn_scenario "$CODEX_CHANNEL" "$CODEX_TMUX" codex-rollover "marker를 그�
 run_direct_turn_scenario "$CLAUDE_CHANNEL" "$CLAUDE_TMUX" claude-ssh-direct "한 줄로 marker를 그대로 응답하고, 'ssh-direct' 단어도 포함해줘." >/dev/null
 run_direct_turn_scenario "$CODEX_CHANNEL" "$CODEX_TMUX" codex-ssh-direct "한 줄로 marker를 그대로 응답하고, 'ssh-direct' 단어도 포함해줘." >/dev/null
 
+assert_channel_stable_idle "$CLAUDE_CHANNEL"
+assert_channel_stable_idle "$CODEX_CHANNEL"
 assert_tmux_alive "$CLAUDE_TMUX"
 assert_tmux_alive "$CODEX_TMUX"
 assert_no_processing_tail "$CLAUDE_TMUX"
