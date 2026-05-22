@@ -1105,6 +1105,22 @@ mod post_terminal_output_tests {
             "ExternalInput lease present: notification failure must not suppress response output"
         );
     }
+
+    #[test]
+    fn post_terminal_hard_result_after_committed_turn_requires_direct_input_evidence() {
+        assert!(
+            should_suppress_post_terminal_output_without_inflight(true, true, false, false),
+            "a late hard_result envelope after a committed Discord turn must not relay again"
+        );
+        assert!(
+            !should_suppress_post_terminal_output_without_inflight(true, true, true, false),
+            "a pending SSH-direct prompt is explicit evidence of a fresh direct-input turn"
+        );
+        assert!(
+            !should_suppress_post_terminal_output_without_inflight(true, true, false, true),
+            "an ExternalInput lease is explicit evidence of a fresh direct-input turn"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
