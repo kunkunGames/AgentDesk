@@ -1973,22 +1973,28 @@ pub(super) async fn restore_inflight_turns(
                                         finish_mailbox_on_completion,
                                     );
                                 shared.record_tmux_watcher_reconnect(channel_id);
-                                tokio::spawn(super::tmux::tmux_output_watcher_with_restore(
-                                    channel_id,
-                                    http.clone(),
+                                super::task_supervisor::spawn_observed_tmux_watcher(
+                                    "recovery_tmux_output_watcher_with_restore",
                                     shared.clone(),
-                                    output_path,
                                     tmux_session_name.clone(),
-                                    initial_offset,
-                                    cancel,
-                                    paused,
-                                    resume_offset,
-                                    pause_epoch,
-                                    turn_delivered,
-                                    last_heartbeat_ts_ms,
-                                    mailbox_finalize_owed,
-                                    restored_turn,
-                                ));
+                                    cancel.clone(),
+                                    super::tmux::tmux_output_watcher_with_restore(
+                                        channel_id,
+                                        http.clone(),
+                                        shared.clone(),
+                                        output_path,
+                                        tmux_session_name.clone(),
+                                        initial_offset,
+                                        cancel,
+                                        paused,
+                                        resume_offset,
+                                        pause_epoch,
+                                        turn_delivered,
+                                        last_heartbeat_ts_ms,
+                                        mailbox_finalize_owed,
+                                        restored_turn,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -3015,22 +3021,28 @@ pub(super) async fn restore_inflight_turns(
                             finish_mailbox_on_completion,
                         );
                         shared.record_tmux_watcher_reconnect(channel_id);
-                        tokio::spawn(super::tmux::tmux_output_watcher_with_restore(
-                            channel_id,
-                            http.clone(),
+                        super::task_supervisor::spawn_observed_tmux_watcher(
+                            "recovery_restore_inflight_tmux_output_watcher_with_restore",
                             shared.clone(),
-                            output_path.clone(),
                             tmux_session_name.clone(),
-                            initial_offset,
-                            cancel,
-                            paused,
-                            resume_offset,
-                            pause_epoch,
-                            turn_delivered,
-                            last_heartbeat_ts_ms,
-                            mailbox_finalize_owed,
-                            restored_turn,
-                        ));
+                            cancel.clone(),
+                            super::tmux::tmux_output_watcher_with_restore(
+                                channel_id,
+                                http.clone(),
+                                shared.clone(),
+                                output_path.clone(),
+                                tmux_session_name.clone(),
+                                initial_offset,
+                                cancel,
+                                paused,
+                                resume_offset,
+                                pause_epoch,
+                                turn_delivered,
+                                last_heartbeat_ts_ms,
+                                mailbox_finalize_owed,
+                                restored_turn,
+                            ),
+                        );
                     }
                 }
             }
@@ -3733,21 +3745,27 @@ pub(crate) async fn rebind_inflight_for_channel(
             );
             if claim.should_spawn() {
                 shared.record_tmux_watcher_reconnect(discord_channel_id);
-                tokio::spawn(super::tmux::tmux_output_watcher(
-                    discord_channel_id,
-                    http.clone(),
+                super::task_supervisor::spawn_observed_tmux_watcher(
+                    "recovery_restore_inflight_tmux_output_watcher",
                     shared.clone(),
-                    output_path.clone(),
                     tmux_session_name.clone(),
-                    initial_offset,
-                    cancel,
-                    paused,
-                    resume_offset,
-                    pause_epoch,
-                    turn_delivered,
-                    last_heartbeat_ts_ms,
-                    mailbox_finalize_owed,
-                ));
+                    cancel.clone(),
+                    super::tmux::tmux_output_watcher(
+                        discord_channel_id,
+                        http.clone(),
+                        shared.clone(),
+                        output_path.clone(),
+                        tmux_session_name.clone(),
+                        initial_offset,
+                        cancel,
+                        paused,
+                        resume_offset,
+                        pause_epoch,
+                        turn_delivered,
+                        last_heartbeat_ts_ms,
+                        mailbox_finalize_owed,
+                    ),
+                );
             }
             (claim.should_spawn(), claim.replaced_existing())
         }

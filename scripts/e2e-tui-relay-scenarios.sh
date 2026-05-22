@@ -194,7 +194,7 @@ wait_tmux_contains() {
   local marker="$2"
   local deadline=$((SECONDS + 60))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if tmux capture-pane -p -J -S -200 -t "$session" 2>/dev/null | grep -q "$marker"; then
+    if tmux capture-pane -p -J -S -1000 -t "$session" 2>/dev/null | grep -q "$marker"; then
       return 0
     fi
     sleep 2

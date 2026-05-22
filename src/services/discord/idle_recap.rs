@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use poise::serenity_prelude::{
-    self as serenity, ButtonStyle, ChannelId, CreateActionRow, CreateButton, MessageId,
+    self as serenity, ButtonKind, ButtonStyle, ChannelId, CreateActionRow, CreateButton, MessageId,
 };
 use sqlx::PgPool;
 use tokio::task;
@@ -382,16 +382,63 @@ fn make_recap_components(message_id_suffix: &str) -> Vec<CreateActionRow> {
     ])]
 }
 
-/// Delete the previous recap card if one is recorded. Errors are swallowed
-/// so the renderer never fails the cycle just because Discord has GC'd the
-/// old message itself. Same allowlist rationale as `post_recap_card`.
+fn content_looks_like_idle_recap_card(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed == "📦" || trimmed.starts_with("📦 ")
+}
+
+fn component_is_idle_recap_clear_button(component: &serenity::ActionRowComponent) -> bool {
+    match component {
+        serenity::ActionRowComponent::Button(button) => match &button.data {
+            ButtonKind::NonLink { custom_id, .. } => {
+                custom_id.starts_with(IDLE_RECAP_CLEAR_BUTTON_PREFIX)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn message_is_idle_recap_card(message: &serenity::Message) -> bool {
+    content_looks_like_idle_recap_card(&message.content)
+        && message.components.iter().any(|row| {
+            row.components
+                .iter()
+                .any(component_is_idle_recap_clear_button)
+        })
+}
+
+/// Delete the previous recap card if one is recorded and still looks like an
+/// idle-recap card. A stale/corrupt `sessions.idle_recap_message_id` must
+/// never be allowed to delete a real turn response, so this probes Discord
+/// first and only deletes messages carrying both the recap content marker and
+/// the recap button custom id. Errors are swallowed so the renderer never
+/// fails the cycle just because Discord has GC'd the old message itself.
+/// Same allowlist rationale as `post_recap_card`.
 pub(crate) async fn delete_previous_card(http: &serenity::Http, channel_id: u64, message_id: u64) {
-    let _ = super::http::delete_channel_message(
-        http,
-        ChannelId::new(channel_id),
-        MessageId::new(message_id),
-    )
-    .await;
+    let channel = ChannelId::new(channel_id);
+    let message = MessageId::new(message_id);
+    match http.get_message(channel, message).await {
+        Ok(current) if message_is_idle_recap_card(&current) => {
+            let _ = super::http::delete_channel_message(http, channel, message).await;
+        }
+        Ok(current) => {
+            tracing::warn!(
+                channel_id = channel_id,
+                message_id = message_id,
+                author_id = current.author.id.get(),
+                "idle_recap: preserving recorded message because it is not an idle recap card"
+            );
+        }
+        Err(error) => {
+            tracing::debug!(
+                channel_id = channel_id,
+                message_id = message_id,
+                error = %error,
+                "idle_recap: previous card probe failed; skipping destructive delete"
+            );
+        }
+    }
 }
 
 /// Persist the freshly-posted message id (and the channel it lives in) so
@@ -515,5 +562,19 @@ mod tests {
         assert!(!snapshot_with_sessions(Some("  "), Some("")).has_resumable_provider_session());
         assert!(snapshot_with_sessions(Some("session-1"), None).has_resumable_provider_session());
         assert!(snapshot_with_sessions(None, Some("raw-1")).has_resumable_provider_session());
+    }
+
+    #[test]
+    fn idle_recap_delete_guard_requires_recap_content_marker() {
+        assert!(content_looks_like_idle_recap_card("📦 idle 8분"));
+        assert!(content_looks_like_idle_recap_card(
+            "📦 12k / 200k tokens (6%) · idle 8분"
+        ));
+        assert!(!content_looks_like_idle_recap_card(
+            "✅ **응답 완료** — codex"
+        ));
+        assert!(!content_looks_like_idle_recap_card(
+            "> 📦 mentioned inside a normal response"
+        ));
     }
 }

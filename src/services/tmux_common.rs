@@ -75,6 +75,7 @@ pub(crate) const CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT: &str = "claude-tui-settings.
 pub(crate) const CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT: &str = "claude-tui.sh";
 pub(crate) const CODEX_TUI_HOME_TEMP_EXT: &str = "codex-tui-home";
 pub(crate) const TMUX_DEAD_MARKER_TEMP_EXT: &str = "pane_dead";
+pub(crate) const TMUX_RUNTIME_KIND_TEMP_EXT: &str = "runtime-kind";
 
 /// Returns the persistent AgentDesk sessions directory, if a runtime root
 /// is configured. This is the new canonical location for session temp files
@@ -222,6 +223,7 @@ pub fn cleanup_session_temp_files(session_name: &str) {
         "sh",
         "generation",
         "exit_reason",
+        TMUX_RUNTIME_KIND_TEMP_EXT,
         TMUX_DEAD_MARKER_TEMP_EXT,
         CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
         CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
@@ -255,6 +257,23 @@ pub fn write_tmux_owner_marker(tmux_session_name: &str) -> Result<(), String> {
     let owner_path = tmux_owner_path(tmux_session_name);
     std::fs::write(&owner_path, current_tmux_owner_marker())
         .map_err(|e| format!("Failed to write tmux owner marker: {}", e))
+}
+
+pub(crate) fn write_tmux_runtime_kind_marker(
+    tmux_session_name: &str,
+    runtime_kind: crate::services::agent_protocol::RuntimeHandoffKind,
+) -> Result<(), String> {
+    let path = session_temp_path(tmux_session_name, TMUX_RUNTIME_KIND_TEMP_EXT);
+    std::fs::write(&path, runtime_kind.as_str())
+        .map_err(|e| format!("Failed to write tmux runtime kind marker: {}", e))
+}
+
+pub(crate) fn resolve_tmux_runtime_kind_marker(
+    tmux_session_name: &str,
+) -> Option<crate::services::agent_protocol::RuntimeHandoffKind> {
+    let path = resolve_session_temp_path(tmux_session_name, TMUX_RUNTIME_KIND_TEMP_EXT)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    crate::services::agent_protocol::RuntimeHandoffKind::from_str(&raw)
 }
 
 /// Append-only JSONL writer that reopens the path when external rotation
@@ -933,6 +952,7 @@ mod tests {
             "sh",
             "generation",
             "exit_reason",
+            TMUX_RUNTIME_KIND_TEMP_EXT,
             TMUX_DEAD_MARKER_TEMP_EXT,
             CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
             CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
@@ -968,6 +988,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&death_log_path);
+        let _ = std::fs::remove_dir_all(&tdir);
+        match previous_root {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+        match previous_host {
+            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
+            None => unsafe { std::env::remove_var("HOSTNAME") },
+        }
+    }
+
+    #[test]
+    fn tmux_runtime_kind_marker_round_trips_and_cleanup_removes_it() {
+        let _lock = crate::services::discord::runtime_store::lock_test_env();
+        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let previous_host = std::env::var_os("HOSTNAME");
+
+        let tdir =
+            std::env::temp_dir().join(format!("adk-runtime-kind-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tdir);
+
+        unsafe {
+            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
+            std::env::set_var("HOSTNAME", "runtime-kind-host");
+        }
+
+        let session = format!("runtime-kind-sess-{}", std::process::id());
+        write_tmux_runtime_kind_marker(
+            &session,
+            crate::services::agent_protocol::RuntimeHandoffKind::CodexTui,
+        )
+        .expect("write marker");
+
+        assert_eq!(
+            resolve_tmux_runtime_kind_marker(&session),
+            Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui)
+        );
+
+        cleanup_session_temp_files(&session);
+        assert_eq!(resolve_tmux_runtime_kind_marker(&session), None);
+
         let _ = std::fs::remove_dir_all(&tdir);
         match previous_root {
             Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },

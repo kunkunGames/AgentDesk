@@ -46,12 +46,64 @@ use crate::services::memory::{
 use crate::services::observability::turn_lifecycle::TurnEvent;
 use crate::services::provider::{CancelToken, cancel_requested};
 use std::sync::Arc;
+use url::Url;
 
 const WATCHDOG_DEADLOCK_PREALERT_MS: i64 = 5 * 60 * 1000;
 const WATCHDOG_DEADLOCK_PREALERT_BOT: &str = "announce";
 const WATCHDOG_TIMEOUT_REASON: &str = "watchdog timeout";
 const WATCHDOG_TIMEOUT_CANCEL_SOURCE: &str = "watchdog_timeout";
 const CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE: &str = "⚠ Claude TUI가 아직 이전 터미널 턴을 처리 중이라 이 메시지를 주입하지 않았습니다. 현재 응답이 끝난 뒤 다시 보내 주세요.";
+const CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_QUEUED_NOTICE: &str =
+    "📬 이 메시지는 이미 큐에 들어가 있어 추가 적재하지 않았습니다. 큐 결과를 기다려 주세요.";
+const CLAUDE_TUI_BUSY_FOLLOWUP_DEDUP_NOTICE: &str =
+    "📬 방금 동일한 메시지가 큐에 적재되어 중복으로 무시했습니다. 큐 결과를 기다려 주세요.";
+const CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE: &str =
+    "⚠ 내부 처리 큐에 접근하지 못해 이 메시지를 적재하지 못했습니다. 잠시 후 다시 보내 주세요.";
+const DISCORD_ATTACHMENT_HOSTS: &[&str] = &["cdn.discordapp.com", "media.discordapp.net"];
+
+fn claude_tui_busy_followup_refusal_notice(
+    reason: Option<crate::services::turn_orchestrator::EnqueueRefusalReason>,
+) -> &'static str {
+    match reason {
+        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdAlreadyQueued) => {
+            CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_QUEUED_NOTICE
+        }
+        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::LastItemDedup) => {
+            CLAUDE_TUI_BUSY_FOLLOWUP_DEDUP_NOTICE
+        }
+        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::ActorUnreachable) => {
+            CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE
+        }
+        None => CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,
+    }
+}
+
+fn is_allowed_discord_attachment_url(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    if url.scheme() != "https" {
+        return false;
+    }
+    url.host_str()
+        .is_some_and(|host| DISCORD_ATTACHMENT_HOSTS.contains(&host))
+}
+
+async fn download_discord_attachment(raw_url: &str) -> Result<Vec<u8>, String> {
+    if !is_allowed_discord_attachment_url(raw_url) {
+        return Err("attachment URL host is not allowed".to_string());
+    }
+    let response = reqwest::get(raw_url)
+        .await
+        .map_err(|error| format!("Download failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Download failed: {error}"))?;
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| format!("Download failed: {error}"))
+}
 
 fn watchdog_deadlock_prealert_bot_name() -> &'static str {
     WATCHDOG_DEADLOCK_PREALERT_BOT
@@ -549,6 +601,95 @@ fn prelaunch_runtime_kind_for_managed_session(
     None
 }
 
+#[cfg(unix)]
+fn observed_runtime_kind_for_managed_tmux(
+    provider: &ProviderKind,
+    tmux_session_name: &str,
+) -> Option<RuntimeHandoffKind> {
+    if let Some(binding) =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)
+    {
+        return Some(binding.runtime_kind);
+    }
+    if let Some(marker) =
+        crate::services::tmux_common::resolve_tmux_runtime_kind_marker(tmux_session_name)
+    {
+        return Some(marker);
+    }
+    if crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input").is_some()
+    {
+        return Some(RuntimeHandoffKind::LegacyTmuxWrapper);
+    }
+    match provider {
+        ProviderKind::Claude => Some(RuntimeHandoffKind::ClaudeTui),
+        ProviderKind::Codex => Some(RuntimeHandoffKind::CodexTui),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn reconcile_managed_tmux_runtime_kind_for_config(
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+    tmux_session_name: Option<&str>,
+    expected_runtime_kind: Option<RuntimeHandoffKind>,
+) {
+    let (Some(tmux_session_name), Some(expected_runtime_kind)) =
+        (tmux_session_name, expected_runtime_kind)
+    else {
+        return;
+    };
+    if !provider.uses_managed_tmux_backend()
+        || !crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
+    {
+        return;
+    }
+    let Some(observed_runtime_kind) =
+        observed_runtime_kind_for_managed_tmux(provider, tmux_session_name)
+    else {
+        return;
+    };
+    if observed_runtime_kind == expected_runtime_kind {
+        return;
+    }
+
+    let reason = format!(
+        "tui_hosting config changed: expected {}, found {}; recreating tmux session",
+        expected_runtime_kind.as_str(),
+        observed_runtime_kind.as_str()
+    );
+    tracing::warn!(
+        provider = provider.as_str(),
+        channel_id = channel_id.get(),
+        tmux_session_name,
+        expected_runtime_kind = expected_runtime_kind.as_str(),
+        observed_runtime_kind = observed_runtime_kind.as_str(),
+        "managed tmux runtime kind mismatch detected; killing stale session before dispatch"
+    );
+    crate::services::termination_audit::record_termination_for_tmux(
+        tmux_session_name,
+        None,
+        "discord_dispatch",
+        "runtime_kind_mismatch_recreate",
+        Some(&reason),
+        None,
+    );
+    crate::services::tmux_diagnostics::record_tmux_exit_reason(tmux_session_name, &reason);
+    crate::services::platform::tmux::kill_session(tmux_session_name, &reason);
+    crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
+}
+
+#[cfg(test)]
+fn runtime_kind_mismatch_requires_recreate(
+    observed_runtime_kind: Option<RuntimeHandoffKind>,
+    expected_runtime_kind: Option<RuntimeHandoffKind>,
+) -> bool {
+    matches!(
+        (observed_runtime_kind, expected_runtime_kind),
+        (Some(observed), Some(expected)) if observed != expected
+    )
+}
+
 fn apply_prelaunch_runtime_kind(
     state: &mut InflightTurnState,
     runtime_kind: Option<RuntimeHandoffKind>,
@@ -948,21 +1089,27 @@ fn attach_paused_turn_watcher(
             if claim.replaced_existing() {
                 shared.record_tmux_watcher_reconnect(channel_id);
             }
-            tokio::spawn(super::super::tmux::tmux_output_watcher(
-                channel_id,
-                http,
+            super::super::task_supervisor::spawn_observed_tmux_watcher(
+                "router_tmux_output_watcher",
                 shared.clone(),
-                output_path,
-                tmux_session_name,
-                initial_offset,
-                cancel,
-                paused,
-                resume_offset,
-                pause_epoch,
-                turn_delivered,
-                last_heartbeat_ts_ms,
-                mailbox_finalize_owed,
-            ));
+                tmux_session_name.clone(),
+                cancel.clone(),
+                super::super::tmux::tmux_output_watcher(
+                    channel_id,
+                    http,
+                    shared.clone(),
+                    output_path,
+                    tmux_session_name,
+                    initial_offset,
+                    cancel,
+                    paused,
+                    resume_offset,
+                    pause_epoch,
+                    turn_delivered,
+                    last_heartbeat_ts_ms,
+                    mailbox_finalize_owed,
+                ),
+            );
         }
     }
 
@@ -2374,7 +2521,7 @@ async fn start_reserved_headless_turn_with_owner(
 
         let watchdog_channel_id_num = channel_id.get();
         let watchdog_provider = provider.clone();
-        tokio::spawn(async move {
+        super::super::task_supervisor::spawn_observed("headless_turn_watchdog", async move {
             const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
             let mut last_deadlock_prealert_deadline_ms: Option<i64> = None;
 
@@ -2516,6 +2663,19 @@ async fn start_reserved_headless_turn_with_owner(
                     .cloned()
             })
     };
+    let prelaunch_runtime_kind = prelaunch_runtime_kind_for_managed_session(
+        &provider,
+        remote_profile.is_none(),
+        tmux_session_name.is_some(),
+        Some(channel_id.get()),
+    );
+    #[cfg(unix)]
+    reconcile_managed_tmux_runtime_kind_for_config(
+        &provider,
+        channel_id,
+        tmux_session_name.as_deref(),
+        prelaunch_runtime_kind,
+    );
 
     let adk_session_name = channel_name.clone();
     let adk_session_info =
@@ -2591,15 +2751,7 @@ async fn start_reserved_headless_turn_with_owner(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
-    apply_prelaunch_runtime_kind(
-        &mut inflight_state,
-        prelaunch_runtime_kind_for_managed_session(
-            &provider,
-            remote_profile.is_none(),
-            tmux_session_name.is_some(),
-            Some(channel_id.get()),
-        ),
-    );
+    apply_prelaunch_runtime_kind(&mut inflight_state, prelaunch_runtime_kind);
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
         data.sessions
@@ -5298,7 +5450,7 @@ pub(in crate::services::discord) async fn handle_text_message(
 
         let watchdog_channel_id_num = channel_id.get();
         let watchdog_provider = provider.clone();
-        tokio::spawn(async move {
+        super::super::task_supervisor::spawn_observed("text_turn_watchdog", async move {
             const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
             let mut last_deadlock_prealert_deadline_ms: Option<i64> = None;
 
@@ -5485,6 +5637,19 @@ pub(in crate::services::discord) async fn handle_text_message(
                     .cloned()
             })
     };
+    let prelaunch_runtime_kind = prelaunch_runtime_kind_for_managed_session(
+        &provider,
+        remote_profile.is_none(),
+        tmux_session_name.is_some(),
+        Some(channel_id.get()),
+    );
+    #[cfg(unix)]
+    reconcile_managed_tmux_runtime_kind_for_config(
+        &provider,
+        channel_id,
+        tmux_session_name.as_deref(),
+        prelaunch_runtime_kind,
+    );
 
     let adk_session_name = channel_name.clone();
     let adk_session_info = derive_adk_session_info(
@@ -5842,11 +6007,12 @@ pub(in crate::services::discord) async fn handle_text_message(
         } else if enqueue_outcome.enqueued {
             let _ = channel_id.delete_message(http, placeholder_msg_id).await;
         } else {
+            let notice = claude_tui_busy_followup_refusal_notice(enqueue_outcome.refusal_reason);
             let _ = super::super::http::edit_channel_message(
                 http,
                 channel_id,
                 placeholder_msg_id,
-                CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,
+                notice,
             )
             .await;
         }
@@ -5976,15 +6142,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         inflight_input_fifo.clone(),
         inflight_offset,
     );
-    apply_prelaunch_runtime_kind(
-        &mut inflight_state,
-        prelaunch_runtime_kind_for_managed_session(
-            &provider,
-            remote_profile.is_none(),
-            tmux_session_name.is_some(),
-            Some(channel_id.get()),
-        ),
-    );
+    apply_prelaunch_runtime_kind(&mut inflight_state, prelaunch_runtime_kind);
     let (worktree_path, worktree_branch, base_commit) = {
         let data = shared.core.lock().await;
         data.sessions
@@ -6339,22 +6497,18 @@ pub(super) async fn handle_file_upload(
     for attachment in &msg.attachments {
         let file_name = &attachment.filename;
 
-        // Download file from Discord CDN
-        let buf = match reqwest::get(&attachment.url).await {
-            Ok(resp) => match resp.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    rate_limit_wait(shared, channel_id).await;
-                    let _ = channel_id
-                        .say(&ctx.http, format!("Download failed: {}", e))
-                        .await;
-                    continue;
-                }
-            },
+        // Download only from Discord-owned attachment hosts.
+        let buf = match download_discord_attachment(&attachment.url).await {
+            Ok(bytes) => bytes,
             Err(e) => {
+                tracing::warn!(
+                    channel_id = channel_id.get(),
+                    attachment_url = %attachment.url,
+                    "skipping Discord attachment download: {e}"
+                );
                 rate_limit_wait(shared, channel_id).await;
                 let _ = channel_id
-                    .say(&ctx.http, format!("Download failed: {}", e))
+                    .say(&ctx.http, format!("Download failed: {e}"))
                     .await;
                 continue;
             }
@@ -6719,7 +6873,7 @@ pub(super) async fn handle_text_command(
                             )
                             .await;
 
-                        tokio::spawn(async move {
+                        super::super::task_supervisor::spawn_observed("meeting_start_command", async move {
                             match meeting::start_meeting(
                                 &*http,
                                 channel_id,
@@ -6778,7 +6932,7 @@ pub(super) async fn handle_text_command(
                             )
                             .await;
 
-                        tokio::spawn(async move {
+                        super::super::task_supervisor::spawn_observed("meeting_start_command_with_agenda", async move {
                             match meeting::start_meeting(
                                 &*http,
                                 channel_id,
@@ -8634,6 +8788,54 @@ mod tests {
         assert!(seed >= HEADLESS_TURN_MESSAGE_ID_BASE);
         assert!(later_seed > seed);
         assert_ne!(seed, other_process_seed);
+    }
+
+    #[test]
+    fn claude_tui_busy_followup_notice_names_enqueue_refusal_reason() {
+        use crate::services::turn_orchestrator::EnqueueRefusalReason;
+
+        assert_eq!(
+            claude_tui_busy_followup_refusal_notice(Some(
+                EnqueueRefusalReason::SourceIdAlreadyQueued
+            )),
+            CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_QUEUED_NOTICE
+        );
+        assert_eq!(
+            claude_tui_busy_followup_refusal_notice(Some(EnqueueRefusalReason::LastItemDedup)),
+            CLAUDE_TUI_BUSY_FOLLOWUP_DEDUP_NOTICE
+        );
+        assert_eq!(
+            claude_tui_busy_followup_refusal_notice(Some(EnqueueRefusalReason::ActorUnreachable)),
+            CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE
+        );
+        assert_eq!(
+            claude_tui_busy_followup_refusal_notice(None),
+            CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE
+        );
+    }
+
+    #[test]
+    fn tui_hosting_runtime_kind_mismatch_requires_session_recreate() {
+        assert!(runtime_kind_mismatch_requires_recreate(
+            Some(RuntimeHandoffKind::ClaudeTui),
+            Some(RuntimeHandoffKind::LegacyTmuxWrapper)
+        ));
+        assert!(runtime_kind_mismatch_requires_recreate(
+            Some(RuntimeHandoffKind::LegacyTmuxWrapper),
+            Some(RuntimeHandoffKind::CodexTui)
+        ));
+        assert!(!runtime_kind_mismatch_requires_recreate(
+            Some(RuntimeHandoffKind::CodexTui),
+            Some(RuntimeHandoffKind::CodexTui)
+        ));
+        assert!(!runtime_kind_mismatch_requires_recreate(
+            None,
+            Some(RuntimeHandoffKind::CodexTui)
+        ));
+        assert!(!runtime_kind_mismatch_requires_recreate(
+            Some(RuntimeHandoffKind::CodexTui),
+            None
+        ));
     }
 
     #[test]
@@ -10835,5 +11037,34 @@ mod tests {
                 "provider-session-123",
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_url_tests {
+    use super::is_allowed_discord_attachment_url;
+
+    #[test]
+    fn discord_attachment_url_guard_allows_discord_cdn_hosts() {
+        assert!(is_allowed_discord_attachment_url(
+            "https://cdn.discordapp.com/attachments/1/2/file.txt"
+        ));
+        assert!(is_allowed_discord_attachment_url(
+            "https://media.discordapp.net/attachments/1/2/image.png"
+        ));
+    }
+
+    #[test]
+    fn discord_attachment_url_guard_rejects_ssrf_shapes() {
+        assert!(!is_allowed_discord_attachment_url(
+            "http://cdn.discordapp.com/attachments/1/2/file.txt"
+        ));
+        assert!(!is_allowed_discord_attachment_url(
+            "https://cdn.discordapp.com.evil.test/attachments/1/2/file.txt"
+        ));
+        assert!(!is_allowed_discord_attachment_url(
+            "https://127.0.0.1/attachments/1/2/file.txt"
+        ));
+        assert!(!is_allowed_discord_attachment_url("not a url"));
     }
 }

@@ -77,6 +77,20 @@ struct DeferredHookBacklogGuard {
     shared: Arc<SharedData>,
 }
 
+const DEFERRED_IDLE_QUEUE_KICKOFF_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(2);
+const DEFERRED_IDLE_QUEUE_KICKOFF_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(2);
+// Keep retrying long enough to cover dcserver/gateway restart windows. A
+// queued user reply should not wait for the next external Discord event just
+// because cached ctx/token arrived slightly after the first post-turn kickoff.
+const DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS: usize = 150;
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn should_retry_deferred_idle_queue_kickoff(attempt: usize) -> bool {
+    attempt < DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS
+}
+
 impl Drop for DeferredHookBacklogGuard {
     fn drop(&mut self) {
         self.shared
@@ -94,29 +108,43 @@ pub(super) fn schedule_deferred_idle_queue_kickoff(
     shared
         .deferred_hook_backlog
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    tokio::spawn(async move {
+    super::task_supervisor::spawn_observed("deferred_idle_queue_kickoff", async move {
         // #2044 F3: bind the decrement to a Drop guard so it fires on
         // panic-unwind as well as on normal return.
         let _backlog_guard = DeferredHookBacklogGuard {
             shared: shared.clone(),
         };
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        if let (Some(ctx), Some(tok)) = (
-            shared.cached_serenity_ctx.get(),
-            shared.cached_bot_token.get(),
-        ) {
+        tokio::time::sleep(DEFERRED_IDLE_QUEUE_KICKOFF_INITIAL_DELAY).await;
+        for attempt in 1..=DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS {
+            if let (Some(ctx), Some(tok)) = (
+                shared.cached_serenity_ctx.get(),
+                shared.cached_bot_token.get(),
+            ) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 🚀 Deferred drain: kicking off idle queues for channel {} ({reason}, attempt {attempt}/{})",
+                    channel_id,
+                    DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS
+                );
+                super::kickoff_idle_queues(ctx, &shared, tok, &provider).await;
+                return;
+            }
+
             let ts = chrono::Local::now().format("%H:%M:%S");
+            if !should_retry_deferred_idle_queue_kickoff(attempt) {
+                tracing::warn!(
+                    "  [{ts}] ⚠ Deferred drain: missing cached context for channel {} after {} attempts ({reason}); queued items remain persisted for next kickoff",
+                    channel_id,
+                    DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS
+                );
+                break;
+            }
             tracing::info!(
-                "  [{ts}] 🚀 Deferred drain: kicking off idle queues for channel {} ({reason})",
-                channel_id
+                "  [{ts}] ⚠ Deferred drain: missing cached context for channel {} ({reason}, attempt {attempt}/{}); retrying",
+                channel_id,
+                DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS
             );
-            super::kickoff_idle_queues(ctx, &shared, tok, &provider).await;
-        } else {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] ⚠ Deferred drain: missing cached context for channel {} ({reason})",
-                channel_id
-            );
+            tokio::time::sleep(DEFERRED_IDLE_QUEUE_KICKOFF_RETRY_DELAY).await;
         }
         // Drop guard at end of scope decrements the backlog counter.
     });
@@ -244,6 +272,17 @@ mod tests {
             true,
             &mut queues,
             channel_id
+        ));
+    }
+
+    #[test]
+    fn deferred_idle_queue_kickoff_retries_until_final_attempt() {
+        assert!(should_retry_deferred_idle_queue_kickoff(1));
+        assert!(should_retry_deferred_idle_queue_kickoff(
+            DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS - 1
+        ));
+        assert!(!should_retry_deferred_idle_queue_kickoff(
+            DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS
         ));
     }
 

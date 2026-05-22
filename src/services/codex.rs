@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage};
+use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage, is_valid_session_id};
 use crate::services::claude;
 use crate::services::claude_tui::hook_bundle::{
     HookBundleConfig, codex_hook_config_overrides, run_codex_hook_launch_self_check_with_exec_path,
@@ -18,7 +18,7 @@ use crate::services::discord::restart_report::{
 use crate::services::process::{kill_child_tree, kill_pid_tree, shell_escape};
 use crate::services::provider::{
     CancelToken, FollowupResult, ProviderKind, SessionProbe, cancel_requested,
-    fold_read_output_result, is_readonly_tool_policy, register_child_pid,
+    fold_read_output_result, is_readonly_tool_policy, register_child_pid, spawn_cancel_watchdog,
     tmux_followup_fallback_after_read_error,
 };
 use crate::services::remote::RemoteProfile;
@@ -85,6 +85,7 @@ fn log_codex_runtime_kind(entrypoint: &'static str, runtime_kind: CodexRuntimeKi
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CodexLaunchOptions {
     pub(crate) prompt: String,
+    pub(crate) developer_instructions: Option<String>,
     pub(crate) resume_session_id: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
@@ -105,7 +106,13 @@ impl CodexLaunchOptions {
     }
 
     pub(crate) fn with_resume_session_id(mut self, value: Option<&str>) -> Self {
-        self.resume_session_id = clean_nonempty(value);
+        self.resume_session_id =
+            clean_nonempty(value).filter(|session_id| is_valid_session_id(session_id));
+        self
+    }
+
+    pub(crate) fn with_developer_instructions(mut self, value: Option<&str>) -> Self {
+        self.developer_instructions = clean_nonempty(value);
         self
     }
 
@@ -237,6 +244,7 @@ fn render_codex_wrapper_tmux_script(
     codex_bin: &str,
     model: Option<&str>,
     session_id: Option<&str>,
+    developer_instructions: Option<&str>,
     compact_token_limit: Option<u64>,
     fast_mode_enabled: Option<bool>,
     goals_enabled: Option<bool>,
@@ -245,6 +253,7 @@ fn render_codex_wrapper_tmux_script(
     let wrapper_args = build_codex_wrapper_cli_args(
         &CodexLaunchOptions::new("")
             .with_resume_session_id(session_id)
+            .with_developer_instructions(developer_instructions)
             .with_model(model)
             .with_reasoning_effort(reasoning_effort.as_deref())
             .with_compact_token_limit(compact_token_limit)
@@ -393,6 +402,9 @@ fn codex_config_overrides(options: &CodexLaunchOptions) -> Vec<String> {
     if let Some(limit) = options.compact_token_limit.filter(|limit| *limit > 0) {
         overrides.push(format!("model_auto_compact_token_limit={limit}"));
     }
+    if let Some(instructions) = options.developer_instructions.as_deref() {
+        overrides.push(format!("developer_instructions={instructions:?}"));
+    }
     overrides
 }
 
@@ -478,6 +490,10 @@ fn build_codex_wrapper_cli_args(options: &CodexLaunchOptions, codex_bin: &str) -
     if let Some(effort) = options.reasoning_effort.as_deref() {
         args.push("--reasoning-effort".to_string());
         args.push(effort.to_string());
+    }
+    if let Some(instructions) = options.developer_instructions.as_deref() {
+        args.push("--developer-instructions".to_string());
+        args.push(instructions.to_string());
     }
     if let Some(session_id) = options.resume_session_id.as_deref() {
         args.push("--resume-session-id".to_string());
@@ -1118,7 +1134,8 @@ pub fn execute_command_streaming(
     session_selection.log_start("codex.execute_command_streaming");
 
     let readonly_mode = is_readonly_tool_policy(allowed_tools);
-    let prompt = compose_codex_prompt(prompt, system_prompt, allowed_tools);
+    let developer_instructions = compose_codex_developer_instructions(system_prompt, allowed_tools);
+    let prompt = compose_codex_prompt(prompt, None, allowed_tools);
 
     if let Some(profile) = remote_profile {
         // Issue #2193 — remote tmux is hard-refused regardless of the
@@ -1215,6 +1232,7 @@ pub fn execute_command_streaming(
                     tmux_name,
                     report_channel_id,
                     report_provider,
+                    developer_instructions.as_deref(),
                     readonly_mode,
                     compact_token_limit,
                     force_fresh_provider_session,
@@ -1236,6 +1254,7 @@ pub fn execute_command_streaming(
                 tmux_name,
                 report_channel_id,
                 report_provider,
+                developer_instructions.as_deref(),
                 compact_token_limit,
                 force_fresh_provider_session,
             );
@@ -1255,6 +1274,7 @@ pub fn execute_command_streaming(
             sender,
             cancel_token,
             tmux_name,
+            developer_instructions.as_deref(),
             compact_token_limit,
             force_fresh_provider_session,
         );
@@ -1275,6 +1295,7 @@ pub fn execute_command_streaming(
         cancel_token,
         report_channel_id,
         report_provider,
+        developer_instructions.as_deref(),
         readonly_mode,
         compact_token_limit,
     )
@@ -1282,10 +1303,24 @@ pub fn execute_command_streaming(
 
 fn compose_codex_prompt(
     prompt: &str,
-    system_prompt: Option<&str>,
-    allowed_tools: Option<&[String]>,
+    _system_prompt: Option<&str>,
+    _allowed_tools: Option<&[String]>,
 ) -> String {
-    crate::services::provider::compose_structured_turn_prompt(prompt, system_prompt, allowed_tools)
+    prompt.to_string()
+}
+
+fn compose_codex_developer_instructions(
+    system_prompt: Option<&str>,
+    _allowed_tools: Option<&[String]>,
+) -> Option<String> {
+    system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|system_prompt| {
+            format!(
+                "{system_prompt}\n\nThese instructions are authoritative for this turn. Follow them over any generic assistant persona unless the user explicitly asks to inspect or compare them."
+            )
+        })
 }
 
 fn execute_streaming_direct(
@@ -1299,6 +1334,7 @@ fn execute_streaming_direct(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    developer_instructions: Option<&str>,
     readonly_mode: bool,
     compact_token_limit: Option<u64>,
 ) -> Result<(), String> {
@@ -1310,6 +1346,7 @@ fn execute_streaming_direct(
     let args = build_codex_exec_args(
         &CodexLaunchOptions::new(prompt)
             .with_resume_session_id(session_id)
+            .with_developer_instructions(developer_instructions)
             .with_model(model)
             .with_reasoning_effort(Some("high"))
             .with_compact_token_limit(compact_token_limit)
@@ -1339,6 +1376,8 @@ fn execute_streaming_direct(
         .map_err(|e| format!("Failed to start Codex: {}", e))?;
 
     register_child_pid(cancel_token.as_deref(), child.id());
+    let _cancel_watchdog =
+        spawn_cancel_watchdog(cancel_token.clone(), child.id(), "codex-direct-stream");
     // Race condition fix: if /stop arrived before PID was stored, kill now
     if cancel_requested(cancel_token.as_deref()) {
         kill_child_tree(&mut child);
@@ -1454,6 +1493,7 @@ fn execute_streaming_local_tui_tmux(
     tmux_session_name: &str,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    developer_instructions: Option<&str>,
     readonly_mode: bool,
     compact_token_limit: Option<u64>,
     force_fresh_provider_session: bool,
@@ -1467,6 +1507,7 @@ fn execute_streaming_local_tui_tmux(
     let reasoning_effort = codex_reasoning_effort_from_env();
     let launch_options = CodexLaunchOptions::new(prompt)
         .with_resume_session_id(session_selection.resume_session_id())
+        .with_developer_instructions(developer_instructions)
         .with_model(model)
         .with_reasoning_effort(reasoning_effort.as_deref())
         .with_compact_token_limit(compact_token_limit)
@@ -1493,6 +1534,7 @@ fn execute_streaming_local_tui_tmux(
             tmux_session_name,
             report_channel_id,
             report_provider,
+            developer_instructions,
             compact_token_limit,
             force_fresh_provider_session,
         );
@@ -1524,6 +1566,10 @@ fn execute_streaming_local_tui_tmux(
     crate::services::codex_tui::session::CodexTuiSessionFiles::for_tmux_session(tmux_session_name)
         .cleanup_best_effort();
     write_tmux_owner_marker(tmux_session_name)?;
+    crate::services::tmux_common::write_tmux_runtime_kind_marker(
+        tmux_session_name,
+        crate::services::agent_protocol::RuntimeHandoffKind::CodexTui,
+    )?;
     let owner_path = tmux_owner_path(tmux_session_name);
 
     let resolution = resolve_codex_binary();
@@ -1880,6 +1926,7 @@ fn execute_streaming_local_tmux(
     tmux_session_name: &str,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
+    developer_instructions: Option<&str>,
     compact_token_limit: Option<u64>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
@@ -1974,6 +2021,10 @@ fn execute_streaming_local_tmux(
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
     write_tmux_owner_marker(tmux_session_name)?;
+    crate::services::tmux_common::write_tmux_runtime_kind_marker(
+        tmux_session_name,
+        crate::services::agent_protocol::RuntimeHandoffKind::LegacyTmuxWrapper,
+    )?;
 
     let exe =
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
@@ -2002,6 +2053,7 @@ fn execute_streaming_local_tmux(
         &codex_bin,
         model,
         session_id,
+        developer_instructions,
         compact_token_limit,
         fast_mode_enabled,
         goals_enabled,
@@ -2219,6 +2271,7 @@ fn execute_streaming_local_process_codex(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     session_name: &str,
+    developer_instructions: Option<&str>,
     compact_token_limit: Option<u64>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
@@ -2300,6 +2353,7 @@ fn execute_streaming_local_process_codex(
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
     let launch_options = CodexLaunchOptions::new(prompt)
         .with_resume_session_id(session_id)
+        .with_developer_instructions(developer_instructions)
         .with_model(model)
         .with_reasoning_effort(codex_reasoning_effort_from_env().as_deref())
         .with_compact_token_limit(compact_token_limit)
@@ -2816,6 +2870,23 @@ mod tui_hosting_tests {
     }
 
     #[test]
+    fn codex_tui_resume_args_reject_flag_like_session_id() {
+        let args = base_tui_args(
+            Some("--config"),
+            "fresh prompt",
+            Some("gpt-5-codex"),
+            Some("high"),
+            false,
+            Some(true),
+            None,
+        );
+
+        assert!(!args.iter().any(|arg| arg == "resume"));
+        assert!(!args.iter().any(|arg| arg == "--config"));
+        assert_eq!(args.last().map(String::as_str), Some("fresh prompt"));
+    }
+
+    #[test]
     fn codex_tui_config_overrides_are_inserted_before_prompt_delimiter() {
         let mut args = base_tui_args(
             None,
@@ -2920,6 +2991,7 @@ mod tui_hosting_tests {
             "/opt/bin/codex",
             Some("gpt-5-codex"),
             Some("thread-123"),
+            Some("developer rules"),
             Some(120_000),
             Some(false),
             Some(true),
@@ -2932,6 +3004,8 @@ mod tui_hosting_tests {
         assert!(script.contains("'gpt-5-codex'"));
         assert!(script.contains("'--resume-session-id'"));
         assert!(script.contains("'thread-123'"));
+        assert!(script.contains("'--developer-instructions'"));
+        assert!(script.contains("'developer rules'"));
         assert!(script.contains("'--compact-token-limit'"));
         assert!(script.contains("'120000'"));
         assert!(!script.contains("exec '/opt/bin/codex' "));
@@ -2985,7 +3059,8 @@ mod tests {
 
     use super::{
         CODEX_BACKGROUND_TASK_NOTIFICATION_ID, CODEX_BACKGROUND_TASK_NOTIFICATION_STATUS,
-        TMUX_PROMPT_B64_PREFIX, base_exec_args, build_tmux_launch_env_lines, compose_codex_prompt,
+        CodexLaunchOptions, TMUX_PROMPT_B64_PREFIX, base_exec_args, build_codex_exec_args,
+        build_tmux_launch_env_lines, compose_codex_developer_instructions, compose_codex_prompt,
         handle_codex_json_line, should_reuse_existing_provider_session,
     };
     use crate::services::agent_protocol::StreamMessage;
@@ -3092,18 +3167,37 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_codex_prompt_includes_authoritative_sections() {
+    fn test_compose_codex_prompt_keeps_authoritative_sections_out_of_user_prompt() {
         let prompt = compose_codex_prompt(
             "role과 mission만 답해줘.",
             Some("role: PMD\nmission: 백로그 관리"),
             Some(&["Bash".to_string(), "Read".to_string()]),
         );
 
-        assert!(prompt.contains("[Authoritative Instructions]"));
-        assert!(prompt.contains("role: PMD"));
-        assert!(!prompt.contains("[Tool Policy]"));
-        assert!(!prompt.contains("Bash, Read"));
-        assert!(prompt.contains("[User Request]\nrole과 mission만 답해줘."));
+        assert_eq!(prompt, "role과 mission만 답해줘.");
+        assert!(!prompt.contains("[Authoritative Instructions]"));
+        assert!(!prompt.contains("role: PMD"));
+    }
+
+    #[test]
+    fn codex_launch_options_put_adk_instructions_in_developer_config() {
+        let developer_instructions =
+            compose_codex_developer_instructions(Some("role: PMD\nmission: 백로그 관리"), None)
+                .unwrap();
+        let args = build_codex_exec_args(
+            &CodexLaunchOptions::new("role과 mission만 답해줘.")
+                .with_developer_instructions(Some(&developer_instructions))
+                .with_model(Some("gpt-5-codex")),
+        );
+
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "-c"
+                && pair[1].starts_with("developer_instructions=")
+                && pair[1].contains("role: PMD")
+        }));
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args[separator + 1], "role과 mission만 답해줘.");
+        assert!(!args[separator + 1].contains("[Authoritative Instructions]"));
     }
 
     #[test]

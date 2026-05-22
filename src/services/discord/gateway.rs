@@ -39,6 +39,14 @@ pub(super) trait TurnGateway: Send + Sync {
         content: &'a str,
     ) -> GatewayFuture<'a, Result<(), String>>;
 
+    fn delete_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     fn replace_message_with_outcome<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -311,7 +319,7 @@ fn parse_channel_id(
 fn dispatch_post_error(
     error: serenity::Error,
 ) -> crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError {
-    let detail = error.to_string();
+    let detail = crate::utils::redact::redact_known_secrets(&error.to_string());
     let lowered = detail.to_ascii_lowercase();
     let kind = if detail.contains("BASE_TYPE_MAX_LENGTH")
         || lowered.contains("2000 or fewer in length")
@@ -476,6 +484,20 @@ impl TurnGateway for DiscordGateway {
             )
             .await
             .map_err(|e| e.to_string())
+        })
+    }
+
+    fn delete_message<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            rate_limit_wait(&self.shared, channel_id).await;
+            channel_id
+                .delete_message(&self.http, message_id)
+                .await
+                .map_err(|e| e.to_string())
         })
     }
 
@@ -712,6 +734,14 @@ impl TurnGateway for HeadlessGateway {
         _content: &'a str,
     ) -> GatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
         Box::pin(async move { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+    }
+
+    fn delete_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
     }
 
     fn add_reaction<'a>(

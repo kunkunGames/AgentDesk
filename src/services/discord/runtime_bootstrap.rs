@@ -2229,8 +2229,38 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         }
     });
 
-    if let Err(e) = client.start().await {
-        tracing::warn!("  ✗ {} bot error: {e}", provider_for_error.display_name());
+    let gateway_backend_task = tokio::spawn(async move { client.start().await });
+    let gateway_backend_failed = match gateway_backend_task.await {
+        Ok(Ok(())) => {
+            tracing::warn!(
+                "  ✗ {} gateway backend exited without error",
+                provider_for_error.display_name()
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                "  ✗ {} bot error: {error}",
+                provider_for_error.display_name()
+            );
+            true
+        }
+        Err(join_error) if join_error.is_panic() => {
+            tracing::error!(
+                "  ✗ {} gateway backend task panicked: {join_error}",
+                provider_for_error.display_name()
+            );
+            true
+        }
+        Err(join_error) => {
+            tracing::warn!(
+                "  ✗ {} gateway backend task ended unexpectedly: {join_error}",
+                provider_for_error.display_name()
+            );
+            true
+        }
+    };
+    if gateway_backend_failed {
         run_startup_diagnostic_after_reconcile_barrier(
             startup_reconcile_remaining_for_client_start,
             startup_doctor_started_for_client_start,

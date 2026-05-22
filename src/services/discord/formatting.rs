@@ -2078,7 +2078,9 @@ pub(super) fn format_for_discord_with_provider(
     s: &str,
     provider: &crate::services::provider::ProviderKind,
 ) -> String {
-    let sanitized = super::response_sanitizer::sanitize_hidden_context(s);
+    let sanitized = super::response_sanitizer::strip_leading_tui_response_chrome(
+        &super::response_sanitizer::sanitize_hidden_context(s),
+    );
     let filtered;
     let input = if matches!(provider, crate::services::provider::ProviderKind::Codex) {
         filtered = filter_codex_tool_logs(&sanitized);
@@ -2095,7 +2097,9 @@ pub(super) fn format_for_discord_with_status_panel(
     s: &str,
     provider: &crate::services::provider::ProviderKind,
 ) -> String {
-    let sanitized = super::response_sanitizer::sanitize_hidden_context(s);
+    let sanitized = super::response_sanitizer::strip_leading_tui_response_chrome(
+        &super::response_sanitizer::sanitize_hidden_context(s),
+    );
     let filtered;
     let input = if matches!(provider, crate::services::provider::ProviderKind::Codex) {
         filtered = strip_codex_tool_log_lines(&sanitized);
@@ -2148,6 +2152,20 @@ mod status_panel_v2_formatter_tests {
         let input = "Final answer\n\n⠋ Processing...";
         let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
         assert_eq!(output, "Final answer");
+    }
+
+    #[test]
+    fn format_for_discord_removes_leading_tui_no_response_chrome() {
+        let input = "No response requested.\n\nFinal answer";
+        let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
+        assert_eq!(output, "Final answer");
+    }
+
+    #[test]
+    fn format_for_discord_preserves_legitimate_no_response_sentence() {
+        let input = "No response requested. But here is the explanation.";
+        let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
+        assert_eq!(output, input);
     }
 
     #[test]

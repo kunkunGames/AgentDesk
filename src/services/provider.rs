@@ -1,7 +1,8 @@
 use crate::services::platform::BinaryResolution;
 use crate::utils::format::safe_prefix;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 /// Tmux session name prefix — always "AgentDesk".
 pub const TMUX_SESSION_PREFIX: &str = "AgentDesk";
@@ -1440,6 +1441,54 @@ pub fn register_child_pid(token: Option<&CancelToken>, child_pid: u32) {
     if let Some(token) = token {
         *token.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(child_pid);
     }
+}
+
+pub struct CancelWatchdog {
+    done: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CancelWatchdog {
+    fn new(done: Arc<AtomicBool>, handle: JoinHandle<()>) -> Self {
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for CancelWatchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub fn spawn_cancel_watchdog(
+    token: Option<Arc<CancelToken>>,
+    child_pid: u32,
+    label: &'static str,
+) -> Option<CancelWatchdog> {
+    let token = token?;
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_thread = done.clone();
+    let handle = std::thread::spawn(move || {
+        while !done_for_thread.load(Ordering::Relaxed) {
+            if token.cancelled.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    provider_cancel_watchdog = label,
+                    child_pid,
+                    "cancel watchdog killing provider process tree"
+                );
+                crate::services::process::kill_pid_tree(child_pid);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    Some(CancelWatchdog::new(done, handle))
 }
 
 /// Result from reading a provider session output stream until completion or session death.

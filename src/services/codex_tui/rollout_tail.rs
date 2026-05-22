@@ -210,6 +210,12 @@ struct RolloutParseState {
     /// Turn-local launch prompt used to suppress the first matching rollout
     /// user message even when the global pending TTL has elapsed.
     discord_origin_prompt: Option<String>,
+    /// Prevents one warning per drain tick while a modern Codex TUI rollout
+    /// is waiting for the explicit turn-completion envelope. Modern TUI panes
+    /// can briefly resemble an input-ready composer between model/tool phases,
+    /// so the drain heuristic must not close the Discord turn while the pane
+    /// is still alive.
+    heuristic_finalize_waiting_for_completion_logged: bool,
 }
 
 impl RolloutParseState {
@@ -885,19 +891,22 @@ fn tail_rollout_file_until_assistant_response(
                     if effective_drain.is_zero()
                         || last_output_at.is_some_and(|at| at.elapsed() >= effective_drain)
                     {
-                        emit_done(
-                            &sender,
-                            &state,
-                            RolloutFinalizePath::Heuristic,
-                            rollout_path,
-                            current_offset,
-                        );
-                        return Ok((
-                            ReadOutputResult::Completed {
-                                offset: current_offset,
-                            },
-                            outcome(&state, current_offset),
-                        ));
+                        if heuristic_finalize_allowed(&mut state, rollout_path, current_offset) {
+                            emit_done(
+                                &sender,
+                                &state,
+                                RolloutFinalizePath::Heuristic,
+                                rollout_path,
+                                current_offset,
+                            );
+                            return Ok((
+                                ReadOutputResult::Completed {
+                                    offset: current_offset,
+                                },
+                                outcome(&state, current_offset),
+                            ));
+                        }
+                        last_output_at = Some(Instant::now());
                     }
                 }
                 // #2419 follow-up (Codex review HIGH): bounded recovery for
@@ -1231,6 +1240,30 @@ fn explicit_finalize_path(
     Some(RolloutFinalizePath::Envelope)
 }
 
+fn heuristic_finalize_allowed(
+    state: &mut RolloutParseState,
+    rollout_path: &Path,
+    offset: u64,
+) -> bool {
+    let Some(tmux_session_name) = state.tmux_session_name.as_deref() else {
+        return true;
+    };
+    if !state.seen_any_event_msg {
+        return true;
+    }
+
+    if !state.heuristic_finalize_waiting_for_completion_logged {
+        tracing::warn!(
+            rollout_path = %rollout_path.display(),
+            offset,
+            tmux_session_name,
+            "codex rollout heuristic Done deferred until explicit modern TUI completion"
+        );
+        state.heuristic_finalize_waiting_for_completion_logged = true;
+    }
+    false
+}
+
 fn emit_done(
     sender: &RelaySuppressionSender<'_>,
     state: &RolloutParseState,
@@ -1374,7 +1407,7 @@ fn response_item_messages(json: &Value, state: &mut RolloutParseState) -> Vec<St
     };
     match payload.get("type").and_then(Value::as_str).unwrap_or("") {
         "message" => response_message_items(payload, state),
-        "function_call" | "custom_tool_call" => {
+        "function_call" | "custom_tool_call" | "tool_search_call" => {
             // #2419: a tool call has started — suppress terminal_drain Done
             // until the matching output line arrives. Track by `call_id` so
             // that concurrent tool calls all hold the gate open until each
@@ -1398,7 +1431,7 @@ fn response_item_messages(json: &Value, state: &mut RolloutParseState) -> Vec<St
             state.lifecycle_activity = true;
             tool_call_message(payload).into_iter().collect()
         }
-        "function_call_output" | "custom_tool_call_output" => {
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
             // #2419: tool call resolved — release that specific call's hold
             // on the drain gate. Other pending calls (if any) keep it shut.
             // Saturating sub on the unkeyed counter tolerates start-mid-turn
@@ -2346,6 +2379,80 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
             "segment2 must be emitted after the tool call resolves; got {:?}",
+            messages
+        );
+        assert!(matches!(
+            messages.last(),
+            Some(StreamMessage::Done { result, .. })
+                if result.contains("segment1") && result.contains("segment2")
+        ));
+    }
+
+    #[test]
+    fn tool_search_pause_does_not_emit_premature_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let prefix = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"tool-search-pause\",\"cwd\":\"{}\"}}}}\n",
+            cwd.path().display()
+        );
+        let rollout = dir.path().join("rollout-tool-search-pause.jsonl");
+        std::fs::write(&rollout, &prefix).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        file.write_all(
+            br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"segment1"}]}}
+{"type":"response_item","payload":{"type":"tool_search_call","call_id":"search-1","status":"in_progress"}}
+"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let (tx, rx) = mpsc::channel();
+        let tail_path = rollout.clone();
+        let handle = std::thread::spawn(move || {
+            tail_rollout_file_until_assistant_response(
+                &tail_path,
+                0,
+                None,
+                &tx,
+                None,
+                || true,
+                Duration::from_millis(150),
+                Some(Duration::from_secs(10)),
+                None,
+                true,
+                None,
+                true,
+                None,
+                None,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        file.write_all(
+            br#"{"type":"response_item","payload":{"type":"tool_search_output","call_id":"search-1","status":"completed"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"segment2"}]}}
+"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let (result, _outcome) = handle.join().unwrap().unwrap();
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        let messages: Vec<_> = rx.iter().collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            "segment2 must be emitted after the tool_search output resolves; got {:?}",
             messages
         );
         assert!(matches!(
@@ -3363,6 +3470,144 @@ mod tests {
             messages.last(),
             Some(StreamMessage::Done { result, .. }) if result == "modern"
         ));
+    }
+
+    #[test]
+    fn modern_tmux_heuristic_waits_for_explicit_completion() {
+        let mut modern_tmux = RolloutParseState {
+            tmux_session_name: Some("agentdesk-codex-modern".to_string()),
+            seen_any_event_msg: true,
+            ..RolloutParseState::default()
+        };
+        assert!(!heuristic_finalize_allowed(
+            &mut modern_tmux,
+            Path::new("rollout-modern.jsonl"),
+            42
+        ));
+        assert!(modern_tmux.heuristic_finalize_waiting_for_completion_logged);
+
+        let mut legacy_tmux = RolloutParseState {
+            tmux_session_name: Some("agentdesk-codex-legacy".to_string()),
+            seen_any_event_msg: false,
+            ..RolloutParseState::default()
+        };
+        assert!(heuristic_finalize_allowed(
+            &mut legacy_tmux,
+            Path::new("rollout-legacy.jsonl"),
+            42
+        ));
+
+        let mut replay = RolloutParseState {
+            seen_any_event_msg: true,
+            ..RolloutParseState::default()
+        };
+        assert!(heuristic_finalize_allowed(
+            &mut replay,
+            Path::new("rollout-replay.jsonl"),
+            42
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modern_tmux_rollout_does_not_done_while_pane_still_working() {
+        if !std::process::Command::new("tmux")
+            .arg("-V")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
+        let session = format!(
+            "agentdesk-codex-rollout-busy-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let started = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "printf 'Working\\n'; sleep 60",
+            ])
+            .status()
+            .is_ok_and(|status| status.success());
+        if !started {
+            return;
+        }
+
+        struct KillTmuxSession(String);
+        impl Drop for KillTmuxSession {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &self.0])
+                    .status();
+            }
+        }
+        let _guard = KillTmuxSession(session.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-modern-busy.jsonl");
+        std::fs::write(
+            &rollout,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"modern-busy","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"output_tokens":1}}}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"progress only"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let path = rollout.clone();
+        let tail_session = session.clone();
+        let handle = std::thread::spawn(move || {
+            tail_rollout_file_until_assistant_response(
+                &path,
+                0,
+                None,
+                &tx,
+                None,
+                || true,
+                Duration::from_millis(100),
+                Some(Duration::from_secs(30)),
+                None,
+                true,
+                None,
+                true,
+                Some(tail_session),
+                None,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(450));
+        assert!(
+            !handle.is_finished(),
+            "modern tmux tail must not emit heuristic Done while the pane is still busy"
+        );
+        assert!(
+            rx.try_iter()
+                .all(|message| !matches!(message, StreamMessage::Done { .. })),
+            "busy-pane drain must not emit Done before an explicit completion signal"
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        file.write_all(
+            br#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"progress only"}}
+"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let (result, _outcome) = handle.join().unwrap().unwrap();
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
     }
 
     #[test]

@@ -171,9 +171,13 @@ pub(in crate::services::discord) fn process_watcher_lines(
 
         // Parse the JSON line
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if outcome.soft_terminal_candidate && event_type == "user" {
+                buffer.insert_str(0, &line);
+                break;
+            }
             observe_stream_context(&val, state);
             tool_state.record_placeholder_events_from_json(&val);
-            let event_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
             match event_type {
                 "assistant" => {
                     if let Some(message) = val.get("message") {
@@ -422,7 +426,9 @@ pub(in crate::services::discord) fn process_watcher_lines(
                     }
 
                     state.final_result = Some(String::new());
+                    strip_leading_tui_response_chrome_in_place(full_response, &mut outcome);
                     outcome.found_result = true;
+                    outcome.terminal_kind = Some(WatcherTerminalKind::HardResult);
                     // #1216: stop after the first turn-terminating event so a
                     // buffer containing multiple completed turns (post-deploy
                     // backlog, paused watcher resume) does not merge their
@@ -466,12 +472,11 @@ pub(in crate::services::discord) fn process_watcher_lines(
                                 classify_task_notification_kind(&val, state),
                             );
                         }
-                        // #2110: Claude TUI transcript signals end-of-turn
-                        // via `stop_hook_summary` instead of `type=result`.
-                        // Treat it as the turn terminator so the watcher
-                        // flushes accumulated `assistant.content[].text` to
-                        // Discord for monitor auto-restart turns and direct
-                        // tmux-typed user turns under the TUI driver.
+                        // #2110/#relay-commit: Claude TUI transcript can
+                        // emit `stop_hook_summary` before late assistant text.
+                        // Treat it as a soft terminal candidate only; the
+                        // watcher commits after readiness/quiescence or a
+                        // debounce, while hard `result` remains immediate.
                         if subtype == "stop_hook_summary" {
                             if let Some(session_id) = val
                                 .get("session_id")
@@ -480,12 +485,9 @@ pub(in crate::services::discord) fn process_watcher_lines(
                             {
                                 state.last_session_id = Some(session_id.to_string());
                             }
-                            state.final_result = Some(String::new());
-                            outcome.found_result = true;
-                            // #1216: stop after the first turn-terminating
-                            // event so a buffer with multiple completed turns
-                            // does not merge them into a single `full_response`.
-                            break;
+                            strip_leading_tui_response_chrome_in_place(full_response, &mut outcome);
+                            outcome.soft_terminal_candidate = true;
+                            outcome.terminal_kind = Some(WatcherTerminalKind::SoftStopHookSummary);
                         }
                     }
                 }
@@ -493,6 +495,7 @@ pub(in crate::services::discord) fn process_watcher_lines(
             }
         } else if is_auth_error_message(trimmed) {
             outcome.found_result = true;
+            outcome.terminal_kind = Some(WatcherTerminalKind::AuthError);
             outcome.is_auth_error = true;
             outcome
                 .auth_error_message
@@ -513,6 +516,7 @@ pub(in crate::services::discord) fn process_watcher_lines(
             break;
         } else if let Some(message) = detect_provider_overload_message(trimmed) {
             outcome.found_result = true;
+            outcome.terminal_kind = Some(WatcherTerminalKind::ProviderOverload);
             outcome.is_provider_overloaded = true;
             outcome.provider_overload_message.get_or_insert(message);
             push_transcript_event(
@@ -533,6 +537,22 @@ pub(in crate::services::discord) fn process_watcher_lines(
     }
 
     outcome
+}
+
+fn strip_leading_tui_response_chrome_in_place(
+    full_response: &mut String,
+    outcome: &mut WatcherLineOutcome,
+) {
+    let cleaned = crate::services::discord::response_sanitizer::strip_leading_tui_response_chrome(
+        full_response,
+    );
+    if cleaned != *full_response {
+        full_response.clear();
+        full_response.push_str(&cleaned);
+        if full_response.trim().is_empty() {
+            outcome.assistant_text_seen = false;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -560,17 +580,41 @@ mod tests {
         );
     }
 
-    /// #2110: Claude TUI transcript jsonl uses `system/stop_hook_summary`
-    /// instead of `type=result` to terminate a turn. The watcher must treat
-    /// it as a turn-terminator so accumulated `assistant.content[].text` is
-    /// flushed to Discord for monitor auto-restart turns and direct
-    /// tmux-typed user turns.
+    /// #2110/#relay-commit: Claude TUI transcript jsonl can emit
+    /// `system/stop_hook_summary` before late assistant text. It must remain
+    /// a soft candidate so the watcher can debounce/readiness-confirm before
+    /// committing the terminal relay.
     #[test]
-    fn process_watcher_lines_treats_stop_hook_summary_as_turn_terminator() {
+    fn process_watcher_lines_treats_stop_hook_summary_as_soft_terminal_candidate() {
         let mut buffer = concat!(
             "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"tui reply\"}]},\"sessionId\":\"sess-tui\"}\n",
             "{\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"sessionId\":\"sess-tui\",\"hookCount\":1,\"hasOutput\":true}\n",
-            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"next turn\"}]},\"sessionId\":\"sess-tui\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\" late tail\"}]},\"sessionId\":\"sess-tui\"}\n",
+        )
+        .to_string();
+        let mut state = StreamLineState::new();
+        let mut full_response = String::new();
+        let mut tool_state = WatcherToolState::new();
+
+        let outcome =
+            process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
+
+        assert!(!outcome.found_result);
+        assert!(outcome.soft_terminal_candidate);
+        assert_eq!(
+            outcome.terminal_kind,
+            Some(WatcherTerminalKind::SoftStopHookSummary)
+        );
+        assert_eq!(full_response, "tui reply late tail");
+        assert_eq!(state.last_session_id.as_deref(), Some("sess-tui"));
+        assert!(buffer.trim().is_empty());
+    }
+
+    #[test]
+    fn process_watcher_lines_strips_leading_tui_no_response_before_result() {
+        let mut buffer = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No response requested.\\n\\nreal answer\"}]},\"sessionId\":\"sess-tui\"}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\",\"session_id\":\"sess-tui\"}\n",
         )
         .to_string();
         let mut state = StreamLineState::new();
@@ -581,10 +625,45 @@ mod tests {
             process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
 
         assert!(outcome.found_result);
-        assert_eq!(full_response, "tui reply");
-        assert_eq!(state.last_session_id.as_deref(), Some("sess-tui"));
-        // #1216: stop after first terminator; the next turn's assistant
-        // line must remain in the buffer for the next watcher tick.
-        assert!(buffer.contains("next turn"));
+        assert!(outcome.assistant_text_seen);
+        assert_eq!(full_response, "real answer");
+    }
+
+    #[test]
+    fn process_watcher_lines_suppresses_pure_tui_no_response() {
+        let mut buffer = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No response requested.\"}]},\"sessionId\":\"sess-tui\"}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\",\"session_id\":\"sess-tui\"}\n",
+        )
+        .to_string();
+        let mut state = StreamLineState::new();
+        let mut full_response = String::new();
+        let mut tool_state = WatcherToolState::new();
+
+        let outcome =
+            process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
+
+        assert!(outcome.found_result);
+        assert!(!outcome.assistant_text_seen);
+        assert!(full_response.is_empty());
+    }
+
+    #[test]
+    fn process_watcher_lines_strips_tui_no_response_before_stop_hook_summary() {
+        let mut buffer = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"No response requested.\\n\\nssh direct answer\"}]},\"sessionId\":\"sess-tui\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"sessionId\":\"sess-tui\",\"hookCount\":1,\"hasOutput\":true}\n",
+        )
+        .to_string();
+        let mut state = StreamLineState::new();
+        let mut full_response = String::new();
+        let mut tool_state = WatcherToolState::new();
+
+        let outcome =
+            process_watcher_lines(&mut buffer, &mut state, &mut full_response, &mut tool_state);
+
+        assert!(!outcome.found_result);
+        assert!(outcome.soft_terminal_candidate);
+        assert_eq!(full_response, "ssh direct answer");
     }
 }

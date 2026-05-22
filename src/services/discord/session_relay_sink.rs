@@ -18,7 +18,9 @@ use super::health::HealthRegistry;
 use super::inflight::{InflightTurnState, RelayOwnerKind};
 use super::tmux::{WatcherToolState, process_watcher_lines};
 use crate::services::agent_protocol::TaskNotificationKind;
-use crate::services::cluster::stream_relay::{RelaySink, RelaySinkError, StreamFrame};
+use crate::services::cluster::stream_relay::{
+    RelaySink, RelaySinkError, RelaySinkOutcome, StreamFrame,
+};
 use crate::services::cluster::watcher_supervisor::{SupervisorConfig, run_watcher_supervisor_loop};
 use crate::services::provider::ProviderKind;
 use crate::services::session_backend::StreamLineState;
@@ -72,6 +74,22 @@ fn session_bound_terminal_delivery_route(
     Some(SessionBoundTerminalDeliveryRoute::NewMessage)
 }
 
+fn session_bound_terminal_delivery_route_or_error(
+    inflight: Option<&InflightTurnState>,
+    tmux_session_name: &str,
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Result<SessionBoundTerminalDeliveryRoute, RelaySinkError> {
+    session_bound_terminal_delivery_route(inflight, tmux_session_name).ok_or_else(|| {
+        RelaySinkError::Transient(format!(
+            "session-bound terminal delivery route skipped for provider={} channel={} tmux_session={}",
+            provider.as_str(),
+            channel_id,
+            tmux_session_name
+        ))
+    })
+}
+
 pub(in crate::services::discord) struct SessionBoundDiscordRelaySink {
     health_registry: Arc<HealthRegistry>,
     frames_total: AtomicU64,
@@ -100,6 +118,15 @@ impl SessionBoundDiscordRelaySink {
             .ingest_frame(frame)
     }
 
+    fn finish_terminal_candidate(&self, session_name: &str) {
+        let Ok(mut sessions) = self.by_session.lock() else {
+            return;
+        };
+        if let Some(parser) = sessions.get_mut(session_name) {
+            parser.reset_turn();
+        }
+    }
+
     async fn deliver_response(&self, delivery: SessionRelayDelivery) -> Result<(), RelaySinkError> {
         let channel_id = delivery.channel_id;
         let provider = delivery.provider;
@@ -121,16 +148,24 @@ impl SessionBoundDiscordRelaySink {
         })?;
 
         let inflight = super::inflight::load_inflight_state(&provider, channel_id);
-        let route =
-            session_bound_terminal_delivery_route(inflight.as_ref(), &delivery.session_name);
-        let Some(route) = route else {
-            tracing::debug!(
-                provider = provider.as_str(),
-                channel = channel_id,
-                tmux_session = %delivery.session_name,
-                "session-bound relay sink skipped bridge-owned or mismatched inflight"
-            );
-            return Ok(());
+        let route = match session_bound_terminal_delivery_route_or_error(
+            inflight.as_ref(),
+            &delivery.session_name,
+            &provider,
+            channel_id,
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                let error_message = error.to_string();
+                tracing::debug!(
+                    provider = provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %delivery.session_name,
+                        error = %error_message,
+                        "session-bound relay sink skipped bridge-owned or mismatched inflight"
+                );
+                return Err(error);
+            }
         };
 
         let formatted = if shared.status_panel_v2_enabled {
@@ -167,6 +202,11 @@ impl SessionBoundDiscordRelaySink {
                         chars = relay_text.chars().count(),
                         "session-bound relay sink delivered terminal response via placeholder edit"
                     );
+                    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                        provider.as_str(),
+                        &delivery.session_name,
+                        channel_id,
+                    );
                     Ok(())
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
@@ -186,6 +226,11 @@ impl SessionBoundDiscordRelaySink {
                         chars = relay_text.chars().count(),
                         error = %edit_error,
                         "session-bound relay sink delivered terminal response via fallback; preserving original msg_id (#2757)"
+                    );
+                    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                        provider.as_str(),
+                        &delivery.session_name,
+                        channel_id,
                     );
                     Ok(())
                 }
@@ -214,6 +259,11 @@ impl SessionBoundDiscordRelaySink {
                 clear_ssh_direct_prompt_anchor(&provider, &delivery.session_name, prompt_anchor);
             }
             self.delivered_total.fetch_add(1, Ordering::AcqRel);
+            crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                provider.as_str(),
+                &delivery.session_name,
+                channel_id,
+            );
             tracing::info!(
                 provider = provider.as_str(),
                 channel = channel_id,
@@ -230,12 +280,27 @@ impl SessionBoundDiscordRelaySink {
 
 #[async_trait]
 impl RelaySink for SessionBoundDiscordRelaySink {
-    async fn deliver(&self, frame: &StreamFrame) -> Result<(), RelaySinkError> {
+    async fn deliver(&self, frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
         let deliveries = self.ingest_frame(frame);
+        let mut terminal_committed = false;
         for delivery in deliveries {
-            self.deliver_response(delivery).await?;
+            let session_name = delivery.session_name.clone();
+            match self.deliver_response(delivery).await {
+                Ok(()) => {
+                    terminal_committed = true;
+                    self.finish_terminal_candidate(&session_name);
+                }
+                Err(error) => {
+                    self.finish_terminal_candidate(&session_name);
+                    return Err(error);
+                }
+            }
         }
-        Ok(())
+        if terminal_committed {
+            Ok(RelaySinkOutcome::TerminalCommitted)
+        } else {
+            Ok(RelaySinkOutcome::FrameAccepted)
+        }
     }
 }
 
@@ -329,8 +394,10 @@ impl SessionRelayParser {
                     response_text: self.full_response.clone(),
                     task_notification_kind: self.task_notification_kind,
                 });
+                break;
+            } else {
+                self.reset_turn();
             }
-            self.reset_turn();
             if self.buffer.trim().is_empty() {
                 break;
             }
@@ -542,6 +609,28 @@ mod tests {
             session_bound_terminal_delivery_route(Some(&watcher_owned), "AgentDesk-claude-other"),
             None
         );
+    }
+
+    #[test]
+    fn terminal_delivery_route_skip_is_sink_error_for_ack_fallback() {
+        let tmux = "AgentDesk-claude-relay-test";
+        let bridge_owned = inflight_for(tmux, RelayOwnerKind::None, false);
+        let result = session_bound_terminal_delivery_route_or_error(
+            Some(&bridge_owned),
+            tmux,
+            &ProviderKind::Claude,
+            42,
+        );
+        assert!(matches!(result, Err(RelaySinkError::Transient(_))));
+
+        let watcher_owned = inflight_for(tmux, RelayOwnerKind::Watcher, false);
+        let result = session_bound_terminal_delivery_route_or_error(
+            Some(&watcher_owned),
+            "AgentDesk-claude-other",
+            &ProviderKind::Claude,
+            42,
+        );
+        assert!(matches!(result, Err(RelaySinkError::Transient(_))));
     }
 
     #[test]

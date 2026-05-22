@@ -15,7 +15,7 @@ use crate::services::discord::restart_report::{
 use crate::services::process::{kill_child_tree, kill_pid_tree, shell_escape};
 use crate::services::provider::{
     CancelToken, ProviderKind, ReadOutputResult, SessionProbe, cancel_requested,
-    fold_read_output_result, register_child_pid,
+    fold_read_output_result, register_child_pid, spawn_cancel_watchdog,
 };
 use crate::services::provider_hosting::ProviderSessionDriver;
 use crate::services::remote::RemoteProfile;
@@ -960,6 +960,8 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Store child PID in cancel token so the caller can kill it externally
     register_child_pid(cancel_token.as_deref(), child.id());
+    let _cancel_watchdog =
+        spawn_cancel_watchdog(cancel_token.clone(), child.id(), "claude-direct-stream");
 
     // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
@@ -2321,6 +2323,10 @@ fn execute_streaming_local_tui_tmux(
 
     crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
     write_tmux_owner_marker(tmux_session_name)?;
+    crate::services::tmux_common::write_tmux_runtime_kind_marker(
+        tmux_session_name,
+        crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+    )?;
     let owner_path = tmux_owner_path(tmux_session_name);
     let mut prepared_session_files = None;
     let launch_result = (|| -> Result<std::process::Output, String> {
@@ -2972,6 +2978,10 @@ fn execute_streaming_local_tmux(
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
     write_tmux_owner_marker(tmux_session_name)?;
+    crate::services::tmux_common::write_tmux_runtime_kind_marker(
+        tmux_session_name,
+        crate::services::agent_protocol::RuntimeHandoffKind::LegacyTmuxWrapper,
+    )?;
 
     // Get paths
     let exe =
@@ -3973,6 +3983,8 @@ mod tests {
         assert!(is_valid_session_id("abc123"));
         assert!(is_valid_session_id("session-1"));
         assert!(is_valid_session_id("session_2"));
+        assert!(is_valid_session_id("session.3"));
+        assert!(is_valid_session_id("session:4"));
         assert!(is_valid_session_id("ABC-XYZ_123"));
         assert!(is_valid_session_id("a")); // Single char
     }
@@ -4003,7 +4015,9 @@ mod tests {
         assert!(!is_valid_session_id("session\0null"));
         assert!(!is_valid_session_id("path/traversal"));
         assert!(!is_valid_session_id("session with space"));
-        assert!(!is_valid_session_id("session.dot"));
+        assert!(!is_valid_session_id("-config"));
+        assert!(!is_valid_session_id("--resume-session-id"));
+        assert!(!is_valid_session_id("_leading_underscore"));
         assert!(!is_valid_session_id("session@email"));
     }
 

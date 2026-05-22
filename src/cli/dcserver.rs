@@ -980,7 +980,7 @@ pub fn handle_dcserver(token: Option<String>) {
         }
     }
 
-    if let Err(error) = crate::logging::init_tracing() {
+    if let Err(error) = crate::logging::init_dcserver_tracing() {
         eprintln!("  ✖ Failed to initialize tracing: {error}");
         std::process::exit(1);
     }

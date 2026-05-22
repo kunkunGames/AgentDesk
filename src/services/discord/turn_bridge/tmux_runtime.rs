@@ -942,11 +942,14 @@ pub(crate) fn tmux_runtime_paths(tmux_session_name: &str) -> (String, String) {
 }
 
 pub(in crate::services::discord) fn stale_inflight_message(saved_response: &str) -> String {
-    let trimmed = saved_response.trim();
-    if trimmed.is_empty() {
+    let cleaned = crate::services::discord::response_sanitizer::strip_leading_tui_response_chrome(
+        saved_response.trim(),
+    );
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
         "⚠️ AgentDesk가 재시작되어 진행 중이던 응답을 이어붙이지 못했습니다.".to_string()
     } else {
-        let formatted = format_for_discord(trimmed);
+        let formatted = format_for_discord(cleaned);
         format!("{formatted}\n\n[Interrupted by restart]")
     }
 }
@@ -955,21 +958,24 @@ pub(in crate::services::discord) fn handoff_interrupted_message(
     restart_mode: InflightRestartMode,
     saved_response: &str,
 ) -> String {
-    let trimmed = saved_response.trim();
+    let cleaned = crate::services::discord::response_sanitizer::strip_leading_tui_response_chrome(
+        saved_response.trim(),
+    );
+    let cleaned = cleaned.trim();
     match restart_mode {
         InflightRestartMode::DrainRestart => {
-            if trimmed.is_empty() {
+            if cleaned.is_empty() {
                 "⚠️ dcserver 재시작 중이던 turn을 다시 붙이지 못했습니다. 다음 메시지부터 새 turn으로 이어갑니다.".to_string()
             } else {
-                let formatted = format_for_discord(trimmed);
+                let formatted = format_for_discord(cleaned);
                 format!("{formatted}\n\n[Restart handoff incomplete]")
             }
         }
         InflightRestartMode::HotSwapHandoff => {
-            if trimmed.is_empty() {
+            if cleaned.is_empty() {
                 "⚠️ 런타임 handoff 중 세션 재연결이 완료되지 않았습니다. 다음 메시지부터 새 turn으로 이어갑니다.".to_string()
             } else {
-                let formatted = format_for_discord(trimmed);
+                let formatted = format_for_discord(cleaned);
                 format!("{formatted}\n\n[Runtime handoff incomplete]")
             }
         }
@@ -1008,6 +1014,24 @@ mod tests {
         assert!(partial.contains("partial response"));
         assert!(partial.contains("[Interrupted by restart]"));
         assert!(!partial.contains("[재시작 후 복구 진행 중]"));
+    }
+
+    #[test]
+    fn stale_and_handoff_messages_strip_tui_no_response_chrome() {
+        let stale = stale_inflight_message("No response requested.\n\npartial response");
+        assert!(stale.contains("partial response"));
+        assert!(!stale.contains("No response requested."));
+
+        let stale_empty = stale_inflight_message("No response requested.");
+        assert!(stale_empty.contains("이어붙이지 못했습니다"));
+        assert!(!stale_empty.contains("[Interrupted by restart]"));
+
+        let handoff = handoff_interrupted_message(
+            InflightRestartMode::HotSwapHandoff,
+            "No response requested.\n\nhandoff response",
+        );
+        assert!(handoff.contains("handoff response"));
+        assert!(!handoff.contains("No response requested."));
     }
 
     #[test]

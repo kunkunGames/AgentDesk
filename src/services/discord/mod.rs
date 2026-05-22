@@ -64,6 +64,7 @@ pub(crate) mod settings;
 pub(crate) mod shared_memory;
 mod stall_recovery;
 pub(in crate::services::discord) mod streaming_finalizer;
+pub(in crate::services::discord) mod task_supervisor;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]
@@ -1060,6 +1061,22 @@ impl TmuxWatcherRegistry {
         self.by_tmux_session
             .remove(tmux_session_name)
             .map(|(_, handle)| (owner_channel_id, handle))
+    }
+
+    pub(super) fn remove_tmux_session_if_current(
+        &self,
+        tmux_session_name: &str,
+        expected_cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<(ChannelId, TmuxWatcherHandle)> {
+        let guard = lock_tmux_watcher_registry();
+        let is_current = self
+            .by_tmux_session
+            .get(tmux_session_name)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.cancel, expected_cancel));
+        if !is_current {
+            return None;
+        }
+        self.remove_tmux_session_locked(&guard, tmux_session_name)
     }
 
     pub(super) fn iter(&self) -> dashmap::iter::Iter<'_, String, TmuxWatcherHandle> {
@@ -2894,7 +2911,7 @@ fn maybe_schedule_catch_up_retry_after_queue_drain(
 
     let shared = Arc::clone(shared);
     let provider = provider.clone();
-    tokio::spawn(async move {
+    task_supervisor::spawn_observed("catch_up_retry_after_queue_drain", async move {
         let retry_checkpoints = HashMap::from([(channel_id, retry_checkpoint)]);
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::info!(

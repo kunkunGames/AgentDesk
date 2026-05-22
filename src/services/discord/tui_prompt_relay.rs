@@ -29,10 +29,32 @@ static CODEX_IDLE_ROLLOUT_RELAY_STARTED: AtomicBool = AtomicBool::new(false);
 static CLAUDE_IDLE_TRANSCRIPT_RELAY_STARTED: AtomicBool = AtomicBool::new(false);
 static CLAUDE_IDLE_RESPONSE_TAILS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
-const TUI_IDLE_RESPONSE_CHROME_PREFIXES: &[&str] = &[
-    "No response requested.",
-    "Continue from where you left off.",
-];
+
+struct ClaudeIdleTailGuard {
+    tmux_session_name: String,
+}
+
+impl Drop for ClaudeIdleTailGuard {
+    fn drop(&mut self) {
+        CLAUDE_IDLE_RESPONSE_TAILS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.tmux_session_name);
+    }
+}
+
+struct CodexIdleTailDoneGuard {
+    tmux_session_name: Option<String>,
+    done_tx: tokio::sync::mpsc::UnboundedSender<String>,
+}
+
+impl Drop for CodexIdleTailDoneGuard {
+    fn drop(&mut self) {
+        if let Some(tmux_session_name) = self.tmux_session_name.take() {
+            let _ = self.done_tx.send(tmux_session_name);
+        }
+    }
+}
 
 pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: ProviderKind) {
     #[cfg(unix)]
@@ -44,7 +66,7 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
         spawn_claude_idle_transcript_relay(shared.clone());
     }
 
-    tokio::spawn(async move {
+    super::task_supervisor::spawn_observed("tui_prompt_relay_observer", async move {
         let mut hook_rx = subscribe_hook_events();
         let mut observed_rx = subscribe_observed_prompts();
         let provider_name = provider.as_str().to_string();
@@ -110,6 +132,11 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         );
         return;
     };
+    crate::services::tui_prompt_dedupe::record_external_input_relay_lease(
+        &prompt.provider,
+        &prompt.tmux_session_name,
+        Some(channel_id.get()),
+    );
     let Some(registry) = shared.health_registry() else {
         tracing::warn!(
             provider = %prompt.provider,
@@ -230,7 +257,10 @@ fn spawn_claude_idle_response_tail_once(
         }
     }
 
-    tokio::spawn(async move {
+    super::task_supervisor::spawn_observed("claude_idle_response_tail", async move {
+        let _tail_guard = ClaudeIdleTailGuard {
+            tmux_session_name: tmux_session_name.clone(),
+        };
         run_claude_idle_response_tail(
             shared,
             tmux_session_name.clone(),
@@ -239,10 +269,6 @@ fn spawn_claude_idle_response_tail_once(
             start_offset,
         )
         .await;
-        CLAUDE_IDLE_RESPONSE_TAILS
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&tmux_session_name);
     });
     true
 }
@@ -252,7 +278,7 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
     if CLAUDE_IDLE_TRANSCRIPT_RELAY_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    tokio::spawn(async move {
+    super::task_supervisor::spawn_observed("claude_idle_transcript_relay", async move {
         let relay_started_at = SystemTime::now();
         let mut next_rehydrate = tokio::time::Instant::now();
         loop {
@@ -917,7 +943,7 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
     if CODEX_IDLE_ROLLOUT_RELAY_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    tokio::spawn(async move {
+    super::task_supervisor::spawn_observed("codex_idle_rollout_relay", async move {
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut active_tails: HashSet<String> = HashSet::new();
 
@@ -1002,17 +1028,23 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                         active_tails.insert(tmux_session_name.clone());
                         let shared_for_tail = shared.clone();
                         let done_tx_for_tail = done_tx.clone();
-                        tokio::spawn(async move {
-                            run_codex_idle_response_tail(
-                                shared_for_tail,
-                                tmux_session_name.clone(),
-                                channel_id,
-                                rollout_path,
-                                line_end_offset,
-                            )
-                            .await;
-                            let _ = done_tx_for_tail.send(tmux_session_name);
-                        });
+                        super::task_supervisor::spawn_observed(
+                            "codex_idle_response_tail",
+                            async move {
+                                let _done_guard = CodexIdleTailDoneGuard {
+                                    tmux_session_name: Some(tmux_session_name.clone()),
+                                    done_tx: done_tx_for_tail,
+                                };
+                                run_codex_idle_response_tail(
+                                    shared_for_tail,
+                                    tmux_session_name.clone(),
+                                    channel_id,
+                                    rollout_path,
+                                    line_end_offset,
+                                )
+                                .await;
+                            },
+                        );
                     }
                 }
             }
@@ -1419,7 +1451,7 @@ fn compose_tui_idle_response(
         .or(error_result)
         .filter(|text| !text.trim().is_empty())
         .unwrap_or(streamed);
-    let body = strip_leading_tui_idle_response_chrome(&body);
+    let body = super::response_sanitizer::strip_leading_tui_response_chrome(&body);
     let sideband = sideband
         .into_iter()
         .filter(|line| !line.trim().is_empty())
@@ -1431,39 +1463,6 @@ fn compose_tui_idle_response(
     } else {
         format!("{}\n\n{}", sideband.join("\n"), body)
     }
-}
-
-#[cfg(unix)]
-fn strip_leading_tui_idle_response_chrome(body: &str) -> String {
-    let mut stripped = body;
-    let mut changed = false;
-    loop {
-        let trimmed = stripped.trim_start();
-        if let Some(prefix) = TUI_IDLE_RESPONSE_CHROME_PREFIXES
-            .iter()
-            .find(|prefix| leading_chrome_prefix_matches(trimmed, prefix))
-        {
-            changed = true;
-            stripped = &trimmed[prefix.len()..];
-            continue;
-        }
-        return if changed {
-            trimmed.to_string()
-        } else {
-            body.to_string()
-        };
-    }
-}
-
-#[cfg(unix)]
-fn leading_chrome_prefix_matches(trimmed: &str, prefix: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix(prefix) else {
-        return false;
-    };
-    rest.is_empty()
-        || rest.starts_with('\n')
-        || rest.starts_with('\r')
-        || rest.chars().next().is_some_and(|ch| !ch.is_whitespace())
 }
 
 #[cfg(unix)]

@@ -89,9 +89,11 @@ pub struct StreamFrame {
 pub struct RelayMetrics {
     pub frames_received: AtomicU64,
     pub frames_delivered: AtomicU64,
+    pub terminal_commits: AtomicU64,
     pub dropped_frames: AtomicU64,
     pub sink_errors: AtomicU64,
     last_delivered_sequence_plus_one: AtomicU64,
+    last_terminal_committed_sequence_plus_one: AtomicU64,
     last_dropped_sequence_plus_one: AtomicU64,
     last_sink_error_sequence_plus_one: AtomicU64,
 }
@@ -101,10 +103,15 @@ impl RelayMetrics {
         RelayMetricsSnapshot {
             frames_received: self.frames_received.load(Ordering::Acquire),
             frames_delivered: self.frames_delivered.load(Ordering::Acquire),
+            terminal_commits: self.terminal_commits.load(Ordering::Acquire),
             dropped_frames: self.dropped_frames.load(Ordering::Acquire),
             sink_errors: self.sink_errors.load(Ordering::Acquire),
             last_delivered_sequence: decode_sequence_marker(
                 self.last_delivered_sequence_plus_one
+                    .load(Ordering::Acquire),
+            ),
+            last_terminal_committed_sequence: decode_sequence_marker(
+                self.last_terminal_committed_sequence_plus_one
                     .load(Ordering::Acquire),
             ),
             last_dropped_sequence: decode_sequence_marker(
@@ -120,6 +127,12 @@ impl RelayMetrics {
     #[cfg(test)]
     pub(crate) fn record_delivered_sequence_for_test(&self, sequence: u64) {
         self.last_delivered_sequence_plus_one
+            .fetch_max(encode_sequence_marker(sequence), Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_terminal_committed_sequence_for_test(&self, sequence: u64) {
+        self.last_terminal_committed_sequence_plus_one
             .fetch_max(encode_sequence_marker(sequence), Ordering::AcqRel);
     }
 
@@ -140,9 +153,11 @@ impl RelayMetrics {
 pub struct RelayMetricsSnapshot {
     pub frames_received: u64,
     pub frames_delivered: u64,
+    pub terminal_commits: u64,
     pub dropped_frames: u64,
     pub sink_errors: u64,
     pub last_delivered_sequence: Option<u64>,
+    pub last_terminal_committed_sequence: Option<u64>,
     pub last_dropped_sequence: Option<u64>,
     pub last_sink_error_sequence: Option<u64>,
 }
@@ -193,7 +208,23 @@ pub trait RelaySink: Send + Sync + 'static {
     /// Deliver a single frame. Returning `Err` increments the sink-error
     /// counter and skips this frame; the relay does NOT terminate — a
     /// transient Discord HTTP error must not stop session observation.
-    async fn deliver(&self, frame: &StreamFrame) -> Result<(), RelaySinkError>;
+    async fn deliver(&self, frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError>;
+}
+
+/// Result of accepting a relay frame into the sink. This deliberately
+/// distinguishes "the sink accepted/parsing-counted this frame" from "a
+/// terminal Discord response was actually committed". Watchers must use only
+/// `TerminalCommitted` as delegation success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaySinkOutcome {
+    FrameAccepted,
+    TerminalCommitted,
+}
+
+impl RelaySinkOutcome {
+    pub fn terminal_committed(self) -> bool {
+        matches!(self, Self::TerminalCommitted)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -211,8 +242,8 @@ pub struct DiscardSink;
 
 #[async_trait]
 impl RelaySink for DiscardSink {
-    async fn deliver(&self, _frame: &StreamFrame) -> Result<(), RelaySinkError> {
-        Ok(())
+    async fn deliver(&self, _frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
+        Ok(RelaySinkOutcome::FrameAccepted)
     }
 }
 
@@ -660,11 +691,17 @@ async fn deliver_frame(
     session_name: &str,
 ) {
     match sink.deliver(frame).await {
-        Ok(()) => {
+        Ok(outcome) => {
             metrics.frames_delivered.fetch_add(1, Ordering::AcqRel);
             metrics
                 .last_delivered_sequence_plus_one
                 .fetch_max(encode_sequence_marker(frame.sequence), Ordering::AcqRel);
+            if outcome.terminal_committed() {
+                metrics.terminal_commits.fetch_add(1, Ordering::AcqRel);
+                metrics
+                    .last_terminal_committed_sequence_plus_one
+                    .fetch_max(encode_sequence_marker(frame.sequence), Ordering::AcqRel);
+            }
         }
         Err(error) => {
             metrics.sink_errors.fetch_add(1, Ordering::AcqRel);
@@ -706,12 +743,12 @@ mod tests {
 
     #[async_trait]
     impl RelaySink for CapturingSink {
-        async fn deliver(&self, frame: &StreamFrame) -> Result<(), RelaySinkError> {
+        async fn deliver(&self, frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
             if self.fail_next.swap(false, Ordering::AcqRel) {
                 return Err(RelaySinkError::Transient("forced".into()));
             }
             self.frames.lock().unwrap().push(frame.clone());
-            Ok(())
+            Ok(RelaySinkOutcome::FrameAccepted)
         }
     }
 
@@ -723,12 +760,12 @@ mod tests {
 
     #[async_trait]
     impl RelaySink for BlockingSequenceSink {
-        async fn deliver(&self, _frame: &StreamFrame) -> Result<(), RelaySinkError> {
+        async fn deliver(&self, _frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
             if self.block_first.swap(false, Ordering::AcqRel) {
                 self.first_started.notify_one();
                 self.unblock.notified().await;
             }
-            Ok(())
+            Ok(RelaySinkOutcome::FrameAccepted)
         }
     }
 
@@ -988,13 +1025,16 @@ mod tests {
         }
         #[async_trait]
         impl RelaySink for BlockingSink {
-            async fn deliver(&self, frame: &StreamFrame) -> Result<(), RelaySinkError> {
+            async fn deliver(
+                &self,
+                frame: &StreamFrame,
+            ) -> Result<RelaySinkOutcome, RelaySinkError> {
                 if self.block_first.swap(false, Ordering::AcqRel) {
                     self.first_started.notify_one();
                     self.unblock.notified().await;
                 }
                 self.frames.lock().unwrap().push(frame.clone());
-                Ok(())
+                Ok(RelaySinkOutcome::FrameAccepted)
             }
         }
         let sink = Arc::new(BlockingSink {

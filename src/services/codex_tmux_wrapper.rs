@@ -21,6 +21,7 @@ pub fn run(
     codex_bin: &str,
     codex_model: Option<&str>,
     reasoning_effort: Option<&str>,
+    developer_instructions: Option<&str>,
     resume_session_id: Option<&str>,
     fast_mode_enabled: Option<bool>,
     goals_enabled: Option<bool>,
@@ -135,6 +136,7 @@ pub fn run(
         codex_bin,
         codex_model,
         reasoning_effort,
+        developer_instructions,
         &expanded_dir,
         &prompt,
         &mut thread_id,
@@ -174,6 +176,7 @@ pub fn run(
             codex_bin,
             codex_model,
             reasoning_effort,
+            developer_instructions,
             &expanded_dir,
             next_prompt.trim(),
             &mut thread_id,
@@ -263,6 +266,7 @@ fn run_turn(
     codex_bin: &str,
     codex_model: Option<&str>,
     reasoning_effort: Option<&str>,
+    developer_instructions: Option<&str>,
     working_dir: &str,
     prompt: &str,
     thread_id: &mut Option<String>,
@@ -285,6 +289,7 @@ fn run_turn(
     let args = build_codex_exec_args(
         &CodexLaunchOptions::new(prompt)
             .with_resume_session_id(thread_id.as_deref())
+            .with_developer_instructions(developer_instructions)
             .with_model(codex_model)
             .with_reasoning_effort(effective_reasoning_effort)
             .with_compact_token_limit(compact_token_limit)

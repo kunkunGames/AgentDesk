@@ -14,6 +14,7 @@ const PROMPT_ANCHOR_TTL: Duration = Duration::from_secs(30 * 60);
 // can plausibly take before `record_prompt_anchor` lands. 60s is generous;
 // the marker is also cleared explicitly when an anchor is consumed.
 const SSH_DIRECT_OBSERVATION_TTL: Duration = Duration::from_secs(60);
+const EXTERNAL_INPUT_RELAY_LEASE_TTL: Duration = Duration::from_secs(10 * 60);
 const OBSERVED_PROMPT_BUFFER: usize = 128;
 
 static STATE: LazyLock<Mutex<TuiPromptDedupeState>> =
@@ -32,6 +33,11 @@ pub struct ObservedTuiPrompt {
 pub(crate) struct TuiPromptAnchor {
     pub channel_id: u64,
     pub message_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalInputRelayLease {
+    pub channel_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +82,11 @@ struct TuiPromptDedupeState {
     // closing the window before `record_prompt_anchor` runs (the latter has
     // to wait for the Discord notify await to land).
     ssh_direct_observation_by_tmux: HashMap<PromptKey, TimedValue<()>>,
+    // Longer-lived response relay lease set as soon as a direct tmux prompt
+    // is observed. Unlike the Discord prompt anchor this survives notify-bot
+    // failures; watchers use it to keep post-terminal suppression from eating
+    // the response.
+    external_input_relay_lease_by_tmux: HashMap<PromptKey, TimedValue<ExternalInputRelayLease>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -422,6 +433,7 @@ pub fn observe_prompt_by_tmux(
         return PromptObservation::SuppressedRecentDuplicate;
     }
     mark_ssh_direct_observation_pending(&provider, tmux_session_name);
+    record_external_input_relay_lease(&provider, tmux_session_name, None);
     let event = ObservedTuiPrompt {
         provider,
         tmux_session_name: tmux_session_name.to_string(),
@@ -429,6 +441,75 @@ pub fn observe_prompt_by_tmux(
     };
     let _ = OBSERVED_PROMPTS.send(event);
     PromptObservation::PublishedSshDirect
+}
+
+pub(crate) fn record_external_input_relay_lease(
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: Option<u64>,
+) {
+    let provider = normalize_provider(provider);
+    let tmux_session_name = tmux_session_name.trim();
+    if provider.is_empty() || tmux_session_name.is_empty() {
+        return;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.purge_expired();
+    state.external_input_relay_lease_by_tmux.insert(
+        PromptKey::new(&provider, tmux_session_name),
+        TimedValue {
+            value: ExternalInputRelayLease { channel_id },
+            recorded_at: Instant::now(),
+        },
+    );
+}
+
+pub(crate) fn external_input_relay_lease_present(
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: u64,
+) -> bool {
+    let provider = normalize_provider(provider);
+    let tmux_session_name = tmux_session_name.trim();
+    if provider.is_empty() || tmux_session_name.is_empty() || channel_id == 0 {
+        return false;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.purge_expired();
+    state
+        .external_input_relay_lease_by_tmux
+        .get(&PromptKey::new(&provider, tmux_session_name))
+        .is_some_and(|entry| match entry.value.channel_id {
+            Some(leased) => leased == channel_id,
+            None => true,
+        })
+}
+
+pub(crate) fn clear_external_input_relay_lease(
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: u64,
+) -> bool {
+    let provider = normalize_provider(provider);
+    let tmux_session_name = tmux_session_name.trim();
+    if provider.is_empty() || tmux_session_name.is_empty() || channel_id == 0 {
+        return false;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.purge_expired();
+    let key = PromptKey::new(&provider, tmux_session_name);
+    let Some(entry) = state.external_input_relay_lease_by_tmux.get(&key) else {
+        return false;
+    };
+    if entry
+        .value
+        .channel_id
+        .is_some_and(|leased| leased != channel_id)
+    {
+        return false;
+    }
+    state.external_input_relay_lease_by_tmux.remove(&key);
+    true
 }
 
 fn mark_ssh_direct_observation_pending(provider: &str, tmux_session_name: &str) {
@@ -722,6 +803,9 @@ impl TuiPromptDedupeState {
             .retain(|_, entry| now.duration_since(entry.recorded_at) <= PROMPT_ANCHOR_TTL);
         self.ssh_direct_observation_by_tmux
             .retain(|_, entry| now.duration_since(entry.recorded_at) <= SSH_DIRECT_OBSERVATION_TTL);
+        self.external_input_relay_lease_by_tmux.retain(|_, entry| {
+            now.duration_since(entry.recorded_at) <= EXTERNAL_INPUT_RELAY_LEASE_TTL
+        });
     }
 }
 
@@ -1242,6 +1326,24 @@ mod tests {
             observe_prompt_by_tmux("claude", "tmux-a", "typed over ssh"),
             PromptObservation::PublishedSshDirect
         );
+        assert!(
+            external_input_relay_lease_present("claude", "tmux-a", 42),
+            "prompt observation creates a relay lease before Discord notification/anchor succeeds"
+        );
+        assert!(clear_external_input_relay_lease("claude", "tmux-a", 42));
+        assert!(!external_input_relay_lease_present("claude", "tmux-a", 42));
+    }
+
+    #[test]
+    fn external_input_relay_lease_can_be_bound_to_channel_after_observation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        observe_prompt_by_tmux("claude", "tmux-a", "typed over ssh");
+        record_external_input_relay_lease("claude", "tmux-a", Some(42));
+
+        assert!(external_input_relay_lease_present("claude", "tmux-a", 42));
+        assert!(!external_input_relay_lease_present("claude", "tmux-a", 43));
     }
 
     #[test]
