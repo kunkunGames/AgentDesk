@@ -37,7 +37,6 @@ fn record_leader_only_worker_started(spec: WorkerSpec) {
         .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
     tracing::info!(
         worker = spec.name,
-        target = spec.target,
         execution_scope = spec.execution_scope.as_doc_str(),
         "leader-only worker epoch started"
     );
@@ -51,7 +50,6 @@ fn record_leader_only_worker_stopped(spec: WorkerSpec, reason: &str) {
     );
     tracing::warn!(
         worker = spec.name,
-        target = spec.target,
         reason,
         "leader-only worker epoch stopped"
     );
@@ -844,18 +842,17 @@ impl SupervisedWorkerRegistry {
             tokio::pin!(future);
             tokio::select! {
                 _ = &mut future => {
-                    tracing::warn!(worker = spec.name, target = spec.target, "leader-only worker future exited");
+                    tracing::warn!(worker = spec.name, "leader-only worker future exited");
                 }
                 _ = cluster_runtime.wait_until_not_leader() => {
                     tracing::warn!(
                         worker = spec.name,
-                        target = spec.target,
                         instance_id = cluster_runtime.instance_id(),
                         "leader-only worker self-fenced after cluster leadership was lost"
                     );
                 }
                 _ = wait_until_shutdown(shutdown.clone()) => {
-                    tracing::info!(worker = spec.name, target = spec.target, "leader-only worker supervisor shutting down");
+                    tracing::info!(worker = spec.name, "leader-only worker supervisor shutting down");
                     break;
                 }
             }
@@ -889,7 +886,6 @@ impl SupervisedWorkerRegistry {
     fn log_start(&self, spec: WorkerSpec) {
         tracing::info!(
             worker = spec.name,
-            target = spec.target,
             kind = spec.kind.as_doc_str(),
             stage = spec.start_stage.as_doc_str(),
             order = spec.start_order,
@@ -907,7 +903,6 @@ impl SupervisedWorkerRegistry {
     fn log_skip(&self, spec: WorkerSpec, reason: &str) {
         tracing::info!(
             worker = spec.name,
-            target = spec.target,
             stage = spec.start_stage.as_doc_str(),
             execution_scope = spec.execution_scope.as_doc_str(),
             reason,
