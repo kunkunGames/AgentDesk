@@ -146,17 +146,12 @@ fn watcher_inflight_represents_external_input(inflight: Option<&InflightTurnStat
 fn watcher_direct_terminal_should_commit_session_idle(
     direct_send_delivered: bool,
     inflight_present: bool,
-    external_input_lease_consumed_by_relay: bool,
-    prompt_anchor_present_before_relay: bool,
-    external_input_lease_before_relay: bool,
-    ssh_direct_pending: bool,
+    _external_input_lease_consumed_by_relay: bool,
+    _prompt_anchor_present_before_relay: bool,
+    _external_input_lease_before_relay: bool,
+    _ssh_direct_pending: bool,
 ) -> bool {
-    direct_send_delivered
-        && !inflight_present
-        && (external_input_lease_consumed_by_relay
-            || prompt_anchor_present_before_relay
-            || external_input_lease_before_relay
-            || ssh_direct_pending)
+    direct_send_delivered && !inflight_present
 }
 
 fn watcher_terminal_token_update_status(
@@ -5982,7 +5977,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_direct_terminal_idle_commit_requires_external_input_without_inflight() {
+    fn watcher_direct_terminal_idle_commit_requires_delivery_without_inflight() {
         assert!(watcher_direct_terminal_should_commit_session_idle(
             true, false, true, false, false, false
         ));
@@ -6001,7 +5996,7 @@ mod tests {
         assert!(!watcher_direct_terminal_should_commit_session_idle(
             true, true, true, true, true, true
         ));
-        assert!(!watcher_direct_terminal_should_commit_session_idle(
+        assert!(watcher_direct_terminal_should_commit_session_idle(
             true, false, false, false, false, false
         ));
     }
