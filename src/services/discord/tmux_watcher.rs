@@ -326,6 +326,14 @@ fn observe_qwen_user_prompts_in_buffer(
     }
 }
 
+fn watcher_batch_contains_relayable_response(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    text.contains("\"type\":\"assistant\"")
+        || text.contains("\"type\": \"assistant\"")
+        || text.contains("\"type\":\"result\"")
+        || text.contains("\"type\": \"result\"")
+}
+
 fn legacy_wrapper_prompt_candidates_from_pane(pane: &str) -> Vec<String> {
     let mut collecting = false;
     let mut current_block: Vec<String> = Vec::new();
@@ -2270,7 +2278,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         if matches!(
             runtime_kind_marker,
             Some(crate::services::agent_protocol::RuntimeHandoffKind::LegacyTmuxWrapper)
-        ) {
+        ) && watcher_batch_contains_relayable_response(&data)
+        {
             let _ = observe_legacy_wrapper_direct_prompt_from_pane(
                 &watcher_provider,
                 &tmux_session_name,
@@ -6066,7 +6075,8 @@ mod tests {
         discard_restored_response_seed_before_no_inflight_terminal_relay,
         discard_watcher_pending_buffer_after_suppressed_turn,
         legacy_wrapper_prompt_candidates_from_pane, should_probe_tmux_liveness,
-        terminal_event_consumed_offset, watcher_direct_terminal_should_commit_session_idle,
+        terminal_event_consumed_offset, watcher_batch_contains_relayable_response,
+        watcher_direct_terminal_should_commit_session_idle,
         watcher_fallback_edit_failure_can_delete_original_placeholder,
         watcher_inflight_represents_external_input,
         watcher_should_clear_stale_terminal_message_ids, watcher_should_defer_delegated_fresh_idle,
@@ -6306,6 +6316,19 @@ TUI-E2E-marker ssh-direct
                 .any(|candidate| candidate.contains("'ssh -direct'")),
             "wrapped terminal prompt should keep a spaced candidate for readable direct observation"
         );
+    }
+
+    #[test]
+    fn legacy_wrapper_prompt_observation_requires_response_batch() {
+        assert!(!watcher_batch_contains_relayable_response(
+            br#"{"provider":"codex","type":"ready_for_input"}"#
+        ));
+        assert!(watcher_batch_contains_relayable_response(
+            br#"{"type":"assistant","message":{"content":[{"text":"ok"}]}}"#
+        ));
+        assert!(watcher_batch_contains_relayable_response(
+            br#"{"type":"result","result":"ok"}"#
+        ));
     }
 
     #[test]
