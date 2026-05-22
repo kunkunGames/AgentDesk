@@ -1423,7 +1423,7 @@ use turn_analytics::{
 };
 
 use super::watcher_lifecycle_decision::should_resume_watcher_after_turn;
-use crate::db::session_status::{AWAITING_BG, AWAITING_USER, IDLE};
+use crate::db::session_status::{AWAITING_BG, IDLE, TURN_ACTIVE};
 use sqlx::Row;
 
 #[cfg(unix)]
@@ -1790,12 +1790,12 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     last_status_panel_text: &mut String,
     background: bool,
     source: &'static str,
-) {
+) -> bool {
     if !shared.status_panel_v2_enabled {
-        return;
+        return true;
     }
     let Some(status_msg_id) = status_panel_msg_id else {
-        return;
+        return true;
     };
     shared
         .placeholder_live_events
@@ -1805,7 +1805,7 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
             .placeholder_live_events
             .render_status_panel(channel_id, provider, started_at_unix);
     if panel_text == *last_status_panel_text {
-        return;
+        return true;
     }
     match gateway
         .edit_message(channel_id, status_msg_id, &panel_text)
@@ -1813,6 +1813,7 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     {
         Ok(()) => {
             *last_status_panel_text = panel_text;
+            true
         }
         Err(error) => {
             tracing::warn!(
@@ -1822,6 +1823,7 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
                 source,
                 error
             );
+            false
         }
     }
 }
@@ -5703,19 +5705,20 @@ pub(super) fn spawn_turn_bridge(
             && bridge_output_owner.is_none();
         let should_fail_dispatch_after_delivery = transport_error && !cancelled;
 
-        let final_session_status = if cancelled || transport_error {
+        let final_session_status = if active_background_child_session_ids.is_empty() {
             IDLE
-        } else if active_background_child_session_ids.is_empty() {
-            AWAITING_USER
         } else {
             AWAITING_BG
         };
 
+        // Keep the session visibly active while Discord terminal delivery and
+        // status-panel finalization are still pending. Publishing idle here lets
+        // observers race ahead of the final response/status edit.
         post_adk_session_status(
             adk_session_key.as_deref(),
             adk_session_name.as_deref(),
             Some(provider.as_str()),
-            final_session_status,
+            TURN_ACTIVE,
             &provider,
             adk_session_info.as_deref(),
             persisted_context_tokens(
@@ -6926,12 +6929,13 @@ pub(super) fn spawn_turn_bridge(
                 terminal_delivery_committed && !preserve_inflight_for_cleanup_retry;
         }
 
+        let mut status_panel_completion_committed = true;
         if status_panel_terminal_committed && bridge_should_emit_completion {
             // #2161 (Codex H1): the bridge-owned delivery path runs the
             // gate ABOVE so it can also block dispatch completion on
             // TimedOut. Here we just reuse the outcome and skip the
             // visible `응답 완료` if the pane was still busy.
-            complete_status_panel_v2(
+            status_panel_completion_committed = complete_status_panel_v2(
                 shared_owned.as_ref(),
                 gateway.as_ref(),
                 channel_id,
@@ -6943,6 +6947,43 @@ pub(super) fn spawn_turn_bridge(
                 "turn_terminal_delivery",
             )
             .await;
+        }
+
+        if status_panel_terminal_committed
+            && status_panel_completion_committed
+            && !preserve_inflight_for_cleanup_retry
+        {
+            post_adk_session_status(
+                adk_session_key.as_deref(),
+                adk_session_name.as_deref(),
+                Some(provider.as_str()),
+                final_session_status,
+                &provider,
+                adk_session_info.as_deref(),
+                persisted_context_tokens(
+                    accumulated_input_tokens,
+                    accumulated_cache_create_tokens,
+                    accumulated_cache_read_tokens,
+                    accumulated_output_tokens,
+                ),
+                adk_cwd.as_deref(),
+                dispatch_id.as_deref(),
+                adk_session_name.as_deref().and_then(
+                    crate::services::discord::adk_session::parse_thread_channel_id_from_name,
+                ),
+                Some(channel_id),
+                role_binding
+                    .as_ref()
+                    .map(|binding| binding.role_id.as_str()),
+                shared_owned.api_port,
+            )
+            .await;
+        } else if status_panel_terminal_committed && !status_panel_completion_committed {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id.get(),
+                "turn bridge withheld final idle status because status-panel completion edit did not commit"
+            );
         }
 
         if !bridge_relay_delegated_to_watcher

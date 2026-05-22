@@ -93,6 +93,7 @@ pub enum TuiInputAction {
     PasteBuffer(String),
     Enter,
     Escape,
+    Backspace(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +274,17 @@ fn run_actions(
             TuiInputAction::Escape => {
                 crate::services::platform::tmux::send_keys(session_name, &["Escape"])?
             }
+            TuiInputAction::Backspace(count) => {
+                let mut remaining = *count;
+                while remaining > 0 {
+                    let batch = remaining.min(32);
+                    let keys = vec!["BSpace"; batch];
+                    let output = crate::services::platform::tmux::send_keys(session_name, &keys)?;
+                    ensure_tmux_success(output, action)?;
+                    remaining -= batch;
+                }
+                continue;
+            }
         };
         ensure_tmux_success(output, action)?;
     }
@@ -379,13 +391,40 @@ fn prompt_submit_settle_for_attempt(attempt: usize) -> Duration {
 }
 
 fn clear_prompt_draft_before_error(session_name: &str, cancel_token: Option<&CancelToken>) {
-    if let Err(error) = run_actions(session_name, &[TuiInputAction::Escape], cancel_token) {
+    let snapshot = prompt_readiness_snapshot(session_name);
+    let mut actions = vec![TuiInputAction::Escape];
+    if let Some(count) = claude_prompt_draft_backspace_budget_from_tail(&snapshot.pane_tail) {
+        actions.push(TuiInputAction::Backspace(count));
+    }
+    if let Err(error) = run_actions(session_name, &actions, cancel_token) {
         tracing::warn!(
             tmux_session_name = session_name,
             error = %error,
             "failed to clear Claude TUI draft after prompt submit retries"
         );
     }
+}
+
+pub(crate) fn claude_prompt_draft_backspace_budget_from_tail(pane_tail: &str) -> Option<usize> {
+    pane_tail
+        .lines()
+        .rev()
+        .find_map(claude_prompt_draft_backspace_budget_from_line)
+}
+
+pub(crate) fn claude_prompt_draft_backspace_budget_from_line(line: &str) -> Option<usize> {
+    let rest = line
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}')
+        .strip_prefix('\u{276f}')?
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
+    if rest.is_empty()
+        || rest
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"))
+    {
+        return None;
+    }
+    Some(rest.chars().count().saturating_add(4).min(512))
 }
 
 fn check_prompt_cancel(cancel_token: Option<&CancelToken>) -> Result<(), String> {
@@ -406,6 +445,7 @@ fn ensure_tmux_success(output: Output, action: &TuiInputAction) -> Result<(), St
         TuiInputAction::PasteBuffer(_) => "paste-buffer",
         TuiInputAction::Enter => "enter",
         TuiInputAction::Escape => "escape",
+        TuiInputAction::Backspace(_) => "backspace",
     };
     if stderr.is_empty() {
         Err(format!("tmux send {action_name} failed: {}", output.status))
@@ -958,6 +998,21 @@ mod tests {
     #[test]
     fn cancel_uses_escape() {
         assert_eq!(plan_cancel(), vec![TuiInputAction::Escape]);
+    }
+
+    #[test]
+    fn claude_prompt_draft_backspace_budget_ignores_submitted_discord_prompt_history() {
+        assert_eq!(
+            claude_prompt_draft_backspace_budget_from_line("❯ [User: 명령봇 (ID: 1)] hello"),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_prompt_draft_backspace_budget_handles_nbsp_prompt_line() {
+        let budget = claude_prompt_draft_backspace_budget_from_line("❯\u{00a0}commit this");
+
+        assert_eq!(budget, Some("commit this".chars().count() + 4));
     }
 
     #[test]

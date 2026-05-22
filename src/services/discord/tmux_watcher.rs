@@ -5128,7 +5128,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 session_key.as_deref(),
                 channel_name.as_deref(),
                 None,
-                "idle",
+                crate::db::session_status::TURN_ACTIVE,
                 &provider,
                 None,
                 Some(tokens),
@@ -5418,7 +5418,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         }
     }
 
-    if cleanup_plan.report_idle_status {
+    let defer_idle_status_to_bridge =
+        crate::services::discord::inflight::load_inflight_state(&provider, channel_id.get())
+            .as_ref()
+            .is_some_and(|state| {
+                state.tmux_session_name.as_deref() == Some(tmux_session_name.as_str())
+            });
+
+    if cleanup_plan.report_idle_status && !defer_idle_status_to_bridge {
         // Report idle status to DB so the dashboard doesn't show stale "working" state.
         // Always report idle when the watcher exits, even if dispatch protection
         // keeps the dead tmux session around for the active-dispatch safety path.
@@ -5443,6 +5450,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             api_port,
         )
         .await;
+    } else if cleanup_plan.report_idle_status {
+        tracing::debug!(
+            provider = %provider.as_str(),
+            channel = channel_id.get(),
+            tmux_session = %tmux_session_name,
+            "watcher deferred idle status because bridge-owned inflight still needs terminal Discord finalization"
+        );
     }
 
     let ts = chrono::Local::now().format("%H:%M:%S");

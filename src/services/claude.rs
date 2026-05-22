@@ -1640,6 +1640,38 @@ fn ensure_tmux_key_send_success(
 }
 
 #[cfg(unix)]
+fn clear_claude_tui_draft_with_backspaces(
+    tmux_session_name: &str,
+    snapshot: &mut crate::services::claude_tui::input::PromptReadinessSnapshot,
+    cancel_token: Option<&CancelToken>,
+) -> Result<(), String> {
+    let Some(mut remaining) =
+        crate::services::claude_tui::input::claude_prompt_draft_backspace_budget_from_tail(
+            &snapshot.pane_tail,
+        )
+    else {
+        return Ok(());
+    };
+    let output = crate::services::platform::tmux::send_keys(tmux_session_name, &["C-e"])?;
+    ensure_tmux_key_send_success(output, "draft-clear-cursor-end")?;
+    while remaining > 0 {
+        if cancel_requested(cancel_token) {
+            return Err(
+                crate::services::claude_tui::input::PROMPT_READY_CANCELLED_ERROR.to_string(),
+            );
+        }
+        let batch = remaining.min(32);
+        let keys = vec!["BSpace"; batch];
+        let output = crate::services::platform::tmux::send_keys(tmux_session_name, &keys)?;
+        ensure_tmux_key_send_success(output, "draft-clear-backspace")?;
+        remaining -= batch;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    *snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
+    Ok(())
+}
+
+#[cfg(unix)]
 fn clear_claude_tui_stranded_prompt_draft(
     tmux_session_name: &str,
     cancel_token: Option<&CancelToken>,
@@ -1671,6 +1703,10 @@ fn clear_claude_tui_stranded_prompt_draft(
             if !snapshot.prompt_draft_detected || !snapshot.tmux_pane_alive {
                 return Ok(snapshot);
             }
+        }
+        clear_claude_tui_draft_with_backspaces(tmux_session_name, &mut snapshot, cancel_token)?;
+        if !snapshot.prompt_draft_detected || !snapshot.tmux_pane_alive {
+            return Ok(snapshot);
         }
         tracing::warn!(
             tmux_session_name,
@@ -1709,6 +1745,10 @@ fn gently_clear_claude_tui_prompt_draft(
         ensure_tmux_key_send_success(output, "gentle-clear-draft")?;
         std::thread::sleep(std::time::Duration::from_millis(120));
         snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
+        if !snapshot.prompt_draft_detected || !snapshot.tmux_pane_alive {
+            return Ok(snapshot);
+        }
+        clear_claude_tui_draft_with_backspaces(tmux_session_name, &mut snapshot, cancel_token)?;
         if !snapshot.prompt_draft_detected || !snapshot.tmux_pane_alive {
             return Ok(snapshot);
         }
