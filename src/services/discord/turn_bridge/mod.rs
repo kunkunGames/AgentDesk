@@ -2365,6 +2365,41 @@ fn bridge_pre_submission_tui_prompt_error(provider: &ProviderKind, full_response
     }
 }
 
+fn bridge_tui_transport_error_should_skip_quiescence(
+    provider: &ProviderKind,
+    runtime_kind: Option<crate::services::agent_protocol::RuntimeHandoffKind>,
+    full_response: &str,
+) -> bool {
+    let Some(error_text) = full_response
+        .trim_start()
+        .strip_prefix("Error:")
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+
+    match (provider, runtime_kind) {
+        (
+            ProviderKind::Claude,
+            Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
+        ) => {
+            bridge_pre_submission_tui_prompt_error(provider, full_response)
+                || error_text == "Timeout waiting for output file"
+                || error_text.starts_with("timeout waiting for claude tui transcript file")
+                || error_text.contains("claude tui session died")
+        }
+        (
+            ProviderKind::Codex,
+            Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui),
+        ) => {
+            bridge_pre_submission_tui_prompt_error(provider, full_response)
+                || error_text == "Timeout waiting for output file"
+                || error_text.contains("codex tui session died")
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod pre_submission_tui_prompt_error_tests {
     use super::*;
@@ -2386,6 +2421,37 @@ mod pre_submission_tui_prompt_error_tests {
         assert!(!bridge_pre_submission_tui_prompt_error(
             &ProviderKind::Claude,
             "timeout waiting for claude tui follow-up prompt input readiness after 45s",
+        ));
+    }
+
+    #[test]
+    fn tui_transport_errors_skip_quiescence_only_for_matching_tui_runtime() {
+        use crate::services::agent_protocol::RuntimeHandoffKind;
+
+        assert!(bridge_tui_transport_error_should_skip_quiescence(
+            &ProviderKind::Claude,
+            Some(RuntimeHandoffKind::ClaudeTui),
+            "Error: Timeout waiting for output file",
+        ));
+        assert!(bridge_tui_transport_error_should_skip_quiescence(
+            &ProviderKind::Claude,
+            Some(RuntimeHandoffKind::ClaudeTui),
+            "Error: timeout waiting for claude tui transcript file after 120s; capture_available=true; prompt_marker_detected=true; prompt_draft_detected=false",
+        ));
+        assert!(bridge_tui_transport_error_should_skip_quiescence(
+            &ProviderKind::Codex,
+            Some(RuntimeHandoffKind::CodexTui),
+            "Error: timeout waiting for codex tui follow-up prompt input readiness after 45s; reason=composer_not_detected; previous_tui_turn_still_running=true; capture_available=true",
+        ));
+        assert!(!bridge_tui_transport_error_should_skip_quiescence(
+            &ProviderKind::Claude,
+            Some(RuntimeHandoffKind::LegacyTmuxWrapper),
+            "Error: Timeout waiting for output file",
+        ));
+        assert!(!bridge_tui_transport_error_should_skip_quiescence(
+            &ProviderKind::Claude,
+            Some(RuntimeHandoffKind::ClaudeTui),
+            "Error: upstream API returned 500",
         ));
     }
 }
@@ -6827,11 +6893,15 @@ pub(super) fn spawn_turn_bridge(
             // the two gate sites.
             #[cfg(unix)]
             {
-                let pre_submission_tui_prompt_error =
-                    transport_error && bridge_pre_submission_tui_prompt_error(&provider, &full_response);
+                let tui_transport_error_skip_gate = transport_error
+                    && bridge_tui_transport_error_should_skip_quiescence(
+                        &provider,
+                        inflight_state.runtime_kind,
+                        &full_response,
+                    );
                 let bridge_gate_outcome = if terminal_delivery_committed
                     && !preserve_inflight_for_cleanup_retry
-                    && !pre_submission_tui_prompt_error
+                    && !tui_transport_error_skip_gate
                 {
                     if let Some(outcome) = bridge_tui_gate_outcome_early {
                         outcome
@@ -6849,11 +6919,12 @@ pub(super) fn spawn_turn_bridge(
                         super::tmux::TuiCompletionGateOutcome::NotGated
                     }
                 } else {
-                    if terminal_delivery_committed && pre_submission_tui_prompt_error {
+                    if terminal_delivery_committed && tui_transport_error_skip_gate {
                         tracing::info!(
                             provider = %provider.as_str(),
                             channel = channel_id.get(),
-                            "pre-submission TUI prompt readiness error was already delivered; skipping quiescence gate so inflight cleanup can complete"
+                            runtime_kind = ?inflight_state.runtime_kind,
+                            "TUI transport error was already delivered; skipping quiescence gate so inflight cleanup can complete"
                         );
                     }
                     super::tmux::TuiCompletionGateOutcome::NotGated

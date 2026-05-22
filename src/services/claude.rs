@@ -39,6 +39,10 @@ const CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS: usize = 2;
 const CLAUDE_TUI_FRESH_PROMPT_READY_BACKOFF_BASE: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 const CLAUDE_TUI_STRANDED_DRAFT_CLEAR_ATTEMPTS: usize = 2;
+#[cfg(unix)]
+const CLAUDE_TUI_TRANSCRIPT_INITIAL_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(unix)]
+const CLAUDE_TUI_TRANSCRIPT_INITIAL_WAIT_MAX_INTERVAL: Duration = Duration::from_millis(500);
 
 #[cfg(unix)]
 type ClaudeTuiSessionTurnLock = Arc<Mutex<()>>;
@@ -2710,10 +2714,102 @@ fn read_claude_tui_transcript_until_done(
             )
         },
     );
+    if let Some(early_result) = wait_for_claude_tui_transcript_file(
+        transcript_path,
+        start_offset,
+        cancel_token.as_deref(),
+        tmux_session_name,
+    )? {
+        return Ok(early_result);
+    }
     let result =
         read_output_file_until_result(transcript_path, start_offset, sender, cancel_token, probe);
     log_claude_tui_hook_relay_failures(&expected_session_id_for_result);
     result
+}
+
+#[cfg(unix)]
+fn wait_for_claude_tui_transcript_file(
+    transcript_path: &str,
+    start_offset: u64,
+    cancel_token: Option<&CancelToken>,
+    tmux_session_name: &str,
+) -> Result<Option<ReadOutputResult>, String> {
+    wait_for_claude_tui_transcript_file_inner(
+        transcript_path,
+        start_offset,
+        cancel_token,
+        tmux_session_name,
+        CLAUDE_TUI_TRANSCRIPT_INITIAL_WAIT_TIMEOUT,
+        || std::fs::metadata(transcript_path).is_ok(),
+        || tmux_session_has_live_pane(tmux_session_name),
+        || crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name),
+    )
+}
+
+#[cfg(unix)]
+fn wait_for_claude_tui_transcript_file_inner<Exists, Alive, Snapshot>(
+    transcript_path: &str,
+    start_offset: u64,
+    cancel_token: Option<&CancelToken>,
+    tmux_session_name: &str,
+    timeout: Duration,
+    mut exists: Exists,
+    mut alive: Alive,
+    mut snapshot: Snapshot,
+) -> Result<Option<ReadOutputResult>, String>
+where
+    Exists: FnMut() -> bool,
+    Alive: FnMut() -> bool,
+    Snapshot: FnMut() -> crate::services::claude_tui::input::PromptReadinessSnapshot,
+{
+    if exists() {
+        return Ok(None);
+    }
+
+    let started_at = std::time::Instant::now();
+    let mut wait_interval = Duration::from_millis(10);
+    loop {
+        if cancel_requested(cancel_token) {
+            return Ok(Some(ReadOutputResult::Cancelled {
+                offset: start_offset,
+            }));
+        }
+        if exists() {
+            return Ok(None);
+        }
+        if !alive() {
+            return Ok(Some(ReadOutputResult::SessionDied {
+                offset: start_offset,
+            }));
+        }
+        if started_at.elapsed() >= timeout {
+            let snapshot = snapshot();
+            tracing::warn!(
+                tmux_session_name = %tmux_session_name,
+                transcript_path = %transcript_path,
+                timeout_secs = timeout.as_secs(),
+                prompt_marker_detected = snapshot.prompt_marker_detected,
+                prompt_draft_detected = snapshot.prompt_draft_detected,
+                tmux_pane_alive = snapshot.tmux_pane_alive,
+                capture_available = snapshot.capture_available,
+                pane_tail = %snapshot.pane_tail,
+                "claude_tui transcript file did not appear after prompt submission"
+            );
+            return Err(format!(
+                "timeout waiting for claude tui transcript file after {}s; capture_available={}; prompt_marker_detected={}; prompt_draft_detected={}",
+                timeout.as_secs(),
+                snapshot.capture_available,
+                snapshot.prompt_marker_detected,
+                snapshot.prompt_draft_detected
+            ));
+        }
+        std::thread::sleep(wait_interval);
+        wait_interval = std::cmp::min(
+            Duration::from_millis((wait_interval.as_millis() as f64 * 1.5) as u64),
+            CLAUDE_TUI_TRANSCRIPT_INITIAL_WAIT_MAX_INTERVAL,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -3739,6 +3835,107 @@ mod local_tmux_lifecycle_tests {
             claude_tui_fresh_prompt_ready_backoff(2),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn claude_tui_transcript_wait_returns_ready_when_file_exists() {
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: String::new(),
+        };
+        let result = wait_for_claude_tui_transcript_file_inner(
+            "/tmp/agentdesk-existing-transcript.jsonl",
+            7,
+            None,
+            "claude-tui-test",
+            Duration::from_millis(1),
+            || true,
+            || true,
+            || snapshot.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn claude_tui_transcript_wait_returns_session_died_before_timeout() {
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            tmux_pane_alive: false,
+            capture_available: true,
+            pane_tail: String::new(),
+        };
+        let result = wait_for_claude_tui_transcript_file_inner(
+            "/tmp/agentdesk-missing-transcript.jsonl",
+            9,
+            None,
+            "claude-tui-test",
+            Duration::from_secs(10),
+            || false,
+            || false,
+            || snapshot.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(ReadOutputResult::SessionDied { offset: 9 }));
+    }
+
+    #[test]
+    fn claude_tui_transcript_wait_respects_cancel_token() {
+        let token = CancelToken::new();
+        token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: String::new(),
+        };
+        let result = wait_for_claude_tui_transcript_file_inner(
+            "/tmp/agentdesk-missing-transcript.jsonl",
+            11,
+            Some(&token),
+            "claude-tui-test",
+            Duration::from_secs(10),
+            || false,
+            || true,
+            || snapshot.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(result, Some(ReadOutputResult::Cancelled { offset: 11 }));
+    }
+
+    #[test]
+    fn claude_tui_transcript_wait_timeout_uses_tui_error_prefix() {
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            prompt_draft_detected: false,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "ready".to_string(),
+        };
+        let error = wait_for_claude_tui_transcript_file_inner(
+            "/tmp/agentdesk-missing-transcript.jsonl",
+            13,
+            None,
+            "claude-tui-test",
+            Duration::ZERO,
+            || false,
+            || true,
+            || snapshot.clone(),
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("timeout waiting for claude tui transcript file"));
+        assert!(crate::services::claude_tui::input::is_prompt_ready_timeout_error(&error));
     }
 
     #[test]

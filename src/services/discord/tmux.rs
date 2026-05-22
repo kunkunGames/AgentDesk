@@ -1777,6 +1777,11 @@ mod tui_completion_gate_outcome_tests {
     }
 
     #[test]
+    fn skipped_dead_emits() {
+        assert!(TuiCompletionGateOutcome::SkippedDead.should_emit_completion());
+    }
+
+    #[test]
     fn timed_out_suppresses_emit() {
         // Codex H2: timeout MUST suppress the TurnCompleted emit;
         // placeholder sweeper / next-turn intake reconciles later.
@@ -1792,7 +1797,7 @@ mod tui_completion_gate_outcome_tests {
 /// `recovery_engine`. The pure derivation lives in this module's
 /// `should_emit_completion` contract, but the consumers compute their flag
 /// inline via `matches!(outcome, TuiCompletionGateOutcome::TimedOut)` — these
-/// tests pin the matrix so a future refactor that adds a fourth variant
+/// tests pin the matrix so a future refactor that adds another variant
 /// cannot silently widen the "proceed" set without also updating the side-
 /// effect gates.
 #[cfg(test)]
@@ -1812,6 +1817,9 @@ mod lifecycle_stage_pause_matrix_tests {
         assert!(!lifecycle_stage_paused(
             TuiCompletionGateOutcome::ConfirmedIdle
         ));
+        assert!(!lifecycle_stage_paused(
+            TuiCompletionGateOutcome::SkippedDead
+        ));
         assert!(lifecycle_stage_paused(TuiCompletionGateOutcome::TimedOut));
     }
 
@@ -1825,6 +1833,7 @@ mod lifecycle_stage_pause_matrix_tests {
         for outcome in [
             TuiCompletionGateOutcome::NotGated,
             TuiCompletionGateOutcome::ConfirmedIdle,
+            TuiCompletionGateOutcome::SkippedDead,
             TuiCompletionGateOutcome::TimedOut,
         ] {
             assert_eq!(

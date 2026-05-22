@@ -767,6 +767,7 @@ async fn complete_watcher_status_panel_v2(
 pub(in crate::services::discord) enum TuiCompletionGateOutcome {
     NotGated,
     ConfirmedIdle,
+    SkippedDead,
     TimedOut,
 }
 
@@ -778,7 +779,7 @@ impl TuiCompletionGateOutcome {
     /// sweeper / next-turn intake reconciles the still-Active panel later.
     pub(in crate::services::discord) fn should_emit_completion(self) -> bool {
         match self {
-            Self::NotGated | Self::ConfirmedIdle => true,
+            Self::NotGated | Self::ConfirmedIdle | Self::SkippedDead => true,
             Self::TimedOut => false,
         }
     }
@@ -1412,6 +1413,27 @@ pub(in crate::services::discord) async fn run_tui_completion_gate(
         task_notification_kind,
     ) {
         return TuiCompletionGateOutcome::NotGated;
+    }
+    let tmux_session_for_liveness = tmux_session_name.to_string();
+    let pane_alive = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            crate::services::tmux_diagnostics::tmux_session_has_live_pane(
+                &tmux_session_for_liveness,
+            )
+        }),
+    )
+    .await
+    .unwrap_or(Ok(false))
+    .unwrap_or(false);
+    if !pane_alive {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel = channel_id.get(),
+            tmux_session = %tmux_session_name,
+            "TUI completion gate skipped because tmux pane is no longer live"
+        );
+        return TuiCompletionGateOutcome::SkippedDead;
     }
 
     let started_at = tokio::time::Instant::now();
