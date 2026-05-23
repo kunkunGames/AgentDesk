@@ -287,7 +287,7 @@
 | `services` | `src/services/mod.rs` | 79 |  |
 | `services::agent_protocol` | `src/services/agent_protocol.rs` | 351 |  |
 | `services::agent_quality` | `src/services/agent_quality/mod.rs` | 24 |  |
-| `services::agent_quality::regression_alerts` | `src/services/agent_quality/regression_alerts.rs` | 655 |  |
+| `services::agent_quality::regression_alerts` | `src/services/agent_quality/regression_alerts.rs` | 726 |  |
 | `services::agents` | `src/services/agents/mod.rs` | 2 |  |
 | `services::agents::query` | `src/services/agents/query.rs` | 569 |  |
 | `services::agents::turn` | `src/services/agents/turn.rs` | 810 |  |
