@@ -1,1 +1,0 @@
-echo "cargo test successful"
