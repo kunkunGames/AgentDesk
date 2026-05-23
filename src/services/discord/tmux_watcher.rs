@@ -811,6 +811,7 @@ fn forward_chunk_to_supervisor_relay(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionBoundRelayAckOutcome {
     Delivered,
+    TerminalSkipped,
     Dropped,
     SinkError,
     TimedOut,
@@ -828,6 +829,9 @@ fn session_bound_relay_ack_snapshot_outcome(
     let snapshot = target.metrics.snapshot();
     if sequence_reached(snapshot.last_terminal_committed_sequence, target.sequence) {
         return Some(SessionBoundRelayAckOutcome::Delivered);
+    }
+    if sequence_reached(snapshot.last_terminal_skipped_sequence, target.sequence) {
+        return Some(SessionBoundRelayAckOutcome::TerminalSkipped);
     }
     if sequence_reached(snapshot.last_sink_error_sequence, target.sequence) {
         return Some(SessionBoundRelayAckOutcome::SinkError);
@@ -1482,6 +1486,18 @@ mod matched_session_jsonl_gate_tests {
             Some(SessionBoundRelayAckOutcome::Dropped)
         );
 
+        let skipped_metrics =
+            std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
+        let skipped_target = SessionBoundRelayAckTarget {
+            metrics: skipped_metrics.clone(),
+            sequence: 11,
+        };
+        skipped_metrics.record_terminal_skipped_sequence_for_test(11);
+        assert_eq!(
+            session_bound_relay_ack_snapshot_outcome(Some(&skipped_target)),
+            Some(SessionBoundRelayAckOutcome::TerminalSkipped)
+        );
+
         let delivered_metrics =
             std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
         let delivered_target = SessionBoundRelayAckTarget {
@@ -1523,6 +1539,10 @@ mod matched_session_jsonl_gate_tests {
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
+            SessionBoundRelayAckOutcome::TerminalSkipped
+        ));
+        assert!(watcher_should_direct_send_after_session_bound_ack(
+            true,
             SessionBoundRelayAckOutcome::MissingTarget
         ));
         assert!(!watcher_should_direct_send_after_session_bound_ack(
@@ -1540,6 +1560,10 @@ mod matched_session_jsonl_gate_tests {
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
             SessionBoundRelayAckOutcome::SinkError
+        ));
+        assert!(watcher_should_direct_send_after_session_bound_ack(
+            true,
+            SessionBoundRelayAckOutcome::TerminalSkipped
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,

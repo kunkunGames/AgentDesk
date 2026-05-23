@@ -1261,7 +1261,7 @@ async fn run_codex_idle_response_tail(
         );
         return;
     }
-    let delivered = deliver_tui_idle_response(
+    let delivery_result = deliver_tui_idle_response(
         &shared,
         ProviderKind::Codex,
         channel_id,
@@ -1270,7 +1270,7 @@ async fn run_codex_idle_response_tail(
         tail_started_at,
     )
     .await;
-    if tui_idle_tail_should_commit_runtime_binding_offset(response, delivered) {
+    if tui_idle_tail_should_commit_runtime_binding_offset(response, delivery_result.is_ok()) {
         crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
             &tmux_session_name,
             rollout_path.to_str().unwrap_or_default(),
@@ -1381,7 +1381,7 @@ async fn run_claude_idle_response_tail(
         );
         return;
     }
-    let delivered = deliver_tui_idle_response(
+    let delivery_result = deliver_tui_idle_response(
         &shared,
         ProviderKind::Claude,
         channel_id,
@@ -1390,7 +1390,7 @@ async fn run_claude_idle_response_tail(
         tail_started_at,
     )
     .await;
-    if tui_idle_tail_should_commit_runtime_binding_offset(response, delivered) {
+    if tui_idle_tail_should_commit_runtime_binding_offset(response, delivery_result.is_ok()) {
         advance_claude_tmux_runtime_binding_offset(
             &tmux_session_name,
             &transcript_path,
@@ -1490,7 +1490,7 @@ async fn deliver_tui_idle_response(
     tmux_session_name: &str,
     response: &str,
     tail_started_at: chrono::DateTime<chrono::Utc>,
-) -> bool {
+) -> Result<(), String> {
     let Some(http) = shared.serenity_http_or_token_fallback() else {
         tracing::warn!(
             channel_id = channel_id.get(),
@@ -1498,7 +1498,10 @@ async fn deliver_tui_idle_response(
             provider = %provider.as_str(),
             "skipping TUI idle response relay; Discord HTTP unavailable"
         );
-        return false;
+        return Err(format!(
+            "discord http unavailable for provider {}",
+            provider.as_str()
+        ));
     };
     let formatted = if shared.status_panel_v2_enabled {
         super::formatting::format_for_discord_with_status_panel(response, &provider)
@@ -1551,7 +1554,7 @@ async fn deliver_tui_idle_response(
                 prompt_anchor_message_id = reference.map(|(_, message_id)| message_id.get()),
                 "TUI idle response relayed"
             );
-            true
+            Ok(())
         }
         Err(error) => {
             tracing::warn!(
@@ -1561,7 +1564,7 @@ async fn deliver_tui_idle_response(
                 error = %error,
                 "failed to relay TUI idle response"
             );
-            false
+            Err(error.to_string())
         }
     }
 }

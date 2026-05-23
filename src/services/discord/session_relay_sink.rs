@@ -53,6 +53,12 @@ enum SessionBoundTerminalDeliveryRoute {
     PlaceholderEdit(MessageId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionBoundTerminalDeliveryRouteDecision {
+    Route(SessionBoundTerminalDeliveryRoute),
+    Skipped,
+}
+
 fn session_bound_terminal_delivery_route(
     inflight: Option<&InflightTurnState>,
     tmux_session_name: &str,
@@ -74,20 +80,37 @@ fn session_bound_terminal_delivery_route(
     Some(SessionBoundTerminalDeliveryRoute::NewMessage)
 }
 
-fn session_bound_terminal_delivery_route_or_error(
+fn session_bound_terminal_delivery_route_or_skip(
     inflight: Option<&InflightTurnState>,
     tmux_session_name: &str,
     provider: &ProviderKind,
     channel_id: u64,
-) -> Result<SessionBoundTerminalDeliveryRoute, RelaySinkError> {
+) -> Result<SessionBoundTerminalDeliveryRoute, String> {
     session_bound_terminal_delivery_route(inflight, tmux_session_name).ok_or_else(|| {
-        RelaySinkError::Transient(format!(
+        format!(
             "session-bound terminal delivery route skipped for provider={} channel={} tmux_session={}",
             provider.as_str(),
             channel_id,
             tmux_session_name
-        ))
+        )
     })
+}
+
+fn session_bound_terminal_delivery_route_decision(
+    inflight: Option<&InflightTurnState>,
+    tmux_session_name: &str,
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> SessionBoundTerminalDeliveryRouteDecision {
+    match session_bound_terminal_delivery_route_or_skip(
+        inflight,
+        tmux_session_name,
+        provider,
+        channel_id,
+    ) {
+        Ok(route) => SessionBoundTerminalDeliveryRouteDecision::Route(route),
+        Err(_) => SessionBoundTerminalDeliveryRouteDecision::Skipped,
+    }
 }
 
 pub(in crate::services::discord) struct SessionBoundDiscordRelaySink {
@@ -127,9 +150,30 @@ impl SessionBoundDiscordRelaySink {
         }
     }
 
-    async fn deliver_response(&self, delivery: SessionRelayDelivery) -> Result<(), RelaySinkError> {
+    async fn deliver_response(
+        &self,
+        delivery: SessionRelayDelivery,
+    ) -> Result<SessionRelayDeliveryOutcome, RelaySinkError> {
         let channel_id = delivery.channel_id;
         let provider = delivery.provider;
+        let inflight = super::inflight::load_inflight_state(&provider, channel_id);
+        let route = match session_bound_terminal_delivery_route_decision(
+            inflight.as_ref(),
+            &delivery.session_name,
+            &provider,
+            channel_id,
+        ) {
+            SessionBoundTerminalDeliveryRouteDecision::Route(route) => route,
+            SessionBoundTerminalDeliveryRouteDecision::Skipped => {
+                tracing::debug!(
+                    provider = provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %delivery.session_name,
+                    "session-bound relay sink skipped bridge-owned or mismatched inflight"
+                );
+                return Ok(SessionRelayDeliveryOutcome::Skipped);
+            }
+        };
         let shared = self
             .health_registry
             .shared_for_provider(&provider)
@@ -146,27 +190,6 @@ impl SessionBoundDiscordRelaySink {
                 provider.as_str()
             ))
         })?;
-
-        let inflight = super::inflight::load_inflight_state(&provider, channel_id);
-        let route = match session_bound_terminal_delivery_route_or_error(
-            inflight.as_ref(),
-            &delivery.session_name,
-            &provider,
-            channel_id,
-        ) {
-            Ok(route) => route,
-            Err(error) => {
-                let error_message = error.to_string();
-                tracing::debug!(
-                    provider = provider.as_str(),
-                    channel = channel_id,
-                    tmux_session = %delivery.session_name,
-                        error = %error_message,
-                        "session-bound relay sink skipped bridge-owned or mismatched inflight"
-                );
-                return Err(error);
-            }
-        };
 
         let formatted = if shared.status_panel_v2_enabled {
             formatting::format_for_discord_with_status_panel(&delivery.response_text, &provider)
@@ -207,7 +230,7 @@ impl SessionBoundDiscordRelaySink {
                         &delivery.session_name,
                         channel_id,
                     );
-                    Ok(())
+                    Ok(SessionRelayDeliveryOutcome::Committed)
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
                     // #2757: do not delete msg_id here. The 3e158e588 path
@@ -232,7 +255,7 @@ impl SessionBoundDiscordRelaySink {
                         &delivery.session_name,
                         channel_id,
                     );
-                    Ok(())
+                    Ok(SessionRelayDeliveryOutcome::Committed)
                 }
                 Ok(ReplaceLongMessageOutcome::PartialContinuationFailure { error, .. }) => {
                     Err(RelaySinkError::Transient(error.to_string()))
@@ -273,9 +296,15 @@ impl SessionBoundDiscordRelaySink {
                 chars = relay_text.chars().count(),
                 "session-bound relay sink delivered terminal response via new message"
             );
-            Ok(())
+            Ok(SessionRelayDeliveryOutcome::Committed)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionRelayDeliveryOutcome {
+    Committed,
+    Skipped,
 }
 
 #[async_trait]
@@ -283,11 +312,16 @@ impl RelaySink for SessionBoundDiscordRelaySink {
     async fn deliver(&self, frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
         let deliveries = self.ingest_frame(frame);
         let mut terminal_committed = false;
+        let mut terminal_skipped = false;
         for delivery in deliveries {
             let session_name = delivery.session_name.clone();
             match self.deliver_response(delivery).await {
-                Ok(()) => {
+                Ok(SessionRelayDeliveryOutcome::Committed) => {
                     terminal_committed = true;
+                    self.finish_terminal_candidate(&session_name);
+                }
+                Ok(SessionRelayDeliveryOutcome::Skipped) => {
+                    terminal_skipped = true;
                     self.finish_terminal_candidate(&session_name);
                 }
                 Err(error) => {
@@ -298,6 +332,8 @@ impl RelaySink for SessionBoundDiscordRelaySink {
         }
         if terminal_committed {
             Ok(RelaySinkOutcome::TerminalCommitted)
+        } else if terminal_skipped {
+            Ok(RelaySinkOutcome::TerminalSkipped)
         } else {
             Ok(RelaySinkOutcome::FrameAccepted)
         }
@@ -612,25 +648,40 @@ mod tests {
     }
 
     #[test]
-    fn terminal_delivery_route_skip_is_sink_error_for_ack_fallback() {
+    fn terminal_delivery_route_skip_is_not_sink_error_for_ack_fallback() {
         let tmux = "AgentDesk-claude-relay-test";
         let bridge_owned = inflight_for(tmux, RelayOwnerKind::None, false);
-        let result = session_bound_terminal_delivery_route_or_error(
+        let result = session_bound_terminal_delivery_route_or_skip(
             Some(&bridge_owned),
             tmux,
             &ProviderKind::Claude,
             42,
         );
-        assert!(matches!(result, Err(RelaySinkError::Transient(_))));
+        assert!(result.is_err());
 
         let watcher_owned = inflight_for(tmux, RelayOwnerKind::Watcher, false);
-        let result = session_bound_terminal_delivery_route_or_error(
+        let result = session_bound_terminal_delivery_route_or_skip(
             Some(&watcher_owned),
             "AgentDesk-claude-other",
             &ProviderKind::Claude,
             42,
         );
-        assert!(matches!(result, Err(RelaySinkError::Transient(_))));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn terminal_delivery_route_skip_maps_to_terminal_skipped_outcome() {
+        let tmux = "AgentDesk-claude-relay-test";
+        let bridge_owned = inflight_for(tmux, RelayOwnerKind::None, false);
+        assert_eq!(
+            session_bound_terminal_delivery_route_decision(
+                Some(&bridge_owned),
+                tmux,
+                &ProviderKind::Claude,
+                42,
+            ),
+            SessionBoundTerminalDeliveryRouteDecision::Skipped
+        );
     }
 
     #[tokio::test]
@@ -645,6 +696,31 @@ mod tests {
             .expect("frame without terminal delivery should be accepted");
 
         assert_eq!(outcome, RelaySinkOutcome::FrameAccepted);
+    }
+
+    #[test]
+    fn parser_keeps_stop_hook_summary_soft_until_late_assistant_text_and_result() {
+        let binding = matched("45");
+        let mut parser = SessionRelayParser::default();
+        let stop_hook_candidate = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"early \"}]}}\n",
+            "{\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"sessionId\":\"sess-tui\",\"hookCount\":1,\"hasOutput\":true}\n"
+        );
+
+        assert!(
+            parser
+                .ingest_frame(&frame(&binding, stop_hook_candidate, 1))
+                .is_empty(),
+            "stop_hook_summary is only a soft terminal candidate and must not reset the turn"
+        );
+
+        let late_tail_and_result = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"late tail\"}]}}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done\"}\n"
+        );
+        let deliveries = parser.ingest_frame(&frame(&binding, late_tail_and_result, 2));
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].response_text, "early late tail");
     }
 
     #[test]
