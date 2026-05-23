@@ -1434,7 +1434,27 @@ impl CancelToken {
 }
 
 pub fn cancel_requested(token: Option<&CancelToken>) -> bool {
-    token.is_some_and(|token| token.cancelled.load(Ordering::Relaxed))
+    token.is_some_and(|token| {
+        enforce_watchdog_deadline(token, current_unix_millis());
+        token.cancelled.load(Ordering::Relaxed)
+    })
+}
+
+fn current_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn enforce_watchdog_deadline(token: &CancelToken, now_ms: i64) -> bool {
+    let deadline_ms = token.watchdog_deadline_ms.load(Ordering::Relaxed);
+    if deadline_ms > 0 && now_ms >= deadline_ms {
+        token.set_cancel_source_kind(CancelSource::WatchdogTimeout);
+        token.cancelled.store(true, Ordering::Relaxed);
+        return true;
+    }
+    false
 }
 
 pub fn register_child_pid(token: Option<&CancelToken>, child_pid: u32) {
@@ -1476,6 +1496,7 @@ pub fn spawn_cancel_watchdog(
     let done_for_thread = done.clone();
     let handle = std::thread::spawn(move || {
         while !done_for_thread.load(Ordering::Relaxed) {
+            enforce_watchdog_deadline(&token, current_unix_millis());
             if token.cancelled.load(Ordering::Relaxed) {
                 tracing::warn!(
                     provider_cancel_watchdog = label,
@@ -2097,7 +2118,11 @@ fn codex_model_context_window(model: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod cancel_token_tests {
-    use super::{CancelSource, CancelToken, cancel_requested, register_child_pid};
+    use super::{
+        CancelSource, CancelToken, cancel_requested, current_unix_millis,
+        enforce_watchdog_deadline, register_child_pid,
+    };
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn cancel_token_helpers_register_source_and_state() {
@@ -2187,6 +2212,26 @@ mod cancel_token_tests {
             token.cancel_source().as_deref(),
             Some("voice_barge_in_live_cut")
         );
+    }
+
+    #[test]
+    fn watchdog_deadline_enforcement_marks_cancelled_timeout() {
+        let token = CancelToken::new();
+        let now = current_unix_millis();
+        token
+            .watchdog_deadline_ms
+            .store(now + 1_000, Ordering::Relaxed);
+
+        assert!(!enforce_watchdog_deadline(&token, now + 999));
+        assert!(!token.cancelled.load(Ordering::Relaxed));
+
+        assert!(enforce_watchdog_deadline(&token, now + 1_000));
+        assert!(cancel_requested(Some(&token)));
+        assert_eq!(
+            token.cancel_source_kind(),
+            Some(CancelSource::WatchdogTimeout)
+        );
+        assert_eq!(token.cancel_source().as_deref(), Some("watchdog_timeout"));
     }
 }
 

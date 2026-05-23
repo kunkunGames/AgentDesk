@@ -18,8 +18,10 @@ fn tracing_env_filter() -> Result<EnvFilter> {
 }
 
 fn init_tracing_once() -> Result<()> {
+    crate::utils::redact::register_common_env_secrets();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_env_filter()?)
+        .with_writer(RedactingStdout)
         .try_init()
         .map_err(|error| anyhow::anyhow!("Failed to initialize tracing subscriber: {error}"))?;
     Ok(())
@@ -37,6 +39,7 @@ pub(crate) fn init_tracing() -> Result<()> {
 }
 
 fn init_dcserver_tracing_once() -> Result<()> {
+    crate::utils::redact::register_common_env_secrets();
     let root = crate::config::runtime_root()
         .ok_or_else(|| anyhow::anyhow!("Failed to resolve AgentDesk runtime root"))?;
     let log_path = root.join("logs").join("dcserver.stdout.log");
@@ -128,21 +131,56 @@ struct RotatingLogGuard {
     inner: Arc<Mutex<RotatingLogState>>,
 }
 
+#[derive(Clone, Copy)]
+struct RedactingStdout;
+
+struct RedactingIoGuard<W> {
+    inner: W,
+}
+
+impl<'a> MakeWriter<'a> for RedactingStdout {
+    type Writer = RedactingIoGuard<io::Stdout>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingIoGuard {
+            inner: io::stdout(),
+        }
+    }
+}
+
+fn redacted_log_bytes(buf: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(buf);
+    crate::utils::redact::redact_known_secrets(&text).into_bytes()
+}
+
+impl<W: Write> Write for RedactingIoGuard<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let redacted = redacted_log_bytes(buf);
+        self.inner.write_all(&redacted)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 impl Write for RotatingLogGuard {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut state = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("rotating log writer lock poisoned"))?;
+        let redacted = redacted_log_bytes(buf);
         if state.max_files > 0
             && state.max_bytes > 0
             && state.size > 0
-            && state.size.saturating_add(buf.len() as u64) > state.max_bytes
+            && state.size.saturating_add(redacted.len() as u64) > state.max_bytes
         {
             state.rotate()?;
         }
-        state.file.write_all(buf)?;
-        state.size = state.size.saturating_add(buf.len() as u64);
+        state.file.write_all(&redacted)?;
+        state.size = state.size.saturating_add(redacted.len() as u64);
         Ok(buf.len())
     }
 
@@ -383,10 +421,22 @@ mod tests {
 
 #[cfg(test)]
 mod rotation_tests {
-    use super::RotatingLogWriter;
+    use super::{RotatingLogWriter, redacted_log_bytes};
     use std::fs;
     use std::io::Write;
     use tracing_subscriber::fmt::writer::MakeWriter;
+
+    #[test]
+    fn redacted_log_bytes_masks_registered_plain_secret() {
+        crate::utils::redact::register_known_secret("disk-log-secret");
+
+        let redacted = String::from_utf8(redacted_log_bytes(
+            b"connection error carried disk-log-secret into Display",
+        ))
+        .unwrap();
+
+        assert_eq!(redacted, "connection error carried *** into Display");
+    }
 
     #[test]
     fn rotating_writer_compacts_oversized_existing_log_on_startup() {

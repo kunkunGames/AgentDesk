@@ -1969,6 +1969,7 @@ impl Default for Config {
 }
 
 pub fn load() -> Result<Config> {
+    crate::utils::redact::register_common_env_secrets();
     let path = resolve_graceful_config_path(
         std::env::var("AGENTDESK_CONFIG")
             .ok()
@@ -1985,6 +1986,7 @@ pub fn load() -> Result<Config> {
     let config: Config = serde_yaml::from_str(&contents)
         .with_context(|| format!("Failed to parse config: {path_display}"))?;
     let config = config.apply_runtime_defaults();
+    register_config_secrets(&config);
 
     // Ensure data dir exists
     std::fs::create_dir_all(&config.data.dir)?;
@@ -1993,11 +1995,36 @@ pub fn load() -> Result<Config> {
 }
 
 pub fn load_from_path(path: &Path) -> Result<Config> {
+    crate::utils::redact::register_common_env_secrets();
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config {}", path.display()))?;
     let config = serde_yaml::from_str::<Config>(&contents)
         .with_context(|| format!("Failed to parse config {}", path.display()))?;
-    Ok(config.apply_runtime_defaults())
+    let config = config.apply_runtime_defaults();
+    register_config_secrets(&config);
+    Ok(config)
+}
+
+fn register_config_secrets(config: &Config) {
+    if let Some(token) = config.server.auth_token.as_deref() {
+        crate::utils::redact::register_known_secret(token);
+    }
+    if let Some(password) = config.database.password.as_deref() {
+        crate::utils::redact::register_known_secret(password);
+    }
+    for bot in config.discord.bots.values() {
+        if let Some(token) = bot.token.as_deref() {
+            crate::utils::redact::register_known_secret(token);
+        }
+    }
+    for server in config.mcp_servers.values() {
+        if let Some(auth) = server.auth.as_ref()
+            && let Some(env_var) = auth.token_env_var.as_deref()
+            && let Ok(value) = std::env::var(env_var)
+        {
+            crate::utils::redact::register_known_secret(&value);
+        }
+    }
 }
 
 pub fn save_to_path(path: &Path, config: &Config) -> Result<()> {

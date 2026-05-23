@@ -563,7 +563,12 @@ async fn build_reply_context(
     let ref_author = &ref_msg.author.name;
     let ref_content = ref_msg.content.trim();
     let ref_text = if ref_content.is_empty() {
-        format!("[Reply to {}'s message (no text content)]", ref_author)
+        let attachments = ref_msg
+            .attachments
+            .iter()
+            .map(AttachmentReplyItem::from)
+            .collect::<Vec<_>>();
+        format_attachment_reply_context(ref_author, ref_msg.id.get(), &attachments)
     } else {
         let truncated = truncate_str(ref_content, 500);
         format!(
@@ -614,6 +619,58 @@ async fn build_reply_context(
             preceding_ctx, ref_text
         ))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AttachmentReplyItem {
+    filename: String,
+    size: u32,
+    description: Option<String>,
+}
+
+impl From<&serenity::Attachment> for AttachmentReplyItem {
+    fn from(attachment: &serenity::Attachment) -> Self {
+        Self {
+            filename: attachment.filename.clone(),
+            size: attachment.size,
+            description: attachment.description.clone(),
+        }
+    }
+}
+
+fn format_attachment_reply_context(
+    ref_author: &str,
+    ref_message_id: u64,
+    attachments: &[AttachmentReplyItem],
+) -> String {
+    if attachments.is_empty() {
+        return format!("[Reply to {}'s message (no text content)]", ref_author);
+    }
+
+    let mut lines = vec![
+        "[Reply context]".to_string(),
+        format!("Author: {ref_author}"),
+        format!("Canonical Discord message id: {ref_message_id}"),
+        "Content: [message has attachments but no text]".to_string(),
+        "Attachments:".to_string(),
+    ];
+    for (index, attachment) in attachments.iter().take(10).enumerate() {
+        let description = attachment.description.as_deref().unwrap_or("").trim();
+        let mut line = format!(
+            "{}. {} ({} bytes)",
+            index + 1,
+            attachment.filename,
+            attachment.size
+        );
+        if !description.is_empty() {
+            line.push_str(&format!(" — {}", truncate_str(description, 160)));
+        }
+        lines.push(line);
+    }
+    if attachments.len() > 10 {
+        lines.push(format!("... {} more attachment(s)", attachments.len() - 10));
+    }
+    lines.join("\n")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2785,6 +2842,30 @@ mod thread_guard_stale_tests {
             ),
             "missing inflight state must NOT be classified as stale"
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_context_tests {
+    use super::{AttachmentReplyItem, format_attachment_reply_context};
+
+    #[test]
+    fn attachment_reply_context_keeps_canonical_message_id_and_all_files() {
+        let attachments = (1..=5)
+            .map(|index| AttachmentReplyItem {
+                filename: format!("photo-{index}.png"),
+                size: 1024 * index,
+                description: (index == 3).then_some("middle attachment".to_string()),
+            })
+            .collect::<Vec<_>>();
+
+        let context = format_attachment_reply_context("사용자", 1500, &attachments);
+
+        assert!(context.contains("Canonical Discord message id: 1500"));
+        assert!(context.contains("photo-1.png"));
+        assert!(context.contains("photo-3.png"));
+        assert!(context.contains("middle attachment"));
+        assert!(context.contains("photo-5.png"));
     }
 }
 

@@ -1421,18 +1421,59 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
-                        // Detect restart_pending marker and set the in-memory flag
-                        // so the router queues new messages instead of starting turns.
-                        if !shared_for_deferred.restart_pending.load(Ordering::Relaxed) {
-                            if let Some(root) = crate::agentdesk_runtime_root() {
-                                if root.join("restart_pending").exists() {
-                                    shared_for_deferred
-                                        .restart_pending
-                                        .store(true, Ordering::SeqCst);
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    tracing::info!(
-                                        "  [{ts}] ⏸ DRAIN: restart_pending detected, entering drain mode — new turns blocked"
+                        // Quick-exit restart (#2713): dcserver no longer waits
+                        // for all active turns to drain. The marker is a deploy
+                        // request to persist cheap local state and exit; managed
+                        // TUI/tmux sessions survive and the next process
+                        // rehydrates transcript tailing from runtime state.
+                        if let Some(root) = crate::agentdesk_runtime_root() {
+                            let marker = root.join("restart_pending");
+                            if marker.exists() {
+                                shared_for_deferred
+                                    .restart_pending
+                                    .store(true, Ordering::SeqCst);
+                                shared_for_deferred
+                                    .shutting_down
+                                    .store(true, Ordering::SeqCst);
+                                if shared_for_deferred
+                                    .shutdown_counted
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                                let queue_count = mailbox_restart_drain_all(
+                                    &shared_for_deferred,
+                                    &provider_for_deferred,
+                                )
+                                .await;
+                                let ids: std::collections::HashMap<u64, u64> = shared_for_deferred
+                                    .last_message_ids
+                                    .iter()
+                                    .map(|entry| (entry.key().get(), *entry.value()))
+                                    .collect();
+                                if !ids.is_empty() {
+                                    runtime_store::save_all_last_message_ids(
+                                        provider_for_deferred.as_str(),
+                                        &ids,
                                     );
+                                }
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                tracing::info!(
+                                    "  [{ts}] 🔄 restart_pending detected — quick exit after persisting {queue_count} queued item(s)"
+                                );
+                                if shared_for_deferred
+                                        .shutdown_remaining
+                                        .fetch_sub(1, Ordering::AcqRel)
+                                        == 1
+                                {
+                                    let _ = std::fs::remove_file(&marker);
+                                    std::process::exit(0);
                                 }
                             }
                         }

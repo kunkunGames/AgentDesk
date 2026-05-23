@@ -604,9 +604,10 @@ pub fn handle_restart_dcserver(
         }
     }
 
-    // Deferred restart: write marker file and wait for dcserver to self-exit
-    // after all active turns complete. Falls back to force-kill on timeout.
-    const DEFERRED_TIMEOUT: Duration = Duration::from_secs(120);
+    // Quick restart (#2713): write marker file and wait for dcserver to
+    // self-exit after persisting cheap queue/checkpoint state. Active TUI/tmux
+    // turns survive and are rehydrated by the new process.
+    const DEFERRED_TIMEOUT: Duration = Duration::from_secs(30);
     if let Some(root) = agentdesk_runtime_root() {
         let marker = root.join("restart_pending");
         if let Err(e) = fs::write(&marker, VERSION) {
@@ -618,7 +619,7 @@ pub fn handle_restart_dcserver(
             return;
         }
         println!(
-            "   ⏳ Deferred restart requested — waiting for active turns to complete (max {}s)",
+            "   ⏳ Restart requested — waiting for dcserver quick-exit (max {}s)",
             DEFERRED_TIMEOUT.as_secs()
         );
 
