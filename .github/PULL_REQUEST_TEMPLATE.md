@@ -14,6 +14,10 @@
 ## Closes
 <!-- e.g. Closes #1234 -->
 
+## Duplicate / Overlap Check
+<!-- Run `gh pr list --state open` before submitting. Provide exact open PR numbers below if overlapping work exists. -->
+<!-- NOTE: Generated inventory refresh PRs MUST explicitly state duplicate checks here. -->
+
 ## WorkFingerprint
 
 - Agent:
