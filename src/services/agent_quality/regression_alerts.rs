@@ -100,6 +100,32 @@ impl Regression {
     }
 }
 
+/// Fallback decode for Postgres rows where legacy/malformed data yields
+/// `ColumnDecode` errors rather than burying the entire query. Missing
+/// columns or network errors still correctly fail closed.
+pub fn explicit_decode_fallback<'r, T, R>(
+    row: &'r R,
+    column: &str,
+    default_val: T,
+) -> Result<T, anyhow::Error>
+where
+    R: Row,
+    T: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+{
+    match row.try_get(column) {
+        Ok(val) => Ok(val),
+        Err(sqlx::Error::ColumnDecode { .. }) => {
+            tracing::warn!(
+                column = column,
+                "[quality] explicit fallback on column decode error"
+            );
+            Ok(default_val)
+        }
+        Err(e) => Err(anyhow!("decode {}: {}", column, e)),
+    }
+}
+
 /// Resolve the alert channel id (env override or fallback const).
 pub fn resolve_alert_channel() -> String {
     std::env::var(ALERT_CHANNEL_ENV)
@@ -191,18 +217,10 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             .try_get("agent_id")
             .map_err(|error| anyhow!("decode agent_id: {error}"))?;
 
-        let turn_7d: Option<f64> = row
-            .try_get("turn_success_rate_7d")
-            .map_err(|error| anyhow!("decode turn_success_rate_7d: {error}"))?;
-        let turn_30d: Option<f64> = row
-            .try_get("turn_success_rate_30d")
-            .map_err(|error| anyhow!("decode turn_success_rate_30d: {error}"))?;
-        let turn_s7: i64 = row
-            .try_get("turn_sample_size_7d")
-            .map_err(|error| anyhow!("decode turn_sample_size_7d: {error}"))?;
-        let turn_s30: i64 = row
-            .try_get("turn_sample_size_30d")
-            .map_err(|error| anyhow!("decode turn_sample_size_30d: {error}"))?;
+        let turn_7d: Option<f64> = explicit_decode_fallback(&row, "turn_success_rate_7d", None)?;
+        let turn_30d: Option<f64> = explicit_decode_fallback(&row, "turn_success_rate_30d", None)?;
+        let turn_s7: i64 = explicit_decode_fallback(&row, "turn_sample_size_7d", 0)?;
+        let turn_s30: i64 = explicit_decode_fallback(&row, "turn_sample_size_30d", 0)?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::TurnSuccessRate,
@@ -214,18 +232,10 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             out.push(reg);
         }
 
-        let review_7d: Option<f64> = row
-            .try_get("review_pass_rate_7d")
-            .map_err(|error| anyhow!("decode review_pass_rate_7d: {error}"))?;
-        let review_30d: Option<f64> = row
-            .try_get("review_pass_rate_30d")
-            .map_err(|error| anyhow!("decode review_pass_rate_30d: {error}"))?;
-        let review_s7: i64 = row
-            .try_get("review_sample_size_7d")
-            .map_err(|error| anyhow!("decode review_sample_size_7d: {error}"))?;
-        let review_s30: i64 = row
-            .try_get("review_sample_size_30d")
-            .map_err(|error| anyhow!("decode review_sample_size_30d: {error}"))?;
+        let review_7d: Option<f64> = explicit_decode_fallback(&row, "review_pass_rate_7d", None)?;
+        let review_30d: Option<f64> = explicit_decode_fallback(&row, "review_pass_rate_30d", None)?;
+        let review_s7: i64 = explicit_decode_fallback(&row, "review_sample_size_7d", 0)?;
+        let review_s30: i64 = explicit_decode_fallback(&row, "review_sample_size_30d", 0)?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::ReviewPassRate,
@@ -641,5 +651,76 @@ mod tests {
                 .to_string()
                 .contains("decode error: db error")
         );
+    }
+
+    // Mock row implementation for testing decode fallback
+    struct MockRow {
+        should_fail_decode: bool,
+        missing_column: bool,
+    }
+
+    impl sqlx::Row for MockRow {
+        type Database = sqlx::Postgres;
+
+        fn columns(&self) -> &[<Self::Database as sqlx::Database>::Column] {
+            &[]
+        }
+
+        fn try_get_raw<I>(
+            &self,
+            _index: I,
+        ) -> Result<<Self::Database as sqlx::Database>::ValueRef<'_>, sqlx::Error>
+        where
+            I: sqlx::ColumnIndex<Self>,
+        {
+            if self.missing_column {
+                Err(sqlx::Error::ColumnNotFound("missing".to_string()))
+            } else if self.should_fail_decode {
+                Err(sqlx::Error::ColumnDecode {
+                    index: "mock_col".to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "mock decode error",
+                    )),
+                })
+            } else {
+                unreachable!("Happy path not implemented for mock")
+            }
+        }
+    }
+
+    impl sqlx::ColumnIndex<MockRow> for &str {
+        fn index(&self, _row: &MockRow) -> Result<usize, sqlx::Error> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn explicit_decode_fallback_returns_default_on_column_decode_error() {
+        let mock_row = MockRow {
+            should_fail_decode: true,
+            missing_column: false,
+        };
+
+        // This triggers `try_get` -> `try_get_raw` returning a `ColumnDecode` error,
+        // which our helper should catch and replace with the default `42.0`.
+        let result: Result<f64, anyhow::Error> =
+            explicit_decode_fallback(&mock_row, "some_column", 42.0);
+
+        assert_eq!(result.unwrap(), 42.0);
+    }
+
+    #[test]
+    fn explicit_decode_fallback_fails_closed_on_other_errors() {
+        let mock_row = MockRow {
+            should_fail_decode: false,
+            missing_column: true, // triggers ColumnNotFound
+        };
+
+        let result: Result<f64, anyhow::Error> =
+            explicit_decode_fallback(&mock_row, "some_column", 42.0);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ColumnNotFound"));
     }
 }
