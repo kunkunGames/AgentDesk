@@ -406,25 +406,11 @@ fn clear_prompt_draft_before_error(session_name: &str, cancel_token: Option<&Can
 }
 
 pub(crate) fn claude_prompt_draft_backspace_budget_from_tail(pane_tail: &str) -> Option<usize> {
-    pane_tail
-        .lines()
-        .rev()
-        .find_map(claude_prompt_draft_backspace_budget_from_line)
+    crate::services::tmux_common::tmux_capture_claude_tui_prompt_draft_backspace_budget(pane_tail)
 }
 
 pub(crate) fn claude_prompt_draft_backspace_budget_from_line(line: &str) -> Option<usize> {
-    let rest = line
-        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}')
-        .strip_prefix('\u{276f}')?
-        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
-    if rest.is_empty()
-        || rest
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"))
-    {
-        return None;
-    }
-    Some(rest.chars().count().saturating_add(4).min(512))
+    crate::services::tmux_common::claude_tui_prompt_draft_backspace_budget_from_line(line)
 }
 
 fn check_prompt_cancel(cancel_token: Option<&CancelToken>) -> Result<(), String> {
@@ -1013,6 +999,16 @@ mod tests {
         let budget = claude_prompt_draft_backspace_budget_from_line("❯\u{00a0}commit this");
 
         assert_eq!(budget, Some("commit this".chars().count() + 4));
+    }
+
+    #[test]
+    fn claude_prompt_draft_backspace_budget_ignores_completed_history_tail() {
+        let tail = "\
+❯ write a plan
+계획만 적고 보류 — 1개
+  CLAUDE.md: 1, MCP: 2 │ Tools: 5 done";
+
+        assert_eq!(claude_prompt_draft_backspace_budget_from_tail(tail), None);
     }
 
     #[test]

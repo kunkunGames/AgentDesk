@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::services::tmux_diagnostics::clear_tmux_exit_reason;
 
 const CLAUDE_TUI_READY_SCAN_LINES: usize = 12;
+const CLAUDE_TUI_DRAFT_SCAN_LINES: usize = 36;
 const CLAUDE_TUI_READY_BANNER: &str = "Ready for input (type message + Enter)";
 const CLAUDE_TUI_PROMPT_MARKER: &str = "\u{276f}";
 
@@ -34,7 +35,15 @@ fn tmux_line_is_claude_tui_prompt_draft(line: &str) -> bool {
 fn tmux_lines_after_claude_prompt_show_completed_history(lines: &[&str]) -> bool {
     lines.iter().any(|line| {
         let line = trim_prompt_line(line);
-        line.starts_with('⏺') || line.starts_with("✻ ")
+        let nonzero_tool_summary =
+            line.contains("Tools:") && line.contains(" done") && !line.contains("Tools: 0 done");
+        line.starts_with('⏺')
+            || line.starts_with("✻ ")
+            || line.contains("Baked for")
+            || line.contains("Brewed for")
+            || line.contains("Crunched for")
+            || line.contains("Cogitated for")
+            || nonzero_tool_summary
     })
 }
 
@@ -48,11 +57,17 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
 }
 
 pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
+    tmux_capture_claude_tui_prompt_draft_backspace_budget(capture).is_some()
+}
+
+pub(crate) fn tmux_capture_claude_tui_prompt_draft_backspace_budget(
+    capture: &str,
+) -> Option<usize> {
     let non_empty = capture
         .lines()
         .filter(|l| !l.trim().is_empty())
         .collect::<Vec<_>>();
-    let start = non_empty.len().saturating_sub(CLAUDE_TUI_READY_SCAN_LINES);
+    let start = non_empty.len().saturating_sub(CLAUDE_TUI_DRAFT_SCAN_LINES);
     let recent = &non_empty[start..];
     recent
         .iter()
@@ -63,17 +78,31 @@ pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> b
                 return None;
             }
             if !tmux_line_is_claude_tui_prompt_draft(line) {
-                return Some(false);
+                return Some(None);
             }
             // Claude keeps submitted prompt lines in the pane history. If the
             // prompt line is followed by rendered assistant/completion output,
             // it is historical text, not an editable composer draft.
             if tmux_lines_after_claude_prompt_show_completed_history(&recent[index + 1..]) {
-                return Some(false);
+                return Some(None);
             }
-            Some(true)
+            Some(claude_tui_prompt_draft_backspace_budget_from_line(line))
         })
-        .unwrap_or(false)
+        .unwrap_or(None)
+}
+
+pub(crate) fn claude_tui_prompt_draft_backspace_budget_from_line(line: &str) -> Option<usize> {
+    let rest = trim_prompt_line(line)
+        .strip_prefix(CLAUDE_TUI_PROMPT_MARKER)?
+        .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
+    if rest.is_empty()
+        || rest
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"))
+    {
+        return None;
+    }
+    Some(rest.chars().count().saturating_add(4).min(512))
 }
 
 pub(crate) fn tmux_capture_indicates_generic_ready_banner(capture: &str) -> bool {
@@ -625,6 +654,45 @@ assistant output
 ✻ Brewed for 2s
 ─────────────────────────────────────────────────────────────────────────────
   🤖 Opus(H) │ ██░░░░░░░░ │ 24%";
+
+        assert!(!tmux_capture_indicates_claude_tui_prompt_draft(capture));
+    }
+
+    #[test]
+    fn claude_prompt_draft_detector_ignores_response_tail_with_tool_summary() {
+        let capture = "\
+❯ 계획만 적고 보류해줘
+계획만 적고 보류 — 1개
+  📁 claude-adk-cc-20260523-070547
+  CLAUDE.md: 1, MCP: 2 │ Tools: 5 done";
+
+        assert!(!tmux_capture_indicates_claude_tui_prompt_draft(capture));
+        assert_eq!(
+            tmux_capture_claude_tui_prompt_draft_backspace_budget(capture),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_prompt_draft_detector_uses_wider_window_for_history_completion() {
+        let capture = "\
+❯ direct prompt typed through ssh
+  wrapped prompt line
+  more wrapped prompt line
+  filler 01
+  filler 02
+  filler 03
+  filler 04
+  filler 05
+  filler 06
+  filler 07
+  filler 08
+  filler 09
+  filler 10
+  filler 11
+  filler 12
+⏺ direct prompt typed through ssh
+✻ Brewed for 2s";
 
         assert!(!tmux_capture_indicates_claude_tui_prompt_draft(capture));
     }

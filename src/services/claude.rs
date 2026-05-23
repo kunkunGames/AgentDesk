@@ -1631,7 +1631,7 @@ fn claude_tui_followup_stranded_prompt_draft_state(
         crate::services::claude_tui::transcript_tail::observe_transcript_turn_state(
             transcript_path,
         );
-    if !snapshot.tmux_pane_alive || !snapshot.prompt_draft_detected {
+    if !claude_tui_snapshot_has_recoverable_prompt_draft(snapshot) {
         return None;
     }
     match transcript_turn_state {
@@ -1643,6 +1643,18 @@ fn claude_tui_followup_stranded_prompt_draft_state(
         }
         _ => None,
     }
+}
+
+#[cfg(unix)]
+fn claude_tui_snapshot_has_recoverable_prompt_draft(
+    snapshot: &crate::services::claude_tui::input::PromptReadinessSnapshot,
+) -> bool {
+    snapshot.tmux_pane_alive
+        && snapshot.prompt_draft_detected
+        && crate::services::claude_tui::input::claude_prompt_draft_backspace_budget_from_tail(
+            &snapshot.pane_tail,
+        )
+        .is_some()
 }
 
 #[cfg(unix)]
@@ -4135,7 +4147,7 @@ mod claude_tui_session_resolution_tests {
             prompt_draft_detected: true,
             tmux_pane_alive: true,
             capture_available: true,
-            pane_tail: "draft".to_string(),
+            pane_tail: "❯ stranded draft".to_string(),
         };
 
         assert_eq!(
@@ -4180,6 +4192,29 @@ mod claude_tui_session_resolution_tests {
         };
         assert_eq!(
             claude_tui_followup_stranded_prompt_draft_state(&dead_pane, &transcript_path),
+            None
+        );
+    }
+
+    #[test]
+    fn response_residue_draft_heuristic_does_not_recreate_claude_tui() {
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let transcript_path = transcript_dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript_path,
+            r#"{"type":"system","subtype":"turn_duration","session_id":"s"}"#,
+        )
+        .unwrap();
+        let snapshot = crate::services::claude_tui::input::PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "계획만 적고 보류 — 1개\n  CLAUDE.md: 1, MCP: 2 │ Tools: 5 done".to_string(),
+        };
+
+        assert_eq!(
+            claude_tui_followup_stranded_prompt_draft_state(&snapshot, &transcript_path),
             None
         );
     }
