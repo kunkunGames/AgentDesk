@@ -181,7 +181,10 @@ pub(super) async fn post_adk_session_status(
         provider: Some(provider.as_str().to_string()),
         session_info: session_info.map(str::to_string),
         name: name.and_then(clean_nonempty).map(str::to_string),
-        model: model.and_then(clean_nonempty).map(str::to_string),
+        model: model
+            .and_then(clean_nonempty)
+            .filter(|value| !value.eq_ignore_ascii_case(provider.as_str()))
+            .map(str::to_string),
         tokens,
         cwd: cwd.and_then(clean_nonempty).map(str::to_string),
         dispatch_id: dispatch_id.and_then(clean_nonempty).map(str::to_string),

@@ -2676,6 +2676,8 @@ async fn start_reserved_headless_turn_with_owner(
         prelaunch_runtime_kind,
     );
 
+    let model_for_turn =
+        super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
     let adk_session_name = channel_name.clone();
     let adk_session_info =
         derive_adk_session_info(Some(prompt), channel_name.as_deref(), Some(&current_path));
@@ -2685,7 +2687,7 @@ async fn start_reserved_headless_turn_with_owner(
     post_adk_session_status(
         adk_session_key.as_deref(),
         adk_session_name.as_deref(),
-        Some(provider.as_str()),
+        model_for_turn.as_deref(),
         "working",
         &provider,
         Some(&adk_session_info),
@@ -2823,8 +2825,6 @@ async fn start_reserved_headless_turn_with_owner(
         }
     }
 
-    let model_for_turn =
-        super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
     let native_fast_mode_override = native_fast_mode_override_for_turn(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, fast_mode_channel_id).await,
@@ -5682,6 +5682,8 @@ pub(in crate::services::discord) async fn handle_text_message(
         prelaunch_runtime_kind,
     );
 
+    let model_for_turn =
+        super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
     let adk_session_name = channel_name.clone();
     let adk_session_info = derive_adk_session_info(
         Some(user_text),
@@ -5710,7 +5712,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     post_adk_session_status(
         adk_session_key.as_deref(),
         adk_session_name.as_deref(),
-        Some(provider.as_str()),
+        model_for_turn.as_deref(),
         "working",
         &provider,
         Some(&adk_session_info),
@@ -6268,8 +6270,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         }
     }
 
-    let model_for_turn =
-        super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
     let native_fast_mode_override = native_fast_mode_override_for_turn(
         &provider,
         super::super::commands::channel_fast_mode_setting(shared, fast_mode_channel_id).await,
