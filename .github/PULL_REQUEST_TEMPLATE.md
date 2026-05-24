@@ -3,6 +3,10 @@
 ## Summary
 <!-- 1–3 bullets: what changed and why. -->
 
+## Queue Hygiene Checklist
+<!-- Mandatory for Steward, Redline, Scribe, and Cartographer-Lite tasks -->
+- [ ] **Overlap guard:** I have checked for duplicate open PRs. If this is a generated inventory refresh, no open PR already updates the exact same boundary.
+
 ## Test plan
 <!-- Bulleted checklist: how to verify the change. -->
 
