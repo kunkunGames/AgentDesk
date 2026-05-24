@@ -16,6 +16,9 @@ concurrency:
   group: main-ci-triage-${{ github.event.workflow_run.id }}
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   triage:
     name: Triage main CI red/green streaks
