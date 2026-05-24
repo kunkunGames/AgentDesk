@@ -2293,7 +2293,7 @@ fn strip_trailing_streaming_status_footer(lines: &mut Vec<&str>) {
     }
 }
 
-fn is_streaming_placeholder_status_line(line: &str) -> bool {
+pub(super) fn is_streaming_placeholder_status_line(line: &str) -> bool {
     const SPINNER_FRAMES: &[char] = &[
         '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', '|', '/', '-', '\\', '◐', '◓', '◑', '◒',
         '⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷',
@@ -2302,7 +2302,10 @@ fn is_streaming_placeholder_status_line(line: &str) -> bool {
     let Some(first) = chars.next() else {
         return false;
     };
-    if !SPINNER_FRAMES.contains(&first) || !chars.next().is_some_and(char::is_whitespace) {
+    let braille_spinner = ('\u{2800}'..='\u{28ff}').contains(&first);
+    if !(SPINNER_FRAMES.contains(&first) || braille_spinner)
+        || !chars.next().is_some_and(char::is_whitespace)
+    {
         return false;
     }
     let status = chars.as_str().trim();

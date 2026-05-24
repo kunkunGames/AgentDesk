@@ -1807,10 +1807,21 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     if panel_text == *last_status_panel_text {
         return true;
     }
-    match gateway
-        .edit_message(channel_id, status_msg_id, &panel_text)
-        .await
-    {
+    let edit_result = if gateway.can_chain_locally() {
+        gateway
+            .edit_message(channel_id, status_msg_id, &panel_text)
+            .await
+    } else if let Some(http) = shared.serenity_http_or_token_fallback() {
+        super::http::edit_channel_message(&http, channel_id, status_msg_id, &panel_text)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        gateway
+            .edit_message(channel_id, status_msg_id, &panel_text)
+            .await
+    };
+    match edit_result {
         Ok(()) => {
             *last_status_panel_text = panel_text;
             true
@@ -1825,6 +1836,172 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
             );
             false
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeadlessPlaceholderCleanupAction {
+    Delete,
+    Edit(String),
+    Skip,
+}
+
+fn is_synthetic_headless_message_id(message_id: MessageId) -> bool {
+    message_id.get() >= 8_000_000_000_000_000_000
+}
+
+fn is_codex_tool_log_marker_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some((name, _)) = rest.split_once(']') else {
+        return false;
+    };
+    const CODEX_TOOL_MARKER_NAMES: &[&str] = &[
+        "bash",
+        "read",
+        "edit",
+        "multiedit",
+        "grep",
+        "glob",
+        "ls",
+        "task",
+        "todowrite",
+        "webfetch",
+        "websearch",
+        "applypatch",
+        "notebookread",
+        "notebookedit",
+    ];
+    let normalized = name.trim().to_ascii_lowercase();
+    normalized.starts_with("mcp__")
+        || CODEX_TOOL_MARKER_NAMES
+            .iter()
+            .any(|candidate| *candidate == normalized)
+}
+
+fn strip_headless_placeholder_artifacts(text: &str, provider: &ProviderKind) -> String {
+    let strip_codex_tool_logs = matches!(provider, ProviderKind::Codex);
+    let mut kept = Vec::new();
+    let mut pending_fence: Option<Vec<&str>> = None;
+
+    for line in text.lines() {
+        if let Some(fence) = pending_fence.as_mut() {
+            fence.push(line);
+            if line.trim_start().starts_with("```") {
+                let inner = &fence[1..fence.len().saturating_sub(1)];
+                let tool_log_only = strip_codex_tool_logs
+                    && inner
+                        .iter()
+                        .filter(|inner_line| !inner_line.trim().is_empty())
+                        .all(|inner_line| is_codex_tool_log_marker_line(inner_line));
+                if !tool_log_only {
+                    kept.extend(fence.iter().copied());
+                }
+                pending_fence = None;
+            }
+            continue;
+        }
+
+        let trimmed = line.trim();
+        if super::formatting::is_streaming_placeholder_status_line(trimmed) {
+            continue;
+        }
+        if strip_codex_tool_logs && is_codex_tool_log_marker_line(line) {
+            continue;
+        }
+        if line.trim_start().starts_with("```") {
+            pending_fence = Some(vec![line]);
+            continue;
+        }
+        kept.push(line);
+    }
+
+    if let Some(fence) = pending_fence {
+        let inner = &fence[1..];
+        let tool_log_only = strip_codex_tool_logs
+            && inner
+                .iter()
+                .filter(|inner_line| !inner_line.trim().is_empty())
+                .all(|inner_line| is_codex_tool_log_marker_line(inner_line));
+        if !tool_log_only {
+            kept.extend(fence);
+        }
+    }
+
+    kept.join("\n").trim().to_string()
+}
+
+fn headless_streaming_placeholder_cleanup_action(
+    last_edit_text: &str,
+    provider: &ProviderKind,
+    status_panel_v2_enabled: bool,
+) -> HeadlessPlaceholderCleanupAction {
+    let mut cleaned = if status_panel_v2_enabled {
+        super::formatting::format_for_discord_with_status_panel(last_edit_text, provider)
+    } else {
+        super::formatting::format_for_discord_with_provider(last_edit_text, provider)
+    };
+    if status_panel_v2_enabled {
+        cleaned = strip_headless_placeholder_artifacts(&cleaned, provider);
+    }
+    if cleaned.trim().is_empty() {
+        HeadlessPlaceholderCleanupAction::Delete
+    } else if cleaned == last_edit_text {
+        HeadlessPlaceholderCleanupAction::Skip
+    } else {
+        HeadlessPlaceholderCleanupAction::Edit(cleaned)
+    }
+}
+
+async fn cleanup_headless_streaming_placeholder_after_delivery(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    current_msg_id: MessageId,
+    status_panel_msg_id: Option<MessageId>,
+    last_edit_text: &str,
+    provider: &ProviderKind,
+) {
+    if current_msg_id.get() == 0
+        || status_panel_msg_id == Some(current_msg_id)
+        || is_synthetic_headless_message_id(current_msg_id)
+    {
+        return;
+    }
+    let Some(http) = shared.serenity_http_or_token_fallback() else {
+        return;
+    };
+    match headless_streaming_placeholder_cleanup_action(
+        last_edit_text,
+        provider,
+        shared.status_panel_v2_enabled,
+    ) {
+        HeadlessPlaceholderCleanupAction::Delete => {
+            if let Err(error) =
+                super::http::delete_channel_message(&http, channel_id, current_msg_id).await
+            {
+                tracing::warn!(
+                    "[turn_bridge] failed to delete stale headless streaming placeholder {} in channel {}: {}",
+                    current_msg_id,
+                    channel_id,
+                    error
+                );
+            }
+        }
+        HeadlessPlaceholderCleanupAction::Edit(cleaned) => {
+            if let Err(error) =
+                super::http::edit_channel_message(&http, channel_id, current_msg_id, &cleaned).await
+            {
+                tracing::warn!(
+                    "[turn_bridge] failed to clean stale headless streaming placeholder {} in channel {}: {}",
+                    current_msg_id,
+                    channel_id,
+                    error
+                );
+            }
+        }
+        HeadlessPlaceholderCleanupAction::Skip => {}
     }
 }
 
@@ -2344,6 +2521,42 @@ mod streaming_edit_text_tests {
             &PlaceholderCleanupOutcome::AlreadyGone
         ));
     }
+
+    #[test]
+    fn headless_cleanup_deletes_status_only_codex_placeholder() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "[Bash] /bin/zsh -lc 'cargo test'\n⠙ Processing...",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(action, HeadlessPlaceholderCleanupAction::Delete);
+    }
+
+    #[test]
+    fn headless_cleanup_deletes_processing_with_codex_tool_log_block() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "⠂ Processing...\n\n```\n[Bash] /bin/zsh -lc 'grep -n foo src/lib.rs'\n[Bash] /bin/zsh -lc \"sed -n '1,40p' src/lib.rs\"\n```",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(action, HeadlessPlaceholderCleanupAction::Delete);
+    }
+
+    #[test]
+    fn headless_cleanup_edits_partial_answer_without_processing_footer() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "partial answer\n\n⠙ Processing...",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(
+            action,
+            HeadlessPlaceholderCleanupAction::Edit("partial answer".to_string())
+        );
+    }
 }
 
 fn bridge_pre_submission_tui_prompt_error(provider: &ProviderKind, full_response: &str) -> bool {
@@ -2479,6 +2692,14 @@ fn live_watcher_registered_for_relay(shared: &SharedData, owner_channel_id: Chan
         .tmux_watchers
         .get(&owner_channel_id)
         .is_some_and(|watcher| !watcher.cancel.load(Ordering::Relaxed))
+}
+
+fn bridge_should_reclaim_relay_from_missing_watcher(
+    watcher_owns_assistant_relay: bool,
+    standby_relay_owns_output: bool,
+    live_watcher_registered: bool,
+) -> bool {
+    watcher_owns_assistant_relay && !standby_relay_owns_output && !live_watcher_registered
 }
 
 fn advance_tmux_relay_confirmed_end(
@@ -5430,6 +5651,22 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
+            if bridge_should_reclaim_relay_from_missing_watcher(
+                watcher_owns_assistant_relay,
+                standby_relay_owns_output,
+                live_watcher_registered_for_relay(shared_owned.as_ref(), watcher_owner_channel_id),
+            ) {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ turn_bridge reclaiming assistant relay for channel {} after watcher disappeared",
+                    channel_id.get()
+                );
+                watcher_owns_assistant_relay = false;
+                watcher_relay_available_for_turn = false;
+                inflight_state.set_relay_owner_kind(super::inflight::RelayOwnerKind::None);
+                state_dirty = true;
+            }
+
             if state_dirty
                 || pending_long_running_open_after_state_save.is_some()
                 || pending_long_running_retarget_after_state_save.is_some()
@@ -6771,6 +7008,15 @@ pub(super) fn spawn_turn_bridge(
                     .await
                     {
                         Ok(()) => {
+                            cleanup_headless_streaming_placeholder_after_delivery(
+                                shared_owned.as_ref(),
+                                channel_id,
+                                current_msg_id,
+                                status_panel_msg_id,
+                                &last_edit_text,
+                                &provider,
+                            )
+                            .await;
                             terminal_delivery_committed = true;
                         }
                         Err(error) => {

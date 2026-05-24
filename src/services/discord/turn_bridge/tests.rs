@@ -26,10 +26,10 @@ use super::stale_resume::{
     result_event_has_stale_resume_error, stream_error_requires_terminal_session_reset,
 };
 use super::{
-    advance_tmux_relay_confirmed_end, merge_task_notification_kind, monitor_handoff_tool_context,
-    release_task_notification_kind, should_delegate_bridge_relay_to_watcher,
-    task_notification_closes_background_child, terminal_delivery_response_after_offset,
-    turn_bridge_replace_outcome_committed,
+    advance_tmux_relay_confirmed_end, bridge_should_reclaim_relay_from_missing_watcher,
+    merge_task_notification_kind, monitor_handoff_tool_context, release_task_notification_kind,
+    should_delegate_bridge_relay_to_watcher, task_notification_closes_background_child,
+    terminal_delivery_response_after_offset, turn_bridge_replace_outcome_committed,
 };
 use crate::db::turns::TurnTokenUsage;
 use crate::services::agent_protocol::{
@@ -3134,6 +3134,22 @@ fn bridge_relay_delegation_stays_disabled_for_terminal_error_paths() {
             recovery_retry,
         ));
     }
+}
+
+#[test]
+fn bridge_reclaims_relay_when_watcher_owner_disappears() {
+    assert!(bridge_should_reclaim_relay_from_missing_watcher(
+        true, false, false
+    ));
+    assert!(!bridge_should_reclaim_relay_from_missing_watcher(
+        true, false, true
+    ));
+    assert!(!bridge_should_reclaim_relay_from_missing_watcher(
+        false, false, false
+    ));
+    assert!(!bridge_should_reclaim_relay_from_missing_watcher(
+        true, true, false
+    ));
 }
 
 // ========== resolve_done_response tests ==========
