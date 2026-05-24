@@ -10186,6 +10186,7 @@ mod tests {
         };
         let item = crate::services::turn_orchestrator::PendingQueueItem {
             author_id: 555,
+            author_is_bot: false,
             message_id: 2_266_003,
             source_message_ids: vec![2_266_003],
             text: "회의록 정리해줘".to_string(),
@@ -10531,6 +10532,7 @@ mod tests {
             channel_id,
             super::super::super::Intervention {
                 author_id: owner,
+                author_is_bot: false,
                 message_id: queued_msg_id,
                 source_message_ids: vec![queued_msg_id],
                 text: "race-loser queued message".to_string(),
@@ -10749,6 +10751,7 @@ mod tests {
             channel_id,
             super::super::super::Intervention {
                 author_id: owner,
+                author_is_bot: false,
                 message_id: race_lost_msg_id_clone,
                 source_message_ids: vec![race_lost_msg_id_clone],
                 text: "queued during race".to_string(),

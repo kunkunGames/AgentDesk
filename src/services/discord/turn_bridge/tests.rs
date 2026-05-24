@@ -517,6 +517,7 @@ async fn replace_fallback_preserves_cleanup_inflight_and_defers_queued_dispatch(
         channel_id,
         super::super::Intervention {
             author_id: owner_id,
+            author_is_bot: false,
             message_id: queued_msg_id,
             source_message_ids: vec![queued_msg_id],
             text: "queued follow-up".to_string(),
@@ -3712,6 +3713,7 @@ async fn watcher_does_not_kickoff_queue_when_dispatch_failed() {
         channel_id,
         super::super::Intervention {
             author_id: UserId::new(7),
+            author_is_bot: false,
             message_id: MessageId::new(1500042670918336517),
             source_message_ids: vec![MessageId::new(1500042670918336517)],
             text: "queued behind failing dispatch".to_string(),

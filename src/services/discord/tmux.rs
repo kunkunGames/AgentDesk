@@ -6198,6 +6198,7 @@ mod tests {
             channel,
             super::super::Intervention {
                 author_id: UserId::new(99),
+                author_is_bot: false,
                 message_id: MessageId::new(200),
                 source_message_ids: vec![MessageId::new(200)],
                 text: "queued behind monitor".to_string(),

@@ -2841,6 +2841,7 @@ async fn enqueue_internal_followup(
         channel_id,
         Intervention {
             author_id: UserId::new(1),
+            author_is_bot: false,
             message_id: reply_message_id,
             source_message_ids: vec![reply_message_id],
             text: text.into(),
@@ -3435,6 +3436,7 @@ async fn catch_up_missed_messages_inner(
                 channel_id,
                 Intervention {
                     author_id: msg.author.id,
+                    author_is_bot: msg.author.bot,
                     message_id: msg.id,
                     source_message_ids: vec![msg.id],
                     text: text.clone(),
@@ -3631,6 +3633,7 @@ async fn catch_up_missed_messages_inner(
                 channel_id,
                 Intervention {
                     author_id: msg.author.id,
+                    author_is_bot: msg.author.bot,
                     message_id: msg.id,
                     source_message_ids: vec![msg.id],
                     text: text.to_string(),
@@ -4760,6 +4763,7 @@ mod tests {
             active_user_message_id: Some(MessageId::new(200)),
             intervention_queue: vec![Intervention {
                 author_id: UserId::new(42),
+                author_is_bot: false,
                 message_id: MessageId::new(100),
                 source_message_ids: vec![MessageId::new(90), MessageId::new(100)],
                 text: "queued".to_string(),
@@ -4848,6 +4852,7 @@ mod tests {
                 channel_id,
                 Intervention {
                     author_id,
+                    author_is_bot: false,
                     message_id,
                     source_message_ids: vec![message_id],
                     text: format!("queued {offset}"),
@@ -5055,6 +5060,7 @@ mod tests {
             active_user_message_id: Some(MessageId::new(200)),
             intervention_queue: vec![Intervention {
                 author_id: UserId::new(42),
+                author_is_bot: false,
                 message_id: MessageId::new(100),
                 source_message_ids: vec![MessageId::new(90), MessageId::new(100)],
                 text: "queued".to_string(),
@@ -5096,6 +5102,7 @@ mod tests {
             channel_id,
             Intervention {
                 author_id: owner_id,
+                author_is_bot: false,
                 message_id: queued_msg_id,
                 source_message_ids: vec![queued_msg_id],
                 text: "queued turn".to_string(),
@@ -5500,6 +5507,7 @@ mod tests {
         let event = QueueExitEvent {
             intervention: Intervention {
                 author_id: UserId::new(42),
+                author_is_bot: false,
                 message_id: user_msg_id,
                 source_message_ids: vec![user_msg_id],
                 text: "ignored".to_string(),
@@ -5567,6 +5575,7 @@ mod tests {
         let mk_event = |msg_id: MessageId, kind: QueueExitKind| QueueExitEvent {
             intervention: Intervention {
                 author_id: UserId::new(99),
+                author_is_bot: false,
                 message_id: msg_id,
                 source_message_ids: vec![msg_id],
                 text: "ignored".to_string(),
@@ -5663,6 +5672,7 @@ mod tests {
         let event = QueueExitEvent {
             intervention: Intervention {
                 author_id: UserId::new(50),
+                author_is_bot: false,
                 message_id: head_msg,
                 source_message_ids: vec![merged_msg_a, merged_msg_b, head_msg],
                 text: "merged".to_string(),
@@ -5749,6 +5759,7 @@ mod tests {
         let event = QueueExitEvent {
             intervention: Intervention {
                 author_id: UserId::new(50),
+                author_is_bot: false,
                 message_id: head_msg,
                 source_message_ids: vec![head_msg, merged_msg],
                 text: "merged".to_string(),

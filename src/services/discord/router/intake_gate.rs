@@ -214,6 +214,7 @@ async fn claim_voice_transcript_announcement_for_queue(
 
 fn build_soft_intervention(
     author_id: serenity::UserId,
+    author_is_bot: bool,
     message_id: serenity::MessageId,
     text: &str,
     reply_context: Option<String>,
@@ -231,6 +232,7 @@ fn build_soft_intervention(
 ) -> Intervention {
     Intervention {
         author_id,
+        author_is_bot,
         message_id,
         source_message_ids: vec![message_id],
         text: text.to_string(),
@@ -247,6 +249,7 @@ async fn enqueue_soft_intervention(
     data: &Data,
     channel_id: serenity::ChannelId,
     author_id: serenity::UserId,
+    author_is_bot: bool,
     message_id: serenity::MessageId,
     text: &str,
     reply_context: Option<String>,
@@ -262,6 +265,7 @@ async fn enqueue_soft_intervention(
         channel_id,
         build_soft_intervention(
             author_id,
+            author_is_bot,
             message_id,
             text,
             reply_context,
@@ -285,7 +289,7 @@ pub(super) async fn enqueue_soft_intervention_for_test(
         shared,
         &ProviderKind::Codex,
         channel_id,
-        build_soft_intervention(author_id, message_id, text, None, false, false, None),
+        build_soft_intervention(author_id, false, message_id, text, None, false, false, None),
     )
     .await
     .enqueued
@@ -1756,6 +1760,7 @@ pub(in crate::services::discord) async fn handle_event(
                                 data,
                                 channel_id,
                                 user_id,
+                                new_message.author.bot,
                                 new_message.id,
                                 text,
                                 None,
@@ -1813,6 +1818,7 @@ pub(in crate::services::discord) async fn handle_event(
                         data,
                         channel_id,
                         user_id,
+                        new_message.author.bot,
                         new_message.id,
                         text,
                         None,
@@ -1871,6 +1877,7 @@ pub(in crate::services::discord) async fn handle_event(
                     data,
                     channel_id,
                     user_id,
+                    new_message.author.bot,
                     new_message.id,
                     text,
                     reply_context.clone(),
@@ -1950,6 +1957,7 @@ pub(in crate::services::discord) async fn handle_event(
                     data,
                     channel_id,
                     user_id,
+                    new_message.author.bot,
                     new_message.id,
                     text,
                     reply_context.clone(),
@@ -1999,6 +2007,7 @@ pub(in crate::services::discord) async fn handle_event(
                     data,
                     channel_id,
                     user_id,
+                    new_message.author.bot,
                     new_message.id,
                     text,
                     reply_context.clone(),
@@ -2085,6 +2094,7 @@ pub(in crate::services::discord) async fn handle_event(
                             data,
                             channel_id,
                             user_id,
+                            new_message.author.bot,
                             new_message.id,
                             text,
                             reply_context.clone(),

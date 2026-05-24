@@ -167,6 +167,7 @@ mod tests {
     fn make_intervention(text: &str) -> Intervention {
         Intervention {
             author_id: UserId::new(1),
+            author_is_bot: false,
             message_id: MessageId::new(100),
             source_message_ids: vec![MessageId::new(100)],
             text: text.to_string(),
@@ -194,6 +195,7 @@ mod tests {
             channel_id,
             vec![Intervention {
                 author_id: UserId::new(42),
+                author_is_bot: false,
                 message_id: MessageId::new(7),
                 source_message_ids: vec![MessageId::new(7)],
                 text: "pending".to_string(),
@@ -223,6 +225,7 @@ mod tests {
             channel_id,
             vec![Intervention {
                 author_id: UserId::new(42),
+                author_is_bot: false,
                 message_id: MessageId::new(7),
                 source_message_ids: vec![MessageId::new(7)],
                 text: "stale".to_string(),
@@ -251,6 +254,7 @@ mod tests {
             channel_id,
             vec![Intervention {
                 author_id: UserId::new(42),
+                author_is_bot: false,
                 message_id: MessageId::new(7),
                 source_message_ids: vec![MessageId::new(7)],
                 text: "pending".to_string(),
@@ -471,6 +475,7 @@ mod tests {
         let items: Vec<PendingQueueItem> = serde_json::from_str(old_json).unwrap();
         assert_eq!(items[0].text, "hello");
         assert!(items[0].source_message_ids.is_empty());
+        assert!(!items[0].author_is_bot);
         assert!(items[0].reply_context.is_none());
         assert!(!items[0].has_reply_boundary);
         assert!(!items[0].merge_consecutive);
@@ -480,6 +485,7 @@ mod tests {
 
         let new_item = PendingQueueItem {
             author_id: 1,
+            author_is_bot: false,
             message_id: 100,
             source_message_ids: vec![100, 101],
             text: "hello".to_string(),
@@ -610,6 +616,7 @@ mod tests {
         let legacy_file = legacy_dir.join(format!("{}.json", ch.get()));
         let item = PendingQueueItem {
             author_id: 1,
+            author_is_bot: false,
             message_id: 100,
             source_message_ids: vec![100],
             text: "legacy msg".to_string(),
