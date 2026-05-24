@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn test_build_processing_status_block_uses_spinner_processing() {
-        assert_eq!(build_processing_status_block("⠋"), "⠋ Processing...");
+        assert_eq!(build_processing_status_block("⠋"), "⠋ 계속 처리 중");
     }
 
     #[test]
@@ -2195,6 +2195,13 @@ mod status_panel_v2_formatter_tests {
     }
 
     #[test]
+    fn format_for_discord_removes_trailing_korean_processing_footer() {
+        let input = "Final answer\n\n⠋ 계속 처리 중";
+        let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
+        assert_eq!(output, "Final answer");
+    }
+
+    #[test]
     fn format_for_discord_removes_leading_tui_no_response_chrome() {
         let input = "No response requested.\n\nFinal answer";
         let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
@@ -2327,6 +2334,7 @@ pub(super) fn is_streaming_placeholder_status_line(line: &str) -> bool {
         || status.starts_with("Thinking")
         || status.starts_with("Generating")
         || status.starts_with("Working")
+        || status.starts_with("계속 처리 중")
         || status.starts_with("응답")
         || status.starts_with("처리")
         || status.starts_with('⚙')
@@ -3683,6 +3691,7 @@ impl MonitorHandoffReason {
 pub(super) enum MonitorHandoffStatus<'a> {
     Queued,
     Active,
+    Stalled,
     Completed,
     Failed { reason: &'a str },
     TimedOut,
@@ -3706,6 +3715,8 @@ fn monitor_handoff_header(
         MonitorHandoffStatus::Queued => "📬 **메시지 대기 중**".to_string(),
         MonitorHandoffStatus::Active if background_label => "🔄 **백그라운드 처리 중**".to_string(),
         MonitorHandoffStatus::Active => "🔄 **응답 처리 중**".to_string(),
+        MonitorHandoffStatus::Stalled if background_label => "⚠ **백그라운드 정체**".to_string(),
+        MonitorHandoffStatus::Stalled => "⚠ **응답 정체**".to_string(),
         MonitorHandoffStatus::Completed if background_label => "✅ **백그라운드 완료**".to_string(),
         MonitorHandoffStatus::Completed => "✅ **응답 완료**".to_string(),
         MonitorHandoffStatus::Failed { reason } => {
@@ -3744,6 +3755,7 @@ fn monitor_handoff_footer(
             "완료 시 이 채널로 결과 이어서 보냅니다."
         }
         MonitorHandoffStatus::Active => "완료 시 이 채널로 결과를 이어서 표시합니다.",
+        MonitorHandoffStatus::Stalled => "스트림 진행이 멈춰 복구 상태를 확인 중입니다.",
         MonitorHandoffStatus::Completed => "결과가 위에 도착했습니다.",
         MonitorHandoffStatus::Failed { .. } => "자세한 사유는 다음 응답을 확인해 주세요.",
         MonitorHandoffStatus::TimedOut => "타임아웃 임계를 넘어 종료되었습니다.",
@@ -4043,7 +4055,19 @@ pub(super) fn build_placeholder_status_block(
 }
 
 pub(super) fn build_processing_status_block(indicator: &str) -> String {
-    build_placeholder_status_block(indicator, None, None, "")
+    format!("{indicator} 계속 처리 중")
+}
+
+pub(super) fn build_status_panel_streaming_edit_text(
+    current_portion: &str,
+    status_block: &str,
+    provider: &crate::services::provider::ProviderKind,
+) -> String {
+    if current_portion.is_empty() {
+        return status_block.to_string();
+    }
+    let formatted = format_for_discord_with_status_panel(current_portion, provider);
+    build_streaming_placeholder_text(&formatted, status_block)
 }
 
 fn truncate_for_status_bytes(s: &str, max_bytes: usize) -> String {

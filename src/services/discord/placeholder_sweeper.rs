@@ -27,6 +27,7 @@ use poise::serenity_prelude as serenity;
 use super::SharedData;
 use super::formatting::{
     MonitorHandoffReason, MonitorHandoffStatus, build_monitor_handoff_placeholder,
+    build_monitor_handoff_placeholder_with_context,
 };
 use super::gateway::edit_outbound_message;
 use super::inflight::{
@@ -106,16 +107,17 @@ fn build_stalled_placeholder(state: &InflightTurnState) -> String {
         // uses persisted started_at so the stalled content stays stable.
         chrono::Utc::now().timestamp()
     });
-    let mut text = build_monitor_handoff_placeholder(
-        MonitorHandoffStatus::Active,
+    build_monitor_handoff_placeholder_with_context(
+        MonitorHandoffStatus::Stalled,
         MonitorHandoffReason::AsyncDispatch,
         started_at_unix,
         state.current_tool_line.as_deref(),
         None,
-    );
-    text.push('\n');
-    text.push_str("⚠ stalled — no stream progress");
-    text
+        Some("stalled — no stream progress"),
+        None,
+        None,
+        None,
+    )
 }
 
 fn build_abandoned_placeholder(state: &InflightTurnState) -> String {
@@ -275,6 +277,8 @@ pub(super) fn is_message_still_placeholder(content: &str) -> bool {
         "📬 **메시지 대기 중**",
         "🔄 **백그라운드 처리 중**",
         "🔄 **응답 처리 중**",
+        "⚠ **백그라운드 정체**",
+        "⚠ **응답 정체**",
         "✅ **백그라운드 완료**",
         "✅ **응답 완료**",
         "⏱ **백그라운드 타임아웃**",
@@ -821,6 +825,8 @@ mod is_message_still_placeholder_tests {
     fn handoff_card_headers_are_placeholder() {
         assert!(is_message_still_placeholder("🔄 **응답 처리 중**\nfooter"));
         assert!(is_message_still_placeholder("🔄 **백그라운드 처리 중**"));
+        assert!(is_message_still_placeholder("⚠ **응답 정체**"));
+        assert!(is_message_still_placeholder("⚠ **백그라운드 정체**"));
         assert!(is_message_still_placeholder("📬 **메시지 대기 중**"));
         assert!(is_message_still_placeholder("⏱ **응답 타임아웃**"));
         assert!(is_message_still_placeholder("❌ **응답 실패**: foo"));
@@ -1041,8 +1047,9 @@ mod tests {
     fn build_stalled_placeholder_uses_stable_badge() {
         let state = make_state(1234, 5678);
         let text = build_stalled_placeholder(&state);
-        assert!(text.starts_with("🔄 **응답 처리 중**"));
-        assert!(text.contains("⚠ stalled — no stream progress"));
+        assert!(text.starts_with("⚠ **응답 정체**"));
+        assert!(text.contains("stalled — no stream progress"));
+        assert!(!text.contains("계속 처리 중"));
         assert!(!text.contains("90s"));
     }
 

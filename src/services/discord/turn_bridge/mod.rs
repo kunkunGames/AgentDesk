@@ -2431,8 +2431,12 @@ fn build_turn_bridge_streaming_edit_text(
     status_block: &str,
     provider: &ProviderKind,
 ) -> String {
-    if status_panel_v2_enabled && !current_portion.is_empty() {
-        super::formatting::format_for_discord_with_status_panel(current_portion, provider)
+    if status_panel_v2_enabled {
+        super::formatting::build_status_panel_streaming_edit_text(
+            current_portion,
+            status_block,
+            provider,
+        )
     } else {
         super::formatting::build_streaming_placeholder_text(current_portion, status_block)
     }
@@ -2443,16 +2447,18 @@ mod streaming_edit_text_tests {
     use super::*;
 
     #[test]
-    fn status_panel_v2_streaming_edit_omits_processing_footer_once_text_exists() {
+    fn status_panel_v2_streaming_edit_moves_processing_footer_to_response_message() {
         let rendered = build_turn_bridge_streaming_edit_text(
             true,
             "E2E-CODEX-1-OK\n- Working on the backend now",
-            "⠙ Processing...",
+            "⠙ 계속 처리 중",
             &ProviderKind::Codex,
         );
 
-        assert_eq!(rendered, "E2E-CODEX-1-OK\n- Working on the backend now");
-        assert!(!rendered.contains("Processing"));
+        assert_eq!(
+            rendered,
+            "E2E-CODEX-1-OK\n- Working on the backend now\n\n⠙ 계속 처리 중"
+        );
     }
 
     #[test]
@@ -2460,23 +2466,19 @@ mod streaming_edit_text_tests {
         let rendered = build_turn_bridge_streaming_edit_text(
             false,
             "Partial answer",
-            "⠙ Processing...",
+            "⠙ 계속 처리 중",
             &ProviderKind::Codex,
         );
 
-        assert_eq!(rendered, "Partial answer\n\n⠙ Processing...");
+        assert_eq!(rendered, "Partial answer\n\n⠙ 계속 처리 중");
     }
 
     #[test]
     fn status_panel_v2_empty_streaming_edit_keeps_placeholder() {
-        let rendered = build_turn_bridge_streaming_edit_text(
-            true,
-            "",
-            "⠙ Processing...",
-            &ProviderKind::Codex,
-        );
+        let rendered =
+            build_turn_bridge_streaming_edit_text(true, "", "⠙ 계속 처리 중", &ProviderKind::Codex);
 
-        assert_eq!(rendered, "⠙ Processing...");
+        assert_eq!(rendered, "⠙ 계속 처리 중");
     }
 
     #[test]
@@ -2577,6 +2579,20 @@ mod streaming_edit_text_tests {
     fn headless_cleanup_edits_partial_answer_without_processing_footer() {
         let action = headless_streaming_placeholder_cleanup_action(
             "partial answer\n\n⠙ Processing...",
+            &ProviderKind::Codex,
+            true,
+        );
+
+        assert_eq!(
+            action,
+            HeadlessPlaceholderCleanupAction::Edit("partial answer".to_string())
+        );
+    }
+
+    #[test]
+    fn headless_cleanup_edits_partial_answer_without_korean_processing_footer() {
+        let action = headless_streaming_placeholder_cleanup_action(
+            "partial answer\n\n⠙ 계속 처리 중",
             &ProviderKind::Codex,
             true,
         );

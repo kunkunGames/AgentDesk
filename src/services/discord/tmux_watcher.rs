@@ -41,9 +41,10 @@ fn build_watcher_streaming_edit_text(
     status_block: &str,
     provider: &ProviderKind,
 ) -> String {
-    if status_panel_v2_enabled && !current_portion.is_empty() {
-        crate::services::discord::formatting::format_for_discord_with_status_panel(
+    if status_panel_v2_enabled {
+        crate::services::discord::formatting::build_status_panel_streaming_edit_text(
             current_portion,
+            status_block,
             provider,
         )
     } else {
@@ -6612,16 +6613,15 @@ TUI-E2E-marker ssh-direct
     }
 
     #[test]
-    fn status_panel_v2_watcher_streaming_edit_omits_processing_footer_once_text_exists() {
+    fn status_panel_v2_watcher_streaming_edit_moves_processing_footer_to_response_message() {
         let rendered = build_watcher_streaming_edit_text(
             true,
             "PIPE-E2E-CODEX OK",
-            "⠙ Processing...",
+            "⠙ 계속 처리 중",
             &ProviderKind::Codex,
         );
 
-        assert_eq!(rendered, "PIPE-E2E-CODEX OK");
-        assert!(!rendered.contains("Processing"));
+        assert_eq!(rendered, "PIPE-E2E-CODEX OK\n\n⠙ 계속 처리 중");
     }
 
     #[test]
@@ -6629,11 +6629,11 @@ TUI-E2E-marker ssh-direct
         let rendered = build_watcher_streaming_edit_text(
             false,
             "Partial answer",
-            "⠙ Processing...",
+            "⠙ 계속 처리 중",
             &ProviderKind::Codex,
         );
 
-        assert_eq!(rendered, "Partial answer\n\n⠙ Processing...");
+        assert_eq!(rendered, "Partial answer\n\n⠙ 계속 처리 중");
     }
 
     #[test]

@@ -48,7 +48,7 @@
 | `POST` | `/api/channels/{channel_id}/monitoring` | `super::super::monitoring::upsert_monitoring` | `src/server/routes/monitoring.rs:19` | `src/server/routes/domains/ops.rs:297` |
 | `DELETE` | `/api/channels/{channel_id}/monitoring/{key}` | `super::super::monitoring::remove_monitoring` | `src/server/routes/monitoring.rs:52` | `src/server/routes/domains/ops.rs:302` |
 | `GET` | `/api/channels/{id}/queue` | `queue_api::list_channel_queue` | `src/server/routes/queue_api.rs:19` | `src/server/routes/domains/ops.rs:288` |
-| `POST` | `/api/channels/{id}/relay-recovery` | `health_api::relay_recovery_handler` | `src/server/routes/health_api.rs:1144` | `src/server/routes/domains/ops.rs:293` |
+| `POST` | `/api/channels/{id}/relay-recovery` | `health_api::relay_recovery_handler` | `src/server/routes/health_api.rs:1140` | `src/server/routes/domains/ops.rs:293` |
 | `GET` | `/api/channels/{id}/watcher-state` | `queue_api::get_watcher_state` | `src/server/routes/queue_api.rs:207` | `src/server/routes/domains/ops.rs:289` |
 | `GET` | `/api/cluster/issue-specs` | `cluster::list_issue_specs` | `src/server/routes/cluster.rs:378` | `src/server/routes/domains/ops.rs:88` |
 | `POST` | `/api/cluster/issue-specs/upsert` | `cluster::upsert_issue_spec` | `src/server/routes/cluster.rs:394` | `src/server/routes/domains/ops.rs:89` |
@@ -75,9 +75,9 @@
 | `GET` | `/api/discord/bindings` | `discord::list_bindings` | `src/server/routes/discord.rs:18` | `src/server/routes/domains/integrations.rs:34` |
 | `GET` | `/api/discord/channels/{id}` | `discord::channel_info` | `src/server/routes/discord.rs:278` | `src/server/routes/domains/integrations.rs:39` |
 | `GET` | `/api/discord/channels/{id}/messages` | `discord::channel_messages` | `src/server/routes/discord.rs:150` | `src/server/routes/domains/integrations.rs:35` |
-| `POST` | `/api/discord/send` | `health_api::send_handler` | `src/server/routes/health_api.rs:1216` | `src/server/routes/domains/ops.rs:31` |
-| `POST` | `/api/discord/send-dm` | `health_api::senddm_handler` | `src/server/routes/health_api.rs:1326` | `src/server/routes/domains/ops.rs:36` |
-| `POST` | `/api/discord/send-to-agent` | `health_api::send_to_agent_handler` | `src/server/routes/health_api.rs:1291` | `src/server/routes/domains/ops.rs:32` |
+| `POST` | `/api/discord/send` | `health_api::send_handler` | `src/server/routes/health_api.rs:1212` | `src/server/routes/domains/ops.rs:31` |
+| `POST` | `/api/discord/send-dm` | `health_api::senddm_handler` | `src/server/routes/health_api.rs:1322` | `src/server/routes/domains/ops.rs:36` |
+| `POST` | `/api/discord/send-to-agent` | `health_api::send_to_agent_handler` | `src/server/routes/health_api.rs:1287` | `src/server/routes/domains/ops.rs:32` |
 | `GET` | `/api/dispatch-outbox/failed` | `health_api::list_dispatch_outbox_failures_handler` | `src/server/routes/health_api.rs:574` | `src/server/routes/domains/ops.rs:22` |
 | `POST` | `/api/dispatch-outbox/failed` | `health_api::ack_dispatch_outbox_failures_handler` | `src/server/routes/health_api.rs:599` | `src/server/routes/domains/ops.rs:22` |
 | `GET` | `/api/dispatched-sessions` | `dispatched_sessions::list_dispatched_sessions` | `src/server/routes/dispatched_sessions.rs:17` | `src/server/routes/domains/ops.rs:153` |
@@ -121,7 +121,7 @@
 | `POST` | `/api/hook/reset-status` | `hooks::reset_status` | `src/server/routes/hooks.rs:25` | `src/server/routes/domains/ops.rs:173` |
 | `DELETE` | `/api/hook/session/{sessionKey}` | `hooks::disconnect_session` | `src/server/routes/hooks.rs:59` | `src/server/routes/domains/ops.rs:175` |
 | `POST` | `/api/hook/skill-usage` | `hooks::skill_usage` | `src/server/routes/hooks.rs:42` | `src/server/routes/domains/ops.rs:174` |
-| `POST` | `/api/inflight/rebind` | `health_api::rebind_inflight_handler` | `src/server/routes/health_api.rs:1257` | `src/server/routes/domains/ops.rs:37` |
+| `POST` | `/api/inflight/rebind` | `health_api::rebind_inflight_handler` | `src/server/routes/health_api.rs:1253` | `src/server/routes/domains/ops.rs:37` |
 | `GET` | `/api/internal/card-thread` | `dispatches::get_card_thread` | `src/server/routes/dispatches/thread_reuse.rs:1219` | `src/server/routes/domains/ops.rs:113` |
 | `POST` | `/api/internal/escalation/emit` | `escalation::emit_escalation` | `src/server/routes/escalation.rs:1513` | `src/server/routes/domains/admin.rs:68` |
 | `POST` | `/api/internal/link-dispatch-thread` | `dispatches::link_dispatch_thread` | `src/server/routes/dispatches/thread_reuse.rs:1104` | `src/server/routes/domains/ops.rs:109` |
@@ -224,7 +224,7 @@
 | `POST` | `/api/reviews/decision` | `review_verdict::submit_review_decision` | `src/server/routes/review_verdict/decision_route.rs:2719` | `src/server/routes/domains/reviews.rs:23` |
 | `POST` | `/api/reviews/recovery` | `reviews::recover_review_target` | `src/server/routes/reviews.rs:563` | `src/server/routes/domains/reviews.rs:21` |
 | `POST` | `/api/reviews/tuning/aggregate` | `review_verdict::aggregate_review_tuning` | `src/server/routes/review_verdict/tuning_aggregate.rs:438` | `src/server/routes/domains/reviews.rs:27` |
-| `POST` | `/api/reviews/verdict` | `review_verdict::submit_verdict` | `src/server/routes/review_verdict/verdict_route.rs:212` | `src/server/routes/domains/reviews.rs:22` |
+| `POST` | `/api/reviews/verdict` | `review_verdict::submit_verdict` | `src/server/routes/review_verdict/verdict_route.rs:230` | `src/server/routes/domains/reviews.rs:22` |
 | `GET` | `/api/round-table-meetings` | `meetings::list_meetings` | `src/server/routes/meetings.rs:669` | `src/server/routes/domains/integrations.rs:41` |
 | `POST` | `/api/round-table-meetings` | `meetings::upsert_meeting` | `src/server/routes/meetings.rs:1264` | `src/server/routes/domains/integrations.rs:41` |
 | `GET` | `/api/round-table-meetings/channels` | `meetings::list_meeting_channels` | `src/server/routes/meetings.rs:718` | `src/server/routes/domains/integrations.rs:45` |

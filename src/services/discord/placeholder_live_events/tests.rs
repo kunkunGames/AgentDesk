@@ -230,7 +230,7 @@ fn status_panel_turn_completed_drops_recent_live_block() {
     );
     assert!(active.contains("🖥️ Recent"));
     assert!(active.contains("[Bash]"));
-    assert!(active.ends_with("⠋ 계속 처리 중 · 갱신 <t:1700000005:R> · 시작 <t:1700000000:R>"));
+    assert!(!active.contains("계속 처리 중"));
 
     events.push_status_event(channel_id, StatusEvent::TurnCompleted { background: false });
 
@@ -242,7 +242,7 @@ fn status_panel_turn_completed_drops_recent_live_block() {
 }
 
 #[test]
-fn status_panel_codex_active_tail_remains_last_after_recent_block() {
+fn status_panel_codex_active_omits_processing_tail_after_recent_block() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(175);
     events.push_status_events(
@@ -271,25 +271,21 @@ fn status_panel_codex_active_tail_remains_last_after_recent_block() {
     assert!(rendered.contains("🔧 도구 실행 중"));
     assert!(rendered.contains("🖥️ Recent"));
     assert!(rendered.contains("[Bash]"));
-    assert!(
-        rendered.ends_with("⠋ 계속 처리 중 · 갱신 <t:1700000005:R> · 시작 <t:1700000000:R>"),
-        "active tail marker must remain the final visible line: {rendered}"
-    );
+    assert!(!rendered.contains("계속 처리 중"));
 }
 
 #[test]
-fn status_panel_preserves_active_tail_when_body_is_truncated() {
+fn status_panel_truncates_long_body_without_processing_tail() {
     let sections = vec!["x".repeat(STATUS_PANEL_MAX_CHARS + 100)];
-    let tail = render_active_tail_marker(1_700_000_000, 1_700_000_005);
 
-    let rendered = truncate_status_panel_sections(sections, Some(&tail));
+    let rendered = truncate_status_panel_sections(sections);
 
     assert!(rendered.chars().count() <= STATUS_PANEL_MAX_CHARS);
-    assert!(rendered.ends_with(&tail));
+    assert!(!rendered.contains("계속 처리 중"));
 }
 
 #[test]
-fn status_panel_active_tail_changes_with_heartbeat() {
+fn status_panel_heartbeat_without_new_events_is_stable() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(176);
 
@@ -306,8 +302,8 @@ fn status_panel_active_tail_changes_with_heartbeat() {
         1_700_000_010,
     );
 
-    assert_ne!(first, second);
-    assert!(second.ends_with("⠋ 계속 처리 중 · 갱신 <t:1700000010:R> · 시작 <t:1700000000:R>"));
+    assert_eq!(first, second);
+    assert!(!second.contains("계속 처리 중"));
 }
 
 #[test]

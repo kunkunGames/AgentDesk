@@ -65,6 +65,8 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:7ad920b17a3df190",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:7abf8711963b3515",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:6a864e3e920d8a62",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:403e086784912951",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:360a790ca3e3dbc3",
 ]
 
 # Manual JSON row mapping: legacy mapping callsites pending typed migration.
@@ -87,7 +89,7 @@ git_subprocess_callsites = [
 # fallback path); the audit regex `\.sqlite\b` cannot see the cfg gate, so
 # we pin them by file:line.
 legacy_sqlite_refs = [
-  "src/services/discord/turn_bridge/mod.rs:2634",
+  "src/services/discord/turn_bridge/mod.rs:2900",
   "src/services/discord/watchers/lifecycle.rs:347",
 ]
 
