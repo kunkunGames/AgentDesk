@@ -20,6 +20,7 @@ use crate::voice::commands::{
     wake_word_decision,
 };
 use crate::voice::config::DEFAULT_STT_LANGUAGE;
+use crate::voice::flight::{VoiceFlightEvent, VoiceFlightRoute, record_voice_flight_event};
 use crate::voice::progress;
 use crate::voice::runtime_boundary::VoiceRuntimeConfigSnapshot;
 use crate::voice::sanitizer::{foreground_spoken_only_with_limit, spoken_result_only_with_limit};
@@ -86,6 +87,7 @@ pub(in crate::services::discord) enum VoiceBargeInTranscriptOutcome {
     ExplicitStop {
         cancelled: bool,
         already_stopping: bool,
+        cancel_channel_id: u64,
     },
     IgnoredNoise,
     TranscriptUnavailable,
@@ -102,6 +104,59 @@ pub(in crate::services::discord) struct VoiceProgressEvent {
     pub label: String,
 }
 
+#[derive(Debug, Clone)]
+struct TranscribedVoiceUtterance {
+    text: String,
+    stt_mode: &'static str,
+    stt_latency_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceFlightUtteranceContext {
+    voice_channel_id: u64,
+    control_channel_id: Option<u64>,
+    user_id: u64,
+    utterance_id: String,
+    stt_mode: String,
+    stt_latency_ms: u64,
+    transcript_chars: usize,
+}
+
+impl VoiceFlightUtteranceContext {
+    fn from_utterance(
+        voice_channel_id: ChannelId,
+        utterance: &CompletedUtterance,
+        transcript: &str,
+        stt: &TranscribedVoiceUtterance,
+    ) -> Self {
+        Self {
+            voice_channel_id: voice_channel_id.get(),
+            control_channel_id: Some(
+                utterance
+                    .control_channel_id
+                    .unwrap_or(voice_channel_id.get()),
+            ),
+            user_id: utterance.user_id,
+            utterance_id: utterance.utterance_id.clone(),
+            stt_mode: stt.stt_mode.to_string(),
+            stt_latency_ms: stt.stt_latency_ms,
+            transcript_chars: transcript.chars().count(),
+        }
+    }
+
+    fn event(&self, route: VoiceFlightRoute) -> VoiceFlightEvent {
+        let mut event = VoiceFlightEvent::new(route);
+        event.voice_channel_id = Some(self.voice_channel_id);
+        event.control_channel_id = self.control_channel_id;
+        event.user_id = Some(self.user_id.to_string());
+        event.utterance_id = Some(self.utterance_id.clone());
+        event.stt_mode = Some(self.stt_mode.clone());
+        event.stt_latency_ms = Some(self.stt_latency_ms);
+        event.transcript_chars = Some(self.transcript_chars);
+        event
+    }
+}
+
 /// #2374 — return value from `dispatch_voice_background_handoff`. The
 /// caller needs both the dispatched `turn_id` (for tracing /
 /// follow-up cancellation) AND the handoff message id so it can key
@@ -111,6 +166,7 @@ pub(in crate::services::discord) struct VoiceProgressEvent {
 struct VoiceBackgroundHandoffOutcome {
     turn_id: String,
     handoff_message_id: Option<MessageId>,
+    correlation_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +296,40 @@ enum VoiceForegroundDecision {
     Silence,
     HandoffBackground(String),
     Speak(String),
+}
+
+fn voice_flight_event_from_announcement(
+    route: VoiceFlightRoute,
+    source_channel_id: ChannelId,
+    target_channel_id: Option<ChannelId>,
+    announcement: &crate::voice::prompt::VoiceTranscriptAnnouncement,
+) -> VoiceFlightEvent {
+    let mut event = VoiceFlightEvent::new(route);
+    event.voice_channel_id = Some(source_channel_id.get());
+    event.control_channel_id = Some(
+        announcement
+            .control_channel_id
+            .unwrap_or(source_channel_id.get()),
+    );
+    event.background_channel_id = target_channel_id.map(|id| id.get());
+    event.user_id = Some(announcement.user_id.clone());
+    event.utterance_id = Some(announcement.utterance_id.clone());
+    event.stt_mode = announcement.stt_mode.clone();
+    event.stt_latency_ms = announcement.stt_latency_ms;
+    event.transcript_chars = Some(announcement.transcript.chars().count());
+    event
+}
+
+fn attach_foreground_flight_metadata(
+    event: &mut VoiceFlightEvent,
+    foreground: &EffectiveVoiceForegroundConfig,
+    foreground_latency_ms: u64,
+    decision: &'static str,
+) {
+    event.foreground_provider = Some(foreground.provider.clone());
+    event.foreground_model = Some(foreground.model.clone());
+    event.foreground_latency_ms = Some(foreground_latency_ms);
+    event.foreground_decision = Some(decision.to_string());
 }
 
 fn voice_lobby_accepts_source_channel(config: &VoiceConfig, channel_id: ChannelId) -> bool {
@@ -2233,6 +2323,7 @@ impl VoiceBargeInRuntime {
                 VoiceBargeInTranscriptOutcome::ExplicitStop {
                     cancelled: result.token.is_some(),
                     already_stopping: result.already_stopping,
+                    cancel_channel_id: cancel_channel.get(),
                 }
             }
             ProcessingBargeInDecision::DeferPrompt(prompt) => {
@@ -2283,6 +2374,7 @@ impl VoiceBargeInRuntime {
         )
         .await
         .unwrap_or(VoiceForegroundDecision::Silence);
+        let foreground_latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
 
         // Issue #2335 (c) — Codex round 2: keep the foreground cancel token
         // REGISTERED through every suppressible side effect (synth, play,
@@ -2310,6 +2402,28 @@ impl VoiceBargeInRuntime {
             token: cancel_token.clone(),
         };
 
+        let record_cancel_suppressed = |label: &'static str| {
+            let mut event = voice_flight_event_from_announcement(
+                VoiceFlightRoute::ExplicitStop,
+                source_channel_id,
+                Some(target_channel_id),
+                announcement,
+            );
+            attach_foreground_flight_metadata(
+                &mut event,
+                &foreground,
+                foreground_latency_ms,
+                "cancelled",
+            );
+            event.cancel_source = cancel_token
+                .cancel_source()
+                .or_else(|| Some(label.to_string()));
+            event.cancel_channel_id = Some(target_channel_id.get());
+            event.cancelled = Some(true);
+            event.reason = Some(label.to_string());
+            record_voice_flight_event(event);
+        };
+
         let log_cancel_suppressed = |label: &'static str| {
             tracing::info!(
                 source_channel_id = source_channel_id.get(),
@@ -2324,12 +2438,26 @@ impl VoiceBargeInRuntime {
 
         // First gate: cancel that arrived during ack generation.
         if cancel_token.cancelled.load(Ordering::Relaxed) {
+            record_cancel_suppressed("post_generation");
             log_cancel_suppressed("post_generation");
             return true;
         }
 
         match decision {
             VoiceForegroundDecision::Silence => {
+                let mut event = voice_flight_event_from_announcement(
+                    VoiceFlightRoute::ForegroundSilence,
+                    source_channel_id,
+                    Some(target_channel_id),
+                    announcement,
+                );
+                attach_foreground_flight_metadata(
+                    &mut event,
+                    &foreground,
+                    foreground_latency_ms,
+                    "silence",
+                );
+                record_voice_flight_event(event);
                 tracing::info!(
                     source_channel_id = source_channel_id.get(),
                     target_channel_id = target_channel_id.get(),
@@ -2342,6 +2470,7 @@ impl VoiceBargeInRuntime {
             }
             VoiceForegroundDecision::Speak(spoken) => {
                 if cancel_token.cancelled.load(Ordering::Relaxed) {
+                    record_cancel_suppressed("pre_speak_synth");
                     log_cancel_suppressed("pre_speak_synth");
                     return true;
                 }
@@ -2350,12 +2479,27 @@ impl VoiceBargeInRuntime {
                     .await
                 {
                     if cancel_token.cancelled.load(Ordering::Relaxed) {
+                        record_cancel_suppressed("post_speak_synth");
                         log_cancel_suppressed("post_speak_synth");
                         return true;
                     }
                     self.play_acknowledgement(shared, source_channel_id, path)
                         .await;
                 }
+                let mut event = voice_flight_event_from_announcement(
+                    VoiceFlightRoute::ForegroundSpeak,
+                    source_channel_id,
+                    Some(target_channel_id),
+                    announcement,
+                );
+                attach_foreground_flight_metadata(
+                    &mut event,
+                    &foreground,
+                    foreground_latency_ms,
+                    "speak",
+                );
+                event.tts_chars = Some(spoken.chars().count());
+                record_voice_flight_event(event);
                 tracing::info!(
                     source_channel_id = source_channel_id.get(),
                     target_channel_id = target_channel_id.get(),
@@ -2368,6 +2512,7 @@ impl VoiceBargeInRuntime {
             }
             VoiceForegroundDecision::HandoffBackground(summary) => {
                 if cancel_token.cancelled.load(Ordering::Relaxed) {
+                    record_cancel_suppressed("pre_background_handoff");
                     log_cancel_suppressed("pre_background_handoff");
                     return true;
                 }
@@ -2385,6 +2530,7 @@ impl VoiceBargeInRuntime {
                         let VoiceBackgroundHandoffOutcome {
                             turn_id,
                             handoff_message_id,
+                            correlation_id,
                         } = handoff_outcome;
                         let tombstone = handoff_message_id.and_then(|id| {
                             crate::voice::cancel_tombstone::global_store().lookup(id)
@@ -2398,9 +2544,29 @@ impl VoiceBargeInRuntime {
                                 target_channel_id,
                                 &turn_id,
                                 handoff_message_id,
-                                observation,
+                                observation.clone(),
                             )
                             .await;
+                            let mut event = voice_flight_event_from_announcement(
+                                VoiceFlightRoute::ExplicitStop,
+                                source_channel_id,
+                                Some(target_channel_id),
+                                announcement,
+                            );
+                            attach_foreground_flight_metadata(
+                                &mut event,
+                                &foreground,
+                                foreground_latency_ms,
+                                "handoff_cancelled",
+                            );
+                            event.handoff_correlation_id = Some(correlation_id.clone());
+                            event.handoff_message_id = handoff_message_id.map(|id| id.get());
+                            event.background_turn_id = Some(turn_id.clone());
+                            event.cancel_source = Some(observation.cancel_reason);
+                            event.cancel_channel_id = Some(target_channel_id.get());
+                            event.cancelled = Some(true);
+                            event.reason = Some("post_background_handoff_started".to_string());
+                            record_voice_flight_event(event);
                             log_cancel_suppressed("post_background_handoff_started");
                             return true;
                         }
@@ -2424,9 +2590,29 @@ impl VoiceBargeInRuntime {
                                 target_channel_id,
                                 &turn_id,
                                 handoff_message_id,
-                                observation,
+                                observation.clone(),
                             )
                             .await;
+                            let mut event = voice_flight_event_from_announcement(
+                                VoiceFlightRoute::ExplicitStop,
+                                source_channel_id,
+                                Some(target_channel_id),
+                                announcement,
+                            );
+                            attach_foreground_flight_metadata(
+                                &mut event,
+                                &foreground,
+                                foreground_latency_ms,
+                                "handoff_cancelled",
+                            );
+                            event.handoff_correlation_id = Some(correlation_id.clone());
+                            event.handoff_message_id = handoff_message_id.map(|id| id.get());
+                            event.background_turn_id = Some(turn_id.clone());
+                            event.cancel_source = Some(observation.cancel_reason);
+                            event.cancel_channel_id = Some(target_channel_id.get());
+                            event.cancelled = Some(true);
+                            event.reason = Some("post_background_handoff_play".to_string());
+                            record_voice_flight_event(event);
                             log_cancel_suppressed("post_background_handoff_play");
                             return true;
                         }
@@ -2434,6 +2620,23 @@ impl VoiceBargeInRuntime {
                             self.play_acknowledgement(shared, source_channel_id, path)
                                 .await;
                         }
+                        let mut event = voice_flight_event_from_announcement(
+                            VoiceFlightRoute::BackgroundHandoff,
+                            source_channel_id,
+                            Some(target_channel_id),
+                            announcement,
+                        );
+                        attach_foreground_flight_metadata(
+                            &mut event,
+                            &foreground,
+                            foreground_latency_ms,
+                            "handoff_background",
+                        );
+                        event.handoff_correlation_id = Some(correlation_id.clone());
+                        event.handoff_message_id = handoff_message_id.map(|id| id.get());
+                        event.background_turn_id = Some(turn_id.clone());
+                        event.tts_chars = Some(ack.chars().count());
+                        record_voice_flight_event(event);
                         tracing::info!(
                             source_channel_id = source_channel_id.get(),
                             target_channel_id = target_channel_id.get(),
@@ -2446,6 +2649,20 @@ impl VoiceBargeInRuntime {
                         );
                     }
                     Err(error) => {
+                        let mut event = voice_flight_event_from_announcement(
+                            VoiceFlightRoute::BackgroundHandoff,
+                            source_channel_id,
+                            Some(target_channel_id),
+                            announcement,
+                        );
+                        attach_foreground_flight_metadata(
+                            &mut event,
+                            &foreground,
+                            foreground_latency_ms,
+                            "handoff_background",
+                        );
+                        event.reason = Some(format!("handoff_failed:{error}"));
+                        record_voice_flight_event(event);
                         tracing::warn!(
                             error = %error,
                             source_channel_id = source_channel_id.get(),
@@ -2717,6 +2934,7 @@ impl VoiceBargeInRuntime {
         Ok(VoiceBackgroundHandoffOutcome {
             turn_id: outcome.turn_id,
             handoff_message_id: outcome.message_id,
+            correlation_id,
         })
     }
 
@@ -2727,6 +2945,7 @@ impl VoiceBargeInRuntime {
         target_channel_id: ChannelId,
         utterance: &CompletedUtterance,
         transcript: &str,
+        flight_context: &VoiceFlightUtteranceContext,
     ) -> VoiceBargeInTranscriptOutcome {
         let verbose_progress = self.verbose_progress_enabled();
         let language = self.spoken_result_language().await;
@@ -2762,6 +2981,13 @@ impl VoiceBargeInRuntime {
             &utterance.started_at,
             &utterance.completed_at,
             utterance.samples_written,
+            Some(
+                utterance
+                    .control_channel_id
+                    .unwrap_or(source_channel_id.get()),
+            ),
+            Some(flight_context.stt_mode.as_str()),
+            Some(flight_context.stt_latency_ms),
         );
         let generation = default_voice_announce_generation();
         let voice_delivery_id = guild_id.map(|guild_id| {
@@ -2900,6 +3126,16 @@ impl VoiceBargeInRuntime {
                     foreground_max_chars = foreground.max_chars,
                     "voice transcript announcement posted to voice channel as canonical foreground trigger"
                 );
+                let mut event = flight_context.event(VoiceFlightRoute::Queued);
+                event.background_channel_id = Some(target_channel_id.get());
+                event.turn_id = Some(outcome.turn_id.clone());
+                event.foreground_provider = Some(foreground.provider.clone());
+                event.foreground_model = Some(foreground.model.clone());
+                event.foreground_decision = Some("queued_foreground_trigger".to_string());
+                if let Some(route) = self.active_voice_routes.get(&source_channel_id.get()) {
+                    event.agent_id = Some(route.agent_id.clone());
+                }
+                record_voice_flight_event(event);
                 return VoiceBargeInTranscriptOutcome::VoiceTurnStarted {
                     turn_id: outcome.turn_id,
                 };
@@ -2932,6 +3168,13 @@ impl VoiceBargeInRuntime {
                     utterance_id = %utterance.utterance_id,
                     "voice transcript announcement failed; refusing direct voice turn fallback"
                 );
+                let mut event = flight_context.event(VoiceFlightRoute::Queued);
+                event.background_channel_id = Some(target_channel_id.get());
+                event.foreground_provider = Some(foreground.provider.clone());
+                event.foreground_model = Some(foreground.model.clone());
+                event.foreground_decision = Some("queue_failed".to_string());
+                event.reason = Some(format!("voice_turn_start_failed:{error}"));
+                record_voice_flight_event(event);
                 return VoiceBargeInTranscriptOutcome::VoiceTurnStartFailed(format!(
                     "voice transcript announcement failed: {error}"
                 ));
@@ -3352,7 +3595,7 @@ impl VoiceBargeInRuntime {
             return VoiceBargeInTranscriptOutcome::Disabled;
         }
 
-        let transcript = match self
+        let transcribed = match self
             .transcribe_completed_utterance(channel_id, utterance)
             .await
         {
@@ -3360,8 +3603,17 @@ impl VoiceBargeInRuntime {
             None => return VoiceBargeInTranscriptOutcome::TranscriptUnavailable,
         };
 
-        let transcript = transcript.trim();
+        let transcript = transcribed.text.trim();
+        let flight_context = VoiceFlightUtteranceContext::from_utterance(
+            channel_id,
+            utterance,
+            transcript,
+            &transcribed,
+        );
         if transcript.is_empty() {
+            let mut event = flight_context.event(VoiceFlightRoute::IgnoredNoise);
+            event.reason = Some("empty_transcript".to_string());
+            record_voice_flight_event(event);
             return VoiceBargeInTranscriptOutcome::EmptyTranscript;
         }
 
@@ -3375,12 +3627,18 @@ impl VoiceBargeInRuntime {
                 WakeWordDecision::NotRequired(transcript) => transcript,
                 WakeWordDecision::Matched(matched) => matched.remaining,
                 WakeWordDecision::Missing => {
+                    let mut event = flight_context.event(VoiceFlightRoute::IgnoredNoise);
+                    event.reason = Some("wake_word_required".to_string());
+                    record_voice_flight_event(event);
                     return VoiceBargeInTranscriptOutcome::WakeWordRequired;
                 }
             }
         };
         let transcript = transcript.trim();
         if transcript.is_empty() {
+            let mut event = flight_context.event(VoiceFlightRoute::IgnoredNoise);
+            event.reason = Some("empty_after_wake_word".to_string());
+            record_voice_flight_event(event);
             return VoiceBargeInTranscriptOutcome::EmptyTranscript;
         }
 
@@ -3399,9 +3657,47 @@ impl VoiceBargeInRuntime {
             .is_some()
             || has_inflight_foreground
         {
-            return self
+            let outcome = self
                 .handle_processing_transcript(shared, provider, channel_id, transcript)
                 .await;
+            let mut event = match &outcome {
+                VoiceBargeInTranscriptOutcome::ExplicitStop {
+                    cancelled,
+                    already_stopping,
+                    cancel_channel_id,
+                } => {
+                    let mut event = flight_context.event(VoiceFlightRoute::ExplicitStop);
+                    event.cancel_channel_id = Some(*cancel_channel_id);
+                    event.barge_in = Some(true);
+                    event.cancel_source = Some("voice_barge_in_explicit_stop".to_string());
+                    event.cancelled = Some(*cancelled);
+                    event.already_stopping = Some(*already_stopping);
+                    event
+                }
+                VoiceBargeInTranscriptOutcome::Deferred(_) => {
+                    let mut event = flight_context.event(VoiceFlightRoute::Deferred);
+                    event.barge_in = Some(true);
+                    event.reason = Some("processing_barge_in_defer".to_string());
+                    event
+                }
+                VoiceBargeInTranscriptOutcome::IgnoredNoise => {
+                    let mut event = flight_context.event(VoiceFlightRoute::IgnoredNoise);
+                    event.barge_in = Some(true);
+                    event.reason = Some("processing_barge_in_noise".to_string());
+                    event
+                }
+                _ => {
+                    let mut event = flight_context.event(VoiceFlightRoute::IgnoredNoise);
+                    event.reason = Some("processing_barge_in_no_route".to_string());
+                    event
+                }
+            };
+            if let Some(route) = self.active_voice_routes.get(&channel_id.get()) {
+                event.agent_id = Some(route.agent_id.clone());
+                event.background_channel_id = Some(route.channel_id.get());
+            }
+            record_voice_flight_event(event);
+            return outcome;
         }
 
         if let Some(outcome) = self.apply_dispatcher_command(channel_id, transcript).await {
@@ -3417,10 +3713,16 @@ impl VoiceBargeInRuntime {
                 transcript,
             } => (channel_id, transcript),
             VoiceTurnTargetResolution::NeedsAgent => {
+                let mut event = flight_context.event(VoiceFlightRoute::Deferred);
+                event.reason = Some("agent_routing_required".to_string());
+                record_voice_flight_event(event);
                 self.ask_for_agent(shared, channel_id).await;
                 return VoiceBargeInTranscriptOutcome::AgentRoutingRequired;
             }
             VoiceTurnTargetResolution::Ignored => {
+                let mut event = flight_context.event(VoiceFlightRoute::IgnoredNoise);
+                event.reason = Some("no_active_voice_route".to_string());
+                record_voice_flight_event(event);
                 return VoiceBargeInTranscriptOutcome::NoActiveTurn;
             }
         };
@@ -3431,6 +3733,7 @@ impl VoiceBargeInRuntime {
             target_channel_id,
             utterance,
             &transcript,
+            &flight_context,
         )
         .await
     }
@@ -3763,7 +4066,7 @@ impl VoiceBargeInRuntime {
         &self,
         channel_id: ChannelId,
         utterance: &CompletedUtterance,
-    ) -> Option<String> {
+    ) -> Option<TranscribedVoiceUtterance> {
         let stt_started_at = std::time::Instant::now();
         if let Some(stt) = self.stt.read().await.clone() {
             if stt.is_streaming() {
@@ -3775,12 +4078,18 @@ impl VoiceBargeInRuntime {
                 if let Some((_, session)) = self.streaming_stt_sessions.remove(&key) {
                     match stt.finalize(session).await {
                         Ok(transcript) if !transcript.text.trim().is_empty() => {
+                            let stt_latency_ms =
+                                stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
                             crate::voice::metrics::record_stt(
                                 channel_id.get(),
                                 Some(&utterance.utterance_id),
-                                stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                                stt_latency_ms,
                             );
-                            return Some(transcript.text);
+                            return Some(TranscribedVoiceUtterance {
+                                text: transcript.text,
+                                stt_mode: "stream",
+                                stt_latency_ms,
+                            });
                         }
                         Ok(_) => {
                             tracing::debug!(
@@ -3809,12 +4118,22 @@ impl VoiceBargeInRuntime {
 
             match stt.transcribe_file(&utterance.path).await {
                 Ok(transcript) => {
+                    let stt_latency_ms =
+                        stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     crate::voice::metrics::record_stt(
                         channel_id.get(),
                         Some(&utterance.utterance_id),
-                        stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        stt_latency_ms,
                     );
-                    return Some(transcript);
+                    return Some(TranscribedVoiceUtterance {
+                        text: transcript,
+                        stt_mode: if stt.is_streaming() {
+                            "file_fallback"
+                        } else {
+                            "file"
+                        },
+                        stt_latency_ms,
+                    });
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -3837,12 +4156,17 @@ impl VoiceBargeInRuntime {
             );
             return None;
         };
+        let stt_latency_ms = stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
         crate::voice::metrics::record_stt(
             channel_id.get(),
             Some(&utterance.utterance_id),
-            stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            stt_latency_ms,
         );
-        Some(transcript)
+        Some(TranscribedVoiceUtterance {
+            text: transcript,
+            stt_mode: "sidecar",
+            stt_latency_ms,
+        })
     }
 
     async fn wait_for_stt_transcript(&self, utterance: &CompletedUtterance) -> Option<String> {
@@ -4900,8 +5224,9 @@ mod tests {
             outcome,
             VoiceBargeInTranscriptOutcome::ExplicitStop {
                 cancelled: true,
-                already_stopping: false
-            }
+                already_stopping: false,
+                cancel_channel_id,
+            } if cancel_channel_id == target_channel_id.get()
         ));
         assert!(token.cancelled.load(Ordering::Relaxed));
         assert_eq!(
@@ -5156,6 +5481,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             samples_written: None,
+            control_channel_id: None,
+            stt_mode: None,
+            stt_latency_ms: None,
         };
 
         let error = runtime

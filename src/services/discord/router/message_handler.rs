@@ -3466,6 +3466,21 @@ pub(in crate::services::discord) async fn handle_text_message(
     {
         return Ok(());
     }
+    if let Some(announcement) = voice_announcement.as_ref() {
+        let mut event = crate::voice::flight::VoiceFlightEvent::new(
+            crate::voice::flight::VoiceFlightRoute::FallbackNormalTurn,
+        );
+        event.voice_channel_id = Some(channel_id.get());
+        event.control_channel_id =
+            Some(announcement.control_channel_id.unwrap_or(channel_id.get()));
+        event.user_id = Some(announcement.user_id.clone());
+        event.utterance_id = Some(announcement.utterance_id.clone());
+        event.stt_mode = announcement.stt_mode.clone();
+        event.stt_latency_ms = announcement.stt_latency_ms;
+        event.transcript_chars = Some(announcement.transcript.chars().count());
+        event.reason = Some("voice_foreground_not_handled".to_string());
+        crate::voice::flight::record_voice_flight_event(event);
+    }
     if !is_voice_announcement
         && shared
             .voice_barge_in
@@ -10018,6 +10033,9 @@ mod tests {
             started_at: Some("2026-05-16T10:00:00+09:00".to_string()),
             completed_at: Some("2026-05-16T10:00:01+09:00".to_string()),
             samples_written: Some(48_000),
+            control_channel_id: None,
+            stt_mode: None,
+            stt_latency_ms: None,
         };
         let queued = build_race_requeued_intervention(
             UserId::new(7),
@@ -10065,6 +10083,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             samples_written: None,
+            control_channel_id: None,
+            stt_mode: None,
+            stt_latency_ms: None,
         };
 
         // Step 1: active turn consumes the store entry (mirroring
@@ -10132,6 +10153,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             samples_written: None,
+            control_channel_id: None,
+            stt_mode: None,
+            stt_latency_ms: None,
         };
 
         // The race-loss enqueue path uses `original_request_owner`, which is
@@ -10175,6 +10199,9 @@ mod tests {
             started_at: None,
             completed_at: None,
             samples_written: None,
+            control_channel_id: None,
+            stt_mode: None,
+            stt_latency_ms: None,
         };
 
         let store = crate::voice::announce_meta::VoiceAnnouncementMetaStore::default();
@@ -10214,6 +10241,9 @@ mod tests {
             started_at: Some("2026-05-16T10:00:00+09:00".to_string()),
             completed_at: Some("2026-05-16T10:00:01+09:00".to_string()),
             samples_written: Some(48_000),
+            control_channel_id: None,
+            stt_mode: None,
+            stt_latency_ms: None,
         };
         let item = crate::services::turn_orchestrator::PendingQueueItem {
             author_id: 555,
