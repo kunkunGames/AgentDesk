@@ -4521,6 +4521,38 @@ pub(in crate::services::discord) async fn handle_text_message(
     )
     .await;
 
+    if started
+        && let Some(stale) =
+            super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text).await
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⏭ DISPATCH-GUARD: aborted terminal dispatch at turn start in channel {} (dispatch={}, status={})",
+            channel_id,
+            stale.dispatch_id,
+            stale.status
+        );
+        let finish =
+            super::super::mailbox_finish_turn(shared.as_ref(), &provider, channel_id).await;
+        super::super::advance_last_message_checkpoint(shared, &provider, channel_id, user_msg_id);
+        super::super::formatting::add_reaction_raw(
+            http,
+            channel_id,
+            user_msg_id,
+            super::super::queue_exit_feedback_emoji(stale.queue_exit_kind),
+        )
+        .await;
+        if finish.has_pending {
+            super::super::schedule_deferred_idle_queue_kickoff(
+                shared.clone(),
+                provider.clone(),
+                channel_id,
+                "terminal dispatch skipped at turn start",
+            );
+        }
+        return Ok(());
+    }
+
     // #1332 dispatch hand-off: if this turn was previously enqueued and is now
     // being dispatched, reuse the Queued placeholder card so the user sees a
     // single message transition `📬 → 🔄` instead of two distinct placeholders.

@@ -247,6 +247,125 @@ pub(super) fn should_process_allowed_bot_turn_text(text: &str) -> bool {
     has_monitor_origin || sanitized.trim_start().starts_with("DISPATCH:")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::services::discord) struct StaleDispatchTurn {
+    pub(in crate::services::discord) dispatch_id: String,
+    pub(in crate::services::discord) status: String,
+    pub(in crate::services::discord) queue_exit_kind: QueueExitKind,
+}
+
+fn dispatch_status_allows_turn(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "pending" | "dispatched" | "in_progress"
+    )
+}
+
+fn stale_dispatch_queue_exit_kind(
+    status: Option<&str>,
+    result: Option<&str>,
+) -> Option<QueueExitKind> {
+    let Some(status) = status.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Some(QueueExitKind::Superseded);
+    };
+    if dispatch_status_allows_turn(status) {
+        return None;
+    }
+    let normalized_status = status.to_ascii_lowercase();
+    let result_says_superseded = result
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|value| value.contains("superseded"));
+    if normalized_status == "superseded" || result_says_superseded {
+        Some(QueueExitKind::Superseded)
+    } else {
+        Some(QueueExitKind::Cancelled)
+    }
+}
+
+pub(in crate::services::discord) async fn stale_dispatch_turn_for_text(
+    pg_pool: Option<&sqlx::PgPool>,
+    text: &str,
+) -> Option<StaleDispatchTurn> {
+    let dispatch_id = parse_dispatch_id(text)?;
+    let Some(pool) = pg_pool else {
+        return None;
+    };
+    let row = match sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT status, result::TEXT AS result
+           FROM task_dispatches
+          WHERE id = $1",
+    )
+    .bind(&dispatch_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(
+                dispatch_id = %dispatch_id,
+                error = %error,
+                "failed to validate dispatch turn status; allowing message to proceed"
+            );
+            return None;
+        }
+    };
+    match row {
+        Some((status, result)) => stale_dispatch_queue_exit_kind(Some(&status), result.as_deref())
+            .map(|queue_exit_kind| StaleDispatchTurn {
+                dispatch_id,
+                status,
+                queue_exit_kind,
+            }),
+        None => Some(StaleDispatchTurn {
+            dispatch_id,
+            status: "missing".to_string(),
+            queue_exit_kind: QueueExitKind::Superseded,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod dispatch_turn_gate_tests {
+    use super::{QueueExitKind, dispatch_status_allows_turn, stale_dispatch_queue_exit_kind};
+
+    #[test]
+    fn dispatch_turn_status_allows_only_live_statuses() {
+        for status in ["pending", "dispatched", "in_progress", " DISPATCHED "] {
+            assert!(dispatch_status_allows_turn(status));
+        }
+        for status in [
+            "cancelled",
+            "completed",
+            "failed",
+            "superseded",
+            "",
+            "missing",
+        ] {
+            assert!(!dispatch_status_allows_turn(status));
+        }
+    }
+
+    #[test]
+    fn stale_dispatch_queue_exit_kind_classifies_terminal_statuses() {
+        assert_eq!(stale_dispatch_queue_exit_kind(Some("pending"), None), None);
+        assert_eq!(
+            stale_dispatch_queue_exit_kind(
+                Some("cancelled"),
+                Some("Cancelled: superseded by rereview")
+            ),
+            Some(QueueExitKind::Superseded)
+        );
+        assert_eq!(
+            stale_dispatch_queue_exit_kind(Some("failed"), Some("tmux session died")),
+            Some(QueueExitKind::Cancelled)
+        );
+        assert_eq!(
+            stale_dispatch_queue_exit_kind(None, None),
+            Some(QueueExitKind::Superseded)
+        );
+    }
+}
+
 pub(in crate::services::discord) async fn resolve_announce_bot_user_id(
     shared: &SharedData,
 ) -> Option<u64> {
@@ -2698,7 +2817,7 @@ async fn mailbox_enqueue_intervention(
     }
 }
 
-fn queue_exit_feedback_emoji(kind: QueueExitKind) -> char {
+pub(in crate::services::discord) fn queue_exit_feedback_emoji(kind: QueueExitKind) -> char {
     match kind {
         QueueExitKind::Cancelled => '🚫',
         QueueExitKind::Expired => '⌛',
@@ -3064,16 +3183,43 @@ async fn mailbox_take_next_soft_intervention(
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> Option<(Intervention, bool)> {
-    let result: TakeNextSoftResult = shared
-        .mailbox(channel_id)
-        .take_next_soft(queue_persistence_context(shared, provider, channel_id))
-        .await;
-    let queue_len_after = result.queue_len_after;
-    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
-    maybe_schedule_catch_up_retry_after_queue_drain(shared, provider, channel_id, queue_len_after);
-    result
-        .intervention
-        .map(|intervention| (intervention, result.has_more))
+    loop {
+        let result: TakeNextSoftResult = shared
+            .mailbox(channel_id)
+            .take_next_soft(queue_persistence_context(shared, provider, channel_id))
+            .await;
+        let queue_len_after = result.queue_len_after;
+        apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+        maybe_schedule_catch_up_retry_after_queue_drain(
+            shared,
+            provider,
+            channel_id,
+            queue_len_after,
+        );
+        let Some(intervention) = result.intervention else {
+            return None;
+        };
+
+        if let Some(stale) =
+            stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), &intervention.text).await
+        {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ⏭ DISPATCH-GUARD: dropped queued terminal dispatch {} in channel {} (status={})",
+                stale.dispatch_id,
+                channel_id,
+                stale.status
+            );
+            let queue_exit_events = [QueueExitEvent {
+                intervention,
+                kind: stale.queue_exit_kind,
+            }];
+            apply_queue_exit_feedback(shared, channel_id, &queue_exit_events).await;
+            continue;
+        }
+
+        return Some((intervention, result.has_more));
+    }
 }
 
 async fn idle_queue_take_next_soft_if_ready(
