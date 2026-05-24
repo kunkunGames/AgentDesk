@@ -216,8 +216,8 @@ fn agent_channel_for_provider<'a>(
 
 fn resolve_configured_path(runtime_root: &FsPath, raw: &str) -> PathBuf {
     let trimmed = raw.trim();
-    let path = crate::runtime_layout::expand_user_path(trimmed)
-        .unwrap_or_else(|| PathBuf::from(trimmed));
+    let path =
+        crate::runtime_layout::expand_user_path(trimmed).unwrap_or_else(|| PathBuf::from(trimmed));
     if path.is_absolute() {
         path
     } else {
