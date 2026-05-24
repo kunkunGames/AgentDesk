@@ -43,6 +43,13 @@ pub(in crate::services::discord) struct PlaceholderLiveEvents {
     status_by_channel: dashmap::DashMap<ChannelId, Mutex<StatusPanelState>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::services::discord) struct LiveContextPanelSnapshot {
+    pub(in crate::services::discord) provider_session_id: Option<String>,
+    pub(in crate::services::discord) used_tokens: u64,
+    pub(in crate::services::discord) context_window_tokens: u64,
+}
+
 impl PlaceholderLiveEvents {
     pub(in crate::services::discord) fn clear_channel(&self, channel_id: ChannelId) {
         self.by_channel.remove(&channel_id);
@@ -85,6 +92,25 @@ impl PlaceholderLiveEvents {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         render_events(guard.iter())
+    }
+
+    pub(in crate::services::discord) fn context_panel_snapshot(
+        &self,
+        channel_id: ChannelId,
+    ) -> Option<LiveContextPanelSnapshot> {
+        let entry = self.status_by_channel.get(&channel_id)?;
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let context = guard.context.as_ref()?;
+        Some(LiveContextPanelSnapshot {
+            provider_session_id: context.provider_session_id.clone(),
+            used_tokens: context
+                .input_tokens
+                .saturating_add(context.cache_create_tokens)
+                .saturating_add(context.cache_read_tokens),
+            context_window_tokens: context.context_window_tokens,
+        })
     }
 
     pub(in crate::services::discord) fn push_status_event(
@@ -193,6 +219,7 @@ impl PlaceholderLiveEvents {
     pub(in crate::services::discord) fn set_context_panel_usage(
         &self,
         channel_id: ChannelId,
+        provider_session_id: Option<&str>,
         input_tokens: u64,
         cache_create_tokens: u64,
         cache_read_tokens: u64,
@@ -205,6 +232,10 @@ impl PlaceholderLiveEvents {
         self.set_context_panel_snapshot(
             channel_id,
             Some(ContextPanelSnapshot {
+                provider_session_id: provider_session_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
                 input_tokens,
                 cache_create_tokens,
                 cache_read_tokens,

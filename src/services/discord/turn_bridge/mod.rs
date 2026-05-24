@@ -4676,10 +4676,15 @@ pub(super) fn spawn_turn_bridge(
                                 accumulated_output_tokens = accumulated_output_tokens.max(ot);
                             }
                             if shared_owned.status_panel_v2_enabled && has_context_token_data {
+                                let context_provider_session_id = new_raw_provider_session_id
+                                    .as_deref()
+                                    .or(new_session_id.as_deref())
+                                    .or(inflight_state.session_id.as_deref());
                                 status_panel_dirty |= shared_owned
                                     .placeholder_live_events
                                     .set_context_panel_usage(
                                         channel_id,
+                                        context_provider_session_id,
                                         accumulated_input_tokens,
                                         accumulated_cache_create_tokens,
                                         accumulated_cache_read_tokens,
