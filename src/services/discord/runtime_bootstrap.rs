@@ -1655,14 +1655,16 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                         }
                         if !restored_queues.is_empty() {
                             let mut added = 0usize;
-                            let mut skipped = 0usize;
+                            let mut skipped_unowned = 0usize;
+                            let mut skipped_sender = 0usize;
+                            let mut skipped_duplicate = 0usize;
                             for (channel_id, items) in restored_queues {
                                 if !matches!(
                                     resolve_runtime_channel_binding_status(&http_for_tmux, channel_id)
                                         .await,
                                     RuntimeChannelBindingStatus::Owned
                                 ) {
-                                    skipped += items.len();
+                                    skipped_unowned += items.len();
                                     continue;
                                 }
                                 let snapshot = mailbox_snapshot(&shared_for_tmux2, channel_id).await;
@@ -1673,10 +1675,10 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                                         &allowed_bot_ids_for_restore,
                                         announce_bot_id_for_restore,
                                         item.author_id.get(),
-                                        true,
+                                        item.author_is_bot,
                                         &item.text,
                                     ) {
-                                        skipped += 1;
+                                        skipped_sender += 1;
                                         continue;
                                     }
                                     if enqueue_restored_intervention(
@@ -1686,7 +1688,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                                     ) {
                                         added += 1;
                                     } else {
-                                        skipped += 1;
+                                        skipped_duplicate += 1;
                                     }
                                 }
                                 mailbox_replace_queue(
@@ -1697,9 +1699,10 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                                 )
                                 .await;
                             }
+                            let skipped = skipped_unowned + skipped_sender + skipped_duplicate;
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             tracing::info!(
-                                "  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped} duplicates)"
+                                "  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped}: unowned={skipped_unowned}, sender={skipped_sender}, duplicate={skipped_duplicate})"
                             );
                         }
 
@@ -2757,6 +2760,7 @@ mod tests {
 
         let intervention = Intervention {
             author_id: UserId::new(2024),
+            author_is_bot: false,
             message_id: head_msg,
             // Merged interventions accumulate every source id, including
             // the head. Only the head reaches the dispatch hand-off, so the
@@ -3201,6 +3205,7 @@ mod tests {
     fn make_intervention(message_id: u64, source_message_ids: &[u64], text: &str) -> Intervention {
         Intervention {
             author_id: UserId::new(42),
+            author_is_bot: false,
             message_id: MessageId::new(message_id),
             source_message_ids: source_message_ids
                 .iter()

@@ -313,6 +313,37 @@ fn jsonl_tail_contains_ready_for_input_sentinel(output_path: &str) -> bool {
     String::from_utf8_lossy(&buf).contains(&needle)
 }
 
+fn watcher_jsonl_turn_state_ready_for_input(
+    provider: &crate::services::provider::ProviderKind,
+    runtime_kind: Option<crate::services::agent_protocol::RuntimeHandoffKind>,
+    output_path: &str,
+    current_offset: u64,
+) -> Option<bool> {
+    let path = std::path::Path::new(output_path);
+    crate::services::tui_turn_state::jsonl_ready_for_input(
+        provider,
+        runtime_kind,
+        path,
+        Some(current_offset),
+    )
+    .map(crate::services::tui_turn_state::TuiReadyState::is_ready)
+}
+
+fn watcher_session_ready_for_input(
+    tmux_session_name: &str,
+    provider: &crate::services::provider::ProviderKind,
+    output_path: &str,
+    current_offset: u64,
+) -> bool {
+    let runtime_kind =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)
+            .map(|binding| binding.runtime_kind);
+    watcher_jsonl_turn_state_ready_for_input(provider, runtime_kind, output_path, current_offset)
+        .unwrap_or_else(|| {
+            crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
+        })
+}
+
 fn observe_qwen_user_prompts_in_buffer(
     buffer: &str,
     provider: &crate::services::provider::ProviderKind,
@@ -1043,6 +1074,28 @@ fn matched_session_jsonl_turn_state(
         return Some(crate::services::tui_turn_state::TuiTurnState::Unknown);
     }
     Some(crate::services::tui_turn_state::observe_provider_jsonl_turn_state(provider, path))
+}
+
+fn matched_session_structured_ready_for_input(
+    provider: &ProviderKind,
+    inflight: Option<&crate::services::discord::inflight::InflightTurnState>,
+    tmux_session_name: &str,
+) -> Option<crate::services::tui_turn_state::TuiReadyState> {
+    let state = inflight?;
+    if state.tmux_session_name.as_deref() != Some(tmux_session_name) {
+        return None;
+    }
+    let output_path = state
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    crate::services::tui_turn_state::jsonl_ready_for_input(
+        provider,
+        state.runtime_kind,
+        std::path::Path::new(output_path),
+        None,
+    )
 }
 
 fn jsonl_terminal_can_confirm_completion(
@@ -1779,15 +1832,20 @@ pub(in crate::services::discord) async fn run_tui_completion_gate(
 
     let started_at = tokio::time::Instant::now();
     loop {
-        let session_name = tmux_session_name.to_string();
-        let provider_for_probe = provider.clone();
         let ready = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || {
-                crate::services::provider::tmux_session_ready_for_input(
-                    &session_name,
-                    &provider_for_probe,
-                )
+            tokio::task::spawn_blocking({
+                let provider = provider.clone();
+                let tmux_session_name = tmux_session_name.to_string();
+                let inflight = inflight.clone();
+                move || {
+                    matched_session_structured_ready_for_input(
+                        &provider,
+                        inflight.as_ref(),
+                        &tmux_session_name,
+                    )
+                    .is_some_and(crate::services::tui_turn_state::TuiReadyState::is_ready)
+                }
             }),
         )
         .await
@@ -1805,7 +1863,7 @@ pub(in crate::services::discord) async fn run_tui_completion_gate(
                 channel = channel_id.get(),
                 tmux_session = %tmux_session_name,
                 gate = "tui_completion_quiescence",
-                "[{ts}] \u{26a0} TUI pane was not yet idle after {:?} — suppressing turn-complete status to avoid premature completion (#2161); placeholder sweeper / next-turn intake will reconcile",
+                "[{ts}] \u{26a0} TUI structured turn state was not idle after {:?} — suppressing turn-complete status to avoid premature completion (#2161); placeholder sweeper / next-turn intake will reconcile",
                 crate::services::discord::tmux::TUI_COMPLETION_QUIESCENCE_TIMEOUT,
             );
             return TuiCompletionGateOutcome::TimedOut;
@@ -2607,6 +2665,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let mut ready_for_input_failure_notice: Option<String> = None;
             let mut ready_for_input_stall_dispatch_id: Option<String> = None;
             let mut streaming_suppressed_by_recent_stop = false;
+            let mut streaming_suppressed_by_missing_inflight = false;
             let mut fresh_ready_for_input_idle = false;
 
             while !found_result && turn_start.elapsed() < turn_timeout {
@@ -2844,8 +2903,16 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         // and short-circuit the 2s probe cadence. The
                         // legacy `should_probe_ready` cadence stays as a
                         // fallback for the SIGKILL / sentinel-lost case.
+                        //
+                        // Claude TUI is transcript-backed: its visible
+                        // composer can stay on-screen during active work, so
+                        // watcher completion must use the JSONL turn state,
+                        // not pane chrome.
                         let sentinel_ready =
-                            jsonl_tail_contains_ready_for_input_sentinel(&output_path);
+                            !matches!(
+                                watcher_provider,
+                                crate::services::provider::ProviderKind::Claude
+                            ) && jsonl_tail_contains_ready_for_input_sentinel(&output_path);
                         let should_probe_ready = sentinel_ready
                             || last_ready_probe_at
                                 .map(|last| {
@@ -2862,9 +2929,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     tokio::task::spawn_blocking({
                                         let name = tmux_session_name.clone();
                                         let provider = watcher_provider.clone();
+                                        let path = output_path.clone();
+                                        let offset = current_offset;
                                         move || {
-                                            crate::services::provider::tmux_session_ready_for_input(
-                                                &name, &provider,
+                                            watcher_session_ready_for_input(
+                                                &name, &provider, &path, offset,
                                             )
                                         }
                                     }),
@@ -3085,6 +3154,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             channel_id.get(),
                         )
                         .is_none();
+                    if should_skip_streaming_placeholder_without_inflight(
+                        inflight_missing_for_streaming,
+                    ) {
+                        if !streaming_suppressed_by_missing_inflight {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            tracing::warn!(
+                                "  [{ts}] 🛑 watcher: suppressed streaming placeholder edit for channel {} because inflight state is missing (tmux={}, range {}..{})",
+                                channel_id.get(),
+                                tmux_session_name,
+                                data_start_offset,
+                                current_offset
+                            );
+                            streaming_suppressed_by_missing_inflight = true;
+                        }
+                        continue;
+                    }
                     if should_suppress_streaming_placeholder_after_recent_stop(
                         has_assistant_response_for_streaming,
                         inflight_missing_for_streaming,
@@ -6103,7 +6188,7 @@ mod tests {
         terminal_event_consumed_offset, watcher_batch_contains_relayable_response,
         watcher_direct_terminal_should_commit_session_idle,
         watcher_fallback_edit_failure_can_delete_original_placeholder,
-        watcher_inflight_represents_external_input,
+        watcher_inflight_represents_external_input, watcher_jsonl_turn_state_ready_for_input,
         watcher_should_clear_stale_terminal_message_ids, watcher_should_defer_delegated_fresh_idle,
         watcher_should_delete_suppressed_placeholder,
         watcher_should_suppress_streaming_after_bridge_delivery,
@@ -6354,6 +6439,77 @@ TUI-E2E-marker ssh-direct
         assert!(watcher_batch_contains_relayable_response(
             br#"{"type":"result","result":"ok"}"#
         ));
+    }
+
+    #[test]
+    fn claude_watcher_ready_uses_transcript_turn_state_not_pane_prompt() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"type":"user","message":{"content":"review"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let len = std::fs::metadata(file.path()).unwrap().len();
+
+        assert_eq!(
+            watcher_jsonl_turn_state_ready_for_input(
+                &crate::services::provider::ProviderKind::Claude,
+                Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
+                file.path().to_str().unwrap(),
+                len,
+            ),
+            Some(false)
+        );
+
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"type":"user","message":{"content":"review"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","sessionId":"s"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let len = std::fs::metadata(file.path()).unwrap().len();
+
+        assert_eq!(
+            watcher_jsonl_turn_state_ready_for_input(
+                &crate::services::provider::ProviderKind::Claude,
+                Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
+                file.path().to_str().unwrap(),
+                len,
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn claude_watcher_ready_waits_for_unread_transcript_bytes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{"type":"system","subtype":"turn_duration","sessionId":"s"}"#,
+        )
+        .unwrap();
+        let len = std::fs::metadata(file.path()).unwrap().len();
+
+        assert_eq!(
+            watcher_jsonl_turn_state_ready_for_input(
+                &crate::services::provider::ProviderKind::Claude,
+                Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
+                file.path().to_str().unwrap(),
+                len.saturating_sub(1),
+            ),
+            Some(false)
+        );
     }
 
     #[test]

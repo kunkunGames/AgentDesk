@@ -209,26 +209,17 @@ fn classify_claude_tui_followup_submission(
     transcript_turn_state: crate::services::tui_turn_state::TuiTurnState,
     tmux_session_name: &str,
 ) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
-    if transcript_turn_state == crate::services::tui_turn_state::TuiTurnState::Idle {
+    let structured_turn_busy = transcript_turn_state.is_busy();
+    let draft_blocks_submission =
+        snapshot.tmux_pane_alive && snapshot.prompt_draft_detected && inflight_state != "missing";
+    if !structured_turn_busy && !draft_blocks_submission {
         return None;
-    }
-    if snapshot.tmux_pane_alive
-        && snapshot.prompt_draft_detected
-        && transcript_turn_state == crate::services::tui_turn_state::TuiTurnState::Unknown
-        && inflight_state == "missing"
-    {
-        return None;
-    }
-    if snapshot.prompt_marker_detected || !snapshot.tmux_pane_alive {
-        if !transcript_turn_state.is_busy() {
-            return None;
-        }
     }
     Some(ClaudeTuiBusyFollowupDiagnostic {
         tmux_session_name: tmux_session_name.to_string(),
         prompt_marker_detected: snapshot.prompt_marker_detected,
         prompt_draft_detected: snapshot.prompt_draft_detected,
-        previous_tui_turn_still_running: true,
+        previous_tui_turn_still_running: structured_turn_busy,
         tmux_pane_alive: snapshot.tmux_pane_alive,
         capture_available: snapshot.capture_available,
         watcher_state,
@@ -4521,6 +4512,38 @@ pub(in crate::services::discord) async fn handle_text_message(
     )
     .await;
 
+    if started
+        && let Some(stale) =
+            super::super::stale_dispatch_turn_for_text(shared.pg_pool.as_ref(), user_text).await
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⏭ DISPATCH-GUARD: aborted terminal dispatch at turn start in channel {} (dispatch={}, status={})",
+            channel_id,
+            stale.dispatch_id,
+            stale.status
+        );
+        let finish =
+            super::super::mailbox_finish_turn(shared.as_ref(), &provider, channel_id).await;
+        super::super::advance_last_message_checkpoint(shared, &provider, channel_id, user_msg_id);
+        super::super::formatting::add_reaction_raw(
+            http,
+            channel_id,
+            user_msg_id,
+            super::super::queue_exit_feedback_emoji(stale.queue_exit_kind),
+        )
+        .await;
+        if finish.has_pending {
+            super::super::schedule_deferred_idle_queue_kickoff(
+                shared.clone(),
+                provider.clone(),
+                channel_id,
+                "terminal dispatch skipped at turn start",
+            );
+        }
+        return Ok(());
+    }
+
     // #1332 dispatch hand-off: if this turn was previously enqueued and is now
     // being dispatched, reuse the Queued placeholder card so the user sees a
     // single message transition `📬 → 🔄` instead of two distinct placeholders.
@@ -6024,6 +6047,12 @@ pub(in crate::services::discord) async fn handle_text_message(
             )
             .await;
         }
+        let queue_kickoff_scheduled = release_mailbox_after_hosted_tui_busy_pre_submit(
+            shared,
+            &bot_owner_provider,
+            channel_id,
+        )
+        .await;
         let mut diagnostic_json = diagnostic.to_json();
         if let Some(object) = diagnostic_json.as_object_mut() {
             object.insert(
@@ -6041,6 +6070,10 @@ pub(in crate::services::discord) async fn handle_text_message(
             object.insert(
                 "queued_card_rendered".to_string(),
                 serde_json::json!(queued_card_rendered),
+            );
+            object.insert(
+                "queue_kickoff_scheduled".to_string(),
+                serde_json::json!(queue_kickoff_scheduled),
             );
             // #2728: when `enqueued == false` we previously had no signal in
             // the producer-exit diagnostic to distinguish dup-guard / dedup /
@@ -6069,8 +6102,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             diagnostic_json,
         );
         super::super::formatting::remove_reaction_raw(http, channel_id, user_msg_id, '⏳').await;
-        release_mailbox_after_hosted_tui_busy_pre_submit(shared, &bot_owner_provider, channel_id)
-            .await;
         shared
             .global_active
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -6101,7 +6132,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             enqueue_outcome.merged,
             queue_depth_after_busy_enqueue,
             queued_card_rendered,
-            false
+            queue_kickoff_scheduled
         );
         cancel_token
             .cancelled
@@ -8039,7 +8070,7 @@ mod session_strategy_lifecycle_tests {
 
     #[cfg(unix)]
     #[test]
-    fn claude_tui_direct_busy_followup_blocks_before_prompt_submit() {
+    fn claude_tui_structured_busy_followup_blocks_before_prompt_submit() {
         let snapshot = HostedTuiPromptReadinessSnapshot {
             prompt_marker_detected: false,
             prompt_draft_detected: false,
@@ -8053,10 +8084,10 @@ mod session_strategy_lifecycle_tests {
             "attached",
             Some(1479671301387059200),
             "missing",
-            crate::services::tui_turn_state::TuiTurnState::Unknown,
+            crate::services::tui_turn_state::TuiTurnState::Streaming,
             "AgentDesk-claude-adk-cdx-direct",
         )
-        .expect("busy direct TUI turn should block follow-up submission");
+        .expect("structured busy TUI turn should block follow-up submission");
 
         assert!(diagnostic.previous_tui_turn_still_running);
         assert!(!diagnostic.prompt_marker_detected);
@@ -10186,6 +10217,7 @@ mod tests {
         };
         let item = crate::services::turn_orchestrator::PendingQueueItem {
             author_id: 555,
+            author_is_bot: false,
             message_id: 2_266_003,
             source_message_ids: vec![2_266_003],
             text: "회의록 정리해줘".to_string(),
@@ -10531,6 +10563,7 @@ mod tests {
             channel_id,
             super::super::super::Intervention {
                 author_id: owner,
+                author_is_bot: false,
                 message_id: queued_msg_id,
                 source_message_ids: vec![queued_msg_id],
                 text: "race-loser queued message".to_string(),
@@ -10579,7 +10612,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn busy_pre_submit_requeues_without_immediate_idle_kickoff() {
+    async fn busy_pre_submit_requeues_and_schedules_idle_kickoff_when_pending() {
         use crate::services::provider::CancelToken;
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
@@ -10621,12 +10654,17 @@ mod tests {
         );
 
         let backlog_before = shared.deferred_hook_backlog.load(Ordering::Relaxed);
-        release_mailbox_after_hosted_tui_busy_pre_submit(&shared, &provider, channel_id).await;
+        let kicked =
+            release_mailbox_after_hosted_tui_busy_pre_submit(&shared, &provider, channel_id).await;
 
+        assert!(
+            kicked,
+            "hosted TUI busy pre-submit must schedule a deferred kickoff when it leaves a queued item behind"
+        );
         assert_eq!(
             shared.deferred_hook_backlog.load(Ordering::Relaxed),
-            backlog_before,
-            "hosted TUI busy pre-submit must not immediately re-kick the same queued retry"
+            backlog_before + 1,
+            "hosted TUI busy pre-submit must not leave an idle mailbox with a queued retry"
         );
 
         let snapshot = shared.mailbox(channel_id).snapshot().await;
@@ -10749,6 +10787,7 @@ mod tests {
             channel_id,
             super::super::super::Intervention {
                 author_id: owner,
+                author_is_bot: false,
                 message_id: race_lost_msg_id_clone,
                 source_message_ids: vec![race_lost_msg_id_clone],
                 text: "queued during race".to_string(),

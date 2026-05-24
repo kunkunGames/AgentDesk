@@ -214,6 +214,7 @@ async fn claim_voice_transcript_announcement_for_queue(
 
 fn build_soft_intervention(
     author_id: serenity::UserId,
+    author_is_bot: bool,
     message_id: serenity::MessageId,
     text: &str,
     reply_context: Option<String>,
@@ -231,6 +232,7 @@ fn build_soft_intervention(
 ) -> Intervention {
     Intervention {
         author_id,
+        author_is_bot,
         message_id,
         source_message_ids: vec![message_id],
         text: text.to_string(),
@@ -247,6 +249,7 @@ async fn enqueue_soft_intervention(
     data: &Data,
     channel_id: serenity::ChannelId,
     author_id: serenity::UserId,
+    author_is_bot: bool,
     message_id: serenity::MessageId,
     text: &str,
     reply_context: Option<String>,
@@ -262,6 +265,7 @@ async fn enqueue_soft_intervention(
         channel_id,
         build_soft_intervention(
             author_id,
+            author_is_bot,
             message_id,
             text,
             reply_context,
@@ -285,7 +289,7 @@ pub(super) async fn enqueue_soft_intervention_for_test(
         shared,
         &ProviderKind::Codex,
         channel_id,
-        build_soft_intervention(author_id, message_id, text, None, false, false, None),
+        build_soft_intervention(author_id, false, message_id, text, None, false, false, None),
     )
     .await
     .enqueued
@@ -1509,6 +1513,32 @@ pub(in crate::services::discord) async fn handle_event(
             if !is_allowed_bot && !check_auth(user_id, user_name, &data.shared, &data.token).await {
                 return Ok(());
             }
+            if let Some(stale) =
+                super::super::stale_dispatch_turn_for_text(data.shared.pg_pool.as_ref(), text).await
+            {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⏭ DISPATCH-GUARD: skipped terminal dispatch message {} in channel {} (dispatch={}, status={})",
+                    new_message.id,
+                    channel_id,
+                    stale.dispatch_id,
+                    stale.status
+                );
+                super::super::advance_last_message_checkpoint(
+                    &data.shared,
+                    &data.provider,
+                    channel_id,
+                    new_message.id,
+                );
+                add_reaction(
+                    &ctx.http,
+                    channel_id,
+                    new_message.id,
+                    super::super::queue_exit_feedback_emoji(stale.queue_exit_kind),
+                )
+                .await;
+                return Ok(());
+            }
             // PR #3b: clear any active idle-recap card once a message is
             // accepted as a real turn. This intentionally includes
             // trigger-capable announce/allowed-bot messages used by
@@ -1756,6 +1786,7 @@ pub(in crate::services::discord) async fn handle_event(
                                 data,
                                 channel_id,
                                 user_id,
+                                new_message.author.bot,
                                 new_message.id,
                                 text,
                                 None,
@@ -1813,6 +1844,7 @@ pub(in crate::services::discord) async fn handle_event(
                         data,
                         channel_id,
                         user_id,
+                        new_message.author.bot,
                         new_message.id,
                         text,
                         None,
@@ -1871,6 +1903,7 @@ pub(in crate::services::discord) async fn handle_event(
                     data,
                     channel_id,
                     user_id,
+                    new_message.author.bot,
                     new_message.id,
                     text,
                     reply_context.clone(),
@@ -1950,6 +1983,7 @@ pub(in crate::services::discord) async fn handle_event(
                     data,
                     channel_id,
                     user_id,
+                    new_message.author.bot,
                     new_message.id,
                     text,
                     reply_context.clone(),
@@ -1999,6 +2033,7 @@ pub(in crate::services::discord) async fn handle_event(
                     data,
                     channel_id,
                     user_id,
+                    new_message.author.bot,
                     new_message.id,
                     text,
                     reply_context.clone(),
@@ -2085,6 +2120,7 @@ pub(in crate::services::discord) async fn handle_event(
                             data,
                             channel_id,
                             user_id,
+                            new_message.author.bot,
                             new_message.id,
                             text,
                             reply_context.clone(),

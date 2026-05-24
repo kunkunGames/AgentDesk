@@ -568,7 +568,7 @@ fn status_panel_renders_task_line_with_dispatch_fallback() {
 fn status_panel_renders_context_usage_severity_levels() {
     let events = PlaceholderLiveEvents::default();
     let normal_channel_id = ChannelId::new(182);
-    assert!(events.set_context_panel_usage(normal_channel_id, 740, 0, 0, 1000, 90));
+    assert!(events.set_context_panel_usage(normal_channel_id, None, 740, 0, 0, 1000, 90));
     let normal =
         events.render_status_panel(normal_channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(normal.contains("Context   📦 740 / 1.0k tokens (74%) · auto-compact 90%"));
@@ -576,13 +576,13 @@ fn status_panel_renders_context_usage_severity_levels() {
     assert!(!normal.contains("자동 압축 직전"));
 
     let approaching_channel_id = ChannelId::new(183);
-    events.set_context_panel_usage(approaching_channel_id, 700, 40, 10, 1000, 90);
+    events.set_context_panel_usage(approaching_channel_id, None, 700, 40, 10, 1000, 90);
     let approaching =
         events.render_status_panel(approaching_channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(approaching.contains("Context   📦 750 / 1.0k tokens (75%) · auto-compact 90% (임박)"));
 
     let critical_channel_id = ChannelId::new(184);
-    events.set_context_panel_usage(critical_channel_id, 700, 100, 50, 1000, 90);
+    events.set_context_panel_usage(critical_channel_id, None, 700, 100, 50, 1000, 90);
     let critical =
         events.render_status_panel(critical_channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(
@@ -595,7 +595,7 @@ fn status_panel_renders_context_usage_severity_levels() {
 fn status_panel_caps_context_usage_display_at_100_percent() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(188);
-    assert!(events.set_context_panel_usage(channel_id, 4000, 80, 10, 1000, 60));
+    assert!(events.set_context_panel_usage(channel_id, None, 4000, 80, 10, 1000, 60));
 
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
 

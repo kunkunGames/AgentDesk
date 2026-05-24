@@ -25,6 +25,7 @@ pub(crate) enum InterventionMode {
 #[derive(Clone, Debug)]
 pub(crate) struct Intervention {
     pub(crate) author_id: UserId,
+    pub(crate) author_is_bot: bool,
     pub(crate) message_id: MessageId,
     pub(crate) source_message_ids: Vec<MessageId>,
     pub(crate) text: String,
@@ -282,6 +283,8 @@ pub(crate) fn requeue_intervention_front(
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingQueueItem {
     pub(crate) author_id: u64,
+    #[serde(default)]
+    pub(crate) author_is_bot: bool,
     pub(crate) message_id: u64,
     #[serde(default)]
     pub(crate) source_message_ids: Vec<u64>,
@@ -523,6 +526,7 @@ pub(crate) fn save_channel_queue(
         .iter()
         .map(|i| PendingQueueItem {
             author_id: i.author_id.get(),
+            author_is_bot: i.author_is_bot,
             message_id: i.message_id.get(),
             source_message_ids: if i.source_message_ids.is_empty() {
                 vec![i.message_id.get()]
@@ -560,6 +564,7 @@ fn pending_queue_item_to_intervention(item: PendingQueueItem, now: Instant) -> I
     }
     Intervention {
         author_id: UserId::new(item.author_id),
+        author_is_bot: item.author_is_bot,
         message_id: MessageId::new(item.message_id),
         source_message_ids,
         text: item.text,
@@ -617,6 +622,7 @@ pub(crate) fn save_pending_queues(
             .iter()
             .map(|i| PendingQueueItem {
                 author_id: i.author_id.get(),
+                author_is_bot: i.author_is_bot,
                 message_id: i.message_id.get(),
                 source_message_ids: if i.source_message_ids.is_empty() {
                     vec![i.message_id.get()]
@@ -2441,6 +2447,7 @@ mod actor_hydrate_regression_tests {
     fn make_intervention(message_id: u64, text: &str, created_at: Instant) -> Intervention {
         Intervention {
             author_id: UserId::new(1),
+            author_is_bot: false,
             message_id: MessageId::new(message_id),
             source_message_ids: vec![MessageId::new(message_id)],
             text: text.to_string(),
@@ -2899,6 +2906,7 @@ mod enqueue_refusal_reason_tests {
     fn intervention(message_id: u64, text: &str, created_at: Instant) -> Intervention {
         Intervention {
             author_id: UserId::new(1),
+            author_is_bot: false,
             message_id: MessageId::new(message_id),
             source_message_ids: vec![MessageId::new(message_id)],
             text: text.to_string(),
@@ -2948,6 +2956,58 @@ mod enqueue_refusal_reason_tests {
     }
 }
 
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
+    static TEST_ENV_LOCK: LazyLock<std::sync::Mutex<()>> =
+        LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn pending_queue_roundtrip_preserves_author_is_bot() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Codex;
+        let token_hash = "author_bot_roundtrip";
+        let channel_id = ChannelId::new(4242);
+        let message_id = MessageId::new(9001);
+        let intervention = Intervention {
+            author_id: UserId::new(100),
+            author_is_bot: true,
+            message_id,
+            source_message_ids: vec![message_id],
+            text: "DISPATCH: restore me".to_string(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            voice_announcement: None,
+        };
+
+        save_channel_queue(&provider, token_hash, channel_id, &[intervention], None);
+
+        let path = tmp
+            .path()
+            .join("runtime")
+            .join("discord_pending_queue")
+            .join(provider.as_str())
+            .join(token_hash)
+            .join(format!("{}.json", channel_id.get()));
+        let saved: Vec<PendingQueueItem> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(saved[0].author_is_bot);
+
+        let (loaded, _) = load_pending_queues(&provider, token_hash);
+        assert!(loaded[&channel_id][0].author_is_bot);
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+}
+
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;
@@ -2982,6 +3042,7 @@ mod tests {
     fn make_intervention(message_id: u64, text: &str, created_at: Instant) -> Intervention {
         Intervention {
             author_id: UserId::new(1),
+            author_is_bot: false,
             message_id: MessageId::new(message_id),
             source_message_ids: vec![MessageId::new(message_id)],
             text: text.to_string(),
@@ -3695,6 +3756,7 @@ mod purge_queue_tests {
     fn make_intervention(message_id: u64, text: &str, created_at: Instant) -> Intervention {
         Intervention {
             author_id: UserId::new(1),
+            author_is_bot: false,
             message_id: MessageId::new(message_id),
             source_message_ids: vec![MessageId::new(message_id)],
             text: text.to_string(),

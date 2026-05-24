@@ -42,7 +42,7 @@ pub async fn post_idle_recap(
         return error(StatusCode::INTERNAL_SERVER_ERROR, "pg pool unavailable");
     };
 
-    let snapshot = match idle_recap::load_recap_snapshot(&pool, &session_key).await {
+    let mut snapshot = match idle_recap::load_recap_snapshot(&pool, &session_key).await {
         Ok(Some(snap)) => snap,
         Ok(None) => return error(StatusCode::NOT_FOUND, "session not found"),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &format!("load: {e}")),
@@ -75,6 +75,7 @@ pub async fn post_idle_recap(
         Ok(http) => http,
         Err(_) => return skip("provider bot not registered for recap interaction"),
     };
+    idle_recap::attach_live_context_usage(registry.as_ref(), &mut snapshot, channel_id).await;
 
     // Stamp only after the recap is known to be meaningful and postable. No
     // resumable-session skips should stay eligible until a real session id is
