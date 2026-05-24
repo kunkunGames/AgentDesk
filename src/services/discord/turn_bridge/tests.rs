@@ -1,6 +1,6 @@
 use super::completion_guard::{
     build_verdict_payload, extract_explicit_review_verdict, extract_explicit_work_outcome,
-    extract_review_decision, extract_review_decision_commit_sha,
+    extract_phase_gate_pass, extract_review_decision, extract_review_decision_commit_sha,
     extract_review_decision_out_of_scope,
 };
 use super::context_window::{
@@ -2927,6 +2927,17 @@ fn explicit_review_verdict_parser_ignores_unstructured_text() {
         extract_explicit_review_verdict("검토 완료. 전반적으로 좋아 보입니다."),
         None
     );
+}
+
+#[test]
+fn phase_gate_pass_parser_accepts_structured_marker() {
+    assert!(extract_phase_gate_pass(
+        "Phase Gate P2: PASS\nReady to continue."
+    ));
+    assert!(extract_phase_gate_pass(
+        "result: phase_gate_passed\nAll checks green."
+    ));
+    assert!(!extract_phase_gate_pass("Phase Gate P2: FAIL\nNeeds work."));
 }
 
 #[test]

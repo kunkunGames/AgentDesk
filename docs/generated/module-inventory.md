@@ -5,7 +5,7 @@
 
 - Production Rust modules: `623`
 - Giant-file threshold: `>= 1000` lines
-- Giant files: `123`
+- Giant files: `124`
 
 ## Namespace Summary
 
@@ -79,7 +79,7 @@
 | `db::auto_queue::claim` | `src/db/auto_queue/claim.rs` | 738 |  |
 | `db::auto_queue::consultation` | `src/db/auto_queue/consultation.rs` | 112 |  |
 | `db::auto_queue::entries` | `src/db/auto_queue/entries.rs` | 1505 | giant-file |
-| `db::auto_queue::phase_gates` | `src/db/auto_queue/phase_gates.rs` | 2963 | giant-file |
+| `db::auto_queue::phase_gates` | `src/db/auto_queue/phase_gates.rs` | 3032 | giant-file |
 | `db::auto_queue::queries` | `src/db/auto_queue/queries.rs` | 533 |  |
 | `db::auto_queue::runs` | `src/db/auto_queue/runs.rs` | 291 |  |
 | `db::auto_queue::slots` | `src/db/auto_queue/slots.rs` | 209 |  |
@@ -88,7 +88,7 @@
 | `db::cancel_tombstones` | `src/db/cancel_tombstones.rs` | 420 |  |
 | `db::dispatch_semaphores` | `src/db/dispatch_semaphores.rs` | 331 |  |
 | `db::dispatched_sessions` | `src/db/dispatched_sessions.rs` | 1930 | giant-file |
-| `db::dispatches` | `src/db/dispatches/mod.rs` | 991 |  |
+| `db::dispatches` | `src/db/dispatches/mod.rs` | 1087 | giant-file |
 | `db::dispatches::delivery_events` | `src/db/dispatches/delivery_events.rs` | 479 |  |
 | `db::dispatches::metadata` | `src/db/dispatches/metadata.rs` | 262 |  |
 | `db::dispatches::outbox` | `src/db/dispatches/outbox/mod.rs` | 43 |  |
@@ -263,10 +263,10 @@
 | `server::routes::receipt` | `src/server/routes/receipt.rs` | 343 |  |
 | `server::routes::resume` | `src/server/routes/resume.rs` | 1260 | giant-file |
 | `server::routes::review_verdict` | `src/server/routes/review_verdict/mod.rs` | 19 |  |
-| `server::routes::review_verdict::decision_route` | `src/server/routes/review_verdict/decision_route.rs` | 4681 | giant-file |
+| `server::routes::review_verdict::decision_route` | `src/server/routes/review_verdict/decision_route.rs` | 4832 | giant-file |
 | `server::routes::review_verdict::review_state_repo` | `src/server/routes/review_verdict/review_state_repo.rs` | 35 |  |
 | `server::routes::review_verdict::tuning_aggregate` | `src/server/routes/review_verdict/tuning_aggregate.rs` | 703 |  |
-| `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 581 |  |
+| `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 584 |  |
 | `server::routes::reviews` | `src/server/routes/reviews.rs` | 1174 | giant-file |
 | `server::routes::routes_tests` | `src/server/routes/routes_tests/mod.rs` | 26 |  |
 | `server::routes::routes_tests::common` | `src/server/routes/routes_tests/common.rs` | 1418 | giant-file |
@@ -434,7 +434,7 @@
 | `services::discord::outbound::transport` | `src/services/discord/outbound/transport.rs` | 367 |  |
 | `services::discord::placeholder_cleanup` | `src/services/discord/placeholder_cleanup.rs` | 456 |  |
 | `services::discord::placeholder_controller` | `src/services/discord/placeholder_controller.rs` | 1618 | giant-file |
-| `services::discord::placeholder_live_events` | `src/services/discord/placeholder_live_events/mod.rs` | 643 |  |
+| `services::discord::placeholder_live_events` | `src/services/discord/placeholder_live_events/mod.rs` | 647 |  |
 | `services::discord::placeholder_live_events::common` | `src/services/discord/placeholder_live_events/common.rs` | 130 |  |
 | `services::discord::placeholder_live_events::context_panel` | `src/services/discord/placeholder_live_events/context_panel.rs` | 59 |  |
 | `services::discord::placeholder_live_events::recent_events` | `src/services/discord/placeholder_live_events/recent_events.rs` | 236 |  |
@@ -497,8 +497,8 @@
 | `services::discord::tmux_session_files` | `src/services/discord/tmux_session_files.rs` | 329 |  |
 | `services::discord::tmux_watcher` | `src/services/discord/tmux_watcher.rs` | 6716 | giant-file |
 | `services::discord::tui_prompt_relay` | `src/services/discord/tui_prompt_relay.rs` | 2449 | giant-file |
-| `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 8407 | giant-file |
-| `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2439 | giant-file |
+| `services::discord::turn_bridge` | `src/services/discord/turn_bridge/mod.rs` | 8409 | giant-file |
+| `services::discord::turn_bridge::completion_guard` | `src/services/discord/turn_bridge/completion_guard.rs` | 2540 | giant-file |
 | `services::discord::turn_bridge::context_window` | `src/services/discord/turn_bridge/context_window.rs` | 88 |  |
 | `services::discord::turn_bridge::memory_lifecycle` | `src/services/discord/turn_bridge/memory_lifecycle.rs` | 194 |  |
 | `services::discord::turn_bridge::output_lifecycle` | `src/services/discord/turn_bridge/output_lifecycle.rs` | 78 |  |

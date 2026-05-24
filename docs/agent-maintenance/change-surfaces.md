@@ -321,6 +321,10 @@
     + `reconcile_phase_gate_for_terminal_dispatch_on_pg_tx`. Split the test
     module out into a sibling `phase_gates_tests.rs` before adding new
     feature logic).
+  - `src/db/dispatches/mod.rs` (1087 lines; dispatch slot/thread binding and
+    outbox-adjacent PG helpers, pushed over the giant-file threshold by
+    #2778/#2783 slot-isolation recovery. Split slot allocation helpers before
+    adding new feature logic).
   - `src/db/schema.rs` (3194 lines).
   - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
     GitHub sync lookup surface).

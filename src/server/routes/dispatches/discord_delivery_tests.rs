@@ -2741,7 +2741,10 @@ async fn review_decision_resolves_free_slot_and_skips_card_thread_candidate_pg()
     .await
     .unwrap();
 
-    let dispatch_context = serde_json::json!({});
+    let dispatch_context = serde_json::json!({
+        "entry_id": "entry-work",
+        "slot_index": 0
+    });
     let binding = resolve_slot_thread_binding_pg(
         &pool,
         "agent-1",

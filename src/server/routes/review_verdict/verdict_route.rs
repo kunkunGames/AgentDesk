@@ -65,7 +65,10 @@ fn review_dispatch_allows_late_failed_verdict(dispatch: &serde_json::Value) -> b
     let Some(result) = dispatch.get("result") else {
         return false;
     };
-    result.get("failure_kind").and_then(|value| value.as_str()) == Some("stuck_at_ready")
+    matches!(
+        result.get("failure_kind").and_then(|value| value.as_str()),
+        Some("stuck_at_ready" | "tmux_session_died")
+    )
 }
 
 fn review_state_sync_pg_first(state: &AppState, payload: &serde_json::Value) -> String {
