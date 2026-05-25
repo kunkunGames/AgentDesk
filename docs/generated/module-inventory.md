@@ -359,7 +359,7 @@
 | `services::cluster::session_registry` | `src/services/cluster/session_registry.rs` | 572 |  |
 | `services::cluster::stream_relay` | `src/services/cluster/stream_relay.rs` | 1153 | giant-file |
 | `services::cluster::watcher_supervisor` | `src/services/cluster/watcher_supervisor.rs` | 844 |  |
-| `services::codex` | `src/services/codex.rs` | 3887 | giant-file |
+| `services::codex` | `src/services/codex.rs` | 3888 | giant-file |
 | `services::codex_remote_policy` | `src/services/codex_remote_policy.rs` | 49 |  |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 812 |  |
 | `services::codex_tui` | `src/services/codex_tui/mod.rs` | 3 |  |
