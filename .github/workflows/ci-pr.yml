@@ -548,6 +548,46 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+  lint_required_context:
+    name: Lint required context (ubuntu-latest)
+    needs:
+      - changes
+      - lint
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mirror lint result for branch protection
+        if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
+        env:
+          CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
+          FILTER_NAME: rust_or_policy
+          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_or_policy }}
+          UPSTREAM_JOB_NAME: lint
+          UPSTREAM_RESULT: ${{ needs.lint.result }}
+        run: ./scripts/required-check-mirror.sh
+
+  check_fast_cross_os_required_context:
+    name: Fast check cross OS required context (ubuntu-latest)
+    needs:
+      - changes
+      - check_fast_cross_os
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mirror check_fast_cross_os result for branch protection
+        if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
+        env:
+          CHANGED_PATHS_RESULT: ${{ needs.changes.result }}
+          FILTER_NAME: rust_compile
+          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_compile }}
+          UPSTREAM_JOB_NAME: check_fast_cross_os
+          UPSTREAM_RESULT: ${{ needs.check_fast_cross_os.result }}
+        run: ./scripts/required-check-mirror.sh
+
   scripts:
     name: Script checks
     needs: changes
