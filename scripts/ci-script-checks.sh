@@ -20,6 +20,18 @@ echo "=== PG audit guard ==="
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
 
+echo "=== Scratch file guard ==="
+FAIL=0
+for scratch_file in plan.md scratch.md scratch.txt scratchpad.md scratchpad.txt test_scratch.rs plan.txt; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
+if [ "$FAIL" -ne 0 ]; then
+  exit "$FAIL"
+fi
+
 echo "=== Check hardcoded port/path drift ==="
 grep -rn '8791\|8799' --include='*.rs' --include='*.js' --include='*.yaml' --include='*.json' \
   --exclude-dir=target --exclude-dir=.git --exclude-dir=node_modules \
