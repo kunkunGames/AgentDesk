@@ -5,7 +5,7 @@ use axum::{
 
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
-    health_api, idle_recap, maintenance, messages, pipeline, prompt_manifest_retention,
+    health_api, idle_recap, maintenance, messages, monitoring, pipeline, prompt_manifest_retention,
     protected_api_domain, provider_cli_api, queue_api, routines, skills_api, termination_events,
 };
 
@@ -290,12 +290,11 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             )
             .route(
                 "/channels/{channel_id}/monitoring",
-                post(super::super::monitoring::upsert_monitoring)
-                    .get(super::super::monitoring::list_monitoring),
+                post(monitoring::upsert_monitoring).get(monitoring::list_monitoring),
             )
             .route(
                 "/channels/{channel_id}/monitoring/{key}",
-                delete(super::super::monitoring::remove_monitoring),
+                delete(monitoring::remove_monitoring),
             )
             .route(
                 "/dispatches/pending",

@@ -237,7 +237,7 @@
 | `server::routes::domains::integrations` | `src/server/routes/domains/integrations.rs` | 78 |  |
 | `server::routes::domains::kanban` | `src/server/routes/domains/kanban.rs` | 87 |  |
 | `server::routes::domains::onboarding` | `src/server/routes/domains/onboarding.rs` | 39 |  |
-| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 331 |  |
+| `server::routes::domains::ops` | `src/server/routes/domains/ops.rs` | 330 |  |
 | `server::routes::domains::reviews` | `src/server/routes/domains/reviews.rs` | 33 |  |
 | `server::routes::escalation` | `src/server/routes/escalation.rs` | 2391 | giant-file |
 | `server::routes::github` | `src/server/routes/github.rs` | 737 |  |
