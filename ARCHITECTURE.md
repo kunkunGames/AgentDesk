@@ -277,6 +277,7 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routines.rs
+│   │   ├── routines_migrated.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── settings_tests.rs
@@ -662,6 +663,7 @@ src/
 │   ├── message_outbox.rs
 │   ├── mod.rs
 │   ├── opencode.rs
+│   ├── operator_connectors.rs
 │   ├── pipeline_override.rs
 │   ├── pipeline_routes.rs
 │   ├── pr_summary.rs

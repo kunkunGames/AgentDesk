@@ -892,6 +892,138 @@ fn run_codex_command_vec(codex_bin: &str, args: &[String]) -> Result<(), String>
     })
 }
 
+#[cfg(test)]
+mod portable_provider_mirror_tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static PORTABLE_MCP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_portable_mcp_test_env<F>(f: F)
+    where
+        F: FnOnce(&Path),
+    {
+        let _guard = PORTABLE_MCP_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join(".adk").join("release");
+        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+        let previous_home = std::env::var_os("HOME");
+        let previous_userprofile = std::env::var_os("USERPROFILE");
+        let previous_qwen_home = std::env::var_os("QWEN_HOME");
+        let previous_gemini_cli_home = std::env::var_os("GEMINI_CLI_HOME");
+        unsafe {
+            std::env::set_var("AGENTDESK_ROOT_DIR", &runtime_root);
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("USERPROFILE", temp.path());
+            std::env::set_var("QWEN_HOME", temp.path());
+            std::env::set_var("GEMINI_CLI_HOME", temp.path());
+        }
+
+        f(temp.path());
+
+        match previous_root {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+        }
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match previous_userprofile {
+            Some(value) => unsafe { std::env::set_var("USERPROFILE", value) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        match previous_qwen_home {
+            Some(value) => unsafe { std::env::set_var("QWEN_HOME", value) },
+            None => unsafe { std::env::remove_var("QWEN_HOME") },
+        }
+        match previous_gemini_cli_home {
+            Some(value) => unsafe { std::env::set_var("GEMINI_CLI_HOME", value) },
+            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
+        }
+    }
+
+    fn config_with_memento() -> Config {
+        let mut config = Config::default();
+        config.mcp_servers.insert(
+            "memento".to_string(),
+            McpServerConfig {
+                url: "http://localhost:57332/mcp".to_string(),
+                auth: Some(crate::config::McpServerAuthConfig {
+                    auth_type: McpServerAuthType::Bearer,
+                    token_env_var: Some("MEMENTO_ACCESS_KEY".to_string()),
+                }),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn provider_mcp_detection_treats_missing_provider_dirs_as_absent() {
+        with_portable_mcp_test_env(|temp_root| {
+            assert!(!temp_root.join(".claude").exists());
+            assert!(!temp_root.join(".codex").exists());
+            assert!(!temp_root.join(".config").join("opencode").exists());
+            assert!(!temp_root.join(".qwen").exists());
+            assert!(!temp_root.join(".gemini").exists());
+
+            assert!(!provider_has_mcp_server(&ProviderKind::Claude, "memento"));
+            assert!(!provider_has_mcp_server(&ProviderKind::Codex, "memento"));
+            assert!(!provider_has_mcp_server(&ProviderKind::OpenCode, "memento"));
+            assert!(!provider_has_mcp_server(&ProviderKind::Qwen, "memento"));
+            assert!(!provider_has_mcp_server(&ProviderKind::Gemini, "memento"));
+        });
+    }
+
+    #[test]
+    fn provider_mcp_sync_creates_missing_json_provider_dirs() {
+        with_portable_mcp_test_env(|temp_root| {
+            let config = config_with_memento();
+
+            sync_opencode_mcp_servers(&config).unwrap();
+            sync_qwen_mcp_servers(&config).unwrap();
+            sync_gemini_mcp_servers(&config).unwrap();
+
+            let opencode_path = temp_root
+                .join(".config")
+                .join("opencode")
+                .join("opencode.json");
+            let qwen_path = temp_root.join(".qwen").join("settings.json");
+            let gemini_path = temp_root.join(".gemini").join("settings.json");
+            assert!(opencode_path.is_file());
+            assert!(qwen_path.is_file());
+            assert!(gemini_path.is_file());
+
+            let opencode: Value =
+                serde_json::from_str(&fs::read_to_string(opencode_path).unwrap()).unwrap();
+            let qwen: Value =
+                serde_json::from_str(&fs::read_to_string(qwen_path).unwrap()).unwrap();
+            let gemini: Value =
+                serde_json::from_str(&fs::read_to_string(gemini_path).unwrap()).unwrap();
+
+            assert_eq!(opencode["mcp"]["memento"]["type"], json!("remote"));
+            assert_eq!(
+                opencode["mcp"]["memento"]["headers"]["Authorization"],
+                json!("Bearer {env:MEMENTO_ACCESS_KEY}")
+            );
+            assert_eq!(
+                qwen["mcpServers"]["memento"]["httpUrl"],
+                json!("http://localhost:57332/mcp")
+            );
+            assert_eq!(
+                gemini["mcpServers"]["memento"]["httpUrl"],
+                json!("http://localhost:57332/mcp")
+            );
+            assert!(provider_has_mcp_server(&ProviderKind::OpenCode, "memento"));
+            assert!(provider_has_mcp_server(&ProviderKind::Qwen, "memento"));
+            assert!(provider_has_mcp_server(&ProviderKind::Gemini, "memento"));
+        });
+    }
+}
+
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::*;

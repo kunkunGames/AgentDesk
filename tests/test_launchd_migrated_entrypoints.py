@@ -5,9 +5,7 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROUTINE_DIR = REPO_ROOT / "routines" / "migrated-launchd"
 ENTRYPOINT_DIR = REPO_ROOT / "scripts" / "launchd-migrated"
-RELEASE_ENTRYPOINT_DIR = "/Users/itismyfield/.adk/release/scripts/launchd-migrated"
-
-LOCAL_BIN = "/Users/itismyfield/.local/bin"
+SPECIFIC_USER_HOME = "/Users/itismyfield"
 
 MIGRATED_SHELL_JOBS = [
     "agent-feedback-briefing",
@@ -39,17 +37,18 @@ class LaunchdMigratedEntrypointTests(unittest.TestCase):
             text = routine.read_text(encoding="utf-8")
 
             self.assertTrue(script.exists(), f"missing repo entrypoint for {name}")
-            self.assertIn(f"{RELEASE_ENTRYPOINT_DIR}/{name}.sh", text)
-            self.assertNotIn(LOCAL_BIN, text)
+            self.assertIn(f"scripts/launchd-migrated/{name}.sh", text)
+            self.assertIn("AGENTDESK_ROOT_DIR", text)
+            self.assertNotIn(SPECIFIC_USER_HOME, text)
 
     def test_migrated_entrypoints_do_not_call_local_bin_helpers(self) -> None:
         for path in ENTRYPOINT_DIR.iterdir():
             if path.is_file():
                 text = path.read_text(encoding="utf-8")
                 self.assertNotIn(
-                    LOCAL_BIN,
+                    SPECIFIC_USER_HOME,
                     text,
-                    f"{path.name} still depends on host-local bin",
+                    f"{path.name} still depends on an operator-specific home path",
                 )
 
     def test_issue_2396_memory_jobs_have_concrete_owners(self) -> None:

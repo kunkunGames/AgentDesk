@@ -58,6 +58,10 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 get(settings::get_runtime_config).put(settings::put_runtime_config),
             )
             .route(
+                "/settings/operator-connectors",
+                get(settings::get_operator_connectors),
+            )
+            .route(
                 "/settings/escalation",
                 get(escalation::get_escalation_settings).put(escalation::put_escalation_settings),
             )

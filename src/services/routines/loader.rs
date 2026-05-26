@@ -21,6 +21,7 @@ pub struct LoadedRoutineScript {
     pub script_ref: String,
     pub file: PathBuf,
     pub script_version: String,
+    pub metadata: Value,
     source: String,
 }
 
@@ -31,6 +32,7 @@ impl Clone for LoadedRoutineScript {
             script_ref: self.script_ref.clone(),
             file: self.file.clone(),
             script_version: self.script_version.clone(),
+            metadata: self.metadata.clone(),
             source: self.source.clone(),
         }
     }
@@ -355,13 +357,15 @@ pub fn load_single_routine_script(root: &Path, path: &Path) -> Result<LoadedRout
     let script_ref = script_ref(root, path);
     let script_version = compute_policy_version(&source);
 
-    let name = evaluate_routine_script_metadata(&source, &fallback_name, &script_ref, path)?;
+    let (name, metadata) =
+        evaluate_routine_script_metadata(&source, &fallback_name, &script_ref, path)?;
 
     Ok(LoadedRoutineScript {
         name,
         script_ref,
         file: path.to_path_buf(),
         script_version,
+        metadata,
         source,
     })
 }
@@ -371,17 +375,17 @@ fn evaluate_routine_script_metadata(
     fallback_name: &str,
     script_ref: &str,
     path: &Path,
-) -> Result<String> {
+) -> Result<(String, Value)> {
     let runtime =
         Runtime::new().map_err(|e| anyhow!("routine QuickJS runtime creation failed: {e}"))?;
     install_interrupt_handler(&runtime, Duration::from_secs(5));
     let context = Context::full(&runtime)
         .map_err(|e| anyhow!("routine QuickJS context creation failed: {e}"))?;
 
-    context.with(|ctx| -> Result<String> {
-        let (name, _tick) =
+    context.with(|ctx| -> Result<(String, Value)> {
+        let registration =
             capture_registered_routine(ctx.clone(), source, fallback_name, script_ref, path)?;
-        Ok(name)
+        Ok((registration.name, registration.metadata))
     })
 }
 
@@ -402,7 +406,7 @@ fn evaluate_tick_action(
         .to_string();
 
     context.with(|ctx| -> Result<Value> {
-        let (_, tick) = capture_registered_routine(
+        let registration = capture_registered_routine(
             ctx.clone(),
             &script.source,
             &fallback_name,
@@ -416,7 +420,8 @@ fn evaluate_tick_action(
         let js_context: rquickjs::Value = ctx
             .eval(format!("JSON.parse({context_literal})"))
             .map_err(|e| anyhow!("build routine tick context: {e}"))?;
-        let action_value: rquickjs::Value = tick
+        let action_value: rquickjs::Value = registration
+            .tick
             .call((js_context,))
             .map_err(|e| anyhow!("routine script {} tick(ctx) failed: {e}", script.script_ref))?;
         ensure_acyclic_js_value(ctx, action_value.clone())?;
@@ -429,13 +434,19 @@ fn install_interrupt_handler(runtime: &Runtime, timeout: Duration) {
     runtime.set_interrupt_handler(Some(Box::new(move || started.elapsed() > timeout)));
 }
 
+struct CapturedRoutineRegistration<'js> {
+    name: String,
+    tick: Function<'js>,
+    metadata: Value,
+}
+
 fn capture_registered_routine<'js>(
     ctx: rquickjs::Ctx<'js>,
     source: &str,
     fallback_name: &str,
     script_ref: &str,
     path: &Path,
-) -> Result<(String, Function<'js>)> {
+) -> Result<CapturedRoutineRegistration<'js>> {
     let globals = ctx.globals();
     let _: rquickjs::Value = ctx
         .eval(
@@ -500,7 +511,19 @@ fn capture_registered_routine<'js>(
         .into_function()
         .ok_or_else(|| anyhow!("routine script {script_ref} tick must be a function"))?;
 
-    Ok((name, tick))
+    let metadata = routine_obj
+        .get::<_, rquickjs::Value>("metadata")
+        .ok()
+        .filter(|value| !value.is_null() && !value.is_undefined())
+        .map(js_value_to_json)
+        .transpose()?
+        .unwrap_or(Value::Null);
+
+    Ok(CapturedRoutineRegistration {
+        name,
+        tick,
+        metadata,
+    })
 }
 
 fn js_value_to_json(value: rquickjs::Value<'_>) -> Result<Value> {
@@ -668,6 +691,43 @@ mod tests {
         assert_eq!(script_ref, "daily-summary.js");
         assert!(loader.has_script("daily-summary.js").unwrap());
         assert_eq!(loader.script_refs().unwrap(), vec!["daily-summary.js"]);
+    }
+
+    #[test]
+    fn captures_registered_routine_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("portable.js");
+        std::fs::write(
+            &path,
+            r#"
+            agentdesk.routines.register({
+              name: "Portable",
+              metadata: {
+                migrated_launchd: {
+                  entrypoint: "scripts/launchd-migrated/portable.sh",
+                  required_connectors: ["obsidian_skill_root"]
+                }
+              },
+              tick(ctx) {
+                return { action: "complete", result: { ok: true } };
+              }
+            });
+            "#,
+        )
+        .unwrap();
+
+        let loader = RoutineScriptLoader::new().unwrap();
+        loader.load_script(dir.path(), &path).unwrap();
+        let script = loader.get_script("portable.js").unwrap().unwrap();
+
+        assert_eq!(
+            script.metadata["migrated_launchd"]["entrypoint"],
+            "scripts/launchd-migrated/portable.sh"
+        );
+        assert_eq!(
+            script.metadata["migrated_launchd"]["required_connectors"][0],
+            "obsidian_skill_root"
+        );
     }
 
     #[test]

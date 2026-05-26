@@ -938,8 +938,14 @@ if [ -d "$OBSIDIAN_AGENTS_SRC" ]; then
     mkdir -p "$PROMPTS_STAGED"
     rsync -a "$OBSIDIAN_AGENTS_SRC/" "$PROMPTS_STAGED/"
 else
-    echo "⚠ Obsidian agent prompt source missing: $OBSIDIAN_AGENTS_SRC"
-    echo "  Skipping prompt staging — existing $ADK_REL/config/agents/ will be retained."
+    if [ -n "${AGENTDESK_OBSIDIAN_AGENTS_SRC:-}" ]; then
+        echo "⚠ Optional connector obsidian_agent_prompts invalid: $OBSIDIAN_AGENTS_SRC"
+        echo "  state=missing_path reason=missing_path; core release deploy will continue."
+    else
+        echo "ℹ Optional connector obsidian_agent_prompts skipped: $OBSIDIAN_AGENTS_SRC"
+        echo "  state=missing_config reason=missing_config; core release deploy will continue."
+    fi
+    echo "  Existing $ADK_REL/config/agents/ will be retained."
 fi
 
 # Stage managed skills before stopping release so skill sync never sees partial content.

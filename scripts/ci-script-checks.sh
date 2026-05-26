@@ -65,6 +65,16 @@ if [ "$FAIL" -ne 0 ]; then
   exit "$FAIL"
 fi
 
+echo "=== Portable deployable path lint ==="
+python3 scripts/check-portable-paths.py
+python3 -m unittest \
+  tests.test_portable_path_lint \
+  tests.test_portable_docs_examples \
+  tests.test_launchd_migrated_entrypoints \
+  tests.test_git_hook_python_resolution \
+  tests.test_portable_operator_migration \
+  tests.test_operator_init_portable
+
 echo "=== Generate inventory docs ==="
 python3 scripts/generate_inventory_docs.py
 
