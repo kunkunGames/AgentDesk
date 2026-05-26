@@ -12,7 +12,7 @@ pub(crate) async fn activate_with_deps_pg(
         );
     };
     let active_only = body.active_only.unwrap_or(false);
-    let run_id = if let Some(run_id) = body.run_id.clone() {
+    let run_id = if let Some(run_id) = body.run_id {
         run_id
     } else {
         let repo = body
