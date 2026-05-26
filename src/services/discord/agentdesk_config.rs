@@ -15,12 +15,9 @@ use crate::config::{
 use crate::services::provider::ProviderKind;
 
 fn expand_tilde(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        if path == "~" {
-            return home.display().to_string();
-        }
-        if path.starts_with("~/") {
-            return format!("{}{}", home.display(), &path[1..]);
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+            return expanded.to_string_lossy().into_owned();
         }
     }
     path.to_string()
