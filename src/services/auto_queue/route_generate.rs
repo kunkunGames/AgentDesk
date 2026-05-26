@@ -410,7 +410,7 @@ pub async fn generate(
     }
 
     let plan = build_group_plan(&filtered_cards);
-    let mut grouped_entries = plan.entries.clone();
+    let mut grouped_entries = plan.entries;
     let mut thread_group_count = plan.thread_group_count.max(1);
     let mut recommended_parallel_threads = plan.recommended_parallel_threads.max(1);
     let dependency_edges = plan.dependency_edges;
