@@ -1400,7 +1400,7 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
             CheckGroup::ProviderRuntime,
             "Provider Bindings",
             detail.clone(),
-            "agent/provider/channel binding과 Discord bot auth hint를 분리해 확인하세요.",
+            "Check agent/provider/channel binding and Discord bot auth hints separately.",
         )
         .with_subsystem("provider_binding")
         .with_expected_actual("provider/agent/channel bindings consistent", detail)
@@ -2327,7 +2327,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                 CheckGroup::Core,
                 "Discord Bot",
                 format!("overall={overall}, connected={total}/{total}; {detail}"),
-                "모든 provider가 connected 상태이므로 token/offline 안내 대신 degraded reason을 확인하세요.",
+                "All providers are connected; check degraded reasons instead of token/offline guidance.",
             )
             .with_subsystem("provider_runtime")
             .with_severity(highest_reason_severity(&provider_reasons))
@@ -2351,7 +2351,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                 CheckGroup::Core,
                 "Discord Bot",
                 format!("no providers registered in unified health payload — {base}"),
-                "dcserver가 아직 provider를 등록하지 못했을 수 있습니다. startup 로그와 bot token 구성을 확인하세요.",
+                "dcserver may not have registered providers yet. Check startup logs and bot token configuration.",
             )
             .with_path(health_endpoint(base))
             .with_expected_actual("provider registry populated", "providers=0")
@@ -2374,7 +2374,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                     disconnected.join(", ")
                 }
             ),
-            "오프라인 provider의 Discord token, gateway 연결 상태, dcserver stdout 로그를 확인하세요.",
+            "Check Discord tokens, gateway connection status, and dcserver stdout logs for offline providers.",
         )
         .with_subsystem("provider_runtime")
         .with_security_exposure(SecurityExposure::OperationalMetadata)
@@ -2406,7 +2406,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
             CheckGroup::Core,
             "Discord Bot",
             format!("standalone health only — provider status unavailable at {base}"),
-            "현재 서버는 응답하지만 Discord provider health registry는 비어 있습니다. standalone 실행 중인지 확인하세요.",
+            "The server responds, but the Discord provider health registry is empty. Check if running in standalone mode.",
         )
         .with_path(health_endpoint(base))
         .with_expected_actual("unified provider registry available", "standalone health payload only")
@@ -2420,7 +2420,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
             CheckGroup::Core,
             "Discord Bot",
             format!("server unhealthy or provider data missing: ok={ok} db={db}"),
-            "서버가 떠 있더라도 Discord provider 초기화가 실패했을 수 있습니다. dcserver stdout 로그를 확인하세요.",
+            "Discord provider initialization may have failed even if the server is running. Check dcserver stdout logs.",
         )
         .with_path(health_endpoint(base))
         .with_expected_actual("healthy server with provider registry", format!("ok={ok} db={db}"))
@@ -2644,7 +2644,7 @@ fn check_provider_cli(
             CheckGroup::ProviderRuntime,
             name,
             "unsupported provider",
-            "지원되지 않는 provider입니다.",
+            "Unsupported provider.",
         )
         .with_expected_actual("supported provider", "unsupported provider"),
     }
@@ -4439,7 +4439,7 @@ mod tests {
                 .guidance
                 .as_deref()
                 .unwrap_or_default()
-                .contains("오프라인 provider의 Discord token")
+                .contains("Check Discord tokens")
         );
     }
 
