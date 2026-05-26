@@ -48,7 +48,7 @@
 | `cli` | `src/cli/mod.rs` | 21 |  |
 | `cli::args` | `src/cli/args.rs` | 1163 | giant-file |
 | `cli::client` | `src/cli/client.rs` | 3174 | giant-file |
-| `cli::dcserver` | `src/cli/dcserver.rs` | 1578 | giant-file |
+| `cli::dcserver` | `src/cli/dcserver.rs` | 1579 | giant-file |
 | `cli::direct` | `src/cli/direct.rs` | 1635 | giant-file |
 | `cli::discord` | `src/cli/discord.rs` | 123 |  |
 | `cli::doctor` | `src/cli/doctor.rs` | 9 |  |

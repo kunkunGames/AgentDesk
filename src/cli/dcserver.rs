@@ -862,7 +862,7 @@ pub fn handle_restart_dcserver(
     // They will be reconnected by restore_tmux_watchers() after the new dcserver starts.
     // Orphan sessions (channels renamed/deleted) are cleaned up inside the bot event loop.
 
-    // Launch new dcserver inside tmux session "AgentDesk-dcserver"
+    // Launch new dcserver inside the tmux fallback session recognized by startup doctor.
     // Write a launcher script to avoid token exposure in ps aux
     let Some(runtime_root) = agentdesk_runtime_root() else {
         eprintln!("Error: Cannot determine runtime root");
@@ -944,12 +944,13 @@ pub fn handle_restart_dcserver(
         }
     }
 
-    let tmux_session = "AgentDesk-dcserver";
+    let tmux_session = current_dcserver_tmux_fallback_session();
+    let tmux_session = tmux_session.as_str();
 
     // Kill existing tmux session if it exists
     crate::services::platform::tmux::kill_session(
         tmux_session,
-        "dcserver tmux launcher restart: replace existing AgentDesk-dcserver session",
+        "dcserver tmux launcher restart: replace existing doctor-recognized fallback session",
     );
     std::thread::sleep(std::time::Duration::from_millis(500));
 
