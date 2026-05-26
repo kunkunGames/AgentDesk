@@ -148,7 +148,7 @@
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1525 lines).
   - `src/services/discord/formatting.rs` (3247 lines).
   - `src/services/discord/settings.rs` (2445 lines).
-  - `src/services/discord/prompt_builder.rs` (2114 lines).
+  - `src/services/discord/prompt_builder/` (directory, refactored).
   - `src/services/discord/runtime_bootstrap.rs` (3235 lines after #2558
     thread-session GC loopback shim cleanup).
   - `src/services/discord/session_runtime.rs` (1887 lines).
@@ -333,8 +333,7 @@
     persistence helpers).
   - `src/db/session_transcripts.rs` (877 lines, retained PG-cleanup surface).
   - `src/db/agents.rs` (1125 lines).
-  - `src/db/prompt_manifests.rs` (1219 lines, post-#1699 retention policy +
-    write-time byte cap pushed it past the giant-file threshold).
+  - `src/db/prompt_manifests/` (directory, refactored).
   - `src/db/intake_outbox.rs` (~1240 lines after intake-node-routing Phase 2;
     schema migration tests + claim/transition/sweep helpers + their
     PG-backed integration coverage. Phase 5 transition-12 helper +
