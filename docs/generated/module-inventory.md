@@ -194,7 +194,7 @@
 | `runtime_layout` | `src/runtime_layout/mod.rs` | 1655 | giant-file |
 | `runtime_layout::config_merge` | `src/runtime_layout/config_merge.rs` | 601 |  |
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 |  |
-| `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 161 |  |
+| `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 173 |  |
 | `runtime_layout::skill_sync` | `src/runtime_layout/skill_sync.rs` | 806 |  |
 | `server` | `src/server/mod.rs` | 4075 | giant-file |
 | `server::cluster` | `src/server/cluster.rs` | 1248 | giant-file |
@@ -369,7 +369,7 @@
 | `services::discord` | `src/services/discord/mod.rs` | 6876 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 938 |  |
 | `services::discord::agent_handoff` | `src/services/discord/agent_handoff.rs` | 413 |  |
-| `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1382 | giant-file |
+| `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1379 | giant-file |
 | `services::discord::commands` | `src/services/discord/commands/mod.rs` | 108 |  |
 | `services::discord::commands::command_policy` | `src/services/discord/commands/command_policy.rs` | 553 |  |
 | `services::discord::commands::config` | `src/services/discord/commands/config.rs` | 1900 | giant-file |
@@ -423,7 +423,7 @@
 | `services::discord::model_catalog` | `src/services/discord/model_catalog.rs` | 1273 | giant-file |
 | `services::discord::model_picker_interaction` | `src/services/discord/model_picker_interaction.rs` | 424 |  |
 | `services::discord::monitoring_status` | `src/services/discord/monitoring_status.rs` | 557 |  |
-| `services::discord::org_schema` | `src/services/discord/org_schema.rs` | 938 |  |
+| `services::discord::org_schema` | `src/services/discord/org_schema.rs` | 935 |  |
 | `services::discord::org_writer` | `src/services/discord/org_writer.rs` | 239 |  |
 | `services::discord::outbound` | `src/services/discord/outbound/mod.rs` | 37 |  |
 | `services::discord::outbound::decision` | `src/services/discord/outbound/decision.rs` | 488 |  |
