@@ -359,12 +359,12 @@
 | `services::cluster::session_registry` | `src/services/cluster/session_registry.rs` | 572 |  |
 | `services::cluster::stream_relay` | `src/services/cluster/stream_relay.rs` | 1153 | giant-file |
 | `services::cluster::watcher_supervisor` | `src/services/cluster/watcher_supervisor.rs` | 844 |  |
-| `services::codex` | `src/services/codex.rs` | 3887 | giant-file |
+| `services::codex` | `src/services/codex.rs` | 3768 | giant-file |
 | `services::codex_remote_policy` | `src/services/codex_remote_policy.rs` | 49 |  |
 | `services::codex_tmux_wrapper` | `src/services/codex_tmux_wrapper.rs` | 812 |  |
 | `services::codex_tui` | `src/services/codex_tui/mod.rs` | 3 |  |
 | `services::codex_tui::input` | `src/services/codex_tui/input.rs` | 2355 | giant-file |
-| `services::codex_tui::rollout_tail` | `src/services/codex_tui/rollout_tail.rs` | 4002 | giant-file |
+| `services::codex_tui::rollout_tail` | `src/services/codex_tui/rollout_tail.rs` | 3830 | giant-file |
 | `services::codex_tui::session` | `src/services/codex_tui/session.rs` | 496 |  |
 | `services::discord` | `src/services/discord/mod.rs` | 6876 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 938 |  |
@@ -472,7 +472,7 @@
 | `services::discord::runtime_bootstrap` | `src/services/discord/runtime_bootstrap.rs` | 3434 | giant-file |
 | `services::discord::runtime_store` | `src/services/discord/runtime_store.rs` | 375 |  |
 | `services::discord::session_identity` | `src/services/discord/session_identity.rs` | 185 |  |
-| `services::discord::session_relay_sink` | `src/services/discord/session_relay_sink.rs` | 837 |  |
+| `services::discord::session_relay_sink` | `src/services/discord/session_relay_sink.rs` | 834 |  |
 | `services::discord::session_runtime` | `src/services/discord/session_runtime.rs` | 1841 | giant-file |
 | `services::discord::settings` | `src/services/discord/settings.rs` | 2479 | giant-file |
 | `services::discord::settings::content` | `src/services/discord/settings/content.rs` | 594 |  |
