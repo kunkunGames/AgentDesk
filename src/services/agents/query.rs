@@ -18,6 +18,8 @@ pub struct AgentDiagSession {
     pub active_children: i32,
     pub thread_channel_id: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    pub cwd: Option<String>,
+    pub provider_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -89,7 +91,9 @@ pub async fn find_diag_session_pg(
                 s.last_tool_at,
                 COALESCE(s.active_children, 0) AS active_children,
                 s.thread_channel_id::TEXT AS thread_channel_id,
-                s.created_at
+                s.created_at,
+                s.cwd,
+                COALESCE(s.raw_provider_session_id, s.claude_session_id) AS provider_session_id
            FROM sessions s
            LEFT JOIN agents a ON a.id = s.agent_id
           WHERE s.agent_id = $1
@@ -132,6 +136,8 @@ pub async fn find_diag_session_pg(
             active_children: row.try_get("active_children").unwrap_or(0),
             thread_channel_id: row.try_get("thread_channel_id").ok().flatten(),
             created_at: row.try_get("created_at").ok().flatten(),
+            cwd: row.try_get("cwd").ok().flatten(),
+            provider_session_id: row.try_get("provider_session_id").ok().flatten(),
         })
     })
     .transpose()

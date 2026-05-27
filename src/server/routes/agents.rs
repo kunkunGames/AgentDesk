@@ -6,6 +6,7 @@ use axum::{
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::Path as FsPath;
 
 use super::AppState;
 use crate::server::dto::agents::{
@@ -209,8 +210,12 @@ pub async fn agent_diag(
         .map(|last| now.signed_duration_since(last).num_seconds().max(0));
 
     let tmux_name = extract_tmux_name(&session.session_key);
-    let tui_prompt_readiness =
-        tui_prompt_readiness_json(session.provider.as_deref(), tmux_name.as_deref());
+    let tui_prompt_readiness = tui_prompt_readiness_json(
+        session.provider.as_deref(),
+        tmux_name.as_deref(),
+        session.cwd.as_deref(),
+        session.provider_session_id.as_deref(),
+    );
     let inflight = load_inflight_snapshot(session.provider.as_deref(), tmux_name.as_deref());
     let recent_output = tmux_name
         .as_deref()
@@ -326,7 +331,12 @@ pub async fn agent_diag(
 }
 
 #[cfg(unix)]
-fn tui_prompt_readiness_json(provider: Option<&str>, tmux_name: Option<&str>) -> Option<Value> {
+fn tui_prompt_readiness_json(
+    provider: Option<&str>,
+    tmux_name: Option<&str>,
+    cwd: Option<&str>,
+    provider_session_id: Option<&str>,
+) -> Option<Value> {
     let tmux_name = tmux_name.map(str::trim).filter(|value| !value.is_empty())?;
     match provider
         .map(str::trim)
@@ -336,15 +346,21 @@ fn tui_prompt_readiness_json(provider: Option<&str>, tmux_name: Option<&str>) ->
     {
         "claude" => {
             let snapshot = crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_name);
+            let pane_ready = snapshot.tmux_pane_alive
+                && snapshot.prompt_marker_detected
+                && !snapshot.prompt_draft_detected;
+            let transcript_state = claude_transcript_turn_state_for_diag(cwd, provider_session_id);
+            let transcript_ready = snapshot.tmux_pane_alive
+                && !snapshot.prompt_draft_detected
+                && transcript_state == Some(crate::services::tui_turn_state::TuiTurnState::Idle);
             Some(json!({
                 "kind": "claude-tui",
-                "ready_for_input": snapshot.tmux_pane_alive
-                    && snapshot.prompt_marker_detected
-                    && !snapshot.prompt_draft_detected,
+                "ready_for_input": pane_ready || transcript_ready,
                 "prompt_marker_detected": snapshot.prompt_marker_detected,
                 "prompt_draft_detected": snapshot.prompt_draft_detected,
                 "tmux_pane_alive": snapshot.tmux_pane_alive,
                 "capture_available": snapshot.capture_available,
+                "transcript_turn_state": transcript_state.map(|state| state.as_str()),
                 "pane_tail": snapshot.pane_tail,
             }))
         }
@@ -367,8 +383,31 @@ fn tui_prompt_readiness_json(provider: Option<&str>, tmux_name: Option<&str>) ->
 }
 
 #[cfg(not(unix))]
-fn tui_prompt_readiness_json(_provider: Option<&str>, _tmux_name: Option<&str>) -> Option<Value> {
+fn tui_prompt_readiness_json(
+    _provider: Option<&str>,
+    _tmux_name: Option<&str>,
+    _cwd: Option<&str>,
+    _provider_session_id: Option<&str>,
+) -> Option<Value> {
     None
+}
+
+#[cfg(unix)]
+fn claude_transcript_turn_state_for_diag(
+    cwd: Option<&str>,
+    provider_session_id: Option<&str>,
+) -> Option<crate::services::tui_turn_state::TuiTurnState> {
+    let cwd = cwd.map(str::trim).filter(|value| !value.is_empty())?;
+    let provider_session_id = provider_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+        FsPath::new(cwd),
+        provider_session_id,
+        None,
+    )
+    .ok()?;
+    Some(crate::services::claude_tui::transcript_tail::observe_transcript_turn_state(&path))
 }
 
 /// GET /api/agents/:id/offices
