@@ -885,15 +885,7 @@ fn expand_gemini_working_dir(raw: &str) -> PathBuf {
     if raw.is_empty() {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     }
-    if raw == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw));
-    }
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        return dirs::home_dir()
-            .map(|home| home.join(stripped))
-            .unwrap_or_else(|| PathBuf::from(raw));
-    }
-    PathBuf::from(raw)
+    crate::runtime_layout::expand_user_path(raw).unwrap_or_else(|| PathBuf::from(raw))
 }
 
 fn gemini_trust_rules() -> Vec<GeminiTrustRule> {
@@ -1409,6 +1401,38 @@ fn render_gemini_value(value: &Value) -> String {
         Value::Null => String::new(),
         Value::String(text) => text.to_string(),
         _ => value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod path_expansion_tests {
+    use super::expand_gemini_working_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn expand_gemini_working_dir_keeps_existing_trimmed_relative_behavior() {
+        assert_eq!(
+            expand_gemini_working_dir("  relative/project  "),
+            PathBuf::from("relative/project")
+        );
+    }
+
+    #[test]
+    fn expand_gemini_working_dir_reuses_runtime_tilde_expansion() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        assert_eq!(
+            expand_gemini_working_dir("~/agentdesk"),
+            home.join("agentdesk")
+        );
+
+        #[cfg(windows)]
+        assert_eq!(
+            expand_gemini_working_dir(r"~\agentdesk"),
+            home.join("agentdesk")
+        );
     }
 }
 
