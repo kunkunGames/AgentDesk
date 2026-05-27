@@ -354,7 +354,8 @@ pub async fn resume_routine(
         )));
     }
     let metadata = migrated_launchd_metadata_for_state(&state, &routine.script_ref)?;
-    validate_migrated_launchd_activation(&routine, metadata.as_ref())?;
+    let routine_script_dirs = state.config.routines.script_dirs();
+    validate_migrated_launchd_activation(&routine, metadata.as_ref(), &routine_script_dirs)?;
     let changed = store
         .resume_routine(&routine_id, body.next_due_at_update())
         .await
@@ -431,7 +432,7 @@ pub async fn run_routine_now(
     } else {
         None
     };
-    validate_migrated_launchd_activation(&routine, metadata.as_ref())?;
+    validate_migrated_launchd_activation(&routine, metadata.as_ref(), &routine_script_dirs)?;
 
     let Some(claimed) = store
         .claim_run_now(&routine_id)

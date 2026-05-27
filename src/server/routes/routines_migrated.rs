@@ -12,11 +12,12 @@ pub(super) fn is_migrated_launchd_script_ref(script_ref: &str) -> bool {
 pub(super) fn validate_migrated_launchd_activation(
     routine: &crate::services::routines::store::RoutineRecord,
     metadata: Option<&Value>,
+    routine_dirs: &[std::path::PathBuf],
 ) -> AppResult<()> {
     if !is_migrated_launchd_script_ref(&routine.script_ref) {
         return Ok(());
     }
-    validate_migrated_launchd_entrypoint(&routine.script_ref, metadata)?;
+    validate_migrated_launchd_entrypoint(&routine.script_ref, metadata, routine_dirs)?;
     validate_migrated_launchd_required_paths(
         &routine.script_ref,
         metadata,
@@ -32,19 +33,20 @@ pub(super) fn validate_migrated_launchd_activation(
 fn validate_migrated_launchd_entrypoint(
     script_ref: &str,
     metadata: Option<&Value>,
+    routine_dirs: &[std::path::PathBuf],
 ) -> AppResult<()> {
     let relative = migrated_launchd_entrypoint_relative_path(script_ref, metadata)?;
     let mut candidates = Vec::new();
     if let Some(root) = crate::config::runtime_root() {
-        candidates.push(root.join(&relative));
+        push_entrypoint_candidate(&mut candidates, root.join(&relative));
     }
     if let Ok(cwd) = std::env::current_dir() {
-        let cwd_candidate = cwd.join(&relative);
-        if !candidates
-            .iter()
-            .any(|candidate| candidate == &cwd_candidate)
-        {
-            candidates.push(cwd_candidate);
+        push_entrypoint_candidate(&mut candidates, cwd.join(&relative));
+    }
+    for dir in routine_dirs {
+        push_entrypoint_candidate(&mut candidates, dir.join(&relative));
+        if let Some(parent) = dir.parent() {
+            push_entrypoint_candidate(&mut candidates, parent.join(&relative));
         }
     }
     if candidates.iter().any(|candidate| candidate.is_file()) {
@@ -58,6 +60,15 @@ fn validate_migrated_launchd_entrypoint(
     Err(AppError::conflict(format!(
         "migrated routine {script_ref} is invalid: shell entrypoint not found ({checked})"
     )))
+}
+
+fn push_entrypoint_candidate(
+    candidates: &mut Vec<std::path::PathBuf>,
+    candidate: std::path::PathBuf,
+) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
 }
 
 fn migrated_launchd_entrypoint_relative_path(
@@ -515,7 +526,7 @@ mod tests {
 
     #[test]
     fn migrated_launchd_entrypoint_validation_uses_repo_relative_fallback() {
-        validate_migrated_launchd_entrypoint("migrated-launchd/memory-merge.js", None)
+        validate_migrated_launchd_entrypoint("migrated-launchd/memory-merge.js", None, &[])
             .expect("repo checkout includes migrated shell entrypoint");
     }
 
@@ -530,8 +541,35 @@ mod tests {
         validate_migrated_launchd_entrypoint(
             "migrated-launchd/queue-stability-batch.js",
             Some(&metadata),
+            &[],
         )
         .expect("queue stability routine uses a repo-local non-launchd-migrated entrypoint");
+    }
+
+    #[test]
+    fn migrated_launchd_entrypoint_validation_uses_configured_routine_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let routine_dir = temp.path().join("routines");
+        let entrypoint_dir = temp.path().join("scripts").join("launchd-migrated");
+        std::fs::create_dir_all(&routine_dir).unwrap();
+        std::fs::create_dir_all(&entrypoint_dir).unwrap();
+        std::fs::write(
+            entrypoint_dir.join("operator-only-test-entrypoint.sh"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let metadata = json!({
+            "migrated_launchd": {
+                "entrypoint": "scripts/launchd-migrated/operator-only-test-entrypoint.sh"
+            }
+        });
+
+        validate_migrated_launchd_entrypoint(
+            "migrated-launchd/operator-only-test-entrypoint.js",
+            Some(&metadata),
+            &[routine_dir],
+        )
+        .expect("entrypoint beside configured routine directory should be accepted");
     }
 
     #[test]

@@ -17,6 +17,8 @@ fresh_home="$smoke_base/home"
 fresh_root="$smoke_base/release"
 mkdir -p "$fresh_home" "$fresh_root/bin" "$fresh_home/Library/LaunchAgents"
 
+runner_home_was_set="${HOME+x}"
+runner_home="${HOME:-}"
 export HOME="$fresh_home"
 export AGENTDESK_ROOT_DIR="$fresh_root"
 export AGENTDESK_CONFIG="$fresh_root/config/agentdesk.yaml"
@@ -27,6 +29,12 @@ python3 scripts/operator-init-portable.py \
 
 test -f "$AGENTDESK_CONFIG"
 test -d "$fresh_root/workspaces"
+
+if [[ -n "$runner_home_was_set" ]]; then
+  export HOME="$runner_home"
+else
+  unset HOME
+fi
 
 cargo run --quiet -- emit-launchd-plist \
   --flavor release \

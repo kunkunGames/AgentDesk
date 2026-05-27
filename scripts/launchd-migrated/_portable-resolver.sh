@@ -24,9 +24,10 @@ agentdesk_source_portable_resolver() {
   export AGENTDESK_AGENT_FEEDBACK_INBOX="${AGENTDESK_AGENT_FEEDBACK_INBOX:-$OBSIDIAN_REMOTE_VAULT_ROOT/agents/ch-pmd/inbox}"
 
   local bin_dir="${AGENTDESK_OPERATOR_BIN_DIR:-$HOME/bin}"
-  case ":$PATH:" in
+  local current_path="${PATH:-}"
+  case ":$current_path:" in
     *":$bin_dir:"*) ;;
-    *) export PATH="$bin_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH" ;;
+    *) export PATH="$bin_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${current_path:+:$current_path}" ;;
   esac
 
   export LANG="${LANG:-ko_KR.UTF-8}"
