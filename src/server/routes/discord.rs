@@ -5,7 +5,7 @@ use axum::{
 };
 use poise::serenity_prelude::ChannelId;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::AppState;
 use crate::db::agents::load_all_agent_channel_bindings_pg;
@@ -114,34 +114,67 @@ async fn ensure_channel_is_role_mapped(
         }
     };
 
-    let url = format!("https://discord.com/api/v10/channels/{}", channel_id.get());
-    let channel_name = match reqwest::Client::new()
-        .get(&url)
-        .header("Authorization", format!("Bot {token}"))
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            }),
-        _ => None,
-    };
+    let client = reqwest::Client::new();
+    let channel_info = fetch_discord_channel_info(&client, &token, channel_id).await;
+    let channel_name = channel_info.as_ref().and_then(discord_channel_name);
 
     if resolve_role_binding(channel_id, channel_name.as_deref()).is_some() {
         return Ok(());
     }
 
+    if let Some(parent_id) = channel_info.as_ref().and_then(thread_parent_id) {
+        let parent_info = fetch_discord_channel_info(&client, &token, parent_id).await;
+        let parent_name = parent_info.as_ref().and_then(discord_channel_name);
+        if resolve_role_binding(parent_id, parent_name.as_deref()).is_some() {
+            return Ok(());
+        }
+    };
+
     Err((
         StatusCode::FORBIDDEN,
         Json(json!({"error": "channel not in role-map"})),
     ))
+}
+
+async fn fetch_discord_channel_info(
+    client: &reqwest::Client,
+    token: &str,
+    channel_id: ChannelId,
+) -> Option<Value> {
+    let url = format!("https://discord.com/api/v10/channels/{}", channel_id.get());
+    client
+        .get(&url)
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .await
+        .ok()
+        .filter(|resp| resp.status().is_success())?
+        .json::<Value>()
+        .await
+        .ok()
+}
+
+fn discord_channel_name(payload: &Value) -> Option<String> {
+    payload
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn thread_parent_id(payload: &Value) -> Option<ChannelId> {
+    let is_thread = matches!(
+        payload.get("type").and_then(|value| value.as_u64()),
+        Some(10 | 11 | 12)
+    );
+    if !is_thread {
+        return None;
+    }
+
+    payload
+        .get("parent_id")
+        .and_then(|value| value.as_str())
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(ChannelId::new)
 }
 
 /// GET /api/discord/channels/:id/messages
@@ -350,5 +383,28 @@ mod tests {
         assert!(parse_channel_id("not-a-number").is_err());
         assert!(parse_channel_id("-1").is_err());
         assert!(parse_channel_id("").is_err());
+    }
+
+    #[test]
+    fn thread_parent_id_extracts_discord_thread_parent() {
+        let payload = json!({
+            "id": "222",
+            "parent_id": "111",
+            "type": 11,
+            "name": "thread"
+        });
+
+        assert_eq!(thread_parent_id(&payload).map(|id| id.get()), Some(111));
+    }
+
+    #[test]
+    fn thread_parent_id_ignores_regular_channels() {
+        let payload = json!({
+            "id": "111",
+            "type": 0,
+            "name": "parent"
+        });
+
+        assert_eq!(thread_parent_id(&payload), None);
     }
 }
