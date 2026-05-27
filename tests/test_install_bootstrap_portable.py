@@ -175,7 +175,8 @@ class InstallBootstrapPortableTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            config = runtime_root / "config" / "agentdesk.yaml"
+            normalized_runtime_root = runtime_root.resolve()
+            config = normalized_runtime_root / "config" / "agentdesk.yaml"
             legacy_config = runtime_root / "agentdesk.yaml"
             default_plist = home / "Library" / "LaunchAgents" / "com.agentdesk.release.plist"
             sandbox_plists = sorted((home / "Library" / "LaunchAgents").glob("com.agentdesk.release.sandbox-release.*.plist"))
@@ -191,7 +192,7 @@ class InstallBootstrapPortableTests(unittest.TestCase):
             rendered = config.read_text(encoding="utf-8") + plist.read_text(encoding="utf-8")
             config_text = config.read_text(encoding="utf-8")
             self.assertIn(str(home), rendered)
-            self.assertIn(str(runtime_root), rendered)
+            self.assertIn(str(normalized_runtime_root), rendered)
             self.assertNotIn("<string>com.agentdesk.release</string>", rendered)
             self.assertIn("<string>com.agentdesk.release.sandbox-release.", rendered)
             self.assertIn("<key>AGENTDESK_DCSERVER_LABEL</key>", rendered)
