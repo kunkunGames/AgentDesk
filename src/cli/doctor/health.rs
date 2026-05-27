@@ -93,6 +93,31 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("pipeline override warnings count is {count}"),
             next_step: "run config audit and inspect override report".to_string(),
         },
+        [
+            "global_active_counter_out_of_bounds",
+            raw_val,
+            prov_val,
+            fin_val,
+        ] => {
+            let raw_clean = raw_val.strip_prefix("raw=").unwrap_or(raw_val);
+            let prov_clean = prov_val
+                .strip_prefix("provider_active_turns=")
+                .unwrap_or(prov_val);
+            let fin_clean = fin_val
+                .strip_prefix("global_finalizing=")
+                .unwrap_or(fin_val);
+            ClassifiedReason {
+                raw: raw.to_string(),
+                subsystem: "health",
+                severity: Severity::Warning,
+                fix_safety: FixSafety::ReadOnly,
+                security_exposure: SecurityExposure::OperationalMetadata,
+                summary: format!(
+                    "global active counter out of bounds (raw: {raw_clean}, provider: {prov_clean}, finalizing: {fin_clean})"
+                ),
+                next_step: "inspect global active counter tracking in dcserver logs".to_string(),
+            }
+        }
         ["no_providers_registered"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "provider_registry",
@@ -198,6 +223,23 @@ mod health_classification_tests {
         assert_eq!(warned.subsystem, "startup_doctor");
         assert_eq!(warned.summary, "startup doctor reported 3 warning(s)");
         assert_eq!(warned.next_step.as_str(), expected_next_step.as_str());
+    }
+
+    #[test]
+    fn global_active_counter_reason_is_actionable() {
+        let reason = classify_degraded_reason(
+            "global_active_counter_out_of_bounds:raw=4:provider_active_turns=2:global_finalizing=1",
+        );
+
+        assert_eq!(reason.subsystem, "health");
+        assert_eq!(
+            reason.summary,
+            "global active counter out of bounds (raw: 4, provider: 2, finalizing: 1)"
+        );
+        assert_eq!(
+            reason.next_step,
+            "inspect global active counter tracking in dcserver logs"
+        );
     }
 }
 
