@@ -21,6 +21,16 @@ ARCHITECTURE_TOP_LEVEL_MAP_END = "<!-- END GENERATED: TOP LEVEL MODULE MAP -->"
 GIANT_FILE_THRESHOLD = 1000
 HTTP_METHODS = ("delete", "get", "head", "options", "patch", "post", "put")
 TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs"}
+MAIN_RS = SRC_ROOT / "main.rs"
+MOUNTED_ROUTE_FILES = (
+    (REPO_ROOT / "src" / "server" / "routes" / "v1.rs", "/api", None),
+    (REPO_ROOT / "src" / "services" / "claude_tui" / "tui_relay.rs", "", None),
+    (
+        REPO_ROOT / "src" / "services" / "claude_tui" / "hook_server.rs",
+        "",
+        frozenset({"/hooks/{provider}/{event}"}),
+    ),
+)
 
 TOP_LEVEL_MODULE_PURPOSES = {
     "bootstrap.rs": "Builds config, database, policy engine, and shared app state before launch.",
@@ -110,9 +120,33 @@ def is_test_file(path: Path) -> bool:
     return path.name.endswith("_tests.rs") or path.name in TEST_FILE_NAMES
 
 
+def cfg_gated_top_level_modules() -> set[str]:
+    text = read_text(MAIN_RS)
+    gated: set[str] = set()
+    pattern = re.compile(
+        r"#\[cfg\([^\]]*test[^\]]*\)\]\s*(?:pub(?:\([^)]*\))?\s+)?(?:pub\(crate\)\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(text):
+        gated.add(match.group(1))
+    return gated
+
+
+def is_cfg_gated_top_level_module(path: Path, gated_modules: set[str]) -> bool:
+    rel = path.relative_to(SRC_ROOT)
+    top_level = rel.parts[0]
+    module_name = top_level[:-3] if top_level.endswith(".rs") else top_level
+    return module_name in gated_modules
+
+
 def production_rust_files() -> list[Path]:
+    gated_modules = cfg_gated_top_level_modules()
     return sorted(
-        path for path in SRC_ROOT.rglob("*.rs") if path.is_file() and not is_test_file(path)
+        path
+        for path in SRC_ROOT.rglob("*.rs")
+        if path.is_file()
+        and not is_test_file(path)
+        and not is_cfg_gated_top_level_module(path, gated_modules)
     )
 
 
@@ -150,6 +184,10 @@ def format_path_with_line(path: Path, line: int) -> str:
 
 def strip_wrapping_whitespace(text: str) -> str:
     return " ".join(text.strip().split())
+
+
+def markdown_cell(text: str) -> str:
+    return strip_wrapping_whitespace(re.sub(r"\\\s+", " ", text)).replace("|", r"\|")
 
 
 def split_raw_string_start(text: str, index: int) -> tuple[int, int] | None:
@@ -406,6 +444,7 @@ def resolve_function_source(
     handler_expr: str,
     by_file: dict[Path, dict[str, int]],
     by_name: dict[str, list[tuple[Path, int]]],
+    current_file: Path | None = None,
 ) -> tuple[Path, int] | None:
     handler_expr = handler_expr.strip()
     if "|" in handler_expr:
@@ -417,6 +456,8 @@ def resolve_function_source(
 
     fn_name = parts[-1]
     module_parts = parts[:-1]
+    if current_file is not None and not module_parts and fn_name in by_file.get(current_file, {}):
+        return current_file, by_file[current_file][fn_name]
     candidates: list[Path] = []
     candidate_dirs: list[Path] = []
 
@@ -511,6 +552,7 @@ def parse_route_file(
     path_prefix: str,
     by_file: dict[Path, dict[str, int]],
     by_name: dict[str, list[tuple[Path, int]]],
+    allowed_paths: frozenset[str] | None = None,
 ) -> list[RouteEntry]:
     text = read_text(path)
     entries: list[RouteEntry] = []
@@ -525,16 +567,19 @@ def parse_route_file(
         if not path_expr.startswith('"') or not path_expr.endswith('"'):
             raise ParseError(f"unsupported non-literal path {path_expr!r} in {path}")
         route_path = path_expr[1:-1]
+        full_route_path = f"{path_prefix}{route_path}"
+        if allowed_paths is not None and full_route_path not in allowed_paths:
+            continue
         decl_line = offset_to_line(text, match.start())
         for method, handler in parse_method_chain(methods_expr):
-            resolved = resolve_function_source(handler, by_file, by_name)
+            resolved = resolve_function_source(handler, by_file, by_name, path)
             if resolved is None:
                 raise ParseError(f"could not resolve handler source for {handler!r}")
             handler_path, handler_line = resolved
             entries.append(
                 RouteEntry(
                     method=method,
-                    path=f"{path_prefix}{route_path}",
+                    path=full_route_path,
                     handler=f"`{handler}`",
                     handler_source=format_path_with_line(handler_path, handler_line),
                     route_decl=format_path_with_line(path, decl_line),
@@ -664,7 +709,7 @@ def collect_workers() -> list[WorkerEntry]:
                 kind=kind,
                 target=f"`{target}`",
                 source=format_path_with_line(registry_path, line),
-                notes=(
+                notes=markdown_cell(
                     f"stage={stage}; order={start_order}; restart={restart}; shutdown={shutdown}; "
                     f"owner={owner}; health={health_owner}; responsibility={responsibility}; {notes}"
                 ),
@@ -818,6 +863,13 @@ def render_route_inventory(entries: list[RouteEntry]) -> str:
     return "\n".join(lines)
 
 
+def unique_route_entries(entries: list[RouteEntry]) -> list[RouteEntry]:
+    by_identity: dict[tuple[str, str, str], RouteEntry] = {}
+    for entry in entries:
+        by_identity[(entry.method, entry.path, entry.handler)] = entry
+    return list(by_identity.values())
+
+
 def render_worker_inventory(entries: list[WorkerEntry]) -> str:
     lines = [
         "# Bootstrap Worker Inventory",
@@ -839,11 +891,7 @@ def render_worker_inventory(entries: list[WorkerEntry]) -> str:
 
 
 def generated_documents() -> dict[Path, str]:
-    function_paths = sorted(
-        path
-        for path in (REPO_ROOT / "src" / "server").rglob("*.rs")
-        if path.is_file() and not is_test_file(path)
-    )
+    function_paths = production_rust_files()
     route_paths = sorted(
         path
         for path in (REPO_ROOT / "src" / "server" / "routes" / "domains").rglob("*.rs")
@@ -858,6 +906,11 @@ def generated_documents() -> dict[Path, str]:
     route_entries.extend(
         parse_route_file(REPO_ROOT / "src" / "server" / "mod.rs", "", by_file, by_name)
     )
+    for route_path, path_prefix, allowed_paths in MOUNTED_ROUTE_FILES:
+        route_entries.extend(
+            parse_route_file(route_path, path_prefix, by_file, by_name, allowed_paths)
+        )
+    route_entries = unique_route_entries(route_entries)
     route_entries.sort(key=lambda entry: (entry.path, entry.method, entry.handler))
     worker_entries = collect_workers()
     return {
