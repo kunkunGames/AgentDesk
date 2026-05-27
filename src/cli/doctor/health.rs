@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use super::contract::{FixSafety, SecurityExposure, Severity};
+use super::startup::LATEST_STARTUP_DOCTOR_ENDPOINT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClassifiedReason {
@@ -11,6 +12,10 @@ pub(crate) struct ClassifiedReason {
     pub(crate) security_exposure: SecurityExposure,
     pub(crate) summary: String,
     pub(crate) next_step: String,
+}
+
+fn startup_doctor_report_next_step() -> String {
+    format!("inspect the startup doctor report via {LATEST_STARTUP_DOCTOR_ENDPOINT}")
 }
 
 pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
@@ -104,7 +109,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!("startup doctor reported {count} failure(s)"),
-            next_step: "inspect the startup doctor logs or report".to_string(),
+            next_step: startup_doctor_report_next_step(),
         },
         ["startup_doctor_warned", count] => ClassifiedReason {
             raw: raw.to_string(),
@@ -113,7 +118,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!("startup doctor reported {count} warning(s)"),
-            next_step: "inspect the startup doctor logs or report".to_string(),
+            next_step: startup_doctor_report_next_step(),
         },
         ["disk_low_free_bytes", bytes] => ClassifiedReason {
             raw: raw.to_string(),
@@ -173,6 +178,27 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
 
 pub(crate) fn is_loopback_base_url(base: &str) -> bool {
     crate::utils::loopback_url::is_loopback_url(base, None)
+}
+
+#[cfg(test)]
+mod health_classification_tests {
+    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
+
+    #[test]
+    fn startup_doctor_reasons_point_to_latest_report_endpoint() {
+        let expected_next_step =
+            format!("inspect the startup doctor report via {LATEST_STARTUP_DOCTOR_ENDPOINT}");
+
+        let failed = classify_degraded_reason("startup_doctor_failed:2");
+        assert_eq!(failed.subsystem, "startup_doctor");
+        assert_eq!(failed.summary, "startup doctor reported 2 failure(s)");
+        assert_eq!(failed.next_step.as_str(), expected_next_step.as_str());
+
+        let warned = classify_degraded_reason("startup_doctor_warned:3");
+        assert_eq!(warned.subsystem, "startup_doctor");
+        assert_eq!(warned.summary, "startup doctor reported 3 warning(s)");
+        assert_eq!(warned.next_step.as_str(), expected_next_step.as_str());
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
