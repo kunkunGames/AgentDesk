@@ -727,13 +727,26 @@ fn translate_sqlite_rowid(sql: &str) -> String {
             }
 
             let token: String = chars[start..idx].iter().collect();
-            if token.eq_ignore_ascii_case("rowid") {
+            if token.eq_ignore_ascii_case("rowid")
+                || token.eq_ignore_ascii_case("_rowid_")
+                || token.eq_ignore_ascii_case("oid")
+            {
                 result.push_str("ctid");
                 continue;
             }
 
             let lower = token.to_ascii_lowercase();
             if let Some(prefix) = lower.strip_suffix(".rowid") {
+                result.push_str(&token[..prefix.len()]);
+                result.push_str(".ctid");
+                continue;
+            }
+            if let Some(prefix) = lower.strip_suffix("._rowid_") {
+                result.push_str(&token[..prefix.len()]);
+                result.push_str(".ctid");
+                continue;
+            }
+            if let Some(prefix) = lower.strip_suffix(".oid") {
                 result.push_str(&token[..prefix.len()]);
                 result.push_str(".ctid");
                 continue;
@@ -1407,13 +1420,13 @@ mod tests {
 
     #[test]
     fn prepare_policy_sql_for_pg_rewrites_rowid_tokens() {
-        let sql = "SELECT rowid, td.rowid, 'rowid' AS literal FROM task_dispatches td ORDER BY td.rowid DESC, rowid DESC";
+        let sql = "SELECT rowid, td.rowid, _rowid_, td._rowid_, oid, td.oid, 'rowid' AS literal FROM task_dispatches td ORDER BY td.rowid DESC, rowid DESC";
         let prepared = prepare_policy_sql_for_pg(sql, &[]).expect("render rowid");
 
         assert!(
             prepared
                 .sql
-                .contains("SELECT ctid, td.ctid, 'rowid' AS literal")
+                .contains("SELECT ctid, td.ctid, ctid, td.ctid, ctid, td.ctid, 'rowid' AS literal")
         );
         assert!(prepared.sql.contains("ORDER BY td.ctid DESC, ctid DESC"));
         assert!(prepared.params.is_empty());
