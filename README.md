@@ -18,6 +18,14 @@ This will:
 3. Register a launchd service (auto-starts on boot)
 4. Open the web dashboard for guided onboarding
 
+For a portable operator scaffold before wiring real Discord or connector secrets, run:
+
+```bash
+python3 scripts/operator-init-portable.py --root ~/.adk/release
+```
+
+The helper writes `config/agentdesk.yaml`, prompt stubs, workspace directories, and `config/launchd.env.example` without embedding machine-specific `/Users/<name>` paths in repository templates. Use `--with-obsidian-stubs` only when you want local placeholder directories for the optional Obsidian connector.
+
 ### Windows and Linux Native Runtime
 
 Windows and Linux run natively today, but they use the manual/runtime-first path instead of the macOS `curl | bash` bootstrap.
@@ -245,7 +253,7 @@ A React-based dashboard served from the same binary:
 - **Control Center** — Runtime controls, dispatch monitoring, system health
 - **Analytics** — Streaks, achievements, activity heatmaps, audit logs
 - **Meeting Minutes** — Round-table meeting transcripts with issue extraction
-- **Settings** — Runtime configuration, onboarding re-run, policy management, escalation routing
+- **Settings** — Runtime configuration, optional connector readiness, onboarding re-run, policy management, escalation routing
 
 ### Round-Table Meetings
 Coordinate multi-agent discussions with structured rounds, automatic transcript recording, and post-meeting issue extraction to GitHub.
@@ -355,11 +363,11 @@ database:
 # dispatch claims, and resource locks.
 cluster:
   enabled: true
-  instance_id: mac-mini-release    # use a unique value per host, e.g. mac-book-release
+  instance_id: example-main-node   # use a unique value per host, e.g. example-worker-node
   role: auto                       # auto | leader | worker
   heartbeat_interval_secs: 10
   lease_ttl_secs: 30
-  labels: [mac-mini, release]
+  labels: [example-main, release]
   capabilities:
     providers: [codex, claude, gemini, qwen]
     max_agent_turns: 1
@@ -368,7 +376,7 @@ cluster:
       unreal_editor:
         healthy: false
   dispatch_routing:
-    default_preferred_labels: [mac-book]
+    default_preferred_labels: [example-worker]
     opt_out_dispatch_types: ["create-pr", "github-sync"]
     constraints: [noop]
 

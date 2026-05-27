@@ -1471,6 +1471,28 @@ mod launchd_plist_tests {
         }
         assert_plist_xml_valid(&plist);
     }
+
+    #[test]
+    fn generate_launchd_plist_uses_requested_fresh_home_and_root_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("fresh-home");
+        let root_dir = temp_dir.path().join("fresh-runtime");
+        let agentdesk_bin = root_dir.join("bin").join("agentdesk");
+        let plist = generate_launchd_plist_for_flavor_with_root(
+            LaunchdPlistFlavorArg::Release,
+            &home,
+            &agentdesk_bin,
+            &root_dir,
+        );
+
+        assert!(plist.contains(&format!("<string>{}</string>", home.display())));
+        assert!(plist.contains(&format!("<string>{}</string>", root_dir.display())));
+        assert!(plist.contains(&format!("<string>{}</string>", agentdesk_bin.display())));
+        assert!(plist.contains("<key>AGENTDESK_ROOT_DIR</key>"));
+        assert!(!plist.contains("/Users/itismyfield"));
+        assert!(!plist.contains("/Users/kunkun"));
+        assert_plist_xml_valid(&plist);
+    }
 }
 
 #[cfg(target_os = "macos")]

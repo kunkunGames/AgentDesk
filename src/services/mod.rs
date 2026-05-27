@@ -40,6 +40,7 @@ pub mod message_outbox;
 pub mod observability;
 pub mod onboarding;
 pub mod opencode;
+pub mod operator_connectors;
 pub mod pipeline_override;
 pub mod pipeline_routes;
 pub mod platform;

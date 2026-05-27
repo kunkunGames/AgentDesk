@@ -9,7 +9,7 @@ Pair it with [`source-of-truth.md`](source-of-truth.md), which owns the canonica
 Claude Code concatenates matching `CLAUDE.md` content into its instruction stream. Later layers do not overwrite earlier ones — they append, so the last file to speak on a topic effectively wins for the model. The ordering below reflects how Claude Code traverses the filesystem from global to workspace.
 
 1. **Global user** — `~/.claude/CLAUDE.md`
-   - Symlink into Obsidian: `/Users/itismyfield/ObsidianVault/RemoteVault/10_Claude/mac-mini/claude-home/CLAUDE.md`.
+   - Optional operator symlink into Obsidian, for example `~/ObsidianVault/RemoteVault/10_Claude/<host>/claude-home/CLAUDE.md`.
    - Loaded on every Claude Code session regardless of working directory.
    - Scope: personal Claude Code add-ons (Subagent Strategy, Sidecar, RTK include, etc.).
    - Edit: the symlink target. Do not replace the symlink with inline content.
@@ -46,7 +46,7 @@ Layer 4 is out of AgentDesk's scope — it belongs to the downstream workspace's
 
 If the same instruction appears in more than one layer, keep it in the most-specific layer that needs it and remove it from the broader layers. Concretely:
 
-- Agent-identity content (role name, responsibilities, tool preferences) belongs in the per-agent prompt (`~/ObsidianVault/RemoteVault/adk-config/agents/<role>.prompt.md`) — not in any `CLAUDE.md`.
+- Agent-identity content (role name, responsibilities, tool preferences) belongs in the per-agent prompt (`~/.adk/release/config/agents/<role>.prompt.md`, optionally mirrored from `~/ObsidianVault/RemoteVault/adk-config/agents/<role>.prompt.md`) — not in any `CLAUDE.md`.
 - Project paths and workspace bootstrap live in layer 3 (`workspace-claude-md/<agent>.md`).
 - Repo-wide edit rules live in layer 2 (`<repo>/CLAUDE.md`).
 - Personal Claude Code preferences live in layer 1 (`~/.claude/CLAUDE.md`).
