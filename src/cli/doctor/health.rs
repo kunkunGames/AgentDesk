@@ -88,6 +88,31 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             summary: format!("pipeline override warnings count is {count}"),
             next_step: "run config audit and inspect override report".to_string(),
         },
+        [
+            "global_active_counter_out_of_bounds",
+            raw_val,
+            prov_val,
+            fin_val,
+        ] => {
+            let raw_clean = raw_val.strip_prefix("raw=").unwrap_or(raw_val);
+            let prov_clean = prov_val
+                .strip_prefix("provider_active_turns=")
+                .unwrap_or(prov_val);
+            let fin_clean = fin_val
+                .strip_prefix("global_finalizing=")
+                .unwrap_or(fin_val);
+            ClassifiedReason {
+                raw: raw.to_string(),
+                subsystem: "health",
+                severity: Severity::Warning,
+                fix_safety: FixSafety::ReadOnly,
+                security_exposure: SecurityExposure::OperationalMetadata,
+                summary: format!(
+                    "global active counter out of bounds (raw: {raw_clean}, provider: {prov_clean}, finalizing: {fin_clean})"
+                ),
+                next_step: "inspect global active counter tracking in dcserver logs".to_string(),
+            }
+        }
         ["no_providers_registered"] => ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "provider_registry",
@@ -173,6 +198,44 @@ pub(crate) fn reasons_evidence(reasons: &[ClassifiedReason]) -> Value {
 
 pub(crate) fn is_loopback_base_url(base: &str) -> bool {
     crate::utils::loopback_url::is_loopback_url(base, None)
+}
+
+#[cfg(test)]
+mod health_classification_tests {
+    use super::{LATEST_STARTUP_DOCTOR_ENDPOINT, classify_degraded_reason};
+
+    #[test]
+    fn startup_doctor_reasons_point_to_latest_report_endpoint() {
+        let expected_next_step =
+            format!("inspect the startup doctor report via {LATEST_STARTUP_DOCTOR_ENDPOINT}");
+
+        let failed = classify_degraded_reason("startup_doctor_failed:2");
+        assert_eq!(failed.subsystem, "startup_doctor");
+        assert_eq!(failed.summary, "startup doctor reported 2 failure(s)");
+        assert_eq!(failed.next_step.as_str(), expected_next_step.as_str());
+
+        let warned = classify_degraded_reason("startup_doctor_warned:3");
+        assert_eq!(warned.subsystem, "startup_doctor");
+        assert_eq!(warned.summary, "startup doctor reported 3 warning(s)");
+        assert_eq!(warned.next_step.as_str(), expected_next_step.as_str());
+    }
+
+    #[test]
+    fn global_active_counter_reason_is_actionable() {
+        let reason = classify_degraded_reason(
+            "global_active_counter_out_of_bounds:raw=4:provider_active_turns=2:global_finalizing=1",
+        );
+
+        assert_eq!(reason.subsystem, "health");
+        assert_eq!(
+            reason.summary,
+            "global active counter out of bounds (raw: 4, provider: 2, finalizing: 1)"
+        );
+        assert_eq!(
+            reason.next_step,
+            "inspect global active counter tracking in dcserver logs"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
