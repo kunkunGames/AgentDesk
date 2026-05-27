@@ -1129,11 +1129,11 @@ pub async fn finalize_completed_dispatch_terminal_entry_on_pg_tx(
     )
     .await?;
 
-    for run_id in result.affected_run_ids.clone() {
+    for run_id in &result.affected_run_ids {
         if auto_queue_run_review_disabled_on_pg_tx(tx, &run_id).await?
             && maybe_finalize_run_if_ready_pg(tx, &run_id).await?
         {
-            result.finalized_run_ids.push(run_id);
+            result.finalized_run_ids.push(run_id.clone());
         }
     }
 

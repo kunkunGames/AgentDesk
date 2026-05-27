@@ -1114,7 +1114,7 @@ fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
             "health payload unavailable",
             "dispatch outbox health를 읽을 수 없습니다.",
         )
-        .with_subsystem("health")
+        .with_subsystem("dispatch_outbox")
         .with_fix_safety(FixSafety::NotFixable);
     };
     let stats = body.get("dispatch_outbox");
@@ -1361,7 +1361,6 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
     disconnected.sort();
     disconnected.dedup();
 
-    let has_duplicate_providers = !duplicate_providers.is_empty();
     let has_binding_issues = !disconnected.is_empty()
         || !missing_channels.is_empty()
         || !missing_runtime_providers.is_empty()
@@ -1384,20 +1383,7 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
         "missing_auth_hints": missing_auth_hints,
     });
 
-    if has_duplicate_providers {
-        Check::fail(
-            "provider_bindings",
-            CheckGroup::ProviderRuntime,
-            "Provider Bindings",
-            detail.clone(),
-            "health registry에 duplicate provider entry가 있습니다. registration deduplication과 runtime bootstrap 로그를 확인하세요.",
-        )
-        .with_subsystem("provider_binding")
-        .with_severity(Severity::Error)
-        .with_security_exposure(SecurityExposure::OperationalMetadata)
-        .with_evidence(evidence)
-        .with_expected_actual("unique provider health entries", detail)
-    } else if !has_binding_issues {
+    if !has_binding_issues {
         Check::ok(
             "provider_bindings",
             CheckGroup::ProviderRuntime,
@@ -1414,7 +1400,7 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
             CheckGroup::ProviderRuntime,
             "Provider Bindings",
             detail.clone(),
-            "agent/provider/channel binding과 Discord bot auth hint를 분리해 확인하세요.",
+            "Check agent/provider/channel binding and Discord bot auth hints separately.",
         )
         .with_subsystem("provider_binding")
         .with_expected_actual("provider/agent/channel bindings consistent", detail)
@@ -2341,7 +2327,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                 CheckGroup::Core,
                 "Discord Bot",
                 format!("overall={overall}, connected={total}/{total}; {detail}"),
-                "모든 provider가 connected 상태이므로 token/offline 안내 대신 degraded reason을 확인하세요.",
+                "All providers are connected; check degraded reasons instead of token/offline guidance.",
             )
             .with_subsystem("provider_runtime")
             .with_severity(highest_reason_severity(&provider_reasons))
@@ -2365,7 +2351,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                 CheckGroup::Core,
                 "Discord Bot",
                 format!("no providers registered in unified health payload — {base}"),
-                "dcserver가 아직 provider를 등록하지 못했을 수 있습니다. startup 로그와 bot token 구성을 확인하세요.",
+                "dcserver may not have registered providers yet. Check startup logs and bot token configuration.",
             )
             .with_path(health_endpoint(base))
             .with_expected_actual("provider registry populated", "providers=0")
@@ -2388,7 +2374,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
                     disconnected.join(", ")
                 }
             ),
-            "오프라인 provider의 Discord token, gateway 연결 상태, dcserver stdout 로그를 확인하세요.",
+            "Check Discord tokens, gateway connection status, and dcserver stdout logs for offline providers.",
         )
         .with_subsystem("provider_runtime")
         .with_security_exposure(SecurityExposure::OperationalMetadata)
@@ -2420,7 +2406,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
             CheckGroup::Core,
             "Discord Bot",
             format!("standalone health only — provider status unavailable at {base}"),
-            "현재 서버는 응답하지만 Discord provider health registry는 비어 있습니다. standalone 실행 중인지 확인하세요.",
+            "The server responds, but the Discord provider health registry is empty. Check if running in standalone mode.",
         )
         .with_path(health_endpoint(base))
         .with_expected_actual("unified provider registry available", "standalone health payload only")
@@ -2434,7 +2420,7 @@ fn discord_bot_check_from_health(base: &str, body: &Value) -> Check {
             CheckGroup::Core,
             "Discord Bot",
             format!("server unhealthy or provider data missing: ok={ok} db={db}"),
-            "서버가 떠 있더라도 Discord provider 초기화가 실패했을 수 있습니다. dcserver stdout 로그를 확인하세요.",
+            "Discord provider initialization may have failed even if the server is running. Check dcserver stdout logs.",
         )
         .with_path(health_endpoint(base))
         .with_expected_actual("healthy server with provider registry", format!("ok={ok} db={db}"))
@@ -2658,7 +2644,7 @@ fn check_provider_cli(
             CheckGroup::ProviderRuntime,
             name,
             "unsupported provider",
-            "지원되지 않는 provider입니다.",
+            "Unsupported provider.",
         )
         .with_expected_actual("supported provider", "unsupported provider"),
     }
@@ -2943,9 +2929,9 @@ fn check_mailbox_consistency(snapshot: &HealthSnapshot) -> Vec<Check> {
                 "Turn Mailbox Consistency",
                 finding.detail,
                 if finding.live_work_present {
-                    "live work evidence가 있으므로 자동 정리를 건너뛰고 operator 확인이 필요합니다."
+                    "operator verification is required because live work evidence exists, skipping auto-cleanup."
                 } else {
-                    "live work evidence가 없으면 protected stale-mailbox repair를 적용할 수 있습니다."
+                    "protected stale-mailbox repair can be applied since no live work evidence is present."
                 },
             )
             .with_subsystem("provider_runtime")
@@ -3020,6 +3006,20 @@ fn check_service_manager() -> Check {
         )
         .with_expected_actual("launchd job loaded", format!("{label} loaded"))
     } else {
+        let fallback_session = dcserver::current_dcserver_tmux_fallback_session();
+        if dcserver::is_tmux_fallback_session_loaded(&fallback_session) {
+            return Check::ok(
+                "service_manager",
+                CheckGroup::Core,
+                "Service Manager",
+                format!("tmux fallback — {fallback_session} active"),
+            )
+            .with_expected_actual(
+                "launchd job loaded or tmux fallback active",
+                format!("{fallback_session} active"),
+            );
+        }
+
         Check::warn(
             "service_manager",
             CheckGroup::Core,
@@ -3027,9 +3027,16 @@ fn check_service_manager() -> Check {
             format!("launchd — {label} not loaded"),
             "launchd로 운영 중이면 plist 로드 상태를 확인하세요. 수동 실행 환경이면 무시해도 됩니다.",
         )
-        .with_expected_actual("launchd job loaded", format!("{label} not loaded"))
+        .with_expected_actual(
+            "launchd job loaded or tmux fallback active",
+            format!("{label} not loaded; {fallback_session} inactive"),
+        )
         .with_next_steps(vec![
-            format!("launchctl print gui/$(id -u)/{label}"),
+            format!(
+                "launchctl print {}/{label}",
+                dcserver::current_launchd_domain().unwrap_or_else(|| "gui/$(id -u)".to_string())
+            ),
+            format!("tmux has-session -t ={fallback_session}:"),
             "agentdesk doctor --fix".to_string(),
         ])
     }
@@ -4020,20 +4027,25 @@ pub(crate) fn run_doctor_report(options: DoctorOptions) -> Result<DoctorReport, 
     let snapshot = fetch_health_snapshot(&options);
     let mut checks = build_all_checks(&cfg, &snapshot);
     if let Some(profile) = options.profile {
-        checks.retain(|check| match profile {
-            DoctorProfile::Quick => {
-                matches!(check.subsystem, "server" | "health" | "provider_runtime")
-            }
-            DoctorProfile::Deep => true,
-            DoctorProfile::Security => {
-                matches!(
-                    check.subsystem,
-                    "security" | "config_audit" | "health" | "provider_runtime"
-                ) || !matches!(check.security_exposure, SecurityExposure::None)
-            }
-        });
+        checks.retain(|check| doctor_profile_includes_check(profile, check));
     }
     Ok(build_json_report(&options, &checks, &actions))
+}
+
+fn doctor_profile_includes_check(profile: DoctorProfile, check: &Check) -> bool {
+    match profile {
+        DoctorProfile::Quick => matches!(
+            check.subsystem,
+            "server" | "health" | "provider_runtime" | "dispatch_outbox"
+        ),
+        DoctorProfile::Deep => true,
+        DoctorProfile::Security => {
+            matches!(
+                check.subsystem,
+                "security" | "config_audit" | "health" | "provider_runtime"
+            ) || !matches!(check.security_exposure, SecurityExposure::None)
+        }
+    }
 }
 
 pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
@@ -4156,6 +4168,39 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
         ))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod profile_filter_tests {
+    use super::{Check, CheckGroup, doctor_profile_includes_check};
+    use crate::cli::doctor::contract::DoctorProfile;
+
+    #[test]
+    fn quick_profile_keeps_dispatch_outbox_checks() {
+        let dispatch_outbox = Check::ok(
+            "dispatch_outbox",
+            CheckGroup::Core,
+            "Dispatch Outbox",
+            "dispatch outbox is healthy",
+        )
+        .with_subsystem("dispatch_outbox");
+        let config_audit = Check::ok(
+            "config_paths",
+            CheckGroup::Core,
+            "Config Paths",
+            "config paths are healthy",
+        )
+        .with_subsystem("config_audit");
+
+        assert!(doctor_profile_includes_check(
+            DoctorProfile::Quick,
+            &dispatch_outbox
+        ));
+        assert!(!doctor_profile_includes_check(
+            DoctorProfile::Quick,
+            &config_audit
+        ));
     }
 }
 
@@ -4394,7 +4439,7 @@ mod tests {
                 .guidance
                 .as_deref()
                 .unwrap_or_default()
-                .contains("오프라인 provider의 Discord token")
+                .contains("Check Discord tokens")
         );
     }
 
@@ -4734,7 +4779,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_binding_check_reports_duplicate_entries_as_error() {
+    fn provider_binding_check_allows_same_provider_channel_runtimes() {
         let cfg = crate::config::Config::default();
         let snapshot = HealthSnapshot {
             base: test_base_url(),
@@ -4748,7 +4793,7 @@ mod tests {
         };
 
         let check = check_provider_bindings(&cfg, &snapshot);
-        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.status, CheckStatus::Pass);
         assert_eq!(check.subsystem, "provider_binding");
         assert!(
             check

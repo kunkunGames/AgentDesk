@@ -510,14 +510,14 @@ pub(super) fn compact_path_label(path: &str) -> String {
 }
 
 pub(super) fn group_path_labels(members: &[usize], paths: &[HashSet<String>]) -> Vec<String> {
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
     for &member in members {
         for path in &paths[member] {
-            *counts.entry(path.clone()).or_insert(0) += 1;
+            *counts.entry(path.as_str()).or_insert(0) += 1;
         }
     }
 
-    let mut ranked: Vec<(String, usize)> = counts
+    let mut ranked: Vec<(&str, usize)> = counts
         .into_iter()
         .filter(|(_, count)| *count >= 2)
         .collect();
@@ -525,7 +525,7 @@ pub(super) fn group_path_labels(members: &[usize], paths: &[HashSet<String>]) ->
     ranked
         .into_iter()
         .take(3)
-        .map(|(path, _)| compact_path_label(&path))
+        .map(|(path, _)| compact_path_label(path))
         .collect()
 }
 
@@ -867,7 +867,7 @@ pub(super) fn reorder_entry_ids(
         return Err("ordered_ids cannot be empty".to_string());
     }
 
-    let scope_ids: Vec<String> = entries
+    let scope_ids: Vec<&str> = entries
         .iter()
         .filter(|entry| {
             entry.status == "pending"
@@ -875,19 +875,19 @@ pub(super) fn reorder_entry_ids(
                     .map(|target| entry.agent_id == target)
                     .unwrap_or(true)
         })
-        .map(|entry| entry.id.clone())
+        .map(|entry| entry.id.as_str())
         .collect();
     if scope_ids.is_empty() {
         return Err("no pending entries found for reorder scope".to_string());
     }
 
-    let scope_set: HashSet<&str> = scope_ids.iter().map(String::as_str).collect();
+    let scope_set: HashSet<&str> = scope_ids.iter().copied().collect();
     let mut seen = HashSet::new();
     let mut replacement_ids = Vec::new();
     for id in ordered_ids {
         let id_str = id.as_str();
         if scope_set.contains(id_str) && seen.insert(id_str) {
-            replacement_ids.push(id.clone());
+            replacement_ids.push(id_str);
         }
     }
     if replacement_ids.is_empty() {
@@ -895,8 +895,8 @@ pub(super) fn reorder_entry_ids(
     }
 
     for id in &scope_ids {
-        if !seen.contains(id.as_str()) {
-            replacement_ids.push(id.clone());
+        if !seen.contains(*id) {
+            replacement_ids.push(*id);
         }
     }
 
@@ -911,7 +911,7 @@ pub(super) fn reorder_entry_ids(
             let next_id = replacement_iter
                 .next()
                 .ok_or_else(|| "replacement sequence exhausted".to_string())?;
-            reordered.push(next_id);
+            reordered.push(next_id.to_string());
         } else {
             reordered.push(entry.id.clone());
         }

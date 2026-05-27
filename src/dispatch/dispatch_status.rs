@@ -543,25 +543,28 @@ async fn set_dispatch_status_on_pg_with_sync(
     // does. Without this, the downstream
     // `reconcile_phase_gate_for_terminal_dispatch_on_pg_tx` call observes a
     // verdict-less result and either parks the gate row or marks it failed.
-    let effective_result_owned: Option<serde_json::Value> =
-        if to_status == "completed" && result.is_some() {
+    let effective_result_owned: Option<serde_json::Value> = if to_status == "completed" {
+        if let Some(res) = result {
             let ctx_text_for_verdict = current
-            .try_get::<Option<String>, _>("context_text")
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "decode postgres dispatch context for verdict inference {dispatch_id}: {error}"
-                )
-            })?;
+                .try_get::<Option<String>, _>("context_text")
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "decode postgres dispatch context for verdict inference {dispatch_id}: {error}"
+                    )
+                })?;
             ctx_text_for_verdict
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
                 .and_then(|ctx| ctx.get("phase_gate").and_then(|v| v.as_object()).cloned())
                 .and_then(|phase_gate_ctx| {
-                    infer_phase_gate_verdict(dispatch_id, &phase_gate_ctx, result.unwrap())
+                    infer_phase_gate_verdict(dispatch_id, &phase_gate_ctx, res)
                 })
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     let result: Option<&serde_json::Value> = effective_result_owned.as_ref().or(result);
 
     let result_json = result.map(|value| value.to_string());
@@ -975,29 +978,6 @@ async fn card_needs_review_dispatch_pg(pool: &PgPool, card_id: &str) -> Result<b
         .try_get("assigned_agent_id")
         .map_err(|error| anyhow::anyhow!("decode assigned_agent_id for {card_id}: {error}"))?;
 
-    let has_review_dispatch = sqlx::query_scalar::<_, bool>(
-        "SELECT COUNT(*) > 0
-         FROM task_dispatches
-         WHERE kanban_card_id = $1
-           AND dispatch_type IN ('review', 'review-decision')
-           AND status IN ('pending', 'dispatched')",
-    )
-    .bind(card_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| anyhow::anyhow!("load review dispatch gate for {card_id}: {error}"))?;
-    let has_active_work = sqlx::query_scalar::<_, bool>(
-        "SELECT COUNT(*) > 0
-         FROM task_dispatches
-         WHERE kanban_card_id = $1
-           AND dispatch_type IN ('implementation', 'rework')
-           AND status IN ('pending', 'dispatched')",
-    )
-    .bind(card_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| anyhow::anyhow!("load active work gate for {card_id}: {error}"))?;
-
     let Some(card_status) = card_status else {
         return Ok(false);
     };
@@ -1007,7 +987,23 @@ async fn card_needs_review_dispatch_pg(pool: &PgPool, card_id: &str) -> Result<b
         .hooks_for_state(&card_status)
         .is_some_and(|hooks| hooks.on_enter.iter().any(|name| name == "OnReviewEnter"));
 
-    Ok(is_review_state && !has_review_dispatch && !has_active_work)
+    if !is_review_state {
+        return Ok(false);
+    }
+
+    let has_blocking_dispatch = sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*) > 0
+         FROM task_dispatches
+         WHERE kanban_card_id = $1
+           AND dispatch_type IN ('review', 'review-decision', 'implementation', 'rework')
+           AND status IN ('pending', 'dispatched')",
+    )
+    .bind(card_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| anyhow::anyhow!("load blocking dispatch gate for {card_id}: {error}"))?;
+
+    Ok(!has_blocking_dispatch)
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -1031,31 +1027,6 @@ fn card_needs_review_dispatch_on_conn(
         return Ok(false);
     };
 
-    let has_review_dispatch: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0
-             FROM task_dispatches
-             WHERE kanban_card_id = ?1
-               AND dispatch_type IN ('review', 'review-decision')
-               AND status IN ('pending', 'dispatched')",
-            [card_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| {
-            anyhow::anyhow!("load sqlite review dispatch gate for {card_id}: {error}")
-        })?;
-    let has_active_work: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0
-             FROM task_dispatches
-             WHERE kanban_card_id = ?1
-               AND dispatch_type IN ('implementation', 'rework')
-               AND status IN ('pending', 'dispatched')",
-            [card_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| anyhow::anyhow!("load sqlite active work gate for {card_id}: {error}"))?;
-
     let Some(card_status) = card_status else {
         return Ok(false);
     };
@@ -1065,7 +1036,25 @@ fn card_needs_review_dispatch_on_conn(
         .hooks_for_state(&card_status)
         .is_some_and(|hooks| hooks.on_enter.iter().any(|name| name == "OnReviewEnter"));
 
-    Ok(is_review_state && !has_review_dispatch && !has_active_work)
+    if !is_review_state {
+        return Ok(false);
+    }
+
+    let has_blocking_dispatch: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0
+             FROM task_dispatches
+             WHERE kanban_card_id = ?1
+               AND dispatch_type IN ('review', 'review-decision', 'implementation', 'rework')
+               AND status IN ('pending', 'dispatched')",
+            [card_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("load sqlite blocking dispatch gate for {card_id}: {error}")
+        })?;
+
+    Ok(!has_blocking_dispatch)
 }
 
 async fn maybe_inject_phase_gate_verdict_pg(
