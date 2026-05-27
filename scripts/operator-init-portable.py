@@ -194,6 +194,7 @@ def build_dirs(root: Path, with_obsidian_stubs: bool) -> list[DirSpec]:
     dirs = [
         DirSpec(root / "config" / "agents", "agent prompt directory"),
         DirSpec(root / "data", "data directory"),
+        DirSpec(root / "logs", "launchd log directory"),
         DirSpec(root / "runtime", "runtime directory"),
         DirSpec(root / "workspaces" / "ch-td", "starter workspace"),
         DirSpec(root / "workspaces" / "agentfactory", "migrated launchd workspace"),

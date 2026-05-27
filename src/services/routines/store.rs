@@ -1791,6 +1791,28 @@ impl RoutineStore {
         .await
     }
 
+    pub async fn fail_run_and_pause_routine(
+        &self,
+        run_id: &str,
+        error: &str,
+        result_json: Option<Value>,
+    ) -> Result<bool> {
+        self.close_run(
+            run_id,
+            CloseRun {
+                run_status: "failed",
+                action: None,
+                result_json,
+                error: Some(error),
+                checkpoint: None,
+                last_result: Some(error),
+                next_due_at: NextDueAtUpdate::Clear,
+                pause_routine: true,
+            },
+        )
+        .await
+    }
+
     pub async fn mark_agent_turn_started(
         &self,
         run_id: &str,

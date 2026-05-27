@@ -5,29 +5,22 @@ use crate::services::operator_connectors::{
     OptionalConnectorState, optional_connector_status_by_id,
 };
 
-pub(super) fn is_migrated_launchd_script_ref(script_ref: &str) -> bool {
+pub fn is_migrated_launchd_script_ref(script_ref: &str) -> bool {
     script_ref.starts_with("migrated-launchd/")
 }
 
-pub(super) fn validate_migrated_launchd_activation(
-    routine: &crate::services::routines::store::RoutineRecord,
+pub fn validate_migrated_launchd_activation(
+    script_ref: &str,
+    checkpoint: Option<&Value>,
     metadata: Option<&Value>,
     routine_dirs: &[std::path::PathBuf],
 ) -> AppResult<()> {
-    if !is_migrated_launchd_script_ref(&routine.script_ref) {
+    if !is_migrated_launchd_script_ref(script_ref) {
         return Ok(());
     }
-    validate_migrated_launchd_entrypoint(&routine.script_ref, metadata, routine_dirs)?;
-    validate_migrated_launchd_required_paths(
-        &routine.script_ref,
-        metadata,
-        routine.checkpoint.as_ref(),
-    )?;
-    validate_migrated_launchd_required_connectors(
-        &routine.script_ref,
-        metadata,
-        routine.checkpoint.as_ref(),
-    )
+    validate_migrated_launchd_entrypoint(script_ref, metadata, routine_dirs)?;
+    validate_migrated_launchd_required_paths(script_ref, metadata, checkpoint)?;
+    validate_migrated_launchd_required_connectors(script_ref, metadata, checkpoint)
 }
 
 fn validate_migrated_launchd_entrypoint(
@@ -696,6 +689,9 @@ mod tests {
     fn migrated_launchd_required_connector_validation_accepts_ready_connector() {
         let _lock = env_lock();
         let temp = tempfile::tempdir().unwrap();
+        let skill = temp.path().join("ai-integrated-briefing");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "# AI integrated briefing\n").unwrap();
         let previous = std::env::var_os("AGENTDESK_OBSIDIAN_SKILL_ROOT");
         unsafe { std::env::set_var("AGENTDESK_OBSIDIAN_SKILL_ROOT", temp.path()) };
         let metadata = json!({

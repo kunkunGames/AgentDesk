@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const OBSIDIAN_AGENT_PROMPTS_CONNECTOR: &str = "obsidian_agent_prompts";
 pub const OBSIDIAN_SKILL_ROOT_CONNECTOR: &str = "obsidian_skill_root";
@@ -144,15 +144,30 @@ fn obsidian_agent_prompts_status() -> OptionalConnectorStatus {
 fn obsidian_skill_root_status() -> OptionalConnectorStatus {
     let source = explicit_env_path("AGENTDESK_OBSIDIAN_SKILL_ROOT")
         .or_else(|| obsidian_remote_vault_root().map(|root| root.join("99_Skills")));
-    connector_dir_status(ConnectorDirSpec {
+    let mut status = connector_dir_status(ConnectorDirSpec {
         id: OBSIDIAN_SKILL_ROOT_CONNECTOR,
         name: "Obsidian skill root",
         env_var: "AGENTDESK_OBSIDIAN_SKILL_ROOT",
-        source,
+        source: source.clone(),
         explicit: explicit_env_path("AGENTDESK_OBSIDIAN_SKILL_ROOT").is_some(),
         capability: OBSIDIAN_SKILL_ROOT_CONNECTOR,
-        setup_hint: "Set AGENTDESK_OBSIDIAN_SKILL_ROOT to an existing skill directory, or run scripts/operator-init-portable.py --with-obsidian-stubs to create starter directories.",
-    })
+        setup_hint: "Set AGENTDESK_OBSIDIAN_SKILL_ROOT to an existing skill directory containing at least one <skill>/SKILL.md, or run scripts/operator-init-portable.py --with-obsidian-stubs before syncing real skills.",
+    });
+    if status.state == OptionalConnectorState::Ready
+        && !source
+            .as_deref()
+            .is_some_and(obsidian_skill_root_contains_skill)
+    {
+        let source_text = status.source.clone().unwrap_or_default();
+        status.state = OptionalConnectorState::InvalidConfig;
+        status.reason = Some("missing_skill_files");
+        status.detail =
+            format!("state=invalid_config source={source_text} reason=missing_skill_files");
+        status.setup_actions = vec![format!(
+            "Add at least one skill directory containing SKILL.md under {source_text}."
+        )];
+    }
+    status
 }
 
 struct ConnectorDirSpec {
@@ -228,6 +243,16 @@ fn connector_dir_status(spec: ConnectorDirSpec) -> OptionalConnectorStatus {
             capabilities: vec![spec.capability],
         }
     }
+}
+
+fn obsidian_skill_root_contains_skill(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        path.is_dir() && path.join("SKILL.md").is_file()
+    })
 }
 
 fn explicit_env_path(name: &str) -> Option<PathBuf> {
@@ -389,7 +414,13 @@ mod tests {
             let root = temp.path().join("release");
             let remote = root.join("ObsidianVault").join("RemoteVault");
             std::fs::create_dir_all(remote.join("adk-config").join("agents")).unwrap();
-            std::fs::create_dir_all(remote.join("99_Skills")).unwrap();
+            let skill_root = remote.join("99_Skills");
+            std::fs::create_dir_all(skill_root.join("ai-integrated-briefing")).unwrap();
+            std::fs::write(
+                skill_root.join("ai-integrated-briefing").join("SKILL.md"),
+                "# AI integrated briefing\n",
+            )
+            .unwrap();
             unsafe {
                 std::env::set_var("HOME", &home);
                 std::env::set_var("USERPROFILE", &home);
@@ -413,6 +444,34 @@ mod tests {
                     .as_deref()
                     .is_some_and(|source| source.contains("ObsidianVault"))
             }));
+        });
+    }
+
+    #[test]
+    fn empty_obsidian_skill_stub_requires_real_skill_content() {
+        with_connector_env(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = temp.path().join("release");
+            let remote = root.join("ObsidianVault").join("RemoteVault");
+            std::fs::create_dir_all(remote.join("adk-config").join("agents")).unwrap();
+            std::fs::create_dir_all(remote.join("99_Skills")).unwrap();
+            unsafe {
+                std::env::set_var("HOME", &home);
+                std::env::set_var("USERPROFILE", &home);
+                std::env::set_var("AGENTDESK_ROOT_DIR", &root);
+                std::env::remove_var("OBSIDIAN_VAULT_ROOT");
+                std::env::remove_var("OBSIDIAN_REMOTE_VAULT_ROOT");
+                std::env::remove_var("AGENTDESK_OBSIDIAN_AGENTS_SRC");
+                std::env::remove_var("AGENTDESK_OBSIDIAN_SKILL_ROOT");
+            }
+
+            let prompts = optional_connector_status_by_id("obsidian_agent_prompts").unwrap();
+            let skills = optional_connector_status_by_id("obsidian_skill_root").unwrap();
+
+            assert_eq!(prompts.state, OptionalConnectorState::Ready);
+            assert_eq!(skills.state, OptionalConnectorState::InvalidConfig);
+            assert_eq!(skills.reason, Some("missing_skill_files"));
         });
     }
 }

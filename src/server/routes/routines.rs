@@ -12,15 +12,13 @@ use crate::error::{AppError, AppResult, ErrorCode};
 use crate::services::routines::{
     NewRoutine, RoutineAgentExecutor, RoutineDiscordLogger, RoutineLifecycleEvent, RoutinePatch,
     RoutineScriptLoader, RoutineSessionCommand, RoutineSessionController, RoutineStore,
-    execute_claimed_script_run, is_resume_routine_requires_next_due_at,
+    execute_claimed_script_run, is_migrated_launchd_script_ref,
+    is_resume_routine_requires_next_due_at, validate_migrated_launchd_activation,
     validate_routine_runtime_config, validate_routine_schedule,
 };
 use crate::utils::api::clamp_api_limit;
 
-use super::{
-    AppState,
-    routines_migrated::{is_migrated_launchd_script_ref, validate_migrated_launchd_activation},
-};
+use super::AppState;
 
 const PARALLEL_SAFE_MIGRATED_LAUNCHD_SCRIPT_REF: &str = "migrated-launchd/queue-stability-batch.js";
 
@@ -355,7 +353,12 @@ pub async fn resume_routine(
     }
     let metadata = migrated_launchd_metadata_for_state(&state, &routine.script_ref)?;
     let routine_script_dirs = state.config.routines.script_dirs();
-    validate_migrated_launchd_activation(&routine, metadata.as_ref(), &routine_script_dirs)?;
+    validate_migrated_launchd_activation(
+        &routine.script_ref,
+        routine.checkpoint.as_ref(),
+        metadata.as_ref(),
+        &routine_script_dirs,
+    )?;
     let changed = store
         .resume_routine(&routine_id, body.next_due_at_update())
         .await
@@ -432,7 +435,12 @@ pub async fn run_routine_now(
     } else {
         None
     };
-    validate_migrated_launchd_activation(&routine, metadata.as_ref(), &routine_script_dirs)?;
+    validate_migrated_launchd_activation(
+        &routine.script_ref,
+        routine.checkpoint.as_ref(),
+        metadata.as_ref(),
+        &routine_script_dirs,
+    )?;
 
     let Some(claimed) = store
         .claim_run_now(&routine_id)

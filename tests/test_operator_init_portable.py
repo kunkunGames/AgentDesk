@@ -44,6 +44,7 @@ class OperatorInitPortableTests(unittest.TestCase):
                 self.assertTrue(path.is_file(), path)
             for path in (
                 root / "data",
+                root / "logs",
                 root / "runtime",
                 root / "workspaces" / "ch-td",
                 root / "workspaces" / "agentfactory",

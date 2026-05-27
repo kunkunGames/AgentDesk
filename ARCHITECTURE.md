@@ -277,7 +277,6 @@ src/
 │   │   ├── resume.rs
 │   │   ├── reviews.rs
 │   │   ├── routines.rs
-│   │   ├── routines_migrated.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
 │   │   ├── settings_tests.rs
@@ -632,6 +631,7 @@ src/
 │   │   ├── agent_executor.rs
 │   │   ├── discord_log.rs
 │   │   ├── loader.rs
+│   │   ├── migrated.rs
 │   │   ├── mod.rs
 │   │   ├── runtime.rs
 │   │   ├── runtime_config.rs
