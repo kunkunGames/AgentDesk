@@ -75,7 +75,7 @@ class PortableOperatorMigrationTests(unittest.TestCase):
                 }
             )
             output = subprocess.check_output(
-                ["bash", "-lc", command],
+                [bash_path, "-lc", command],
                 cwd=ROOT,
                 env=env,
                 encoding="utf-8",
@@ -125,7 +125,7 @@ class PortableOperatorMigrationTests(unittest.TestCase):
                 }
             )
             output = subprocess.check_output(
-                ["bash", "-lc", command],
+                [bash_path, "-lc", command],
                 cwd=ROOT,
                 env=env,
                 encoding="utf-8",
