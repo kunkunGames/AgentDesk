@@ -222,11 +222,39 @@ pub fn current_dcserver_root_marker() -> Option<String> {
 }
 
 #[cfg(unix)]
+fn command_output_with_timeout(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    let mut child = command.spawn().ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 pub fn dcserver_process_command(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["eww", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("ps");
+    command.args(["eww", "-o", "command=", "-p", &pid.to_string()]);
+    let output = command_output_with_timeout(command, std::time::Duration::from_secs(2))?;
     if !output.status.success() {
         return None;
     }
@@ -256,11 +284,10 @@ pub fn dcserver_process_matches_instance(command: &str) -> bool {
 
 #[cfg(unix)]
 pub fn dcserver_instance_pids() -> Vec<u32> {
-    let output = match std::process::Command::new("pgrep")
-        .args(["-f", "agentdesk.*dcserver"])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
+    let mut command = std::process::Command::new("pgrep");
+    command.args(["-f", "agentdesk.*dcserver"]);
+    let output = match command_output_with_timeout(command, std::time::Duration::from_secs(2)) {
+        Some(output) if output.status.success() => output,
         _ => return Vec::new(),
     };
 
@@ -811,7 +838,7 @@ pub fn handle_restart_dcserver(
     // They will be reconnected by restore_tmux_watchers() after the new dcserver starts.
     // Orphan sessions (channels renamed/deleted) are cleaned up inside the bot event loop.
 
-    // Launch new dcserver inside tmux session "AgentDesk-dcserver"
+    // Launch new dcserver inside the tmux fallback session recognized by startup doctor.
     // Write a launcher script to avoid token exposure in ps aux
     let Some(runtime_root) = agentdesk_runtime_root() else {
         eprintln!("Error: Cannot determine runtime root");
@@ -893,12 +920,12 @@ pub fn handle_restart_dcserver(
         }
     }
 
-    let tmux_session = "AgentDesk-dcserver";
+    let tmux_session = "AgentDesk-dcserver-release-manual";
 
     // Kill existing tmux session if it exists
     crate::services::platform::tmux::kill_session_with_reason(
         tmux_session,
-        "dcserver tmux launcher restart: replace existing AgentDesk-dcserver session",
+        "dcserver tmux launcher restart: replace existing AgentDesk-dcserver-release-manual session",
     );
     std::thread::sleep(std::time::Duration::from_millis(500));
 
@@ -1028,7 +1055,7 @@ pub fn handle_dcserver(token: Option<String>) {
         .unwrap_or_default();
 
     if let Some(root) = runtime_root.as_ref() {
-        match crate::runtime_layout::ensure_runtime_layout(&root) {
+        match crate::runtime_layout::ensure_runtime_layout_for_dcserver(&root) {
             Ok(report) => {
                 if report.migrated {
                     if let Some(backup) = report.backup_path {

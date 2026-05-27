@@ -39,7 +39,13 @@ fn exit_for_json_cli(result: std::result::Result<(), String>) -> Result<()> {
 pub(crate) fn execute(command: Commands) -> Result<()> {
     match command {
         Commands::Dcserver { token } => {
-            let token = token.or_else(|| std::env::var("AGENTDESK_TOKEN").ok());
+            let token = token.or_else(|| {
+                if crate::services::discord::load_discord_bot_launch_configs().is_empty() {
+                    std::env::var("AGENTDESK_TOKEN").ok()
+                } else {
+                    None
+                }
+            });
             super::handle_dcserver(token);
             Ok(())
         }

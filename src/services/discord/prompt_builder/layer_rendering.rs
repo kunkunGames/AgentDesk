@@ -48,6 +48,8 @@ pub(super) fn shared_agent_rules_lookup() -> &'static str {
     "\n\n[Shared Agent Rules Index]\n\
      - Keep changes scoped, verified, and no broader than the current request.\n\
      - Verify user claims against code/data before acting.\n\
+     - Concise does not mean one-word. For status, debugging, build, deploy, or recovery work, include the verified result, cause or uncertainty, and next action.\n\
+     - For multi-step or long-running work, send short progress updates at the start, after major findings, before risky actions, and periodically while waiting.\n\
      - Prefer `rg` and narrow reads; avoid dumping long tool output.\n\
      - Do not use sqlite for ADK operational data; inspect `/api/docs` first.\n\
      - Source-of-truth map: `docs/source-of-truth.md`; read it before editing prompts, config, skills, policies, or memory surfaces.\n\

@@ -284,6 +284,17 @@ pub fn long_term_memory_root(root: &Path) -> PathBuf {
 }
 
 pub fn ensure_runtime_layout(root: &Path) -> Result<LayoutReport, String> {
+    ensure_runtime_layout_inner(root, true)
+}
+
+pub fn ensure_runtime_layout_for_dcserver(root: &Path) -> Result<LayoutReport, String> {
+    ensure_runtime_layout_inner(root, false)
+}
+
+fn ensure_runtime_layout_inner(
+    root: &Path,
+    migrate_legacy_skills: bool,
+) -> Result<LayoutReport, String> {
     fs::create_dir_all(root).map_err(|e| format!("Failed to create '{}': {e}", root.display()))?;
 
     let mut report = LayoutReport::default();
@@ -302,7 +313,9 @@ pub fn ensure_runtime_layout(root: &Path) -> Result<LayoutReport, String> {
     merge_role_map_into_agentdesk_yaml(root)?;
     update_org_yaml_prompt_paths(root)?;
     ensure_managed_skills_manifest(root)?;
-    migrate_legacy_skill_links(root)?;
+    if migrate_legacy_skills {
+        migrate_legacy_skill_links(root)?;
+    }
     Ok(report)
 }
 
@@ -386,12 +399,28 @@ fn migrate_legacy_credential_entries(legacy: &Path, canonical: &Path) -> Result<
 }
 
 fn load_memory_backend_from_yaml(root: &Path) -> Option<MemoryBackendConfig> {
+    #[derive(Deserialize)]
+    struct MemoryConfigOnly {
+        memory: Option<crate::config::MemoryConfig>,
+    }
+
     for path in [config_file_path(root), legacy_config_file_path(root)] {
         if !path.is_file() {
             continue;
         }
 
-        match crate::config::load_from_path(&path) {
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                tracing::warn!(
+                    "  [memory] Warning: failed to read '{}' for memory config: {error}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        match serde_yaml::from_str::<MemoryConfigOnly>(&content) {
             Ok(config) => {
                 if let Some(memory) = config.memory {
                     return Some(memory_backend_from_config(memory));

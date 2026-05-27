@@ -225,6 +225,103 @@ fn resolve_bot_token(bot_name: &str, bot: &crate::config::BotConfig) -> Option<S
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .or_else(|| crate::credential::read_bot_token(bot_name))
+        .or_else(|| resolve_legacy_bot_settings_token(bot_name, bot))
+}
+
+fn normalized_legacy_agent_id(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized
+        .strip_prefix("openclaw-")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+}
+
+fn resolve_legacy_bot_settings_token(
+    bot_name: &str,
+    bot: &crate::config::BotConfig,
+) -> Option<String> {
+    let path = super::runtime_store::bot_settings_path()?;
+    let content = std::fs::read_to_string(path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let obj = json.as_object()?;
+
+    let target_agent = bot
+        .agent
+        .as_deref()
+        .map(normalized_legacy_agent_id)
+        .unwrap_or_else(|| normalized_legacy_agent_id(bot_name));
+    let target_provider = bot
+        .provider
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let target_channels = bot
+        .auth
+        .allowed_channel_ids
+        .as_ref()
+        .map(|ids| ids.iter().copied().collect::<HashSet<_>>())
+        .unwrap_or_default();
+
+    let mut best: Option<(u8, String)> = None;
+    for entry in obj.values() {
+        let Some(entry_obj) = entry.as_object() else {
+            continue;
+        };
+        let Some(token) = entry_obj
+            .get("token")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let legacy_agent = entry_obj
+            .get("agent")
+            .and_then(|value| value.as_str())
+            .map(normalized_legacy_agent_id);
+        let legacy_provider = entry_obj
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_ascii_lowercase());
+        let legacy_channels = entry_obj
+            .get("allowed_channel_ids")
+            .and_then(|value| value.as_array())
+            .map(|ids| ids.iter().filter_map(json_u64).collect::<HashSet<_>>())
+            .unwrap_or_default();
+
+        let score = if legacy_agent.as_deref() == Some(target_agent.as_str()) {
+            100
+        } else if !target_channels.is_empty()
+            && legacy_channels
+                .iter()
+                .any(|channel_id| target_channels.contains(channel_id))
+        {
+            90
+        } else if target_provider.as_deref().is_some_and(|provider| {
+            legacy_provider.as_deref() == Some(provider)
+                && legacy_agent.as_deref() == Some(provider)
+        }) {
+            80
+        } else {
+            continue;
+        };
+
+        if best
+            .as_ref()
+            .map(|(best_score, _)| score > *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((score, token.to_string()));
+        }
+    }
+
+    best.map(|(_, token)| token)
 }
 
 fn default_prompt_path(role_id: &str) -> Option<String> {

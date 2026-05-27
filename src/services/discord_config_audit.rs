@@ -529,9 +529,10 @@ fn audit_bot_settings(
 
         let Some(bot_name) = resolved_config_bot_name(config, token) else {
             report.warnings.push(format!(
-                "Legacy bot_settings entry '{}' does not match any bot token in agentdesk.yaml; skipping migration",
+                "Legacy bot_settings entry '{}' does not match any bot token in agentdesk.yaml; preserving legacy launch metadata",
                 legacy.hash_key
             ));
+            runtime_only_entries.insert(legacy.hash_key.clone(), entry_value.clone());
             continue;
         };
 
@@ -1177,12 +1178,26 @@ impl ComparableAgent {
             .as_ref()
             .and_then(AgentChannel::target);
         let discord_channel_cdx = agent.channels.codex.as_ref().and_then(AgentChannel::target);
+        let provider_primary = match agent.provider.as_str() {
+            "gemini" => agent
+                .channels
+                .gemini
+                .as_ref()
+                .and_then(AgentChannel::target),
+            "opencode" => agent
+                .channels
+                .opencode
+                .as_ref()
+                .and_then(AgentChannel::target),
+            "qwen" => agent.channels.qwen.as_ref().and_then(AgentChannel::target),
+            _ => None,
+        };
 
         Self {
             id: agent.id.clone(),
             provider: normalize_provider(Some(agent.provider.as_str()))
                 .unwrap_or_else(|| "claude".to_string()),
-            discord_channel_id: discord_channel_cc.clone(),
+            discord_channel_id: provider_primary.or_else(|| discord_channel_cc.clone()),
             discord_channel_alt: discord_channel_cdx.clone(),
             discord_channel_cc,
             discord_channel_cdx,
