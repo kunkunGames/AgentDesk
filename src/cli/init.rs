@@ -468,12 +468,15 @@ fn generate_launchd_plist_for_flavor_with_root(
     let home_str = home.display();
     let bin_str = agentdesk_bin.display();
     let label = resolved_launchd_label(flavor, label_override);
+    let label_xml = xml_escape(&label);
     let root_str = root_dir.display();
     let logs_dir = root_dir.join("logs");
     let logs_str = logs_dir.display();
     let path_env = launchd_path_env(home);
-    let extra_env_xml =
-        render_launchd_env_entries_xml(&root_dir.join("config").join("launchd.env"));
+    let extra_env_xml = render_launchd_env_entries_xml(
+        &root_dir.join("config").join("launchd.env"),
+        &[dcserver::AGENTDESK_DCSERVER_LABEL_ENV],
+    );
     let nofile_resource_limit_xml = render_launchd_nofile_resource_limit_xml();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -481,7 +484,7 @@ fn generate_launchd_plist_for_flavor_with_root(
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>{label}</string>
+  <string>{label_xml}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{bin_str}</string>
@@ -503,6 +506,8 @@ fn generate_launchd_plist_for_flavor_with_root(
     <string>{home_str}</string>
     <key>AGENTDESK_ROOT_DIR</key>
     <string>{root_str}</string>
+    <key>AGENTDESK_DCSERVER_LABEL</key>
+    <string>{label_xml}</string>
 {extra_env_xml}
   </dict>
   <key>StandardOutPath</key>
@@ -515,9 +520,12 @@ fn generate_launchd_plist_for_flavor_with_root(
 }
 
 #[cfg(target_os = "macos")]
-fn render_launchd_env_entries_xml(env_file: &Path) -> String {
+fn render_launchd_env_entries_xml(env_file: &Path, excluded_keys: &[&str]) -> String {
     let mut xml = String::new();
     for (key, value) in read_launchd_env_entries(env_file) {
+        if excluded_keys.iter().any(|excluded| key == *excluded) {
+            continue;
+        }
         let _ = writeln!(xml, "    <key>{}</key>", xml_escape(&key));
         let _ = writeln!(xml, "    <string>{}</string>", xml_escape(&value));
     }
@@ -1249,7 +1257,7 @@ mod tests {
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("launchd.env"),
-            "MEMENTO_ACCESS_KEY=abc123\nexport SAMPLE_FLAG=\"enabled\"\n",
+            "MEMENTO_ACCESS_KEY=abc123\nexport SAMPLE_FLAG=\"enabled\"\nAGENTDESK_DCSERVER_LABEL=stale\n",
         )
         .unwrap();
 
@@ -1265,6 +1273,11 @@ mod tests {
         assert!(plist.contains("<string>abc123</string>"));
         assert!(plist.contains("<key>SAMPLE_FLAG</key>"));
         assert!(plist.contains("<string>enabled</string>"));
+        assert_eq!(
+            plist.matches("<key>AGENTDESK_DCSERVER_LABEL</key>").count(),
+            1
+        );
+        assert!(!plist.contains("<string>stale</string>"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1319,6 +1332,7 @@ mod tests {
 
         assert!(plist.contains("<string>com.agentdesk.release.sandbox.123</string>"));
         assert!(!plist.contains("<string>com.agentdesk.release</string>"));
+        assert!(plist.contains("<key>AGENTDESK_DCSERVER_LABEL</key>"));
         assert_plist_xml_valid(&plist);
     }
 
@@ -1331,6 +1345,7 @@ mod tests {
         let output_path = temp_dir.path().join("nested").join("agentdesk.plist");
         let args = EmitLaunchdPlistArgs {
             flavor: LaunchdPlistFlavorArg::Release,
+            label: None,
             home: Some(home.clone()),
             root_dir: Some(root_dir.clone()),
             agentdesk_bin: Some(root_dir.join("bin").join("agentdesk")),

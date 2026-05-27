@@ -22,7 +22,11 @@ class InstallBootstrapPortableTests(unittest.TestCase):
         self.assertIn('DEFAULT_INSTALL_DIR="$HOME/.adk/release"', text)
         self.assertIn('INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"', text)
         self.assertIn('LAUNCHD_LABEL="${AGENTDESK_LAUNCHD_LABEL:-}"', text)
-        self.assertIn('--label "$LAUNCHD_LABEL"', text)
+        self.assertIn('INSTALL_PORT="${AGENTDESK_INSTALL_PORT:-}"', text)
+        self.assertIn("normalize_install_dir()", text)
+        self.assertIn("default_install_port()", text)
+        self.assertIn("agentdesk_supports_emit_launchd_label()", text)
+        self.assertIn('if [ "$LAUNCHD_LABEL" = "com.agentdesk.release" ]; then', text)
 
     def test_installer_creates_canonical_config_before_legacy_config(self):
         text = self.read_script()
@@ -100,6 +104,10 @@ class InstallBootstrapPortableTests(unittest.TestCase):
                 #!/usr/bin/env bash
                 set -euo pipefail
                 if [[ "${1:-}" == "emit-launchd-plist" ]]; then
+                  if [[ "${2:-}" == "--help" ]]; then
+                    printf 'Usage: agentdesk emit-launchd-plist [--label <LABEL>]\\n'
+                    exit 0
+                  fi
                   home=""
                   root=""
                   bin=""
@@ -124,6 +132,8 @@ class InstallBootstrapPortableTests(unittest.TestCase):
                   <string>${root}</string>
                   <string>${bin}</string>
                   <key>AGENTDESK_ROOT_DIR</key>
+                  <key>AGENTDESK_DCSERVER_LABEL</key>
+                  <string>${label}</string>
                 </plist>
                 PLIST
                   exit 0
@@ -179,10 +189,13 @@ class InstallBootstrapPortableTests(unittest.TestCase):
             self.assertIn(f"Config:     {config}", result.stdout)
 
             rendered = config.read_text(encoding="utf-8") + plist.read_text(encoding="utf-8")
+            config_text = config.read_text(encoding="utf-8")
             self.assertIn(str(home), rendered)
             self.assertIn(str(runtime_root), rendered)
             self.assertNotIn("<string>com.agentdesk.release</string>", rendered)
             self.assertIn("<string>com.agentdesk.release.sandbox-release.", rendered)
+            self.assertIn("<key>AGENTDESK_DCSERVER_LABEL</key>", rendered)
+            self.assertNotIn("port: 8791", config_text)
             self.assertNotIn("/Users/itismyfield", rendered)
             self.assertNotIn("/Users/kunkun", rendered)
             self.assertNotIn("mac-mini-release", rendered)

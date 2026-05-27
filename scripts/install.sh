@@ -20,6 +20,7 @@ REPO="${AGENTDESK_INSTALL_REPO:-itismyfield/AgentDesk}"
 DEFAULT_INSTALL_DIR="$HOME/.adk/release"
 INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 LAUNCHD_LABEL="${AGENTDESK_LAUNCHD_LABEL:-}"
+INSTALL_PORT="${AGENTDESK_INSTALL_PORT:-}"
 CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
 CONFIG_PATH="$INSTALL_DIR/config/agentdesk.yaml"
 LEGACY_CONFIG_PATH="$INSTALL_DIR/agentdesk.yaml"
@@ -68,8 +69,24 @@ launchd_domain() {
   printf 'gui/%s\n' "$uid"
 }
 
+normalize_install_dir() {
+  local raw="$1" dir base
+  case "$raw" in
+    /*) ;;
+    *) raw="$(pwd -P)/$raw" ;;
+  esac
+  dir="$(dirname "$raw")"
+  base="$(basename "$raw")"
+  mkdir -p "$dir"
+  (cd "$dir" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$base") || printf '%s\n' "$raw"
+}
+
+install_root_is_default() {
+  [ "$INSTALL_DIR" = "$DEFAULT_INSTALL_DIR" ]
+}
+
 default_launchd_label() {
-  if [ "$INSTALL_DIR" = "$DEFAULT_INSTALL_DIR" ]; then
+  if install_root_is_default; then
     printf '%s\n' "com.agentdesk.release"
     return
   fi
@@ -85,6 +102,17 @@ default_launchd_label() {
   [ -n "$slug" ] || slug="sandbox"
   checksum="$(printf '%s' "$INSTALL_DIR" | cksum | awk '{print $1}')"
   printf 'com.agentdesk.release.%s.%s\n' "$slug" "$checksum"
+}
+
+default_install_port() {
+  if install_root_is_default; then
+    printf '%s\n' "$DEFAULT_PORT"
+    return
+  fi
+
+  local checksum
+  checksum="$(printf '%s' "$INSTALL_DIR" | cksum | awk '{print $1}')"
+  printf '%s\n' "$((18000 + checksum % 20000))"
 }
 
 print_native_runtime_help() {
@@ -158,6 +186,35 @@ sign_binary_with_fallback() {
   fi
 }
 
+agentdesk_supports_emit_launchd_label() {
+  "$1" emit-launchd-plist --help 2>&1 | grep -q -- "--label"
+}
+
+emit_launchd_plist() {
+  local agentdesk_bin="$1" plist_path="$2"
+  if [ "$LAUNCHD_LABEL" = "com.agentdesk.release" ]; then
+    "$agentdesk_bin" emit-launchd-plist \
+      --flavor release \
+      --home "$HOME" \
+      --root-dir "$INSTALL_DIR" \
+      --agentdesk-bin "$agentdesk_bin" \
+      --output "$plist_path"
+    return
+  fi
+
+  if ! agentdesk_supports_emit_launchd_label "$agentdesk_bin"; then
+    fail "Installed agentdesk binary does not support custom launchd labels; use the default install root or install a newer AgentDesk build."
+  fi
+
+  "$agentdesk_bin" emit-launchd-plist \
+    --flavor release \
+    --label "$LAUNCHD_LABEL" \
+    --home "$HOME" \
+    --root-dir "$INSTALL_DIR" \
+    --agentdesk-bin "$agentdesk_bin" \
+    --output "$plist_path"
+}
+
 # ── Detect OS and arch ────────────────────────────────────────────────────────
 RAW_OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$RAW_OS" in
@@ -179,8 +236,16 @@ if [ "$OS" != "darwin" ]; then
   fail "One-click installer is only available on macOS."
 fi
 
+DEFAULT_INSTALL_DIR="$(normalize_install_dir "$DEFAULT_INSTALL_DIR")"
+INSTALL_DIR="$(normalize_install_dir "$INSTALL_DIR")"
+CONFIG_PATH="$INSTALL_DIR/config/agentdesk.yaml"
+LEGACY_CONFIG_PATH="$INSTALL_DIR/agentdesk.yaml"
+
 if [ -z "$LAUNCHD_LABEL" ]; then
   LAUNCHD_LABEL="$(default_launchd_label)"
+fi
+if [ -z "$INSTALL_PORT" ]; then
+  INSTALL_PORT="$(default_install_port)"
 fi
 
 echo ""
@@ -329,10 +394,10 @@ if [ ! -f "$CONFIG_PATH" ] && [ ! -f "$LEGACY_CONFIG_PATH" ]; then
   cat > "$CONFIG_PATH" << YAML
 # AgentDesk Configuration
 # Edit this file to add Discord bot tokens and customize settings.
-# Run the web onboarding wizard for guided setup: http://${DEFAULT_LOOPBACK}:${DEFAULT_PORT}
+# Run the web onboarding wizard for guided setup: http://${DEFAULT_LOOPBACK}:${INSTALL_PORT}
 
 server:
-  port: ${DEFAULT_PORT}
+  port: ${INSTALL_PORT}
   host: "${DEFAULT_HOST}"
 
 discord:
@@ -365,13 +430,7 @@ info "Setting up launchd service..."
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$PLIST_DIR/$LAUNCHD_LABEL.plist"
 mkdir -p "$PLIST_DIR"
-"$INSTALL_DIR/bin/agentdesk" emit-launchd-plist \
-  --flavor release \
-  --label "$LAUNCHD_LABEL" \
-  --home "$HOME" \
-  --root-dir "$INSTALL_DIR" \
-  --agentdesk-bin "$INSTALL_DIR/bin/agentdesk" \
-  --output "$PLIST_PATH"
+emit_launchd_plist "$INSTALL_DIR/bin/agentdesk" "$PLIST_PATH"
 
 ok "Launchd plist: $PLIST_PATH"
 
@@ -391,8 +450,8 @@ if launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST_PATH" 2>/dev/null; then
   sleep 3
 
   # Health check
-  if curl -sf --max-time 5 "http://${DEFAULT_LOOPBACK}:$DEFAULT_PORT/api/health" | grep -q '"status":"healthy"'; then
-    ok "AgentDesk is running on port $DEFAULT_PORT"
+  if curl -sf --max-time 5 "http://${DEFAULT_LOOPBACK}:$INSTALL_PORT/api/health" | grep -q '"status":"healthy"'; then
+    ok "AgentDesk is running on port $INSTALL_PORT"
   else
     warn "Service started but health check pending. Check logs: $INSTALL_DIR/logs/"
   fi
@@ -402,7 +461,7 @@ else
 fi
 
 # ── Open browser ──────────────────────────────────────────────────────────────
-DASHBOARD_URL="http://${DEFAULT_LOOPBACK}:$DEFAULT_PORT"
+DASHBOARD_URL="http://${DEFAULT_LOOPBACK}:$INSTALL_PORT"
 
 echo ""
 echo -e "${BOLD}═══ Installation Complete ═══${NC}"
