@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use super::contract::{FixSafety, SecurityExposure, Severity};
+use super::startup::LATEST_STARTUP_DOCTOR_ENDPOINT;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ClassifiedReason {
@@ -11,6 +12,10 @@ pub(crate) struct ClassifiedReason {
     pub(crate) security_exposure: SecurityExposure,
     pub(crate) summary: String,
     pub(crate) next_step: String,
+}
+
+fn startup_doctor_report_next_step() -> String {
+    format!("inspect the startup doctor report via {LATEST_STARTUP_DOCTOR_ENDPOINT}")
 }
 
 pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
@@ -129,7 +134,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!("startup doctor reported {count} failure(s)"),
-            next_step: "inspect the startup doctor logs or report".to_string(),
+            next_step: startup_doctor_report_next_step(),
         },
         ["startup_doctor_warned", count] => ClassifiedReason {
             raw: raw.to_string(),
@@ -138,7 +143,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             fix_safety: FixSafety::ReadOnly,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: format!("startup doctor reported {count} warning(s)"),
-            next_step: "inspect the startup doctor logs or report".to_string(),
+            next_step: startup_doctor_report_next_step(),
         },
         ["disk_low_free_bytes", bytes] => ClassifiedReason {
             raw: raw.to_string(),
