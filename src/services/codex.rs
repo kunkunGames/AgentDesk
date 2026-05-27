@@ -645,6 +645,25 @@ fn should_reuse_existing_provider_session(
 }
 
 #[cfg(unix)]
+fn codex_wrapper_script_uses_pipe_input(script: &str) -> bool {
+    script
+        .lines()
+        .any(|line| line.trim() == "--input-mode pipe \\" || line.trim() == "--input-mode pipe")
+}
+
+#[cfg(unix)]
+fn codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name: &str) -> bool {
+    let Some(script_path) =
+        crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "sh")
+    else {
+        return false;
+    };
+    std::fs::read_to_string(script_path)
+        .map(|script| codex_wrapper_script_uses_pipe_input(&script))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CodexTmuxTerminationReason {
     reason_code: &'static str,
@@ -1948,7 +1967,8 @@ fn execute_streaming_local_tmux(
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
     let session_usable = tmux_session_has_live_pane(tmux_session_name)
         && resolved_output.is_some()
-        && resolved_input.is_some();
+        && resolved_input.is_some()
+        && codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name);
 
     if should_reuse_existing_provider_session(session_usable, force_fresh_provider_session) {
         let output_path = resolved_output
@@ -2756,7 +2776,7 @@ mod tui_hosting_tests {
     #[cfg(unix)]
     use super::{
         codex_tui_existing_session_termination_reason,
-        codex_wrapper_existing_session_termination_reason,
+        codex_wrapper_existing_session_termination_reason, codex_wrapper_script_uses_pipe_input,
     };
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
@@ -3073,6 +3093,16 @@ mod tui_hosting_tests {
         assert!(script.contains("--input-mode pipe"));
         assert!(!script.contains("mkfifo"));
         assert!(!script.contains("exec '/opt/bin/codex' "));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_wrapper_pipe_input_detector_rejects_legacy_scripts() {
+        let pipe_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-mode pipe \\\n";
+        let legacy_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-fifo /tmp/in \\\n";
+
+        assert!(codex_wrapper_script_uses_pipe_input(pipe_script));
+        assert!(!codex_wrapper_script_uses_pipe_input(legacy_script));
     }
 
     #[test]

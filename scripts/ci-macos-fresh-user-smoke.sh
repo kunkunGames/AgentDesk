@@ -13,6 +13,7 @@ python3 -m unittest tests.test_install_bootstrap_portable
 
 runner_temp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 smoke_base="$(mktemp -d "$runner_temp/agentdesk-fresh-user.XXXXXX")"
+smoke_base="$(cd "$smoke_base" && pwd -P)"
 trap 'rm -rf "$smoke_base"' EXIT
 
 fresh_home="$smoke_base/home"
