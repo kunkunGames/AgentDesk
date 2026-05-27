@@ -84,6 +84,59 @@ class PortableOperatorMigrationTests(unittest.TestCase):
 
         self.assertEqual(output, [str(root), str(vault), str(agents_src)])
 
+    def test_shell_resolver_reapplies_launchd_env_after_zprofile(self):
+        bash_path = shutil.which("bash")
+        if bash_path is None:
+            self.skipTest("bash is unavailable")
+        if os.name == "nt" and Path(bash_path).resolve().as_posix().lower().endswith(
+            "/windows/system32/bash.exe"
+        ):
+            self.skipTest("Windows WSL bash launcher does not reliably inherit env overrides")
+
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / "home"
+            home.mkdir()
+            root = Path(temp) / "release"
+            remote = root / "ObsidianVault" / "RemoteVault"
+            stale = Path(temp) / "stale"
+            (home / ".zprofile").write_text(
+                "\n".join(
+                    [
+                        f"export AGENTDESK_ROOT_DIR={stale / 'release'}",
+                        f"export OBSIDIAN_REMOTE_VAULT_ROOT={stale / 'RemoteVault'}",
+                        f"export PATH={stale / 'bin'}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            command = (
+                "source scripts/launchd-migrated/_portable-resolver.sh; "
+                "agentdesk_source_portable_resolver; "
+                'printf "%s\\n%s\\n%s\\n" '
+                '"$AGENTDESK_ROOT_DIR" "$OBSIDIAN_REMOTE_VAULT_ROOT" "$PATH"'
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "AGENTDESK_ROOT_DIR": str(root),
+                    "OBSIDIAN_REMOTE_VAULT_ROOT": str(remote),
+                    "PATH": "/launchd/bin",
+                }
+            )
+            output = subprocess.check_output(
+                ["bash", "-lc", command],
+                cwd=ROOT,
+                env=env,
+                encoding="utf-8",
+                text=True,
+            ).splitlines()
+
+        self.assertEqual(output[0], str(root))
+        self.assertEqual(output[1], str(remote))
+        self.assertIn("/launchd/bin", output[2])
+        self.assertNotIn(str(stale), output[2])
+
     def test_shell_resolver_declares_legacy_override_defaults(self):
         resolver = (ROOT / "scripts" / "launchd-migrated" / "_portable-resolver.sh").read_text(
             encoding="utf-8"
@@ -94,7 +147,7 @@ class PortableOperatorMigrationTests(unittest.TestCase):
             resolver,
         )
         self.assertIn(
-            'export OBSIDIAN_VAULT_ROOT="${OBSIDIAN_VAULT_ROOT:-$HOME/ObsidianVault}"',
+            '$AGENTDESK_ROOT_DIR/ObsidianVault',
             resolver,
         )
         self.assertIn(

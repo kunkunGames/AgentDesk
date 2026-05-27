@@ -240,10 +240,18 @@ fn obsidian_remote_vault_root() -> Option<PathBuf> {
     explicit_env_path("OBSIDIAN_REMOTE_VAULT_ROOT").or_else(|| {
         explicit_env_path("OBSIDIAN_VAULT_ROOT")
             .map(|root| root.join("RemoteVault"))
+            .or_else(runtime_root_obsidian_remote_vault_root)
             .or_else(|| {
                 operator_home_dir().map(|home| home.join("ObsidianVault").join("RemoteVault"))
             })
     })
+}
+
+fn runtime_root_obsidian_remote_vault_root() -> Option<PathBuf> {
+    let remote = crate::config::runtime_root()?
+        .join("ObsidianVault")
+        .join("RemoteVault");
+    remote.exists().then_some(remote)
 }
 
 fn operator_home_dir() -> Option<PathBuf> {
@@ -279,6 +287,7 @@ mod tests {
         let saved_remote_root = std::env::var_os("OBSIDIAN_REMOTE_VAULT_ROOT");
         let saved_agents_src = std::env::var_os("AGENTDESK_OBSIDIAN_AGENTS_SRC");
         let saved_skill_root = std::env::var_os("AGENTDESK_OBSIDIAN_SKILL_ROOT");
+        let saved_runtime_root = std::env::var_os("AGENTDESK_ROOT_DIR");
 
         f();
 
@@ -288,6 +297,7 @@ mod tests {
         restore_env("OBSIDIAN_REMOTE_VAULT_ROOT", saved_remote_root);
         restore_env("AGENTDESK_OBSIDIAN_AGENTS_SRC", saved_agents_src);
         restore_env("AGENTDESK_OBSIDIAN_SKILL_ROOT", saved_skill_root);
+        restore_env("AGENTDESK_ROOT_DIR", saved_runtime_root);
     }
 
     fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
@@ -368,6 +378,41 @@ mod tests {
             let summary = OptionalConnectorSummary::from_statuses(&[status]);
             assert_eq!(summary.missing_path, 1);
             assert_eq!(summary.invalid, 1);
+        });
+    }
+
+    #[test]
+    fn runtime_root_obsidian_stubs_are_discoverable_without_obsidian_env() {
+        with_connector_env(|| {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().join("home");
+            let root = temp.path().join("release");
+            let remote = root.join("ObsidianVault").join("RemoteVault");
+            std::fs::create_dir_all(remote.join("adk-config").join("agents")).unwrap();
+            std::fs::create_dir_all(remote.join("99_Skills")).unwrap();
+            unsafe {
+                std::env::set_var("HOME", &home);
+                std::env::set_var("USERPROFILE", &home);
+                std::env::set_var("AGENTDESK_ROOT_DIR", &root);
+                std::env::remove_var("OBSIDIAN_VAULT_ROOT");
+                std::env::remove_var("OBSIDIAN_REMOTE_VAULT_ROOT");
+                std::env::remove_var("AGENTDESK_OBSIDIAN_AGENTS_SRC");
+                std::env::remove_var("AGENTDESK_OBSIDIAN_SKILL_ROOT");
+            }
+
+            let statuses = optional_connector_statuses();
+
+            assert!(
+                statuses
+                    .iter()
+                    .all(|status| status.state == OptionalConnectorState::Ready)
+            );
+            assert!(statuses.iter().all(|status| {
+                status
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.contains("ObsidianVault"))
+            }));
         });
     }
 }

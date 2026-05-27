@@ -75,6 +75,16 @@ class LaunchdMigratedEntrypointTests(unittest.TestCase):
         self.assertTrue((ENTRYPOINT_DIR / "token-daily-report.py").exists())
         self.assertIn("$SCRIPT_DIR/token-daily-report.py", token_shell)
 
+    def test_queue_stability_entrypoint_is_release_packaged(self) -> None:
+        self.assertTrue((REPO_ROOT / "scripts" / "queue-stability-batch.sh").exists())
+        for path in (
+            REPO_ROOT / "scripts" / "build-release.sh",
+            REPO_ROOT / "scripts" / "deploy-release.sh",
+        ):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("queue-stability-batch.sh", text)
+            self.assertIn("_defaults.sh", text)
+
     def test_output_files_use_unique_tmp_paths(self) -> None:
         helper = (ENTRYPOINT_DIR / "run-claude-message-job.sh").read_text(
             encoding="utf-8"

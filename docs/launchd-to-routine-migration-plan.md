@@ -356,8 +356,8 @@ re-runs at dcserver boot).
    ```
    Note `schedule` is omitted — the routine has no `next_due_at`, so it
    cannot fire.
-2. Verify the row is paused. Calling pause again is safe but no longer
-   required for migrated launchd routines:
+2. Verify the row is paused. Calling pause again is idempotent but no
+   longer required for migrated launchd routines:
    ```bash
    curl -sf "$API/api/routines/<id>/pause" -X POST
    ```

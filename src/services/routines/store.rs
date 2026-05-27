@@ -1867,7 +1867,9 @@ impl RoutineStore {
         .await
     }
 
-    /// Pause an enabled routine.
+    /// Pause an enabled routine; already-paused rows are treated as an
+    /// idempotent success so migrated launchd cutover scripts can safely call
+    /// pause after attaching rows that default to paused.
     ///
     /// `next_due_at` is preserved on purpose (#2395). Clearing it here makes
     /// the resume PATCH-semantics meaningless for routines that only have an
@@ -1883,7 +1885,7 @@ impl RoutineStore {
             SET status = 'paused',
                 updated_at = NOW()
             WHERE id = $1
-              AND status = 'enabled'
+              AND status IN ('enabled', 'paused')
             "#,
         )
         .bind(routine_id)

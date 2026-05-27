@@ -211,10 +211,7 @@ fn migrated_launchd_builtin_required_paths(script_ref: &str) -> AppResult<Vec<Re
             | "migrated-launchd/memory-merge.js"
     ) {
         let workdir = migrated_env_path("AGENTDESK_MIGRATED_AGENTFACTORY_WORKDIR")
-            .or_else(|| {
-                crate::config::runtime_root()
-                    .map(|root| root.join("workspaces").join("agentfactory"))
-            })
+            .or_else(|| migrated_workspace_path("agentfactory"))
             .ok_or_else(|| {
                 AppError::conflict(format!(
                     "migrated routine {script_ref} is invalid: AGENTDESK_MIGRATED_AGENTFACTORY_WORKDIR is unavailable"
@@ -244,6 +241,12 @@ fn migrated_launchd_builtin_required_paths(script_ref: &str) -> AppResult<Vec<Re
         });
     }
     Ok(paths)
+}
+
+fn migrated_workspace_path(name: &str) -> Option<std::path::PathBuf> {
+    migrated_env_path("AGENTDESK_WORKSPACE_ROOT")
+        .map(|root| root.join(name))
+        .or_else(|| crate::config::runtime_root().map(|root| root.join("workspaces").join(name)))
 }
 
 fn migrated_required_paths_from_checkpoint(
@@ -623,6 +626,39 @@ mod tests {
             Some(&checkpoint),
         )
         .expect("existing required file should pass");
+    }
+
+    #[test]
+    fn migrated_launchd_builtin_workdir_honors_workspace_root() {
+        let _lock = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("workspaces-custom");
+        let agentfactory = workspace_root.join("agentfactory");
+        std::fs::create_dir_all(&agentfactory).unwrap();
+        let previous_workspace_root = std::env::var_os("AGENTDESK_WORKSPACE_ROOT");
+        let previous_agentfactory = std::env::var_os("AGENTDESK_MIGRATED_AGENTFACTORY_WORKDIR");
+        unsafe {
+            std::env::set_var("AGENTDESK_WORKSPACE_ROOT", &workspace_root);
+            std::env::remove_var("AGENTDESK_MIGRATED_AGENTFACTORY_WORKDIR");
+        }
+
+        validate_migrated_launchd_required_paths(
+            "migrated-launchd/memento-daily-report.js",
+            None,
+            None,
+        )
+        .expect("AGENTDESK_WORKSPACE_ROOT/agentfactory should satisfy builtin validation");
+
+        match previous_workspace_root {
+            Some(value) => unsafe { std::env::set_var("AGENTDESK_WORKSPACE_ROOT", value) },
+            None => unsafe { std::env::remove_var("AGENTDESK_WORKSPACE_ROOT") },
+        }
+        match previous_agentfactory {
+            Some(value) => unsafe {
+                std::env::set_var("AGENTDESK_MIGRATED_AGENTFACTORY_WORKDIR", value)
+            },
+            None => unsafe { std::env::remove_var("AGENTDESK_MIGRATED_AGENTFACTORY_WORKDIR") },
+        }
     }
 
     #[test]
