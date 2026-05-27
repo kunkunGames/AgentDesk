@@ -16,10 +16,12 @@
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-REPO="itismyfield/AgentDesk"
-INSTALL_DIR="$HOME/.adk/release"
+REPO="${AGENTDESK_INSTALL_REPO:-itismyfield/AgentDesk}"
+INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$HOME/.adk/release}"
 LAUNCHD_LABEL="com.agentdesk.release"
 CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
+CONFIG_PATH="$INSTALL_DIR/config/agentdesk.yaml"
+LEGACY_CONFIG_PATH="$INSTALL_DIR/agentdesk.yaml"
 
 # Read defaults from defaults.json if available (single source of truth)
 _read_default() {
@@ -78,12 +80,12 @@ Recommended path:
   1. Download the release tarball or build from source
      cargo build --release
   2. Initialize the runtime
-     ./target/release/agentdesk --init
+     ./target/release/agentdesk init
   3. Start the server and run diagnostics
      ./target/release/agentdesk dcserver
      ./target/release/agentdesk doctor
 
-Use the service path printed by \`agentdesk --init\` when registering a systemd --user service.
+Use the service path printed by \`agentdesk init\` when registering a systemd --user service.
 Docs: $docs_url
 EOF
       ;;
@@ -94,12 +96,12 @@ Recommended path:
   1. Download the release zip or build from source
      cargo build --release
   2. Initialize the runtime
-     .\\target\\release\\agentdesk.exe --init
+     .\\target\\release\\agentdesk.exe init
   3. Start the server and run diagnostics
      .\\target\\release\\agentdesk.exe dcserver
      .\\target\\release\\agentdesk.exe doctor
 
-Use the NSSM / sc.exe service path printed by \`agentdesk.exe --init\`.
+Use the NSSM / sc.exe service path printed by \`agentdesk.exe init\`.
 Docs: $docs_url
 EOF
       ;;
@@ -173,8 +175,13 @@ fi
 ARTIFACT="agentdesk-${OS}-${ARCH}"
 
 info "Checking latest release..."
-LATEST_TAG=$(curl -sfL "https://api.github.com/repos/$REPO/releases/latest" \
-  | grep '"tag_name"' | head -1 | sed 's/.*: *"\(.*\)".*/\1/')
+LATEST_TAG=$(
+  curl -sfL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep '"tag_name"' \
+    | head -1 \
+    | sed 's/.*: *"\(.*\)".*/\1/' \
+    || true
+)
 
 if [ -z "$LATEST_TAG" ]; then
   # No releases yet — fall back to building from source
@@ -293,8 +300,9 @@ if [ "$OS" = "darwin" ]; then
 fi
 
 # ── Create default config if not exists ───────────────────────────────────────
-if [ ! -f "$INSTALL_DIR/agentdesk.yaml" ]; then
-  cat > "$INSTALL_DIR/agentdesk.yaml" << YAML
+if [ ! -f "$CONFIG_PATH" ] && [ ! -f "$LEGACY_CONFIG_PATH" ]; then
+  mkdir -p "$(dirname "$CONFIG_PATH")"
+  cat > "$CONFIG_PATH" << YAML
 # AgentDesk Configuration
 # Edit this file to add Discord bot tokens and customize settings.
 # Run the web onboarding wizard for guided setup: http://${DEFAULT_LOOPBACK}:${DEFAULT_PORT}
@@ -320,7 +328,11 @@ memory:
 # automation:
 #   strategy: "squash"
 YAML
-  ok "Created default config: $INSTALL_DIR/agentdesk.yaml"
+  ok "Created default config: $CONFIG_PATH"
+elif [ -f "$CONFIG_PATH" ]; then
+  ok "Using existing config: $CONFIG_PATH"
+else
+  ok "Using existing legacy config: $LEGACY_CONFIG_PATH"
 fi
 
 # ── Register launchd service ──────────────────────────────────────────────────
@@ -371,7 +383,12 @@ echo ""
 echo -e "${BOLD}═══ Installation Complete ═══${NC}"
 echo ""
 echo -e "  Dashboard:  ${CYAN}$DASHBOARD_URL${NC}"
-echo -e "  Config:     $INSTALL_DIR/agentdesk.yaml"
+if [ -f "$CONFIG_PATH" ]; then
+  DISPLAY_CONFIG_PATH="$CONFIG_PATH"
+else
+  DISPLAY_CONFIG_PATH="$LEGACY_CONFIG_PATH"
+fi
+echo -e "  Config:     $DISPLAY_CONFIG_PATH"
 echo -e "  Logs:       $INSTALL_DIR/logs/"
 echo -e "  Data:       $INSTALL_DIR/data/"
 echo ""

@@ -15,8 +15,11 @@ curl -fsSL https://raw.githubusercontent.com/itismyfield/AgentDesk/main/scripts/
 This will:
 1. Download the latest release (or build from source if no release is available)
 2. Install to `~/.adk/release/`
-3. Register a launchd service (auto-starts on boot)
-4. Open the web dashboard for guided onboarding
+3. Create `~/.adk/release/config/agentdesk.yaml`
+4. Register a launchd service (auto-starts on boot)
+5. Open the web dashboard for guided onboarding
+
+Set `AGENTDESK_INSTALL_REPO` or `AGENTDESK_INSTALL_DIR` before running the installer when you need to test a fork or install into a sandboxed runtime root.
 
 For a portable operator scaffold before wiring real Discord or connector secrets, run:
 
@@ -743,7 +746,7 @@ Full API documentation is available at `/api/docs` when the server is running, w
 
 ## Limitations
 
-- **Installer is macOS-focused** — The `curl | bash` installer and launchd integration target macOS. Linux systemd and Windows service support exist in `--init`, but native runtime setup is still a manual path.
+- **Installer is macOS-focused** — The `curl | bash` installer and launchd integration target macOS. Linux systemd and Windows service support exist through `agentdesk init`, but native runtime setup is still a manual path.
 - **Node-local provider execution** — Agents run on registered AgentDesk nodes. Each node still needs its own authenticated provider CLIs and local MCP/tooling for the capabilities it advertises.
 - **Discord-dependent** — Agent communication requires Discord. There is no built-in alternative messaging backend.
 - **tmux optional** — Agent sessions use tmux by default, but a backend process mode is available that does not require tmux. That fallback keeps heartbeats, not tmux-style watcher reattachment after restart.
