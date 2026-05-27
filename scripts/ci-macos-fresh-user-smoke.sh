@@ -9,6 +9,8 @@ fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+python3 -m unittest tests.test_install_bootstrap_portable
+
 runner_temp="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 smoke_base="$(mktemp -d "$runner_temp/agentdesk-fresh-user.XXXXXX")"
 trap 'rm -rf "$smoke_base"' EXIT
