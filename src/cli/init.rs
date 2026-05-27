@@ -379,6 +379,15 @@ fn launchd_label(flavor: LaunchdPlistFlavorArg) -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
+fn resolved_launchd_label(flavor: LaunchdPlistFlavorArg, label: Option<&str>) -> String {
+    label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| launchd_label(flavor).to_string())
+}
+
+#[cfg(target_os = "macos")]
 fn launchd_plist_filename(flavor: LaunchdPlistFlavorArg) -> String {
     format!("{}.plist", launchd_label(flavor))
 }
@@ -444,6 +453,7 @@ fn generate_launchd_plist(home: &Path, agentdesk_bin: &Path) -> String {
         home,
         agentdesk_bin,
         &root_dir,
+        None,
     )
 }
 
@@ -453,10 +463,11 @@ fn generate_launchd_plist_for_flavor_with_root(
     home: &Path,
     agentdesk_bin: &Path,
     root_dir: &Path,
+    label_override: Option<&str>,
 ) -> String {
     let home_str = home.display();
     let bin_str = agentdesk_bin.display();
-    let label = launchd_label(flavor);
+    let label = resolved_launchd_label(flavor, label_override);
     let root_str = root_dir.display();
     let logs_dir = root_dir.join("logs");
     let logs_str = logs_dir.display();
@@ -1110,8 +1121,13 @@ pub(crate) fn handle_emit_launchd_plist(args: &EmitLaunchdPlistArgs) -> Result<(
         None => std::env::current_exe()
             .map_err(|e| format!("Failed to resolve current agentdesk executable: {e}"))?,
     };
-    let plist =
-        generate_launchd_plist_for_flavor_with_root(args.flavor, &home, &agentdesk_bin, &root_dir);
+    let plist = generate_launchd_plist_for_flavor_with_root(
+        args.flavor,
+        &home,
+        &agentdesk_bin,
+        &root_dir,
+        args.label.as_deref(),
+    );
 
     if let Some(output_path) = &args.output {
         if let Some(parent) = output_path.parent() {
@@ -1242,6 +1258,7 @@ mod tests {
             temp_dir.path(),
             &root_dir.join("bin").join("agentdesk"),
             &root_dir,
+            None,
         );
 
         assert!(plist.contains("<key>MEMENTO_ACCESS_KEY</key>"));
@@ -1261,6 +1278,7 @@ mod tests {
             &home,
             &root_dir.join("bin").join("agentdesk"),
             &root_dir,
+            None,
         );
 
         assert!(plist.contains("<string>com.agentdesk.release</string>"));
@@ -1282,6 +1300,25 @@ mod tests {
                 .join("dcserver.launchd.stderr.log")
                 .display()
         )));
+        assert_plist_xml_valid(&plist);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generate_launchd_plist_uses_custom_label_override() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = temp_dir.path().join("home");
+        let root_dir = home.join(".adk").join("sandbox");
+        let plist = generate_launchd_plist_for_flavor_with_root(
+            LaunchdPlistFlavorArg::Release,
+            &home,
+            &root_dir.join("bin").join("agentdesk"),
+            &root_dir,
+            Some("com.agentdesk.release.sandbox.123"),
+        );
+
+        assert!(plist.contains("<string>com.agentdesk.release.sandbox.123</string>"));
+        assert!(!plist.contains("<string>com.agentdesk.release</string>"));
         assert_plist_xml_valid(&plist);
     }
 
@@ -1458,6 +1495,7 @@ mod launchd_plist_tests {
             &home,
             &root_dir.join("bin").join("agentdesk"),
             &root_dir,
+            None,
         );
 
         assert!(!plist.contains("<key>HardResourceLimits</key>"));
@@ -1483,6 +1521,7 @@ mod launchd_plist_tests {
             &home,
             &agentdesk_bin,
             &root_dir,
+            None,
         );
 
         assert!(plist.contains(&format!("<string>{}</string>", home.display())));

@@ -17,8 +17,9 @@
 set -euo pipefail
 
 REPO="${AGENTDESK_INSTALL_REPO:-itismyfield/AgentDesk}"
-INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$HOME/.adk/release}"
-LAUNCHD_LABEL="com.agentdesk.release"
+DEFAULT_INSTALL_DIR="$HOME/.adk/release"
+INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+LAUNCHD_LABEL="${AGENTDESK_LAUNCHD_LABEL:-}"
 CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
 CONFIG_PATH="$INSTALL_DIR/config/agentdesk.yaml"
 LEGACY_CONFIG_PATH="$INSTALL_DIR/agentdesk.yaml"
@@ -65,6 +66,25 @@ launchd_domain() {
     fi
   done
   printf 'gui/%s\n' "$uid"
+}
+
+default_launchd_label() {
+  if [ "$INSTALL_DIR" = "$DEFAULT_INSTALL_DIR" ]; then
+    printf '%s\n' "com.agentdesk.release"
+    return
+  fi
+
+  local base slug checksum
+  base="$(basename "$INSTALL_DIR")"
+  slug="$(
+    printf '%s' "$base" \
+      | tr '[:upper:]' '[:lower:]' \
+      | tr -cs '[:alnum:]' '-' \
+      | sed 's/^-//;s/-$//;s/--*/-/g'
+  )"
+  [ -n "$slug" ] || slug="sandbox"
+  checksum="$(printf '%s' "$INSTALL_DIR" | cksum | awk '{print $1}')"
+  printf 'com.agentdesk.release.%s.%s\n' "$slug" "$checksum"
 }
 
 print_native_runtime_help() {
@@ -157,6 +177,10 @@ esac
 if [ "$OS" != "darwin" ]; then
   print_native_runtime_help "$OS"
   fail "One-click installer is only available on macOS."
+fi
+
+if [ -z "$LAUNCHD_LABEL" ]; then
+  LAUNCHD_LABEL="$(default_launchd_label)"
 fi
 
 echo ""
@@ -343,6 +367,7 @@ PLIST_PATH="$PLIST_DIR/$LAUNCHD_LABEL.plist"
 mkdir -p "$PLIST_DIR"
 "$INSTALL_DIR/bin/agentdesk" emit-launchd-plist \
   --flavor release \
+  --label "$LAUNCHD_LABEL" \
   --home "$HOME" \
   --root-dir "$INSTALL_DIR" \
   --agentdesk-bin "$INSTALL_DIR/bin/agentdesk" \

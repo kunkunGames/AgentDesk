@@ -19,7 +19,7 @@ This will:
 4. Register a launchd service (auto-starts on boot)
 5. Open the web dashboard for guided onboarding
 
-Set `AGENTDESK_INSTALL_REPO` or `AGENTDESK_INSTALL_DIR` before running the installer when you need to test a fork or install into a sandboxed runtime root.
+Set `AGENTDESK_INSTALL_REPO` or `AGENTDESK_INSTALL_DIR` before running the installer when you need to test a fork or install into a sandboxed runtime root. Non-default install roots get an isolated launchd label automatically; set `AGENTDESK_LAUNCHD_LABEL` only when you need an explicit label.
 
 For a portable operator scaffold before wiring real Discord or connector secrets, run:
 

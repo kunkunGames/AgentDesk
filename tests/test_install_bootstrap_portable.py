@@ -19,7 +19,10 @@ class InstallBootstrapPortableTests(unittest.TestCase):
         text = self.read_script()
 
         self.assertIn('REPO="${AGENTDESK_INSTALL_REPO:-itismyfield/AgentDesk}"', text)
-        self.assertIn('INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$HOME/.adk/release}"', text)
+        self.assertIn('DEFAULT_INSTALL_DIR="$HOME/.adk/release"', text)
+        self.assertIn('INSTALL_DIR="${AGENTDESK_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"', text)
+        self.assertIn('LAUNCHD_LABEL="${AGENTDESK_LAUNCHD_LABEL:-}"', text)
+        self.assertIn('--label "$LAUNCHD_LABEL"', text)
 
     def test_installer_creates_canonical_config_before_legacy_config(self):
         text = self.read_script()
@@ -46,7 +49,7 @@ class InstallBootstrapPortableTests(unittest.TestCase):
             temp = Path(tmp)
             fakebin = temp / "fakebin"
             home = temp / "fresh-home"
-            runtime_root = home / ".adk" / "release"
+            runtime_root = home / ".adk" / "sandbox-release"
             tmpdir = temp / "tmp"
             fakebin.mkdir()
             home.mkdir()
@@ -101,8 +104,10 @@ class InstallBootstrapPortableTests(unittest.TestCase):
                   root=""
                   bin=""
                   output=""
+                  label=""
                   while [[ "$#" -gt 0 ]]; do
                     case "$1" in
+                      --label) label="$2"; shift 2 ;;
                       --home) home="$2"; shift 2 ;;
                       --root-dir) root="$2"; shift 2 ;;
                       --agentdesk-bin) bin="$2"; shift 2 ;;
@@ -113,6 +118,8 @@ class InstallBootstrapPortableTests(unittest.TestCase):
                   mkdir -p "$(dirname "$output")"
                   cat > "$output" <<PLIST
                 <plist>
+                  <key>Label</key>
+                  <string>${label}</string>
                   <string>${home}</string>
                   <string>${root}</string>
                   <string>${bin}</string>
@@ -132,7 +139,7 @@ class InstallBootstrapPortableTests(unittest.TestCase):
                 exit 0
                 """,
             )
-            for command in ("codesign", "chflags", "launchctl", "xattr", "open"):
+            for command in ("codesign", "chflags", "launchctl", "sudo", "xattr", "open"):
                 self.write_executable(fakebin / command, "exit 0\n")
 
             env = os.environ.copy()
@@ -142,6 +149,7 @@ class InstallBootstrapPortableTests(unittest.TestCase):
                     "HOME": str(home),
                     "TMPDIR": str(tmpdir),
                     "AGENTDESK_INSTALL_REPO": "example/AgentDesk",
+                    "AGENTDESK_INSTALL_DIR": str(runtime_root),
                     "AGENTDESK_CODESIGN_IDENTITY": "-",
                 }
             )
@@ -159,16 +167,22 @@ class InstallBootstrapPortableTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             config = runtime_root / "config" / "agentdesk.yaml"
             legacy_config = runtime_root / "agentdesk.yaml"
-            plist = home / "Library" / "LaunchAgents" / "com.agentdesk.release.plist"
+            default_plist = home / "Library" / "LaunchAgents" / "com.agentdesk.release.plist"
+            sandbox_plists = sorted((home / "Library" / "LaunchAgents").glob("com.agentdesk.release.sandbox-release.*.plist"))
 
             self.assertTrue(config.is_file(), result.stdout)
             self.assertFalse(legacy_config.exists(), result.stdout)
+            self.assertFalse(default_plist.exists(), result.stdout)
+            self.assertEqual(len(sandbox_plists), 1, result.stdout)
+            plist = sandbox_plists[0]
             self.assertTrue(plist.is_file(), result.stdout)
             self.assertIn(f"Config:     {config}", result.stdout)
 
             rendered = config.read_text(encoding="utf-8") + plist.read_text(encoding="utf-8")
             self.assertIn(str(home), rendered)
             self.assertIn(str(runtime_root), rendered)
+            self.assertNotIn("<string>com.agentdesk.release</string>", rendered)
+            self.assertIn("<string>com.agentdesk.release.sandbox-release.", rendered)
             self.assertNotIn("/Users/itismyfield", rendered)
             self.assertNotIn("/Users/kunkun", rendered)
             self.assertNotIn("mac-mini-release", rendered)
