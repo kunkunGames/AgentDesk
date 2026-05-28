@@ -41,11 +41,11 @@ function promptFor(targetKey) {
     `case_id=probe-${targetKey}-${today}`,
     "",
     "family-profile-probe skill workflow를 실행하라.",
-    "이 턴은 ADK routine이 시작한 headless turn이다. Python launchd timing script는 실행하지 말 것.",
-    "반드시 memento에서 오늘 caseId를 먼저 recall해서 message_id=가 이미 있으면 즉시 중단하라.",
-    "아직 전송되지 않았으면 memento profile/gap recall -> 질문 작성 -> /api/senddm 전송 -> message_id 포함 probe-history 기록까지 수행하라.",
-    "DM 전송 시 idempotency_key는 caseId와 동일하게 사용하고 source_agent/context/ttl_seconds는 넣지 말 것.",
-    "채널에는 보이는 응답을 남기지 말 것. 완료/중단 후 최종 assistant 메시지는 NO_REPLY 한 줄만 출력하라.",
+    "이 턴은 ADK routine이 대상 사용자의 DM 채널에서 직접 시작한 headless turn이다. Python launchd timing script와 /api/senddm은 실행하지 말 것.",
+    "반드시 memento에서 오늘 caseId를 먼저 recall해서 dm_bound_turn 또는 message_id=가 이미 있으면 질문을 다시 보내지 말고 NO_REPLY로 중단하라.",
+    "아직 전송되지 않았으면 memento profile/gap recall -> 질문 작성 -> probe-history에 dm_bound_turn 기록 -> 최종 assistant 메시지로 질문 한 줄만 출력하라.",
+    "최종 assistant 메시지가 곧 사용자에게 보이는 DM 질문이다. 질문 외 설명, 진행 로그, NO_REPLY를 함께 출력하지 말 것.",
+    "사용자의 답변은 같은 DM 세션에서 이어질 수 있으므로 방금 물은 질문을 세션 문맥으로 유지하고, 그래도 답변 처리 때는 memento caseId로 재확인하라.",
   ].join("\n");
 }
 
@@ -93,6 +93,7 @@ agentdesk.routines.register({
 
     return {
       action: "agent",
+      dmUserId: TARGET_DISCORD_ID,
       prompt: promptFor(TARGET_KEY),
       checkpoint: nextCheckpoint,
     };
