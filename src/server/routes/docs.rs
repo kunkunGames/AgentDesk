@@ -201,6 +201,17 @@ fn path_param(description: &'static str) -> ParamDoc {
     }
 }
 
+fn header_param(kind: &'static str, required: bool, description: &'static str) -> ParamDoc {
+    ParamDoc {
+        location: "header",
+        kind,
+        required,
+        description,
+        enum_values: None,
+        default: None,
+    }
+}
+
 fn query_param(kind: &'static str, required: bool, description: &'static str) -> ParamDoc {
     ParamDoc {
         location: "query",
@@ -3041,8 +3052,43 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/github/repos/{owner}/{repo}/sync",
             "github",
-            "Sync GitHub repo // TODO: example",
-        ),
+            "Synchronously fetch GitHub issues for one registered repo, triage newly discovered issues into kanban cards, reconcile closed/mainline-linked issues into card state, and update github_repos.last_synced_at. Request body: none. Requirements: the repo must already exist in github_repos (register with POST /api/github/repos or configure it), Postgres must be available, and the server host must have authenticated gh CLI access to the target repo. Auth: include Authorization: Bearer <token> when config.server.auth_token is set; local unauthenticated use is allowed only when server auth is disabled.",
+        )
+        .with_params([
+            (
+                "owner",
+                path_param("GitHub owner or organization path segment, for example `itismyfield`"),
+            ),
+            (
+                "repo",
+                path_param("GitHub repository name path segment, for example `AgentDesk`"),
+            ),
+            (
+                "Authorization",
+                header_param(
+                    "string",
+                    false,
+                    "Bearer token required when config.server.auth_token is set",
+                ),
+            ),
+        ])
+        .with_example(
+            json!({"path": {"owner": "itismyfield", "repo": "AgentDesk"}}),
+            json!({
+                "synced": true,
+                "repo": "itismyfield/AgentDesk",
+                "issues_fetched": 12,
+                "cards_created": 2,
+                "cards_closed": 1,
+                "inconsistencies": 0
+            }),
+        )
+        .with_error_example(
+            404,
+            json!({"path": {"owner": "itismyfield", "repo": "UnknownRepo"}}),
+            json!({"error": "repo 'itismyfield/UnknownRepo' not registered"}),
+        )
+        .with_curl("curl -X POST http://localhost:8787/api/github/repos/itismyfield/AgentDesk/sync -H 'Authorization: Bearer <token>'"),
         ep(
             "GET",
             "/api/github-repos",

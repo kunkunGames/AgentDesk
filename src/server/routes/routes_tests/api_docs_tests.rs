@@ -887,6 +887,86 @@ async fn api_docs_flat_format_lists_routes_missing_from_legacy_docs() {
 }
 
 #[tokio::test]
+async fn api_docs_github_repo_sync_documents_request_response_and_auth_contract() {
+    let db = test_db();
+    let engine = test_engine(&db);
+    let app = test_api_router(db, engine, None);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/docs/integrations/github")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let endpoints = json["endpoints"]
+        .as_array()
+        .expect("github docs must return endpoint array");
+    let sync = endpoints
+        .iter()
+        .find(|ep| ep["method"] == "POST" && ep["path"] == "/api/github/repos/{owner}/{repo}/sync")
+        .expect("github repo sync endpoint must be documented");
+
+    let description = sync["description"].as_str().unwrap_or_default();
+    assert!(
+        !description.contains("TODO"),
+        "sync docs must not ship as TODO-only docs: {description}"
+    );
+    for marker in [
+        "Request body: none",
+        "Authorization: Bearer",
+        "Postgres",
+        "gh CLI",
+        "registered repo",
+    ] {
+        assert!(
+            description.contains(marker),
+            "sync docs description must mention {marker}: {description}"
+        );
+    }
+
+    assert_eq!(sync["params"]["owner"]["location"], "path");
+    assert_eq!(sync["params"]["repo"]["location"], "path");
+    assert_eq!(sync["params"]["Authorization"]["location"], "header");
+    assert_eq!(sync["params"]["Authorization"]["required"], false);
+    assert_eq!(sync["example"]["request"]["path"]["owner"], "itismyfield");
+    assert_eq!(sync["example"]["response"]["synced"], true);
+    assert_eq!(sync["example"]["response"]["repo"], "itismyfield/AgentDesk");
+    for field in [
+        "issues_fetched",
+        "cards_created",
+        "cards_closed",
+        "inconsistencies",
+    ] {
+        assert!(
+            sync["example"]["response"].get(field).is_some(),
+            "sync success example must include {field}"
+        );
+    }
+    assert_eq!(sync["error_example"]["status"], 404);
+    assert!(
+        sync["error_example"]["response"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not registered")
+    );
+    assert!(
+        sync["curl_example"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Authorization: Bearer <token>")
+    );
+}
+
+#[tokio::test]
 async fn api_docs_flat_format_omits_removed_legacy_routes() {
     let db = test_db();
     let engine = test_engine(&db);
