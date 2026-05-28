@@ -2903,10 +2903,7 @@ fn maybe_refresh_active_turn_activity_heartbeat_at(
     };
     let thread_channel_id = active_turn_thread_channel_id(adk_session_name, inflight_state);
 
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    let legacy_db = shared.sqlite.as_ref();
-    #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
-    let legacy_db = None::<&crate::db::Db>;
+    let legacy_db = super::tmux::sqlite_runtime_db(shared);
 
     if super::tmux::refresh_session_heartbeat_from_tmux_output(
         legacy_db,
