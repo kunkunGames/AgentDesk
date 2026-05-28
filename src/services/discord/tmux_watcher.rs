@@ -338,11 +338,23 @@ fn watcher_session_ready_for_input(
 ) -> bool {
     let runtime_kind =
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)
-            .map(|binding| binding.runtime_kind);
-    watcher_jsonl_turn_state_ready_for_input(provider, runtime_kind, output_path, current_offset)
-        .unwrap_or_else(|| {
-            crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
-        })
+            .map(|binding| binding.runtime_kind)
+            .or_else(|| {
+                crate::services::tmux_common::resolve_tmux_runtime_kind_marker(tmux_session_name)
+            });
+    if let Some(ready) = watcher_jsonl_turn_state_ready_for_input(
+        provider,
+        runtime_kind,
+        output_path,
+        current_offset,
+    ) {
+        return ready;
+    }
+    if crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind) {
+        crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
+    } else {
+        false
+    }
 }
 
 fn observe_qwen_user_prompts_in_buffer(

@@ -202,6 +202,19 @@ struct HostedTuiPromptReadinessSnapshot {
 }
 
 #[cfg(unix)]
+impl HostedTuiPromptReadinessSnapshot {
+    fn jsonl_authoritative(tmux_pane_alive: bool) -> Self {
+        Self {
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            tmux_pane_alive,
+            capture_available: false,
+            pane_tail: "<not captured; JSONL turn state is authoritative>".to_string(),
+        }
+    }
+}
+
+#[cfg(unix)]
 fn classify_claude_tui_followup_submission(
     snapshot: &HostedTuiPromptReadinessSnapshot,
     watcher_state: &'static str,
@@ -421,33 +434,6 @@ fn tui_busy_followup_diagnostic(
         return None;
     }
 
-    let snapshot = match provider {
-        ProviderKind::Codex => {
-            let snapshot =
-                crate::services::codex_tui::input::prompt_readiness_snapshot(tmux_session_name);
-            HostedTuiPromptReadinessSnapshot {
-                prompt_marker_detected: snapshot.composer_marker_detected,
-                prompt_draft_detected: snapshot.prompt_draft_detected,
-                tmux_pane_alive: snapshot.tmux_pane_alive,
-                capture_available: snapshot.capture_available,
-                pane_tail: snapshot.pane_tail,
-            }
-        }
-        _ => {
-            let snapshot =
-                crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
-            HostedTuiPromptReadinessSnapshot {
-                prompt_marker_detected: snapshot.prompt_marker_detected,
-                prompt_draft_detected: snapshot.prompt_draft_detected,
-                tmux_pane_alive: snapshot.tmux_pane_alive,
-                capture_available: snapshot.capture_available,
-                pane_tail: snapshot.pane_tail,
-            }
-        }
-    };
-    if hosted_tui_draft_should_enter_provider_recovery(provider, &snapshot) {
-        return None;
-    }
     let watcher_entry = shared
         .tmux_watchers
         .iter()
@@ -484,6 +470,48 @@ fn tui_busy_followup_diagnostic(
         ),
         _ => crate::services::tui_turn_state::TuiTurnState::Unknown,
     };
+    if transcript_turn_state == crate::services::tui_turn_state::TuiTurnState::Idle {
+        return None;
+    }
+    if transcript_turn_state.is_busy() {
+        let snapshot = HostedTuiPromptReadinessSnapshot::jsonl_authoritative(true);
+        return classify_claude_tui_followup_submission(
+            &snapshot,
+            watcher_state,
+            watcher_owner_channel_id,
+            inflight_state,
+            transcript_turn_state,
+            tmux_session_name,
+        );
+    }
+
+    let snapshot = match provider {
+        ProviderKind::Codex => {
+            let snapshot =
+                crate::services::codex_tui::input::prompt_readiness_snapshot(tmux_session_name);
+            HostedTuiPromptReadinessSnapshot {
+                prompt_marker_detected: snapshot.composer_marker_detected,
+                prompt_draft_detected: snapshot.prompt_draft_detected,
+                tmux_pane_alive: snapshot.tmux_pane_alive,
+                capture_available: snapshot.capture_available,
+                pane_tail: snapshot.pane_tail,
+            }
+        }
+        _ => {
+            let snapshot =
+                crate::services::claude_tui::input::prompt_readiness_snapshot(tmux_session_name);
+            HostedTuiPromptReadinessSnapshot {
+                prompt_marker_detected: snapshot.prompt_marker_detected,
+                prompt_draft_detected: snapshot.prompt_draft_detected,
+                tmux_pane_alive: snapshot.tmux_pane_alive,
+                capture_available: snapshot.capture_available,
+                pane_tail: snapshot.pane_tail,
+            }
+        }
+    };
+    if hosted_tui_draft_should_enter_provider_recovery(provider, &snapshot) {
+        return None;
+    }
     classify_claude_tui_followup_submission(
         &snapshot,
         watcher_state,
@@ -8291,6 +8319,29 @@ mod session_strategy_lifecycle_tests {
         assert_eq!(
             diagnostic.watcher_owner_channel_id,
             Some(1479671301387059200)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_jsonl_authoritative_busy_diagnostic_does_not_capture_pane() {
+        let snapshot = HostedTuiPromptReadinessSnapshot::jsonl_authoritative(true);
+
+        let diagnostic = classify_claude_tui_followup_submission(
+            &snapshot,
+            "attached",
+            Some(1479671301387059200),
+            "missing",
+            crate::services::tui_turn_state::TuiTurnState::Streaming,
+            "AgentDesk-claude-adk-cdx-direct",
+        )
+        .expect("structured busy TUI turn should block follow-up submission");
+
+        assert!(diagnostic.previous_tui_turn_still_running);
+        assert!(!diagnostic.capture_available);
+        assert_eq!(
+            diagnostic.pane_tail,
+            "<not captured; JSONL turn state is authoritative>"
         );
     }
 

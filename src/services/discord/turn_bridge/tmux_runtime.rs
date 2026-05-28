@@ -92,16 +92,30 @@ fn fallback_sigint_pid_for_provider(
 }
 
 fn tmux_ready_for_input_without_tui_pane(tmux_session_name: &str, provider: &ProviderKind) -> bool {
-    crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)
+    let binding =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name);
+    let runtime_kind = binding
+        .as_ref()
+        .map(|binding| binding.runtime_kind)
+        .or_else(|| {
+            crate::services::tmux_common::resolve_tmux_runtime_kind_marker(tmux_session_name)
+        });
+    if let Some(ready) = binding
+        .as_ref()
         .and_then(|binding| {
             crate::services::tui_turn_state::runtime_binding_ready_for_input(
-                provider, &binding, true,
+                provider, binding, true,
             )
         })
         .map(crate::services::tui_turn_state::TuiReadyState::is_ready)
-        .unwrap_or_else(|| {
-            crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
-        })
+    {
+        return ready;
+    }
+    if crate::services::tui_turn_state::pane_ready_fallback_allowed(provider, runtime_kind) {
+        crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
+    } else {
+        false
+    }
 }
 
 pub(in crate::services::discord) async fn interrupt_provider_cli_turn(

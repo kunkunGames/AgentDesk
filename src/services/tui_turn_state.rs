@@ -115,6 +115,13 @@ pub(crate) fn provider_runtime_has_structured_jsonl_turn_state(
     )
 }
 
+pub(crate) fn pane_ready_fallback_allowed(
+    provider: &ProviderKind,
+    runtime_kind: Option<RuntimeHandoffKind>,
+) -> bool {
+    !provider_runtime_has_structured_jsonl_turn_state(provider, runtime_kind)
+}
+
 pub(crate) fn jsonl_ready_for_input(
     provider: &ProviderKind,
     runtime_kind: Option<RuntimeHandoffKind>,
@@ -876,6 +883,24 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn pane_ready_fallback_is_disabled_for_structured_tui_jsonl() {
+        assert!(!pane_ready_fallback_allowed(
+            &ProviderKind::Claude,
+            Some(RuntimeHandoffKind::ClaudeTui)
+        ));
+        assert!(!pane_ready_fallback_allowed(
+            &ProviderKind::Codex,
+            Some(RuntimeHandoffKind::CodexTui)
+        ));
+        assert!(!pane_ready_fallback_allowed(&ProviderKind::Claude, None));
+        assert!(pane_ready_fallback_allowed(
+            &ProviderKind::Claude,
+            Some(RuntimeHandoffKind::LegacyTmuxWrapper)
+        ));
+        assert!(pane_ready_fallback_allowed(&ProviderKind::Qwen, None));
     }
 
     #[test]

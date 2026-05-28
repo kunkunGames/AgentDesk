@@ -502,6 +502,16 @@ fn wait_for_prompt_ready_inner(
     let timeout = readiness.timeout();
     let start = Instant::now();
 
+    if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
+        tracing::info!(
+            tmux_session_name = session_name,
+            readiness = readiness.label(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "claude_tui prompt ready via idle transcript"
+        );
+        return Ok(());
+    }
+
     if cancel_token.is_some() {
         return wait_for_prompt_ready_polling(
             session_name,
@@ -765,6 +775,15 @@ fn wait_for_prompt_ready_polling(
     let mut wait_interval = Duration::from_millis(100);
     loop {
         check_prompt_cancel(cancel_token)?;
+        if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "claude_tui prompt ready via idle transcript"
+            );
+            return Ok(());
+        }
         let snapshot = prompt_readiness_snapshot(session_name);
         check_prompt_cancel(cancel_token)?;
         if prompt_marker_confirms_prompt_ready(&snapshot) {
@@ -805,6 +824,20 @@ fn pane_looks_ready_for_prompt(pane: &str) -> bool {
 
 fn prompt_marker_confirms_prompt_ready(snapshot: &PromptReadinessSnapshot) -> bool {
     snapshot.prompt_marker_detected && !snapshot.prompt_draft_detected
+}
+
+fn transcript_idle_confirms_prompt_ready_without_capture(
+    session_name: &str,
+    transcript_path: Option<&std::path::Path>,
+) -> bool {
+    let Some(transcript_path) = transcript_path else {
+        return false;
+    };
+    if !crate::services::tmux_diagnostics::tmux_session_has_live_pane(session_name) {
+        return false;
+    }
+    crate::services::claude_tui::transcript_tail::observe_transcript_turn_state(transcript_path)
+        == crate::services::tui_turn_state::TuiTurnState::Idle
 }
 
 fn transcript_idle_confirms_prompt_ready(
