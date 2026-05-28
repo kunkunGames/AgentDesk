@@ -3259,6 +3259,44 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             }),
         ),
         ep(
+            "GET",
+            "/api/settings/operator-connectors",
+            "settings",
+            "Get optional operator connector status and setup actions. Missing optional connectors do not block the core runtime.",
+        )
+        .with_example(
+            json!({}),
+            json!({
+                "connectors": [
+                    {
+                        "id": "obsidian_skill_root",
+                        "name": "Obsidian skill root",
+                        "state": "missing_config",
+                        "optional": true,
+                        "env_var": "AGENTDESK_OBSIDIAN_SKILL_ROOT",
+                        "source": "/Users/user/ObsidianVault/RemoteVault/99_Skills",
+                        "reason": "missing_config",
+                        "detail": "state=missing_config source=/Users/user/ObsidianVault/RemoteVault/99_Skills reason=missing_config",
+                        "setup_actions": [
+                            "Set AGENTDESK_OBSIDIAN_SKILL_ROOT to an existing skill directory containing at least one <skill>/SKILL.md, or run scripts/operator-init-portable.py --with-obsidian-stubs before syncing real skills."
+                        ],
+                        "capabilities": ["obsidian_skill_root"]
+                    }
+                ],
+                "summary": {
+                    "ready": 0,
+                    "skipped": 0,
+                    "missing_config": 1,
+                    "missing_path": 0,
+                    "missing_provider": 0,
+                    "invalid_config": 0,
+                    "invalid": 0,
+                    "total": 1,
+                    "core_runtime_blocking": false
+                }
+            }),
+        ),
+        ep(
             "PUT",
             "/api/settings/runtime-config",
             "settings",

@@ -5,6 +5,7 @@ use serde_json::Value;
 use super::AppState;
 use crate::error::AppError;
 use crate::server::dto::settings::SettingsErrorResponse;
+use crate::services::operator_connectors::OptionalConnectorsResponse;
 
 fn settings_json_response<T: Serialize>(status: StatusCode, body: T) -> (StatusCode, Json<Value>) {
     (
@@ -73,6 +74,11 @@ pub async fn get_runtime_config(State(state): State<AppState>) -> (StatusCode, J
         Ok(body) => settings_json_response(StatusCode::OK, body),
         Err(error) => service_error_response(error),
     }
+}
+
+/// GET /api/settings/operator-connectors
+pub async fn get_operator_connectors() -> (StatusCode, Json<Value>) {
+    settings_json_response(StatusCode::OK, OptionalConnectorsResponse::current())
 }
 
 /// PUT /api/settings/runtime-config
