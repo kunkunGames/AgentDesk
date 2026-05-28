@@ -1175,6 +1175,25 @@ fn session_bound_relay_should_own_terminal_delivery(
         )
 }
 
+fn post_terminal_jsonl_payload_contains_init_without_user_event(payload: &[u8]) -> bool {
+    let mut contains_init = false;
+    for line in String::from_utf8_lossy(payload).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("user") => return false,
+            Some("system")
+                if value.get("subtype").and_then(serde_json::Value::as_str) == Some("init") =>
+            {
+                contains_init = true;
+            }
+            _ => {}
+        }
+    }
+    contains_init
+}
+
 #[cfg(test)]
 mod matched_session_jsonl_gate_tests {
     use super::*;
@@ -1515,6 +1534,27 @@ mod matched_session_jsonl_gate_tests {
             ),
             "bridge-owned inflight remains on legacy/bridge delivery instead of the session relay sink"
         );
+    }
+
+    #[test]
+    fn post_terminal_jsonl_payload_allows_external_init_without_user_event() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"ScheduleWakeup\"]}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[E2E:E13:WAKE]\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"[E2E:E13:WAKE]\"}\n"
+        );
+        assert!(post_terminal_jsonl_payload_contains_init_without_user_event(payload.as_bytes()));
+    }
+
+    #[test]
+    fn post_terminal_jsonl_payload_rejects_active_tool_result() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"ScheduleWakeup\"]}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"ScheduleWakeup\"}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"scheduled\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"setup complete\"}\n"
+        );
+        assert!(!post_terminal_jsonl_payload_contains_init_without_user_event(payload.as_bytes()));
     }
 
     #[tokio::test]
@@ -2408,13 +2448,33 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         } else {
             false
         };
+        let post_terminal_payload_allows_external_relay =
+            if turn_result_relayed && post_terminal_inflight_missing {
+                let mut post_terminal_payload = String::with_capacity(all_data.len() + data.len());
+                post_terminal_payload.push_str(&all_data);
+                post_terminal_payload.push_str(&String::from_utf8_lossy(&data));
+                post_terminal_jsonl_payload_contains_init_without_user_event(
+                    post_terminal_payload.as_bytes(),
+                )
+            } else {
+                false
+            };
         let post_terminal_no_inflight_should_suppress =
             should_suppress_post_terminal_output_without_inflight(
                 turn_result_relayed,
                 post_terminal_inflight_missing,
                 ssh_direct_prompt_pending,
                 external_input_lease_present,
+            ) && !post_terminal_payload_allows_external_relay;
+        if post_terminal_payload_allows_external_relay {
+            tracing::info!(
+                channel = channel_id.get(),
+                tmux_session = %tmux_session_name,
+                range_start = data_start_offset,
+                range_end = current_offset,
+                "watcher allowed post-terminal no-inflight JSONL init payload for external relay"
             );
+        }
         if post_terminal_no_inflight_should_suppress {
             let suppressed_range = (data_start_offset, current_offset);
             if last_post_terminal_suppressed_range != Some(suppressed_range) {

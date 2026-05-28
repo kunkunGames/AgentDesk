@@ -130,6 +130,16 @@ def text_present(window: Window, *, needle: str) -> None:
     )
 
 
+def raw_text_present(window: Window, *, needle: str) -> None:
+    for message in window.raw_messages:
+        if needle in (message.get("content") or ""):
+            return
+    raise AssertionError(
+        f"expected to find {needle!r} in raw window, got {len(window.raw_messages)} "
+        "raw messages"
+    )
+
+
 def no_control_chars(window: Window) -> None:
     forbidden = {chr(c) for c in (0x07, 0x08, 0x0C, 0x1B, 0x7F, 0x85)}
     for message in window.messages:

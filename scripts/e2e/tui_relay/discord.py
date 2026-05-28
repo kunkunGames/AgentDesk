@@ -38,6 +38,34 @@ class DiscordClient:
             return {}
         return json.loads(payload)
 
+    def send_control(self, channel_id: int | str, content: str) -> dict[str, Any]:
+        """Send harness bookkeeping with notify-bot so workers do not wake.
+
+        The E2E setup/teardown markers are for the operator-visible transcript
+        and for assertion window boundaries. Sending them through the announce
+        bot can wake the worker agent and recursively start another E2E run.
+        """
+
+        body = json.dumps(
+            {
+                "target": f"channel:{channel_id}",
+                "content": content,
+                "source": "adk-e2e-orchestrator",
+                "bot": "notify",
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.base_url}/api/discord/send",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+            payload = response.read().decode("utf-8")
+        if not payload:
+            return {}
+        return json.loads(payload)
+
     def send_prompt(
         self,
         channel_id: int | str,

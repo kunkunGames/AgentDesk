@@ -36,10 +36,28 @@ assertions:
 
 Provider-specific scenarios (`E-6` claude `/compact`, `E-7` codex `/compact`)
 narrow the list. TUI-keystroke-only scenarios (`E-4`, `E-10`, `E-12`) include
-only the two `*-tui` cells. `E-11` (cross-cell concurrency) is `cells: []` —
-the orchestrator owns that scenario.
+only the two `*-tui` cells. `E-13` covers the Claude Code pipe/headless
+scheduled wakeup/monitor path: the first turn must call `ScheduleWakeup`, and
+the automatic wake turn must relay `[E2E:E13:WAKE]` to Discord. It intentionally
+runs only on `claude-pipe`; `claude-tui` and `claude-e` keep normal relay
+coverage because this matrix does not create a persistent Claude Code wake
+session for those cells. `E-11` (cross-cell concurrency) is `cells: []` — the
+orchestrator owns that scenario.
 
 ## Driver
+
+Full matrix baseline:
+
+```bash
+scripts/e2e/run_multi_provider_matrix.py --twice
+```
+
+The matrix runner looks up channel ids from
+`~/.adk/release/config/agentdesk.yaml`, runs all cells sequentially, and writes
+`matrix.json` plus one `report.<cell>.json` per pass/cell under
+`out/e2e/tui_relay/matrix-<run-id>/`.
+
+Single cell:
 
 ```bash
 scripts/e2e/run_tui_relay.py \
@@ -72,11 +90,13 @@ commands:
 
 The orchestrator creates a result thread on the orchestrator channel (named
 `<KST-ISO-short>-<cell>` for single-cell or `<KST-ISO-short>-all-e2e` for
-matrix), dispatches each worker via `send-to-agent`, and writes a one-line
-status per cell into the thread.
+matrix), runs `scripts/e2e/run_multi_provider_matrix.py` or the single-cell
+driver from `/Users/itismyfield/.adk/release/workspaces/agentdesk`, and writes
+a one-line status per cell into the thread.
 
-The orchestrator dispatches workers in series even though their lease files
-are isolated, so the visible progression in the thread stays linear.
+The orchestrator drives worker channels from outside the workers. Workers must
+not run `run_tui_relay.py` against their own channel; doing so makes their
+mailbox busy and can recursively start nested E2E runs.
 
 ## Provisioning (cold start)
 

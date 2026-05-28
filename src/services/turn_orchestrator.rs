@@ -553,6 +553,44 @@ pub(crate) fn save_channel_queue(
     }
 }
 
+/// Remove persisted pending-queue files for one channel across all token
+/// namespaces for the provider. Used by force-cancel recovery when the live
+/// session key is unavailable or stale but the channel still owns queued work.
+pub(crate) fn remove_channel_pending_queue_files_all_tokens(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> usize {
+    let Some(root) = pending_queue_root() else {
+        return 0;
+    };
+    let provider_dir = root.join(provider.as_str());
+    let Ok(entries) = fs::read_dir(&provider_dir) else {
+        return 0;
+    };
+    let filename = format!("{}.json", channel_id.get());
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let token_dir = entry.path();
+        if !token_dir.is_dir() {
+            continue;
+        }
+        let path = token_dir.join(&filename);
+        if !path.is_file() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::warn!(
+                provider = provider.as_str(),
+                channel_id = channel_id.get(),
+                path = %path.display(),
+                "failed to remove pending queue file during force purge: {error}"
+            ),
+        }
+    }
+    removed
+}
+
 fn pending_queue_item_to_intervention(item: PendingQueueItem, now: Instant) -> Intervention {
     let mut source_message_ids: Vec<MessageId> = item
         .source_message_ids
@@ -2464,6 +2502,32 @@ mod actor_hydrate_regression_tests {
         TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn remove_channel_pending_queue_files_all_tokens_only_removes_target_channel() {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _env_guard = EnvGuard;
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(2708);
+        let other_channel_id = ChannelId::new(2709);
+        let first = queue_file_path(tmp.path(), &provider, "token-a", channel_id);
+        let second = queue_file_path(tmp.path(), &provider, "token-b", channel_id);
+        let other = queue_file_path(tmp.path(), &provider, "token-a", other_channel_id);
+        for path in [&first, &second, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "[]").unwrap();
+        }
+
+        let removed = remove_channel_pending_queue_files_all_tokens(&provider, channel_id);
+
+        assert_eq!(removed, 2);
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(other.exists());
     }
 
     #[tokio::test]

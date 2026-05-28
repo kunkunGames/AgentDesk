@@ -6,16 +6,19 @@
 //! inflight is still a valid pane-bound new-message route. The watcher then
 //! treats terminal delivery as delegated instead of sending directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serenity::model::id::{ChannelId, MessageId};
 
 use super::formatting::{self, ReplaceLongMessageOutcome};
 use super::health::HealthRegistry;
-use super::inflight::{InflightTurnState, RelayOwnerKind};
+use super::inflight::InflightTurnState;
 use super::tmux::{WatcherToolState, process_watcher_lines};
 use crate::services::agent_protocol::TaskNotificationKind;
 use crate::services::cluster::stream_relay::{
@@ -26,6 +29,9 @@ use crate::services::provider::ProviderKind;
 use crate::services::session_backend::StreamLineState;
 
 static SESSION_BOUND_DISCORD_DELIVERY_ENABLED: AtomicBool = AtomicBool::new(false);
+const IDLE_JSONL_RELAY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE: Duration = Duration::from_secs(10);
+const IDLE_JSONL_RELAY_MAX_BYTES_PER_TICK: u64 = 1_048_576;
 
 pub(in crate::services::discord) fn session_bound_discord_delivery_enabled() -> bool {
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.load(Ordering::Acquire)
@@ -44,7 +50,13 @@ pub(in crate::services::discord) fn session_bound_discord_relay_can_own_terminal
     if state.tmux_session_name.as_deref() != Some(tmux_session_name) {
         return false;
     }
-    state.rebind_origin || matches!(state.effective_relay_owner_kind(), RelayOwnerKind::Watcher)
+    // A normal Discord-origin inflight already has the tmux watcher as the
+    // terminal delivery owner. The session-bound StreamRelay sink is still
+    // attached to the same JSONL, so letting it deliver while an inflight is
+    // present creates a second terminal post. Treat only rebind/adopted rows
+    // as no real foreground turn; scheduled wakeups and idle background output
+    // reach this path with no inflight at all.
+    state.rebind_origin
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,8 +367,217 @@ pub(crate) async fn run_session_bound_discord_relay_supervisor(
 
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(true, Ordering::Release);
     let sink: Arc<dyn RelaySink> = Arc::new(SessionBoundDiscordRelaySink::new(health_registry));
+    let idle_shutdown = shutdown.clone();
+    super::task_supervisor::spawn_observed("session_bound_idle_jsonl_relay", async move {
+        run_idle_jsonl_relay_loop(idle_shutdown).await;
+    });
     run_watcher_supervisor_loop(SupervisorConfig::default(), sink, shutdown).await;
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(false, Ordering::Release);
+}
+
+async fn run_idle_jsonl_relay_loop(shutdown: Arc<AtomicBool>) {
+    let registry = crate::services::cluster::session_registry::global_session_registry();
+    let producers =
+        crate::services::cluster::relay_producer_registry::global_relay_producer_registry();
+    let mut offsets: HashMap<String, u64> = HashMap::new();
+    let mut first_seen_at: HashMap<String, Instant> = HashMap::new();
+    let mut last_inflight_seen_at: HashMap<String, Instant> = HashMap::new();
+
+    while !shutdown.load(Ordering::Acquire) {
+        let mut seen_sessions = HashSet::new();
+        for entry in registry.list_matched() {
+            let matched = entry.matched;
+            let session_name = matched.expected_session_name.clone();
+            seen_sessions.insert(session_name.clone());
+            let first_seen = *first_seen_at
+                .entry(session_name.clone())
+                .or_insert_with(Instant::now);
+            let Ok(channel_id) = matched.channel_id.parse::<u64>() else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&matched.expected_rollout_path) else {
+                continue;
+            };
+            let len = metadata.len();
+            let offset = offsets.entry(session_name.clone()).or_insert(len);
+            if len < *offset {
+                *offset = 0;
+            }
+
+            if super::inflight::load_inflight_state(&matched.provider, channel_id).is_some() {
+                last_inflight_seen_at.insert(session_name.clone(), Instant::now());
+                *offset = len;
+                continue;
+            }
+            if last_inflight_seen_at
+                .get(&session_name)
+                .is_some_and(|seen_at| seen_at.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE)
+            {
+                *offset = len;
+                continue;
+            }
+            if len <= *offset {
+                continue;
+            }
+
+            let start = *offset;
+            let end = len.min(start.saturating_add(IDLE_JSONL_RELAY_MAX_BYTES_PER_TICK));
+            let Ok(payload) = read_jsonl_range(&matched.expected_rollout_path, start, end) else {
+                continue;
+            };
+            if payload.is_empty() {
+                *offset = end;
+                continue;
+            }
+            if first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE {
+                *offset = end;
+                tracing::debug!(
+                    provider = matched.provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %session_name,
+                    bytes = payload.len(),
+                    "idle JSONL relay skipped new-session grace payload"
+                );
+                continue;
+            }
+            if idle_jsonl_payload_contains_user_event(&payload) {
+                *offset = end;
+                tracing::debug!(
+                    provider = matched.provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %session_name,
+                    bytes = payload.len(),
+                    "idle JSONL relay skipped active-turn payload with user/tool-result event"
+                );
+                continue;
+            }
+            if idle_jsonl_payload_contains_schedule_wakeup_setup(&payload) {
+                *offset = end;
+                tracing::debug!(
+                    provider = matched.provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %session_name,
+                    bytes = payload.len(),
+                    "idle JSONL relay skipped ScheduleWakeup setup payload"
+                );
+                continue;
+            }
+            if !idle_jsonl_payload_contains_init_event(&payload) {
+                *offset = end;
+                tracing::debug!(
+                    provider = matched.provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %session_name,
+                    bytes = payload.len(),
+                    "idle JSONL relay skipped non-init active-session payload"
+                );
+                continue;
+            }
+            let Some(producer) = producers.get_producer(&session_name) else {
+                tracing::debug!(
+                    tmux_session = %session_name,
+                    "idle JSONL relay found new bytes but no session-bound producer"
+                );
+                continue;
+            };
+            if producer.try_send_frame(String::from_utf8_lossy(&payload).into_owned()) {
+                *offset = end;
+                tracing::debug!(
+                    provider = matched.provider.as_str(),
+                    channel = channel_id,
+                    tmux_session = %session_name,
+                    bytes = payload.len(),
+                    "idle JSONL relay forwarded background session output"
+                );
+            }
+        }
+
+        offsets.retain(|session, _| seen_sessions.contains(session));
+        first_seen_at.retain(|session, _| seen_sessions.contains(session));
+        last_inflight_seen_at.retain(|session, _| seen_sessions.contains(session));
+        tokio::time::sleep(IDLE_JSONL_RELAY_POLL_INTERVAL).await;
+    }
+}
+
+fn read_jsonl_range(path: &str, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut payload = Vec::new();
+    file.take(end.saturating_sub(start))
+        .read_to_end(&mut payload)?;
+    Ok(payload)
+}
+
+fn idle_jsonl_payload_contains_user_event(payload: &[u8]) -> bool {
+    for line in String::from_utf8_lossy(payload).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("user") {
+            return true;
+        }
+    }
+    false
+}
+
+fn idle_jsonl_payload_contains_schedule_wakeup_setup(payload: &[u8]) -> bool {
+    for line in String::from_utf8_lossy(payload).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if jsonl_event_contains_schedule_wakeup_setup_reference(&value) {
+            return true;
+        }
+    }
+    false
+}
+
+fn jsonl_event_contains_schedule_wakeup_setup_reference(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("assistant") => assistant_event_contains_schedule_wakeup_reference(value),
+        Some("result") => value
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.contains("ScheduleWakeup")),
+        _ => false,
+    }
+}
+
+fn assistant_event_contains_schedule_wakeup_reference(value: &serde_json::Value) -> bool {
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    content.iter().any(|item| {
+        let item_type = item.get("type").and_then(serde_json::Value::as_str);
+        match item_type {
+            Some("tool_use") => {
+                item.get("name").and_then(serde_json::Value::as_str) == Some("ScheduleWakeup")
+            }
+            Some("text") => item
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("ScheduleWakeup")),
+            _ => false,
+        }
+    })
+}
+
+fn idle_jsonl_payload_contains_init_event(payload: &[u8]) -> bool {
+    for line in String::from_utf8_lossy(payload).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("system")
+            && value.get("subtype").and_then(serde_json::Value::as_str) == Some("init")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 struct SessionRelayParser {
@@ -525,6 +746,7 @@ fn merge_task_notification_kind(
 mod tests {
     use super::*;
     use crate::services::cluster::session_matcher::{MatchedChannel, expected_rollout_path_for};
+    use crate::services::discord::inflight::RelayOwnerKind;
 
     fn matched(channel_id: &str) -> MatchedChannel {
         let session = ProviderKind::Claude.build_tmux_session_name(channel_id);
@@ -544,6 +766,77 @@ mod tests {
             payload: payload.to_string(),
             sequence,
         }
+    }
+
+    #[test]
+    fn idle_jsonl_payload_detects_user_tool_result_events() {
+        let payload = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"ScheduleWakeup\"}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"scheduled\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"setup complete\"}\n"
+        );
+        assert!(idle_jsonl_payload_contains_user_event(payload.as_bytes()));
+    }
+
+    #[test]
+    fn idle_jsonl_payload_allows_external_wakeup_result() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[E2E:E13:WAKE]\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"[E2E:E13:WAKE]\"}\n"
+        );
+        assert!(!idle_jsonl_payload_contains_user_event(payload.as_bytes()));
+        assert!(idle_jsonl_payload_contains_init_event(payload.as_bytes()));
+        assert!(!idle_jsonl_payload_contains_schedule_wakeup_setup(
+            payload.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn idle_jsonl_payload_allows_wakeup_result_with_schedule_wakeup_tool_list() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"ScheduleWakeup\",\"Bash\"]}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[E2E:E13:WAKE]\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"[E2E:E13:WAKE]\"}\n"
+        );
+        assert!(idle_jsonl_payload_contains_init_event(payload.as_bytes()));
+        assert!(!idle_jsonl_payload_contains_schedule_wakeup_setup(
+            payload.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn idle_jsonl_payload_rejects_schedule_wakeup_setup_result() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"E-13 setup. ScheduleWakeup 예약 완료.\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"E-13 setup. ScheduleWakeup 예약 완료.\"}\n"
+        );
+        assert!(idle_jsonl_payload_contains_init_event(payload.as_bytes()));
+        assert!(idle_jsonl_payload_contains_schedule_wakeup_setup(
+            payload.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn idle_jsonl_payload_rejects_schedule_wakeup_tool_use() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"ScheduleWakeup\",\"input\":{\"delaySeconds\":20}}]}}\n",
+            "{\"type\":\"result\",\"result\":\"scheduled\"}\n"
+        );
+        assert!(idle_jsonl_payload_contains_schedule_wakeup_setup(
+            payload.as_bytes()
+        ));
+    }
+
+    #[test]
+    fn idle_jsonl_payload_rejects_steady_session_result_without_init() {
+        let payload = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[E2E:E1:OK]\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"[E2E:E1:OK]\"}\n"
+        );
+        assert!(!idle_jsonl_payload_contains_init_event(payload.as_bytes()));
     }
 
     fn inflight_for(
@@ -586,7 +879,7 @@ mod tests {
         ));
 
         let watcher_owned = inflight_for(tmux, RelayOwnerKind::Watcher, false);
-        assert!(session_bound_discord_relay_can_own_terminal_delivery(
+        assert!(!session_bound_discord_relay_can_own_terminal_delivery(
             Some(&watcher_owned),
             tmux
         ));
@@ -621,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_delivery_route_preserves_bridge_owned_skip_and_watcher_routes() {
+    fn terminal_delivery_route_preserves_active_inflight_skip_and_rebind_route() {
         let tmux = "AgentDesk-claude-relay-test";
         let bridge_owned = inflight_for(tmux, RelayOwnerKind::None, false);
         assert_eq!(
@@ -632,9 +925,7 @@ mod tests {
         let watcher_owned = inflight_for(tmux, RelayOwnerKind::Watcher, false);
         assert_eq!(
             session_bound_terminal_delivery_route(Some(&watcher_owned), tmux),
-            Some(SessionBoundTerminalDeliveryRoute::PlaceholderEdit(
-                MessageId::new(9002)
-            ))
+            None
         );
 
         let mut watcher_external = inflight_for(tmux, RelayOwnerKind::Watcher, false);
@@ -642,7 +933,7 @@ mod tests {
         watcher_external.current_msg_id = 0;
         assert_eq!(
             session_bound_terminal_delivery_route(Some(&watcher_external), tmux),
-            Some(SessionBoundTerminalDeliveryRoute::NewMessage)
+            None
         );
 
         let rebind_origin = inflight_for(tmux, RelayOwnerKind::Watcher, true);

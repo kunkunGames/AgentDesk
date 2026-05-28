@@ -50,31 +50,61 @@ async fn schedule_post_cancel_queue_drain(
 }
 
 /// #2706: force-path queue purge. Empties the in-memory channel mailbox
-/// atomically via `ChannelMailboxHandle::clear`, persisting an empty queue
-/// to disk in the same actor step. Returns the number of intervention
-/// entries that were dropped (best-effort — `None` when the mailbox handle
-/// or persistence context cannot be assembled).
+/// atomically via `ChannelMailboxHandle::purge_queue`, persisting an empty
+/// queue to disk in the same actor step. Returns the number of intervention
+/// entries that were dropped.
 ///
 /// The default preserve path uses `schedule_post_cancel_queue_drain` which
 /// *hydrates* the disk-backed queue back into the mailbox. That is the
 /// opposite of what `force=true` callers want — they reach for force
 /// specifically to clear stale drafts so the next dispatch is not blocked
 /// by a 45s `wait_for_prompt_ready` timeout.
+///
+/// A force cancel must still work when the live session row is already gone
+/// and no `session_key` can be resolved. In that case we use a deterministic
+/// fallback persistence namespace for the actor call, and separately remove
+/// any persisted queue file for this channel across the provider's token
+/// namespaces.
 async fn force_purge_channel_mailbox(
     target: &TurnLifecycleTarget,
     session_key: Option<&str>,
 ) -> Option<usize> {
     let provider = target.provider.as_ref()?;
     let channel_id = target.channel_id?;
-    let session_key = session_key?;
-    let identity = crate::services::discord::session_identity::SessionIdentity::parse(session_key)?;
-    let token_hash = identity.token_hash.as_deref()?;
-    let handle =
-        crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(channel_id)?;
+    let disk_files_removed =
+        crate::services::turn_orchestrator::remove_channel_pending_queue_files_all_tokens(
+            provider, channel_id,
+        );
+    let token_hash = session_key
+        .and_then(crate::services::discord::session_identity::SessionIdentity::parse)
+        .and_then(|identity| identity.token_hash)
+        .unwrap_or_else(|| format!("force-purge-channel-{}", channel_id.get()));
+    let Some(handle) =
+        crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(channel_id)
+    else {
+        tracing::info!(
+            provider = provider.as_str(),
+            channel_id = channel_id.get(),
+            disk_files_removed,
+            "force purge found no live mailbox handle"
+        );
+        return Some(0);
+    };
     let persistence = crate::services::turn_orchestrator::QueuePersistenceContext::new(
-        provider, token_hash, None,
+        provider,
+        &token_hash,
+        None,
     );
-    Some(handle.purge_queue(persistence).await)
+    let purged = handle.purge_queue(persistence).await;
+    tracing::info!(
+        provider = provider.as_str(),
+        channel_id = channel_id.get(),
+        purged,
+        disk_files_removed,
+        session_key,
+        "force purged channel mailbox queue"
+    );
+    Some(purged)
 }
 
 #[derive(Clone)]
@@ -819,5 +849,59 @@ impl QueueService {
                 .with_operation("cancel_dispatch.query_active_session_pg")
                 .with_context("dispatch_id", dispatch_id)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use poise::serenity_prelude::{MessageId, UserId};
+
+    use super::*;
+    use crate::services::turn_orchestrator::{
+        ChannelMailboxRegistry, Intervention, InterventionMode, QueuePersistenceContext,
+    };
+
+    fn make_intervention(message_id: u64, text: &str) -> Intervention {
+        Intervention {
+            author_id: UserId::new(1),
+            author_is_bot: false,
+            message_id: MessageId::new(message_id),
+            source_message_ids: vec![MessageId::new(message_id)],
+            text: text.to_string(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            voice_announcement: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn force_purge_channel_mailbox_drains_queue_without_session_key() {
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(9270601);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+        let persistence = QueuePersistenceContext::new(&provider, "force-purge-test", None);
+        handle
+            .replace_queue(
+                vec![make_intervention(10, "stale queued prompt")],
+                persistence,
+            )
+            .await;
+
+        let target = TurnLifecycleTarget {
+            provider: Some(provider),
+            channel_id: Some(channel_id),
+            tmux_name: String::new(),
+        };
+
+        let purged = force_purge_channel_mailbox(&target, None).await;
+
+        assert_eq!(purged, Some(1));
+        assert!(handle.snapshot().await.intervention_queue.is_empty());
     }
 }

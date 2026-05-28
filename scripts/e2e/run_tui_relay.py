@@ -132,6 +132,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("AGENTDESK_E2E_RESTART_TARGET"),
         help="Override restart_dcserver target.",
     )
+    parser.add_argument(
+        "--turn-start-timeout-s",
+        type=float,
+        default=float(os.environ.get("AGENTDESK_E2E_TURN_START_TIMEOUT_S", "180")),
+        help="How long send_prompt retries transient mailbox-busy turn/start responses.",
+    )
     return parser.parse_args()
 
 
@@ -405,7 +411,7 @@ def run_one_cell(
         print(f"[dry-run] {scenario_id} ({cell}): would send setup → steps → teardown")
         return record
 
-    setup_resp = client.send(channel_id, setup_marker)
+    setup_resp = client.send_control(channel_id, setup_marker)
     setup_marker_id = str(setup_resp.get("message_id") or setup_resp.get("id") or "")
     after_id = setup_marker_id
     window = assertions.Window(setup_marker_id=setup_marker_id)
@@ -463,6 +469,24 @@ def run_one_cell(
                 raise assertions.AssertionError(
                     f"timeout waiting for Discord text {needle!r}"
                 )
+        elif "wait_for_raw_discord_text" in step:
+            needle = step["wait_for_raw_discord_text"]
+            predicate = lambda message: (  # noqa: E731
+                not assertions.is_our_send(message)
+                and needle in (message.get("content") or "")
+            )
+            found, observed = client.wait_for_message(
+                channel_id,
+                predicate=predicate,
+                after_id=after_id,
+                timeout_s=float(step.get("timeout_s", 240)),
+                debug_label=f"{scenario.get('id')}::{cell}::wait_for_raw:{needle[:32]}",
+            )
+            _ingest_observed(observed)
+            if not found:
+                raise assertions.AssertionError(
+                    f"timeout waiting for raw Discord text {needle!r}"
+                )
         elif "restart_dcserver" in step:
             target = args.restart_target_override or (step["restart_dcserver"] or {}).get(
                 "target", "release"
@@ -507,7 +531,7 @@ def run_one_cell(
         run_assertion(assertion_spec, window=window)
         record["assertions"].append({"spec": assertion_spec, "passed": True})
 
-    client.send(channel_id, teardown_marker)
+    client.send_control(channel_id, teardown_marker)
     return record
 
 
@@ -614,6 +638,8 @@ def run_assertion(spec: dict[str, Any], *, window: assertions.Window) -> None:
         assertions.no_duplicate_content(window)
     elif "text_present" in spec:
         assertions.text_present(window, needle=spec["text_present"])
+    elif "raw_text_present" in spec:
+        assertions.raw_text_present(window, needle=spec["raw_text_present"])
     elif spec.get("no_control_chars"):
         assertions.no_control_chars(window)
     elif spec.get("no_resume_prompt_chrome"):
@@ -644,6 +670,7 @@ def main() -> int:
 
     client = discord.DiscordClient(
         base_url=args.base_url,
+        timeout_s=args.turn_start_timeout_s,
         handoff_to_agent=handoff_to,
         handoff_from_agent=args.handoff_from_agent,
     )

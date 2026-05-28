@@ -8,7 +8,7 @@ steps:
     timeout_s: 240
   - wait_idle_s: 3
   - send_prompt: "/compact"
-  - wait_idle_s: 15
+  - wait_idle_s: 90
   - send_prompt: "응답에 정확히 한 줄로 [E2E:E6:AFTER] 만 출력해줘."
   - wait_for_discord_text: "[E2E:E6:AFTER]"
     timeout_s: 240

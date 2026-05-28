@@ -33,6 +33,27 @@ class _Response:
 
 
 class DiscordClientSendPrompt(unittest.TestCase):
+    def test_control_marker_uses_notify_bot(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):  # noqa: ANN001
+            captured["url"] = request.full_url
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _Response({"ok": True, "message_id": "m-1"})
+
+        client = DiscordClient(base_url="http://127.0.0.1:8791", timeout_s=12)
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            response = client.send_control("1509350393350459434", "### E2E SETUP E-1")
+
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(captured["url"], "http://127.0.0.1:8791/api/discord/send")
+        self.assertEqual(captured["timeout"], 12)
+        self.assertEqual(captured["body"]["target"], "channel:1509350393350459434")
+        self.assertEqual(captured["body"]["bot"], "notify")
+        self.assertEqual(captured["body"]["source"], "adk-e2e-orchestrator")
+
     def test_handoff_prompt_starts_headless_codex_turn(self):
         captured = {}
 

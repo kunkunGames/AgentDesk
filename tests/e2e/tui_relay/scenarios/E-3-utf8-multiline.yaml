@@ -4,7 +4,8 @@ cells: [claude-pipe, claude-tui, claude-e, codex-pipe, codex-tui]
 isolation: required
 steps:
   - send_prompt: |
-      안녕👋 다음 코드를 그대로 답장에 echo해줘 (E-3):
+      응답에 정확히 아래 내용만 출력해줘. 빠뜨리거나 설명을 덧붙이지 마.
+      안녕👋 E-3 UTF-8 relay
       ```rust
       fn main() {
           println!("e2e-utf8");
@@ -14,6 +15,6 @@ steps:
     timeout_s: 240
 assertions:
   - no_duplicate_content: true
-  - text_present: "안녕"
+  - text_present: "안녕👋 E-3 UTF-8 relay"
   - text_present: "e2e-utf8"
   - no_control_chars: true
