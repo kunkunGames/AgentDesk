@@ -3,7 +3,7 @@ use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId};
@@ -20,9 +20,6 @@ use crate::services::tui_prompt_dedupe::{
 const SSH_DIRECT_PROMPT_PREVIEW_LIMIT: usize = 1500;
 const CODEX_IDLE_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const CLAUDE_IDLE_REHYDRATE_RECENT_TRANSCRIPT_WINDOW: Duration = Duration::from_secs(30 * 60);
-const CLAUDE_IDLE_REHYDRATE_STARTUP_REPLAY_GRACE: Duration = Duration::from_secs(2 * 60);
-const CLAUDE_TUI_RELAY_OFFSET_TEMP_EXT: &str = "claude-tui-relay-offset.json";
 const CODEX_IDLE_PROMPT_ANCHOR_WAIT: Duration = Duration::from_secs(2);
 const CODEX_IDLE_PROMPT_ANCHOR_POLL: Duration = Duration::from_millis(100);
 static CODEX_IDLE_ROLLOUT_RELAY_STARTED: AtomicBool = AtomicBool::new(false);
@@ -181,8 +178,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         channel_id.get(),
         anchor_message.id.get(),
     );
-    #[cfg(unix)]
-    mark_claude_pending_prompt_notified(&prompt);
     tracing::info!(
         provider = %prompt.provider,
         channel_id = channel_id.get(),
@@ -279,12 +274,11 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
         return;
     }
     super::task_supervisor::spawn_observed("claude_idle_transcript_relay", async move {
-        let relay_started_at = SystemTime::now();
         let mut next_rehydrate = tokio::time::Instant::now();
         loop {
             let now = tokio::time::Instant::now();
             if now >= next_rehydrate {
-                rehydrate_existing_claude_tui_bindings(relay_started_at);
+                rehydrate_existing_claude_tui_bindings();
                 next_rehydrate = now + CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL;
             }
             for (tmux_session_name, binding) in
@@ -333,42 +327,20 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                                 &tmux_session_name,
                                 &transcript_path,
                                 offset,
-                                true,
                             );
                         }
                     }
                     ClaudeIdleTranscriptScan::Prompt {
                         prompt,
-                        prompt_start_offset,
                         line_end_offset,
+                        ..
                     } => {
-                        persist_claude_tui_pending_prompt(
-                            &tmux_session_name,
-                            &transcript_path,
-                            &prompt,
-                            prompt_start_offset,
-                            line_end_offset,
-                            false,
-                        );
                         let observation =
                             crate::services::tui_prompt_dedupe::observe_prompt_by_tmux(
                                 ProviderKind::Claude.as_str(),
                                 &tmux_session_name,
                                 &prompt,
                             );
-                        if !matches!(
-                            observation,
-                            crate::services::tui_prompt_dedupe::PromptObservation::PublishedSshDirect
-                        ) {
-                            persist_claude_tui_pending_prompt(
-                                &tmux_session_name,
-                                &transcript_path,
-                                &prompt,
-                                prompt_start_offset,
-                                line_end_offset,
-                                true,
-                            );
-                        }
                         tracing::info!(
                             tmux_session_name = %tmux_session_name,
                             channel_id = channel_id.get(),
@@ -379,7 +351,6 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                             &tmux_session_name,
                             &transcript_path,
                             line_end_offset,
-                            false,
                         );
                         if claude_idle_prompt_observation_should_tail_response(observation) {
                             spawn_claude_idle_response_tail_once(
@@ -400,7 +371,7 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
 }
 
 #[cfg(unix)]
-fn rehydrate_existing_claude_tui_bindings(relay_started_at: SystemTime) {
+fn rehydrate_existing_claude_tui_bindings() {
     let sessions = match crate::services::platform::tmux::list_session_names() {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -446,8 +417,7 @@ fn rehydrate_existing_claude_tui_bindings(relay_started_at: SystemTime) {
             continue;
         }
 
-        let Some(binding) =
-            rehydrated_claude_tui_binding_for_tmux_session(&tmux_session_name, relay_started_at)
+        let Some(binding) = rehydrated_claude_tui_binding_for_tmux_session(&tmux_session_name)
         else {
             continue;
         };
@@ -471,7 +441,6 @@ fn rehydrate_existing_claude_tui_bindings(relay_started_at: SystemTime) {
 #[cfg(unix)]
 fn rehydrated_claude_tui_binding_for_tmux_session(
     tmux_session_name: &str,
-    relay_started_at: SystemTime,
 ) -> Option<crate::services::tui_prompt_dedupe::TuiRuntimeBinding> {
     let launch_script_path = crate::services::tmux_common::resolve_session_temp_path(
         tmux_session_name,
@@ -487,22 +456,14 @@ fn rehydrated_claude_tui_binding_for_tmux_session(
     if !transcript_path.exists() {
         return None;
     }
-    let rehydrate_offset =
-        claude_tui_rehydrate_start_offset(tmux_session_name, &transcript_path, relay_started_at);
-    if let Some(prompt) = rehydrate_offset.suppress_prompt.as_deref() {
-        crate::services::tui_prompt_dedupe::record_suppressed_discord_origin_prompt(
-            ProviderKind::Claude.as_str(),
-            tmux_session_name,
-            prompt,
-        );
-    }
+    let start_offset = claude_tui_rehydrate_start_offset(&transcript_path);
     Some(crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
         runtime_kind: RuntimeHandoffKind::ClaudeTui,
         output_path: transcript_path.display().to_string(),
         relay_output_path: None,
         input_fifo_path: None,
         session_id: Some(launch.session_id),
-        last_offset: rehydrate_offset.start_offset,
+        last_offset: start_offset,
         relay_last_offset: None,
     })
 }
@@ -543,226 +504,10 @@ fn resolve_rehydrated_claude_tmux_channel_id(tmux_session_name: &str) -> Option<
 }
 
 #[cfg(unix)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ClaudeTuiRehydrateOffset {
-    start_offset: u64,
-    suppress_prompt: Option<String>,
-}
-
-#[cfg(unix)]
-fn claude_tui_rehydrate_start_offset(
-    tmux_session_name: &str,
-    transcript_path: &Path,
-    relay_started_at: SystemTime,
-) -> ClaudeTuiRehydrateOffset {
-    let Ok(metadata) = std::fs::metadata(transcript_path) else {
-        return ClaudeTuiRehydrateOffset {
-            start_offset: 0,
-            suppress_prompt: None,
-        };
-    };
-    let file_len = metadata.len();
-    if let Some(offset) =
-        read_persisted_claude_tui_relay_offset(tmux_session_name, transcript_path, file_len)
-    {
-        return offset;
-    }
-    if !metadata_modified_recent_for_rehydrate(&metadata, SystemTime::now()) {
-        return ClaudeTuiRehydrateOffset {
-            start_offset: file_len,
-            suppress_prompt: None,
-        };
-    }
-    let fallback_since = relay_started_at
-        .checked_sub(CLAUDE_IDLE_REHYDRATE_STARTUP_REPLAY_GRACE)
-        .unwrap_or(UNIX_EPOCH);
-    match last_claude_transcript_user_prompt_start_offset_since(transcript_path, fallback_since) {
-        Ok(Some(offset)) => ClaudeTuiRehydrateOffset {
-            start_offset: offset,
-            suppress_prompt: None,
-        },
-        Ok(None) => ClaudeTuiRehydrateOffset {
-            start_offset: file_len,
-            suppress_prompt: None,
-        },
-        Err(error) => {
-            tracing::debug!(
-                transcript_path = %transcript_path.display(),
-                error = %error,
-                "Claude TUI rehydrate could not find last user prompt; starting at EOF"
-            );
-            ClaudeTuiRehydrateOffset {
-                start_offset: file_len,
-                suppress_prompt: None,
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn metadata_modified_recent_for_rehydrate(metadata: &std::fs::Metadata, now: SystemTime) -> bool {
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    match now.duration_since(modified) {
-        Ok(age) => age <= CLAUDE_IDLE_REHYDRATE_RECENT_TRANSCRIPT_WINDOW,
-        Err(_) => true,
-    }
-}
-
-#[cfg(unix)]
-fn read_persisted_claude_tui_relay_offset(
-    tmux_session_name: &str,
-    transcript_path: &Path,
-    file_len: u64,
-) -> Option<ClaudeTuiRehydrateOffset> {
-    let offset_path = crate::services::tmux_common::resolve_session_temp_path(
-        tmux_session_name,
-        CLAUDE_TUI_RELAY_OFFSET_TEMP_EXT,
-    )?;
-    let content = std::fs::read_to_string(offset_path).ok()?;
-    let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
-    let expected_output_path = transcript_path.display().to_string();
-    if json.get("output_path").and_then(serde_json::Value::as_str)
-        != Some(expected_output_path.as_str())
-    {
-        return None;
-    }
-    if let (Some(prompt), Some(prompt_start), Some(response_start)) = (
-        json.get("pending_prompt")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
-        json.get("pending_prompt_start_offset")
-            .and_then(serde_json::Value::as_u64),
-        json.get("pending_response_start_offset")
-            .and_then(serde_json::Value::as_u64),
-    ) {
-        if prompt_start <= response_start && response_start <= file_len {
-            return Some(ClaudeTuiRehydrateOffset {
-                start_offset: prompt_start,
-                suppress_prompt: json
-                    .get("prompt_notified")
-                    .and_then(serde_json::Value::as_bool)
-                    .is_some_and(|notified| notified)
-                    .then_some(prompt),
-            });
-        }
-    }
-    let offset = json
-        .get("last_offset")
-        .and_then(serde_json::Value::as_u64)?;
-    (offset <= file_len).then_some(ClaudeTuiRehydrateOffset {
-        start_offset: offset,
-        suppress_prompt: None,
-    })
-}
-
-#[cfg(unix)]
-fn persist_claude_tui_relay_offset(tmux_session_name: &str, transcript_path: &Path, offset: u64) {
-    let path = crate::services::tmux_common::session_temp_path(
-        tmux_session_name,
-        CLAUDE_TUI_RELAY_OFFSET_TEMP_EXT,
-    );
-    let payload = serde_json::json!({
-        "output_path": transcript_path.display().to_string(),
-        "last_offset": offset,
-    });
-    if let Err(error) = std::fs::write(&path, format!("{payload}\n")) {
-        tracing::debug!(
-            tmux_session_name,
-            offset_path = %path,
-            error = %error,
-            "failed to persist Claude TUI relay offset"
-        );
-    }
-}
-
-#[cfg(unix)]
-fn persist_claude_tui_pending_prompt(
-    tmux_session_name: &str,
-    transcript_path: &Path,
-    prompt: &str,
-    prompt_start_offset: u64,
-    response_start_offset: u64,
-    prompt_notified: bool,
-) {
-    let path = crate::services::tmux_common::session_temp_path(
-        tmux_session_name,
-        CLAUDE_TUI_RELAY_OFFSET_TEMP_EXT,
-    );
-    let payload = serde_json::json!({
-        "output_path": transcript_path.display().to_string(),
-        "pending_prompt": prompt,
-        "pending_prompt_start_offset": prompt_start_offset,
-        "pending_response_start_offset": response_start_offset,
-        "prompt_notified": prompt_notified,
-    });
-    if let Err(error) = std::fs::write(&path, format!("{payload}\n")) {
-        tracing::debug!(
-            tmux_session_name,
-            offset_path = %path,
-            error = %error,
-            "failed to persist Claude TUI pending prompt"
-        );
-    }
-}
-
-#[cfg(unix)]
-fn mark_claude_pending_prompt_notified(prompt: &ObservedTuiPrompt) {
-    if !prompt
-        .provider
-        .trim()
-        .eq_ignore_ascii_case(ProviderKind::Claude.as_str())
-    {
-        return;
-    }
-    let Some(binding) = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(
-        &prompt.tmux_session_name,
-    ) else {
-        return;
-    };
-    if binding.runtime_kind != RuntimeHandoffKind::ClaudeTui {
-        return;
-    }
-    let transcript_path = PathBuf::from(&binding.output_path);
-    let Some(offset_path) = crate::services::tmux_common::resolve_session_temp_path(
-        &prompt.tmux_session_name,
-        CLAUDE_TUI_RELAY_OFFSET_TEMP_EXT,
-    ) else {
-        return;
-    };
-    let Ok(content) = std::fs::read_to_string(&offset_path) else {
-        return;
-    };
-    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
-    let expected_output_path = transcript_path.display().to_string();
-    if json.get("output_path").and_then(serde_json::Value::as_str)
-        != Some(expected_output_path.as_str())
-    {
-        return;
-    }
-    let Some(pending_prompt) = json
-        .get("pending_prompt")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return;
-    };
-    if !crate::services::tui_prompt_dedupe::prompts_match(pending_prompt, &prompt.prompt) {
-        return;
-    }
-    if let Some(object) = json.as_object_mut() {
-        object.insert("prompt_notified".to_string(), serde_json::json!(true));
-    }
-    if let Err(error) = std::fs::write(&offset_path, format!("{json}\n")) {
-        tracing::debug!(
-            tmux_session_name = %prompt.tmux_session_name,
-            offset_path = %offset_path,
-            error = %error,
-            "failed to mark Claude TUI pending prompt as notified"
-        );
-    }
+fn claude_tui_rehydrate_start_offset(transcript_path: &Path) -> u64 {
+    std::fs::metadata(transcript_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
 }
 
 #[cfg(unix)]
@@ -770,77 +515,12 @@ fn advance_claude_tmux_runtime_binding_offset(
     tmux_session_name: &str,
     transcript_path: &Path,
     offset: u64,
-    persist: bool,
 ) -> bool {
-    let advanced = crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
+    crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
         tmux_session_name,
         transcript_path.to_str().unwrap_or_default(),
         offset,
-    );
-    if advanced && persist {
-        persist_claude_tui_relay_offset(tmux_session_name, transcript_path, offset);
-    }
-    advanced
-}
-
-#[cfg(unix)]
-fn last_claude_transcript_user_prompt_start_offset_since(
-    transcript_path: &Path,
-    since: SystemTime,
-) -> Result<Option<u64>, String> {
-    let file = std::fs::File::open(transcript_path).map_err(|error| {
-        format!(
-            "open Claude transcript {}: {error}",
-            transcript_path.display()
-        )
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-    let mut offset = 0_u64;
-    let mut last_user_prompt_offset = None;
-
-    loop {
-        line.clear();
-        let line_start_offset = offset;
-        let bytes_read = reader.read_line(&mut line).map_err(|error| {
-            format!(
-                "read Claude transcript {}: {error}",
-                transcript_path.display()
-            )
-        })?;
-        if bytes_read == 0 {
-            return Ok(last_user_prompt_offset);
-        }
-        offset = offset.saturating_add(bytes_read as u64);
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            continue;
-        };
-        if crate::services::tui_prompt_dedupe::extract_claude_transcript_user_prompt(&json)
-            .is_some()
-            && claude_transcript_timestamp_at_or_after(&json, since)
-        {
-            last_user_prompt_offset = Some(line_start_offset);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn claude_transcript_timestamp_at_or_after(json: &serde_json::Value, since: SystemTime) -> bool {
-    let Some(timestamp) = json.get("timestamp").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
-        return false;
-    };
-    let millis = parsed.timestamp_millis();
-    let event_time = if millis >= 0 {
-        UNIX_EPOCH + Duration::from_millis(millis as u64)
-    } else {
-        UNIX_EPOCH
-            .checked_sub(Duration::from_millis(millis.unsigned_abs()))
-            .unwrap_or(UNIX_EPOCH)
-    };
-    event_time.duration_since(since).is_ok()
+    )
 }
 
 #[cfg(unix)]
@@ -1381,7 +1061,6 @@ async fn run_claude_idle_response_tail(
             &tmux_session_name,
             &transcript_path,
             final_offset,
-            true,
         );
         return;
     }
@@ -1399,7 +1078,6 @@ async fn run_claude_idle_response_tail(
             &tmux_session_name,
             &transcript_path,
             final_offset,
-            true,
         );
     }
 }
@@ -1890,20 +1568,14 @@ agents:
                 .expect("transcript path");
             std::fs::create_dir_all(transcript_path.parent().expect("transcript parent"))
                 .expect("transcript parent dir");
-            let relay_started_at = UNIX_EPOCH + Duration::from_secs(10);
-            let prompt_timestamp =
-                chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(5))
-                    .to_rfc3339();
             let before = concat!(
                 "{\"type\":\"system\",\"subtype\":\"init\"}\n",
                 "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old answer\"}]}}\n",
             );
-            let prompt = format!(
-                "{{\"type\":\"user\",\"timestamp\":\"{prompt_timestamp}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"direct prompt during restart\"}}]}}}}\n"
-            );
+            let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"direct prompt during restart\"}]}}\n";
             let after = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"new answer\"}]}}\n";
-            std::fs::write(&transcript_path, format!("{before}{prompt}{after}"))
-                .expect("transcript");
+            let transcript_body = format!("{before}{prompt}{after}");
+            std::fs::write(&transcript_path, &transcript_body).expect("transcript");
             let launch_script_path = crate::services::tmux_common::session_temp_path(
                 &tmux_session_name,
                 crate::services::tmux_common::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
@@ -1922,12 +1594,9 @@ agents:
             (
                 resolve_rehydrated_claude_tmux_channel_id(&tmux_session_name)
                     .expect("resolved channel"),
-                rehydrated_claude_tui_binding_for_tmux_session(
-                    &tmux_session_name,
-                    relay_started_at,
-                )
-                .expect("rehydrated binding"),
-                before.len() as u64,
+                rehydrated_claude_tui_binding_for_tmux_session(&tmux_session_name)
+                    .expect("rehydrated binding"),
+                transcript_body.len() as u64,
             )
         })();
 
@@ -1940,14 +1609,14 @@ agents:
             None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
         }
 
-        let (channel_id, binding, prompt_start_offset) = result;
+        let (channel_id, binding, expected_start_offset) = result;
         assert_eq!(channel_id, 1490141479707086938);
         assert_eq!(binding.runtime_kind, RuntimeHandoffKind::ClaudeTui);
         assert_eq!(
             binding.session_id.as_deref(),
             Some("01234567-89ab-cdef-0123-456789abcdef")
         );
-        assert_eq!(binding.last_offset, prompt_start_offset);
+        assert_eq!(binding.last_offset, expected_start_offset);
         assert!(
             binding
                 .output_path
@@ -1955,194 +1624,32 @@ agents:
         );
     }
 
-    // U-11 If the transcript file does not exist yet at rehydrate time,
-    // start_offset is 0 — a new file will then be tailed from the
-    // beginning when it appears.
+    // U-11 Missing transcripts still start at zero; existing transcripts
+    // always start at their current EOF.
     #[cfg(unix)]
     #[test]
     fn claude_rehydrate_start_offset_returns_zero_for_missing_transcript() {
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("never-written.jsonl");
-        let relay_started_at = SystemTime::now();
 
-        let offset = claude_tui_rehydrate_start_offset(
-            "AgentDesk-claude-missing",
-            &missing,
-            relay_started_at,
-        );
-
-        assert_eq!(offset.start_offset, 0);
-        assert!(offset.suppress_prompt.is_none());
-    }
-
-    // U-11 A transcript whose mtime is *outside* the rehydrate grace
-    // window (older than CLAUDE_IDLE_REHYDRATE_STARTUP_REPLAY_GRACE) must
-    // jump straight to EOF — this prevents replaying turns from a
-    // long-idle session when the bot restarts hours later.
-    #[cfg(unix)]
-    #[test]
-    fn claude_rehydrate_start_offset_jumps_to_eof_when_transcript_is_stale() {
-        use std::os::unix::fs::MetadataExt;
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let transcript = dir.path().join("stale.jsonl");
-        let body = "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"s\"}\n";
-        std::fs::write(&transcript, body).expect("write transcript");
-        let file_len = std::fs::metadata(&transcript).expect("metadata").len();
-
-        // Backdate mtime well outside the grace window (≥ 30 min ago).
-        let stale_when = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 60);
-        let stale_seconds = stale_when
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time")
-            .as_secs() as i64;
-        let times = [
-            libc::timespec {
-                tv_sec: stale_seconds,
-                tv_nsec: 0,
-            },
-            libc::timespec {
-                tv_sec: stale_seconds,
-                tv_nsec: 0,
-            },
-        ];
-        let path_cstring = std::ffi::CString::new(transcript.as_os_str().as_encoded_bytes())
-            .expect("path cstring");
-        // SAFETY: utimensat with a known-valid CString path; the timespec
-        // array is fully initialized above.
-        let result =
-            unsafe { libc::utimensat(libc::AT_FDCWD, path_cstring.as_ptr(), times.as_ptr(), 0) };
-        assert_eq!(result, 0, "utimensat failed");
-        let _ = std::fs::metadata(&transcript).expect("metadata").mtime();
-
-        let relay_started_at = std::time::SystemTime::now();
-        let offset = claude_tui_rehydrate_start_offset(
-            "AgentDesk-claude-stale",
-            &transcript,
-            relay_started_at,
-        );
-
-        assert_eq!(offset.start_offset, file_len);
-        assert!(offset.suppress_prompt.is_none());
+        assert_eq!(claude_tui_rehydrate_start_offset(&missing), 0);
     }
 
     #[cfg(unix)]
     #[test]
-    fn claude_rehydrate_start_offset_uses_last_recent_user_prompt() {
+    fn claude_rehydrate_start_offset_uses_current_eof() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let transcript = dir.path().join("transcript.jsonl");
-        let relay_started_at = UNIX_EPOCH + Duration::from_secs(10);
-        let prompt_timestamp =
-            chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(5)).to_rfc3339();
+        let transcript = dir.path().join("current.jsonl");
         let before = "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"s1\"}\n";
-        let prompt = format!(
-            "{{\"type\":\"user\",\"timestamp\":\"{prompt_timestamp}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"direct claude prompt\"}}]}},\"sessionId\":\"s1\"}}\n"
-        );
+        let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"direct claude prompt\"}]},\"sessionId\":\"s1\"}\n";
         let after = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]},\"sessionId\":\"s1\"}\n";
-        std::fs::write(&transcript, format!("{before}{prompt}{after}")).expect("write transcript");
+        let body = format!("{before}{prompt}{after}");
+        std::fs::write(&transcript, &body).expect("write transcript");
 
         assert_eq!(
-            claude_tui_rehydrate_start_offset(
-                "AgentDesk-claude-test",
-                &transcript,
-                relay_started_at
-            )
-            .start_offset,
-            before.len() as u64
+            claude_tui_rehydrate_start_offset(&transcript),
+            body.len() as u64
         );
-    }
-
-    #[cfg(all(unix, feature = "legacy-sqlite-tests"))]
-    #[test]
-    fn claude_rehydrate_start_offset_prefers_persisted_offset() {
-        let _guard = crate::services::discord::runtime_store::lock_test_env();
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().join(".adk");
-        let prev_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &root);
-        }
-
-        let result = (|| {
-            let transcript = temp.path().join("transcript.jsonl");
-            let relay_started_at = UNIX_EPOCH + Duration::from_secs(10);
-            let prompt_timestamp =
-                chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(20))
-                    .to_rfc3339();
-            let before = "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"s1\"}\n";
-            let prompt = format!(
-                "{{\"type\":\"user\",\"timestamp\":\"{prompt_timestamp}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"already relayed\"}}]}},\"sessionId\":\"s1\"}}\n"
-            );
-            let after = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]},\"sessionId\":\"s1\"}\n";
-            std::fs::write(&transcript, format!("{before}{prompt}{after}"))
-                .expect("write transcript");
-            let final_offset = std::fs::metadata(&transcript).expect("metadata").len();
-            let tmux_session_name = "AgentDesk-claude-persisted-offset";
-            persist_claude_tui_relay_offset(tmux_session_name, &transcript, final_offset);
-            (
-                claude_tui_rehydrate_start_offset(tmux_session_name, &transcript, relay_started_at),
-                final_offset,
-            )
-        })();
-
-        match prev_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-
-        let (offset, expected_start) = result;
-        assert!(offset.start_offset > 0);
-        assert_eq!(offset.start_offset, expected_start);
-        assert!(offset.suppress_prompt.is_none());
-    }
-
-    #[cfg(all(unix, feature = "legacy-sqlite-tests"))]
-    #[test]
-    fn claude_rehydrate_start_offset_suppresses_notified_pending_prompt() {
-        let _guard = crate::services::discord::runtime_store::lock_test_env();
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().join(".adk");
-        let prev_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &root);
-        }
-
-        let result = (|| {
-            let transcript = temp.path().join("transcript.jsonl");
-            let relay_started_at = UNIX_EPOCH + Duration::from_secs(10);
-            let before = "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"s1\"}\n";
-            let prompt_text = "already notified";
-            let prompt = format!(
-                "{{\"type\":\"user\",\"timestamp\":\"{}\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{prompt_text}\"}}]}},\"sessionId\":\"s1\"}}\n",
-                chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_secs(20))
-                    .to_rfc3339()
-            );
-            let after = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]},\"sessionId\":\"s1\"}\n";
-            std::fs::write(&transcript, format!("{before}{prompt}{after}"))
-                .expect("write transcript");
-            let tmux_session_name = "AgentDesk-claude-pending-offset";
-            persist_claude_tui_pending_prompt(
-                tmux_session_name,
-                &transcript,
-                prompt_text,
-                before.len() as u64,
-                (before.len() + prompt.len()) as u64,
-                true,
-            );
-            (
-                claude_tui_rehydrate_start_offset(tmux_session_name, &transcript, relay_started_at),
-                before.len() as u64,
-            )
-        })();
-
-        match prev_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-
-        let (offset, expected_start) = result;
-        assert_eq!(offset.start_offset, expected_start);
-        assert_eq!(offset.suppress_prompt.as_deref(), Some("already notified"));
     }
 
     #[test]

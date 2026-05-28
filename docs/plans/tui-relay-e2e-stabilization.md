@@ -41,7 +41,7 @@
 
 ### 트랙 A — Rust 단위/통합 (helper-level subset, 우선)
 **위치**: 기존 컨벤션(`#[cfg(test)] mod tests` inline)을 따라 **대상 함수와 같은 모듈에 inline**으로 추가. 신규 디렉터리 `tests/unit_tui/`는 만들지 않음.
-**Private 함수 접근**: `claude_tui_rehydrate_start_offset`, `read_persisted_claude_tui_relay_offset` 등이 `pub(super)`라 같은 부모 모듈의 inline test에서 호출 가능. 외부 `tests/` 통합테스트가 필요한 경우만 `pub(crate)` 승격 검토.
+**Private 함수 접근**: `claude_tui_rehydrate_start_offset` 등 helper가 같은 부모 모듈의 inline test에서 호출 가능. 외부 `tests/` 통합테스트가 필요한 경우만 `pub(crate)` 승격 검토.
 **원칙**: 외부 의존(Discord, tmux, launchctl) 없이 fixture jsonl + 함수 단위 호출.
 
 ### 트랙 B — Python E2E smoke (12케이스, 후속)
@@ -71,13 +71,13 @@
 | U-8 tool-use-emit-policy | 3.1 codex로 이동 | rollout_tail emit | tool_use 5+ envelope fixture | 결정적 emit/skip 정책 일관 |
 | U-9 idle-dedupe | 4.1 | `tui_prompt_dedupe` | 같은 라인 N회 | PENDING_PROMPT_TTL 내 1회만 emit |
 | U-10 cold-start-window | 5.2 | `register_rehydrated_tmux_runtime_binding` | 비어있는 transcript | replay 0건 |
-| U-11 cold-start-grace | 5.1 reframed | `claude_tui_rehydrate_start_offset` | 마지막 user prompt 직후 transcript | grace 안 라인만 replay |
-| U-12 stream-resume-offset | 5.3 일부 | Claude: `read_persisted_claude_tui_relay_offset` + `claude_tui_rehydrate_start_offset`(:523). Codex: `TuiRuntimeBinding::last_offset` + `scan_codex_idle_rollout_for_prompt`(:1128) + `tail_rollout_file_from_offset`. 기존 inline test 다수(`claude_rehydrate_start_offset_*`, `codex_idle_rollout_scan_*`) — 신규 보강 케이스만 | 청크 N개 본 jsonl + offset/binding | 미관측 청크만 emit, 중복 0 |
+| U-11 cold-start-eof | 5.1 reframed | `claude_tui_rehydrate_start_offset` | 마지막 user prompt 직후 transcript | 현재 EOF에서 시작, replay 0 |
+| U-12 stream-resume-offset | 5.3 일부 | Claude: `claude_tui_rehydrate_start_offset` + `TuiRuntimeBinding::last_offset`. Codex: `TuiRuntimeBinding::last_offset` + `scan_codex_idle_rollout_for_prompt`(:1128) + `tail_rollout_file_from_offset`. 기존 inline test 다수(`claude_rehydrate_start_offset_*`, `codex_idle_rollout_scan_*`) — 신규 보강 케이스만 | 청크 N개 본 jsonl + offset/binding | 미관측 청크만 emit, 중복 0 |
 | U-13 stranded-draft-classify | 6.1 | `claude.rs::claude_tui_followup_stranded_prompt_draft_state`, `gently_clear_claude_tui_prompt_draft` (cb83f2ca6 추가). 기존 inline test 3건(`detects_non_busy_transcript_with_stranded_prompt_draft` 등) 존재 — 보강 케이스만 추가 | 미submit draft 흔적 | 'recoverable' 분류 정확 |
 | U-14 channel-isolation | 7.2 + 7.1 | `tmux_by_provider_session` | cc/cdx 동시 binding | HashMap 키 충돌 0 |
 | U-15 multi-binder-dedupe | 7.1 | dedupe state | 동일 jsonl 1초 겹친 두 reader | 라인당 1 emit — **트랙 B로 이동**: 실제 1초 race 재현은 helper level에서 만들 수 없음. 기존 dedupe inline test가 helper 단위 보호는 cover |
 | U-16 partial-line | 8.1 | `claude_partial_turn_state` | 반쪽 라인 + 다음 라인 | 완성 후 정확 분류 — **트랙 B로 race 시점 재현 이동**: helper level은 기존 `claude_partial_*` 4건이 이미 cover |
-| U-17 compact-reanchor | 8.2 | `persist_*_pending_prompt` | /compact 후 잘린 transcript | offset 재계산, 동일 라인 0 |
+| U-17 compact-reanchor | 8.2 | `scan_claude_idle_transcript_for_prompt` | /compact 후 잘린 transcript | offset 재계산, 동일 라인 0 |
 | U-18 envelope-discord-mapping | 10.2 | dedupe + emit 카운터 | jsonl + 모의 emit log | 1:1 매핑, 중복/누락 0 — **트랙 B로 이동**: 실제 Discord emit 경로(`shared.discord.send_message`)는 process-wide async 의존이 강해 unit fixture로 만들기 부적절. E2E smoke E-1/E-11에서 자연 발생적으로 검증 |
 
 **부속 트랙(이미 합의된 5건)**: 2.5 compact-burst readiness, 4.3 hook vs result race, 4.4 Codex turn.completed 누락, 9.2 fault inject 단위, **추가**: U-19 hook-hash-session-id (#2647).
