@@ -2,10 +2,33 @@ use std::sync::Arc;
 
 use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
+use sqlx::Row;
 
 use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
 
 use super::SharedData;
+
+fn preserve_dispatch_on_watcher_death(dispatch_type: Option<&str>) -> bool {
+    matches!(dispatch_type, Some("review" | "phase-gate"))
+}
+
+async fn load_dispatch_type_for_restart_handoff(
+    shared: &SharedData,
+    dispatch_id: &str,
+) -> Option<String> {
+    let pool = shared.pg_pool.as_ref()?;
+    sqlx::query("SELECT dispatch_type FROM task_dispatches WHERE id = $1")
+        .bind(dispatch_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            row.try_get::<Option<String>, _>("dispatch_type")
+                .ok()
+                .flatten()
+        })
+}
 
 fn seed_restart_handoff_session_metadata(
     sessions: &mut std::collections::HashMap<ChannelId, super::DiscordSession>,
@@ -322,23 +345,32 @@ pub(super) async fn start_restart_handoff_from_state(
 
     clear_restart_handoff_provider_session(channel_id, shared, provider_kind, &state).await;
 
-    // tmux death during an inflight turn must fail the bound dispatch.
-    // Without this the dispatch stays `dispatched` forever — inflight state
-    // is cleared a few lines below so restore_inflight_turns won't pick it
-    // up on the next restart, the session reports idle so timeouts [I]
-    // skips it, and only the [G] 24h sweep eventually cleans it. See the
-    // #866 review orphan incident.
+    // tmux death during an inflight turn usually fails the bound dispatch.
+    // Review and phase-gate dispatches are different: their durable outcome
+    // is submitted through explicit verdict/repair paths. Marking them failed
+    // from watcher death can erase a verdict-ready turn before the endpoint
+    // write lands, so preserve those rows for recovery/retry.
     if let Some(dispatch_id) = state.dispatch_id.as_deref() {
-        let failure_text = format!(
-            "tmux session died mid-turn (watcher death recovery) — session={}",
-            state.tmux_session_name.as_deref().unwrap_or("<unknown>")
-        );
-        super::turn_bridge::fail_dispatch_with_retry(
-            shared.api_port,
-            Some(dispatch_id),
-            &failure_text,
-        )
-        .await;
+        let dispatch_type = load_dispatch_type_for_restart_handoff(shared, dispatch_id).await;
+        if preserve_dispatch_on_watcher_death(dispatch_type.as_deref()) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::warn!(
+                "  [{ts}] ↻ watcher death recovery: preserved {} dispatch {} for explicit verdict/repair recovery",
+                dispatch_type.as_deref().unwrap_or("unknown"),
+                dispatch_id
+            );
+        } else {
+            let failure_text = format!(
+                "tmux session died mid-turn (watcher death recovery) — session={}",
+                state.tmux_session_name.as_deref().unwrap_or("<unknown>")
+            );
+            super::turn_bridge::fail_dispatch_with_retry(
+                shared.api_port,
+                Some(dispatch_id),
+                &failure_text,
+            )
+            .await;
+        }
     }
 
     let seeded_channel_name = {
@@ -478,8 +510,8 @@ mod notice_target_tests {
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::{
-        RestartHandoffScope, build_restart_handoff_session_key, resolve_restart_handoff_scope,
-        seed_restart_handoff_session_metadata,
+        RestartHandoffScope, build_restart_handoff_session_key, preserve_dispatch_on_watcher_death,
+        resolve_restart_handoff_scope, seed_restart_handoff_session_metadata,
     };
     use crate::services::discord::DiscordSession;
     use crate::services::discord::inflight::InflightTurnState;
@@ -606,6 +638,14 @@ mod tests {
         assert!(!changed);
         let seeded = sessions.get(&channel_id).unwrap();
         assert_eq!(seeded.channel_name.as_deref(), Some("already-set"));
+    }
+
+    #[test]
+    fn watcher_death_preserves_verdict_driven_dispatch_types() {
+        assert!(preserve_dispatch_on_watcher_death(Some("review")));
+        assert!(preserve_dispatch_on_watcher_death(Some("phase-gate")));
+        assert!(!preserve_dispatch_on_watcher_death(Some("implementation")));
+        assert!(!preserve_dispatch_on_watcher_death(None));
     }
 
     #[test]

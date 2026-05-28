@@ -45,6 +45,51 @@ test("auto-queue does not infer a phase gate verdict when the result already car
   assert.equal(verdict, null);
 });
 
+test("auto-queue treats phase_gate_verdict as explicit phase gate verdict", () => {
+  const { module } = loadPolicy("policies/auto-queue.js");
+
+  const verdict = module.__test.inferPhaseGatePassVerdict(
+    {
+      phase_gate: {
+        pass_verdict: "phase_gate_passed",
+        checks: ["lint"]
+      }
+    },
+    {
+      phase_gate_verdict: "manual_hold",
+      checks: {
+        lint: { status: "pass" }
+      }
+    }
+  );
+
+  assert.equal(verdict, null);
+});
+
+test("auto-queue accepts pass alias for phase gate when checks pass", () => {
+  const { module } = loadPolicy("policies/auto-queue.js");
+
+  const matches = module.__test.phaseGateVerdictMatches(
+    "pass",
+    "phase_gate_passed",
+    {
+      phase_gate: {
+        pass_verdict: "phase_gate_passed",
+        checks: ["lint", "tests"]
+      }
+    },
+    {
+      verdict: "pass",
+      checks: {
+        lint: { status: "pass" },
+        tests: { result: "passed" }
+      }
+    }
+  );
+
+  assert.equal(matches, true);
+});
+
 test("auto-queue dispatchable targets prioritize requested and keep unique dispatch anchors", () => {
   const pipelineConfig = defaultPipelineConfig();
   const { module } = loadPolicy("policies/auto-queue.js");

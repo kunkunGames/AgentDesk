@@ -10348,7 +10348,7 @@ async fn resume_run_skips_phase_gate_blocked_runs_pg_path() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repair_phase_gate_fails_closed_without_operator_auth_config() {
+async fn repair_phase_gate_reaches_handler_without_operator_auth_config() {
     crate::pipeline::ensure_loaded();
 
     let db = test_db();
@@ -10367,15 +10367,12 @@ async fn repair_phase_gate_fails_closed_without_operator_auth_config() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(
-        json["error"],
-        "phase-gate repair requires server.auth_token or kanban.manager_channel_id to be configured"
-    );
+    assert_eq!(json["error"], "postgres pool is not configured");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

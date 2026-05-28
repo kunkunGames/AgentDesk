@@ -177,7 +177,7 @@ pub const EXPLICIT_AUTH_MUTATION_ROUTES: &[&str] = &[
 /// Mutation routes that fail closed unless an operator auth mechanism is
 /// configured. These routes are still useful in the boot audit because they
 /// explain why an endpoint may reject all callers on auth-less installs.
-pub const FAIL_CLOSED_OPERATOR_MUTATION_ROUTES: &[&str] = &["auto-queue: phase-gate repair"];
+pub const FAIL_CLOSED_OPERATOR_MUTATION_ROUTES: &[&str] = &[];
 
 /// Emits a structured boot-time audit identifying whether the explicit-auth
 /// mutation routes will fail-open with the current configuration. Called
@@ -250,7 +250,6 @@ mod audit_explicit_auth_routes_tests {
             EXPLICIT_AUTH_MUTATION_ROUTES.len(),
             "duplicate label in EXPLICIT_AUTH_MUTATION_ROUTES — audit log will report misleading counts"
         );
-        assert!(!FAIL_CLOSED_OPERATOR_MUTATION_ROUTES.is_empty());
         let mut sorted = FAIL_CLOSED_OPERATOR_MUTATION_ROUTES.to_vec();
         sorted.sort();
         sorted.dedup();

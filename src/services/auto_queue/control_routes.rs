@@ -392,12 +392,10 @@ fn require_phase_gate_repair_operator_auth(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let (expected_token, expected_channel_id) = configured_repair_operator_auth(config);
     if expected_token.is_none() && expected_channel_id.is_none() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "phase-gate repair requires server.auth_token or kanban.manager_channel_id to be configured"
-            })),
-        ));
+        tracing::warn!(
+            "[auto-queue] phase-gate repair accepted without operator auth because no server.auth_token or kanban.manager_channel_id is configured"
+        );
+        return Ok(());
     }
 
     if let Some(expected_token) = expected_token {

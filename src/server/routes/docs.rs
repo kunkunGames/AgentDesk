@@ -4528,7 +4528,7 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/queue/runs/{id}/phase-gates/repair",
             "auto-queue",
-            "Operator-only repair endpoint. Re-evaluate terminal phase-gate dispatch results for a paused run, including gates already marked failed. Requires server.auth_token or kanban.manager_channel_id to be configured; accepts Idempotency-Key for replay-safe double clicks. Use this before /api/queue/resume when blocked_runs indicates a pending/failed phase gate and the dispatch result has been repaired or persisted late.",
+            "Operator repair endpoint. Re-evaluate terminal phase-gate dispatch results for a paused run, including gates already marked failed. When server.auth_token or kanban.manager_channel_id is configured, the matching Bearer token/channel header is required; unconfigured local installs allow the repair path so operators are not blocked during incident recovery. Accepts Idempotency-Key for replay-safe double clicks. Use this before /api/queue/resume when blocked_runs indicates a pending/failed phase gate and the dispatch result has been repaired or persisted late.",
         )
         .with_params([
             ("id", path_param("Auto-queue run ID")),
@@ -4562,9 +4562,9 @@ fn all_endpoints() -> Vec<EndpointDoc> {
             }),
         )
         .with_error_example(
-            403,
+            401,
             json!({"path": {"id": "run-1"}}),
-            json!({"error": "phase-gate repair requires server.auth_token or kanban.manager_channel_id to be configured"}),
+            json!({"error": "phase-gate repair requires explicit Bearer token"}),
         )
         .with_error_example(
             404,

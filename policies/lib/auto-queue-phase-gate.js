@@ -49,17 +49,23 @@ var PHASE_GATE_GRACE_WINDOW_MS = 30 * 1000; // 30s
 
 // #699 (round 2): mirror of src/dispatch/dispatch_status.rs
 // maybe_inject_phase_gate_verdict. Infers `pass_verdict` for a phase-gate
-// result only when (a) no explicit verdict/decision is present, (b) every
+// result only when (a) no explicit verdict/decision/phase_gate_verdict is present, (b) every
 // declared `context.phase_gate.checks` entry is present in `result.checks`
 // and passes, and (c) every present entry passes. Returns the inferred
 // verdict or null. Pure function — caller applies the value.
 function _inferPhaseGatePassVerdict(ctx, result) {
+  if (_explicitPhaseGateVerdict(result)) return null;
+  return _inferPhaseGatePassVerdictFromChecks(ctx, result);
+}
+
+function _explicitPhaseGateVerdict(result) {
+  return result && (result.verdict || result.decision || result.phase_gate_verdict || null);
+}
+
+function _inferPhaseGatePassVerdictFromChecks(ctx, result) {
   if (!result || typeof result !== "object") return null;
   var phaseGate = ctx && ctx.phase_gate;
   if (!phaseGate || typeof phaseGate !== "object") return null;
-
-  var explicit = result.verdict || result.decision;
-  if (explicit) return null;
 
   var checks = result.checks;
   if (!checks || typeof checks !== "object") return null;
@@ -91,6 +97,13 @@ function _inferPhaseGatePassVerdict(ctx, result) {
   }
 
   return phaseGate.pass_verdict || "phase_gate_passed";
+}
+
+function _phaseGateVerdictMatches(actualVerdict, expectedVerdict, ctx, result) {
+  if (!actualVerdict) return false;
+  if (actualVerdict === expectedVerdict) return true;
+  if (actualVerdict !== "pass" && actualVerdict !== "passed") return false;
+  return _inferPhaseGatePassVerdictFromChecks(ctx, result) === expectedVerdict;
 }
 
 function phaseGateFailureKey(cardId, phase) {
@@ -294,6 +307,39 @@ function _attemptPhaseGateAutoCloseFallback(runId, phase, dispatchId, context, r
     agentdesk.kv.set(dedupeKey, String(Date.now()), PHASE_GATE_AUTOCLOSE_TTL_SEC);
     attempted = true;
     try {
+      var issueState = agentdesk.exec(
+        "gh",
+        [
+          "issue", "view", String(card.github_issue_number),
+          "--repo", repo,
+          "--json", "state",
+          "--jq", ".state"
+        ],
+        { timeout_ms: 15000 }
+      );
+      if (String(issueState || "").trim().toUpperCase() === "CLOSED") {
+        agentdesk.db.execute(
+          "UPDATE kanban_cards SET issue_closed_at = COALESCE(issue_closed_at, CURRENT_TIMESTAMP) WHERE id = ?",
+          [cardId]
+        );
+        anyClosed = true;
+        autoQueueLog("info", "Phase gate issue_closed refreshed from GitHub for card " + cardId + " issue #" + card.github_issue_number, {
+          run_id: runId,
+          dispatch_id: dispatchId,
+          card_id: cardId,
+          batch_phase: phase
+        });
+        continue;
+      }
+    } catch (e) {
+      autoQueueLog("warn", "Phase gate issue state lookup failed for card " + cardId + ": " + e, {
+        run_id: runId,
+        dispatch_id: dispatchId,
+        card_id: cardId,
+        batch_phase: phase
+      });
+    }
+    try {
       agentdesk.exec(
         "gh",
         [
@@ -305,6 +351,10 @@ function _attemptPhaseGateAutoCloseFallback(runId, phase, dispatchId, context, r
           ". Commit message did not contain a GitHub auto-close keyword."
         ],
         { timeout_ms: 15000 }
+      );
+      agentdesk.db.execute(
+        "UPDATE kanban_cards SET issue_closed_at = COALESCE(issue_closed_at, CURRENT_TIMESTAMP) WHERE id = ?",
+        [cardId]
       );
       anyClosed = true;
       autoQueueLog("info", "Phase gate autoclose issued for card " + cardId + " issue #" + card.github_issue_number + " commit " + commitHash.substring(0, 8), {
@@ -705,6 +755,7 @@ module.exports = {
   PHASE_GATE_AUTOCLOSE_TTL_SEC: PHASE_GATE_AUTOCLOSE_TTL_SEC,
   PHASE_GATE_GRACE_WINDOW_MS: PHASE_GATE_GRACE_WINDOW_MS,
   inferPhaseGatePassVerdict: _inferPhaseGatePassVerdict,
+  phaseGateVerdictMatches: _phaseGateVerdictMatches,
   phaseGateFailureKey: phaseGateFailureKey,
   incrementPhaseGateFailureCount: incrementPhaseGateFailureCount,
   resetPhaseGateFailureCount: resetPhaseGateFailureCount,

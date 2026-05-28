@@ -38,6 +38,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "integration_tests.rs": "End-to-end pipeline, dispatch, review, and recovery integration test harness.",
     "kanban/": "High-level kanban orchestration, state machine facade, and shared test support.",
     "launch.rs": "Starts the Tokio runtime and hands off to server boot.",
+    "lib.rs": "Library crate boundary that exposes the server/CLI modules for the slim binary entry point and tests.",
     "logging.rs": "Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs.",
     "main.rs": "Binary entry point. Dispatches CLI commands or boots the server runtime.",
     "pipeline.rs": "Pipeline stage loading, resolution, and transition helpers.",

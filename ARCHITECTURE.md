@@ -745,6 +745,7 @@ src/
 ├── high_risk_recovery.rs
 ├── integration_tests.rs
 ├── launch.rs
+├── lib.rs
 ├── logging.rs
 ├── main.rs
 ├── manual_intervention.rs
@@ -788,6 +789,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/high_risk_recovery.rs` | PG-only high-risk recovery tests for boot reconciliation and review refire paths. |
 | `src/integration_tests.rs` | End-to-end pipeline, dispatch, review, and recovery integration test harness. |
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |
+| `src/lib.rs` | Library crate boundary that exposes the server/CLI modules for the slim binary entry point and tests. |
 | `src/logging.rs` | Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs. |
 | `src/main.rs` | Binary entry point. Dispatches CLI commands or boots the server runtime. |
 | `src/manual_intervention.rs` | Manual intervention parsing and helpers shared by Discord reply/requeue flows. |

@@ -575,7 +575,14 @@ async fn reconcile_phase_gate_for_terminal_dispatch_on_pg_tx_inner(
     // Treat any non-`completed` terminal status (`failed`/`cancelled`) as a
     // gate failure regardless of verdict — the dispatch never produced a
     // verdict so we cannot pretend it passed.
-    if dispatch_status != "completed" || verdict.as_deref() != Some(pass_verdict.as_str()) {
+    if dispatch_status != "completed"
+        || !phase_gate_verdict_matches(
+            verdict.as_deref(),
+            &pass_verdict,
+            context_value.as_ref(),
+            result_value.as_ref(),
+        )
+    {
         let failed_reason = compose_failed_reason(
             dispatch_status,
             dispatch_result_json,
@@ -1204,7 +1211,7 @@ fn numeric_i64(value: &Value) -> Option<i64> {
 }
 
 fn extract_explicit_verdict(result: &Value) -> Option<String> {
-    for key in ["verdict", "decision"] {
+    for key in ["verdict", "decision", "phase_gate_verdict"] {
         if let Some(text) = result.get(key).and_then(Value::as_str) {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -1217,19 +1224,27 @@ fn extract_explicit_verdict(result: &Value) -> Option<String> {
 
 /// Mirror of the JS `_inferPhaseGatePassVerdict` helper in
 /// `policies/auto-queue.js`. When a phase-gate dispatch result is missing an
-/// explicit `verdict` / `decision`, but reports check entries that all pass,
+/// explicit `verdict` / `decision` / `phase_gate_verdict`, but reports check entries that all pass,
 /// fall back to the gate's `pass_verdict` (default `phase_gate_passed`). This
 /// keeps legacy / checks-only results from being reconciled as failures by
 /// the durable Rust path.
 ///
 /// Refuses to infer if any check fails, if any declared check is missing, if
-/// no checks are reported, or if `result.verdict` / `result.decision` is
+/// no checks are reported, or if `result.verdict` / `result.decision` /
+/// `result.phase_gate_verdict` is
 /// already set to anything truthy (mirroring JS's `||` operator semantics —
 /// numbers, booleans, objects all count as explicit just like in JS).
 fn infer_phase_gate_pass_verdict(context: Option<&Value>, result: &Value) -> Option<String> {
     if has_js_truthy_explicit_verdict(result) {
         return None;
     }
+    infer_phase_gate_pass_verdict_from_checks(context, result)
+}
+
+fn infer_phase_gate_pass_verdict_from_checks(
+    context: Option<&Value>,
+    result: &Value,
+) -> Option<String> {
     let phase_gate = context?.get("phase_gate")?;
     if !phase_gate.is_object() {
         return None;
@@ -1267,12 +1282,36 @@ fn infer_phase_gate_pass_verdict(context: Option<&Value>, result: &Value) -> Opt
     Some(pass_verdict)
 }
 
-/// JS-style truthiness check for `result.verdict || result.decision`.
+fn phase_gate_verdict_matches(
+    actual_verdict: Option<&str>,
+    expected_verdict: &str,
+    context: Option<&Value>,
+    result: Option<&Value>,
+) -> bool {
+    let Some(actual_verdict) = actual_verdict
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    if actual_verdict == expected_verdict {
+        return true;
+    }
+    if !matches!(actual_verdict, "pass" | "passed") {
+        return false;
+    }
+    result
+        .and_then(|result| infer_phase_gate_pass_verdict_from_checks(context, result))
+        .as_deref()
+        == Some(expected_verdict)
+}
+
+/// JS-style truthiness check for `result.verdict || result.decision || result.phase_gate_verdict`.
 /// Mirrors the `||` short-circuit in `policies/auto-queue.js:47` so any
 /// non-falsy value (boolean true, non-zero number, non-empty string, any
 /// object/array) blocks inference.
 fn has_js_truthy_explicit_verdict(result: &Value) -> bool {
-    for key in ["verdict", "decision"] {
+    for key in ["verdict", "decision", "phase_gate_verdict"] {
         if let Some(value) = result.get(key)
             && is_js_truthy(value)
         {
@@ -1499,7 +1538,12 @@ async fn load_sibling_phase_gate_dispatches_on_pg_tx(
             // rows that completed before the server fix shipped.
             actual_verdict = infer_phase_gate_pass_verdict(context_value.as_ref(), result);
         }
-        if actual_verdict.as_deref() != Some(expected_verdict.as_str()) {
+        if !phase_gate_verdict_matches(
+            actual_verdict.as_deref(),
+            &expected_verdict,
+            context_value.as_ref(),
+            result_value.as_ref(),
+        ) {
             let reason = result_value
                 .as_ref()
                 .and_then(|v| {
@@ -1890,7 +1934,7 @@ mod current_batch_phase_pg_tests {
 mod reconcile_phase_gate_pg_tests {
     use super::{
         PhaseGateReconciliation, PhaseGateRepairOptions, PhaseGateStateWrite,
-        infer_phase_gate_pass_verdict, parse_phase_gate_context,
+        infer_phase_gate_pass_verdict, parse_phase_gate_context, phase_gate_verdict_matches,
         reconcile_phase_gate_for_terminal_dispatch_on_pg_tx, repair_phase_gates_for_run_on_pg,
         save_phase_gate_state_on_pg,
     };
@@ -2027,6 +2071,47 @@ mod reconcile_phase_gate_pg_tests {
         );
         assert!(parse_phase_gate_context(Some("{}")).is_none());
         assert!(parse_phase_gate_context(None).is_none());
+    }
+
+    #[test]
+    fn explicit_phase_gate_verdict_key_blocks_inference() {
+        let context = gate_context();
+        let result = json!({
+            "phase_gate_verdict": "manual_hold",
+            "checks": {
+                "merge_verified": { "status": "pass" },
+                "issue_closed": { "status": "pass" },
+                "build_passed": { "status": "pass" }
+            }
+        });
+
+        assert_eq!(infer_phase_gate_pass_verdict(Some(&context), &result), None);
+        assert!(!phase_gate_verdict_matches(
+            Some("manual_hold"),
+            "phase_gate_passed",
+            Some(&context),
+            Some(&result),
+        ));
+    }
+
+    #[test]
+    fn pass_alias_matches_phase_gate_pass_verdict_when_checks_pass() {
+        let context = gate_context();
+        let result = json!({
+            "verdict": "pass",
+            "checks": {
+                "merge_verified": { "status": "pass" },
+                "issue_closed": { "status": "pass" },
+                "build_passed": { "status": "pass" }
+            }
+        });
+
+        assert!(phase_gate_verdict_matches(
+            Some("pass"),
+            "phase_gate_passed",
+            Some(&context),
+            Some(&result),
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

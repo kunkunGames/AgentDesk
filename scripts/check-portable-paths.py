@@ -36,7 +36,12 @@ DEFAULT_PATTERNS = (
 def iter_default_paths(root: Path) -> list[Path]:
     paths: list[Path] = []
     for pattern in DEFAULT_PATTERNS:
-        paths.extend(path for path in root.glob(pattern) if path.is_file())
+        paths.extend(
+            path
+            for path in root.glob(pattern)
+            if path.is_file()
+            and not any(part.startswith(".") for part in path.relative_to(root).parts)
+        )
     return sorted(set(paths))
 
 

@@ -56,6 +56,7 @@ var PHASE_GATE_ALERT_DEBOUNCE_TTL_SEC = _autoQueuePhaseGateLib.PHASE_GATE_ALERT_
 var PHASE_GATE_AUTOCLOSE_TTL_SEC = _autoQueuePhaseGateLib.PHASE_GATE_AUTOCLOSE_TTL_SEC;
 var PHASE_GATE_GRACE_WINDOW_MS = _autoQueuePhaseGateLib.PHASE_GATE_GRACE_WINDOW_MS;
 var _inferPhaseGatePassVerdict = _autoQueuePhaseGateLib.inferPhaseGatePassVerdict;
+var _phaseGateVerdictMatches = _autoQueuePhaseGateLib.phaseGateVerdictMatches;
 var phaseGateFailureKey = _autoQueuePhaseGateLib.phaseGateFailureKey;
 var incrementPhaseGateFailureCount = _autoQueuePhaseGateLib.incrementPhaseGateFailureCount;
 var resetPhaseGateFailureCount = _autoQueuePhaseGateLib.resetPhaseGateFailureCount;
@@ -213,7 +214,7 @@ var autoQueue = {
       return;
     }
 
-    var verdict = result.verdict || result.decision || null;
+    var verdict = result.verdict || result.decision || result.phase_gate_verdict || null;
     var passVerdict = gate.pass_verdict || "phase_gate_passed";
 
     // #699 fallback: legacy callers may have persisted a phase-gate result
@@ -234,7 +235,7 @@ var autoQueue = {
       }
     }
 
-    if (verdict !== passVerdict) {
+    if (!_phaseGateVerdictMatches(verdict, passVerdict, context, result)) {
       // #2035: before failing this gate, try the issue_closed-only fallback.
       // Conservative entry conditions: merge_verified=pass, build_passed=pass,
       // ONLY issue_closed failing, same commit hash recorded on the card, and
@@ -336,7 +337,7 @@ var autoQueue = {
       try { gateContext = JSON.parse(gateDispatch.context || "{}"); } catch (e) { gateContext = {}; }
       try { gateResult = JSON.parse(gateDispatch.result || "{}"); } catch (e) { gateResult = {}; }
       var expectedVerdict = (gateContext.phase_gate && gateContext.phase_gate.pass_verdict) || "phase_gate_passed";
-      var gateVerdict = gateResult.verdict || gateResult.decision || null;
+      var gateVerdict = gateResult.verdict || gateResult.decision || gateResult.phase_gate_verdict || null;
       // #699 (round 2): sibling gate dispatches persisted before the server
       // fix shipped will still be missing `verdict`. Re-run the inference
       // here so the aggregate gate evaluation does not trip on legacy rows.
@@ -352,7 +353,7 @@ var autoQueue = {
           });
         }
       }
-      if (gateDispatch.status !== "completed" || gateVerdict !== expectedVerdict) {
+      if (gateDispatch.status !== "completed" || !_phaseGateVerdictMatches(gateVerdict, expectedVerdict, gateContext, gateResult)) {
         // #2035: sibling gate path — try the issue_closed-only autoclose
         // fallback before failing. Same one-shot guard as the primary path.
         if (gateDispatch.status === "completed") {
@@ -571,6 +572,7 @@ if (typeof module !== "undefined" && module.exports) {
     policy: autoQueue,
     __test: {
       inferPhaseGatePassVerdict: _inferPhaseGatePassVerdict,
+      phaseGateVerdictMatches: _phaseGateVerdictMatches,
       dispatchableTargets: _dispatchableTargets,
       freePathToDispatchable: _freePathToDispatchable
     }
