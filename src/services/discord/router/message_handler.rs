@@ -619,6 +619,96 @@ fn observed_runtime_kind_for_managed_tmux(
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTuiProviderSessionRecovery {
+    session_id: String,
+    output_path: String,
+}
+
+#[cfg(unix)]
+fn live_tui_provider_session_recovery(
+    provider: &ProviderKind,
+    tmux_session_name: Option<&str>,
+) -> Option<LiveTuiProviderSessionRecovery> {
+    if !matches!(provider, ProviderKind::Claude) {
+        return None;
+    }
+    let tmux_session_name = tmux_session_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if !crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name) {
+        return None;
+    }
+    let binding =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)?;
+    if binding.runtime_kind != RuntimeHandoffKind::ClaudeTui {
+        return None;
+    }
+    let session_id = binding
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if !std::path::Path::new(&binding.output_path).exists() {
+        return None;
+    }
+    Some(LiveTuiProviderSessionRecovery {
+        session_id: session_id.to_string(),
+        output_path: binding.output_path,
+    })
+}
+
+#[cfg(unix)]
+async fn restore_live_tui_provider_session_from_binding(
+    shared: &Arc<SharedData>,
+    channel_id: serenity::ChannelId,
+    provider: &ProviderKind,
+    tmux_session_name: Option<&str>,
+    adk_session_key: Option<&str>,
+) -> Option<(String, bool)> {
+    let recovery = live_tui_provider_session_recovery(provider, tmux_session_name)?;
+    let memento_context_loaded = {
+        let mut data = shared.core.lock().await;
+        if let Some(session) = data.sessions.get_mut(&channel_id) {
+            session.restore_provider_session(Some(recovery.session_id.clone()));
+            session.memento_context_loaded
+        } else {
+            false
+        }
+    };
+    if let Some(session_key) = adk_session_key {
+        super::super::adk_session::save_provider_session_id(
+            session_key,
+            &recovery.session_id,
+            Some(&recovery.session_id),
+            provider,
+            channel_id,
+            shared.api_port,
+        )
+        .await;
+    }
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::warn!(
+        "  [{ts}] ↻ Recovered provider session_id from live TUI runtime binding for channel {}: tmux={} transcript={}",
+        channel_id.get(),
+        tmux_session_name.unwrap_or("(none)"),
+        recovery.output_path
+    );
+    Some((recovery.session_id, memento_context_loaded))
+}
+
+#[cfg(not(unix))]
+async fn restore_live_tui_provider_session_from_binding(
+    _shared: &Arc<SharedData>,
+    _channel_id: serenity::ChannelId,
+    _provider: &ProviderKind,
+    _tmux_session_name: Option<&str>,
+    _adk_session_key: Option<&str>,
+) -> Option<(String, bool)> {
+    None
+}
+
+#[cfg(unix)]
 fn reconcile_managed_tmux_runtime_kind_for_config(
     provider: &ProviderKind,
     channel_id: serenity::ChannelId,
@@ -2265,7 +2355,7 @@ async fn start_reserved_headless_turn_with_owner(
                 shared.api_port,
             )
             .await;
-            if restored.is_some() {
+            if let Some(restored_session_id) = restored {
                 session_strategy_reason = "db_provider_session_restored";
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
@@ -2274,13 +2364,27 @@ async fn start_reserved_headless_turn_with_owner(
                 );
                 let mut data = shared.core.lock().await;
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
-                    session.restore_provider_session(restored.clone());
+                    session.restore_provider_session(Some(restored_session_id.clone()));
                     memento_context_loaded = session.memento_context_loaded;
                 }
+                session_id = Some(restored_session_id);
+            } else if let Some((recovered, recovered_memento_context_loaded)) =
+                restore_live_tui_provider_session_from_binding(
+                    shared,
+                    channel_id,
+                    &provider,
+                    tmux_session_name.as_deref(),
+                    Some(key),
+                )
+                .await
+            {
+                session_strategy_reason = "live_tui_runtime_binding_restored";
+                memento_context_loaded = recovered_memento_context_loaded;
+                session_id = Some(recovered);
             } else {
                 session_strategy_reason = "no_cached_provider_session";
+                session_id = None;
             }
-            session_id = restored;
         } else {
             session_strategy_reason = "session_key_unavailable";
         }
@@ -4524,7 +4628,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 shared.api_port,
             )
             .await;
-            if restored.is_some() {
+            if let Some(restored_session_id) = restored {
                 session_strategy_reason = "db_provider_session_restored";
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
@@ -4533,16 +4637,36 @@ pub(in crate::services::discord) async fn handle_text_message(
                 );
                 let mut data = shared.core.lock().await;
                 if let Some(session) = data.sessions.get_mut(&channel_id) {
-                    session.restore_provider_session(restored.clone());
+                    session.restore_provider_session(Some(restored_session_id.clone()));
                     memento_context_loaded = session.memento_context_loaded;
                 }
                 // Notify: session restored — send before placeholder so it appears first
-                send_restore_notification(shared, http, channel_id, &provider, restored.as_deref())
-                    .await;
+                send_restore_notification(
+                    shared,
+                    http,
+                    channel_id,
+                    &provider,
+                    Some(restored_session_id.as_str()),
+                )
+                .await;
+                session_id = Some(restored_session_id);
+            } else if let Some((recovered, recovered_memento_context_loaded)) =
+                restore_live_tui_provider_session_from_binding(
+                    shared,
+                    channel_id,
+                    &provider,
+                    tmux_session_name.as_deref(),
+                    Some(key),
+                )
+                .await
+            {
+                session_strategy_reason = "live_tui_runtime_binding_restored";
+                memento_context_loaded = recovered_memento_context_loaded;
+                session_id = Some(recovered);
             } else {
                 session_strategy_reason = "no_cached_provider_session";
+                session_id = None;
             }
-            session_id = restored;
         } else {
             session_strategy_reason = "session_key_unavailable";
         }

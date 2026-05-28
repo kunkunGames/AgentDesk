@@ -1914,6 +1914,40 @@ fn fresh_claude_tui_session_resolution(
     })
 }
 
+#[cfg(unix)]
+fn recover_claude_tui_session_resolution_from_runtime_binding(
+    tmux_session_name: &str,
+    requested_session_id: Option<&str>,
+) -> Option<ClaudeTuiSessionResolution> {
+    let binding =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)?;
+    if binding.runtime_kind != crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui {
+        return None;
+    }
+    let session_id = binding
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| is_valid_session_id(value))?;
+    if let Some(requested_session_id) = requested_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && requested_session_id != session_id
+    {
+        return None;
+    }
+    let transcript_path = std::path::PathBuf::from(binding.output_path);
+    if !transcript_path.exists() {
+        return None;
+    }
+    Some(ClaudeTuiSessionResolution {
+        session_id: session_id.to_string(),
+        transcript_path,
+        resume: true,
+    })
+}
+
 /// Execute claude command on a remote host via SSH, streaming stdout lines
 /// back through the sender channel.
 /// NOTE: Remote SSH execution is not available in AgentDesk — always returns Err.
@@ -2026,6 +2060,31 @@ fn execute_streaming_local_tui_tmux(
 
     let session_exists = tmux_session_exists(tmux_session_name);
     let has_live_pane = tmux_session_has_live_pane(tmux_session_name);
+    if session_exists
+        && has_live_pane
+        && !resume
+        && let Some(recovered) = recover_claude_tui_session_resolution_from_runtime_binding(
+            tmux_session_name,
+            session_id,
+        )
+    {
+        tracing::warn!(
+            tmux_session_name,
+            requested_session_id = session_id.unwrap_or("(none)"),
+            recovered_session_id = %recovered.session_id,
+            transcript_path = %recovered.transcript_path.display(),
+            "recovered live Claude TUI session from runtime binding after selector/transcript lookup missed"
+        );
+        debug_log(&format!(
+            "Claude TUI recovered live runtime binding for warm follow-up (session={}, transcript={})",
+            tmux_session_name,
+            recovered.transcript_path.display()
+        ));
+        resolved_session_id = recovered.session_id;
+        transcript_path = recovered.transcript_path;
+        transcript_path_string = transcript_path.display().to_string();
+        resume = recovered.resume;
+    }
 
     if session_exists && has_live_pane && resume {
         debug_log("Existing Claude TUI tmux session found — sending follow-up");
@@ -3829,6 +3888,63 @@ mod local_tmux_lifecycle_tests {
             receiver.try_recv().is_err(),
             "Claude direct TUI handoff must not emit legacy TmuxReady with an empty FIFO"
         );
+    }
+
+    #[test]
+    fn claude_tui_runtime_binding_recovers_resume_transcript_when_cwd_lookup_missed() {
+        let transcript = tempfile::NamedTempFile::new().expect("create transcript");
+        let tmux_session_name = format!("AgentDesk-claude-recover-{}", uuid::Uuid::new_v4());
+        let session_id = uuid::Uuid::new_v4().to_string();
+        crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
+            &tmux_session_name,
+            crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+                runtime_kind: crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+                output_path: transcript.path().display().to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: Some(session_id.clone()),
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+
+        let recovered = recover_claude_tui_session_resolution_from_runtime_binding(
+            &tmux_session_name,
+            Some(&session_id),
+        )
+        .expect("recover binding");
+
+        assert_eq!(recovered.session_id, session_id);
+        assert_eq!(recovered.transcript_path, transcript.path());
+        assert!(recovered.resume);
+        assert!(crate::services::tui_prompt_dedupe::clear_tmux_runtime_binding(&tmux_session_name));
+    }
+
+    #[test]
+    fn claude_tui_runtime_binding_recovery_rejects_mismatched_session() {
+        let transcript = tempfile::NamedTempFile::new().expect("create transcript");
+        let tmux_session_name = format!("AgentDesk-claude-reject-{}", uuid::Uuid::new_v4());
+        crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
+            &tmux_session_name,
+            crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+                runtime_kind: crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+                output_path: transcript.path().display().to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+
+        let requested_session_id = uuid::Uuid::new_v4().to_string();
+        let recovered = recover_claude_tui_session_resolution_from_runtime_binding(
+            &tmux_session_name,
+            Some(&requested_session_id),
+        );
+
+        assert!(recovered.is_none());
+        assert!(crate::services::tui_prompt_dedupe::clear_tmux_runtime_binding(&tmux_session_name));
     }
 
     #[test]
