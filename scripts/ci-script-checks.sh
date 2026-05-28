@@ -22,12 +22,10 @@ echo "=== CI runner hardening guard ==="
 
 echo "=== Scratch file guard ==="
 FAIL=0
-for scratch_file in plan.md scratch.md scratch.txt scratchpad.md scratchpad.txt test_scratch.rs plan.txt; do
-  if [ -f "$scratch_file" ]; then
-    echo "ERROR: Scratch file detected in repository root: $scratch_file"
-    FAIL=1
-  fi
-done
+while IFS= read -r scratch_path; do
+  echo "ERROR: Scratch file detected in repository: $scratch_path"
+  FAIL=1
+done < <(find . \( -path "./target" -o -path "./.git" -o -path "*/node_modules" \) -prune -o -type f \( -name "plan.md" -o -name "pr-body.md" -o -name "scratch.md" -o -name "scratch.txt" -o -name "scratchpad.md" -o -name "scratchpad.txt" -o -name "test_scratch.rs" -o -name "plan.txt" -o -name "commit_message.txt" -o -name "cargo_check_output.txt" -o -name "npm_output.log" \) -print)
 if [ "$FAIL" -ne 0 ]; then
   exit "$FAIL"
 fi
