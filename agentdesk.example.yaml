@@ -7,12 +7,12 @@ cluster:
   # Optional per-worker concurrency caps for dispatch routing.
   # Keys match worker `instance_id` first, then hostname.
   nodes:
-    mac-mini-release:
+    example-main-node:
       max_concurrent_dispatches: 4
-    mac-book-release:
+    example-worker-node:
       max_concurrent_dispatches: 4
   blackout_windows:
-    mac-mini-release:
+    example-main-node:
       - start: "23:00"
         end: "23:30"
         reason: "maintenance"
@@ -379,13 +379,12 @@ automation:
 # - default_provider: provider used when nothing else hints (empty = registry
 #   default, currently `claude`).
 onboarding:
-  guild_id: "1469870512812462284"
+  guild_id: "YOUR_GUILD_ID"
   default_categories:
-    dev: "1474956560391340242"
-    cookingheart: "1474045427740311582"
-    yunhone: "1475110978277478470"
-    notify: "1469870513471094878"
-    content: "1474938030115655722"
+    dev: "YOUR_DEV_CATEGORY_ID"
+    operations: "YOUR_OPERATIONS_CATEGORY_ID"
+    notify: "YOUR_NOTIFY_CATEGORY_ID"
+    content: "YOUR_CONTENT_CATEGORY_ID"
   provider_suffix_map:
     "-cc": claude
     "-cdx": codex

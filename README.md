@@ -21,6 +21,14 @@ This will:
 
 Set `AGENTDESK_INSTALL_REPO` or `AGENTDESK_INSTALL_DIR` before running the installer when you need to test a fork or install into a sandboxed runtime root. Non-default install roots get an isolated launchd label and a derived non-8791 loopback port automatically; set `AGENTDESK_LAUNCHD_LABEL` or `AGENTDESK_INSTALL_PORT` only when you need explicit values. The default install root keeps the existing `com.agentdesk.release` label path so the bootstrap remains compatible with the current published release binary.
 
+For a portable operator scaffold before wiring real Discord or connector secrets, run:
+
+```bash
+python3 scripts/operator-init-portable.py --root ~/.adk/release
+```
+
+The helper writes `config/agentdesk.yaml`, prompt stubs, workspace directories, and `config/launchd.env.example` without embedding machine-specific `/Users/<name>` paths in repository templates. Use `--with-obsidian-stubs` only when you want local placeholder directories for the optional Obsidian connector.
+
 ### Windows and Linux Native Runtime
 
 Windows and Linux run natively today, but they use the manual/runtime-first path instead of the macOS `curl | bash` bootstrap.
@@ -358,11 +366,11 @@ database:
 # dispatch claims, and resource locks.
 cluster:
   enabled: true
-  instance_id: mac-mini-release    # use a unique value per host, e.g. mac-book-release
+  instance_id: example-main-node   # use a unique value per host, e.g. example-worker-node
   role: auto                       # auto | leader | worker
   heartbeat_interval_secs: 10
   lease_ttl_secs: 30
-  labels: [mac-mini, release]
+  labels: [example-main, release]
   capabilities:
     providers: [codex, claude, gemini, qwen]
     max_agent_turns: 1
@@ -371,7 +379,7 @@ cluster:
       unreal_editor:
         healthy: false
   dispatch_routing:
-    default_preferred_labels: [mac-book]
+    default_preferred_labels: [example-worker]
     opt_out_dispatch_types: ["create-pr", "github-sync"]
     constraints: [noop]
 
