@@ -172,23 +172,67 @@ pub(crate) fn jsonl_ready_for_input(
     ))
 }
 
+/// Strict, relay-offset-independent "is the last turn fully over?" probe.
+///
+/// `jsonl_ready_for_input` calls this on the `offset_behind` path (the relay
+/// has not consumed the whole transcript). #2790 introduced it so a fully
+/// written terminator envelope reports Ready even though trailing bytes are
+/// still unconsumed — otherwise the idle-queue drain loops forever
+/// (`hosted TUI structured turn state is busy` every 2s).
+///
+/// #2790 only inspected the single latest line. Claude writes post-turn
+/// housekeeping envelopes *after* the terminator — `pr-link`, `ai-title`,
+/// `last-prompt`, `mode`, `attachment`, plus a `permission-mode` envelope
+/// emitted whenever the user opens an interactive `/model` / `/compact` view
+/// and returns to the prompt. With those trailing lines the latest line is
+/// no longer the terminator, so the probe wrongly reported Busy and the
+/// queued message was never drained — the recurring "no active turn yet the
+/// queue is stuck" bug (observed 9×; see the watcher test note in
+/// `tmux_watcher.rs`).
+///
+/// We now walk backward across those non-turn-state housekeeping lines to
+/// find the most recent *definitive* turn-state envelope:
+///   - a terminator (`result` / `system{turn_duration,stop_hook_summary,init}`
+///     / Codex `turn.completed`) proves the turn is over → idle.
+///   - a `user`/`assistant` envelope proves a turn is in flight → not idle.
+///   - a partial/unparseable trailing fragment cannot prove anything (a new
+///     turn may be mid-write), so we stop and report not-idle — preserving
+///     #2790's race guard against dispatching onto a just-restarted turn.
+///   - `permission-mode` (Unknown) and unrecognized housekeeping envelopes
+///     (None) are skipped; on this offset-behind readiness path the caller
+///     has no active turn, so a trailing `permission-mode` is `/model`
+///     metadata, not a turn spin-up. (The watcher's completion gate has its
+///     own `full_response`-non-empty guard, so this skip cannot tear down a
+///     spinning-up turn — see #2712.)
 fn jsonl_strict_terminator_idle(provider: &ProviderKind, path: &Path) -> bool {
     let Ok(lines) = read_recent_jsonl_lines(path) else {
         return false;
     };
-    let Some(latest) = lines.iter().rev().find(|l| !l.trim().is_empty()) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<Value>(latest.trim()) else {
-        // Partial trailing fragment — cannot prove the turn has ended.
-        return false;
-    };
-    let classified = match provider {
-        ProviderKind::Claude => claude_envelope_turn_state(&json),
-        ProviderKind::Codex => codex_envelope_turn_state(&json),
-        _ => return false,
-    };
-    matches!(classified, Some(TuiTurnState::Idle))
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(trimmed) else {
+            // Partial trailing fragment — a new turn may be mid-write.
+            // Cannot prove the turn has ended.
+            return false;
+        };
+        let classified = match provider {
+            ProviderKind::Claude => claude_envelope_turn_state(&json),
+            ProviderKind::Codex => codex_envelope_turn_state(&json),
+            _ => return false,
+        };
+        match classified {
+            Some(TuiTurnState::Idle) => return true,
+            Some(TuiTurnState::Streaming | TuiTurnState::UserSubmitted) => return false,
+            // Skip post-turn housekeeping (`permission-mode` → Unknown) and
+            // unrecognized metadata envelopes (None); keep looking for the
+            // real terminator.
+            Some(TuiTurnState::Unknown) | None => continue,
+        }
+    }
+    false
 }
 
 pub(crate) fn runtime_binding_ready_for_input(
@@ -745,6 +789,71 @@ mod tests {
                 Some(len),
             ),
             Some(TuiReadyState::Ready)
+        );
+    }
+
+    // Recurring "no active turn but queue stuck" bug: the user opens `/model`
+    // (or `/compact`) in the remote TUI and returns to the prompt. Claude
+    // writes post-turn housekeeping envelopes *after* the turn terminator —
+    // `last-prompt`, `ai-title`, `mode`, `permission-mode`, `pr-link`. With
+    // the relay's consumed offset behind the file, #2790's single-latest-line
+    // strict check saw `pr-link` (a non-turn-state envelope), failed to prove
+    // a terminator, and reported Busy forever — so the deferred idle-queue
+    // drain looped to its 150-attempt ceiling and abandoned the queued
+    // message. The strict probe must walk back across the housekeeping lines
+    // to the real `turn_duration` terminator and report Ready.
+    #[test]
+    fn structured_jsonl_ready_terminator_with_trailing_housekeeping_is_ready() {
+        let file = write_jsonl(&[
+            r#"{"type":"user","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"system","subtype":"stop_hook_summary","session_id":"s"}"#,
+            r#"{"type":"system","subtype":"turn_duration","session_id":"s"}"#,
+            r#"{"type":"last-prompt","prompt":"hi"}"#,
+            r#"{"type":"ai-title","title":"chat"}"#,
+            r#"{"type":"mode","mode":"default"}"#,
+            r#"{"type":"permission-mode","mode":"default"}"#,
+            r#"{"type":"pr-link","url":"https://example.com/pr/1"}"#,
+        ]);
+        let len = std::fs::metadata(file.path()).unwrap().len();
+
+        assert_eq!(
+            jsonl_ready_for_input(
+                &ProviderKind::Claude,
+                Some(RuntimeHandoffKind::ClaudeTui),
+                file.path(),
+                // Relay consumed only through the terminator; the trailing
+                // `/model` housekeeping bytes are still unconsumed.
+                Some(len / 2),
+            ),
+            Some(TuiReadyState::Ready),
+            "a terminator followed by `/model` housekeeping envelopes \
+             (permission-mode, pr-link, …) must still report Ready"
+        );
+    }
+
+    // The walk-back must not cross a genuine in-flight signal: if a new turn's
+    // `user`/`assistant` envelope sits after the last terminator (e.g. a
+    // trailing housekeeping line was appended mid-turn), the session is busy.
+    #[test]
+    fn structured_jsonl_ready_inflight_user_after_terminator_stays_busy() {
+        let file = write_jsonl(&[
+            r#"{"type":"result","result":"done","session_id":"s"}"#,
+            r#"{"type":"user","message":{"content":"next question"}}"#,
+            r#"{"type":"attachment","path":"/tmp/x"}"#,
+        ]);
+        let len = std::fs::metadata(file.path()).unwrap().len();
+
+        assert_eq!(
+            jsonl_ready_for_input(
+                &ProviderKind::Claude,
+                Some(RuntimeHandoffKind::ClaudeTui),
+                file.path(),
+                Some(len / 2),
+            ),
+            Some(TuiReadyState::Busy),
+            "a new `user` envelope after the terminator must keep the session \
+             Busy even when a housekeeping line trails it"
         );
     }
 
