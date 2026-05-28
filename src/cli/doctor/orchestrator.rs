@@ -9,6 +9,9 @@ use crate::cli::dcserver;
 use crate::config;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::{open_write_connection, schema};
+use crate::services::operator_connectors::{
+    OptionalConnectorState, OptionalConnectorStatus, optional_connector_statuses,
+};
 use crate::services::provider::ProviderKind;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -29,6 +32,7 @@ pub(crate) struct DoctorOptions {
 enum CheckGroup {
     Core,
     ProviderRuntime,
+    OptionalConnectors,
     Voice,
 }
 
@@ -37,6 +41,7 @@ impl CheckGroup {
         match self {
             CheckGroup::Core => "core",
             CheckGroup::ProviderRuntime => "provider_runtime",
+            CheckGroup::OptionalConnectors => "optional_connectors",
             CheckGroup::Voice => "voice",
         }
     }
@@ -45,6 +50,7 @@ impl CheckGroup {
         match self {
             CheckGroup::Core => "server",
             CheckGroup::ProviderRuntime => "provider_runtime",
+            CheckGroup::OptionalConnectors => "optional_connectors",
             CheckGroup::Voice => "voice",
         }
     }
@@ -350,6 +356,13 @@ pub(crate) struct DoctorCheckReport {
     security_exposure: &'static str,
 }
 
+#[derive(Serialize)]
+pub(crate) struct DoctorSectionReport {
+    status: &'static str,
+    summary: DoctorSummary,
+    check_ids: Vec<&'static str>,
+}
+
 #[derive(Clone, Serialize)]
 pub(crate) struct DoctorFixReport {
     id: &'static str,
@@ -375,6 +388,7 @@ pub(crate) struct DoctorReport {
     artifact_path: Option<String>,
     profile: Option<&'static str>,
     summary: DoctorSummary,
+    sections: BTreeMap<&'static str, DoctorSectionReport>,
     checks: Vec<DoctorCheckReport>,
     auto_fixes: Vec<DoctorFixReport>,
     fixes: Vec<DoctorFixReport>,
@@ -1579,8 +1593,67 @@ fn check_credential_permissions(cfg: &config::Config) -> Check {
 fn build_all_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec<Check> {
     let mut checks = build_core_checks(cfg, snapshot);
     checks.extend(build_provider_checks(cfg, snapshot));
+    checks.extend(build_optional_connector_checks());
     checks.extend(build_voice_checks(cfg));
     checks
+}
+
+fn build_optional_connector_checks() -> Vec<Check> {
+    optional_connector_statuses()
+        .into_iter()
+        .map(optional_connector_check)
+        .collect()
+}
+
+fn optional_connector_check(status: OptionalConnectorStatus) -> Check {
+    let (id, name) = optional_connector_check_identity(status.id);
+    let evidence = json!({
+        "connector": status.id,
+        "state": status.state.as_str(),
+        "source": status.source.as_deref(),
+        "reason": status.reason,
+        "optional": status.optional,
+        "env_var": status.env_var,
+        "capabilities": &status.capabilities,
+        "setup_actions": &status.setup_actions,
+    });
+    let check = match status.state {
+        OptionalConnectorState::Ready
+        | OptionalConnectorState::Skipped
+        | OptionalConnectorState::MissingConfig => {
+            Check::ok(id, CheckGroup::OptionalConnectors, name, status.detail.clone())
+        }
+        OptionalConnectorState::MissingPath
+        | OptionalConnectorState::MissingProvider
+        | OptionalConnectorState::InvalidConfig => Check::warn(
+            id,
+            CheckGroup::OptionalConnectors,
+            name,
+            status.detail.clone(),
+            format!(
+                "{} is not ready (state={}). Core runtime can continue, but connector-backed routines stay disabled until setup is fixed.",
+                status.env_var,
+                status.state.as_str()
+            ),
+        )
+        .with_expected_actual("optional connector ready or not configured", status.state.as_str())
+        .with_next_steps(status.setup_actions.clone()),
+    };
+
+    let check = if let Some(source) = &status.source {
+        check.with_path(source.clone())
+    } else {
+        check
+    };
+    check.with_evidence(evidence)
+}
+
+fn optional_connector_check_identity(id: &str) -> (&'static str, &'static str) {
+    match id {
+        "obsidian_agent_prompts" => ("optional_obsidian_agents", "Obsidian agent prompts"),
+        "obsidian_skill_root" => ("optional_obsidian_skill_root", "Obsidian skill root"),
+        _ => ("optional_connector", "Optional connector"),
+    }
 }
 
 fn build_voice_checks(cfg: &config::Config) -> Vec<Check> {
@@ -1772,12 +1845,64 @@ fn summarize_checks(checks: &[Check]) -> DoctorSummary {
     }
 }
 
+fn doctor_summary_status(summary: &DoctorSummary) -> &'static str {
+    if summary.failed > 0 {
+        "fail"
+    } else if summary.warned > 0 {
+        "warn"
+    } else {
+        "pass"
+    }
+}
+
+fn build_doctor_sections(checks: &[Check]) -> BTreeMap<&'static str, DoctorSectionReport> {
+    const SECTION_NAMES: [&str; 4] = ["core", "config", "launchd", "optional_connectors"];
+
+    let mut sections = BTreeMap::new();
+    for section in SECTION_NAMES {
+        let section_checks = checks
+            .iter()
+            .filter(|check| doctor_section_includes_check(section, check))
+            .cloned()
+            .collect::<Vec<_>>();
+        let summary = summarize_checks(&section_checks);
+        sections.insert(
+            section,
+            DoctorSectionReport {
+                status: doctor_summary_status(&summary),
+                summary,
+                check_ids: section_checks.iter().map(|check| check.id).collect(),
+            },
+        );
+    }
+    sections
+}
+
+fn doctor_section_includes_check(section: &str, check: &Check) -> bool {
+    match section {
+        "core" => matches!(check.group, CheckGroup::Core),
+        "config" => {
+            check.subsystem.contains("config")
+                || check.id.contains("config")
+                || check.id.contains("runtime")
+        }
+        "launchd" => {
+            check.subsystem.contains("launchd")
+                || check.id.contains("launchd")
+                || check.detail.contains("launchd")
+        }
+        "optional_connectors" => matches!(check.group, CheckGroup::OptionalConnectors),
+        _ => false,
+    }
+}
+
 fn build_json_report(
     options: &DoctorOptions,
     checks: &[Check],
     actions: &[FixAction],
 ) -> DoctorReport {
     let summary = summarize_checks(checks);
+    let sections = build_doctor_sections(checks);
     let checks = checks
         .iter()
         .map(|check| DoctorCheckReport {
@@ -1829,6 +1954,7 @@ fn build_json_report(
             .map(|path| path.display().to_string()),
         profile: options.profile.map(DoctorProfile::as_str),
         summary,
+        sections,
         checks,
         auto_fixes: if matches!(options.run_context, RunContext::StartupOnce) {
             fixes.clone()
@@ -4036,7 +4162,7 @@ fn doctor_profile_includes_check(profile: DoctorProfile, check: &Check) -> bool 
     match profile {
         DoctorProfile::Quick => matches!(
             check.subsystem,
-            "server" | "health" | "provider_runtime" | "dispatch_outbox"
+            "server" | "health" | "provider_runtime" | "dispatch_outbox" | "optional_connectors"
         ),
         DoctorProfile::Deep => true,
         DoctorProfile::Security => {
@@ -4045,6 +4171,15 @@ fn doctor_profile_includes_check(profile: DoctorProfile, check: &Check) -> bool 
                 "security" | "config_audit" | "health" | "provider_runtime"
             ) || !matches!(check.security_exposure, SecurityExposure::None)
         }
+    }
+}
+
+fn check_group_from_report(group: &str) -> CheckGroup {
+    match group {
+        "provider_runtime" => CheckGroup::ProviderRuntime,
+        "optional_connectors" => CheckGroup::OptionalConnectors,
+        "voice" => CheckGroup::Voice,
+        _ => CheckGroup::Core,
     }
 }
 
@@ -4097,11 +4232,7 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
             .iter()
             .map(|check| Check {
                 id: check.id,
-                group: if check.group == "provider_runtime" {
-                    CheckGroup::ProviderRuntime
-                } else {
-                    CheckGroup::Core
-                },
+                group: check_group_from_report(check.group),
                 name: check.name,
                 status: match check.status {
                     "pass" => CheckStatus::Pass,
@@ -4138,19 +4269,19 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
                 },
             })
             .collect::<Vec<_>>();
-        let core_checks: Vec<Check> = checks
-            .iter()
-            .filter(|check| matches!(check.group, CheckGroup::Core))
-            .cloned()
-            .collect();
-        let provider_checks: Vec<Check> = checks
-            .iter()
-            .filter(|check| matches!(check.group, CheckGroup::ProviderRuntime))
-            .cloned()
-            .collect();
-
-        print_group("Core", &core_checks);
-        print_group("Provider Runtime", &provider_checks);
+        for (group, label) in [
+            (CheckGroup::Core, "Core"),
+            (CheckGroup::ProviderRuntime, "Provider Runtime"),
+            (CheckGroup::OptionalConnectors, "Optional Connectors"),
+            (CheckGroup::Voice, "Voice"),
+        ] {
+            let group_checks: Vec<Check> = checks
+                .iter()
+                .filter(|check| check.group == group)
+                .cloned()
+                .collect();
+            print_group(label, &group_checks);
+        }
 
         println!(
             "  {} passed, {} warned, {} failed out of {} checks",
@@ -4173,8 +4304,11 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
 
 #[cfg(test)]
 mod profile_filter_tests {
-    use super::{Check, CheckGroup, doctor_profile_includes_check};
-    use crate::cli::doctor::contract::DoctorProfile;
+    use super::{
+        Check, CheckGroup, DoctorOptions, build_json_report, check_group_from_report,
+        doctor_profile_includes_check,
+    };
+    use crate::cli::doctor::contract::{DoctorProfile, RunContext};
 
     #[test]
     fn quick_profile_keeps_dispatch_outbox_checks() {
@@ -4201,6 +4335,69 @@ mod profile_filter_tests {
             DoctorProfile::Quick,
             &config_audit
         ));
+    }
+
+    #[test]
+    fn quick_profile_keeps_portable_optional_state_checks() {
+        let optional_connector = Check::ok(
+            "optional_obsidian_agents",
+            CheckGroup::OptionalConnectors,
+            "Obsidian agent prompts",
+            "state=missing_config reason=missing_config",
+        );
+
+        assert!(doctor_profile_includes_check(
+            DoctorProfile::Quick,
+            &optional_connector
+        ));
+    }
+
+    #[test]
+    fn json_report_exposes_portable_readiness_sections() {
+        let checks = vec![
+            Check::ok("runtime_root", CheckGroup::Core, "Runtime root", "ok")
+                .with_subsystem("config"),
+            Check::ok(
+                "launchd_service",
+                CheckGroup::Core,
+                "Launchd service",
+                "launchd not loaded in manual mode",
+            )
+            .with_subsystem("launchd"),
+            Check::ok(
+                "optional_obsidian_agents",
+                CheckGroup::OptionalConnectors,
+                "Obsidian agent prompts",
+                "state=missing_config reason=missing_config",
+            ),
+        ];
+        let options = DoctorOptions {
+            fix: false,
+            json: true,
+            allow_restart: false,
+            repair_sqlite_cache: false,
+            allow_remote: false,
+            profile: None,
+            run_context: RunContext::ManualCli,
+            artifact_path: None,
+        };
+        let report = build_json_report(&options, &checks, &[]);
+
+        for section in ["core", "config", "launchd", "optional_connectors"] {
+            assert!(
+                report.sections.contains_key(section),
+                "missing doctor section {section}"
+            );
+        }
+        assert_eq!(report.sections["optional_connectors"].summary.total, 1);
+    }
+
+    #[test]
+    fn report_group_round_trip_keeps_portable_groups() {
+        assert_eq!(
+            check_group_from_report("optional_connectors"),
+            CheckGroup::OptionalConnectors
+        );
     }
 }
 
