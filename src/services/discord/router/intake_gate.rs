@@ -2464,12 +2464,21 @@ pub(in crate::services::discord) async fn handle_event(
                     );
                 }
                 Some(crate::services::cluster::intake_router_hook::IntakeRouterDecision::RanLocal { reason }) => {
-                    tracing::debug!(
-                        ?reason,
-                        channel_id = %channel_id,
-                        user_msg_id = %new_message.id,
-                        "[intake_router] ran locally"
-                    );
+                    if let crate::services::cluster::intake_router_hook::RanLocalReason::DbErrorFellBackToLocal { detail } = &reason {
+                        tracing::warn!(
+                            channel_id = %channel_id,
+                            user_msg_id = %new_message.id,
+                            detail = %detail,
+                            "[intake_router] DB error during routing decision — falling back to local"
+                        );
+                    } else {
+                        tracing::debug!(
+                            ?reason,
+                            channel_id = %channel_id,
+                            user_msg_id = %new_message.id,
+                            "[intake_router] ran locally"
+                        );
+                    }
                 }
                 None => {} // hook not active (no PG pool)
             }
