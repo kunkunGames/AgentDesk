@@ -587,6 +587,13 @@ def run_one_cell(
                 cell_session_name(cell, thread_channel_id=thread_channel_id),
                 step["send_keys_no_enter"],
             )
+        elif "send_keys" in step:
+            thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
+            tmux.send_keys(
+                cell_session_name(cell, thread_channel_id=thread_channel_id),
+                step["send_keys"],
+                "Enter",
+            )
         else:
             raise assertions.AssertionError(f"unknown step shape: {step!r}")
 

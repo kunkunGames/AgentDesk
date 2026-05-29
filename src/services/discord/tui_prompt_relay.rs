@@ -1319,6 +1319,30 @@ async fn deliver_tui_idle_response(
                 tmux_session_name,
                 channel_id.get(),
             );
+            match super::inflight::clear_inflight_state_if_matches_tmux_response(
+                &provider,
+                channel_id.get(),
+                tmux_session_name,
+                response,
+            ) {
+                super::inflight::GuardedClearOutcome::Cleared => {
+                    tracing::info!(
+                        channel_id = channel_id.get(),
+                        tmux_session_name = %tmux_session_name,
+                        provider = %provider.as_str(),
+                        "TUI idle response relay cleared matching inflight state"
+                    );
+                }
+                super::inflight::GuardedClearOutcome::IoError => {
+                    tracing::warn!(
+                        channel_id = channel_id.get(),
+                        tmux_session_name = %tmux_session_name,
+                        provider = %provider.as_str(),
+                        "TUI idle response relay could not clear matching inflight state"
+                    );
+                }
+                _ => {}
+            }
             post_tui_idle_response_session_idle(
                 shared,
                 &provider,

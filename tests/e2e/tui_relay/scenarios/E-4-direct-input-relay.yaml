@@ -3,15 +3,21 @@ title: SSH/direct TUI 입력 시 프롬프트 알림 + 응답 1회 relay (#2697/
 cells: [claude-tui, codex-tui]  # direct keystroke relay assumes TUI host
 isolation: required
 notes: |
-  Setup phase relies on the operator (or a future driver step) to inject a
-  prompt directly into the TUI pane via tmux send-keys outside the Discord
-  message path. Driver here only verifies the Discord side: a prompt
-  notification message appears, followed by the actual response.
+  The driver warms the hosted TUI through Discord, then injects the checked
+  prompt directly into the tmux pane with Enter. This covers the SSH/direct
+  path end-to-end instead of only checking the Discord send path.
 steps:
-  - send_prompt: "direct-input-echo (E-4) — please reply with the literal string DIRECT_E4_OK"
+  - send_prompt: "응답에 정확히 한 줄로 [E2E:E4:WARMUP] 만 출력해줘."
+  - wait_for_discord_text: "[E2E:E4:WARMUP]"
+    timeout_s: 240
+  - wait_idle_s: 3
+  - send_keys: "direct-input-echo (E-4) — please reply with the literal string DIRECT_E4_OK"
+  - wait_for_raw_discord_text: "터미널에 직접 주입된 입력"
+    timeout_s: 60
   - wait_for_discord_text: "DIRECT_E4_OK"
     timeout_s: 240
 assertions:
+  - raw_text_present: "터미널에 직접 주입된 입력"
   - text_present: "DIRECT_E4_OK"
   - no_duplicate_content: true
   - no_control_chars: true
