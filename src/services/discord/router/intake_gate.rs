@@ -36,6 +36,80 @@ pub(super) fn should_skip_for_missing_required_mention(
         && !content_has_explicit_user_mention(content, bot_user_id)
 }
 
+fn saved_attachment_content_type_is_image(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|raw| raw.split(';').next())
+        .map(str::trim)
+        .is_some_and(|media_type| {
+            media_type
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+        })
+}
+
+fn saved_attachment_filename_is_supported_image(filename: &str) -> bool {
+    std::path::Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "heic"
+            )
+        })
+}
+
+fn saved_attachment_is_image_like(
+    attachment: &super::message_handler::SavedDiscordAttachment,
+) -> bool {
+    saved_attachment_content_type_is_image(attachment.content_type.as_deref())
+        || saved_attachment_filename_is_supported_image(&attachment.original_filename)
+}
+
+fn attachment_prompt_field(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\r', '\n'], " ")
+}
+
+fn build_attachment_only_image_prompt(
+    attachments: &[super::message_handler::SavedDiscordAttachment],
+) -> Option<String> {
+    if !attachments.iter().any(saved_attachment_is_image_like) {
+        return None;
+    }
+
+    let message_id = attachments
+        .first()
+        .map(|attachment| attachment.discord_message_id)
+        .unwrap_or_default();
+    let mut lines = vec![
+        "[Attachment-only Discord message]".to_string(),
+        "The user uploaded image attachment(s) with no text.".to_string(),
+        "Open and inspect the local file path(s) below, infer the user's likely request from the screenshot/photo, and proceed with the appropriate analysis or task.".to_string(),
+        "Do not execute non-image attachments; treat them only as supporting files when relevant.".to_string(),
+        format!("Canonical Discord message id: {message_id}"),
+        "Saved attachments:".to_string(),
+    ];
+
+    for (index, attachment) in attachments.iter().enumerate() {
+        let content_type = attachment.content_type.as_deref().unwrap_or("<unknown>");
+        let is_image = saved_attachment_is_image_like(attachment);
+        lines.push(format!(
+            "{}. image={} filename=\"{}\" path=\"{}\" size_bytes={} content_type=\"{}\"",
+            index + 1,
+            is_image,
+            attachment_prompt_field(&attachment.original_filename),
+            attachment_prompt_field(&attachment.saved_path),
+            attachment.size_bytes,
+            attachment_prompt_field(content_type)
+        ));
+    }
+
+    Some(lines.join("\n"))
+}
+
 pub(in crate::services::discord) fn bot_author_allowed_for_live_intake(
     allowed_bot_ids: &[u64],
     announce_bot_id: Option<u64>,
@@ -1598,7 +1672,7 @@ pub(in crate::services::discord) async fn handle_event(
             }
 
             // Handle file attachments — download regardless of session state
-            if !new_message.attachments.is_empty() {
+            let saved_attachments = if !new_message.attachments.is_empty() {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
                     "  [{ts}] ◀ [{user_name}] Upload: {} file(s)",
@@ -1606,9 +1680,17 @@ pub(in crate::services::discord) async fn handle_event(
                 );
                 // Ensure session exists before handling uploads
                 auto_restore_session_with_dm_hint(&data.shared, channel_id, ctx, Some(is_dm)).await;
-                super::message_handler::handle_file_upload(ctx, new_message, &data.shared).await?;
-            }
+                super::message_handler::handle_file_upload(ctx, new_message, &data.shared).await?
+            } else {
+                Vec::new()
+            };
 
+            let attachment_only_prompt = if text.is_empty() {
+                build_attachment_only_image_prompt(&saved_attachments)
+            } else {
+                None
+            };
+            let text = attachment_only_prompt.as_deref().unwrap_or(text);
             if text.is_empty() {
                 return Ok(());
             }
@@ -2915,7 +2997,11 @@ mod thread_guard_stale_tests {
 
 #[cfg(test)]
 mod reply_context_tests {
-    use super::{AttachmentReplyItem, format_attachment_reply_context};
+    use super::super::message_handler::SavedDiscordAttachment;
+    use super::{
+        AttachmentReplyItem, build_attachment_only_image_prompt, format_attachment_reply_context,
+        saved_attachment_is_image_like,
+    };
 
     #[test]
     fn attachment_reply_context_keeps_canonical_message_id_and_all_files() {
@@ -2934,6 +3020,61 @@ mod reply_context_tests {
         assert!(context.contains("photo-3.png"));
         assert!(context.contains("middle attachment"));
         assert!(context.contains("photo-5.png"));
+    }
+
+    fn saved_attachment(
+        original_filename: &str,
+        content_type: Option<&str>,
+    ) -> SavedDiscordAttachment {
+        SavedDiscordAttachment {
+            original_filename: original_filename.to_string(),
+            saved_path: format!("/tmp/uploads/{original_filename}"),
+            size_bytes: 1024,
+            content_type: content_type.map(str::to_string),
+            discord_message_id: 1500,
+        }
+    }
+
+    #[test]
+    fn image_like_attachment_accepts_content_type_or_extension() {
+        assert!(saved_attachment_is_image_like(&saved_attachment(
+            "capture.bin",
+            Some("image/png")
+        )));
+        assert!(saved_attachment_is_image_like(&saved_attachment(
+            "photo.JPG",
+            None
+        )));
+        assert!(!saved_attachment_is_image_like(&saved_attachment(
+            "notes.txt",
+            Some("text/plain")
+        )));
+    }
+
+    #[test]
+    fn attachment_only_prompt_requires_at_least_one_image() {
+        let non_image = vec![saved_attachment("notes.txt", Some("text/plain"))];
+
+        assert!(build_attachment_only_image_prompt(&non_image).is_none());
+    }
+
+    #[test]
+    fn attachment_only_prompt_includes_saved_metadata_for_all_files() {
+        let attachments = vec![
+            saved_attachment("screen.png", Some("image/png")),
+            saved_attachment("notes.txt", Some("text/plain")),
+        ];
+
+        let prompt = build_attachment_only_image_prompt(&attachments)
+            .expect("image attachment should synthesize a prompt");
+
+        assert!(prompt.contains("[Attachment-only Discord message]"));
+        assert!(prompt.contains("Canonical Discord message id: 1500"));
+        assert!(prompt.contains("filename=\"screen.png\""));
+        assert!(prompt.contains("path=\"/tmp/uploads/screen.png\""));
+        assert!(prompt.contains("content_type=\"image/png\""));
+        assert!(prompt.contains("filename=\"notes.txt\""));
+        assert!(prompt.contains("image=false"));
     }
 }
 
