@@ -62,15 +62,6 @@ const CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE: &str =
     "⚠ 내부 처리 큐에 접근하지 못해 이 메시지를 적재하지 못했습니다. 잠시 후 다시 보내 주세요.";
 const DISCORD_ATTACHMENT_HOSTS: &[&str] = &["cdn.discordapp.com", "media.discordapp.net"];
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct SavedDiscordAttachment {
-    pub(super) original_filename: String,
-    pub(super) saved_path: String,
-    pub(super) size_bytes: usize,
-    pub(super) content_type: Option<String>,
-    pub(super) discord_message_id: u64,
-}
-
 fn claude_tui_busy_followup_refusal_notice(
     reason: Option<crate::services::turn_orchestrator::EnqueueRefusalReason>,
 ) -> &'static str {
@@ -6748,7 +6739,7 @@ pub(super) async fn handle_file_upload(
     ctx: &serenity::Context,
     msg: &serenity::Message,
     shared: &Arc<SharedData>,
-) -> Result<Vec<SavedDiscordAttachment>, Error> {
+) -> Result<usize, Error> {
     let channel_id = msg.channel_id;
 
     // Always use the runtime uploads directory (works without session)
@@ -6757,7 +6748,7 @@ pub(super) async fn handle_file_upload(
         let _ = channel_id
             .say(&ctx.http, "Cannot resolve upload directory.")
             .await;
-        return Ok(Vec::new());
+        return Ok(0);
     };
 
     if let Err(e) = fs::create_dir_all(&save_dir) {
@@ -6768,10 +6759,10 @@ pub(super) async fn handle_file_upload(
                 format!("Failed to prepare upload directory: {}", e),
             )
             .await;
-        return Ok(Vec::new());
+        return Ok(0);
     }
 
-    let mut saved_attachments = Vec::new();
+    let mut saved_attachment_count = 0;
     for attachment in &msg.attachments {
         let file_name = &attachment.filename;
 
@@ -6816,13 +6807,7 @@ pub(super) async fn handle_file_upload(
             }
         }
 
-        saved_attachments.push(SavedDiscordAttachment {
-            original_filename: file_name.clone(),
-            saved_path: dest.display().to_string(),
-            size_bytes: file_size,
-            content_type: attachment.content_type.clone(),
-            discord_message_id: msg.id.get(),
-        });
+        saved_attachment_count += 1;
 
         // Record upload in session
         let upload_record = format!(
@@ -6843,7 +6828,7 @@ pub(super) async fn handle_file_upload(
         }
     }
 
-    Ok(saved_attachments)
+    Ok(saved_attachment_count)
 }
 
 /// Handle shell commands from raw text messages (! prefix)
