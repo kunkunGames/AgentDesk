@@ -1142,6 +1142,24 @@ pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity_aft
     )
 }
 
+pub(in crate::services::discord) fn clear_inflight_state_if_matches_tmux_response(
+    provider: &ProviderKind,
+    channel_id: u64,
+    tmux_session_name: &str,
+    response: &str,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    clear_inflight_state_if_matches_tmux_response_in_root(
+        &root,
+        provider,
+        channel_id,
+        tmux_session_name,
+        response,
+    )
+}
+
 pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_identity(
     provider: &ProviderKind,
     channel_id: u64,
@@ -1365,6 +1383,58 @@ fn clear_inflight_state_if_matches_identity_after_delivery_in_root(
         }
     };
     (outcome, mirrored_delivery)
+}
+
+fn clear_inflight_state_if_matches_tmux_response_in_root(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    tmux_session_name: &str,
+    response: &str,
+) -> GuardedClearOutcome {
+    let tmux_session_name = tmux_session_name.trim();
+    let response = response.trim();
+    if tmux_session_name.is_empty() || response.is_empty() {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedClearOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
+        return GuardedClearOutcome::Missing;
+    };
+    if state.restart_mode.is_some() {
+        return GuardedClearOutcome::PlannedRestartSkipped;
+    }
+    if state.rebind_origin {
+        return GuardedClearOutcome::RebindOriginSkipped;
+    }
+    if state.tmux_session_name.as_deref().map(str::trim) != Some(tmux_session_name) {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    if state.full_response.trim() != response {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+
+    match fs::remove_file(&path) {
+        Ok(()) => GuardedClearOutcome::Cleared,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GuardedClearOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                tmux_session_name,
+                error = %error,
+                "inflight tmux-response guarded clear remove_file failed; treating as IoError so sweeper retries"
+            );
+            GuardedClearOutcome::IoError
+        }
+    }
 }
 
 fn refresh_inflight_last_offset_if_matches_identity_in_root(
@@ -1713,6 +1783,15 @@ fn stale_removal_reason(
         }
         None => {
             if age_secs > INFLIGHT_MAX_AGE_SECS {
+                if let Some(name) = state.tmux_session_name.as_deref()
+                    && tmux_pane_alive_for_stale_check(name)
+                {
+                    tracing::warn!(
+                        "  ⚠ inflight stale-age ({age_secs}s > {INFLIGHT_MAX_AGE_SECS}s) overridden — tmux pane '{name}' still alive (channel {})",
+                        state.channel_id
+                    );
+                    return None;
+                }
                 Some(format!(
                     "removing stale inflight state file ({age_secs}s old > {INFLIGHT_MAX_AGE_SECS}s)"
                 ))
@@ -1898,6 +1977,7 @@ mod stall_recovery_tests {
         InflightTurnIdentity, InflightTurnState,
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
+        clear_inflight_state_if_matches_tmux_response_in_root,
         inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
         load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
         refresh_inflight_last_offset_if_matches_identity_in_root, save_inflight_state_in_root,
@@ -2332,6 +2412,47 @@ mod stall_recovery_tests {
     }
 
     #[test]
+    fn tmux_response_guard_clears_matching_delivered_idle_relay() {
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.full_response = "done from idle relay".to_string();
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let outcome = clear_inflight_state_if_matches_tmux_response_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            "AgentDesk-claude-adk",
+            "done from idle relay",
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::Cleared);
+        assert!(load_inflight_states_from_root(temp.path(), &ProviderKind::Claude).is_empty());
+    }
+
+    #[test]
+    fn tmux_response_guard_preserves_new_turn_with_different_response() {
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 101);
+        state.user_msg_id = 101;
+        state.full_response = String::new();
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let outcome = clear_inflight_state_if_matches_tmux_response_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            "AgentDesk-claude-adk",
+            "previous idle relay response",
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        let still_there = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(still_there.len(), 1);
+        assert_eq!(still_there[0].user_msg_id, 101);
+    }
+
+    #[test]
     fn identity_guard_preserves_same_named_respawn() {
         let temp = TempDir::new().unwrap();
         let mut old_turn = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
@@ -2745,6 +2866,72 @@ mod stall_recovery_tests {
         let reason = result.expect("dead-pane DrainRestart past 1800s must be removed");
         assert!(
             reason.contains("removing stale drain_restart"),
+            "unexpected removal reason: {reason}"
+        );
+    }
+
+    /// 2026-05-28 adk-cdx relay gap regression: normal, non-restart inflight
+    /// rows must also be preserved while their tmux pane is alive. Otherwise a
+    /// long-running Codex turn can finish after the 300s cleanup and have its
+    /// terminal response suppressed because the inflight anchor vanished.
+    #[test]
+    fn stale_normal_inflight_preserved_when_tmux_pane_alive() {
+        let _guard = stale_override_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        super::set_test_tmux_alive_override(Some(&["AgentDesk-codex-adk-cdx-stale-alive-79"]));
+
+        let state = InflightTurnState::new(
+            ProviderKind::Codex,
+            79,
+            Some("adk-cdx".to_string()),
+            7,
+            42,
+            43,
+            "hello".to_string(),
+            Some("session-79".to_string()),
+            Some("AgentDesk-codex-adk-cdx-stale-alive-79".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+
+        let result = super::stale_removal_reason(&state, super::INFLIGHT_MAX_AGE_SECS + 1, 7);
+        super::set_test_tmux_alive_override(None);
+        assert!(
+            result.is_none(),
+            "alive tmux pane must preserve normal inflight rows; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn stale_normal_inflight_removed_when_tmux_pane_dead() {
+        let _guard = stale_override_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        super::set_test_tmux_alive_override(Some(&[]));
+
+        let state = InflightTurnState::new(
+            ProviderKind::Codex,
+            80,
+            Some("adk-cdx".to_string()),
+            7,
+            42,
+            43,
+            "hello".to_string(),
+            Some("session-80".to_string()),
+            Some("AgentDesk-codex-adk-cdx-stale-dead-80".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+
+        let result = super::stale_removal_reason(&state, super::INFLIGHT_MAX_AGE_SECS + 1, 7);
+        super::set_test_tmux_alive_override(None);
+        let reason = result.expect("dead-pane normal inflight past 300s must be removed");
+        assert!(
+            reason.contains("removing stale inflight state file"),
             "unexpected removal reason: {reason}"
         );
     }

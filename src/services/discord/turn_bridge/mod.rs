@@ -2969,12 +2969,22 @@ async fn enqueue_headless_delivery(
                     session_key.map(str::trim).filter(|value| !value.is_empty())
                 {
                     let thread_channel_id = channel_id.get().to_string();
+                    // #2838 (codex review): once enqueue returned Ok(Some(outbox_id))
+                    // the outbox row exists and the message WILL be delivered.
+                    // The delivery marker below is best-effort dedup bookkeeping;
+                    // propagating a marker failure as a delivery Err makes the
+                    // caller preserve inflight, which then re-delivers via
+                    // recovery (duplicate) AND stalls the queue. So every
+                    // post-enqueue marker failure logs and returns Ok (delivery
+                    // committed) — only a genuine non-delivery (no outbox row +
+                    // failed direct fallback, below) returns Err.
                     let mut tx = match pool.begin().await {
                         Ok(tx) => tx,
                         Err(error) => {
-                            return Err(format!(
-                                "terminal delivery marker transaction begin failed for session {session_key}: {error}"
-                            ));
+                            tracing::warn!(
+                                "[outbox] terminal delivery marker tx begin failed for session {session_key} (outbox {outbox_id} already enqueued; treating delivery as committed): {error}"
+                            );
+                            return Ok(());
                         }
                     };
                     if let Err(error) =
@@ -2984,9 +2994,10 @@ async fn enqueue_headless_delivery(
                             .await
                     {
                         let _ = tx.rollback().await;
-                        return Err(format!(
-                            "terminal delivery marker lock failed for session {session_key}: {error}"
-                        ));
+                        tracing::warn!(
+                            "[outbox] terminal delivery marker lock failed for session {session_key} (outbox {outbox_id} already enqueued; treating delivery as committed): {error}"
+                        );
+                        return Ok(());
                     }
 
                     let active_user_message_id =
@@ -3017,14 +3028,16 @@ async fn enqueue_headless_delivery(
                     .await
                     {
                         let _ = tx.rollback().await;
-                        return Err(format!(
-                            "terminal delivery marker write failed for session {session_key} row {outbox_id}: {error}"
-                        ));
+                        tracing::warn!(
+                            "[outbox] terminal delivery marker write failed for session {session_key} row {outbox_id} (already enqueued; treating delivery as committed): {error}"
+                        );
+                        return Ok(());
                     }
                     if let Err(error) = tx.commit().await {
-                        return Err(format!(
-                            "terminal delivery marker commit failed for session {session_key}: {error}"
-                        ));
+                        tracing::warn!(
+                            "[outbox] terminal delivery marker commit failed for session {session_key} (outbox {outbox_id} already enqueued; treating delivery as committed): {error}"
+                        );
+                        return Ok(());
                     }
                 }
                 return Ok(());
@@ -3153,6 +3166,28 @@ fn resolve_output_analytics_snapshot(
             .or_else(|| snapshot.inflight_session_id.clone()),
         output_token_usage.unwrap_or(snapshot.fallback_token_usage),
     )
+}
+
+/// #2849: resolve the EXACT final context-occupancy token usage for the
+/// completed status panel, or `None` if no exact usage exists anywhere.
+///
+/// Prefers the live accumulated snapshot (occupancy > 0). If the live
+/// `StatusUpdate`s never carried token data — common for silent/background
+/// turns — it re-parses the output JSONL range exactly as persisted analytics
+/// does via [`resolve_output_analytics_snapshot`]. Returns `None` when neither
+/// source yields non-zero occupancy, so callers never fabricate numbers and
+/// never reuse stale prior-turn usage.
+fn resolve_exact_completion_usage(
+    inflight_state: &InflightTurnState,
+    fallback_session_id: Option<&str>,
+    accumulated: TurnTokenUsage,
+) -> Option<TurnTokenUsage> {
+    if accumulated.context_occupancy_input_tokens() > 0 {
+        return Some(accumulated);
+    }
+    let snapshot = TurnAnalyticsSnapshot::capture(inflight_state, fallback_session_id, accumulated);
+    let (_session_id, usage) = resolve_output_analytics_snapshot(&snapshot);
+    (usage.context_occupancy_input_tokens() > 0).then_some(usage)
 }
 
 pub(super) fn persist_turn_analytics_row(
@@ -3649,6 +3684,21 @@ pub(super) fn spawn_turn_bridge(
         let mut has_post_tool_text = bridge.inflight_state.has_post_tool_text;
         let mut tmux_handed_off = false;
         let initial_relay_owner_kind = bridge.inflight_state.effective_relay_owner_kind();
+        // #2838 (relay-stability P0-1): count turns that begin relay with an
+        // Unknown owner kind (root cause #3 — ownership not cleanly assigned
+        // across the three relay-launch paths). Unknown is treated as a live
+        // external owner just below, so a phantom owner can make the bridge skip
+        // its own delivery (no-emit); this quantifies how often that ambiguity
+        // actually occurs in production.
+        if matches!(
+            initial_relay_owner_kind,
+            super::inflight::RelayOwnerKind::Unknown
+        ) {
+            crate::services::observability::metrics::record_relay_owner_unknown(
+                channel_id.get(),
+                provider.as_str(),
+            );
+        }
         let mut watcher_owns_assistant_relay =
             matches!(initial_relay_owner_kind, super::inflight::RelayOwnerKind::Watcher);
         let mut watcher_relay_available_for_turn = watcher_owns_assistant_relay
@@ -7096,10 +7146,19 @@ pub(super) fn spawn_turn_bridge(
                         Err(error) => {
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             tracing::warn!(
-                                "  [{ts}] ⚠ headless delivery enqueue failed for channel {}: {}",
+                                "  [{ts}] ⚠ headless delivery enqueue failed for channel {}: {} — preserving inflight for retry (full_response not yet delivered)",
                                 channel_id,
                                 error
                             );
+                            // Symmetric with the can_chain_locally failure arm
+                            // above: the answer was NOT delivered (enqueue
+                            // failed), so we must NOT let finalization clear
+                            // inflight — that would destroy the only persisted
+                            // copy of full_response with no retry path, losing
+                            // the answer entirely. Preserving inflight routes
+                            // disposition through save_inflight_state so recovery
+                            // can re-deliver, and holds queued turns until then.
+                            preserve_inflight_for_cleanup_retry = true;
                         }
                     }
                 }
@@ -7327,6 +7386,41 @@ pub(super) fn spawn_turn_bridge(
 
         let mut status_panel_completion_committed = true;
         if status_panel_terminal_committed && bridge_should_emit_completion {
+            // #2849: before rendering the completed panel, backfill exact final
+            // context usage when the live StatusUpdates never carried it (e.g.
+            // silent/background turns). resolve_exact_completion_usage prefers
+            // the live accumulated snapshot, else re-parses the output JSONL the
+            // same way persisted analytics does, and returns None when no exact
+            // usage exists — so we never fabricate or reuse stale numbers.
+            // set_context_panel_usage is a no-op when the live path already set
+            // the same values, and is gated to context_window_tokens != 0.
+            if shared_owned.status_panel_v2_enabled {
+                let context_provider_session_id = new_raw_provider_session_id
+                    .as_deref()
+                    .or(new_session_id.as_deref())
+                    .or(inflight_state.session_id.as_deref());
+                let accumulated_usage = TurnTokenUsage {
+                    input_tokens: accumulated_input_tokens,
+                    cache_create_tokens: accumulated_cache_create_tokens,
+                    cache_read_tokens: accumulated_cache_read_tokens,
+                    output_tokens: accumulated_output_tokens,
+                };
+                if let Some(usage) = resolve_exact_completion_usage(
+                    &inflight_state,
+                    context_provider_session_id,
+                    accumulated_usage,
+                ) {
+                    shared_owned.placeholder_live_events.set_context_panel_usage(
+                        channel_id,
+                        context_provider_session_id,
+                        usage.input_tokens,
+                        usage.cache_create_tokens,
+                        usage.cache_read_tokens,
+                        context_window_tokens,
+                        context_compact_percent,
+                    );
+                }
+            }
             // #2161 (Codex H1): the bridge-owned delivery path runs the
             // gate ABOVE so it can also block dispatch completion on
             // TimedOut. Here we just reuse the outcome and skip the
@@ -7882,6 +7976,36 @@ pub(super) fn spawn_turn_bridge(
                 );
             }
         } else {
+            // #2838 (relay-stability P0-1): detect the missing-answer vector
+            // (root causes #1b / #4). We are about to clear inflight (not
+            // preserving, no delegated owner). If a non-empty full_response was
+            // never committed to Discord on a NORMAL turn — excluding the
+            // intentional cancelled / prompt-too-long paths, which deliver a
+            // [Stopped]/notice via status_panel_terminal_committed rather than
+            // terminal_delivery_committed — the generated answer is being
+            // destroyed with no retry. Each increment is a leaked answer.
+            if !cancelled
+                && !is_prompt_too_long
+                && !terminal_delivery_committed
+                && !inflight_state.full_response.trim().is_empty()
+            {
+                crate::services::observability::metrics::record_relay_uncommitted_inflight_cleared(
+                    channel_id.get(),
+                    provider.as_str(),
+                );
+                crate::services::observability::emit_relay_delivery(
+                    provider.as_str(),
+                    channel_id.get(),
+                    Some(turn_id.as_str()),
+                    Some(current_msg_id.get()),
+                    "turn_bridge",
+                    "skip",
+                    None,
+                    None,
+                    false,
+                    Some("inflight cleared with undelivered full_response"),
+                );
+            }
             clear_inflight_state(&provider, channel_id.get());
             // Defuse the guard — cleanup already done above.
             inflight_guard.provider.take();

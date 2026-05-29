@@ -6,7 +6,7 @@
 > [`docs/generated/module-inventory.md`](../generated/module-inventory.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-05-19 (against #2158 streaming STT wiring giant-file registration).
+> Last refreshed: 2026-05-29 (against #2848 maintainability baseline refresh).
 
 ## Read This First
 
@@ -135,9 +135,18 @@
   - `src/services/cluster/stream_relay.rs` (1049 lines; session-bound
     StreamRelay queue, delivery metrics, and terminal ack sequencing surface —
     split before adding non-bugfix behavior).
+  - `src/services/discord/session_relay_sink.rs` (1125 lines; Discord session
+    relay sink, queue delivery, and message update surface — bugfix only
+    outside an extraction plan).
   - `src/services/discord/gateway.rs` (1006 lines; Discord gateway adapter
     and `TurnGateway` bridge for turn send/edit/pin/unpin behavior — bugfix
     only outside a split plan).
+  - `src/services/discord/session_relay_sink.rs` (1125 lines; Discord
+    `RelaySink` for the session-bound `StreamRelay` path — chunking, dedup,
+    and terminal-delivery wiring; bugfix only outside a split plan).
+  - `src/services/tui_turn_state.rs` (1105 lines; relay-offset-independent
+    hosted-TUI structured turn-state probe — "is the last turn fully over?";
+    bugfix only outside a split plan).
   - `src/services/discord/router/message_handler.rs` (7013 lines).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (7062 lines).
@@ -168,6 +177,9 @@
     CLI STT runtime plus streaming session adapter surface, split before adding
     non-bugfix behavior).
   - `src/services/discord/commands/config.rs` (1877 lines).
+  - `src/services/discord/commands/voice.rs` (1003 lines; voice join/attach
+    commands plus auto-join orchestration surface, split before adding
+    non-bugfix behavior).
   - `src/services/discord/commands/inspect.rs` (1058 lines, post-#1701
     context-view manifest binding pushed it past the giant-file threshold).
   - `src/services/discord/{commands/text_commands.rs, commands/diagnostics.rs,
@@ -177,6 +189,9 @@
     TUI ready/draft heuristics surface — bugfix only outside a split plan).
   - `src/services/discord/standby_relay.rs` (1095 lines; cluster-standby
     JSONL→Discord relay loop from #2011 phase 5.3, bugfix only outside an
+    extraction plan).
+  - `src/services/tui_turn_state.rs` (1105 lines; TUI turn-state persistence,
+    reconciliation, and lifecycle snapshot surface — bugfix only outside an
     extraction plan).
 - active_callsite_coverage: n/a.
 - invariants: watcher single-owner per #1222; placeholder lifecycle invariants
@@ -438,7 +453,13 @@ The remaining giant-file modules under `src/services/` not covered above:
   `src/services/discord_config_audit.rs` (1310),
   `src/services/discord/tmux_lifecycle.rs` (1129), and
   `src/services/qwen_tmux_wrapper.rs` (1194).
+- `src/services/discord/session_relay_sink.rs` (1125) — Discord session relay
+  sink delivery/orchestration surface. Split focused helpers before adding
+  non-bugfix relay behavior.
 - `src/services/turn_orchestrator.rs` (2070).
+- `src/services/tui_turn_state.rs` (1105) — TUI turn-state observation and
+  rendering state surface. Split focused helpers before adding non-bugfix turn
+  state behavior.
 - `src/services/session_backend.rs` (1053).
 - `src/voice/turn_link.rs` (1282 lines) — VoiceTurnLink durable store + GC
   (#2362 / #2164 voice epic A); covers per-utterance status row + advisory-lock

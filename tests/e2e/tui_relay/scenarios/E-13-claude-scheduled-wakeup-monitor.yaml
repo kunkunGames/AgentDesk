@@ -1,0 +1,30 @@
+id: E-13
+title: Claude Code scheduled wakeup/monitor 패턴이 깨어난 뒤 최종 출력 relay
+cells: [claude-pipe]
+isolation: required
+notes: |
+  Claude Code pipe/headless 전용 회귀. 첫 turn은 ScheduleWakeup/Monitor 계열
+  대기 상태를 만들고, 이후 자동 wakeup으로 재진입한 turn이 사용자-visible
+  marker를 Discord에 relay해야 한다. TUI/claude-e cells는 이 matrix에서
+  persistent Claude Code wake session을 안정적으로 만들지 않으므로 일반 relay
+  시나리오만 맡긴다.
+steps:
+  - send_prompt: |
+      E2E E-13 scheduled wakeup/monitor relay test.
+
+      목표:
+      1. 가능하면 Claude Code의 Monitor 패턴을 사용해서 짧은 백그라운드 완료 이벤트가 이 세션을 깨우도록 준비해.
+      2. 반드시 ScheduleWakeup을 마지막 액션으로 호출해. delaySeconds는 20으로 하고, prompt는 아래 문장 그대로 사용해.
+
+      "E2E E-13 wake fired. 응답에 정확히 한 줄로 [E2E:E13:WAKE] 만 출력해줘. 추가 설명 금지."
+
+      첫 turn에서는 [E2E:E13:WAKE]를 출력하지 마. ScheduleWakeup 호출이 마지막 액션이어야 해.
+  - wait_for_raw_discord_text: "ScheduleWakeup"
+    timeout_s: 120
+  - wait_for_discord_text: "[E2E:E13:WAKE]"
+    timeout_s: 360
+assertions:
+  - raw_text_present: "ScheduleWakeup"
+  - text_present: "[E2E:E13:WAKE]"
+  - no_duplicate_content: true
+  - no_resume_prompt_chrome: true

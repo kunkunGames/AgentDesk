@@ -240,7 +240,12 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
         let channel_id = parse_channel_id(target_channel)?;
         rate_limit_wait(&self.shared, channel_id).await;
         channel_id
-            .send_message(&self.http, serenity::CreateMessage::new().content(content))
+            .send_message(
+                &self.http,
+                serenity::CreateMessage::new()
+                    .content(content)
+                    .allowed_mentions(super::http::relay_allowed_mentions()),
+            )
             .await
             .map(|message| message.id.get().to_string())
             .map_err(dispatch_post_error)
@@ -268,7 +273,8 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
                 &self.http,
                 serenity::CreateMessage::new()
                     .reference_message((reference_channel_id, reference_message_id))
-                    .content(content),
+                    .content(content)
+                    .allowed_mentions(super::http::relay_allowed_mentions()),
             )
             .await
             .map(|message| message.id.get().to_string())
@@ -294,7 +300,9 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
             .edit_message(
                 &self.http,
                 message_id,
-                serenity::EditMessage::new().content(content),
+                serenity::EditMessage::new()
+                    .content(content)
+                    .allowed_mentions(super::http::relay_allowed_mentions()),
             )
             .await
             .map(|message| message.id.get().to_string())
@@ -649,6 +657,14 @@ impl TurnGateway for DiscordGateway {
             } else {
                 live_turn.request_owner
             };
+            if !intervention.pending_uploads.is_empty() {
+                let mut data = self.shared.core.lock().await;
+                if let Some(session) = data.sessions.get_mut(&channel_id) {
+                    session
+                        .pending_uploads
+                        .extend(intervention.pending_uploads.iter().cloned());
+                }
+            }
             handle_text_message(
                 &deps,
                 channel_id,
@@ -666,6 +682,7 @@ impl TurnGateway for DiscordGateway {
                 // Queued turn kickoff: the prior turn already finished, so
                 // this dispatch is not racing the placeholder-delete path.
                 router::TurnKind::Foreground,
+                Vec::new(),
             )
             .await
             .map_err(|e| e.to_string())

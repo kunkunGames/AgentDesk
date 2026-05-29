@@ -92,6 +92,10 @@ async fn voice_join_impl(ctx: Context<'_>) -> Result<(), Error> {
         .shared
         .voice_barge_in
         .register_voice_context(control_channel_id, guild_id);
+    ctx.data()
+        .shared
+        .voice_barge_in
+        .register_voice_context(channel_id, guild_id);
     voice_occupancy().insert(
         (ctx.data().provider.as_str().to_string(), guild_id.get()),
         channel_id.get(),
@@ -167,6 +171,10 @@ async fn cmd_voice_attach(
         .shared
         .voice_barge_in
         .register_voice_context(text_channel_id, guild_id);
+    ctx.data()
+        .shared
+        .voice_barge_in
+        .register_voice_context(voice_channel_id, guild_id);
 
     ctx.say(format!(
         "Voice channel `{}` is attached to text channel `{}`.",
@@ -276,6 +284,9 @@ pub(in crate::services::discord) async fn handle_vc_text_command(
             data.shared
                 .voice_barge_in
                 .register_voice_context(control_channel_id, guild_id);
+            data.shared
+                .voice_barge_in
+                .register_voice_context(channel_id, guild_id);
             voice_occupancy().insert(
                 (data.provider.as_str().to_string(), guild_id.get()),
                 channel_id.get(),
@@ -432,7 +443,8 @@ pub(in crate::services::discord) async fn auto_join_voice_channels(
     barge_in: std::sync::Arc<super::super::voice_barge_in::VoiceBargeInRuntime>,
     pairings: std::sync::Arc<super::super::voice_routing::VoiceChannelPairingStore>,
     provider: crate::services::provider::ProviderKind,
-    channel_provider_map: std::collections::HashMap<String, String>,
+    agent_id: Option<String>,
+    channel_provider_map: std::collections::HashMap<String, (String, Option<String>)>,
 ) {
     if !config.enabled {
         tracing::info!("voice auto-join skipped: voice.enabled=false");
@@ -448,11 +460,16 @@ pub(in crate::services::discord) async fn auto_join_voice_channels(
     );
 
     let self_provider = provider.as_str().to_string();
+    let self_agent = agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    // Pass 1: self-mapped channels. Each provider bot enters only the channels
-    // explicitly mapped to it in agentdesk.yaml.
+    // Pass 1: self-mapped channels. Provider-wide mappings keep legacy behavior;
+    // agent voice mappings are claimed only by the exact configured agent.
     for raw_channel_id in raw_ids.iter() {
-        let Some(mapped) = channel_provider_map.get(raw_channel_id.trim()) else {
+        let Some((mapped_provider, mapped_agent)) = channel_provider_map.get(raw_channel_id.trim())
+        else {
             // Unmapped channels never receive a bot. Surface the gap once via
             // the notify bot so the operator can fix the agent yaml.
             let Ok(notify_channel_id) = raw_channel_id.trim().parse::<u64>().map(ChannelId::new)
@@ -482,9 +499,25 @@ pub(in crate::services::discord) async fn auto_join_voice_channels(
             .await;
             continue;
         };
-        if mapped.as_str() != self_provider.as_str() {
+        if mapped_provider.as_str() != self_provider.as_str() {
             // Pass 2 candidate.
             continue;
+        }
+        let target_agent = mapped_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(target_agent) = target_agent {
+            if self_agent != Some(target_agent) {
+                tracing::debug!(
+                    provider = self_provider.as_str(),
+                    self_agent = ?self_agent,
+                    target_agent,
+                    channel_id = raw_channel_id,
+                    "voice auto-join skipped: agent-specific channel belongs to another agent"
+                );
+                continue;
+            }
         }
         try_join_for_provider(
             &ctx,
@@ -508,11 +541,20 @@ pub(in crate::services::discord) async fn auto_join_voice_channels(
     // from also entering this channel). The fallback bot joins solely to make
     // voice available; text/TTS routing in `channel_provider_map` is untouched.
     for raw_channel_id in raw_ids.iter() {
-        let Some(mapped) = channel_provider_map.get(raw_channel_id.trim()) else {
+        let Some((mapped_provider, mapped_agent)) = channel_provider_map.get(raw_channel_id.trim())
+        else {
             continue; // Pass 1 already notified.
         };
-        if mapped.as_str() == self_provider.as_str() {
+        if mapped_provider.as_str() == self_provider.as_str() {
             continue; // Already handled in Pass 1.
+        }
+        if mapped_agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            continue; // Agent-specific voice channels must not be taken over by another bot.
         }
         try_join_for_provider(
             &ctx,
@@ -522,7 +564,7 @@ pub(in crate::services::discord) async fn auto_join_voice_channels(
             &self_provider,
             raw_channel_id,
             JoinMode::Takeover {
-                mapped_provider: mapped.clone(),
+                mapped_provider: mapped_provider.clone(),
             },
         )
         .await;
@@ -644,6 +686,7 @@ async fn try_join_for_provider(
                 "voice auto-join skipped: songbird call already connected for guild (#2054 idempotency)"
             );
             barge_in.register_voice_context(control_channel_id, guild_id);
+            barge_in.register_voice_context(ChannelId::new(recorded_channel), guild_id);
             voice_occupancy().insert(
                 (self_provider.to_string(), guild_id.get()),
                 recorded_channel,
@@ -679,6 +722,7 @@ async fn try_join_for_provider(
                 "voice auto-join Ok: songbird connected, receiver registered"
             );
             barge_in.register_voice_context(control_channel_id, guild_id);
+            barge_in.register_voice_context(channel_id, guild_id);
             voice_occupancy().insert(
                 (self_provider.to_string(), guild_id.get()),
                 channel_id.get(),

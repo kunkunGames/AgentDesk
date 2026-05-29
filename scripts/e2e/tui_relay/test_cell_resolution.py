@@ -78,6 +78,7 @@ class ScenarioFilter(unittest.TestCase):
         # TUI-keystroke ones (E-4, E-10, E-12).
         self.assertIn("E-1", ids)
         self.assertIn("E-6", ids)
+        self.assertIn("E-13", ids)
         self.assertIn("E-8", ids)
         self.assertNotIn("E-4", ids)
         self.assertNotIn("E-10", ids)
@@ -89,15 +90,25 @@ class ScenarioFilter(unittest.TestCase):
         scenarios = driver.load_scenarios(self.scenarios_dir, cell="claude-tui")
         ids = {str(s.get("id")) for s in scenarios}
         self.assertIn("E-1", ids)
+        self.assertNotIn("E-13", ids)
         self.assertIn("E-4", ids)
         self.assertIn("E-10", ids)
         self.assertIn("E-12", ids)
+        self.assertNotIn("E-7", ids)
+
+    def test_claude_e_scenarios(self):
+        scenarios = driver.load_scenarios(self.scenarios_dir, cell="claude-e")
+        ids = {str(s.get("id")) for s in scenarios}
+        self.assertIn("E-1", ids)
+        self.assertNotIn("E-13", ids)
+        self.assertNotIn("E-4", ids)
         self.assertNotIn("E-7", ids)
 
     def test_codex_pipe_scenarios(self):
         scenarios = driver.load_scenarios(self.scenarios_dir, cell="codex-pipe")
         ids = {str(s.get("id")) for s in scenarios}
         self.assertIn("E-7", ids)
+        self.assertNotIn("E-13", ids)
         self.assertNotIn("E-6", ids)
         self.assertNotIn("E-4", ids)
 

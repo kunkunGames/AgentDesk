@@ -378,6 +378,11 @@ fn watcher_batch_contains_relayable_response(data: &[u8]) -> bool {
         || text.contains("\"type\": \"result\"")
 }
 
+fn watcher_batch_contains_assistant_event(data: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(data);
+    text.contains("\"type\":\"assistant\"") || text.contains("\"type\": \"assistant\"")
+}
+
 fn legacy_wrapper_prompt_candidates_from_pane(pane: &str) -> Vec<String> {
     let mut collecting = false;
     let mut current_block: Vec<String> = Vec::new();
@@ -901,6 +906,64 @@ fn watcher_should_direct_send_after_session_bound_ack(
     should_direct_send && !matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered)
 }
 
+/// #2840 (relay-stability P1): RAII guard for the cross-watcher emission slot
+/// (`relay_coord.relay_slot`, an `Arc<AtomicU64>`: 0 = free, non-zero = a
+/// watcher is mid-emission with that start offset). The slot is shared across
+/// every watcher instance for a channel/session, so if the holding watcher
+/// early-returns, hits a `?`, panics, or is task-aborted between CAS-acquire
+/// and the manual `store(0)`, the slot stays non-zero forever and every
+/// replacement watcher's relay is skipped — a permanent channel wedge until
+/// process restart.
+///
+/// The guard releases the slot on Drop so ANY exit path frees it. The two
+/// intended in-loop release points still call `release()` explicitly to
+/// preserve their exact timing (site 1 releases *before* a 500ms backoff sleep,
+/// so scope-end Drop alone would hold the slot across that sleep); the
+/// idempotent `released` flag makes the trailing Drop a no-op after an explicit
+/// release.
+struct RelaySlotGuard {
+    slot: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    released: bool,
+}
+
+impl RelaySlotGuard {
+    fn new(slot: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            slot,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.slot.store(0, std::sync::atomic::Ordering::Release);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for RelaySlotGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            // #2841 (codex review): reaching Drop without a prior explicit
+            // release() means an abnormal exit (panic / `?` / task
+            // cancellation) BEFORE the turn recorded its relayed offset /
+            // advanced confirmed-end — so the delivery outcome of any in-flight
+            // Discord send is UNKNOWN. Freeing the slot prevents a permanent
+            // channel wedge, but a replacement watcher MAY then re-emit the same
+            // range (a bounded duplicate window). This is strictly better than a
+            // permanent wedge; the (channel, turn, byte-range) delivery lease
+            // (P1) closes the window by recording delivery BEFORE the slot
+            // frees. Surface it so the window is measurable until the lease lands.
+            tracing::warn!(
+                target: "agentdesk::relay_flight_recorder",
+                "relay emission slot freed via Drop on abnormal exit (in-flight send outcome unknown); a replacement watcher may re-emit the same range — resolved by the delivery lease"
+            );
+        }
+        self.release();
+    }
+}
+
 async fn wait_for_session_bound_relay_delivery_ack(
     target: Option<&SessionBoundRelayAckTarget>,
     timeout: std::time::Duration,
@@ -1173,6 +1236,25 @@ fn session_bound_relay_should_own_terminal_delivery(
             inflight,
             tmux_session_name,
         )
+}
+
+fn post_terminal_jsonl_payload_contains_init_without_user_event(payload: &[u8]) -> bool {
+    let mut contains_init = false;
+    for line in String::from_utf8_lossy(payload).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("user") => return false,
+            Some("system")
+                if value.get("subtype").and_then(serde_json::Value::as_str) == Some("init") =>
+            {
+                contains_init = true;
+            }
+            _ => {}
+        }
+    }
+    contains_init
 }
 
 #[cfg(test)]
@@ -1515,6 +1597,27 @@ mod matched_session_jsonl_gate_tests {
             ),
             "bridge-owned inflight remains on legacy/bridge delivery instead of the session relay sink"
         );
+    }
+
+    #[test]
+    fn post_terminal_jsonl_payload_allows_external_init_without_user_event() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"ScheduleWakeup\"]}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"[E2E:E13:WAKE]\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"[E2E:E13:WAKE]\"}\n"
+        );
+        assert!(post_terminal_jsonl_payload_contains_init_without_user_event(payload.as_bytes()));
+    }
+
+    #[test]
+    fn post_terminal_jsonl_payload_rejects_active_tool_result() {
+        let payload = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"tools\":[\"ScheduleWakeup\"]}\n",
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"ScheduleWakeup\"}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"scheduled\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"setup complete\"}\n"
+        );
+        assert!(!post_terminal_jsonl_payload_contains_init_without_user_event(payload.as_bytes()));
     }
 
     #[tokio::test]
@@ -2408,13 +2511,34 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         } else {
             false
         };
+        let post_terminal_payload_allows_external_relay =
+            if turn_result_relayed && post_terminal_inflight_missing {
+                let mut post_terminal_payload = String::with_capacity(all_data.len() + data.len());
+                post_terminal_payload.push_str(&all_data);
+                post_terminal_payload.push_str(&String::from_utf8_lossy(&data));
+                post_terminal_jsonl_payload_contains_init_without_user_event(
+                    post_terminal_payload.as_bytes(),
+                )
+            } else {
+                false
+            };
         let post_terminal_no_inflight_should_suppress =
             should_suppress_post_terminal_output_without_inflight(
                 turn_result_relayed,
                 post_terminal_inflight_missing,
                 ssh_direct_prompt_pending,
                 external_input_lease_present,
+                watcher_batch_contains_assistant_event(&data),
+            ) && !post_terminal_payload_allows_external_relay;
+        if post_terminal_payload_allows_external_relay {
+            tracing::info!(
+                channel = channel_id.get(),
+                tmux_session = %tmux_session_name,
+                range_start = data_start_offset,
+                range_end = current_offset,
+                "watcher allowed post-terminal no-inflight JSONL init payload for external relay"
             );
+        }
         if post_terminal_no_inflight_should_suppress {
             let suppressed_range = (data_start_offset, current_offset);
             if last_post_terminal_suppressed_range != Some(suppressed_range) {
@@ -4625,6 +4749,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             continue;
         }
 
+        // #2840: the CAS above acquired the emission slot. Hold it via an RAII
+        // guard so ANY exit from here on (early `continue`, `?`, panic, task
+        // abort) frees the slot on Drop instead of wedging the channel for
+        // every replacement watcher. The two intended release points below call
+        // `slot_guard.release()` explicitly to preserve their timing.
+        let mut slot_guard = RelaySlotGuard::new(relay_coord.relay_slot.clone());
+
         // Send the terminal response to Discord, or delegate it to the
         // supervisor-owned StreamRelay sink when the matched session's
         // inflight metadata says session-bound delivery owns this terminal
@@ -4688,6 +4819,23 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 relay_decision.should_direct_send,
                 session_bound_ack_outcome,
             );
+        // #2838 (relay-stability P0-1): count the primary duplicate-emit vector.
+        // The 10s session-bound terminal ACK timed out yet the watcher proceeds
+        // to direct-send, so the StreamRelay sink may have actually posted (just
+        // lagged the committed-sequence metric) and this re-sends the same
+        // answer. Rising counts here are the signal that the dual-authority
+        // terminal-delivery lease (P1) is overdue.
+        if watcher_direct_fallback_after_session_bound_ack
+            && matches!(
+                session_bound_ack_outcome,
+                SessionBoundRelayAckOutcome::TimedOut
+            )
+        {
+            crate::services::observability::metrics::record_relay_terminal_ack_timeout(
+                channel_id.get(),
+                watcher_provider.as_str(),
+            );
+        }
         tracing::info!(
             target: "agentdesk::relay_flight_recorder",
             provider = watcher_provider.as_str(),
@@ -5091,9 +5239,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 all_data_start_offset = current_offset;
                 all_data_fully_mirrored_to_session_relay = true;
                 all_data_session_bound_relay_ack = None;
-                relay_coord
-                    .relay_slot
-                    .store(0, std::sync::atomic::Ordering::Release);
+                // #2840: release before the backoff sleep (timing preserved);
+                // the guard's Drop is the safety net for non-explicit exits.
+                slot_guard.release();
                 sleep_or_jsonl_event(
                     tokio::time::Duration::from_millis(500),
                     &jsonl_notify,
@@ -5292,6 +5440,36 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         }
 
         if terminal_output_committed && watcher_tui_gate_outcome.should_emit_completion() {
+            // #2849: watcher-completed turns never traverse the bridge
+            // StatusUpdate path, so the completed panel can lack the Context
+            // line even when terminal output carried exact usage. Backfill the
+            // exact final context usage onto the panel BEFORE rendering the
+            // completed panel. Skip entirely when no exact usage exists or the
+            // provider/model has no resolvable window — never fabricate numbers
+            // and never reuse stale prior-turn usage. set_context_panel_usage is
+            // also internally gated to context_window != 0.
+            if shared.status_panel_v2_enabled
+                && let Some(usage) = stream_line_state_token_usage(&state)
+                    .filter(|usage| usage.context_occupancy_input_tokens() > 0)
+            {
+                let context_window =
+                    watcher_provider.resolve_context_window(state.last_model.as_deref());
+                if context_window > 0 {
+                    let ctx_cfg = crate::services::discord::adk_session::fetch_context_thresholds(
+                        shared.api_port,
+                    )
+                    .await;
+                    shared.placeholder_live_events.set_context_panel_usage(
+                        channel_id,
+                        state.last_session_id.as_deref(),
+                        usage.input_tokens,
+                        usage.cache_create_tokens,
+                        usage.cache_read_tokens,
+                        context_window,
+                        ctx_cfg.compact_pct_for(&watcher_provider),
+                    );
+                }
+            }
             // #2427 D wire (Codex round 2 HIGH-1): the watcher loop is not
             // turn-scoped — by the time we reach here a new turn may have
             // rewritten the inflight on disk. Reading user_msg_id from that
@@ -5342,10 +5520,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // Release the emission slot regardless of success. If delivery failed
         // the local `last_relayed_offset` also stayed put, so the same watcher
         // (or its replacement) can retry on the next tick without fighting
-        // the slot.
-        relay_coord
-            .relay_slot
-            .store(0, std::sync::atomic::Ordering::Release);
+        // the slot. #2840: via the RAII guard, so a panic/abort before this
+        // point also frees the slot (Drop) instead of wedging the channel.
+        slot_guard.release();
 
         finish_monitor_auto_turn_if_claimed(
             &shared,
@@ -6193,12 +6370,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
 #[cfg(test)]
 mod tests {
     use super::{
-        Utf8ChunkDecoder, adopt_watcher_terminal_message_ids_from_inflight,
+        RelaySlotGuard, Utf8ChunkDecoder, adopt_watcher_terminal_message_ids_from_inflight,
         build_watcher_streaming_edit_text,
         discard_restored_response_seed_before_no_inflight_terminal_relay,
         discard_watcher_pending_buffer_after_suppressed_turn,
         legacy_wrapper_prompt_candidates_from_pane, should_probe_tmux_liveness,
-        terminal_event_consumed_offset, watcher_batch_contains_relayable_response,
+        terminal_event_consumed_offset, watcher_batch_contains_assistant_event,
+        watcher_batch_contains_relayable_response,
         watcher_direct_terminal_should_commit_session_idle,
         watcher_fallback_edit_failure_can_delete_original_placeholder,
         watcher_inflight_represents_external_input, watcher_jsonl_turn_state_ready_for_input,
@@ -6216,6 +6394,49 @@ mod tests {
     fn terminal_event_consumed_offset_excludes_buffered_tail() {
         assert_eq!(terminal_event_consumed_offset(128, "next-turn\n"), 118);
         assert_eq!(terminal_event_consumed_offset(8, "longer-than-offset"), 0);
+    }
+
+    #[test]
+    fn relay_slot_guard_releases_on_drop() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Simulate a watcher acquiring the slot (CAS 0 -> non-zero token).
+        let slot = Arc::new(AtomicU64::new(0));
+        slot.store(42, Ordering::Release);
+        {
+            let _guard = RelaySlotGuard::new(slot.clone());
+            assert_eq!(slot.load(Ordering::Acquire), 42, "slot held inside scope");
+        }
+        // #2840: dropping without an explicit release (panic / `?` / abort) must
+        // still free the slot so a replacement watcher is not wedged.
+        assert_eq!(slot.load(Ordering::Acquire), 0, "Drop released the slot");
+    }
+
+    #[test]
+    fn relay_slot_guard_release_is_idempotent_and_does_not_clobber_reacquire() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let slot = Arc::new(AtomicU64::new(7));
+        let mut guard = RelaySlotGuard::new(slot.clone());
+        guard.release();
+        assert_eq!(
+            slot.load(Ordering::Acquire),
+            0,
+            "explicit release frees slot"
+        );
+
+        // After the explicit release, another watcher may legitimately acquire
+        // the slot. The first guard's trailing Drop must NOT reset that token to
+        // 0 — the idempotent `released` flag guarantees it.
+        slot.store(99, Ordering::Release);
+        drop(guard);
+        assert_eq!(
+            slot.load(Ordering::Acquire),
+            99,
+            "Drop after explicit release must not clobber a re-acquired slot"
+        );
     }
 
     #[test]
@@ -6451,6 +6672,19 @@ TUI-E2E-marker ssh-direct
         ));
         assert!(watcher_batch_contains_relayable_response(
             br#"{"type":"result","result":"ok"}"#
+        ));
+    }
+
+    #[test]
+    fn post_terminal_continuation_probe_ignores_result_only_batches() {
+        assert!(!watcher_batch_contains_assistant_event(
+            br#"{"provider":"codex","type":"ready_for_input"}"#
+        ));
+        assert!(watcher_batch_contains_assistant_event(
+            br#"{"type":"assistant","message":{"content":[{"type":"tool_use"}]}}"#
+        ));
+        assert!(!watcher_batch_contains_assistant_event(
+            br#"{"type":"result","result":"duplicate terminal text"}"#
         ));
     }
 

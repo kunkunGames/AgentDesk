@@ -71,6 +71,11 @@ def parse_args() -> argparse.Namespace:
         help="Discord channel id bound to the cell's worker agent.",
     )
     parser.add_argument(
+        "--thread-channel-id",
+        default=os.environ.get("AGENTDESK_E2E_THREAD_CHANNEL_ID"),
+        help="Discord thread id for scenarios that exercise parent-channel thread relay.",
+    )
+    parser.add_argument(
         "--scenarios",
         default="tests/e2e/tui_relay/scenarios",
         help="Directory of YAML scenario files.",
@@ -132,6 +137,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("AGENTDESK_E2E_RESTART_TARGET"),
         help="Override restart_dcserver target.",
     )
+    parser.add_argument(
+        "--turn-start-timeout-s",
+        type=float,
+        default=float(os.environ.get("AGENTDESK_E2E_TURN_START_TIMEOUT_S", "180")),
+        help="How long send_prompt retries transient mailbox-busy turn/start responses.",
+    )
     return parser.parse_args()
 
 
@@ -143,9 +154,10 @@ def cell_runtime(cell: str) -> str:
     return cell.split("-", 1)[1]
 
 
-def cell_session_name(cell: str) -> str:
+def cell_session_name(cell: str, *, thread_channel_id: str | None = None) -> str:
     """tmux session name owned by the cell's worker agent."""
-    return f"AgentDesk-{cell_provider(cell)}-adk-{cell}-e2e"
+    suffix = f"-t{thread_channel_id}" if thread_channel_id else ""
+    return f"AgentDesk-{cell_provider(cell)}-adk-{cell}-e2e{suffix}"
 
 
 def cell_default_agent(cell: str) -> str:
@@ -192,10 +204,22 @@ def is_destructive(scenario: dict[str, Any]) -> bool:
     for step in scenario.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        for key in ("restart_dcserver", "kill_pane", "kill_tui_process", "send_keys_no_enter"):
+        for key in (
+            "restart_dcserver",
+            "kill_pane",
+            "kill_tui_process",
+            "send_keys_no_enter",
+            "poison_claude_tui_relay_offset",
+        ):
             if key in step:
                 return True
     return False
+
+
+def scenario_channel_id(scenario: dict[str, Any], args: argparse.Namespace) -> str | None:
+    if scenario.get("requires_thread_channel"):
+        return str(args.thread_channel_id).strip() if args.thread_channel_id else None
+    return str(args.channel_id)
 
 
 def _truncate_queue_file(path: Path) -> None:
@@ -210,9 +234,10 @@ def hard_reset_provider_session(
     cell: str,
     channel_id: str,
     runtime_root: Path,
+    thread_channel_id: str | None = None,
 ) -> dict[str, Any]:
     """Burn the cell's TUI session so the next prompt starts fresh."""
-    session_name = cell_session_name(cell)
+    session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
     workspace_substring = cell_workspace_substring(cell)
     summary: dict[str, Any] = {
         "cell": cell,
@@ -309,6 +334,36 @@ def reset_channel_state(
     return summary
 
 
+def poison_claude_tui_relay_offset(
+    *,
+    cell: str,
+    channel_id: str,
+    runtime_root: Path,
+) -> dict[str, Any]:
+    """Force a stale Claude TUI offset so restart rehydrate must prefer launch state."""
+    if cell_provider(cell) != "claude" or cell_runtime(cell) != "tui":
+        raise assertions.AssertionError("poison_claude_tui_relay_offset requires claude-tui")
+    session_name = cell_session_name(cell, thread_channel_id=channel_id)
+    sessions_root = runtime_root / "sessions"
+    sessions_root.mkdir(parents=True, exist_ok=True)
+    matches = sorted(sessions_root.glob(f"*{session_name}.claude-tui-relay-offset.json"))
+    offset_path = matches[0] if matches else sessions_root / (
+        f"agentdesk-e2e-{session_name}.claude-tui-relay-offset.json"
+    )
+    stale_path = Path("/tmp") / f"agentdesk-e2e-stale-{session_name}.jsonl"
+    try:
+        stale_path.unlink()
+    except OSError:
+        pass
+    payload = {"last_offset": 999_999_999, "output_path": str(stale_path)}
+    offset_path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "session_name": session_name,
+        "offset_path": str(offset_path),
+        "stale_output_path": str(stale_path),
+    }
+
+
 def run_scenario(
     scenario: dict[str, Any],
     *,
@@ -329,6 +384,12 @@ def run_scenario(
         "assertions": [],
     }
 
+    target_channel_id = scenario_channel_id(scenario, args)
+    if target_channel_id is None:
+        result["reason"] = "requires --thread-channel-id or AGENTDESK_E2E_THREAD_CHANNEL_ID"
+        return result
+    result["channel_id"] = target_channel_id
+
     destructive = is_destructive(scenario)
     if destructive and not (
         args.allow_destructive
@@ -345,7 +406,7 @@ def run_scenario(
         result["resets"] = [
             reset_channel_state(
                 base_url=args.base_url,
-                channel_id=args.channel_id,
+                channel_id=target_channel_id,
                 runtime_root=runtime_root,
                 provider=cell_provider(cell),
             )
@@ -354,8 +415,11 @@ def run_scenario(
             result["hard_resets"] = [
                 hard_reset_provider_session(
                     cell=cell,
-                    channel_id=args.channel_id,
+                    channel_id=target_channel_id,
                     runtime_root=runtime_root,
+                    thread_channel_id=(
+                        target_channel_id if scenario.get("requires_thread_channel") else None
+                    ),
                 )
             ]
         time.sleep(2.0)
@@ -364,7 +428,7 @@ def run_scenario(
         window = run_one_cell(
             scenario=scenario,
             cell=cell,
-            channel_id=args.channel_id,
+            channel_id=target_channel_id,
             client=client,
             run_id=run_id,
             dry_run=args.dry_run,
@@ -405,7 +469,7 @@ def run_one_cell(
         print(f"[dry-run] {scenario_id} ({cell}): would send setup → steps → teardown")
         return record
 
-    setup_resp = client.send(channel_id, setup_marker)
+    setup_resp = client.send_control(channel_id, setup_marker)
     setup_marker_id = str(setup_resp.get("message_id") or setup_resp.get("id") or "")
     after_id = setup_marker_id
     window = assertions.Window(setup_marker_id=setup_marker_id)
@@ -463,6 +527,24 @@ def run_one_cell(
                 raise assertions.AssertionError(
                     f"timeout waiting for Discord text {needle!r}"
                 )
+        elif "wait_for_raw_discord_text" in step:
+            needle = step["wait_for_raw_discord_text"]
+            predicate = lambda message: (  # noqa: E731
+                not assertions.is_our_send(message)
+                and needle in (message.get("content") or "")
+            )
+            found, observed = client.wait_for_message(
+                channel_id,
+                predicate=predicate,
+                after_id=after_id,
+                timeout_s=float(step.get("timeout_s", 240)),
+                debug_label=f"{scenario.get('id')}::{cell}::wait_for_raw:{needle[:32]}",
+            )
+            _ingest_observed(observed)
+            if not found:
+                raise assertions.AssertionError(
+                    f"timeout waiting for raw Discord text {needle!r}"
+                )
         elif "restart_dcserver" in step:
             target = args.restart_target_override or (step["restart_dcserver"] or {}).get(
                 "target", "release"
@@ -470,8 +552,17 @@ def run_one_cell(
             restart_dcserver_for_e2e(
                 target=target, args=args, base_url=client.base_url, cell=cell
             )
+        elif "poison_claude_tui_relay_offset" in step:
+            record.setdefault("poisoned_offsets", []).append(
+                poison_claude_tui_relay_offset(
+                    cell=cell,
+                    channel_id=channel_id,
+                    runtime_root=Path(args.queue_runtime_root),
+                )
+            )
         elif "kill_pane" in step:
-            session_name = cell_session_name(cell)
+            thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
+            session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
             workspace_substring = cell_workspace_substring(cell)
             panes = tmux.list_panes(session_name)
             reverify = (step["kill_pane"] or {}).get(
@@ -491,7 +582,24 @@ def run_one_cell(
                 )
             tmux.kill_pane(target_pane.pane_id)
         elif "send_keys_no_enter" in step:
-            tmux.send_keys(cell_session_name(cell), step["send_keys_no_enter"])
+            thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
+            session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
+            if not tmux.send_keys(session_name, step["send_keys_no_enter"]):
+                raise assertions.AssertionError(
+                    f"tmux send-keys failed for session {session_name!r}"
+                )
+        elif "send_keys" in step:
+            thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
+            session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
+            if not tmux.send_keys(session_name, step["send_keys"]):
+                raise assertions.AssertionError(
+                    f"tmux send-keys failed for session {session_name!r}"
+                )
+            time.sleep(0.2)
+            if not tmux.send_keys(session_name, "C-m"):
+                raise assertions.AssertionError(
+                    f"tmux submit failed for session {session_name!r}"
+                )
         else:
             raise assertions.AssertionError(f"unknown step shape: {step!r}")
 
@@ -507,7 +615,7 @@ def run_one_cell(
         run_assertion(assertion_spec, window=window)
         record["assertions"].append({"spec": assertion_spec, "passed": True})
 
-    client.send(channel_id, teardown_marker)
+    client.send_control(channel_id, teardown_marker)
     return record
 
 
@@ -614,6 +722,31 @@ def run_assertion(spec: dict[str, Any], *, window: assertions.Window) -> None:
         assertions.no_duplicate_content(window)
     elif "text_present" in spec:
         assertions.text_present(window, needle=spec["text_present"])
+    elif "raw_text_present" in spec:
+        assertions.raw_text_present(window, needle=spec["raw_text_present"])
+    elif "ordered_text_present" in spec:
+        # #2838 (P0-2): completeness + ordering of multiple expected fragments.
+        needles = spec["ordered_text_present"]
+        if not isinstance(needles, list):
+            raise assertions.AssertionError(
+                f"ordered_text_present must be a list of needles: {spec!r}"
+            )
+        assertions.ordered_text_present(window, needles=needles)
+    elif "no_duplicate_marker" in spec:
+        # #2838 (P0-2): catches duplicate-with-differing-header re-emit (e.g.
+        # restart-induced or ACK-timeout re-relay) that no_duplicate_content misses.
+        assertions.no_duplicate_marker(window, marker=spec["no_duplicate_marker"])
+    elif "body_complete" in spec:
+        # #2838 (P0-2): catches a truncated-tail relay on long responses.
+        params = spec["body_complete"]
+        if not isinstance(params, dict) or "head" not in params or "tail" not in params:
+            raise assertions.AssertionError(f"body_complete requires {{head, tail}}: {spec!r}")
+        assertions.body_complete(window, head=params["head"], tail=params["tail"])
+    elif "relay_latency_within" in spec:
+        # #2838 (P0-2): bounds the first→last relay span (catches stalls).
+        params = spec["relay_latency_within"]
+        max_seconds = params.get("max_seconds") if isinstance(params, dict) else params
+        assertions.relay_latency_within(window, max_seconds=float(max_seconds))
     elif spec.get("no_control_chars"):
         assertions.no_control_chars(window)
     elif spec.get("no_resume_prompt_chrome"):
@@ -644,6 +777,7 @@ def main() -> int:
 
     client = discord.DiscordClient(
         base_url=args.base_url,
+        timeout_s=args.turn_start_timeout_s,
         handoff_to_agent=handoff_to,
         handoff_from_agent=args.handoff_from_agent,
     )

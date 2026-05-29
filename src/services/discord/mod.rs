@@ -1219,6 +1219,18 @@ impl TmuxWatcherRegistry {
         })
     }
 
+    /// #2843: the output path the live watcher (if any) is tailing for this tmux
+    /// session. The Claude idle relay uses this to decide whether a non-stale
+    /// watcher genuinely covers the freshest transcript (and thus already relays
+    /// it). Comparing against the runtime *binding* is wrong: re-registering the
+    /// binding does not retarget the already-running watcher, so the binding and
+    /// the watcher can point at different files.
+    pub(super) fn watcher_output_path(&self, tmux_session_name: &str) -> Option<String> {
+        self.by_tmux_session
+            .get(tmux_session_name)
+            .map(|entry| entry.output_path.clone())
+    }
+
     #[cfg(all(test, feature = "legacy-sqlite-tests"))]
     pub(super) fn assert_invariants_for_tests(&self) {
         let _guard = lock_tmux_watcher_registry();
@@ -3067,6 +3079,7 @@ async fn enqueue_internal_followup(
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         },
     )
@@ -3693,6 +3706,7 @@ async fn catch_up_missed_messages_inner(
                         && !text.starts_with('!')
                         && !text.starts_with('/')
                         && !text.starts_with("DISPATCH:"),
+                    pending_uploads: Vec::new(),
                     voice_announcement: None,
                 },
             )
@@ -3890,6 +3904,7 @@ async fn catch_up_missed_messages_inner(
                         && !text.starts_with('!')
                         && !text.starts_with('/')
                         && !text.starts_with("DISPATCH:"),
+                    pending_uploads: Vec::new(),
                     voice_announcement: None,
                 },
             )
@@ -4060,6 +4075,7 @@ pub(super) async fn kickoff_idle_queues(
             // own their own placeholder; they're never racing for it.
             // Foreground keeps legacy behavior.
             router::TurnKind::Foreground,
+            intervention.pending_uploads.clone(),
         )
         .await
         {

@@ -532,6 +532,7 @@ async fn enqueue_busy_tui_followup_for_retry(
     reply_context: Option<String>,
     has_reply_boundary: bool,
     merge_consecutive: bool,
+    pending_uploads: Vec<String>,
     voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> MailboxEnqueueOutcome {
     super::super::mailbox_enqueue_intervention(
@@ -545,6 +546,7 @@ async fn enqueue_busy_tui_followup_for_retry(
             reply_context,
             has_reply_boundary,
             merge_consecutive,
+            pending_uploads,
             voice_announcement,
         ),
     )
@@ -2039,6 +2041,12 @@ async fn start_reserved_headless_turn_with_owner(
         .as_ref()
         .and_then(|binding| binding.provider.clone())
         .unwrap_or_else(|| settings_provider.clone());
+    let resolved_channel_name_for_session = channel_name_hint
+        .clone()
+        .or_else(|| early_resolved_channel_name.clone())
+        .or_else(|| {
+            super::super::adk_session::registered_channel_fallback_name(channel_id, &early_provider)
+        });
     let early_fast_mode_channel_id =
         effective_fast_mode_channel_id(channel_id, early_thread_parent.clone());
     if let GoalCommandKind::Lifecycle(command) = classify_codex_goal_command_for_provider(
@@ -2105,17 +2113,17 @@ async fn start_reserved_headless_turn_with_owner(
     let (mut session_id, mut memento_context_loaded, mut current_path) = {
         let mut data = shared.core.lock().await;
         if let Some(info) = load_session_runtime_state(&mut data.sessions, channel_id) {
-            if let Some(channel_name_hint) = channel_name_hint.as_ref()
+            if let Some(channel_name) = resolved_channel_name_for_session.as_ref()
                 && let Some(session) = data.sessions.get_mut(&channel_id)
                 && session.channel_name.is_none()
             {
-                session.channel_name = Some(channel_name_hint.clone());
+                session.channel_name = Some(channel_name.clone());
             }
             info
         } else {
             let workspace = resolve_headless_workspace(
                 channel_id,
-                channel_name_hint.as_deref(),
+                resolved_channel_name_for_session.as_deref(),
                 metadata.as_ref(),
             )
             .ok_or_else(|| {
@@ -2163,7 +2171,7 @@ async fn start_reserved_headless_turn_with_owner(
                     history: Vec::new(),
                     pending_uploads: Vec::new(),
                     cleared: false,
-                    channel_name: channel_name_hint.clone(),
+                    channel_name: resolved_channel_name_for_session.clone(),
                     category_name: None,
                     remote_profile_name: None,
                     channel_id: Some(channel_id.get()),
@@ -3316,6 +3324,7 @@ pub(crate) async fn execute_intake_turn_core(
         request.has_reply_boundary,
         request.dm_hint,
         request.turn_kind,
+        Vec::new(),
     )
     .await
 }
@@ -3433,6 +3442,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     has_reply_boundary: bool,
     dm_hint: Option<bool>,
     turn_kind: TurnKind,
+    preloaded_uploads: Vec<String>,
 ) -> Result<(), Error> {
     let IntakeDeps {
         http,
@@ -3744,7 +3754,7 @@ pub(in crate::services::discord) async fn handle_text_message(
     let mut session_reset_reason = None;
     let mut reset_session_id_to_clear = None;
     // Get session info, allowed tools, and pending uploads
-    let (session_info, pending_uploads, session_was_cleared) = {
+    let (session_info, mut pending_uploads, session_was_cleared) = {
         let mut data = shared.core.lock().await;
         if let Some(session) = data.sessions.get_mut(&channel_id)
             && let Some(reason) =
@@ -3778,6 +3788,7 @@ pub(in crate::services::discord) async fn handle_text_message(
         drop(data);
         (info, uploads, was_cleared)
     };
+    pending_uploads.extend(preloaded_uploads);
     let provider = settings_provider;
     let dispatch_id_for_thread = super::super::adk_session::parse_dispatch_id(user_text);
     let dispatch_info_cached = if let Some(ref did) = dispatch_id_for_thread {
@@ -4841,6 +4852,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 reply_context.clone(),
                 has_reply_boundary,
                 merge_consecutive,
+                pending_uploads.clone(),
                 // #2266: keep the voice payload self-contained in the queued
                 // `Intervention` so `dispatch_queued_turn` can reinsert it
                 // before re-entering `handle_text_message`, which restores
@@ -6155,6 +6167,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             reply_context.clone(),
             has_reply_boundary,
             merge_consecutive,
+            pending_uploads.clone(),
             voice_announcement.clone(),
         )
         .await;
@@ -6733,7 +6746,7 @@ pub(super) async fn handle_file_upload(
     ctx: &serenity::Context,
     msg: &serenity::Message,
     shared: &Arc<SharedData>,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     let channel_id = msg.channel_id;
 
     // Always use the runtime uploads directory (works without session)
@@ -6742,7 +6755,7 @@ pub(super) async fn handle_file_upload(
         let _ = channel_id
             .say(&ctx.http, "Cannot resolve upload directory.")
             .await;
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     if let Err(e) = fs::create_dir_all(&save_dir) {
@@ -6753,9 +6766,10 @@ pub(super) async fn handle_file_upload(
                 format!("Failed to prepare upload directory: {}", e),
             )
             .await;
-        return Ok(());
+        return Ok(Vec::new());
     }
 
+    let mut upload_records = Vec::new();
     for attachment in &msg.attachments {
         let file_name = &attachment.filename;
 
@@ -6800,26 +6814,16 @@ pub(super) async fn handle_file_upload(
             }
         }
 
-        // Record upload in session
         let upload_record = format!(
             "[File uploaded] {} → {} ({} bytes)",
             file_name,
             dest.display(),
             file_size
         );
-        {
-            let mut data = shared.core.lock().await;
-            if let Some(session) = data.sessions.get_mut(&channel_id) {
-                session.history.push(HistoryItem {
-                    item_type: HistoryType::User,
-                    content: upload_record.clone(),
-                });
-                session.pending_uploads.push(upload_record);
-            }
-        }
+        upload_records.push(upload_record);
     }
 
-    Ok(())
+    Ok(upload_records)
 }
 
 /// Handle shell commands from raw text messages (! prefix)
@@ -10418,6 +10422,7 @@ mod tests {
             None,
             true,
             true,
+            Vec::new(),
             None,
         );
 
@@ -10436,6 +10441,7 @@ mod tests {
             None,
             false,
             false,
+            Vec::new(),
             None,
         );
 
@@ -10472,6 +10478,7 @@ mod tests {
             None,
             false,
             false,
+            Vec::new(),
             Some(announcement.clone()),
         );
 
@@ -10538,6 +10545,7 @@ mod tests {
             None,
             false,
             false,
+            Vec::new(),
             Some(active_take.clone()),
         );
         assert!(queued.voice_announcement.is_some());
@@ -10597,6 +10605,7 @@ mod tests {
             None,
             false,
             false,
+            Vec::new(),
             Some(announcement.clone()),
         );
 
