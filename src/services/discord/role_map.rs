@@ -13,7 +13,22 @@ use crate::services::provider::ProviderKind;
 /// Expand `~` or `~/` prefix to the user's home directory.
 fn expand_tilde(path: &str) -> String {
     if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
-        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+        if path.trim() == path {
+            if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+                return expanded.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            if path == "~" {
+                return home.display().to_string();
+            }
+            if path.starts_with("~/") {
+                return format!("{}{}", home.display(), &path[1..]);
+            }
+            if let Some(rest) = path.strip_prefix("~\\") {
+                return home.join(rest).to_string_lossy().into_owned();
+            }
+        } else if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
             return expanded.to_string_lossy().into_owned();
         }
     }
@@ -635,6 +650,21 @@ pub(super) fn list_registered_channel_bindings() -> Vec<RegisteredChannelBinding
 
     bindings.sort_by_key(|binding| binding.channel_id);
     bindings
+}
+
+#[cfg(test)]
+mod expand_tilde_tests {
+    use super::*;
+
+    #[test]
+    fn preserves_trailing_space_in_home_relative_role_map_paths() {
+        let home = dirs::home_dir().expect("home directory should be available in tests");
+
+        assert_eq!(
+            expand_tilde("~/prompts/bot.md "),
+            format!("{}{}", home.display(), "/prompts/bot.md ")
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
