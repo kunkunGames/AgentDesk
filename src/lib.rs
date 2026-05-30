@@ -162,7 +162,76 @@ pub(crate) use cli::agentdesk_runtime_root;
 
 use anyhow::{Context, Result};
 
+/// Target soft `RLIMIT_NOFILE` for the running process. Mirrors the launchd
+/// `SoftResourceLimits` value written by `agentdesk init` (see
+/// `cli::init::LAUNCHD_NOFILE_SOFT_LIMIT_TARGET`) so the binary keeps the same
+/// FD headroom even when started outside launchd.
+#[cfg(unix)]
+const NOFILE_SOFT_TARGET: libc::rlim_t = 16_384;
+
+/// Returns the soft limit we should raise to, or `None` when the current soft
+/// limit already meets the target (we never lower an existing limit).
+#[cfg(unix)]
+fn desired_nofile_soft_limit(cur: libc::rlim_t, max: libc::rlim_t) -> Option<libc::rlim_t> {
+    let desired = if max == libc::RLIM_INFINITY {
+        NOFILE_SOFT_TARGET
+    } else {
+        NOFILE_SOFT_TARGET.min(max)
+    };
+    (cur < desired).then_some(desired)
+}
+
+/// Best-effort raise of this process's soft `RLIMIT_NOFILE` toward
+/// [`NOFILE_SOFT_TARGET`], clamped to the hard limit. Non-fatal: any failure is
+/// reported to stderr and startup continues.
+#[cfg(unix)]
+fn raise_nofile_soft_limit() {
+    let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let mut limits = unsafe { limits.assume_init() };
+    let Some(desired) = desired_nofile_soft_limit(limits.rlim_cur, limits.rlim_max) else {
+        return;
+    };
+    limits.rlim_cur = desired;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+        eprintln!(
+            "warning: failed to raise RLIMIT_NOFILE soft limit to {desired}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_soft_limit() {}
+
+#[cfg(all(test, unix))]
+mod nofile_limit_tests {
+    use super::{NOFILE_SOFT_TARGET, desired_nofile_soft_limit};
+
+    #[test]
+    fn raises_when_below_target_and_clamps_to_hard() {
+        assert_eq!(
+            desired_nofile_soft_limit(256, 1_000_000),
+            Some(NOFILE_SOFT_TARGET)
+        );
+        assert_eq!(desired_nofile_soft_limit(256, 1_024), Some(1_024));
+        assert_eq!(
+            desired_nofile_soft_limit(256, libc::RLIM_INFINITY),
+            Some(NOFILE_SOFT_TARGET)
+        );
+    }
+
+    #[test]
+    fn never_lowers_existing_limit() {
+        assert_eq!(desired_nofile_soft_limit(NOFILE_SOFT_TARGET, 1_000_000), None);
+        assert_eq!(desired_nofile_soft_limit(65_536, 1_000_000), None);
+    }
+}
+
 pub fn run_from_args() -> Result<()> {
+    raise_nofile_soft_limit();
     match cli::args::parse() {
         cli::args::ParseOutcome::Command(command) => cli::execute(command),
         cli::args::ParseOutcome::RunServer => {
