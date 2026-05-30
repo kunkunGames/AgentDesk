@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use poise::serenity_prelude::ChannelId;
+use poise::serenity_prelude::{ChannelId, MessageId};
 use serde::Serialize;
 
 use crate::services::discord::{self as discord, SharedData};
@@ -1227,6 +1227,17 @@ pub(crate) async fn run_stall_watchdog_pass(
                     .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
                 let leak_dispatch_id = leak_inflight.as_ref().and_then(|s| s.dispatch_id.clone());
                 let leak_session_key = leak_inflight.as_ref().and_then(|s| s.session_key.clone());
+                // Only a genuinely unrelayed answer is a leak. A stale-but-
+                // delivered turn — e.g. one whose answer went out as a bridge
+                // fallback message, which advances response_sent_offset to len —
+                // must NOT raise the leaked-answer alarm or trigger recovery.
+                let has_unrelayed_answer = leak_inflight.as_ref().is_some_and(|s| {
+                    leak_recovery_unrelayed_range(&s.full_response, s.response_sent_offset)
+                        .is_some()
+                });
+                if !has_unrelayed_answer {
+                    continue;
+                }
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::warn!(
                     "  [{ts}] 🔎 inflight leak suspected on channel {} (provider={}): completed-stale + healthy watcher; emitting telemetry only",
@@ -1261,6 +1272,13 @@ pub(crate) async fn run_stall_watchdog_pass(
                             .map(|s| s.watcher_owns_live_relay),
                     }),
                 );
+
+                // #2860 delivery-lease consolidation: upgrade detection ->
+                // recovery. Scoped to the watcher-delegated-but-never-relayed
+                // signature and gated on a live-message probe, so it can never
+                // double-deliver (see maybe_recover_completed_stale_leak). The
+                // recovery re-loads its own fresh inflight state.
+                maybe_recover_completed_stale_leak(registry, provider, &shared, channel_id).await;
             }
             continue;
         }
@@ -1338,6 +1356,258 @@ pub fn spawn_stall_watchdog(registry: Arc<HealthRegistry>, provider: ProviderKin
     });
 }
 
+/// #2860 — pure decision: the unrelayed byte range of `full_response` that a
+/// completed-stale leak recovery should deliver. `start` is `response_sent_offset`
+/// snapped down to a UTF-8 char boundary (Korean/multibyte safety) and clamped to
+/// len; `end` is the full length. Returns `None` when nothing is unrelayed
+/// (`start >= len`), making a repeated watchdog pass an idempotent no-op once the
+/// offset has been advanced to len.
+///
+/// `last_watcher_relayed_offset` is deliberately NOT mixed into this range:
+/// it is a tmux output-buffer coordinate, not a `full_response` byte index, so
+/// max()-ing it against `response_sent_offset` could both over- and under-skip.
+/// The authoritative delivered/not-delivered decision is the live-message probe,
+/// not this offset; this range only bounds WHAT to send once the probe confirms
+/// the message is still an undelivered placeholder.
+fn leak_recovery_unrelayed_range(
+    full_response: &str,
+    response_sent_offset: usize,
+) -> Option<(usize, usize)> {
+    let len = full_response.len();
+    let mut start = response_sent_offset.min(len);
+    while start > 0 && !full_response.is_char_boundary(start) {
+        start -= 1;
+    }
+    if start >= len {
+        None
+    } else {
+        Some((start, len))
+    }
+}
+
+/// #2860 — pure render: format the unrelayed tail exactly as the bridge's
+/// terminal-replace path would (strip TUI chrome, then status-panel or provider
+/// formatting selected by the same flag). Returns `None` when the tail strips or
+/// formats to empty — recovery must never post a placeholder or an empty notice,
+/// only real leaked content.
+fn render_leak_recovery_delivery(
+    full_response: &str,
+    start: usize,
+    status_panel_v2_enabled: bool,
+    provider: &ProviderKind,
+) -> Option<String> {
+    let raw_tail = full_response.get(start..)?;
+    let stripped = discord::response_sanitizer::strip_leading_tui_response_chrome(raw_tail);
+    // Mirror terminal_delivery_response_after_offset: if the raw tail had content
+    // but it was all chrome, there is nothing real to deliver.
+    if !raw_tail.trim().is_empty() && stripped.trim().is_empty() {
+        return None;
+    }
+    let rendered = if status_panel_v2_enabled {
+        discord::formatting::format_for_discord_with_status_panel(&stripped, provider)
+    } else {
+        discord::formatting::format_for_discord_with_provider(&stripped, provider)
+    };
+    if rendered.trim().is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+/// #2860 — recover a completed-stale inflight leak by delivering the generated
+/// answer that never reached the user. Returns `true` only when an answer was
+/// actually delivered.
+///
+/// SAFETY (no double-delivery) — two independent guards, both required:
+///   1. Scope to the watcher-delegated-but-never-relayed signature
+///      (`effective_relay_owner_kind() == Watcher` and `last_watcher_relayed_offset
+///      == None`). The only delivery path that strands an answer in a *separate*
+///      message — the bridge's local `SentFallbackAfterEditFailure` fallback-post
+///      — lives exclusively in the bridge-owns-delivery branch
+///      (`bridge_output_owner == None`), which never sets `RelayOwnerKind::Watcher`.
+///      Requiring `Watcher` therefore excludes the fallback class entirely; for the
+///      delegated class the bridge skipped its own delivery and the watcher (per the
+///      null offset) never relayed, so the answer is provably nowhere.
+///   2. A live-message probe of `current_msg_id`: only `StillPlaceholder` proceeds.
+/// Recovery edits `current_msg_id` in place (bridge parity), which is idempotent
+/// across repeated watchdog passes (re-editing to the same content is a no-op).
+async fn maybe_recover_completed_stale_leak(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+) -> bool {
+    // Operate on a freshly re-loaded row, not the detection-time snapshot, so any
+    // relay that advanced state between detection and now is respected.
+    let Some(state) = discord::inflight::load_inflight_state(provider, channel_id.get()) else {
+        return false;
+    };
+
+    // Planned restart / rebind flows re-deliver the answer themselves.
+    if state.restart_mode.is_some() || state.rebind_origin {
+        return false;
+    }
+    // A silent turn intentionally suppresses assistant-text relay (mirrors the
+    // bridge's `silent_turn` terminal-delivery suppression); never resurface it.
+    if state.silent_turn {
+        return false;
+    }
+    // Scope guard (1): only the watcher-delegated, never-relayed class — the exact
+    // signature of the observed leaks. Excludes the bridge-local fallback-post
+    // class (owner == None) that could strand the answer in a separate message.
+    if state.effective_relay_owner_kind() != discord::inflight::RelayOwnerKind::Watcher
+        || state.last_watcher_relayed_offset.is_some()
+    {
+        return false;
+    }
+    // We recover by editing the existing placeholder in place (bridge parity).
+    // With no addressable placeholder there is nothing to safely edit.
+    if state.current_msg_id == 0 {
+        return false;
+    }
+    let Some((start, end)) =
+        leak_recovery_unrelayed_range(&state.full_response, state.response_sent_offset)
+    else {
+        return false;
+    };
+    // NB: the bridge appends a turn-time `review_dispatch_warning` before
+    // formatting; that guard is turn-lifecycle-only, so stale-leak recovery
+    // intentionally delivers just the answer body.
+    let Some(delivery_text) = render_leak_recovery_delivery(
+        &state.full_response,
+        start,
+        shared.status_panel_v2_enabled,
+        provider,
+    ) else {
+        return false;
+    };
+    // Recovery delivers via a raw, fallback-free single-message EDIT of the
+    // placeholder. Skip anything the chunker would split into continuation
+    // messages — a single chunk is the only shape we can edit in place without
+    // creating a separate message or risking a stranded tail. `split_message` is
+    // the authoritative limit (its effective cap is below Discord's 2000).
+    // Multi-chunk (long-answer) auto-recovery is a deliberate follow-up: this v1
+    // recovers the common small-answer case safely and ESCALATES the rare large
+    // case via telemetry rather than risking a multi-message double-delivery.
+    let chunks = discord::formatting::split_message(&delivery_text);
+    let [delivery_chunk] = chunks.as_slice() else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ leak too large to auto-recover ({} bytes, {} chunks) on channel {}; escalating for manual follow-up",
+            delivery_text.len(),
+            chunks.len(),
+            channel_id
+        );
+        let turn_id = (state.user_msg_id != 0)
+            .then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id));
+        crate::services::observability::emit_inflight_lifecycle_event(
+            provider.as_str(),
+            channel_id.get(),
+            state.dispatch_id.as_deref(),
+            state.session_key.as_deref(),
+            turn_id.as_deref(),
+            "leak_recovery_skipped_too_large",
+            serde_json::json!({
+                "byte_len": delivery_text.len(),
+                "chunks": chunks.len(),
+            }),
+        );
+        return false;
+    };
+
+    let http = match super::resolve_bot_http(registry, provider.as_str()).await {
+        Ok(http) => http,
+        Err(_) => return false,
+    };
+
+    // AUTHORITATIVE guard: only deliver when the live message is still an
+    // undelivered placeholder. AlreadyDelivered / MessageGone / ProbeFailed all
+    // mean "do not touch".
+    match discord::placeholder_sweeper::probe_placeholder_state(
+        &http,
+        channel_id.get(),
+        state.current_msg_id,
+    )
+    .await
+    {
+        discord::placeholder_sweeper::PlaceholderProbe::StillPlaceholder => {}
+        _ => return false,
+    }
+
+    // Edit the placeholder in place with a raw, fallback-free edit. No new
+    // message is ever created, so a re-fire just re-edits the same message to the
+    // same content (idempotent) — no double-delivery, no stranded tail. On error
+    // nothing was delivered; fail closed and retry next pass.
+    if discord::http::edit_channel_message(
+        http.as_ref(),
+        channel_id,
+        MessageId::new(state.current_msg_id),
+        delivery_chunk,
+    )
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    let (delivery_detail, op) = ("edited", "edit");
+
+    // Advance the offset and persist so a later pass (even after a dcserver
+    // restart) treats this tail as delivered and never re-sends it. Re-load and
+    // re-check identity first so we never clobber a concurrently-updated row, and
+    // skip if another path already advanced past `end`.
+    if let Some(mut fresh) = discord::inflight::load_inflight_state(provider, channel_id.get())
+        && fresh.user_msg_id == state.user_msg_id
+        && fresh.current_msg_id == state.current_msg_id
+        && fresh.response_sent_offset < end
+    {
+        fresh.response_sent_offset = end;
+        if let Err(error) = discord::inflight::save_inflight_state(&fresh) {
+            tracing::warn!(
+                "[leak-recover] delivered answer on channel {} but failed to persist offset: {error}",
+                channel_id
+            );
+        }
+    }
+
+    let turn_id = (state.user_msg_id != 0)
+        .then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id));
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::warn!(
+        "  [{ts}] 📤 leak recovered ({delivery_detail}): delivered {}-byte answer on channel {} (provider={})",
+        end - start,
+        channel_id,
+        provider.as_str()
+    );
+    crate::services::observability::emit_inflight_lifecycle_event(
+        provider.as_str(),
+        channel_id.get(),
+        state.dispatch_id.as_deref(),
+        state.session_key.as_deref(),
+        turn_id.as_deref(),
+        "leak_recovered_flushed",
+        serde_json::json!({
+            "byte_start": start,
+            "byte_end": end,
+            "flushed_len": end - start,
+            "delivery": delivery_detail,
+        }),
+    );
+    crate::services::observability::emit_relay_delivery(
+        provider.as_str(),
+        channel_id.get(),
+        turn_id.as_deref(),
+        Some(state.current_msg_id),
+        "recovery",
+        op,
+        Some(start as u64),
+        Some(end as u64),
+        true,
+        Some(delivery_detail),
+    );
+    true
+}
+
 /// #1446 — pure-helper tests for the stall-watchdog decision logic.
 /// Always-on (`#[cfg(test)]`) because the helper has no filesystem/runtime
 /// dependencies; the legacy-sqlite-tests gate would prevent these from
@@ -1347,9 +1617,73 @@ pub fn spawn_stall_watchdog(registry: Arc<HealthRegistry>, provider: ProviderKin
 mod stall_watchdog_pure_tests {
     use super::{
         STALL_WATCHDOG_THRESHOLD_SECS, inflight_completed_stale_leak_detected,
+        leak_recovery_unrelayed_range, render_leak_recovery_delivery,
         stall_watchdog_should_force_clean,
     };
+    use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+
+    #[test]
+    fn leak_range_whole_response_when_nothing_relayed() {
+        // The exact 8-leak signature: response_sent_offset=0, full answer present.
+        assert_eq!(
+            leak_recovery_unrelayed_range("hello world", 0),
+            Some((0, 11))
+        );
+    }
+
+    #[test]
+    fn leak_range_none_when_already_fully_delivered() {
+        // Idempotent re-run after a prior recovery advanced the offset to len.
+        assert_eq!(leak_recovery_unrelayed_range("hello world", 11), None);
+        assert_eq!(leak_recovery_unrelayed_range("hello world", 99), None);
+    }
+
+    #[test]
+    fn leak_range_empty_response_is_none() {
+        assert_eq!(leak_recovery_unrelayed_range("", 0), None);
+    }
+
+    #[test]
+    fn leak_range_partial_tail_only() {
+        assert_eq!(
+            leak_recovery_unrelayed_range("hello world", 6),
+            Some((6, 11))
+        );
+    }
+
+    #[test]
+    fn leak_range_snaps_back_to_char_boundary() {
+        // "안녕" is 6 bytes (3 each). An offset landing mid-codepoint must walk
+        // back to a boundary so the returned slice never panics.
+        let s = "안녕하세요";
+        let (start, end) = leak_recovery_unrelayed_range(s, 4).unwrap();
+        assert!(s.is_char_boundary(start));
+        assert_eq!(start, 3); // walked back from 4 to the boundary after "안"
+        assert_eq!(end, s.len());
+        // Slicing at the returned start must be valid.
+        let _ = &s[start..end];
+    }
+
+    #[test]
+    fn render_skips_blank_tail() {
+        // A blank/whitespace tail formats to empty -> no delivery, never a
+        // placeholder post or empty notice.
+        let provider = ProviderKind::Claude;
+        assert_eq!(render_leak_recovery_delivery("", 0, false, &provider), None);
+        assert_eq!(
+            render_leak_recovery_delivery("   \n  ", 0, false, &provider),
+            None
+        );
+    }
+
+    #[test]
+    fn render_returns_formatted_real_answer() {
+        let provider = ProviderKind::Claude;
+        let out = render_leak_recovery_delivery("실제 답변입니다", 0, false, &provider)
+            .expect("real answer should render");
+        assert!(out.contains("실제 답변입니다"));
+    }
 
     fn local_string(unix: i64) -> String {
         chrono::Local
