@@ -12,7 +12,7 @@ use crate::services::provider::ProviderKind;
 
 /// Expand `~` or `~/` prefix to the user's home directory.
 fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+    if path == "~" || path.starts_with("~/") || (cfg!(windows) && path.starts_with("~\\")) {
         if path.trim() == path {
             if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
                 return expanded.to_string_lossy().into_owned();
@@ -25,8 +25,10 @@ fn expand_tilde(path: &str) -> String {
             if path.starts_with("~/") {
                 return format!("{}{}", home.display(), &path[1..]);
             }
-            if let Some(rest) = path.strip_prefix("~\\") {
-                return home.join(rest).to_string_lossy().into_owned();
+            if cfg!(windows) {
+                if let Some(rest) = path.strip_prefix("~\\") {
+                    return home.join(rest).to_string_lossy().into_owned();
+                }
             }
         } else if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
             return expanded.to_string_lossy().into_owned();
@@ -664,6 +666,12 @@ mod expand_tilde_tests {
             expand_tilde("~/prompts/bot.md "),
             format!("{}{}", home.display(), "/prompts/bot.md ")
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn preserves_backslash_prefixed_role_map_paths_on_unix() {
+        assert_eq!(expand_tilde(r"~\fixtures\bot.md"), r"~\fixtures\bot.md");
     }
 }
 
