@@ -2435,6 +2435,7 @@ mod watcher_placeholder_status_tests {
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 mod tests {
     use super::FallbackPlaceholderCleanupDecision;
+    use super::tmux_watcher::watcher_lifecycle_terminal_delivery_observed;
     use super::{
         CANCEL_TEARDOWN_GRACE_BYTES, DeadSessionCleanupPlan,
         MONITOR_AUTO_TURN_DEFERRED_REASON_CODE, MONITOR_AUTO_TURN_PREAMBLE_HINT,
@@ -2442,7 +2443,8 @@ mod tests {
         PlaceholderSuppressDecision, PlaceholderSuppressOrigin, READY_FOR_INPUT_STUCK_REASON,
         SUPPRESSED_INTERNAL_LABEL, SUPPRESSED_RESTART_LABEL, SuppressedPlaceholderAction,
         TmuxWatcherHandle, TmuxWatcherRegistry, WatcherClaimAction, WatcherToolState,
-        build_bg_trigger_session_key, cancel_induced_watcher_death, claim_or_reuse_watcher,
+        build_bg_trigger_session_key, cancel_induced_watcher_death,
+        cancel_suppression_applies_to_watcher_death, claim_or_reuse_watcher,
         clear_recent_turn_stops_for_tests, consume_monitor_auto_turn_preamble_once,
         dead_session_cleanup_plan, decide_placeholder_suppression,
         enqueue_background_trigger_response_to_notify_outbox,
@@ -2458,13 +2460,14 @@ mod tests {
         refresh_session_heartbeat_from_tmux_output,
         reset_stale_local_relay_offset_if_output_regressed,
         reset_stale_relay_watermark_if_output_regressed, restored_watcher_turn_from_inflight,
-        rollback_enqueued_offset_for_reconciled_failures,
+        rollback_enqueued_offset_for_reconciled_failures, session_ended_notice,
         should_discard_restored_seed_for_idle_direct_prompt,
-        should_flush_post_terminal_success_continuation, should_suppress_relay_before_emit,
-        should_suppress_streaming_placeholder_after_recent_stop,
+        should_flush_post_terminal_success_continuation, should_send_session_ended_notice,
+        should_suppress_relay_before_emit, should_suppress_streaming_placeholder_after_recent_stop,
         should_suppress_terminal_output_after_recent_stop, start_monitor_auto_turn_when_available,
         strip_inprogress_indicators, suppressed_placeholder_action, terminal_relay_decision,
-        tmux_death_is_normal_completion, tmux_death_lifecycle_notification_reason,
+        tmux_death_is_normal_completion, tmux_death_lifecycle_decision,
+        tmux_death_lifecycle_notification_reason, watcher_output_file_offset,
         watcher_ready_for_input_turn_completed, watcher_should_yield_to_inflight_state,
         watcher_stream_seed,
     };
@@ -4066,6 +4069,121 @@ mod tests {
         );
 
         clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn cancel_induced_watcher_death_does_not_suppress_e12_followup_rollout_frame() {
+        // #2929: E-12 resets the scenario with a force-cancel, then starts a
+        // fresh Codex TUI turn on the same tmux session within the tombstone
+        // TTL. The follow-up rollout frame observed in the failing run was
+        // 6,725 bytes past the cancel boundary; that is real next-turn output,
+        // not cancel teardown, so pane death must surface its lifecycle signal.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        clear_recent_turn_stops_for_tests();
+        let channel = ChannelId::new(987_2929_012);
+        let tmux_name = "AgentDesk-codex-e12-followup";
+        let stop_offset: u64 = 411_519;
+
+        record_recent_turn_stop_with_offset_for_tests(
+            channel,
+            tmux_name,
+            stop_offset,
+            "scenario reset force-cancel",
+        );
+
+        assert!(
+            !cancel_induced_watcher_death(channel, tmux_name, Some(stop_offset + 6_725)),
+            "E-12 follow-up output inside the old 16 KiB grace must not be classified as cancel cleanup"
+        );
+
+        clear_recent_turn_stops_for_tests();
+    }
+
+    #[test]
+    fn watcher_death_uses_actual_watcher_output_path_offset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let output_path = tmp.path().join("rollout.jsonl");
+        std::fs::write(&output_path, vec![b'x'; 6_725]).expect("write rollout");
+
+        assert_eq!(
+            watcher_output_file_offset(output_path.to_str().expect("utf8 path")),
+            Some(6_725),
+            "pane-death cancel suppression must compare against the transcript the live watcher is actually tailing"
+        );
+    }
+
+    #[test]
+    fn terminal_delivery_disqualifies_stale_cancel_suppression() {
+        assert!(
+            cancel_suppression_applies_to_watcher_death(true, false),
+            "pre-terminal watcher death can still be suppressed by a matching cancel"
+        );
+        assert!(
+            !cancel_suppression_applies_to_watcher_death(true, true),
+            "after fresh terminal delivery was observed, a prior cancel tombstone must not suppress pane death"
+        );
+        assert!(
+            !cancel_suppression_applies_to_watcher_death(false, true),
+            "no cancel tombstone means no suppression"
+        );
+    }
+
+    #[test]
+    fn session_ended_notice_is_limited_to_delivered_abnormal_pane_death() {
+        assert!(session_ended_notice().contains("session ended"));
+        assert!(should_send_session_ended_notice(false, false, true, false));
+        assert!(!should_send_session_ended_notice(true, false, true, false));
+        assert!(!should_send_session_ended_notice(false, true, true, false));
+        assert!(!should_send_session_ended_notice(
+            false, false, false, false
+        ));
+        assert!(!should_send_session_ended_notice(false, false, true, true));
+    }
+
+    #[test]
+    fn bridge_terminal_delivery_then_pane_dead_ignores_session_unscoped_cancel_tombstone() {
+        let decision = tmux_death_lifecycle_decision(
+            true,  // session-unscoped recent reset/cancel tombstone matched
+            false, // prompt-too-long did not kill this pane
+            true,  // StreamRelay already delivered/committed the terminal response
+            false, // pane death was not a normal provider completion exit
+        );
+
+        assert!(
+            !decision.cancel_induced,
+            "a pre-reset cancel tombstone must not suppress pane death after fresh terminal delivery"
+        );
+        assert!(
+            decision.send_session_ended_notice,
+            "E-12 expects an abnormal pane death after a delivered marker response to emit session ended"
+        );
+    }
+
+    #[test]
+    fn bridge_delivered_resume_then_pane_dead_preserves_lifecycle_delivery_signal() {
+        let terminal_delivery_observed = watcher_lifecycle_terminal_delivery_observed(false, true);
+        let decision = tmux_death_lifecycle_decision(
+            true,  // reset cleanup left a session-unscoped cancel tombstone
+            false, // prompt-too-long did not kill this pane
+            terminal_delivery_observed,
+            false, // manual pane death is abnormal
+        );
+
+        assert!(
+            terminal_delivery_observed,
+            "watcher resume must carry bridge turn_delivered into lifecycle state before clearing the duplicate-relay flag"
+        );
+        assert!(
+            !decision.cancel_induced,
+            "bridge-delivered marker response must disqualify the reset cancel tombstone"
+        );
+        assert!(
+            decision.send_session_ended_notice,
+            "subsequent E-12 pane death should emit session ended"
+        );
     }
 
     #[test]
