@@ -70,8 +70,14 @@ python3 -m unittest \
   tests.test_install_bootstrap_portable
 
 echo "=== Generate inventory docs ==="
-if ! python3 scripts/generate_inventory_docs.py --check; then
+set +e
+python3 scripts/generate_inventory_docs.py --check
+INVENTORY_STATUS=$?
+set -e
+if [ "$INVENTORY_STATUS" -eq 1 ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
   echo "::warning::Inventory docs drift detected. Generated docs drift is warning-only for PR script checks; run python3 scripts/generate_inventory_docs.py or wait for the weekly Regen inventory docs workflow."
+elif [ "$INVENTORY_STATUS" -ne 0 ]; then
+  exit "$INVENTORY_STATUS"
 fi
 
 echo "=== Agent maintenance freshness gate (warn, #1432) ==="
