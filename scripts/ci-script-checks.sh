@@ -74,8 +74,8 @@ set +e
 python3 scripts/generate_inventory_docs.py --check
 INVENTORY_STATUS=$?
 set -e
-if [ "$INVENTORY_STATUS" -eq 1 ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
-  echo "::warning::Inventory docs drift detected. Generated docs drift is warning-only for PR script checks; run python3 scripts/generate_inventory_docs.py or wait for the weekly Regen inventory docs workflow."
+if [ "$INVENTORY_STATUS" -eq 1 ] && { [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] || [ "${GITHUB_WORKFLOW:-}" = "CI PR" ]; }; then
+  echo "::warning::Inventory docs drift detected. Generated docs drift is warning-only for CI PR script checks; run python3 scripts/generate_inventory_docs.py or wait for the weekly Regen inventory docs workflow."
 elif [ "$INVENTORY_STATUS" -ne 0 ]; then
   exit "$INVENTORY_STATUS"
 fi
