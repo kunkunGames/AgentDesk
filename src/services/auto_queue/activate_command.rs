@@ -316,9 +316,10 @@ pub(crate) async fn activate_with_deps_pg(
     let active_turn_count = match sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
          FROM task_dispatches d
+         CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{}')::jsonb AS ctx) c
          WHERE d.status IN ('pending', 'dispatched')
-           AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-           AND (COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+           AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+           AND c.ctx->'phase_gate' IS NULL
            AND EXISTS (
                SELECT 1
                FROM auto_queue_entries e
@@ -510,9 +511,10 @@ pub(crate) async fn activate_with_deps_pg(
         let active_turn_count_now = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*)::BIGINT
              FROM task_dispatches d
+             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{}')::jsonb AS ctx) c
              WHERE d.status IN ('pending', 'dispatched')
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-               AND (COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+               AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+               AND c.ctx->'phase_gate' IS NULL
                AND EXISTS (
                    SELECT 1
                    FROM auto_queue_entries e
@@ -1132,9 +1134,10 @@ pub(crate) async fn activate_with_deps_pg(
     let active_turn_count_after = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)::BIGINT
          FROM task_dispatches d
+         CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{}')::jsonb AS ctx) c
          WHERE d.status IN ('pending', 'dispatched')
-           AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-           AND (COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+           AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+           AND c.ctx->'phase_gate' IS NULL
            AND EXISTS (
                SELECT 1
                FROM auto_queue_entries e
