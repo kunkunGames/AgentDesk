@@ -140,7 +140,25 @@ export default function AgentFormModal({
             <div className="space-y-4">
             {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
             <div className="flex items-center gap-3" role="group" aria-label={tr("스프라이트 선택기", "Sprite Selector")}>
-              <div className="flex flex-col items-center gap-1">
+              <div
+                className="flex flex-col items-center gap-1"
+                role="spinbutton"
+                aria-valuenow={spriteNum || 0}
+                aria-valuetext={t({ ko: `스프라이트 ${spriteNum || "없음"}`, en: `Sprite ${spriteNum || "None"}` })}
+                aria-label={tr("스프라이트 번호", "Sprite Number")}
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    const next = Math.max(1, spriteNum || 0) + 1;
+                    setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                  } else if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    const next = Math.max(1, (spriteNum || 1) - 1);
+                    setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                  }
+                }}
+              >
                 <button
                   type="button"
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
