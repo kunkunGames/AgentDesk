@@ -20,7 +20,7 @@ ARCHITECTURE_TOP_LEVEL_MAP_START = "<!-- BEGIN GENERATED: TOP LEVEL MODULE MAP -
 ARCHITECTURE_TOP_LEVEL_MAP_END = "<!-- END GENERATED: TOP LEVEL MODULE MAP -->"
 GIANT_FILE_THRESHOLD = 1000
 HTTP_METHODS = ("delete", "get", "head", "options", "patch", "post", "put")
-TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs"}
+TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs", "high_risk_recovery.rs"}
 
 TOP_LEVEL_MODULE_PURPOSES = {
     "bootstrap.rs": "Builds config, database, policy engine, and shared app state before launch.",
@@ -84,6 +84,7 @@ class WorkerEntry:
     kind: str
     target: str
     source: str
+    execution_scope: str
     notes: str
 
 
@@ -108,6 +109,8 @@ def offset_to_line(text: str, offset: int) -> int:
 
 
 def is_test_file(path: Path) -> bool:
+    if "integration_tests" in path.parts:
+        return True
     return path.name.endswith("_tests.rs") or path.name in TEST_FILE_NAMES
 
 
@@ -407,6 +410,7 @@ def resolve_function_source(
     handler_expr: str,
     by_file: dict[Path, dict[str, int]],
     by_name: dict[str, list[tuple[Path, int]]],
+    current_file: Path,
 ) -> tuple[Path, int] | None:
     handler_expr = handler_expr.strip()
     if "|" in handler_expr:
@@ -417,7 +421,13 @@ def resolve_function_source(
         return None
 
     fn_name = parts[-1]
+
+    if len(parts) == 1:
+        if fn_name in by_file.get(current_file, {}):
+            return current_file, by_file[current_file][fn_name]
+
     module_parts = parts[:-1]
+
     candidates: list[Path] = []
     candidate_dirs: list[Path] = []
 
@@ -528,7 +538,7 @@ def parse_route_file(
         route_path = path_expr[1:-1]
         decl_line = offset_to_line(text, match.start())
         for method, handler in parse_method_chain(methods_expr):
-            resolved = resolve_function_source(handler, by_file, by_name)
+            resolved = resolve_function_source(handler, by_file, by_name, path)
             if resolved is None:
                 raise ParseError(f"could not resolve handler source for {handler!r}")
             handler_path, handler_line = resolved
@@ -656,6 +666,7 @@ def collect_workers() -> list[WorkerEntry]:
             )
         ]
         responsibility = capture(body, r'responsibility:\s*"([^"]+)"', "responsibility")
+        execution_scope = capture(body, r"execution_scope:\s*WorkerExecutionScope::([A-Za-z0-9_]+)", "execution_scope")
         owner = capture(body, r'owner:\s*"([^"]+)"', "owner")
         health_owner = capture(body, r'health_owner:\s*"([^"]+)"', "health_owner")
         notes = capture(body, r'notes:\s*"([^"]*)"', "notes")
@@ -665,6 +676,7 @@ def collect_workers() -> list[WorkerEntry]:
                 kind=kind,
                 target=f"`{target}`",
                 source=format_path_with_line(registry_path, line),
+                execution_scope=execution_scope,
                 notes=(
                     f"stage={stage}; order={start_order}; restart={restart}; shutdown={shutdown}; "
                     f"owner={owner}; health={health_owner}; responsibility={responsibility}; {notes}"
@@ -828,12 +840,12 @@ def render_worker_inventory(entries: list[WorkerEntry]) -> str:
         "- Scope: supervised worker specs registered in `server::worker_registry::WORKER_SPECS`.",
         f"- Workers: `{len(entries)}`",
         "",
-        "| Worker | Kind | Target | Source | Notes |",
+        "| Worker | Kind | Target | Source | Scope | Notes |",
         "| --- | --- | --- | --- | --- |",
     ]
     for entry in entries:
         lines.append(
-            f"| {entry.worker} | `{entry.kind}` | {entry.target} | {entry.source} | {entry.notes} |"
+            f"| {entry.worker} | `{entry.kind}` | {entry.target} | {entry.source} | {entry.execution_scope} | {entry.notes} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -842,7 +854,7 @@ def render_worker_inventory(entries: list[WorkerEntry]) -> str:
 def generated_documents() -> dict[Path, str]:
     function_paths = sorted(
         path
-        for path in (REPO_ROOT / "src" / "server").rglob("*.rs")
+        for path in (list((REPO_ROOT / "src" / "server").rglob("*.rs")) + list((REPO_ROOT / "src" / "services" / "claude_tui").rglob("*.rs")))
         if path.is_file() and not is_test_file(path)
     )
     route_paths = sorted(
@@ -856,6 +868,17 @@ def generated_documents() -> dict[Path, str]:
     route_entries: list[RouteEntry] = []
     for route_path in route_paths:
         route_entries.extend(parse_route_file(route_path, "/api", by_file, by_name))
+
+    # Parse /api/v1 routes
+    v1_path = REPO_ROOT / "src" / "server" / "routes" / "v1.rs"
+    if v1_path.exists():
+        route_entries.extend(parse_route_file(v1_path, "/api", by_file, by_name))
+
+    # Parse root-level tui routes
+    tui_relay_path = REPO_ROOT / "src" / "services" / "claude_tui" / "tui_relay.rs"
+    if tui_relay_path.exists():
+        route_entries.extend(parse_route_file(tui_relay_path, "", by_file, by_name))
+
     route_entries.extend(
         parse_route_file(REPO_ROOT / "src" / "server" / "mod.rs", "", by_file, by_name)
     )
