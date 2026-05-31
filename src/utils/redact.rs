@@ -2,8 +2,9 @@ use regex::Regex;
 use std::sync::{LazyLock, RwLock};
 use url::Url;
 
-static AUTH_HEADER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(authorization\s*:\s*(?:[a-z][a-z0-9._~+/-]*\s+)?)[^\r\n]+").unwrap());
+static AUTH_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(authorization\s*:\s*(?:[a-z][a-z0-9._~+/-]*\s+)?)[^\r\n]+").unwrap()
+});
 static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|DATABASE_URL|API[_-]?KEY)[A-Z0-9_]*\s*=\s*)[^\s]+")
         .unwrap()
