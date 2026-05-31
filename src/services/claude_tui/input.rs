@@ -29,6 +29,11 @@ const PROMPT_SUBMIT_CONFIRM_RETRIES: usize = 2;
 /// readiness) before giving up and letting the timeout fire. See
 /// `wait_for_prompt_ready_polling`.
 const PROMPT_READY_STRANDED_DRAFT_CLEAR_ATTEMPTS: usize = 3;
+/// Maximum number of times the readiness wait will auto-confirm a blocking
+/// startup modal (workspace-trust gate, large-session resume prompt) before
+/// giving up. The cap allows a couple of sequential modals (trust then resume)
+/// plus a retry while still letting a truly stuck modal time out.
+const PROMPT_READY_DIALOG_DISMISS_ATTEMPTS: usize = 4;
 const PROMPT_READY_TIMEOUT_ERROR_PREFIX: &str = "timeout waiting for claude tui";
 pub const PROMPT_READY_CANCELLED_ERROR: &str = "claude tui prompt readiness wait cancelled";
 
@@ -784,6 +789,7 @@ fn wait_for_prompt_ready_polling(
     let mut wait_interval = Duration::from_millis(100);
     let mut stranded_draft_clear_attempts = 0usize;
     let mut prior_snapshot_had_stranded_draft = false;
+    let mut dialog_dismiss_attempts = 0usize;
     loop {
         check_prompt_cancel(cancel_token)?;
         if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
@@ -841,6 +847,37 @@ fn wait_for_prompt_ready_polling(
             continue;
         }
         prior_snapshot_had_stranded_draft = stranded_draft_now;
+        // Auto-confirm the startup modals that otherwise pin a fresh prompt
+        // forever because the orchestrator never answers them: the workspace
+        // trust gate and the large/old-session resume prompt. Both
+        // default-highlight the option we want, so a single Enter confirms
+        // ("Yes, I trust this folder" / "Resume from summary"). The feedback
+        // survey is deliberately NOT dismissed — it only appears alongside a
+        // genuinely running turn, where waiting is correct and sending keys
+        // would interrupt real work (see `blocking_dialog_dismissal_actions`).
+        if dialog_dismiss_attempts < PROMPT_READY_DIALOG_DISMISS_ATTEMPTS
+            && let Some(actions) = blocking_dialog_dismissal_actions(&snapshot)
+        {
+            dialog_dismiss_attempts += 1;
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                attempt = dialog_dismiss_attempts,
+                max_attempts = PROMPT_READY_DIALOG_DISMISS_ATTEMPTS,
+                reason = prompt_ready_timeout_reason(&snapshot),
+                "claude_tui prompt-ready blocked by a startup modal; auto-confirming it before timeout"
+            );
+            if let Err(error) = run_actions(session_name, &actions, cancel_token) {
+                tracing::warn!(
+                    tmux_session_name = session_name,
+                    error = %error,
+                    "failed to send keystroke to dismiss Claude TUI startup modal"
+                );
+            }
+            check_prompt_cancel(cancel_token)?;
+            std::thread::sleep(PROMPT_SUBMIT_RETRY_SETTLE);
+            continue;
+        }
         if !snapshot.tmux_pane_alive {
             check_prompt_cancel(cancel_token)?;
             return Err("claude tui session died before prompt input was ready".to_string());
@@ -881,10 +918,43 @@ fn snapshot_has_stranded_prompt_draft(snapshot: &PromptReadinessSnapshot) -> boo
         && snapshot.prompt_draft_detected
 }
 
+/// Keystrokes that confirm a blocking startup modal, or `None` when there is
+/// nothing safe to dismiss. Both actionable modals default-highlight the option
+/// AgentDesk wants, so a single Enter confirms it. The feedback survey returns
+/// `None` on purpose: it is not a readiness blocker (an idle prompt is already
+/// ready regardless of the survey overlay), and it only appears while a turn is
+/// running, where sending keys would interrupt genuine work.
+fn blocking_dialog_dismissal_actions(
+    snapshot: &PromptReadinessSnapshot,
+) -> Option<Vec<TuiInputAction>> {
+    if !snapshot.tmux_pane_alive || !snapshot.capture_available {
+        return None;
+    }
+    use crate::services::tmux_common::ClaudeTuiBlockingDialog;
+    match crate::services::tmux_common::tmux_capture_claude_tui_blocking_dialog(&snapshot.pane_tail)
+    {
+        Some(ClaudeTuiBlockingDialog::TrustFolder | ClaudeTuiBlockingDialog::ResumeSession) => {
+            Some(vec![TuiInputAction::Enter])
+        }
+        Some(ClaudeTuiBlockingDialog::FeedbackSurvey) | None => None,
+    }
+}
+
 /// Human-readable reason for a prompt-readiness timeout, derived from the actual
 /// final snapshot instead of a hardcoded string, so the surfaced error reflects
-/// what was really on screen (e.g. a stranded draft vs. a missing prompt marker).
+/// what was really on screen (e.g. a stranded draft vs. a missing prompt marker
+/// vs. a startup modal we could not get past).
 fn prompt_ready_timeout_reason(snapshot: &PromptReadinessSnapshot) -> &'static str {
+    use crate::services::tmux_common::ClaudeTuiBlockingDialog;
+    if let Some(dialog) =
+        crate::services::tmux_common::tmux_capture_claude_tui_blocking_dialog(&snapshot.pane_tail)
+    {
+        return match dialog {
+            ClaudeTuiBlockingDialog::TrustFolder => "blocking_dialog_trust_folder",
+            ClaudeTuiBlockingDialog::ResumeSession => "blocking_dialog_resume_session",
+            ClaudeTuiBlockingDialog::FeedbackSurvey => "feedback_survey_present",
+        };
+    }
     if snapshot.prompt_marker_detected && snapshot.prompt_draft_detected {
         "stranded_prompt_draft"
     } else if !snapshot.prompt_marker_detected {
@@ -1218,6 +1288,50 @@ mod tests {
             ..stranded.clone()
         };
         assert_eq!(prompt_ready_timeout_reason(&marker_only), "prompt_not_ready");
+    }
+
+    #[test]
+    fn blocking_startup_modals_are_auto_confirmed_but_survey_is_left_alone() {
+        let trust = PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "\u{276f} 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm \u{00b7} Esc to cancel".to_string(),
+        };
+        assert_eq!(
+            blocking_dialog_dismissal_actions(&trust),
+            Some(vec![TuiInputAction::Enter])
+        );
+        assert_eq!(prompt_ready_timeout_reason(&trust), "blocking_dialog_trust_folder");
+
+        let resume = PromptReadinessSnapshot {
+            pane_tail: "\u{276f} 1. Resume from summary (recommended)\n Enter to confirm \u{00b7} Esc to cancel".to_string(),
+            ..trust.clone()
+        };
+        assert_eq!(
+            blocking_dialog_dismissal_actions(&resume),
+            Some(vec![TuiInputAction::Enter])
+        );
+        assert_eq!(
+            prompt_ready_timeout_reason(&resume),
+            "blocking_dialog_resume_session"
+        );
+
+        // The feedback survey must never be dismissed by keystroke.
+        let survey = PromptReadinessSnapshot {
+            pane_tail: "\u{25cf} How is Claude doing this session? (optional)\n  1: Bad 2: Fine 3: Good 0: Dismiss".to_string(),
+            ..trust.clone()
+        };
+        assert_eq!(blocking_dialog_dismissal_actions(&survey), None);
+        assert_eq!(prompt_ready_timeout_reason(&survey), "feedback_survey_present");
+
+        // A dead pane is never actionable even if the modal text lingers.
+        let dead_trust = PromptReadinessSnapshot {
+            tmux_pane_alive: false,
+            ..trust.clone()
+        };
+        assert_eq!(blocking_dialog_dismissal_actions(&dead_trust), None);
     }
 
     #[test]

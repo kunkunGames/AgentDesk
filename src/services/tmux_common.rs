@@ -145,6 +145,51 @@ pub(crate) fn tmux_capture_indicates_claude_tui_idle_suggestion(capture: &str) -
         .unwrap_or(false)
 }
 
+/// An interactive Claude Code TUI dialog that can block a relayed prompt from
+/// ever being accepted until it is answered. These are surfaced by the CLI
+/// itself (not by AgentDesk) and the orchestrator never types into them, so
+/// without recovery they pin the readiness wait until it times out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeTuiBlockingDialog {
+    /// Startup workspace-trust gate: "Is this a project you created or one you
+    /// trust? / Yes, I trust this folder / No, exit".
+    TrustFolder,
+    /// Large/old session resume prompt: "Resume from summary / Resume full
+    /// session as-is / Don't ask me again".
+    ResumeSession,
+    /// Optional "How is Claude doing this session?" feedback survey overlay.
+    /// NOT a true readiness blocker — it only appears alongside a running turn,
+    /// so callers must not send keystrokes to dismiss it.
+    FeedbackSurvey,
+}
+
+/// Classify a blocking interactive dialog from a pane capture, if present. The
+/// startup modals are gated on their "Enter to confirm" footer so free-form
+/// conversation text that merely mentions these phrases can never be mistaken
+/// for the modal itself.
+pub(crate) fn tmux_capture_claude_tui_blocking_dialog(
+    capture: &str,
+) -> Option<ClaudeTuiBlockingDialog> {
+    let recent = capture
+        .lines()
+        .map(trim_prompt_line)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+    let has = |needle: &str| recent.iter().any(|l| l.contains(needle));
+
+    if has("How is Claude doing this session") {
+        return Some(ClaudeTuiBlockingDialog::FeedbackSurvey);
+    }
+    let confirm_footer = has("Enter to confirm");
+    if confirm_footer && has("trust this folder") {
+        return Some(ClaudeTuiBlockingDialog::TrustFolder);
+    }
+    if confirm_footer && (has("Resume from summary") || has("Resume full session")) {
+        return Some(ClaudeTuiBlockingDialog::ResumeSession);
+    }
+    None
+}
+
 fn tmux_recent_lines_show_claude_tui_active_work(lines: &[&str]) -> bool {
     lines.iter().any(|line| {
         let line = trim_prompt_line(line);
@@ -640,6 +685,69 @@ pub fn truncate_jsonl_head_safe(
 #[cfg(test)]
 mod sentinel_tests {
     use super::*;
+
+    #[test]
+    fn blocking_dialog_detects_trust_folder_gate() {
+        let pane = "\
+ Accessing workspace:
+ /Users/kunkun/.adk/release/workspaces/main
+ Quick safety check: Is this a project you created or one you trust?
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ \u{276f} 1. Yes, I trust this folder
+   2. No, exit
+ Enter to confirm \u{00b7} Esc to cancel";
+        assert_eq!(
+            tmux_capture_claude_tui_blocking_dialog(pane),
+            Some(ClaudeTuiBlockingDialog::TrustFolder)
+        );
+    }
+
+    #[test]
+    fn blocking_dialog_detects_resume_session_prompt() {
+        let pane = "\
+This session is 1d old and 141.7k tokens.
+Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.
+  \u{276f} 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+  Enter to confirm \u{00b7} Esc to cancel";
+        assert_eq!(
+            tmux_capture_claude_tui_blocking_dialog(pane),
+            Some(ClaudeTuiBlockingDialog::ResumeSession)
+        );
+    }
+
+    #[test]
+    fn blocking_dialog_detects_feedback_survey() {
+        let pane = "\
+\u{25cf} How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+\u{276f} ";
+        assert_eq!(
+            tmux_capture_claude_tui_blocking_dialog(pane),
+            Some(ClaudeTuiBlockingDialog::FeedbackSurvey)
+        );
+    }
+
+    #[test]
+    fn blocking_dialog_ignores_phrase_without_confirm_footer() {
+        // Free-form assistant text that merely mentions the modal phrasing must
+        // never be mistaken for the modal itself (no "Enter to confirm" footer).
+        let pane = "\
+\u{23fa} Tip: choosing \"Resume from summary\" trades fidelity for speed.
+\u{276f}
+  bypass permissions on";
+        assert_eq!(tmux_capture_claude_tui_blocking_dialog(pane), None);
+    }
+
+    #[test]
+    fn blocking_dialog_absent_for_normal_idle_prompt() {
+        let pane = "\
+\u{276f}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+        assert_eq!(tmux_capture_claude_tui_blocking_dialog(pane), None);
+    }
 
     /// #2442 — round-trip the sentinel through the same code path the
     /// wrappers use, then verify the consumer-side tail-peek picks it up.
