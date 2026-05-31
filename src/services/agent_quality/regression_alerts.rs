@@ -133,7 +133,14 @@ where
     T: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
     for<'a> &'a str: sqlx::ColumnIndex<R>,
 {
-    match row.try_get(column) {
+    decode_with_fallback(column, default_val, || row.try_get(column))
+}
+
+fn decode_with_fallback<T, F>(column: &str, default_val: T, decode: F) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, sqlx::Error>,
+{
+    match decode() {
         Ok(val) => Ok(val),
         Err(sqlx::Error::ColumnDecode { .. }) => {
             tracing::warn!(
@@ -645,75 +652,36 @@ mod tests {
                 .contains("decode error: db error")
         );
     }
+}
 
-    // Mock row implementation for testing decode fallback
-    struct MockRow {
-        should_fail_decode: bool,
-        missing_column: bool,
-    }
-
-    impl sqlx::Row for MockRow {
-        type Database = sqlx::Postgres;
-
-        fn columns(&self) -> &[<Self::Database as sqlx::Database>::Column] {
-            &[]
-        }
-
-        fn try_get_raw<I>(
-            &self,
-            _index: I,
-        ) -> Result<<Self::Database as sqlx::Database>::ValueRef<'_>, sqlx::Error>
-        where
-            I: sqlx::ColumnIndex<Self>,
-        {
-            if self.missing_column {
-                Err(sqlx::Error::ColumnNotFound("missing".to_string()))
-            } else if self.should_fail_decode {
-                Err(sqlx::Error::ColumnDecode {
-                    index: "mock_col".to_string(),
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "mock decode error",
-                    )),
-                })
-            } else {
-                unreachable!("Happy path not implemented for mock")
-            }
-        }
-    }
-
-    impl sqlx::ColumnIndex<MockRow> for &str {
-        fn index(&self, _row: &MockRow) -> Result<usize, sqlx::Error> {
-            Ok(0)
-        }
-    }
+#[cfg(test)]
+mod explicit_decode_fallback_tests {
+    use super::*;
 
     #[test]
-    fn explicit_decode_fallback_returns_default_on_column_decode_error() {
-        let mock_row = MockRow {
-            should_fail_decode: true,
-            missing_column: false,
-        };
-
-        // This triggers `try_get` -> `try_get_raw` returning a `ColumnDecode` error,
-        // which our helper should catch and replace with the default `42.0`.
-        let result: Result<f64, anyhow::Error> =
-            explicit_decode_fallback(&mock_row, "some_column", 42.0);
+    fn returns_default_on_column_decode_error() {
+        let result: Result<f64, anyhow::Error> = decode_with_fallback("some_column", 42.0, || {
+            Err(sqlx::Error::ColumnDecode {
+                index: "some_column".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mock decode error",
+                )),
+            })
+        });
 
         assert_eq!(result.unwrap(), 42.0);
     }
 
     #[test]
-    fn explicit_decode_fallback_fails_closed_on_other_errors() {
-        let mock_row = MockRow {
-            should_fail_decode: false,
-            missing_column: true, // triggers ColumnNotFound
-        };
-
-        let result: Result<f64, anyhow::Error> =
-            explicit_decode_fallback(&mock_row, "some_column", 42.0);
+    fn fails_closed_on_other_errors() {
+        let result: Result<f64, anyhow::Error> = decode_with_fallback("some_column", 42.0, || {
+            Err(sqlx::Error::ColumnNotFound("missing".to_string()))
+        });
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("ColumnNotFound"));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("decode some_column"));
+        assert!(error.contains("missing"));
     }
 }
