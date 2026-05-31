@@ -1439,6 +1439,20 @@ impl ChannelMailboxHandle {
         .await
     }
 
+    pub(crate) async fn finish_cancelled_turn(&self) -> FinishTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::FinishCancelledTurn { reply },
+            FinishTurnResult {
+                removed_token: None,
+                has_pending: false,
+                mailbox_online: false,
+                queue_exit_events: Vec::new(),
+                persistence_error: None,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn clear(&self, persistence: QueuePersistenceContext) -> ClearChannelResult {
         self.request(
             |reply| ChannelMailboxMsg::Clear { persistence, reply },
@@ -1914,6 +1928,9 @@ enum ChannelMailboxMsg {
         reply: oneshot::Sender<FinishTurnResult>,
     },
     HardStop {
+        reply: oneshot::Sender<FinishTurnResult>,
+    },
+    FinishCancelledTurn {
         reply: oneshot::Sender<FinishTurnResult>,
     },
     Clear {
@@ -2679,6 +2696,31 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         persistence.as_ref(),
                     ));
                     mark_turn_finished_signal_done(channel_id);
+                }
+                ChannelMailboxMsg::FinishCancelledTurn { reply } => {
+                    let should_finish = state.cancel_token.as_ref().is_some_and(|token| {
+                        token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    if should_finish {
+                        let persistence = state.last_persistence.clone();
+                        let _ = reply.send(finalize_turn_state(
+                            &mut state,
+                            channel_id,
+                            persistence.as_ref(),
+                        ));
+                        mark_turn_finished_signal_done(channel_id);
+                    } else {
+                        let _ = reply.send(FinishTurnResult {
+                            removed_token: None,
+                            has_pending: state
+                                .intervention_queue
+                                .iter()
+                                .any(|item| item.mode == InterventionMode::Soft),
+                            mailbox_online: true,
+                            queue_exit_events: Vec::new(),
+                            persistence_error: None,
+                        });
+                    }
                 }
                 ChannelMailboxMsg::Clear { persistence, reply } => {
                     state.last_persistence = Some(persistence.clone());
@@ -4598,6 +4640,141 @@ mod purge_queue_tests {
         assert_eq!(drained_first, 0);
         assert_eq!(drained_second, 0);
         assert!(handle.snapshot().await.intervention_queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod finish_cancelled_turn_tests {
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::Instant;
+
+    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
+
+    use crate::services::provider::ProviderKind;
+    use crate::services::turn_orchestrator::{
+        CancelToken, ChannelMailboxRegistry, Intervention, InterventionMode,
+        QueuePersistenceContext, save_channel_queue,
+    };
+
+    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
+    static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn make_intervention(message_id: u64, text: &str) -> Intervention {
+        Intervention {
+            author_id: UserId::new(1),
+            author_is_bot: false,
+            message_id: MessageId::new(message_id),
+            source_message_ids: vec![MessageId::new(message_id)],
+            text: text.to_string(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            pending_uploads: Vec::new(),
+            voice_announcement: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_cancelled_turn_clears_cancelled_active_without_rehydrating_queue() {
+        let _lock = match TEST_ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Codex;
+        let token_hash = "finish-cancelled-no-rehydrate";
+        let channel_id = ChannelId::new(2_997_001);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
+
+        handle.replace_queue(Vec::new(), persistence).await;
+        save_channel_queue(
+            &provider,
+            token_hash,
+            channel_id,
+            &[make_intervention(30, "disk-only queued prompt")],
+            None,
+        )
+        .expect("seed disk-only pending queue");
+
+        let token = Arc::new(CancelToken::new());
+        token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            handle
+                .try_start_turn(token.clone(), UserId::new(7), MessageId::new(70))
+                .await
+        );
+
+        let finished = handle.finish_cancelled_turn().await;
+
+        assert!(
+            finished
+                .removed_token
+                .as_ref()
+                .is_some_and(|removed| Arc::ptr_eq(removed, &token)),
+            "removed_token tells recovery it may decrement global_active",
+        );
+        assert!(!finished.has_pending);
+        assert!(finished.mailbox_online);
+        let snapshot = handle.snapshot().await;
+        assert!(snapshot.cancel_token.is_none());
+        assert!(snapshot.active_user_message_id.is_none());
+        assert!(
+            snapshot.intervention_queue.is_empty(),
+            "finish_cancelled_turn must not hydrate disk-only pending queues",
+        );
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    #[tokio::test]
+    async fn finish_cancelled_turn_preserves_uncancelled_active_turn() {
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(2_997_002);
+        let handle = registry.handle(channel_id);
+        let token = Arc::new(CancelToken::new());
+
+        assert!(
+            handle
+                .try_start_turn(token.clone(), UserId::new(7), MessageId::new(71))
+                .await
+        );
+
+        let finished = handle.finish_cancelled_turn().await;
+
+        assert!(finished.removed_token.is_none());
+        assert!(finished.mailbox_online);
+        let snapshot = handle.snapshot().await;
+        assert!(
+            snapshot
+                .cancel_token
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &token)),
+            "fresh active turn must survive a stale finish_cancelled_turn call",
+        );
+        assert_eq!(snapshot.active_user_message_id, Some(MessageId::new(71)));
+    }
+
+    #[tokio::test]
+    async fn finish_cancelled_turn_is_noop_when_mailbox_is_idle() {
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(2_997_003);
+        let handle = registry.handle(channel_id);
+
+        let finished = handle.finish_cancelled_turn().await;
+
+        assert!(finished.removed_token.is_none());
+        assert!(finished.mailbox_online);
+        let snapshot = handle.snapshot().await;
+        assert!(snapshot.cancel_token.is_none());
+        assert!(snapshot.active_user_message_id.is_none());
     }
 }
 
