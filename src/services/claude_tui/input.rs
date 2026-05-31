@@ -104,6 +104,7 @@ pub enum TuiInputAction {
     Enter,
     Escape,
     End,
+    CtrlU,
     Backspace(usize),
 }
 
@@ -288,6 +289,9 @@ fn run_actions(
             TuiInputAction::End => {
                 crate::services::platform::tmux::send_keys(session_name, &["End"])?
             }
+            TuiInputAction::CtrlU => {
+                crate::services::platform::tmux::send_keys(session_name, &["C-u"])?
+            }
             TuiInputAction::Backspace(count) => {
                 let mut remaining = *count;
                 while remaining > 0 {
@@ -405,19 +409,23 @@ fn prompt_submit_settle_for_attempt(attempt: usize) -> Duration {
 }
 
 /// Best-effort clear of whatever editable text sits in the Claude TUI composer:
-/// press Escape, then backspace over the budgeted draft width. Used both after a
-/// failed submission and by the readiness wait when it finds a stranded draft
-/// blocking an otherwise-idle prompt.
+/// press Escape, move to the end, clear the whole input line, then backspace
+/// over the budgeted draft width as a fallback. Used both after a failed
+/// submission and by the readiness wait when it finds a stranded draft blocking
+/// an otherwise-idle prompt.
 fn clear_claude_tui_prompt_draft_keys(session_name: &str, cancel_token: Option<&CancelToken>) {
     let snapshot = prompt_readiness_snapshot(session_name);
     let full_capture = crate::services::platform::tmux::capture_pane(
         session_name,
         PROMPT_READY_CAPTURE_SCROLLBACK,
     );
-    let mut actions = vec![TuiInputAction::Escape];
+    let mut actions = vec![
+        TuiInputAction::Escape,
+        TuiInputAction::End,
+        TuiInputAction::CtrlU,
+    ];
     let budget_capture = full_capture.as_deref().unwrap_or(&snapshot.pane_tail);
     if let Some(count) = claude_prompt_draft_backspace_budget_from_tail(budget_capture) {
-        actions.push(TuiInputAction::End);
         actions.push(TuiInputAction::Backspace(count));
     }
     if let Err(error) = run_actions(session_name, &actions, cancel_token) {
@@ -460,6 +468,7 @@ fn ensure_tmux_success(output: Output, action: &TuiInputAction) -> Result<(), St
         TuiInputAction::Enter => "enter",
         TuiInputAction::Escape => "escape",
         TuiInputAction::End => "end",
+        TuiInputAction::CtrlU => "ctrl-u",
         TuiInputAction::Backspace(_) => "backspace",
     };
     if stderr.is_empty() {
