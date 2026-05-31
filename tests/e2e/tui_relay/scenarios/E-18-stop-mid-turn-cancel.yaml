@@ -1,0 +1,44 @@
+id: E-18
+title: cancel_turn 중단 후 late marker 미전송 보장
+cells: [codex-tui]
+isolation: required
+destructive: true
+skip_reason: >
+  Stub for #2937. The harness now has a reusable cancel_turn step and negative
+  marker assertions, but this live stop-mid-turn scenario needs a deterministic
+  provider throttle/hook. A long prompt only probabilistically leaves time for
+  cancel_turn, so running it by default would create timing flakes.
+acceptance_criteria:
+  - Provide a deterministic hook or prompt fixture that holds the turn after [E2E:E18:OK].
+  - Execute cancel_turn while the turn is still active.
+  - Assert [E2E:E18:LATE] is absent from relay output after cancellation.
+  - Assert health counters drain to global_active=0 and global_finalizing=0.
+notes: |
+  Phase 1 coverage for #2937. Scope is intentionally conservative: codex-tui
+  declares the reusable cancel_turn step without expanding the flaky live
+  matrix. Enable execution only after a deterministic provider throttle/hook
+  can hold the turn active between the early marker and cancellation.
+steps:
+  - send_prompt: |
+      첫 줄에는 정확히 "[E2E:E18:OK]"만 출력해줘.
+      그 다음부터 250줄을 번호와 함께 작성해줘.
+      250번째 마지막 줄에 도달하기 전에는 절대 "[E2E:E18:LATE]"를 출력하지 말고,
+      정말 마지막 줄에서만 "[E2E:E18:LATE]"를 출력해줘.
+  - wait_for_discord_text: "[E2E:E18:OK]"
+    timeout_s: 180
+  - cancel_turn:
+      force: true
+      timeout_s: 15
+  - wait_idle_s: 15
+  - assert_health:
+      forbid_degraded_reasons:
+        - global_active_counter_out_of_bounds
+      global_active_max: 0
+      global_finalizing_max: 0
+assertions:
+  - text_present: "[E2E:E18:OK]"
+  - marker_absent:
+      marker: "[E2E:E18:LATE]"
+      surface: relay
+  - no_duplicate_content: true
+  - no_suppressed_label_chrome: true

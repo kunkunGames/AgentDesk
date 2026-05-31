@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,13 @@ SUPPORTED_CELLS: tuple[str, ...] = (
     "claude-e",
     "codex-pipe",
     "codex-tui",
+)
+
+IDLE_MAILBOX_STATUSES = {"", "idle", "none"}
+IDLE_RELAY_STALL_STATES = {"", "healthy"}
+RUNTIME_QUEUE_DIRS: tuple[tuple[str, str], ...] = (
+    ("pending_queue", "discord_pending_queue"),
+    ("queued_placeholders", "discord_queued_placeholders"),
 )
 
 
@@ -210,6 +218,7 @@ def is_destructive(scenario: dict[str, Any]) -> bool:
             "kill_tui_process",
             "send_keys_no_enter",
             "poison_claude_tui_relay_offset",
+            "cancel_turn",
         ):
             if key in step:
                 return True
@@ -295,24 +304,14 @@ def reset_channel_state(
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {"channel_id": channel_id, "actions": []}
     try:
-        url = f"{base_url}/api/turns/{channel_id}/cancel?force=true"
-        req = urllib.request.Request(
-            url,
-            data=b"",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
         summary["actions"].append(
             {
-                "cancel_turn": {
-                    "ok": payload.get("ok"),
-                    "queued_remaining": payload.get("queued_remaining"),
-                    "queue_purged": payload.get("queue_purged"),
-                    "tmux_killed": payload.get("tmux_killed"),
-                    "lifecycle_path": payload.get("lifecycle_path"),
-                }
+                "cancel_turn": cancel_turn(
+                    base_url=base_url,
+                    channel_id=channel_id,
+                    force=True,
+                    timeout_s=15,
+                )
             }
         )
     except Exception as error:  # noqa: BLE001
@@ -332,6 +331,60 @@ def reset_channel_state(
                     cleared.append(str(target))
         summary["actions"].append({kind: cleared})
     return summary
+
+
+def cancel_turn(
+    *,
+    base_url: str,
+    channel_id: str,
+    force: bool = True,
+    timeout_s: float = 15.0,
+) -> dict[str, Any]:
+    """POST the reusable turn-cancel endpoint used by reset and scenarios."""
+
+    url = f"{base_url.rstrip('/')}/api/turns/{channel_id}/cancel?force={'true' if force else 'false'}"
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            status = int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        raise assertions.AssertionError(
+            f"cancel_turn HTTP {error.code} for channel={channel_id}: {body[:500]!r}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise assertions.AssertionError(
+            f"cancel_turn URL error for channel={channel_id}: {error}"
+        ) from error
+
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as error:
+        raise assertions.AssertionError(
+            f"cancel_turn returned non-JSON HTTP {status}: {raw[:500]!r}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise assertions.AssertionError(
+            f"cancel_turn returned non-object HTTP {status}: {payload!r}"
+        )
+    if status >= 400 or payload.get("ok") is False:
+        raise assertions.AssertionError(
+            f"cancel_turn failed HTTP {status} for channel={channel_id}: "
+            f"{_payload_summary(payload)}"
+        )
+    return {
+        "ok": payload.get("ok"),
+        "queued_remaining": payload.get("queued_remaining"),
+        "queue_purged": payload.get("queue_purged"),
+        "tmux_killed": payload.get("tmux_killed"),
+        "lifecycle_path": payload.get("lifecycle_path"),
+    }
 
 
 def poison_claude_tui_relay_offset(
@@ -364,6 +417,469 @@ def poison_claude_tui_relay_offset(
     }
 
 
+def scenario_teardown_marker(scenario_id: str, *, cell: str, run_id: str) -> str:
+    return f"### E2E TEARDOWN {scenario_id} cell={cell} run={run_id}"
+
+
+def send_teardown_marker(
+    *,
+    client: discord.DiscordClient,
+    channel_id: str,
+    scenario_id: str,
+    cell: str,
+    run_id: str,
+) -> dict[str, Any]:
+    return client.send_control(
+        channel_id,
+        scenario_teardown_marker(scenario_id, cell=cell, run_id=run_id),
+    )
+
+
+def _read_api_json(base_url: str, path: str, *, timeout: float = 5.0) -> tuple[int, Any]:
+    url = f"{base_url.rstrip('/')}{path}"
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"Connection": "close"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+            status = int(getattr(response, "status", 200))
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", "replace")
+        status = int(error.code)
+    if not raw.strip():
+        return status, {}
+    try:
+        return status, json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise assertions.AssertionError(
+            f"{path} returned non-JSON HTTP {status}: {raw[:240]!r}"
+        ) from error
+
+
+def _payload_summary(payload: Any, *, max_chars: int = 500) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        text = repr(payload)
+    if len(text) > max_chars:
+        return f"{text[:max_chars]}..."
+    return text
+
+
+def _read_health_detail(base_url: str, *, timeout: float = 5.0) -> dict[str, Any]:
+    status, payload = _read_api_json(base_url, "/api/health/detail", timeout=timeout)
+    if not isinstance(payload, dict):
+        raise assertions.AssertionError(
+            f"/api/health/detail returned non-object HTTP {status}: {payload!r}"
+        )
+    if status in {401, 403}:
+        raise assertions.AssertionError(
+            f"/api/health/detail unavailable HTTP {status}: {payload}"
+        )
+    if "mailboxes" not in payload:
+        raise assertions.AssertionError(
+            "/api/health/detail missing mailboxes "
+            f"(HTTP {status}, payload={_payload_summary(payload)})"
+        )
+    return payload
+
+
+def _health_reason_allowed(reason: str, allowed: tuple[str, ...]) -> bool:
+    for pattern in allowed:
+        if pattern.endswith("*") and reason.startswith(pattern[:-1]):
+            return True
+        if reason == pattern:
+            return True
+    return False
+
+
+def _health_ready_violations(
+    payload: dict[str, Any],
+    *,
+    allowed_statuses: tuple[str, ...] = ("healthy",),
+    allowed_degraded_reasons: tuple[str, ...] = (),
+) -> list[str]:
+    status = str(payload.get("status") or "").lower()
+    allowed_status_set = {s.lower() for s in allowed_statuses}
+    strict_healthy = allowed_status_set == {"healthy"}
+    violations: list[str] = []
+    if status not in allowed_status_set:
+        violations.append(f"status={status or '<missing>'}")
+    if strict_healthy and payload.get("ok") is False:
+        violations.append("ok=false")
+    if strict_healthy and payload.get("degraded") is True:
+        violations.append("degraded=true")
+    if strict_healthy and payload.get("fully_recovered") is False:
+        violations.append("fully_recovered=false")
+
+    degraded_reasons = payload.get("degraded_reasons") or []
+    if isinstance(degraded_reasons, list):
+        blocked = [
+            str(reason)
+            for reason in degraded_reasons
+            if not _health_reason_allowed(str(reason), allowed_degraded_reasons)
+        ]
+        if blocked:
+            violations.append(f"degraded_reasons={blocked}")
+    elif degraded_reasons:
+        violations.append(f"degraded_reasons={degraded_reasons!r}")
+    return violations
+
+
+def _health_summary(
+    *,
+    http_status: int | None,
+    payload: dict[str, Any] | None,
+    violations: list[str] | None = None,
+    last_error: str | None = None,
+) -> str:
+    if payload is None:
+        suffix = f" error={last_error}" if last_error else ""
+        return f"http={http_status or '<none>'} payload=<unavailable>{suffix}"
+    fields = {
+        "http": http_status,
+        "status": payload.get("status"),
+        "ok": payload.get("ok"),
+        "fully_recovered": payload.get("fully_recovered"),
+        "degraded": payload.get("degraded"),
+        "degraded_reasons": payload.get("degraded_reasons"),
+        "violations": violations or [],
+    }
+    if last_error:
+        fields["last_error"] = last_error
+    return json.dumps(fields, ensure_ascii=False, sort_keys=True)
+
+
+def _as_string_tuple(value: Any, *, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, list):
+        return tuple(str(item) for item in value)
+    return (str(value),)
+
+
+def _reason_matches(pattern: str, reason: str) -> bool:
+    if pattern.endswith("*"):
+        return reason.startswith(pattern[:-1])
+    return pattern == reason or pattern in reason
+
+
+def _as_counter_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _counter_from_payloads(
+    name: str, payloads: list[dict[str, Any]]
+) -> tuple[int | None, str | None]:
+    for payload in payloads:
+        if name in payload:
+            return _as_counter_int(payload.get(name)), name
+    return None, None
+
+
+def assert_health(
+    base_url: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Scenario-level health probe with explicit status/reason/counter checks."""
+
+    options = params or {}
+    status_code, health = _read_api_json(base_url, "/api/health", timeout=5)
+    if not isinstance(health, dict):
+        raise assertions.AssertionError(
+            f"assert_health /api/health returned non-object HTTP {status_code}: "
+            f"{health!r}"
+        )
+
+    required_statuses = _as_string_tuple(
+        options.get("require_status") or options.get("allowed_statuses"),
+        default=("healthy",),
+    )
+    forbidden_reasons = _as_string_tuple(options.get("forbid_degraded_reasons"))
+    degraded_reasons = health.get("degraded_reasons") or []
+    if not isinstance(degraded_reasons, list):
+        degraded_reasons = [degraded_reasons]
+    if "allowed_degraded_reasons" in options:
+        allowed_degraded_reasons = _as_string_tuple(options.get("allowed_degraded_reasons"))
+    elif forbidden_reasons and {s.lower() for s in required_statuses} != {"healthy"}:
+        allowed_degraded_reasons = tuple(str(reason) for reason in degraded_reasons)
+    else:
+        allowed_degraded_reasons = ()
+    violations = _health_ready_violations(
+        health,
+        allowed_statuses=required_statuses,
+        allowed_degraded_reasons=allowed_degraded_reasons,
+    )
+
+    blocked_reasons = [
+        str(reason)
+        for reason in degraded_reasons
+        if any(_reason_matches(pattern, str(reason)) for pattern in forbidden_reasons)
+    ]
+    if blocked_reasons:
+        violations.append(f"forbidden_degraded_reasons={blocked_reasons}")
+
+    counter_payloads = [health]
+    needs_detail = any(
+        key in options for key in ("global_active_max", "global_finalizing_max")
+    )
+    detail: dict[str, Any] | None = None
+    if needs_detail:
+        detail = _read_health_detail(base_url)
+        counter_payloads.insert(0, detail)
+
+    counter_values: dict[str, int] = {}
+    for counter_name, option_name in (
+        ("global_active", "global_active_max"),
+        ("global_finalizing", "global_finalizing_max"),
+    ):
+        if option_name not in options:
+            continue
+        actual, source_key = _counter_from_payloads(counter_name, counter_payloads)
+        if source_key is None:
+            violations.append(f"{counter_name}=<missing>")
+            continue
+        if actual is None:
+            violations.append(f"{source_key}=<invalid>")
+            continue
+        counter_values[counter_name] = actual
+        if actual < 0:
+            violations.append(f"{source_key}={actual} < 0")
+        maximum = int(options[option_name])
+        if actual > maximum:
+            violations.append(f"{source_key}={actual} > {maximum}")
+
+    if status_code < 200 or status_code >= 300:
+        violations.append(f"http={status_code}")
+    if violations:
+        summary_payload = dict(health)
+        if detail is not None:
+            summary_payload["detail_counters"] = {
+                "global_active": detail.get("global_active"),
+                "global_finalizing": detail.get("global_finalizing"),
+            }
+        raise assertions.AssertionError(
+            "assert_health failed: "
+            f"{_health_summary(http_status=status_code, payload=summary_payload, violations=violations)}"
+        )
+
+    return {
+        "http": status_code,
+        "status": health.get("status"),
+        "degraded_reasons": degraded_reasons,
+        **counter_values,
+    }
+
+
+def _as_nonnegative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
+
+
+def _truthy_identity(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)) and value == 0:
+        return False
+    if isinstance(value, str) and value.strip() in {"", "0", "none", "null"}:
+        return False
+    return True
+
+
+def _mailbox_channel_id(mailbox: dict[str, Any]) -> str:
+    value = mailbox.get("channel_id") or mailbox.get("channelId")
+    return str(value or "")
+
+
+def _mailbox_provider(mailbox: dict[str, Any]) -> str:
+    return str(mailbox.get("provider") or mailbox.get("session_provider") or "").lower()
+
+
+def _relay_health(mailbox: dict[str, Any]) -> dict[str, Any]:
+    relay = mailbox.get("relay_health")
+    return relay if isinstance(relay, dict) else {}
+
+
+def _mailbox_busy_reasons(mailbox: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    relay = _relay_health(mailbox)
+
+    status = str(mailbox.get("agent_turn_status") or "").lower()
+    if status not in IDLE_MAILBOX_STATUSES:
+        reasons.append(f"agent_turn_status={status}")
+    if mailbox.get("has_cancel_token") is True:
+        reasons.append("has_cancel_token=true")
+    if mailbox.get("inflight_state_present") is True:
+        reasons.append("inflight_state_present=true")
+    if _as_nonnegative_int(mailbox.get("queue_depth")) > 0:
+        reasons.append(f"queue_depth={mailbox.get('queue_depth')}")
+    if mailbox.get("recovery_started") is True:
+        reasons.append("recovery_started=true")
+    if mailbox.get("active_dispatch_present") is True:
+        reasons.append("active_dispatch_present=true")
+    if _truthy_identity(mailbox.get("active_user_message_id")):
+        reasons.append(f"active_user_message_id={mailbox.get('active_user_message_id')}")
+
+    relay_active_turn = str(relay.get("active_turn") or "").lower()
+    if relay_active_turn not in {"", "none"}:
+        reasons.append(f"relay_health.active_turn={relay_active_turn}")
+    if relay.get("bridge_inflight_present") is True:
+        reasons.append("relay_health.bridge_inflight_present=true")
+    if relay.get("mailbox_has_cancel_token") is True:
+        reasons.append("relay_health.mailbox_has_cancel_token=true")
+    if _truthy_identity(relay.get("mailbox_active_user_msg_id")):
+        reasons.append(
+            f"relay_health.mailbox_active_user_msg_id={relay.get('mailbox_active_user_msg_id')}"
+        )
+    if _as_nonnegative_int(relay.get("queue_depth")) > 0:
+        reasons.append(f"relay_health.queue_depth={relay.get('queue_depth')}")
+    if _truthy_identity(relay.get("pending_discord_callback_msg_id")):
+        reasons.append(
+            "relay_health.pending_discord_callback_msg_id="
+            f"{relay.get('pending_discord_callback_msg_id')}"
+        )
+    if relay.get("pending_thread_proof") is True:
+        reasons.append("relay_health.pending_thread_proof=true")
+    if relay.get("stale_thread_proof") is True:
+        reasons.append("relay_health.stale_thread_proof=true")
+    if relay.get("desynced") is True:
+        reasons.append("relay_health.desynced=true")
+
+    stall_state = str(mailbox.get("relay_stall_state") or "").lower()
+    if stall_state not in IDLE_RELAY_STALL_STATES:
+        reasons.append(f"relay_stall_state={stall_state}")
+    return reasons
+
+
+def _runtime_payload_has_entries(payload: Any) -> bool:
+    if payload in (None, False, "", [], {}):
+        return False
+    if isinstance(payload, list):
+        return len(payload) > 0
+    if isinstance(payload, dict):
+        return any(_runtime_payload_has_entries(value) for value in payload.values())
+    return True
+
+
+def _runtime_queue_violations(
+    *, runtime_root: Path, provider: str, channel_id: str
+) -> list[str]:
+    violations: list[str] = []
+    for label, subdir in RUNTIME_QUEUE_DIRS:
+        provider_dir = runtime_root / subdir / provider
+        if not provider_dir.is_dir():
+            continue
+        for token_dir in provider_dir.iterdir():
+            target = token_dir / f"{channel_id}.json"
+            if not target.exists():
+                continue
+            try:
+                raw = target.read_text(encoding="utf-8").strip()
+                payload = json.loads(raw) if raw else []
+            except (OSError, json.JSONDecodeError) as error:
+                violations.append(f"{label}:{target}: unreadable:{error}")
+                continue
+            if _runtime_payload_has_entries(payload):
+                violations.append(f"{label}:{target}: nonempty")
+    return violations
+
+
+def _mailbox_label(mailbox: dict[str, Any]) -> str:
+    return (
+        f"{_mailbox_provider(mailbox) or '<provider?>'}:"
+        f"{_mailbox_channel_id(mailbox) or '<channel?>'}"
+    )
+
+
+def assert_cell_idle(
+    *,
+    base_url: str,
+    channel_id: str,
+    cell: str,
+    runtime_root: Path,
+    timeout_s: float = 45.0,
+    poll_interval_s: float = 2.0,
+) -> dict[str, Any]:
+    provider = cell_provider(cell)
+    deadline = time.monotonic() + timeout_s
+    last_violations: list[str] = []
+    last_error: str | None = None
+    last_mailbox_count = 0
+
+    while time.monotonic() < deadline:
+        try:
+            detail = _read_health_detail(base_url)
+            mailboxes = detail.get("mailboxes")
+            if not isinstance(mailboxes, list):
+                raise assertions.AssertionError(
+                    "/api/health/detail mailboxes is not a list "
+                    f"(payload={_payload_summary(detail)})"
+                )
+            last_error = None
+        except Exception as error:  # noqa: BLE001 - poll through transient health errors
+            last_error = f"{type(error).__name__}: {error}"
+            time.sleep(poll_interval_s)
+            continue
+
+        target_mailboxes = [
+            mailbox
+            for mailbox in mailboxes
+            if isinstance(mailbox, dict)
+            and _mailbox_channel_id(mailbox) == str(channel_id)
+            and _mailbox_provider(mailbox) == provider
+        ]
+        last_mailbox_count = len(target_mailboxes)
+        last_violations = []
+        if not target_mailboxes:
+            last_violations.append(
+                f"no matching mailbox for provider={provider} channel={channel_id}"
+            )
+        for mailbox in target_mailboxes:
+            for reason in _mailbox_busy_reasons(mailbox):
+                last_violations.append(f"{_mailbox_label(mailbox)} {reason}")
+        last_violations.extend(
+            _runtime_queue_violations(
+                runtime_root=runtime_root,
+                provider=provider,
+                channel_id=str(channel_id),
+            )
+        )
+
+        if not last_violations:
+            return {
+                "channel_id": str(channel_id),
+                "provider": provider,
+                "mailboxes_seen": last_mailbox_count,
+                "status": "idle",
+            }
+        time.sleep(poll_interval_s)
+
+    raise assertions.AssertionError(
+        f"post-scenario idle check failed for {cell} channel={channel_id}: "
+        f"{last_violations}; mailboxes_seen={last_mailbox_count}; "
+        f"last_error={last_error or '<none>'}"
+    )
+
+
 def run_scenario(
     scenario: dict[str, Any],
     *,
@@ -389,6 +905,11 @@ def run_scenario(
         result["reason"] = "requires --thread-channel-id or AGENTDESK_E2E_THREAD_CHANNEL_ID"
         return result
     result["channel_id"] = target_channel_id
+
+    if scenario.get("skip_reason"):
+        result["reason"] = str(scenario["skip_reason"])
+        result["acceptance_criteria"] = scenario.get("acceptance_criteria")
+        return result
 
     destructive = is_destructive(scenario)
     if destructive and not (
@@ -442,9 +963,35 @@ def run_scenario(
     except assertions.AssertionError as error:
         result["status"] = "fail"
         result["reason"] = f"assertion: {error}"
+        if not args.dry_run:
+            try:
+                send_teardown_marker(
+                    client=client,
+                    channel_id=target_channel_id,
+                    scenario_id=scenario_id,
+                    cell=cell,
+                    run_id=run_id,
+                )
+            except Exception as teardown_error:  # noqa: BLE001 - report without masking failure
+                result["teardown_error"] = (
+                    f"{type(teardown_error).__name__}: {teardown_error}"
+                )
     except Exception as error:  # noqa: BLE001 — surfaced in report
         result["status"] = "fail"
         result["reason"] = f"{type(error).__name__}: {error}"
+        if not args.dry_run:
+            try:
+                send_teardown_marker(
+                    client=client,
+                    channel_id=target_channel_id,
+                    scenario_id=scenario_id,
+                    cell=cell,
+                    run_id=run_id,
+                )
+            except Exception as teardown_error:  # noqa: BLE001 - report without masking failure
+                result["teardown_error"] = (
+                    f"{type(teardown_error).__name__}: {teardown_error}"
+                )
 
     result["completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
     return result
@@ -462,7 +1009,6 @@ def run_one_cell(
 ) -> dict[str, Any]:
     scenario_id = scenario.get("id")
     setup_marker = f"### E2E SETUP {scenario_id} cell={cell} run={run_id}"
-    teardown_marker = f"### E2E TEARDOWN {scenario_id} cell={cell} run={run_id}"
     record: dict[str, Any] = {"assertions": []}
 
     if dry_run:
@@ -501,6 +1047,7 @@ def run_one_cell(
             if not first_send_done:
                 _advance_window_past_setup_echo()
                 first_send_done = True
+            window.mark_prompt_sent()
             client.send_prompt(
                 channel_id,
                 step["send_prompt"],
@@ -550,7 +1097,11 @@ def run_one_cell(
                 "target", "release"
             )
             restart_dcserver_for_e2e(
-                target=target, args=args, base_url=client.base_url, cell=cell
+                target=target,
+                args=args,
+                base_url=client.base_url,
+                cell=cell,
+                channel_id=channel_id,
             )
         elif "poison_claude_tui_relay_offset" in step:
             record.setdefault("poisoned_offsets", []).append(
@@ -559,6 +1110,21 @@ def run_one_cell(
                     channel_id=channel_id,
                     runtime_root=Path(args.queue_runtime_root),
                 )
+            )
+        elif "cancel_turn" in step:
+            params = step["cancel_turn"] or {}
+            record.setdefault("cancel_turns", []).append(
+                cancel_turn(
+                    base_url=client.base_url,
+                    channel_id=channel_id,
+                    force=bool(params.get("force", True)),
+                    timeout_s=float(params.get("timeout_s", 15)),
+                )
+            )
+        elif "assert_health" in step:
+            params = step["assert_health"] or {}
+            record.setdefault("health_assertions", []).append(
+                assert_health(client.base_url, params)
             )
         elif "kill_pane" in step:
             thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
@@ -603,10 +1169,18 @@ def run_one_cell(
         else:
             raise assertions.AssertionError(f"unknown step shape: {step!r}")
 
-    _ingest_observed(client.fetch_messages(channel_id, after_id=after_id, limit=100))
+    final_refetches = max(1, int(os.environ.get("AGENTDESK_E2E_FINAL_REFETCHES", "2")))
+    final_refetch_interval_s = float(
+        os.environ.get("AGENTDESK_E2E_FINAL_REFETCH_INTERVAL_S", "1")
+    )
+    for attempt in range(final_refetches):
+        if attempt > 0:
+            time.sleep(final_refetch_interval_s)
+        _ingest_observed(client.fetch_messages(channel_id, after_id=after_id, limit=100))
 
     record["relay_count"] = len(window.messages)
     record["raw_count"] = len(window.raw_messages)
+    record["message_updates"] = len(window.message_updates)
     record["sample_relay"] = [
         (m.get("content") or "")[:120] for m in window.messages[:6]
     ]
@@ -615,21 +1189,64 @@ def run_one_cell(
         run_assertion(assertion_spec, window=window)
         record["assertions"].append({"spec": assertion_spec, "passed": True})
 
-    client.send_control(channel_id, teardown_marker)
+    idle_check = assert_cell_idle(
+        base_url=client.base_url,
+        channel_id=channel_id,
+        cell=cell,
+        runtime_root=Path(args.queue_runtime_root),
+    )
+    record["post_scenario_idle"] = idle_check
+    record["assertions"].append(
+        {"spec": {"post_scenario_cell_idle": True}, "passed": True, "details": idle_check}
+    )
+
+    send_teardown_marker(
+        client=client,
+        channel_id=channel_id,
+        scenario_id=str(scenario_id),
+        cell=cell,
+        run_id=run_id,
+    )
     return record
 
 
-def wait_for_health(base_url: str, *, timeout_s: float = 90.0, poll_interval_s: float = 2.0) -> None:
+def wait_for_health(
+    base_url: str,
+    *,
+    timeout_s: float = 90.0,
+    poll_interval_s: float = 2.0,
+    allowed_statuses: tuple[str, ...] = ("healthy",),
+    allowed_degraded_reasons: tuple[str, ...] = (),
+) -> None:
     deadline = time.monotonic() + timeout_s
+    last_http_status: int | None = None
+    last_payload: dict[str, Any] | None = None
+    last_violations: list[str] = []
+    last_error: str | None = None
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(f"{base_url}/api/health", timeout=5) as response:
-                if 200 <= response.status < 300:
+            http_status, payload = _read_api_json(base_url, "/api/health", timeout=5)
+            last_http_status = http_status
+            if isinstance(payload, dict):
+                last_payload = payload
+                last_violations = _health_ready_violations(
+                    payload,
+                    allowed_statuses=allowed_statuses,
+                    allowed_degraded_reasons=allowed_degraded_reasons,
+                )
+                if 200 <= http_status < 300 and not last_violations:
                     return
-        except Exception:  # noqa: BLE001
-            pass
+            else:
+                last_payload = None
+                last_violations = [f"non-object health payload: {payload!r}"]
+            last_error = None
+        except Exception as error:  # noqa: BLE001 - preserve last transport/parse failure
+            last_error = f"{type(error).__name__}: {error}"
         time.sleep(poll_interval_s)
-    raise assertions.AssertionError(f"dcserver did not become healthy within {timeout_s}s")
+    raise assertions.AssertionError(
+        f"dcserver did not become healthy within {timeout_s}s; last="
+        f"{_health_summary(http_status=last_http_status, payload=last_payload, violations=last_violations, last_error=last_error)}"
+    )
 
 
 def _guard_no_foreign_active_turns(
@@ -639,6 +1256,44 @@ def _guard_no_foreign_active_turns(
     e2e_channel_ids = {channel_id} if channel_id else set()
     if not e2e_channel_ids:
         return
+    try:
+        detail = _read_health_detail(base_url)
+    except Exception as error:  # noqa: BLE001 - fail closed before destructive restart
+        raise assertions.AssertionError(
+            "refusing to restart dcserver: unable to read /api/health/detail "
+            f"for foreign mailbox guard (cell={cell}, channel={channel_id}): "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    mailboxes = detail.get("mailboxes")
+    if not isinstance(mailboxes, list):
+        raise assertions.AssertionError(
+            "refusing to restart dcserver: /api/health/detail mailboxes is not a list "
+            f"(payload={_payload_summary(detail)})"
+        )
+
+    busy: list[str] = []
+    current_provider = cell_provider(cell)
+    for mailbox in mailboxes:
+        if not isinstance(mailbox, dict):
+            continue
+        channel = _mailbox_channel_id(mailbox)
+        provider = _mailbox_provider(mailbox)
+        if channel in e2e_channel_ids and provider == current_provider:
+            continue
+        reasons = _mailbox_busy_reasons(mailbox)
+        if reasons:
+            busy.append(f"{_mailbox_label(mailbox)} [{', '.join(reasons)}]")
+
+    global_finalizing = _as_nonnegative_int(detail.get("global_finalizing"))
+    if global_finalizing > 0:
+        busy.append(f"global_finalizing={global_finalizing}")
+
+    if busy:
+        raise assertions.AssertionError(
+            f"refusing to restart dcserver: live mailbox state outside cell {cell} "
+            f"(channel={channel_id}). Active: {busy}."
+        )
+
     try:
         with urllib.request.urlopen(f"{base_url}/api/sessions", timeout=5) as response:
             payload = json.loads(response.read())
@@ -652,7 +1307,6 @@ def _guard_no_foreign_active_turns(
         if isinstance(payload, list)
         else []
     )
-    busy: list[str] = []
     workspace_substring = cell_workspace_substring(cell)
     for session in sessions or []:
         status = str(session.get("status", "")).lower()
@@ -678,10 +1332,11 @@ def restart_dcserver_for_e2e(
     args: argparse.Namespace,
     base_url: str,
     cell: str,
+    channel_id: str,
 ) -> None:
     if target not in ("dev", "release"):
         raise assertions.AssertionError(f"unsupported restart target: {target!r}")
-    _guard_no_foreign_active_turns(base_url, args.channel_id, cell)
+    _guard_no_foreign_active_turns(base_url, channel_id, cell)
 
     if args.restart_script:
         script = Path(args.restart_script).expanduser()
@@ -718,12 +1373,51 @@ def run_assertion(spec: dict[str, Any], *, window: assertions.Window) -> None:
         assertions.message_count_between_markers(
             window, low=int(params.get("min", 0)), high=int(params.get("max", 99))
         )
+    elif "raw_message_count_between_markers" in spec:
+        params = spec["raw_message_count_between_markers"]
+        assertions.raw_message_count_between_markers(
+            window,
+            low=int(params.get("min", 0)),
+            high=int(params.get("max", 999)),
+            include_our_send=bool(params.get("include_our_send", False)),
+        )
     elif spec.get("no_duplicate_content"):
         assertions.no_duplicate_content(window)
     elif "text_present" in spec:
         assertions.text_present(window, needle=spec["text_present"])
     elif "raw_text_present" in spec:
         assertions.raw_text_present(window, needle=spec["raw_text_present"])
+    elif "raw_text_absent" in spec:
+        params = spec["raw_text_absent"]
+        if isinstance(params, dict):
+            needle = params.get("needle") or params.get("text")
+            if needle is None:
+                raise assertions.AssertionError(
+                    f"raw_text_absent requires needle/text: {spec!r}"
+                )
+            assertions.raw_text_absent(
+                window,
+                needle=str(needle),
+                include_our_send=bool(params.get("include_our_send", False)),
+            )
+        else:
+            assertions.raw_text_absent(window, needle=str(params))
+    elif "marker_absent" in spec:
+        params = spec["marker_absent"]
+        if isinstance(params, dict):
+            marker = params.get("marker")
+            if marker is None:
+                raise assertions.AssertionError(
+                    f"marker_absent requires marker: {spec!r}"
+                )
+            assertions.marker_absent(
+                window,
+                marker=str(marker),
+                surface=str(params.get("surface", "relay")),
+                include_our_send=bool(params.get("include_our_send", False)),
+            )
+        else:
+            assertions.marker_absent(window, marker=str(params))
     elif "ordered_text_present" in spec:
         # #2838 (P0-2): completeness + ordering of multiple expected fragments.
         needles = spec["ordered_text_present"]
@@ -747,6 +1441,40 @@ def run_assertion(spec: dict[str, Any], *, window: assertions.Window) -> None:
         params = spec["relay_latency_within"]
         max_seconds = params.get("max_seconds") if isinstance(params, dict) else params
         assertions.relay_latency_within(window, max_seconds=float(max_seconds))
+    elif "chrome_count" in spec:
+        params = spec["chrome_count"]
+        if not isinstance(params, dict):
+            raise assertions.AssertionError(f"chrome_count requires a mapping: {spec!r}")
+        assertions.chrome_count(
+            window,
+            text=params.get("text"),
+            regex=params.get("regex"),
+            min_count=int(params.get("min", 0)),
+            max_count=(
+                int(params["max"])
+                if "max" in params and params.get("max") is not None
+                else None
+            ),
+            exact=(
+                int(params["exact"])
+                if "exact" in params and params.get("exact") is not None
+                else None
+            ),
+            include_our_send=bool(params.get("include_our_send", False)),
+        )
+    elif "completion_chrome_after_body" in spec:
+        params = spec["completion_chrome_after_body"]
+        body_marker = params.get("body_marker") if isinstance(params, dict) else params
+        required = bool(params.get("required", False)) if isinstance(params, dict) else False
+        assertions.completion_chrome_after_body(
+            window,
+            body_marker=str(body_marker),
+            required=required,
+        )
+    elif "body_not_overwritten" in spec:
+        assertions.body_not_overwritten(window, marker=str(spec["body_not_overwritten"]))
+    elif spec.get("no_suppressed_label_chrome"):
+        assertions.no_suppressed_label_chrome(window)
     elif spec.get("no_control_chars"):
         assertions.no_control_chars(window)
     elif spec.get("no_resume_prompt_chrome"):
