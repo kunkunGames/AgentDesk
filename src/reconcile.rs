@@ -420,8 +420,7 @@ fn classify_delivery_kv_guard_mismatches(
     let typed_status = row.typed_status.as_deref();
     if typed_status.is_none() {
         let expected = if has_notified { "sent" } else { "reserved" };
-        let mismatch =
-            DispatchDeliveryEventMismatch::missing_typed(row.dispatch_id, expected);
+        let mismatch = DispatchDeliveryEventMismatch::missing_typed(row.dispatch_id, expected);
         stats.record_mismatch(&mismatch.kind);
         mismatches.push(mismatch);
         return;
@@ -436,10 +435,8 @@ fn classify_delivery_kv_guard_mismatches(
         {
             return;
         }
-        let mismatch = DispatchDeliveryEventMismatch::notified_status(
-            row.dispatch_id,
-            row.typed_status,
-        );
+        let mismatch =
+            DispatchDeliveryEventMismatch::notified_status(row.dispatch_id, row.typed_status);
         stats.record_mismatch(&mismatch.kind);
         mismatches.push(mismatch);
         return;
@@ -469,8 +466,7 @@ fn classify_delivery_typed_guard_mismatches(
             mismatches.push(mismatch);
         }
         "sent" => {
-            let mismatch =
-                DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id, "sent");
+            let mismatch = DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id, "sent");
             stats.record_mismatch(&mismatch.kind);
             mismatches.push(mismatch);
         }
