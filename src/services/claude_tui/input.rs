@@ -103,6 +103,7 @@ pub enum TuiInputAction {
     PasteBuffer(String),
     Enter,
     Escape,
+    End,
     Backspace(usize),
 }
 
@@ -284,6 +285,9 @@ fn run_actions(
             TuiInputAction::Escape => {
                 crate::services::platform::tmux::send_keys(session_name, &["Escape"])?
             }
+            TuiInputAction::End => {
+                crate::services::platform::tmux::send_keys(session_name, &["End"])?
+            }
             TuiInputAction::Backspace(count) => {
                 let mut remaining = *count;
                 while remaining > 0 {
@@ -406,8 +410,14 @@ fn prompt_submit_settle_for_attempt(attempt: usize) -> Duration {
 /// blocking an otherwise-idle prompt.
 fn clear_claude_tui_prompt_draft_keys(session_name: &str, cancel_token: Option<&CancelToken>) {
     let snapshot = prompt_readiness_snapshot(session_name);
+    let full_capture = crate::services::platform::tmux::capture_pane(
+        session_name,
+        PROMPT_READY_CAPTURE_SCROLLBACK,
+    );
     let mut actions = vec![TuiInputAction::Escape];
-    if let Some(count) = claude_prompt_draft_backspace_budget_from_tail(&snapshot.pane_tail) {
+    let budget_capture = full_capture.as_deref().unwrap_or(&snapshot.pane_tail);
+    if let Some(count) = claude_prompt_draft_backspace_budget_from_tail(budget_capture) {
+        actions.push(TuiInputAction::End);
         actions.push(TuiInputAction::Backspace(count));
     }
     if let Err(error) = run_actions(session_name, &actions, cancel_token) {
@@ -449,6 +459,7 @@ fn ensure_tmux_success(output: Output, action: &TuiInputAction) -> Result<(), St
         TuiInputAction::PasteBuffer(_) => "paste-buffer",
         TuiInputAction::Enter => "enter",
         TuiInputAction::Escape => "escape",
+        TuiInputAction::End => "end",
         TuiInputAction::Backspace(_) => "backspace",
     };
     if stderr.is_empty() {
@@ -516,16 +527,6 @@ fn wait_for_prompt_ready_inner(
     let timeout = readiness.timeout();
     let start = Instant::now();
 
-    if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
-        tracing::info!(
-            tmux_session_name = session_name,
-            readiness = readiness.label(),
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "claude_tui prompt ready via idle transcript"
-        );
-        return Ok(());
-    }
-
     if cancel_token.is_some() {
         return wait_for_prompt_ready_polling(
             session_name,
@@ -584,7 +585,11 @@ fn wait_for_prompt_ready_inner(
             );
             return Ok(());
         }
-        if transcript_idle_confirms_prompt_ready(&snapshot, transcript_path) {
+        let snapshot_has_prompt_blocker = snapshot_has_stranded_prompt_draft(&snapshot)
+            || blocking_dialog_dismissal_actions(&snapshot).is_some();
+        if !snapshot_has_prompt_blocker
+            && transcript_idle_confirms_prompt_ready(&snapshot, transcript_path)
+        {
             check_prompt_cancel(cancel_token)?;
             tracing::info!(
                 tmux_session_name = session_name,
@@ -792,27 +797,9 @@ fn wait_for_prompt_ready_polling(
     let mut dialog_dismiss_attempts = 0usize;
     loop {
         check_prompt_cancel(cancel_token)?;
-        if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
-            tracing::info!(
-                tmux_session_name = session_name,
-                readiness = readiness.label(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "claude_tui prompt ready via idle transcript"
-            );
-            return Ok(());
-        }
         let snapshot = prompt_readiness_snapshot(session_name);
         check_prompt_cancel(cancel_token)?;
         if prompt_marker_confirms_prompt_ready(&snapshot) {
-            return Ok(());
-        }
-        if transcript_idle_confirms_prompt_ready(&snapshot, transcript_path) {
-            tracing::info!(
-                tmux_session_name = session_name,
-                readiness = readiness.label(),
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "claude_tui prompt ready via idle transcript fallback"
-            );
             return Ok(());
         }
         // An idle Claude TUI that still holds leftover composer text (a stranded
@@ -878,6 +865,15 @@ fn wait_for_prompt_ready_polling(
             std::thread::sleep(PROMPT_SUBMIT_RETRY_SETTLE);
             continue;
         }
+        if transcript_idle_confirms_prompt_ready(&snapshot, transcript_path) {
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "claude_tui prompt ready via idle transcript fallback"
+            );
+            return Ok(());
+        }
         if !snapshot.tmux_pane_alive {
             check_prompt_cancel(cancel_token)?;
             return Err("claude tui session died before prompt input was ready".to_string());
@@ -907,15 +903,15 @@ fn wait_for_prompt_ready_polling(
 /// path already treats as a stuck draft (`prompt_submit_needs_enter_retry`): a
 /// live pane, a detected prompt marker, and detected draft text. The
 /// prompt-marker detector returns false while Claude is actively working, so a
-/// detected marker also implies the turn is not mid-stream — the draft is
-/// genuinely leftover and safe to clear. (Note: a real stranded draft sits
-/// inside the normal idle composer box, so we must NOT exclude the
-/// "idle suggestion" chrome here — that chrome is just the idle prompt border.)
+/// detected marker also implies the turn is not mid-stream. Idle suggestion
+/// chrome can include prompt-looking history; exclude it so the recovery only
+/// clears editable composer text.
 fn snapshot_has_stranded_prompt_draft(snapshot: &PromptReadinessSnapshot) -> bool {
     snapshot.tmux_pane_alive
         && snapshot.capture_available
         && snapshot.prompt_marker_detected
         && snapshot.prompt_draft_detected
+        && !claude_prompt_draft_is_idle_suggestion_tail(&snapshot.pane_tail)
 }
 
 /// Keystrokes that confirm a blocking startup modal, or `None` when there is
@@ -1257,6 +1253,22 @@ mod tests {
             ..stranded.clone()
         };
         assert!(!snapshot_has_stranded_prompt_draft(&no_capture));
+
+        // Idle suggestion chrome can leave prompt-looking text in history, but
+        // it is not an editable stranded composer draft and must not be cleared.
+        let idle_suggestion = PromptReadinessSnapshot {
+            pane_tail: "\
+\u{276f} Try \"fix the failing test\"
+────────────────────────
+Tools: 0 done
+  \u{23f5}\u{23f5} bypass permissions on"
+                .to_string(),
+            ..stranded
+        };
+        assert!(claude_prompt_draft_is_idle_suggestion_tail(
+            &idle_suggestion.pane_tail
+        ));
+        assert!(!snapshot_has_stranded_prompt_draft(&idle_suggestion));
     }
 
     #[test]
@@ -1268,7 +1280,10 @@ mod tests {
             capture_available: true,
             pane_tail: "\u{276f} leftover".to_string(),
         };
-        assert_eq!(prompt_ready_timeout_reason(&stranded), "stranded_prompt_draft");
+        assert_eq!(
+            prompt_ready_timeout_reason(&stranded),
+            "stranded_prompt_draft"
+        );
 
         let no_marker = PromptReadinessSnapshot {
             prompt_marker_detected: false,
@@ -1287,7 +1302,10 @@ mod tests {
             prompt_draft_detected: false,
             ..stranded.clone()
         };
-        assert_eq!(prompt_ready_timeout_reason(&marker_only), "prompt_not_ready");
+        assert_eq!(
+            prompt_ready_timeout_reason(&marker_only),
+            "prompt_not_ready"
+        );
     }
 
     #[test]
@@ -1303,7 +1321,10 @@ mod tests {
             blocking_dialog_dismissal_actions(&trust),
             Some(vec![TuiInputAction::Enter])
         );
-        assert_eq!(prompt_ready_timeout_reason(&trust), "blocking_dialog_trust_folder");
+        assert_eq!(
+            prompt_ready_timeout_reason(&trust),
+            "blocking_dialog_trust_folder"
+        );
 
         let resume = PromptReadinessSnapshot {
             pane_tail: "\u{276f} 1. Resume from summary (recommended)\n Enter to confirm \u{00b7} Esc to cancel".to_string(),
@@ -1324,7 +1345,10 @@ mod tests {
             ..trust.clone()
         };
         assert_eq!(blocking_dialog_dismissal_actions(&survey), None);
-        assert_eq!(prompt_ready_timeout_reason(&survey), "feedback_survey_present");
+        assert_eq!(
+            prompt_ready_timeout_reason(&survey),
+            "feedback_survey_present"
+        );
 
         // A dead pane is never actionable even if the modal text lingers.
         let dead_trust = PromptReadinessSnapshot {

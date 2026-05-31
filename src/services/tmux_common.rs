@@ -68,7 +68,7 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
     });
     let idle_footer = lines.iter().any(|line| {
         let line = trim_prompt_line(line);
-        line.contains("Tools: 0 done") || line.contains("bypass permissions")
+        line.contains("bypass permissions")
     });
     separator && idle_footer
 }
@@ -177,15 +177,15 @@ pub(crate) fn tmux_capture_claude_tui_blocking_dialog(
         .collect::<Vec<_>>();
     let has = |needle: &str| recent.iter().any(|l| l.contains(needle));
 
-    if has("How is Claude doing this session") {
-        return Some(ClaudeTuiBlockingDialog::FeedbackSurvey);
-    }
     let confirm_footer = has("Enter to confirm");
     if confirm_footer && has("trust this folder") {
         return Some(ClaudeTuiBlockingDialog::TrustFolder);
     }
     if confirm_footer && (has("Resume from summary") || has("Resume full session")) {
         return Some(ClaudeTuiBlockingDialog::ResumeSession);
+    }
+    if has("How is Claude doing this session") {
+        return Some(ClaudeTuiBlockingDialog::FeedbackSurvey);
     }
     None
 }
@@ -727,6 +727,22 @@ Resuming the full session will consume a substantial portion of your usage limit
         assert_eq!(
             tmux_capture_claude_tui_blocking_dialog(pane),
             Some(ClaudeTuiBlockingDialog::FeedbackSurvey)
+        );
+    }
+
+    #[test]
+    fn blocking_dialog_prefers_current_actionable_modal_over_stale_survey_text() {
+        let pane = "\
+\u{25cf} How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+
+This session is 1d old and 141.7k tokens.
+  \u{276f} 1. Resume from summary (recommended)
+    2. Resume full session as-is
+  Enter to confirm \u{00b7} Esc to cancel";
+        assert_eq!(
+            tmux_capture_claude_tui_blocking_dialog(pane),
+            Some(ClaudeTuiBlockingDialog::ResumeSession)
         );
     }
 
