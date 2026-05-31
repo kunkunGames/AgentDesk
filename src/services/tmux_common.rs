@@ -55,6 +55,9 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
             || lower.contains("processing")
             || lower.contains("thinking")
             || lower.contains("running")
+            || lower.contains('█')
+            || lower.contains('▓')
+            || lower.contains('▒')
     });
     if busy {
         return false;
@@ -68,7 +71,7 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
     });
     let idle_footer = lines.iter().any(|line| {
         let line = trim_prompt_line(line);
-        line.contains("bypass permissions")
+        line.contains("Tools: 0 done") || line.contains("bypass permissions")
     });
     separator && idle_footer
 }
@@ -996,6 +999,21 @@ assistant output
   🤖 Opus(H) │ ░░░░░░░░░░ │ 4%
   CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
   ⏵⏵ bypass permissions on";
+
+        assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
+        assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
+    }
+
+    #[test]
+    fn claude_idle_suggestion_accepts_tools_zero_footer_without_permissions_line() {
+        let capture = "\
+⏺ TUI-E2E marker
+✻ Worked for 2s
+────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}좋아, 잘 동작하네
+────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ ░░░░░░░░░░ │ 4%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done";
 
         assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
         assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
