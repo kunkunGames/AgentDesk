@@ -256,11 +256,12 @@ fn active_dispatch_slot_guard_sql(agent_expr: &str, slot_expr: &str) -> String {
         "NOT EXISTS (
              SELECT 1
              FROM task_dispatches d
+             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb AS ctx) c
              WHERE d.to_agent_id = {agent_expr}
                AND d.status IN ('pending', 'dispatched')
-               AND COALESCE(NULLIF((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1) = {slot_expr}
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-               AND (COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->'phase_gate' IS NULL
+               AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = {slot_expr}
+               AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+               AND c.ctx->'phase_gate' IS NULL
                AND (
                    COALESCE(d.dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
                    OR d.status = 'pending'
@@ -280,11 +281,12 @@ fn active_dispatch_slot_exists_sql(agent_expr: &str, slot_expr: &str) -> String 
         "EXISTS (
              SELECT 1
              FROM task_dispatches d
+             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb AS ctx) c
              WHERE d.to_agent_id = {agent_expr}
                AND d.status IN ('pending', 'dispatched')
-               AND COALESCE(NULLIF((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1) = {slot_expr}
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-               AND (COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->'phase_gate' IS NULL
+               AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = {slot_expr}
+               AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+               AND c.ctx->'phase_gate' IS NULL
                AND (
                    COALESCE(d.dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
                    OR d.status = 'pending'

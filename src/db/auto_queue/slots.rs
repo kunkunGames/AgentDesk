@@ -83,12 +83,13 @@ pub async fn slot_has_recent_terminal_auto_queue_dispatch_pg(
         "SELECT EXISTS (
              SELECT 1
              FROM task_dispatches d
+             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{}')::jsonb AS ctx) c
              WHERE d.to_agent_id = $1
                AND d.status IN ('completed', 'failed', 'cancelled')
-               AND COALESCE(NULLIF((COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->>'slot_index', '')::BIGINT, -1) = $2
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->>'auto_queue')::BOOLEAN, FALSE) = TRUE
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-               AND (COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+               AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = $2
+               AND COALESCE((c.ctx->>'auto_queue')::BOOLEAN, FALSE) = TRUE
+               AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+               AND c.ctx->'phase_gate' IS NULL
                AND COALESCE(d.completed_at, d.updated_at, d.created_at)
                    >= NOW() - make_interval(secs => $3::INT)
          )",
@@ -167,11 +168,12 @@ pub async fn slot_has_active_dispatch_excluding_pg(
     sqlx::query_scalar::<_, bool>(
         "SELECT COUNT(*) > 0
          FROM task_dispatches
+         CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(context, ''), '{}')::jsonb AS ctx) c
          WHERE to_agent_id = $1
            AND status IN ('pending', 'dispatched')
-           AND COALESCE(NULLIF((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'slot_index', '')::BIGINT, -1) = $2
-           AND COALESCE(((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-           AND (COALESCE(NULLIF(context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+           AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = $2
+           AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+           AND c.ctx->'phase_gate' IS NULL
            AND id != $3
            AND (
                COALESCE(dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')

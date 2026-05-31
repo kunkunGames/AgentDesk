@@ -217,86 +217,34 @@ pub async fn slot_has_active_dispatch_excluding_pg(
         return Ok(true);
     }
 
-    let rows = sqlx::query(
-        "SELECT id, dispatch_type, status, context
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*) > 0
          FROM task_dispatches
          WHERE to_agent_id = $1
-           AND status IN ('pending', 'dispatched')",
+           AND status IN ('pending', 'dispatched')
+           AND COALESCE(NULLIF((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'slot_index', '')::BIGINT, -1) = $2
+           AND COALESCE(((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+           AND (COALESCE(NULLIF(context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+           AND id != $3
+           AND (
+               COALESCE(dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
+               OR status = 'pending'
+               OR EXISTS (
+                   SELECT 1
+                   FROM sessions s
+                   WHERE s.active_dispatch_id = task_dispatches.id
+                     AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
+               )
+           )",
     )
     .bind(agent_id)
-    .fetch_all(pool)
+    .bind(slot_index)
+    .bind(exclude_id)
+    .fetch_one(pool)
     .await
     .map_err(|error| {
-        format!("load postgres active dispatches for {agent_id}:{slot_index}: {error}")
-    })?;
-
-    for row in rows {
-        let dispatch_id: String = row.try_get("id").map_err(|error| {
-            format!("read postgres dispatch id for {agent_id}:{slot_index}: {error}")
-        })?;
-        if dispatch_id == exclude_id {
-            continue;
-        }
-        let dispatch_type: Option<String> = row.try_get("dispatch_type").ok().flatten();
-        let status: String = row.try_get("status").map_err(|error| {
-            format!("read postgres dispatch status for {agent_id}:{slot_index}: {error}")
-        })?;
-        let context: Option<String> = row.try_get("context").ok().flatten();
-        let Some(context) = context else {
-            continue;
-        };
-        let Some(context_json) = serde_json::from_str::<serde_json::Value>(&context).ok() else {
-            continue;
-        };
-        if context_json
-            .get("slot_index")
-            .and_then(|value| value.as_i64())
-            != Some(slot_index)
-        {
-            continue;
-        }
-        if context_json
-            .get("sidecar_dispatch")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if context_json.get("phase_gate").is_some() {
-            continue;
-        }
-        let is_review_class = matches!(
-            dispatch_type.as_deref().unwrap_or("implementation"),
-            "review" | "review-decision" | "create-pr"
-        );
-        if is_review_class {
-            if status == "pending" {
-                return Ok(true);
-            }
-            let has_live_session = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS (
-                     SELECT 1
-                     FROM sessions s
-                     WHERE s.active_dispatch_id = $1
-                       AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
-                 )",
-            )
-            .bind(&dispatch_id)
-            .fetch_one(pool)
-            .await
-            .map_err(|error| {
-                format!(
-                    "probe live session for review-class dispatch {dispatch_id}: {error}"
-                )
-            })?;
-            if !has_live_session {
-                continue;
-            }
-        }
-        return Ok(true);
-    }
-
-    Ok(false)
+        format!("probe active dispatch excluding {exclude_id} for {agent_id}:{slot_index}: {error}")
+    })
 }
 
 pub async fn reset_slot_thread_bindings_pg(

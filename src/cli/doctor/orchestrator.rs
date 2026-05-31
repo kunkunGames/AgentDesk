@@ -1694,10 +1694,9 @@ fn check_voice_cli_present(
         .with_severity(Severity::Error);
     }
     let resolved = if trimmed.contains('/') || trimmed.starts_with('~') {
-        let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
-            std::env::var("HOME")
-                .map(|home| std::path::PathBuf::from(home).join(rest))
-                .unwrap_or_else(|_| std::path::PathBuf::from(trimmed))
+        let expanded = if trimmed.starts_with("~/") || trimmed == "~" {
+            crate::runtime_layout::expand_user_path(trimmed)
+                .unwrap_or_else(|| std::path::PathBuf::from(trimmed))
         } else {
             std::path::PathBuf::from(trimmed)
         };
@@ -3889,7 +3888,10 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
             "DATABASE_URL 또는 database 설정값(host/port/dbname/user/password)을 확인하세요.",
         )
         .with_expected_actual("postgres connection succeeds", error)
-        .with_next_steps(vec!["agentdesk doctor --json".to_string()]),
+        .with_next_steps(vec![
+            "agentdesk doctor --json".to_string(),
+            format!("tail -n 200 {}", dcserver_log_hint()),
+        ]),
     }
 }
 
