@@ -17,7 +17,7 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 NODE_VERSION="$(node -p 'process.versions.node')"
-IFS='.' read -r NODE_MAJOR NODE_MINOR NODE_PATCH <<< "$NODE_VERSION"
+IFS='.' read -r NODE_MAJOR NODE_MINOR _ <<< "$NODE_VERSION"
 
 if [ "$NODE_MAJOR" -lt 22 ] || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -lt 15 ]; }; then
   echo "Error: dashboard verification requires Node >=${REQUIRED_NODE_VERSION} (found v${NODE_VERSION})" >&2
