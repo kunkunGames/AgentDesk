@@ -148,6 +148,9 @@ export default function AgentFormModal({
               aria-valuetext={spriteNum ? t({ ko: `스프라이트 ${spriteNum}`, en: `Sprite ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
               tabIndex={0}
               onKeyDown={(e) => {
+                if (e.currentTarget !== e.target) {
+                  return;
+                }
                 if (e.key === "ArrowUp") {
                   e.preventDefault();
                   const next = Math.max(1, spriteNum || 0) + 1;
