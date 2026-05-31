@@ -127,11 +127,7 @@ pub fn drill_down_link(agent_id: &str) -> String {
 /// Format a Discord-bound alert message for `regression`. Includes
 /// agent id, metric label, expected (baseline) vs actual (current),
 /// sample sizes, and a drill-down link as required by DoD.
-pub fn explicit_decode_fallback<'r, T, R>(
-    row: &'r R,
-    column: &str,
-    default_val: T,
-) -> Result<T>
+pub fn explicit_decode_fallback<'r, T, R>(row: &'r R, column: &str, default_val: T) -> Result<T>
 where
     R: Row,
     T: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
