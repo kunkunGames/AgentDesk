@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 DASHBOARD_DIR="$REPO/dashboard"
-REQUIRED_NODE_VERSION="22.15.0"
+REQUIRED_NODE_MAJOR=22
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Error: node is required to verify the dashboard" >&2
@@ -16,11 +16,9 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
-NODE_VERSION="$(node -p 'process.versions.node')"
-IFS='.' read -r NODE_MAJOR NODE_MINOR _ <<< "$NODE_VERSION"
-
-if [ "$NODE_MAJOR" -lt 22 ] || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -lt 15 ]; }; then
-  echo "Error: dashboard verification requires Node >=${REQUIRED_NODE_VERSION} (found v${NODE_VERSION})" >&2
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if [ "$NODE_MAJOR" -lt "$REQUIRED_NODE_MAJOR" ]; then
+  echo "Error: dashboard verification requires Node >=${REQUIRED_NODE_MAJOR} (found $(node -v))" >&2
   exit 1
 fi
 
