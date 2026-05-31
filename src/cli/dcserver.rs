@@ -1024,7 +1024,59 @@ pub fn handle_restart_dcserver(
     }
 }
 
+/// Raise the process file-descriptor soft limit toward `desired`, clamped to
+/// the inherited hard limit. Best-effort: logs and continues on failure so the
+/// server never refuses to start over an rlimit tweak.
+#[cfg(unix)]
+fn raise_fd_soft_limit(desired: u64) {
+    // SAFETY: getrlimit/setrlimit with a valid resource id and a local rlimit
+    // struct; no aliasing or lifetime concerns.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            eprintln!("  ⚠ getrlimit(RLIMIT_NOFILE) failed; leaving fd limit unchanged");
+            return;
+        }
+        let hard = lim.rlim_max;
+        // rlim_max can be RLIM_INFINITY; cap the request at `desired` either way.
+        let target = if hard == libc::RLIM_INFINITY {
+            desired as libc::rlim_t
+        } else {
+            std::cmp::min(desired as libc::rlim_t, hard)
+        };
+        if lim.rlim_cur >= target {
+            return; // already at or above target
+        }
+        let new_lim = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: hard,
+        };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new_lim) != 0 {
+            eprintln!(
+                "  ⚠ setrlimit(RLIMIT_NOFILE, {target}) failed; fd limit stays at {}",
+                lim.rlim_cur
+            );
+        } else {
+            eprintln!("  ✓ raised RLIMIT_NOFILE soft limit to {target}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_soft_limit(_desired: u64) {}
+
 pub fn handle_dcserver(token: Option<String>) {
+    // Raise the file-descriptor soft limit before anything opens fds. A
+    // tmux-launched dcserver otherwise inherits the tmux server's low default
+    // (256 on macOS), which voice STT exhausts during WAV convert / transcript
+    // sidecar reads / foreground process spawn -> "Too many open files (os error
+    // 24)". This makes the limit launch-model independent (works whether started
+    // via launchd, tmux, or directly).
+    raise_fd_soft_limit(16_384);
+
     // Ensure directory structure exists first (needed for lock file)
     if let Some(root) = agentdesk_runtime_root() {
         for subdir in ["config", "credential", "runtime", "logs", "scripts"] {
