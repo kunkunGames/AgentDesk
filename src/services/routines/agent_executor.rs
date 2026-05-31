@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use crate::services::discord::health::{
 };
 
 use super::runtime::RoutineRunOutcome;
+use super::session_control::RoutineSessionController;
 use super::store::{ClaimedRoutineRun, NextDueAtUpdate, RoutineStore, RunningAgentRoutineRun};
 
 const FRESH_CONTEXT_GUARANTEED: bool = false;
@@ -22,10 +23,52 @@ pub struct RoutineAgentExecutor {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-struct AgentTurnCompletion {
+struct AgentTranscriptCompletionRow {
     assistant_message: String,
     duration_ms: Option<i64>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AgentQualityCompletionRow {
+    event_type: String,
+    outcome: Option<String>,
+    duration_ms: Option<i64>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTurnCompletionEvidence {
+    AssistantTranscript,
+    NoReplyTranscript,
+    TerminalTurn,
+}
+
+impl AgentTurnCompletionEvidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AssistantTranscript => "session_transcripts",
+            Self::NoReplyTranscript => "session_transcripts_no_reply",
+            Self::TerminalTurn => "agent_quality_event_terminal",
+        }
+    }
+
+    fn confirms_assistant_delivery(self) -> bool {
+        matches!(self, Self::AssistantTranscript)
+    }
+
+    fn is_transcript(self) -> bool {
+        matches!(self, Self::AssistantTranscript | Self::NoReplyTranscript)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AgentTurnCompletion {
+    assistant_message: Option<String>,
+    duration_ms: Option<i64>,
+    created_at: DateTime<Utc>,
+    evidence: AgentTurnCompletionEvidence,
+    terminal_status: Option<String>,
 }
 
 impl RoutineAgentExecutor {
@@ -146,9 +189,10 @@ impl RoutineAgentExecutor {
         let mut outcomes = Vec::new();
         for run in pending {
             if let Some(completion) = self.find_turn_completion(&run).await? {
-                let checkpoint = pending_checkpoint(run.result_json.as_ref());
+                let checkpoint =
+                    pending_checkpoint_for_completion(run.result_json.as_ref(), &completion);
                 let next_due_at = pending_next_due_at(run.result_json.as_ref());
-                let last_result = assistant_preview(&completion.assistant_message);
+                let last_result = completion_last_result(&completion);
                 let result_json = Some(completed_result(&run, &completion, last_result.as_str()));
                 let closed = store
                     .complete_agent_run(
@@ -165,6 +209,13 @@ impl RoutineAgentExecutor {
                 if !closed {
                     continue;
                 }
+                self.teardown_fresh_agent_session(
+                    store,
+                    &run.routine_id,
+                    result_json.as_ref(),
+                    "routine fresh agent run completed",
+                )
+                .await;
                 outcomes.push(RoutineRunOutcome {
                     run_id: run.run_id,
                     routine_id: run.routine_id,
@@ -191,6 +242,13 @@ impl RoutineAgentExecutor {
                 if !closed {
                     continue;
                 }
+                self.teardown_fresh_agent_session(
+                    store,
+                    &run.routine_id,
+                    result_json.as_ref(),
+                    "routine fresh agent run timed out",
+                )
+                .await;
                 outcomes.push(RoutineRunOutcome {
                     run_id: run.run_id,
                     routine_id: run.routine_id,
@@ -205,6 +263,56 @@ impl RoutineAgentExecutor {
             }
         }
         Ok(outcomes)
+    }
+
+    async fn teardown_fresh_agent_session(
+        &self,
+        store: &RoutineStore,
+        routine_id: &str,
+        result_json: Option<&Value>,
+        reason: &str,
+    ) {
+        let routine = match store.get_routine(routine_id).await {
+            Ok(Some(routine)) => routine,
+            Ok(None) => {
+                tracing::warn!(
+                    routine_id,
+                    "fresh routine session teardown skipped: routine row not found"
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    routine_id,
+                    error = %error,
+                    "fresh routine session teardown skipped: routine lookup failed"
+                );
+                return;
+            }
+        };
+        if routine.execution_strategy != "fresh" {
+            return;
+        }
+
+        let controller =
+            RoutineSessionController::new(self.pool.clone(), self.health_registry.clone());
+        match controller
+            .teardown_fresh_session(&routine, result_json, reason)
+            .await
+        {
+            Ok(result) => tracing::info!(
+                routine_id,
+                tmux_session = %result.tmux_session,
+                tmux_killed = result.tmux_killed,
+                disconnected_sessions = result.disconnected_sessions,
+                "fresh routine session teardown complete"
+            ),
+            Err(error) => tracing::warn!(
+                routine_id,
+                error = %error,
+                "fresh routine session teardown failed"
+            ),
+        }
     }
 
     async fn start_turn(
@@ -415,7 +523,7 @@ impl RoutineAgentExecutor {
         &self,
         run: &RunningAgentRoutineRun,
     ) -> Result<Option<AgentTurnCompletion>> {
-        sqlx::query_as(
+        let transcript = sqlx::query_as::<_, AgentTranscriptCompletionRow>(
             r#"
             SELECT assistant_message, duration_ms::bigint AS duration_ms, created_at
             FROM session_transcripts
@@ -436,7 +544,55 @@ impl RoutineAgentExecutor {
                 run.turn_id,
                 run.run_id
             )
-        })
+        })?;
+        if let Some(transcript) = transcript {
+            let evidence = if assistant_message_is_no_reply(&transcript.assistant_message) {
+                AgentTurnCompletionEvidence::NoReplyTranscript
+            } else {
+                AgentTurnCompletionEvidence::AssistantTranscript
+            };
+            return Ok(Some(AgentTurnCompletion {
+                assistant_message: Some(transcript.assistant_message),
+                duration_ms: transcript.duration_ms,
+                created_at: transcript.created_at,
+                evidence,
+                terminal_status: None,
+            }));
+        }
+
+        let terminal = sqlx::query_as::<_, AgentQualityCompletionRow>(
+            r#"
+            SELECT event_type::text AS event_type,
+                   payload #>> '{details,outcome}' AS outcome,
+                   CASE
+                       WHEN payload #>> '{details,duration_ms}' ~ '^-?[0-9]+$'
+                       THEN (payload #>> '{details,duration_ms}')::bigint
+                       ELSE NULL
+                   END AS duration_ms,
+                   created_at
+            FROM agent_quality_event
+            WHERE correlation_id = $1
+              AND source_event_id = $1
+              AND created_at >= $2
+              AND event_type = 'turn_error'::agent_quality_event_type
+              AND payload #>> '{details,outcome}' = 'empty_response'
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(&run.turn_id)
+        .bind(run.started_at)
+        .fetch_optional(&*self.pool)
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "lookup routine agent terminal turn {} for run {}: {error}",
+                run.turn_id,
+                run.run_id
+            )
+        })?;
+
+        Ok(terminal.and_then(terminal_completion_from_quality_event))
     }
 
     fn timeout_secs_for_run(&self, run: &RunningAgentRoutineRun) -> u64 {
@@ -672,19 +828,38 @@ fn completed_result(
     completion: &AgentTurnCompletion,
     assistant_preview: &str,
 ) -> Value {
-    json!({
+    let mut result = json!({
         "status": "completed",
         "turn_id": run.turn_id,
         "routine_id": run.routine_id,
         "run_id": run.run_id,
         "script_ref": run.script_ref,
-        "completion_evidence": "session_transcripts",
+        "completion_evidence": completion.evidence.as_str(),
         "assistant_message_preview": assistant_preview,
-        "assistant_message_chars": completion.assistant_message.chars().count(),
+        "assistant_message_chars": completion
+            .assistant_message
+            .as_ref()
+            .map(|message| message.chars().count())
+            .unwrap_or(0),
         "duration_ms": completion.duration_ms,
-        "transcript_created_at": completion.created_at,
+        "completion_created_at": completion.created_at,
         "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
-    })
+    });
+    if let Some(object) = result.as_object_mut() {
+        if completion.evidence.is_transcript() {
+            object.insert(
+                "transcript_created_at".to_string(),
+                Value::String(completion.created_at.to_rfc3339()),
+            );
+        }
+        if let Some(status) = completion.terminal_status.as_deref() {
+            object.insert(
+                "turn_terminal_status".to_string(),
+                Value::String(status.to_string()),
+            );
+        }
+    }
+    with_started_run_routing_metadata(result, run.result_json.as_ref())
 }
 
 fn merge_pending_result(
@@ -693,7 +868,8 @@ fn merge_pending_result(
     error: Option<&str>,
     completion: Option<&AgentTurnCompletion>,
 ) -> Value {
-    json!({
+    with_started_run_routing_metadata(
+        json!({
         "status": status,
         "turn_id": run.turn_id,
         "routine_id": run.routine_id,
@@ -702,7 +878,43 @@ fn merge_pending_result(
         "error": error,
         "duration_ms": completion.and_then(|value| value.duration_ms),
         "fresh_context_guaranteed": FRESH_CONTEXT_GUARANTEED,
-    })
+        }),
+        run.result_json.as_ref(),
+    )
+}
+
+fn with_started_run_routing_metadata(mut result: Value, started_result: Option<&Value>) -> Value {
+    const ROUTING_KEYS: &[&str] = &["channel_id", "parent_channel_id", "discord_thread_id"];
+
+    let Some(started_result) = started_result else {
+        return result;
+    };
+    let Some(result_object) = result.as_object_mut() else {
+        return result;
+    };
+
+    for key in ROUTING_KEYS {
+        if result_object.contains_key(*key) {
+            continue;
+        }
+        if let Some(value) = started_result.get(*key) {
+            result_object.insert((*key).to_string(), value.clone());
+        }
+    }
+
+    result
+}
+
+fn pending_checkpoint_for_completion(
+    result_json: Option<&Value>,
+    completion: &AgentTurnCompletion,
+) -> Option<Value> {
+    let checkpoint = pending_checkpoint(result_json)?;
+    if completion.evidence.confirms_assistant_delivery() {
+        Some(finalize_family_profile_probe_pending_delivery(checkpoint))
+    } else {
+        Some(checkpoint)
+    }
 }
 
 fn pending_checkpoint(result_json: Option<&Value>) -> Option<Value> {
@@ -710,6 +922,67 @@ fn pending_checkpoint(result_json: Option<&Value>) -> Option<Value> {
         .and_then(|value| value.get("checkpoint"))
         .filter(|value| !value.is_null())
         .cloned()
+}
+
+fn finalize_family_profile_probe_pending_delivery(mut checkpoint: Value) -> Value {
+    let Some(object) = checkpoint.as_object_mut() else {
+        return checkpoint;
+    };
+    let Some(pending_delivery) = object.remove("pendingDelivery") else {
+        return checkpoint;
+    };
+    if pending_delivery.get("kind").and_then(Value::as_str) != Some("family-profile-probe") {
+        object.insert("pendingDelivery".to_string(), pending_delivery);
+        return checkpoint;
+    }
+
+    let Some(trigger_date) = pending_delivery
+        .get("triggerDate")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        object.insert("pendingDelivery".to_string(), pending_delivery);
+        return checkpoint;
+    };
+    let triggered_at = pending_delivery
+        .get("triggeredAt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    object.insert(
+        "lastTriggeredDate".to_string(),
+        Value::String(trigger_date.clone()),
+    );
+    if let Some(triggered_at) = triggered_at.clone() {
+        object.insert("lastTriggeredAt".to_string(), Value::String(triggered_at));
+    }
+
+    let mut history = object
+        .get("history")
+        .and_then(Value::as_array)
+        .map(|items| {
+            let start = items.len().saturating_sub(199);
+            items[start..].to_vec()
+        })
+        .unwrap_or_default();
+    let mut item = Map::new();
+    if let Some(target_key) = pending_delivery.get("targetKey").cloned() {
+        item.insert("targetKey".to_string(), target_key);
+    }
+    if let Some(target) = pending_delivery.get("target").cloned() {
+        item.insert("target".to_string(), target);
+    }
+    item.insert("triggerDate".to_string(), Value::String(trigger_date));
+    if let Some(triggered_at) = triggered_at {
+        item.insert("triggeredAt".to_string(), Value::String(triggered_at));
+    }
+    if let Some(plan) = pending_delivery.get("plan").cloned() {
+        item.insert("plan".to_string(), plan);
+    }
+    history.push(Value::Object(item));
+    object.insert("history".to_string(), Value::Array(history));
+
+    checkpoint
 }
 
 fn pending_next_due_at(result_json: Option<&Value>) -> Option<DateTime<Utc>> {
@@ -730,6 +1003,45 @@ fn assistant_preview(message: &str) -> String {
     preview
 }
 
+fn completion_last_result(completion: &AgentTurnCompletion) -> String {
+    match completion.evidence {
+        AgentTurnCompletionEvidence::AssistantTranscript => {
+            assistant_preview(completion.assistant_message.as_deref().unwrap_or_default())
+        }
+        AgentTurnCompletionEvidence::NoReplyTranscript => "NO_REPLY".to_string(),
+        AgentTurnCompletionEvidence::TerminalTurn => {
+            let status = completion.terminal_status.as_deref().unwrap_or("terminal");
+            format!("agent turn completed without assistant transcript ({status})")
+        }
+    }
+}
+
+fn assistant_message_is_no_reply(message: &str) -> bool {
+    message.trim().eq_ignore_ascii_case("NO_REPLY")
+}
+
+fn terminal_completion_from_quality_event(
+    terminal: AgentQualityCompletionRow,
+) -> Option<AgentTurnCompletion> {
+    if !is_no_deliverable_quality_event(&terminal.event_type, terminal.outcome.as_deref()) {
+        return None;
+    }
+    Some(AgentTurnCompletion {
+        assistant_message: None,
+        duration_ms: terminal.duration_ms,
+        created_at: terminal.created_at,
+        evidence: AgentTurnCompletionEvidence::TerminalTurn,
+        terminal_status: terminal
+            .outcome
+            .filter(|value| !value.trim().is_empty())
+            .or(Some(terminal.event_type)),
+    })
+}
+
+fn is_no_deliverable_quality_event(event_type: &str, outcome: Option<&str>) -> bool {
+    event_type == "turn_error" && outcome == Some("empty_response")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +1059,40 @@ mod tests {
         }
     }
 
+    fn running_run_with_result(result_json: Value) -> RunningAgentRoutineRun {
+        RunningAgentRoutineRun {
+            result_json: Some(result_json),
+            ..running_run(None)
+        }
+    }
+
+    fn completion_with_evidence(evidence: AgentTurnCompletionEvidence) -> AgentTurnCompletion {
+        AgentTurnCompletion {
+            assistant_message: match evidence {
+                AgentTurnCompletionEvidence::AssistantTranscript => Some("done".to_string()),
+                AgentTurnCompletionEvidence::NoReplyTranscript => Some("NO_REPLY".to_string()),
+                AgentTurnCompletionEvidence::TerminalTurn => None,
+            },
+            duration_ms: Some(50),
+            created_at: Utc::now(),
+            evidence,
+            terminal_status: matches!(evidence, AgentTurnCompletionEvidence::TerminalTurn)
+                .then(|| "empty_response".to_string()),
+        }
+    }
+
+    fn quality_completion_row(
+        event_type: &str,
+        outcome: Option<&str>,
+    ) -> AgentQualityCompletionRow {
+        AgentQualityCompletionRow {
+            event_type: event_type.to_string(),
+            outcome: outcome.map(str::to_string),
+            duration_ms: Some(50),
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn pending_checkpoint_ignores_null() {
         assert_eq!(pending_checkpoint(Some(&json!({"checkpoint": null}))), None);
@@ -754,6 +1100,86 @@ mod tests {
             pending_checkpoint(Some(&json!({"checkpoint": {"cursor": 3}}))),
             Some(json!({"cursor": 3}))
         );
+    }
+
+    #[test]
+    fn pending_checkpoint_finalizes_family_profile_probe_after_confirmed_delivery() {
+        let completion = completion_with_evidence(AgentTurnCompletionEvidence::AssistantTranscript);
+        let result = pending_checkpoint_for_completion(
+            Some(&json!({
+                "checkpoint": {
+                    "plan": {"date": "2026-05-30", "hour": 12, "minute": 0},
+                    "history": [{"targetKey": "obujang", "triggerDate": "2026-05-29"}],
+                    "pendingDelivery": {
+                        "kind": "family-profile-probe",
+                        "targetKey": "obujang",
+                        "target": "343742347365974026",
+                        "triggerDate": "2026-05-30",
+                        "triggeredAt": "2026-05-30T12:00:00+09:00",
+                        "plan": {"date": "2026-05-30", "hour": 12, "minute": 0}
+                    }
+                }
+            })),
+            &completion,
+        )
+        .expect("checkpoint");
+
+        assert_eq!(
+            result.get("lastTriggeredDate").and_then(Value::as_str),
+            Some("2026-05-30")
+        );
+        assert_eq!(
+            result.get("lastTriggeredAt").and_then(Value::as_str),
+            Some("2026-05-30T12:00:00+09:00")
+        );
+        assert!(
+            result.get("pendingDelivery").is_none(),
+            "confirmed delivery must clear the pending marker"
+        );
+        let history = result
+            .get("history")
+            .and_then(Value::as_array)
+            .expect("history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[1].get("targetKey").and_then(Value::as_str),
+            Some("obujang")
+        );
+    }
+
+    #[test]
+    fn pending_checkpoint_keeps_family_profile_marker_for_no_reply_completion() {
+        for evidence in [
+            AgentTurnCompletionEvidence::NoReplyTranscript,
+            AgentTurnCompletionEvidence::TerminalTurn,
+        ] {
+            let completion = completion_with_evidence(evidence);
+            let result = pending_checkpoint_for_completion(
+                Some(&json!({
+                    "checkpoint": {
+                        "pendingDelivery": {
+                            "kind": "family-profile-probe",
+                            "targetKey": "yohoejang",
+                            "triggerDate": "2026-05-31"
+                        }
+                    }
+                })),
+                &completion,
+            )
+            .expect("checkpoint");
+
+            assert!(
+                result.get("lastTriggeredDate").is_none(),
+                "{evidence:?} must not consume today's delivery marker"
+            );
+            assert_eq!(
+                result
+                    .pointer("/pendingDelivery/triggerDate")
+                    .and_then(Value::as_str),
+                Some("2026-05-31"),
+                "{evidence:?} must leave pendingDelivery for the next real send"
+            );
+        }
     }
 
     #[test]
@@ -770,6 +1196,107 @@ mod tests {
         assert_eq!(timeout_secs_for_run(&running_run(None), 1800), 1800);
         assert_eq!(timeout_secs_for_run(&running_run(Some(0)), 1800), 1800);
         assert_eq!(timeout_secs_for_run(&running_run(Some(-5)), 1800), 1800);
+    }
+
+    #[test]
+    fn completed_result_preserves_started_thread_metadata() {
+        let run = running_run_with_result(json!({
+            "channel_id": "200",
+            "parent_channel_id": "100",
+            "discord_thread_id": "200"
+        }));
+        let completion = completion_with_evidence(AgentTurnCompletionEvidence::AssistantTranscript);
+
+        let result = completed_result(&run, &completion, "done");
+
+        assert_eq!(result.get("channel_id"), Some(&json!("200")));
+        assert_eq!(result.get("parent_channel_id"), Some(&json!("100")));
+        assert_eq!(result.get("discord_thread_id"), Some(&json!("200")));
+        assert_eq!(
+            result.get("completion_evidence"),
+            Some(&json!("session_transcripts"))
+        );
+        assert_eq!(result.get("assistant_message_chars"), Some(&json!(4)));
+    }
+
+    #[test]
+    fn completed_result_records_terminal_completion_without_transcript() {
+        let run = running_run_with_result(json!({
+            "channel_id": "200",
+            "parent_channel_id": "100",
+            "discord_thread_id": "200"
+        }));
+        let completion = completion_with_evidence(AgentTurnCompletionEvidence::TerminalTurn);
+
+        let result = completed_result(
+            &run,
+            &completion,
+            "agent turn completed without assistant transcript (empty_response)",
+        );
+
+        assert_eq!(
+            result.get("completion_evidence"),
+            Some(&json!("agent_quality_event_terminal"))
+        );
+        assert_eq!(result.get("assistant_message_chars"), Some(&json!(0)));
+        assert_eq!(
+            result.get("turn_terminal_status"),
+            Some(&json!("empty_response"))
+        );
+        assert!(result.get("transcript_created_at").is_none());
+    }
+
+    #[test]
+    fn completion_last_result_handles_no_reply() {
+        let completion = completion_with_evidence(AgentTurnCompletionEvidence::NoReplyTranscript);
+
+        assert_eq!(completion_last_result(&completion), "NO_REPLY");
+    }
+
+    #[test]
+    fn normal_turn_complete_quality_event_without_transcript_is_not_no_reply_completion() {
+        let completion = terminal_completion_from_quality_event(quality_completion_row(
+            "turn_complete",
+            Some("completed"),
+        ));
+
+        assert!(
+            completion.is_none(),
+            "normal turn_complete can race transcript insertion and must wait for transcript"
+        );
+    }
+
+    #[test]
+    fn empty_response_quality_event_is_terminal_no_reply_completion() {
+        let completion = terminal_completion_from_quality_event(quality_completion_row(
+            "turn_error",
+            Some("empty_response"),
+        ))
+        .expect("empty_response should be accepted");
+
+        assert_eq!(
+            completion.evidence,
+            AgentTurnCompletionEvidence::TerminalTurn
+        );
+        assert_eq!(
+            completion.terminal_status.as_deref(),
+            Some("empty_response")
+        );
+    }
+
+    #[test]
+    fn timeout_result_preserves_started_thread_metadata_for_teardown_fallback() {
+        let run = running_run_with_result(json!({
+            "channel_id": "200",
+            "parent_channel_id": "100",
+            "discord_thread_id": "200"
+        }));
+
+        let result = merge_pending_result(&run, "timeout", Some("timed out"), None);
+
+        assert_eq!(result.get("channel_id"), Some(&json!("200")));
+        assert_eq!(result.get("parent_channel_id"), Some(&json!("100")));
+        assert_eq!(result.get("discord_thread_id"), Some(&json!("200")));
     }
 
     #[test]

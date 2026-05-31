@@ -15,6 +15,13 @@ path = "src/main.rs"
 [features]
 legacy-sqlite-tests = ["dep:sqlite_test"]
 
+[lints.clippy]
+# #2954 stage-1 hard gates. Full `-D warnings` is tracked separately because
+# the current tree still has existing clippy/rustc warning debt.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [dependencies]
 # HTTP server
 axum = { version = "0.8", features = ["ws", "macros"] }
@@ -107,3 +114,9 @@ tower = { version = "0.5", features = ["util"] }
 opt-level = "z"
 lto = true
 strip = true
+
+[profile.release-fast]
+inherits = "release"
+opt-level = 1
+lto = false
+strip = false

@@ -1318,11 +1318,16 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         commands::cmd_stop(),
         commands::cmd_down(),
         commands::cmd_shell(),
+        commands::cmd_skill(),
         commands::cmd_cc(),
         commands::cmd_metrics(),
         commands::cmd_model(),
         commands::cmd_fast(),
         commands::cmd_goals(),
+        commands::cmd_effort(),
+        commands::cmd_compact(),
+        commands::cmd_cost(),
+        commands::cmd_context(),
         commands::cmd_adk(),
         commands::cmd_voice(),
         commands::cmd_vc_join(),
@@ -1339,6 +1344,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         commands::cmd_allowall(),
         commands::cmd_adduser(),
         commands::cmd_removeuser(),
+        commands::cmd_usage(),
         commands::cmd_receipt(),
         commands::cmd_help(),
         commands::cmd_meeting(),
@@ -1456,11 +1462,18 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                                 {
                                     continue;
                                 }
-                                let queue_count = mailbox_restart_drain_all(
+                                let drain = mailbox_restart_drain_all(
                                     &shared_for_deferred,
                                     &provider_for_deferred,
                                 )
                                 .await;
+                                let queue_count = drain.queued_count;
+                                if !drain.persistence_errors.is_empty() {
+                                    tracing::error!(
+                                        failures = drain.persistence_errors.len(),
+                                        "restart_pending quick exit continuing after pending-queue persistence failure(s)"
+                                    );
+                                }
                                 let ids: std::collections::HashMap<u64, u64> = shared_for_deferred
                                     .last_message_ids
                                     .iter()
@@ -1519,11 +1532,18 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                             && g_finalizing == 0
                             && shared_for_deferred.restart_pending.load(Ordering::Relaxed)
                         {
-                            let queue_count = mailbox_restart_drain_all(
+                            let drain = mailbox_restart_drain_all(
                                 &shared_for_deferred,
                                 &provider_for_deferred,
                             )
                             .await;
+                            let queue_count = drain.queued_count;
+                            if !drain.persistence_errors.is_empty() {
+                                tracing::error!(
+                                    failures = drain.persistence_errors.len(),
+                                    "deferred restart observed pending-queue persistence failure(s)"
+                                );
+                            }
                             if queue_count > 0 {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 tracing::info!(
@@ -2166,8 +2186,15 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                             .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
 
-                    let queue_count =
+                    let drain =
                         mailbox_restart_drain_all(&shared_for_lease, &provider_for_lease).await;
+                    let queue_count = drain.queued_count;
+                    if !drain.persistence_errors.is_empty() {
+                        tracing::error!(
+                            failures = drain.persistence_errors.len(),
+                            "gateway lease self-fence observed pending-queue persistence failure(s)"
+                        );
+                    }
                     if queue_count > 0 {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!(
@@ -2221,8 +2248,15 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 // Save pending queues and last_message_ids FIRST, before any
                 // network calls that might block/timeout and prevent saving.
 
-                let queue_count =
+                let drain =
                     mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
+                let queue_count = drain.queued_count;
+                if !drain.persistence_errors.is_empty() {
+                    tracing::error!(
+                        failures = drain.persistence_errors.len(),
+                        "SIGTERM initial drain observed pending-queue persistence failure(s)"
+                    );
+                }
                 if queue_count > 0 {
                     let ts3 = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!(
@@ -2267,8 +2301,15 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
                 // finished and mutated queues/last_message_ids. Re-save to capture
                 // any changes that occurred after the initial save.
                 {
-                    let queue_count =
+                    let drain =
                         mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
+                    let queue_count = drain.queued_count;
+                    if !drain.persistence_errors.is_empty() {
+                        tracing::error!(
+                            failures = drain.persistence_errors.len(),
+                            "SIGTERM final drain observed pending-queue persistence failure(s)"
+                        );
+                    }
                     if queue_count > 0 {
                         let ts4 = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!(
@@ -2418,18 +2459,155 @@ async fn audit_or_prune_global_slash_commands(
 
 /// Periodic GC: delete stale idle/disconnected thread sessions from DB.
 async fn gc_stale_thread_sessions(shared: &Arc<SharedData>) {
-    match shared.pg_pool.as_ref() {
-        Some(pool) => {
-            let gc = crate::db::dispatched_sessions::gc_stale_thread_sessions_pg(pool).await;
-            if gc > 0 {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!("  [{ts}] 🧹 GC: removed {gc} stale thread session(s) from DB");
+    let Some(pool) = shared.pg_pool.as_ref() else {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!("  [{ts}] ⚠ Thread session GC skipped: postgres pool unavailable");
+        return;
+    };
+    let deleted_keys = crate::db::dispatched_sessions::gc_stale_thread_sessions_pg(pool).await;
+    if deleted_keys.is_empty() {
+        return;
+    }
+    // Option A: kill the orphan thread tmux sessions whose DB rows we just
+    // removed. Their inner CLI commonly stays at an interactive prompt (pane
+    // never dies), so the dead-pane reaper skips them, and with the row gone
+    // the 8h idle-kill policy can never reach them either — they would leak
+    // forever. The effective grace becomes the GC TTL (1h no-dispatch / 3h).
+    let killed = reap_orphan_thread_tmux(&deleted_keys).await;
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] 🧹 GC: removed {} stale thread session(s) from DB, killed {} orphan tmux",
+        deleted_keys.len(),
+        killed
+    );
+}
+
+/// Kill the tmux sessions whose stale thread rows were just GC'd. Only touches
+/// sessions this runtime owns (owner marker) and that still exist locally, so a
+/// co-located dev/release instance can't kill the other's sessions.
+async fn reap_orphan_thread_tmux(deleted_keys: &[String]) -> usize {
+    #[cfg(unix)]
+    {
+        let marker = crate::services::tmux_common::current_tmux_owner_marker();
+        let keys = deleted_keys.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut killed = 0usize;
+            for key in &keys {
+                let Some(tmux_name) = deleted_thread_tmux_reap_candidate(
+                    key,
+                    &marker,
+                    super::tmux::session_belongs_to_current_runtime,
+                    crate::services::platform::tmux::has_session,
+                ) else {
+                    continue;
+                };
+                if crate::services::platform::tmux::kill_session(
+                    tmux_name,
+                    "stale thread session GC — DB row removed",
+                ) {
+                    killed += 1;
+                }
             }
-        }
-        None => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!("  [{ts}] ⚠ Thread session GC skipped: postgres pool unavailable");
-        }
+            killed
+        })
+        .await
+        .unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = deleted_keys;
+        0
+    }
+}
+
+#[cfg(unix)]
+fn deleted_thread_tmux_reap_candidate<'a>(
+    session_key: &'a str,
+    current_owner_marker: &str,
+    belongs_to_current_runtime: impl Fn(&str, &str) -> bool,
+    has_session: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    // session_key format is `hostname:tmux_name`.
+    let (_, tmux_name) = session_key.split_once(':')?;
+    let (_, channel_name) =
+        crate::services::provider::parse_provider_and_channel_from_tmux_name(tmux_name)?;
+    super::adk_session::parse_thread_channel_id_from_name(&channel_name)?;
+    if !belongs_to_current_runtime(tmux_name, current_owner_marker) {
+        return None;
+    }
+    if !has_session(tmux_name) {
+        return None;
+    }
+    Some(tmux_name)
+}
+
+#[cfg(all(test, unix))]
+mod thread_session_gc_tests {
+    use super::deleted_thread_tmux_reap_candidate;
+    use std::collections::HashSet;
+
+    #[test]
+    fn thread_gc_reap_candidate_requires_thread_owner_marker_and_existing_tmux() {
+        let marker = "runtime-a";
+        let owned_thread = "AgentDesk-codex-adk-cdx-t1500628371829428350";
+        let foreign_thread = "AgentDesk-codex-adk-cdx-t1500628371829428351";
+        let main_channel = "AgentDesk-codex-adk-cdx";
+        let missing_thread = "AgentDesk-codex-adk-cdx-t1500628371829428352";
+        let existing: HashSet<&str> = [owned_thread, foreign_thread, main_channel].into();
+        let owned: HashSet<&str> = [owned_thread, main_channel].into();
+
+        let belongs_to_current_runtime =
+            |name: &str, owner_marker: &str| owner_marker == marker && owned.contains(name);
+        let has_session = |name: &str| existing.contains(name);
+
+        assert_eq!(
+            deleted_thread_tmux_reap_candidate(
+                &format!("host:{owned_thread}"),
+                marker,
+                &belongs_to_current_runtime,
+                &has_session,
+            ),
+            Some(owned_thread)
+        );
+        assert_eq!(
+            deleted_thread_tmux_reap_candidate(
+                &format!("host:{foreign_thread}"),
+                marker,
+                &belongs_to_current_runtime,
+                &has_session,
+            ),
+            None,
+            "foreign owner marker must prevent killing another runtime's thread tmux"
+        );
+        assert_eq!(
+            deleted_thread_tmux_reap_candidate(
+                &format!("host:{main_channel}"),
+                marker,
+                &belongs_to_current_runtime,
+                &has_session,
+            ),
+            None,
+            "thread GC must not kill fixed-channel tmux names"
+        );
+        assert_eq!(
+            deleted_thread_tmux_reap_candidate(
+                &format!("host:{missing_thread}"),
+                marker,
+                &belongs_to_current_runtime,
+                &has_session,
+            ),
+            None,
+            "missing local tmux session is not a reap target"
+        );
+        assert_eq!(
+            deleted_thread_tmux_reap_candidate(
+                "malformed-session-key",
+                marker,
+                &belongs_to_current_runtime,
+                &has_session,
+            ),
+            None
+        );
     }
 }
 
@@ -2819,6 +2997,7 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: true,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         };
 
@@ -3264,6 +3443,7 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: true,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         }
     }

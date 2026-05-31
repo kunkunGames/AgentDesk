@@ -716,11 +716,13 @@ fn format_gemini_session_report(
     lines.join("\n")
 }
 
-/// /metrics — Show turn metrics summary
+/// /metrics — Show local turn metrics summary
 #[poise::command(slash_command, rename = "metrics")]
 pub(in crate::services::discord) async fn cmd_metrics(
     ctx: Context<'_>,
-    #[description = "Date (YYYY-MM-DD), default today"] date: Option<String>,
+    #[description = "Date (YYYY-MM-DD), default today, for local turn metrics"] date: Option<
+        String,
+    >,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let user_name = &ctx.author().name;
@@ -1077,6 +1079,7 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         }
     }

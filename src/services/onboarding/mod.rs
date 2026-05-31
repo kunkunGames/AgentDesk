@@ -48,6 +48,7 @@ const MAX_ONBOARDING_DRAFT_AGENTS: usize = 64;
 const MAX_ONBOARDING_DRAFT_CHANNEL_ASSIGNMENTS: usize = 64;
 const MAX_ONBOARDING_DRAFT_PROVIDER_STATUSES: usize = 8;
 const MAX_ONBOARDING_DRAFT_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
+const ONBOARDING_NEW_AGENT_STATUS: &str = "idle";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -1402,12 +1403,49 @@ fn write_credential_token(
     let path = crate::runtime_layout::credential_token_path(runtime_root, bot_name);
 
     match token.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => std::fs::write(path, format!("{value}\n")).map_err(|e| e.to_string()),
+        Some(value) => crate::utils::secret_file::write_secret_file(&path, format!("{value}\n"))
+            .map_err(|e| e.to_string()),
         None => {
             if path.exists() {
                 std::fs::remove_file(path).map_err(|e| e.to_string())?;
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_token_permission_tests {
+    use super::*;
+
+    #[test]
+    fn write_credential_token_creates_owner_only_secret_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(crate::runtime_layout::config_dir(root)).unwrap();
+
+        write_credential_token(root, "announce", Some("announce-token")).unwrap();
+
+        let token_path = crate::runtime_layout::credential_token_path(root, "announce");
+        assert_eq!(
+            std::fs::read_to_string(&token_path).unwrap(),
+            "announce-token\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let credential_dir_mode =
+                std::fs::metadata(crate::runtime_layout::credential_dir(root))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+            let token_mode = std::fs::metadata(&token_path).unwrap().permissions().mode() & 0o777;
+
+            assert_eq!(credential_dir_mode, 0o700);
+            assert_eq!(token_mode, 0o600);
         }
     }
 }
@@ -2559,7 +2597,7 @@ async fn persist_onboarding_pg(
     for mapping in resolved_channels {
         sqlx::query(
             "INSERT INTO agents (id, name, provider, discord_channel_id, description, system_prompt, status, xp)
-             VALUES ($1, $2, $3, $4, $5, $6, 'active', 0)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 0)
              ON CONFLICT (id) DO UPDATE SET
                name = COALESCE(EXCLUDED.name, agents.name),
                provider = COALESCE(EXCLUDED.provider, agents.provider),
@@ -2574,6 +2612,7 @@ async fn persist_onboarding_pg(
         .bind(&mapping.channel_id)
         .bind(&mapping.description)
         .bind(&mapping.system_prompt)
+        .bind(ONBOARDING_NEW_AGENT_STATUS)
         .execute(&mut *tx)
         .await
         .map_err(|error| format!("failed to upsert postgres agent {}: {error}", mapping.role_id))?;
@@ -3433,7 +3472,7 @@ async fn complete_with_options(
             for mapping in &resolved_channels {
                 if let Err(error) = tx.execute(
             "INSERT INTO agents (id, name, provider, discord_channel_id, description, system_prompt, status, xp) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) \
              ON CONFLICT(id) DO UPDATE SET \
                name = COALESCE(excluded.name, agents.name), \
                provider = COALESCE(excluded.provider, agents.provider), \
@@ -3446,7 +3485,8 @@ async fn complete_with_options(
                 provider,
                 mapping.channel_id,
                 mapping.description,
-                mapping.system_prompt
+                mapping.system_prompt,
+                ONBOARDING_NEW_AGENT_STATUS
             ],
         ) {
             completion_state.last_error =
@@ -3688,6 +3728,23 @@ async fn complete_with_options(
         Vec::new(),
         extra,
     )
+}
+
+#[cfg(test)]
+mod canonical_status_tests {
+    use super::*;
+
+    #[test]
+    fn new_agents_start_with_core_canonical_idle_status() {
+        let migration =
+            include_str!("../../../migrations/postgres/0068_core_status_constraints.sql");
+
+        assert_eq!(ONBOARDING_NEW_AGENT_STATUS, "idle");
+        assert!(
+            migration.contains("status IN ('idle', 'working', 'archived')"),
+            "onboarding must use a status allowed by agents_status_known_check"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
@@ -4112,6 +4169,26 @@ mod tests {
                 .unwrap(),
             "notify-token\n"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let credential_dir_mode =
+                std::fs::metadata(crate::runtime_layout::credential_dir(root))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+            let announce_mode = std::fs::metadata(crate::runtime_layout::credential_token_path(
+                root, "announce",
+            ))
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777;
+            assert_eq!(credential_dir_mode, 0o700);
+            assert_eq!(announce_mode, 0o600);
+        }
         assert!(
             std::fs::symlink_metadata(crate::runtime_layout::legacy_credential_dir(root))
                 .unwrap()
@@ -4318,14 +4395,15 @@ mod tests {
         );
 
         let conn = db.read_conn().unwrap();
-        let stored_channel: String = conn
+        let (stored_channel, stored_status): (String, String) = conn
             .query_row(
-                "SELECT discord_channel_id FROM agents WHERE id = 'adk-cdx'",
+                "SELECT discord_channel_id, status FROM agents WHERE id = 'adk-cdx'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(stored_channel, "1001");
+        assert_eq!(stored_status, "idle");
     }
 
     #[tokio::test]
@@ -4713,7 +4791,7 @@ mod tests {
             let conn = db.lock().unwrap();
             conn.execute(
                 "INSERT INTO agents (id, name, provider, discord_channel_id, description, system_prompt, status, xp) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'idle', 0)",
                 sqlite_test::params![
                     "adk-cdx",
                     "adk-cdx",

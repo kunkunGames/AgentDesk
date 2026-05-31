@@ -14,7 +14,18 @@ steps:
   - send_prompt: "응답에 정확히 한 줄로 [E2E:E8:POST] 만 출력해줘."
   - wait_for_discord_text: "[E2E:E8:POST]"
     timeout_s: 240
+  - wait_idle_s: 5
+  - assert_health:
+      forbid_degraded_reasons:
+        - global_active_counter_out_of_bounds
+      global_active_max: 0
+      global_finalizing_max: 0
 assertions:
+  - raw_message_count_between_markers:
+      min: 2
+      max: 36
+  - relay_latency_within:
+      max_seconds: 300
   - no_duplicate_content: true
   - text_present: "[E2E:E8:POST]"
   - no_resume_prompt_chrome: true

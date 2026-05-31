@@ -19,6 +19,10 @@ const STREAMING_PLACEHOLDER_MARGIN: usize = 10;
 const UTF8_ELLIPSIS_EXTRA_BYTES: usize = "…".len().saturating_sub(1);
 const THINKING_STATUS_MAX_BYTES: usize = 600;
 const TOOL_STATUS_MAX_BYTES: usize = 300;
+/// Invisible marker appended to newly-rendered placeholder cards so probes can
+/// distinguish status surfaces from delivered answers that happen to start
+/// with the same handoff header text.
+pub(super) const PLACEHOLDER_PROBE_MARKER: &str = "\u{2063}\u{2062}\u{2063}\u{2062}";
 
 static REPLACE_CONTINUATION_ROLLBACKS: LazyLock<
     Mutex<HashMap<(u64, u64), ReplaceContinuationRollback>>,
@@ -2542,6 +2546,50 @@ pub(super) async fn send_long_message_ctx(ctx: Context<'_>, text: &str) -> Resul
     Ok(())
 }
 
+pub(in crate::services::discord) fn long_message_reply_builders(
+    text: &str,
+) -> Vec<poise::CreateReply> {
+    if text.len() <= DISCORD_MSG_LIMIT {
+        return vec![poise::CreateReply::default().content(text.to_string())];
+    }
+
+    split_message(text)
+        .into_iter()
+        .map(|chunk| poise::CreateReply::default().content(chunk))
+        .collect()
+}
+
+/// Send a long command response through poise's reply abstraction.
+///
+/// In slash-command contexts, poise maps the first call to an interaction
+/// response and later calls to interaction followups. That avoids direct
+/// channel sends from slash command handlers while preserving chunking.
+pub(in crate::services::discord) async fn send_long_message_reply_ctx(
+    ctx: Context<'_>,
+    text: &str,
+) -> Result<(), Error> {
+    let replies = long_message_reply_builders(text);
+    let total = replies.len();
+
+    for (i, reply) in replies.into_iter().enumerate() {
+        let byte_len = reply.content.as_ref().map_or(0, String::len);
+        tracing::debug!(
+            target: "discord::chunker",
+            path = "send_long_message_reply_ctx",
+            chunk_index = i,
+            byte_len,
+            total_chunks = total,
+            "discord command reply chunk"
+        );
+        if i > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        ctx.send(reply).await?;
+    }
+
+    Ok(())
+}
+
 /// Send a long message using raw HTTP, splitting if necessary
 pub(super) async fn send_long_message_raw(
     http: &serenity::Http,
@@ -2665,6 +2713,207 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference(
     }
 
     Ok(())
+}
+
+pub(super) async fn send_long_message_raw_with_rollback(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    rollback_anchor_msg_id: MessageId,
+    text: &str,
+    shared: &Arc<SharedData>,
+) -> Result<Vec<MessageId>, Error> {
+    let payload_byte_len = text.len();
+    let chunks = split_message(text);
+    let total = chunks.len();
+    let rollback_key = replace_continuation_rollback_key(channel_id, rollback_anchor_msg_id);
+
+    match claim_replace_continuation_rollback(rollback_key) {
+        ReplaceContinuationRollbackClaim::None => {}
+        ReplaceContinuationRollbackClaim::InProgress(pending_ids) => {
+            return Err(format!(
+                "previous chunk cleanup in progress for anchor {} in channel {}: {:?}",
+                rollback_anchor_msg_id.get(),
+                channel_id.get(),
+                pending_ids
+            )
+            .into());
+        }
+        ReplaceContinuationRollbackClaim::Owner(pending_ids) => {
+            let cleanup =
+                cleanup_replace_continuations_after_failure(http, channel_id, &pending_ids, shared)
+                    .await;
+            if cleanup.failed_message_ids.is_empty() {
+                if let Err(error) = clear_replace_continuation_rollback(rollback_key) {
+                    unclaim_replace_continuation_rollback(rollback_key);
+                    return Err(format!(
+                        "previous chunk rollback state was not cleared for anchor {} in channel {}: {error}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get()
+                    )
+                    .into());
+                }
+            } else {
+                if let Err(error) = record_replace_continuation_rollback(
+                    rollback_key,
+                    cleanup.failed_message_ids.clone(),
+                ) {
+                    record_replace_continuation_rollback_memory_only(
+                        rollback_key,
+                        cleanup.failed_message_ids,
+                    );
+                    return Err(format!(
+                        "previous chunk cleanup incomplete and rollback state was not durable for anchor {} in channel {}: {error}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get()
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "previous chunk cleanup incomplete for anchor {} in channel {}: {:?}",
+                    rollback_anchor_msg_id.get(),
+                    channel_id.get(),
+                    cleanup.errors
+                )
+                .into());
+            }
+        }
+    }
+
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    tracing::debug!(
+        target: "discord::chunker",
+        path = "send_long_message_raw_with_rollback",
+        channel_id = channel_id.get(),
+        anchor_message_id = rollback_anchor_msg_id.get(),
+        payload_byte_len,
+        total_chunks = total,
+        "discord rollback send begin"
+    );
+
+    let mut sent_message_ids = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i + 1 == total;
+        tracing::debug!(
+            target: "discord::chunker",
+            path = "send_long_message_raw_with_rollback",
+            channel_id = channel_id.get(),
+            anchor_message_id = rollback_anchor_msg_id.get(),
+            chunk_index = i,
+            byte_len = chunk.len(),
+            total_chunks = total,
+            is_last_chunk = is_last,
+            "discord rollback send chunk"
+        );
+        rate_limit_wait(shared, channel_id).await;
+        match super::http::send_channel_message(http, channel_id, chunk).await {
+            Ok(message) => {
+                sent_message_ids.push(message.id.get());
+                if let Err(error) =
+                    record_replace_continuation_rollback(rollback_key, sent_message_ids.clone())
+                {
+                    let cleanup = cleanup_replace_continuations_after_failure(
+                        http,
+                        channel_id,
+                        &sent_message_ids,
+                        shared,
+                    )
+                    .await;
+                    let mut errors = cleanup.errors;
+                    errors.push(error.clone());
+                    if cleanup.failed_message_ids.is_empty() {
+                        if let Err(clear_error) = clear_replace_continuation_rollback(rollback_key)
+                        {
+                            errors.push(clear_error);
+                        }
+                    } else if let Err(record_error) = record_replace_continuation_rollback(
+                        rollback_key,
+                        cleanup.failed_message_ids.clone(),
+                    ) {
+                        record_replace_continuation_rollback_memory_only(
+                            rollback_key,
+                            cleanup.failed_message_ids,
+                        );
+                        errors.push(record_error);
+                    }
+                    return Err(format!(
+                        "sent chunk but rollback state was not durable for anchor {} in channel {}: {}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get(),
+                        errors.join("; ")
+                    )
+                    .into());
+                }
+            }
+            Err(err) => {
+                let error = err.to_string();
+                tracing::warn!(
+                    target: "discord::chunker",
+                    path = "send_long_message_raw_with_rollback",
+                    channel_id = channel_id.get(),
+                    anchor_message_id = rollback_anchor_msg_id.get(),
+                    chunk_index = i,
+                    total_chunks = total,
+                    last_chunk = is_last,
+                    outcome = "err",
+                    error = %error,
+                    "discord rollback send failed; deleting sent chunks before retry"
+                );
+                let cleanup = cleanup_replace_continuations_after_failure(
+                    http,
+                    channel_id,
+                    &sent_message_ids,
+                    shared,
+                )
+                .await;
+                if cleanup.failed_message_ids.is_empty() {
+                    if let Err(clear_error) = clear_replace_continuation_rollback(rollback_key) {
+                        unclaim_replace_continuation_rollback(rollback_key);
+                        return Err(format!(
+                            "send chunk {i}/{total} failed for anchor {} in channel {}, and rollback state was not cleared: {error}; {clear_error}",
+                            rollback_anchor_msg_id.get(),
+                            channel_id.get()
+                        )
+                        .into());
+                    }
+                } else if let Err(record_error) = record_replace_continuation_rollback(
+                    rollback_key,
+                    cleanup.failed_message_ids.clone(),
+                ) {
+                    record_replace_continuation_rollback_memory_only(
+                        rollback_key,
+                        cleanup.failed_message_ids,
+                    );
+                    return Err(format!(
+                        "send chunk {i}/{total} failed for anchor {} in channel {}, cleanup incomplete and rollback state was not durable: {error}; {record_error}",
+                        rollback_anchor_msg_id.get(),
+                        channel_id.get()
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "send chunk {i}/{total} failed for anchor {} in channel {}; sent chunks cleaned before retry: {error}",
+                    rollback_anchor_msg_id.get(),
+                    channel_id.get()
+                )
+                .into());
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
+    if let Err(error) = clear_replace_continuation_rollback(rollback_key) {
+        return Err(format!(
+            "delivered chunks for anchor {} in channel {}, but rollback state was not cleared: {error}",
+            rollback_anchor_msg_id.get(),
+            channel_id.get()
+        )
+        .into());
+    }
+
+    Ok(sent_message_ids.into_iter().map(MessageId::new).collect())
 }
 
 async fn send_channel_message_with_optional_reference(
@@ -2855,7 +3104,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
             "discord first-chunk edit failed; falling back to send_long_message_raw (issue #1043)"
         );
         let edit_error = e.to_string();
-        send_long_message_raw(http, channel_id, text, shared).await?;
+        send_long_message_raw_with_rollback(http, channel_id, message_id, text, shared).await?;
         return Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error });
     }
 
@@ -4054,6 +4303,7 @@ pub(super) fn build_monitor_handoff_placeholder_with_live_events(
     if matches!(status, MonitorHandoffStatus::Active) {
         lines.push(monitor_handoff_active_tail(started_at_unix));
     }
+    lines.push(PLACEHOLDER_PROBE_MARKER.to_string());
 
     lines.join("\n")
 }

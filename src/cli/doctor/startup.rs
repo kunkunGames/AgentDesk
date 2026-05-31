@@ -46,10 +46,21 @@ pub(crate) fn latest_startup_artifact_path() -> Option<PathBuf> {
     Some(root.join(format!("{boot_id}.json")))
 }
 
+pub(crate) fn latest_startup_artifact_lock_path() -> Option<PathBuf> {
+    let root = startup_artifact_root()?;
+    let boot_id = current_boot_id().ok()?;
+    Some(root.join(format!("{boot_id}.lock")))
+}
+
 enum LatestStartupDoctorArtifact {
     Available {
         path: PathBuf,
         report: Value,
+    },
+    Pending {
+        path: Option<PathBuf>,
+        lock_path: Option<PathBuf>,
+        reason: &'static str,
     },
     Missing {
         path: Option<PathBuf>,
@@ -71,6 +82,14 @@ fn load_latest_startup_doctor_artifact() -> LatestStartupDoctorArtifact {
     };
 
     if !path.exists() {
+        let lock_path = latest_startup_artifact_lock_path();
+        if lock_path.as_ref().is_some_and(|path| path.exists()) {
+            return LatestStartupDoctorArtifact::Pending {
+                path: Some(path),
+                lock_path,
+                reason: "startup_doctor_artifact_in_progress",
+            };
+        }
         return LatestStartupDoctorArtifact::Missing {
             path: Some(path),
             reason: "startup_doctor_artifact_missing",
@@ -140,6 +159,49 @@ fn filtered_checks(report: &Value, status: &str) -> Value {
         .unwrap_or_else(|| Value::Array(Vec::new()))
 }
 
+pub(crate) fn is_provider_deferred_hooks_backlog_reason(raw: &str) -> bool {
+    let parts: Vec<&str> = raw.split(':').collect();
+    matches!(
+        parts.as_slice(),
+        ["provider", _, "deferred_hooks_backlog", count] if count.parse::<u64>().unwrap_or(0) > 0
+    )
+}
+
+fn check_only_reports_provider_deferred_hooks_backlog(check: &Value) -> bool {
+    let Some(reasons) = check
+        .get("evidence")
+        .and_then(|evidence| evidence.get("degraded_reasons"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    !reasons.is_empty()
+        && reasons.iter().all(|reason| {
+            reason
+                .get("raw")
+                .and_then(Value::as_str)
+                .is_some_and(is_provider_deferred_hooks_backlog_reason)
+        })
+}
+
+fn effective_count_checks_with_status(
+    report: &Value,
+    status: &str,
+    suppress_recovered_provider_deferred_hooks_backlog: bool,
+) -> Option<u64> {
+    let checks = report.get("checks").and_then(Value::as_array)?;
+    Some(
+        checks
+            .iter()
+            .filter(|check| check.get("status").and_then(Value::as_str) == Some(status))
+            .filter(|check| {
+                !suppress_recovered_provider_deferred_hooks_backlog
+                    || !check_only_reports_provider_deferred_hooks_backlog(check)
+            })
+            .count() as u64,
+    )
+}
+
 fn startup_doctor_status(failed_count: u64, warned_count: u64) -> &'static str {
     if failed_count > 0 {
         "failed"
@@ -195,21 +257,33 @@ fn startup_doctor_summary_json(path: &PathBuf, report: &Value, detailed: bool) -
     summary
 }
 
-/// #2049 Finding 4: Surface failed/warned counts from the latest startup
-/// doctor artifact so `/api/health` can worsen `status` + `degraded_reasons`
-/// when boot-time checks regressed. Returns `(failed_count, warned_count)`;
-/// missing/error artifacts return `(0, 0)` so the doctor signal cannot mask
-/// other degradation signals via false positives.
-pub(crate) fn latest_startup_doctor_counts() -> (u64, u64) {
+/// Counts startup doctor checks that should still worsen live `/api/health`.
+/// A provider deferred-hook backlog found during startup is transient if the
+/// current live provider snapshot has already drained it; keep the artifact
+/// visible, but do not let that recovered boot-time check latch top-level
+/// health forever.
+pub(crate) fn latest_startup_doctor_effective_counts(
+    suppress_recovered_provider_deferred_hooks_backlog: bool,
+) -> (u64, u64) {
     match load_latest_startup_doctor_artifact() {
         LatestStartupDoctorArtifact::Available { report, .. } => {
-            let failed = summary_count(&report, "failed", "fail");
-            let warned = summary_count(&report, "warned", "warn");
+            let failed = effective_count_checks_with_status(
+                &report,
+                "fail",
+                suppress_recovered_provider_deferred_hooks_backlog,
+            )
+            .unwrap_or_else(|| summary_count(&report, "failed", "fail"));
+            let warned = effective_count_checks_with_status(
+                &report,
+                "warn",
+                suppress_recovered_provider_deferred_hooks_backlog,
+            )
+            .unwrap_or_else(|| summary_count(&report, "warned", "warn"));
             (failed, warned)
         }
-        LatestStartupDoctorArtifact::Missing { .. } | LatestStartupDoctorArtifact::Error { .. } => {
-            (0, 0)
-        }
+        LatestStartupDoctorArtifact::Pending { .. }
+        | LatestStartupDoctorArtifact::Missing { .. }
+        | LatestStartupDoctorArtifact::Error { .. } => (0, 0),
     }
 }
 
@@ -217,6 +291,27 @@ pub(crate) fn latest_startup_doctor_health_json(detailed: bool) -> Value {
     match load_latest_startup_doctor_artifact() {
         LatestStartupDoctorArtifact::Available { path, report } => {
             startup_doctor_summary_json(&path, &report, detailed)
+        }
+        LatestStartupDoctorArtifact::Pending {
+            path,
+            lock_path,
+            reason,
+        } => {
+            let mut summary = json!({
+                "available": false,
+                "doctor_status": "pending",
+                "summary": Value::Null,
+                "failed_count": 0,
+                "warned_count": 0,
+                "detail_endpoint": LATEST_STARTUP_DOCTOR_ENDPOINT,
+                "reason": reason,
+                "artifact_path": if detailed { path_json(path.as_ref()) } else { Value::Null },
+            });
+            if detailed {
+                summary["lock_path"] = path_json(lock_path.as_ref());
+                summary["followup_context"] = json!(followup_context());
+            }
+            summary
         }
         LatestStartupDoctorArtifact::Missing { path, reason } => json!({
             "available": false,
@@ -256,6 +351,20 @@ pub(crate) fn latest_startup_doctor_response_json() -> Value {
             "followup_context": followup_context(),
             "summary": report.get("summary").cloned().unwrap_or(Value::Null),
             "artifact": report,
+        }),
+        LatestStartupDoctorArtifact::Pending {
+            path,
+            lock_path,
+            reason,
+        } => json!({
+            "ok": true,
+            "available": false,
+            "artifact_path": path_json(path.as_ref()),
+            "lock_path": path_json(lock_path.as_ref()),
+            "detail_source": "startup_doctor_artifact",
+            "followup_context": followup_context(),
+            "reason": reason,
+            "artifact": Value::Null,
         }),
         LatestStartupDoctorArtifact::Missing { path, reason } => json!({
             "ok": true,

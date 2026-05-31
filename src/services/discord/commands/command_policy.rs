@@ -64,15 +64,15 @@ pub(in crate::services::discord) fn command_risk(cmd: &str, _arg1: &str) -> Comm
     match cmd {
         // Pure inspection.
         "!help" | "!pwd" | "!health" | "!status" | "!inflight" | "!queue" | "!metrics"
-        | "!allowedtools" | "!sessions" | "!receipt" => CommandRisk::ReadOnly,
+        | "!allowedtools" | "!sessions" | "!receipt" | "!usage" => CommandRisk::ReadOnly,
 
         // Session-shaping. All scoped to the current channel: `!clear` /
         // `!deletesession` reset that channel's conversation memory; `!stop`
         // cancels its in-flight turn; `!restart` kills+respawns its tmux
         // session; `!debug` toggles the global debug-logging atomic but the
         // operator trusts every authorized user with that switch.
-        "!start" | "!down" | "!cc" | "!meeting" | "!model" | "!fast" | "!goals" | "!clear"
-        | "!deletesession" | "!stop" | "!restart" | "!debug" => CommandRisk::Mutating,
+        "!start" | "!down" | "!cc" | "!skill" | "!meeting" | "!model" | "!fast" | "!goals"
+        | "!clear" | "!deletesession" | "!stop" | "!restart" | "!debug" => CommandRisk::Mutating,
 
         // Shell execution and tool allowlist mutation — equivalent to RCE.
         // Issue #2653 recovery commands also run curated bash pipelines
@@ -165,11 +165,14 @@ pub(in crate::services::discord) fn slash_command_risk(slash_cmd: &str) -> Comma
     match slash_cmd {
         // Inspection only.
         "/help" | "/pwd" | "/health" | "/status" | "/inflight" | "/queue" | "/metrics"
-        | "/allowedtools" | "/sessions" | "/receipt" | "/adk" => CommandRisk::ReadOnly,
+        | "/allowedtools" | "/sessions" | "/receipt" | "/usage" | "/adk" | "/cost" | "/context" => {
+            CommandRisk::ReadOnly
+        }
 
         // Per-channel session shaping (mirrors text-command tiers).
-        "/start" | "/down" | "/cc" | "/meeting" | "/model" | "/fast" | "/goals" | "/clear"
-        | "/deletesession" | "/stop" | "/restart" | "/debug" => CommandRisk::Mutating,
+        "/start" | "/down" | "/cc" | "/skill" | "/meeting" | "/model" | "/fast" | "/goals"
+        | "/effort" | "/compact" | "/clear" | "/deletesession" | "/stop" | "/restart"
+        | "/debug" => CommandRisk::Mutating,
 
         // RCE-equivalent surface.
         // `/deadlock-recover`, `/machine-flip`, and `/stuck-pr-rebase` (issue
@@ -196,8 +199,9 @@ pub(in crate::services::discord) fn risk_tier_summary_for_help(high_risk_enabled
     };
     format!(
         "**Command Risk Tiers** (issue #1005)\n\
-         `read-only` — help/status/metrics/allowedtools: any authorized user\n\
-         `mutating` — start/down/cc/meeting/model/clear/deletesession/stop/restart/debug: any authorized user\n\
+         `read-only` — help/status/usage/receipt/metrics/allowedtools: any authorized user\n\
+         `mutating` — start/down/skill(/cc)/meeting/model/fast/goals/effort/compact/clear/deletesession/stop/restart/debug: any authorized user\n\
+         `read-only (Claude native)` — cost/context: any authorized user\n\
          `shell/tool-grant` — shell/allowed: {shell_state}\n\
          `credential/system` — allowall/adduser/removeuser/escalation: owner-only"
     )
@@ -273,6 +277,12 @@ mod tests {
         assert_eq!(command_risk("!start", "."), CommandRisk::Mutating);
         assert_eq!(command_risk("!down", "foo.txt"), CommandRisk::Mutating);
         assert_eq!(command_risk("!cc", "clear"), CommandRisk::Mutating);
+        assert_eq!(command_risk("!skill", "clear"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/skill"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/cost"), CommandRisk::ReadOnly);
+        assert_eq!(slash_command_risk("/context"), CommandRisk::ReadOnly);
+        assert_eq!(slash_command_risk("/effort"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/compact"), CommandRisk::Mutating);
     }
 
     #[test]
@@ -465,6 +475,7 @@ mod tests {
             ("!start", "/start"),
             ("!down", "/down"),
             ("!cc", "/cc"),
+            ("!skill", "/skill"),
             ("!meeting", "/meeting"),
             ("!model", "/model"),
             ("!fast", "/fast"),
@@ -486,6 +497,14 @@ mod tests {
                 "tier mismatch between {text_cmd} and {slash_cmd}",
             );
         }
+    }
+
+    #[test]
+    fn claude_passthrough_slash_commands_use_expected_tiers() {
+        assert_eq!(slash_command_risk("/effort"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/compact"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/cost"), CommandRisk::ReadOnly);
+        assert_eq!(slash_command_risk("/context"), CommandRisk::ReadOnly);
     }
 
     /// Issue #2653: recovery commands run launchctl/ssh/git push pipelines
@@ -530,15 +549,20 @@ mod tests {
         assert_eq!(slash_command_risk(""), CommandRisk::Mutating);
     }
 
-    /// `/cc stop` and `!cc stop` route through the same cancel path as
-    /// `/stop` / `!stop`. After #1190 follow-up `/stop` is `Mutating`, so the
-    /// alias must evaluate as `Mutating` too — otherwise authorized non-owners
-    /// could use `!stop` but not `!cc stop`, which would surprise users.
+    /// `/skill stop`, `/cc stop`, `!skill stop`, and `!cc stop` route through
+    /// the same cancel path as `/stop` / `!stop`. After #1190 follow-up
+    /// `/stop` is `Mutating`, so every alias must evaluate as `Mutating` too —
+    /// otherwise authorized non-owners could use `!stop` but not an alias,
+    /// which would surprise users.
     #[test]
-    fn cc_stop_alias_matches_stop_tier() {
+    fn skill_and_cc_stop_aliases_match_stop_tier() {
         // Same tier as the canonical `!stop` / `/stop` surface.
         assert_eq!(command_risk("!stop", ""), CommandRisk::Mutating);
         assert_eq!(slash_command_risk("/stop"), CommandRisk::Mutating);
+        assert_eq!(command_risk("!skill", "stop"), CommandRisk::Mutating);
+        assert_eq!(command_risk("!cc", "stop"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/skill"), CommandRisk::Mutating);
+        assert_eq!(slash_command_risk("/cc"), CommandRisk::Mutating);
         // Mutating evaluates to Allow for any caller that already passed
         // upstream auth — owner or `allow_all_users`/`allowed_user_ids`.
         assert_eq!(

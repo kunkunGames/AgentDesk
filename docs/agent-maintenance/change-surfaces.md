@@ -32,8 +32,10 @@
 - legacy_modules: none; `src/services/discord/outbound/legacy.rs` was removed
   in #2535.
 - do_not_edit_without_migration_plan:
-  `src/services/discord/formatting.rs::send_long_message_raw` (line 1971,
-  ordered-chunk continuation contract not yet modelled in v3).
+  - `src/services/discord/formatting.rs::send_long_message_raw` (line 1971,
+    ordered-chunk continuation contract not yet modelled in v3).
+  - `src/services/message_outbox.rs` (1137 lines; PG-backed message outbox
+    enqueue/claim/accounting surface — bugfix only until split).
 - active_callsite_coverage: see
   [`discord-outbound-migration.md`](discord-outbound-migration.md) (table is
   the authoritative coverage record).
@@ -120,6 +122,9 @@
   - `src/services/discord/tui_prompt_relay.rs` (1155 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
     outside an extraction plan).
+  - `src/services/codex_tmux_wrapper.rs` (1470 lines; Codex tmux wrapper JSON
+    event parser and relay bridge for native Codex session events — bugfix only
+    outside an extraction plan).
   - `src/services/tui_prompt_dedupe.rs` (1045 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
     outside an extraction plan).
@@ -148,6 +153,12 @@
     hosted-TUI structured turn-state probe — "is the last turn fully over?";
     bugfix only outside a split plan).
   - `src/services/discord/router/message_handler.rs` (7013 lines).
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3810 lines;
+    Discord message intake turn orchestration split from the router message
+    handler; bugfix only outside a further extraction plan).
+  - `src/services/discord/router/message_handler/headless_turn.rs` (1318 lines;
+    headless Discord turn launch/terminal-response path split from the router
+    message handler; bugfix only outside a further extraction plan).
   - `src/services/discord/meeting_orchestrator.rs` (3779 lines).
   - `src/services/discord/turn_bridge/mod.rs` (7062 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1525 lines; provider
@@ -430,13 +441,17 @@ The remaining giant-file modules under `src/services/` not covered above:
 - `src/services/settings.rs` (1015) — settings domain service extracted from
   the route layer in #1519. Keep follow-up changes bugfix-only unless the file
   is split further.
+- `src/services/pipeline_override.rs` (1001) — repo/agent pipeline override
+  persistence and cross-context validation surface. Split focused validation
+  helpers before adding non-bugfix behavior.
 - `src/services/routines/loader.rs` (1753),
   `src/services/routines/store.rs` (2755),
-  `src/services/routines/migrated.rs` (1286), and
-  `src/services/routines/discord_log.rs` (1056); routine loader/store,
-  migrated launchd validation, and Discord logging are the canonical scheduled
-  JS routine surfaces. Further feature work should split focused helper
-  modules before growing these files again.
+  `src/services/routines/migrated.rs` (1286),
+  `src/services/routines/discord_log.rs` (1056), and
+  `src/services/routines/agent_executor.rs` (1024); routine loader/store,
+  migrated launchd validation, Discord logging, and agent execution are the
+  canonical scheduled JS routine surfaces. Further feature work should split
+  focused helper modules before growing these files again.
 - `src/services/platform/shell.rs` (1507) — split owned by #1281
   (GitClient extraction).
 - `src/services/platform/binary_resolver.rs` (1377).

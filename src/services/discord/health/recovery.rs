@@ -1,7 +1,9 @@
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
-use poise::serenity_prelude::ChannelId;
+use poise::serenity_prelude::{self as serenity, ChannelId, MessageId};
 use serde::Serialize;
 
 use crate::services::discord::{self as discord, SharedData};
@@ -32,12 +34,6 @@ pub struct ProviderMailboxState {
     pub has_cancel_token: bool,
     pub queue_depth: usize,
     pub recovery_started: bool,
-}
-
-fn decrement_counter(counter: &AtomicUsize) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        current.checked_sub(1)
-    });
 }
 
 /// Resolve the runtime that owns `channel_id` for `provider`. Channel-aware
@@ -518,7 +514,7 @@ async fn apply_runtime_hard_stop_cleanup(
 ) -> bool {
     if let Some(token) = finish.removed_token.as_ref() {
         token.cancelled.store(true, Ordering::Relaxed);
-        decrement_counter(shared.global_active.as_ref());
+        discord::saturating_decrement_global_active(shared);
     }
 
     discord::clear_watchdog_deadline_override(channel_id.get()).await;
@@ -743,7 +739,7 @@ pub async fn clear_provider_channel_runtime(
             "auto-queue slot clear",
         )
         .await;
-        decrement_counter(shared.global_active.as_ref());
+        discord::saturating_decrement_global_active(&shared);
     }
 
     {
@@ -1227,6 +1223,17 @@ pub(crate) async fn run_stall_watchdog_pass(
                     .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
                 let leak_dispatch_id = leak_inflight.as_ref().and_then(|s| s.dispatch_id.clone());
                 let leak_session_key = leak_inflight.as_ref().and_then(|s| s.session_key.clone());
+                // Only a genuinely unrelayed answer is a leak. A stale-but-
+                // delivered turn — e.g. one whose answer went out as a bridge
+                // fallback message, which advances response_sent_offset to len —
+                // must NOT raise the leaked-answer alarm or trigger recovery.
+                let has_unrelayed_answer = leak_inflight.as_ref().is_some_and(|s| {
+                    leak_recovery_unrelayed_range(&s.full_response, s.response_sent_offset)
+                        .is_some()
+                });
+                if !has_unrelayed_answer {
+                    continue;
+                }
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::warn!(
                     "  [{ts}] 🔎 inflight leak suspected on channel {} (provider={}): completed-stale + healthy watcher; emitting telemetry only",
@@ -1261,6 +1268,13 @@ pub(crate) async fn run_stall_watchdog_pass(
                             .map(|s| s.watcher_owns_live_relay),
                     }),
                 );
+
+                // #2860 delivery-lease consolidation: upgrade detection ->
+                // recovery. Scoped to the watcher-delegated-but-never-relayed
+                // signature and gated on a live-message probe, so it can never
+                // double-deliver (see maybe_recover_completed_stale_leak). The
+                // recovery re-loads its own fresh inflight state.
+                maybe_recover_completed_stale_leak(registry, provider, &shared, channel_id).await;
             }
             continue;
         }
@@ -1338,18 +1352,981 @@ pub fn spawn_stall_watchdog(registry: Arc<HealthRegistry>, provider: ProviderKin
     });
 }
 
+/// #2860 — pure decision: the unrelayed byte range of `full_response` that a
+/// completed-stale leak recovery should deliver. `start` is `response_sent_offset`
+/// snapped down to a UTF-8 char boundary (Korean/multibyte safety) and clamped to
+/// len; `end` is the full length. Returns `None` when nothing is unrelayed
+/// (`start >= len`), making a repeated watchdog pass an idempotent no-op once the
+/// offset has been advanced to len.
+///
+/// `last_watcher_relayed_offset` is deliberately NOT mixed into this range:
+/// it is a tmux output-buffer coordinate, not a `full_response` byte index, so
+/// max()-ing it against `response_sent_offset` could both over- and under-skip.
+/// The authoritative delivered/not-delivered decision is the live-message probe,
+/// not this offset; this range only bounds WHAT to send once the probe confirms
+/// the message is still an undelivered placeholder.
+fn leak_recovery_unrelayed_range(
+    full_response: &str,
+    response_sent_offset: usize,
+) -> Option<(usize, usize)> {
+    let len = full_response.len();
+    let mut start = response_sent_offset.min(len);
+    while start > 0 && !full_response.is_char_boundary(start) {
+        start -= 1;
+    }
+    if start >= len {
+        None
+    } else {
+        Some((start, len))
+    }
+}
+
+/// #2860 — pure render: format the unrelayed tail exactly as the bridge's
+/// terminal-replace path would (strip TUI chrome, then status-panel or provider
+/// formatting selected by the same flag). Returns `None` when the tail strips or
+/// formats to empty — recovery must never post a placeholder or an empty notice,
+/// only real leaked content.
+fn render_leak_recovery_delivery(
+    full_response: &str,
+    start: usize,
+    status_panel_v2_enabled: bool,
+    provider: &ProviderKind,
+) -> Option<String> {
+    let raw_tail = full_response.get(start..)?;
+    let stripped = discord::response_sanitizer::strip_leading_tui_response_chrome(raw_tail);
+    // Mirror terminal_delivery_response_after_offset: if the raw tail had content
+    // but it was all chrome, there is nothing real to deliver.
+    if !raw_tail.trim().is_empty() && stripped.trim().is_empty() {
+        return None;
+    }
+    let rendered = if status_panel_v2_enabled {
+        discord::formatting::format_for_discord_with_status_panel(&stripped, provider)
+    } else {
+        discord::formatting::format_for_discord_with_provider(&stripped, provider)
+    };
+    if rendered.trim().is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+fn leak_recovery_chunk_fingerprints(chunks: &[String]) -> Vec<String> {
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            let hash = blake3::hash(chunk.as_bytes());
+            format!("{index}:{}", hash.to_hex())
+        })
+        .collect()
+}
+
+const LEAK_RECOVERY_CONTINUATION_SCAN_LIMIT: u8 = 100;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeakRecoveryLedgerIdentity {
+    provider: String,
+    channel_id: u64,
+    current_msg_id: u64,
+    user_msg_id: u64,
+    byte_start: usize,
+    byte_end: usize,
+    chunk_fingerprints: Vec<String>,
+}
+
+impl LeakRecoveryLedgerIdentity {
+    fn new(
+        provider: &ProviderKind,
+        state: &discord::inflight::InflightTurnState,
+        start: usize,
+        end: usize,
+        chunks: &[String],
+    ) -> Self {
+        Self {
+            provider: provider.as_str().to_string(),
+            channel_id: state.channel_id,
+            current_msg_id: state.current_msg_id,
+            user_msg_id: state.user_msg_id,
+            byte_start: start,
+            byte_end: end,
+            chunk_fingerprints: leak_recovery_chunk_fingerprints(chunks),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct LeakRecoveryChunkLedger {
+    version: u32,
+    provider: String,
+    channel_id: u64,
+    current_msg_id: u64,
+    user_msg_id: u64,
+    byte_start: usize,
+    byte_end: usize,
+    chunk_fingerprints: Vec<String>,
+    confirmed_chunks: Vec<LeakRecoveryConfirmedChunk>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct LeakRecoveryConfirmedChunk {
+    index: usize,
+    message_id: u64,
+}
+
+fn leak_recovery_chunk_ledger_root() -> Option<PathBuf> {
+    crate::config::runtime_root().map(|root| {
+        root.join("runtime")
+            .join("discord_leak_recovery_chunk_ledgers")
+    })
+}
+
+fn leak_recovery_chunk_ledger_path(identity: &LeakRecoveryLedgerIdentity) -> Option<PathBuf> {
+    leak_recovery_chunk_ledger_root().map(|root| {
+        root.join(&identity.provider)
+            .join(identity.channel_id.to_string())
+            .join(format!("{}.json", identity.current_msg_id))
+    })
+}
+
+fn leak_recovery_ledger_matches(
+    ledger: &LeakRecoveryChunkLedger,
+    identity: &LeakRecoveryLedgerIdentity,
+) -> bool {
+    ledger.version == 1
+        && ledger.provider == identity.provider
+        && ledger.channel_id == identity.channel_id
+        && ledger.current_msg_id == identity.current_msg_id
+        && ledger.user_msg_id == identity.user_msg_id
+        && ledger.byte_start == identity.byte_start
+        && ledger.byte_end == identity.byte_end
+        && ledger.chunk_fingerprints == identity.chunk_fingerprints
+}
+
+fn leak_recovery_confirmed_prefix_from_ledger(
+    identity: &LeakRecoveryLedgerIdentity,
+) -> Option<usize> {
+    let path = leak_recovery_chunk_ledger_path(identity)?;
+    let content = fs::read_to_string(path).ok()?;
+    let ledger: LeakRecoveryChunkLedger = serde_json::from_str(&content).ok()?;
+    if !leak_recovery_ledger_matches(&ledger, identity) {
+        return None;
+    }
+    let mut expected = 0usize;
+    for confirmed in &ledger.confirmed_chunks {
+        if confirmed.index != expected || confirmed.message_id == 0 {
+            break;
+        }
+        expected += 1;
+    }
+    Some(expected.min(identity.chunk_fingerprints.len()))
+}
+
+fn leak_recovery_record_confirmed_chunk(
+    identity: &LeakRecoveryLedgerIdentity,
+    chunk_index: usize,
+    message_id: u64,
+) -> Result<(), String> {
+    if chunk_index >= identity.chunk_fingerprints.len() || message_id == 0 {
+        return Err(format!(
+            "invalid confirmed chunk index={chunk_index} message_id={message_id}"
+        ));
+    }
+    let Some(path) = leak_recovery_chunk_ledger_path(identity) else {
+        return Err("runtime root unavailable for leak recovery chunk ledger".to_string());
+    };
+    let mut confirmed_chunks = Vec::new();
+    if let Ok(content) = fs::read_to_string(&path)
+        && let Ok(existing) = serde_json::from_str::<LeakRecoveryChunkLedger>(&content)
+        && leak_recovery_ledger_matches(&existing, identity)
+    {
+        confirmed_chunks = existing.confirmed_chunks;
+    }
+
+    confirmed_chunks.retain(|chunk| chunk.index < chunk_index);
+    if confirmed_chunks.len() != chunk_index
+        || confirmed_chunks
+            .iter()
+            .enumerate()
+            .any(|(index, chunk)| chunk.index != index || chunk.message_id == 0)
+    {
+        return Err(format!(
+            "cannot record non-contiguous leak recovery chunk {chunk_index}"
+        ));
+    }
+    confirmed_chunks.push(LeakRecoveryConfirmedChunk {
+        index: chunk_index,
+        message_id,
+    });
+    let ledger = LeakRecoveryChunkLedger {
+        version: 1,
+        provider: identity.provider.clone(),
+        channel_id: identity.channel_id,
+        current_msg_id: identity.current_msg_id,
+        user_msg_id: identity.user_msg_id,
+        byte_start: identity.byte_start,
+        byte_end: identity.byte_end,
+        chunk_fingerprints: identity.chunk_fingerprints.clone(),
+        confirmed_chunks,
+    };
+    let json = serde_json::to_string_pretty(&ledger)
+        .map_err(|error| format!("serialize leak recovery chunk ledger: {error}"))?;
+    discord::runtime_store::atomic_write(&path, &json)
+}
+
+fn leak_recovery_clear_chunk_ledger(identity: &LeakRecoveryLedgerIdentity) -> Result<(), String> {
+    let Some(path) = leak_recovery_chunk_ledger_path(identity) else {
+        return Ok(());
+    };
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "remove leak recovery chunk ledger {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn leak_recovery_confirmed_chunk_count<'a>(
+    current_message_content: &str,
+    continuation_contents: impl IntoIterator<Item = &'a str>,
+    chunks: &[String],
+) -> Option<usize> {
+    let first_chunk = chunks.first()?;
+    if current_message_content != first_chunk {
+        return None;
+    }
+
+    let mut confirmed = 1usize;
+    for content in continuation_contents {
+        if confirmed >= chunks.len() {
+            break;
+        }
+        if content == chunks[confirmed] {
+            confirmed += 1;
+        }
+    }
+    Some(confirmed)
+}
+
+async fn leak_recovery_fetch_continuation_contents(
+    http: &Arc<serenity::Http>,
+    channel_id: ChannelId,
+    current_msg_id: MessageId,
+    current_bot_user_id: u64,
+) -> Option<Vec<(u64, String)>> {
+    let messages = channel_id
+        .messages(
+            http.as_ref(),
+            serenity::builder::GetMessages::new()
+                .after(current_msg_id)
+                .limit(LEAK_RECOVERY_CONTINUATION_SCAN_LIMIT),
+        )
+        .await
+        .ok()?;
+
+    Some(
+        messages
+            .into_iter()
+            .filter(|msg| msg.author.id.get() == current_bot_user_id)
+            .map(|msg| (msg.id.get(), msg.content))
+            .collect(),
+    )
+}
+
+/// #2860 — recover a completed-stale inflight leak by delivering the generated
+/// answer that never reached the user. Returns `true` only when an answer was
+/// actually delivered.
+///
+/// SAFETY (no double-delivery) — two independent guards, both required:
+///   1. Scope to the watcher-delegated-but-never-relayed signature
+///      (`effective_relay_owner_kind() == Watcher` and `last_watcher_relayed_offset
+///      == None`). The only delivery path that strands an answer in a *separate*
+///      message — the bridge's local `SentFallbackAfterEditFailure` fallback-post
+///      — lives exclusively in the bridge-owns-delivery branch
+///      (`bridge_output_owner == None`), which never sets `RelayOwnerKind::Watcher`.
+///      Requiring `Watcher` therefore excludes the fallback class entirely; for the
+///      delegated class the bridge skipped its own delivery and the watcher (per the
+///      null offset) never relayed, so the answer is provably nowhere.
+///   2. A live-message probe of `current_msg_id`: recovery either starts from a
+///      still-placeholder message, or derives an exact already-delivered chunk
+///      prefix from the original message + same-bot continuation messages. A
+///      non-placeholder body that does not match chunk 0 fails closed.
+/// Recovery edits `current_msg_id` in place for chunk 0 and sends only missing
+/// continuation chunks. Repeated watchdog passes resume after the confirmed
+/// prefix, so partial success is retryable without duplicate chunk sends.
+async fn maybe_recover_completed_stale_leak(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+) -> bool {
+    // Operate on a freshly re-loaded row, not the detection-time snapshot, so any
+    // relay that advanced state between detection and now is respected.
+    let Some(state) = discord::inflight::load_inflight_state(provider, channel_id.get()) else {
+        return false;
+    };
+
+    // Planned restart / rebind flows re-deliver the answer themselves.
+    if state.restart_mode.is_some() || state.rebind_origin {
+        return false;
+    }
+    // A silent turn intentionally suppresses assistant-text relay (mirrors the
+    // bridge's `silent_turn` terminal-delivery suppression); never resurface it.
+    if state.silent_turn {
+        return false;
+    }
+    // Scope guard (1): only the watcher-delegated, never-relayed class — the exact
+    // signature of the observed leaks. Excludes the bridge-local fallback-post
+    // class (owner == None) that could strand the answer in a separate message.
+    if state.effective_relay_owner_kind() != discord::inflight::RelayOwnerKind::Watcher
+        || state.last_watcher_relayed_offset.is_some()
+    {
+        return false;
+    }
+    // We recover by editing the existing placeholder in place (bridge parity).
+    // With no addressable placeholder there is nothing to safely edit.
+    if state.current_msg_id == 0 {
+        return false;
+    }
+    let Some((start, end)) =
+        leak_recovery_unrelayed_range(&state.full_response, state.response_sent_offset)
+    else {
+        return false;
+    };
+    // NB: the bridge appends a turn-time `review_dispatch_warning` before
+    // formatting; that guard is turn-lifecycle-only, so stale-leak recovery
+    // intentionally delivers just the answer body.
+    let Some(delivery_text) = render_leak_recovery_delivery(
+        &state.full_response,
+        start,
+        shared.status_panel_v2_enabled,
+        provider,
+    ) else {
+        return false;
+    };
+    // `split_message` is the authoritative limit (its effective cap is below
+    // Discord's 2000). For multi-chunk recovery we first consult the durable
+    // per-chunk ledger. Legacy/pre-ledger retries can still derive a prefix
+    // from live Discord state, then seed the ledger before continuing.
+    let chunks = discord::formatting::split_message(&delivery_text);
+    if chunks.is_empty() {
+        return false;
+    }
+    let ledger_identity = LeakRecoveryLedgerIdentity::new(provider, &state, start, end, &chunks);
+    let mut confirmed_chunks =
+        leak_recovery_confirmed_prefix_from_ledger(&ledger_identity).unwrap_or(0);
+
+    let http = match super::resolve_bot_http(registry, provider.as_str()).await {
+        Ok(http) => http,
+        Err(_) => return false,
+    };
+
+    let current_msg_id = MessageId::new(state.current_msg_id);
+    let current_message = if confirmed_chunks == 0 {
+        let current_bot_user_id = match http.get_current_user().await {
+            Ok(user) => user.id.get(),
+            Err(error) => {
+                tracing::warn!(
+                    "[leak-recover] failed to resolve current bot id for channel {}: {error}",
+                    channel_id
+                );
+                return false;
+            }
+        };
+        let current_message = match http.get_message(channel_id, current_msg_id).await {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(
+                    "[leak-recover] failed to fetch placeholder message {} in channel {}: {error}",
+                    current_msg_id,
+                    channel_id
+                );
+                return false;
+            }
+        };
+        if current_message.author.id.get() != current_bot_user_id {
+            tracing::warn!(
+                "[leak-recover] refusing recovery for channel {} msg {}: message author is not current bot",
+                channel_id,
+                current_msg_id
+            );
+            return false;
+        }
+
+        let continuation_messages = if chunks.len() > 1 && current_message.content == chunks[0] {
+            let Some(messages) = leak_recovery_fetch_continuation_contents(
+                &http,
+                channel_id,
+                current_msg_id,
+                current_bot_user_id,
+            )
+            .await
+            else {
+                return false;
+            };
+            messages
+        } else {
+            Vec::new()
+        };
+
+        confirmed_chunks = leak_recovery_confirmed_chunk_count(
+            &current_message.content,
+            continuation_messages
+                .iter()
+                .map(|(_, content)| content.as_str()),
+            &chunks,
+        )
+        .unwrap_or(0);
+        if confirmed_chunks > 0 {
+            if let Err(error) =
+                leak_recovery_record_confirmed_chunk(&ledger_identity, 0, state.current_msg_id)
+            {
+                tracing::warn!(
+                    "[leak-recover] failed to persist confirmed chunk 1/{} for channel {}: {error}",
+                    chunks.len(),
+                    channel_id
+                );
+                return false;
+            }
+            let mut chunk_index = 1usize;
+            for (message_id, content) in &continuation_messages {
+                if chunk_index >= confirmed_chunks {
+                    break;
+                }
+                if content != &chunks[chunk_index] {
+                    continue;
+                }
+                if let Err(error) =
+                    leak_recovery_record_confirmed_chunk(&ledger_identity, chunk_index, *message_id)
+                {
+                    tracing::warn!(
+                        "[leak-recover] failed to persist confirmed chunk {}/{} for channel {}: {error}",
+                        chunk_index + 1,
+                        chunks.len(),
+                        channel_id
+                    );
+                    return false;
+                }
+                chunk_index += 1;
+            }
+        }
+        Some(current_message)
+    } else {
+        None
+    };
+
+    let mut wrote_any_chunk = false;
+    if confirmed_chunks == 0 {
+        let Some(current_message) = current_message.as_ref() else {
+            tracing::warn!(
+                "[leak-recover] missing live placeholder probe for channel {} despite empty ledger",
+                channel_id
+            );
+            return false;
+        };
+        if !discord::placeholder_sweeper::is_message_still_placeholder(&current_message.content) {
+            let turn_id = (state.user_msg_id != 0)
+                .then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id));
+            crate::services::observability::emit_inflight_lifecycle_event(
+                provider.as_str(),
+                channel_id.get(),
+                state.dispatch_id.as_deref(),
+                state.session_key.as_deref(),
+                turn_id.as_deref(),
+                "leak_recovery_skipped_already_delivered",
+                serde_json::json!({
+                    "current_msg_id": state.current_msg_id,
+                    "byte_len": delivery_text.len(),
+                    "chunks": chunks.len(),
+                }),
+            );
+            return false;
+        }
+
+        // Edit the original placeholder to chunk 0. If Discord commits the edit
+        // but the client observes an error/crash, the next pass derives
+        // `confirmed_chunks == 1` from the live message and continues with chunk
+        // 1. No fallback send is used for the first chunk.
+        if discord::http::edit_channel_message(
+            http.as_ref(),
+            channel_id,
+            current_msg_id,
+            &chunks[0],
+        )
+        .await
+        .is_err()
+        {
+            return false;
+        }
+        if let Err(error) =
+            leak_recovery_record_confirmed_chunk(&ledger_identity, 0, state.current_msg_id)
+        {
+            tracing::warn!(
+                "[leak-recover] edited chunk 1/{} on channel {} but failed to persist chunk ledger: {error}",
+                chunks.len(),
+                channel_id
+            );
+            return true;
+        }
+        wrote_any_chunk = true;
+        confirmed_chunks = 1;
+    }
+
+    for (chunk_index, chunk) in chunks.iter().enumerate().skip(confirmed_chunks) {
+        match discord::http::send_channel_message(http.as_ref(), channel_id, chunk).await {
+            Ok(message) => {
+                if let Err(error) = leak_recovery_record_confirmed_chunk(
+                    &ledger_identity,
+                    chunk_index,
+                    message.id.get(),
+                ) {
+                    tracing::warn!(
+                        "[leak-recover] sent continuation chunk {}/{} on channel {} but failed to persist chunk ledger: {error}",
+                        chunk_index + 1,
+                        chunks.len(),
+                        channel_id
+                    );
+                    return true;
+                }
+                wrote_any_chunk = true;
+                confirmed_chunks = chunk_index + 1;
+                tracing::debug!(
+                    "[leak-recover] sent continuation chunk {}/{} on channel {}",
+                    chunk_index + 1,
+                    chunks.len(),
+                    channel_id
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "[leak-recover] continuation chunk {}/{} failed on channel {}: {error}",
+                    chunk_index + 1,
+                    chunks.len(),
+                    channel_id
+                );
+                let turn_id = (state.user_msg_id != 0)
+                    .then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id));
+                crate::services::observability::emit_inflight_lifecycle_event(
+                    provider.as_str(),
+                    channel_id.get(),
+                    state.dispatch_id.as_deref(),
+                    state.session_key.as_deref(),
+                    turn_id.as_deref(),
+                    "leak_recovery_partial_retryable",
+                    serde_json::json!({
+                        "failed_chunk_index": chunk_index,
+                        "confirmed_chunks_before_attempt": confirmed_chunks,
+                        "chunks": chunks.len(),
+                    }),
+                );
+                return wrote_any_chunk;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // If a prior attempt already delivered every chunk but crashed before
+    // persisting the offset, this pass reaches here with `wrote_any_chunk=false`;
+    // persist the terminal offset and emit only a confirmation event.
+    if confirmed_chunks >= chunks.len() && !wrote_any_chunk {
+        let turn_id = (state.user_msg_id != 0)
+            .then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id));
+        crate::services::observability::emit_inflight_lifecycle_event(
+            provider.as_str(),
+            channel_id.get(),
+            state.dispatch_id.as_deref(),
+            state.session_key.as_deref(),
+            turn_id.as_deref(),
+            "leak_recovery_confirmed_already_flushed",
+            serde_json::json!({
+                "chunks": chunks.len(),
+                "byte_start": start,
+                "byte_end": end,
+            }),
+        );
+    }
+
+    if confirmed_chunks < chunks.len() && !wrote_any_chunk {
+        return false;
+    }
+    let (delivery_detail, op) = if !wrote_any_chunk {
+        ("confirmed", "probe")
+    } else if chunks.len() == 1 {
+        ("edited", "edit")
+    } else {
+        ("edited+continued", "edit+send")
+    };
+
+    // Advance the offset and persist so a later pass (even after a dcserver
+    // restart) treats this tail as delivered and never re-sends it. Re-load and
+    // re-check identity first so we never clobber a concurrently-updated row, and
+    // skip if another path already advanced past `end`.
+    if let Some(mut fresh) = discord::inflight::load_inflight_state(provider, channel_id.get())
+        && fresh.user_msg_id == state.user_msg_id
+        && fresh.current_msg_id == state.current_msg_id
+        && fresh.response_sent_offset < end
+    {
+        fresh.response_sent_offset = end;
+        if let Err(error) = discord::inflight::save_inflight_state(&fresh) {
+            tracing::warn!(
+                "[leak-recover] delivered answer on channel {} but failed to persist offset: {error}",
+                channel_id
+            );
+        }
+    }
+    if let Err(error) = leak_recovery_clear_chunk_ledger(&ledger_identity) {
+        tracing::warn!(
+            "[leak-recover] recovered answer on channel {} but failed to clear chunk ledger: {error}",
+            channel_id
+        );
+    }
+
+    let turn_id = (state.user_msg_id != 0)
+        .then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id));
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::warn!(
+        "  [{ts}] 📤 leak recovered ({delivery_detail}): delivered {}-byte answer on channel {} (provider={})",
+        end - start,
+        channel_id,
+        provider.as_str()
+    );
+    crate::services::observability::emit_inflight_lifecycle_event(
+        provider.as_str(),
+        channel_id.get(),
+        state.dispatch_id.as_deref(),
+        state.session_key.as_deref(),
+        turn_id.as_deref(),
+        "leak_recovered_flushed",
+        serde_json::json!({
+            "byte_start": start,
+            "byte_end": end,
+            "flushed_len": end - start,
+            "delivery": delivery_detail,
+        }),
+    );
+    crate::services::observability::emit_relay_delivery(
+        provider.as_str(),
+        channel_id.get(),
+        state.dispatch_id.as_deref(),
+        state.session_key.as_deref(),
+        turn_id.as_deref(),
+        Some(state.current_msg_id),
+        "recovery",
+        op,
+        Some(start as u64),
+        Some(end as u64),
+        true,
+        Some(delivery_detail),
+    );
+    true
+}
+
 /// #1446 — pure-helper tests for the stall-watchdog decision logic.
 /// Always-on (`#[cfg(test)]`) because the helper has no filesystem/runtime
 /// dependencies; the legacy-sqlite-tests gate would prevent these from
 /// running in normal `cargo test --bin agentdesk` invocations.
 
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+mod global_active_cleanup_tests {
+    use super::apply_runtime_hard_stop_cleanup;
+    use crate::services::discord;
+    use crate::services::provider::{CancelToken, ProviderKind};
+    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn hard_stop_cleanup_does_not_underflow_global_active_for_restored_mailbox() {
+        let shared = super::super::super::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let channel_id = ChannelId::new(1485506232256984);
+        let token = Arc::new(CancelToken::new());
+
+        assert!(
+            discord::mailbox_try_start_turn(
+                &shared,
+                channel_id,
+                token,
+                UserId::new(343742347365974026),
+                MessageId::new(1487795113240559704),
+            )
+            .await
+        );
+        let finish = discord::mailbox_finish_turn(&shared, &provider, channel_id).await;
+        assert!(finish.removed_token.is_some());
+        assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
+
+        apply_runtime_hard_stop_cleanup(
+            &shared,
+            &provider,
+            channel_id,
+            &finish,
+            "hard_stop_cleanup_does_not_underflow_global_active_for_restored_mailbox",
+            true,
+        )
+        .await;
+
+        assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
+    }
+}
+
 #[cfg(test)]
 mod stall_watchdog_pure_tests {
     use super::{
-        STALL_WATCHDOG_THRESHOLD_SECS, inflight_completed_stale_leak_detected,
+        LeakRecoveryLedgerIdentity, STALL_WATCHDOG_THRESHOLD_SECS,
+        inflight_completed_stale_leak_detected, leak_recovery_chunk_fingerprints,
+        leak_recovery_clear_chunk_ledger, leak_recovery_confirmed_chunk_count,
+        leak_recovery_confirmed_prefix_from_ledger, leak_recovery_record_confirmed_chunk,
+        leak_recovery_unrelayed_range, render_leak_recovery_delivery,
         stall_watchdog_should_force_clean,
     };
+    use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+    use std::ffi::OsString;
+
+    struct EnvVarReset {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarReset {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarReset {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn test_ledger_identity(chunks: &[String]) -> LeakRecoveryLedgerIdentity {
+        LeakRecoveryLedgerIdentity {
+            provider: ProviderKind::Codex.as_str().to_string(),
+            channel_id: 42,
+            current_msg_id: 9001,
+            user_msg_id: 7001,
+            byte_start: 0,
+            byte_end: 12345,
+            chunk_fingerprints: leak_recovery_chunk_fingerprints(chunks),
+        }
+    }
+
+    #[test]
+    fn leak_range_whole_response_when_nothing_relayed() {
+        // The exact 8-leak signature: response_sent_offset=0, full answer present.
+        assert_eq!(
+            leak_recovery_unrelayed_range("hello world", 0),
+            Some((0, 11))
+        );
+    }
+
+    #[test]
+    fn leak_range_none_when_already_fully_delivered() {
+        // Idempotent re-run after a prior recovery advanced the offset to len.
+        assert_eq!(leak_recovery_unrelayed_range("hello world", 11), None);
+        assert_eq!(leak_recovery_unrelayed_range("hello world", 99), None);
+    }
+
+    #[test]
+    fn leak_range_empty_response_is_none() {
+        assert_eq!(leak_recovery_unrelayed_range("", 0), None);
+    }
+
+    #[test]
+    fn leak_range_partial_tail_only() {
+        assert_eq!(
+            leak_recovery_unrelayed_range("hello world", 6),
+            Some((6, 11))
+        );
+    }
+
+    #[test]
+    fn leak_range_snaps_back_to_char_boundary() {
+        // "안녕" is 6 bytes (3 each). An offset landing mid-codepoint must walk
+        // back to a boundary so the returned slice never panics.
+        let s = "안녕하세요";
+        let (start, end) = leak_recovery_unrelayed_range(s, 4).unwrap();
+        assert!(s.is_char_boundary(start));
+        assert_eq!(start, 3); // walked back from 4 to the boundary after "안"
+        assert_eq!(end, s.len());
+        // Slicing at the returned start must be valid.
+        let _ = &s[start..end];
+    }
+
+    #[test]
+    fn render_skips_blank_tail() {
+        // A blank/whitespace tail formats to empty -> no delivery, never a
+        // placeholder post or empty notice.
+        let provider = ProviderKind::Claude;
+        assert_eq!(render_leak_recovery_delivery("", 0, false, &provider), None);
+        assert_eq!(
+            render_leak_recovery_delivery("   \n  ", 0, false, &provider),
+            None
+        );
+    }
+
+    #[test]
+    fn render_returns_formatted_real_answer() {
+        let provider = ProviderKind::Claude;
+        let out = render_leak_recovery_delivery("실제 답변입니다", 0, false, &provider)
+            .expect("real answer should render");
+        assert!(out.contains("실제 답변입니다"));
+    }
+
+    #[test]
+    fn large_leak_chunk_fingerprints_are_stable_and_ordered() {
+        let chunks = vec!["first".to_string(), "second".to_string()];
+        let first = leak_recovery_chunk_fingerprints(&chunks);
+        let second = leak_recovery_chunk_fingerprints(&chunks);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+        assert!(first[0].starts_with("0:"));
+        assert!(first[1].starts_with("1:"));
+        assert_ne!(first[0], first[1]);
+    }
+
+    #[test]
+    fn multi_chunk_progress_is_unknown_before_first_chunk_edit() {
+        let chunks = vec!["chunk-0".to_string(), "chunk-1".to_string()];
+
+        assert_eq!(
+            leak_recovery_confirmed_chunk_count("⠋ Processing...", std::iter::empty(), &chunks),
+            None
+        );
+    }
+
+    #[test]
+    fn multi_chunk_progress_derives_confirmed_prefix_from_live_messages() {
+        let chunks = vec![
+            "chunk-0".to_string(),
+            "chunk-1".to_string(),
+            "chunk-2".to_string(),
+        ];
+        let continuation_contents = ["unrelated bot notice", "chunk-1", "chunk-2"];
+
+        assert_eq!(
+            leak_recovery_confirmed_chunk_count(
+                "chunk-0",
+                continuation_contents.into_iter(),
+                &chunks,
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn multi_chunk_progress_stops_at_missing_tail_for_retry() {
+        let chunks = vec![
+            "chunk-0".to_string(),
+            "chunk-1".to_string(),
+            "chunk-2".to_string(),
+        ];
+        let continuation_contents = ["chunk-1"];
+
+        assert_eq!(
+            leak_recovery_confirmed_chunk_count(
+                "chunk-0",
+                continuation_contents.into_iter(),
+                &chunks,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn chunk_ledger_survives_restart_and_resumes_tail_without_live_fetch() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+        let chunks: Vec<String> = (0..64).map(|index| format!("chunk-{index}")).collect();
+        let identity = test_ledger_identity(&chunks);
+
+        leak_recovery_clear_chunk_ledger(&identity).expect("clear ledger");
+        for index in 0..37 {
+            leak_recovery_record_confirmed_chunk(&identity, index, 10_000 + index as u64)
+                .expect("record chunk");
+        }
+
+        assert_eq!(
+            leak_recovery_confirmed_prefix_from_ledger(&identity),
+            Some(37),
+            "fresh process can resume from persisted prefix without scanning Discord messages"
+        );
+
+        leak_recovery_clear_chunk_ledger(&identity).expect("clear ledger");
+        assert_eq!(leak_recovery_confirmed_prefix_from_ledger(&identity), None);
+    }
+
+    #[test]
+    fn chunk_ledger_records_send_failure_boundary_without_offset_loss() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+        let chunks: Vec<String> = (0..5).map(|index| format!("chunk-{index}")).collect();
+        let identity = test_ledger_identity(&chunks);
+
+        leak_recovery_clear_chunk_ledger(&identity).expect("clear ledger");
+        leak_recovery_record_confirmed_chunk(&identity, 0, identity.current_msg_id)
+            .expect("record edited first chunk");
+        leak_recovery_record_confirmed_chunk(&identity, 1, 10_001)
+            .expect("record sent continuation");
+        // Simulate Discord send failure on chunk 2: no record is written. A retry
+        // must skip exactly chunks 0..1 and resume at the missing tail.
+        assert_eq!(
+            leak_recovery_confirmed_prefix_from_ledger(&identity),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn chunk_ledger_ignores_stale_identity_or_changed_chunks() {
+        let _guard = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let tempdir = tempfile::tempdir().expect("temp runtime root");
+        let _env = EnvVarReset::set("AGENTDESK_ROOT_DIR", tempdir.path());
+        let chunks = vec!["chunk-0".to_string(), "chunk-1".to_string()];
+        let identity = test_ledger_identity(&chunks);
+
+        leak_recovery_clear_chunk_ledger(&identity).expect("clear ledger");
+        leak_recovery_record_confirmed_chunk(&identity, 0, identity.current_msg_id)
+            .expect("record chunk");
+
+        let changed_chunks = vec!["chunk-0".to_string(), "changed-tail".to_string()];
+        let changed_identity = LeakRecoveryLedgerIdentity {
+            chunk_fingerprints: leak_recovery_chunk_fingerprints(&changed_chunks),
+            ..identity.clone()
+        };
+        assert_eq!(
+            leak_recovery_confirmed_prefix_from_ledger(&changed_identity),
+            None,
+            "formatting/content changes must not reuse stale chunk confirmations"
+        );
+
+        let other_turn = LeakRecoveryLedgerIdentity {
+            user_msg_id: identity.user_msg_id + 1,
+            ..identity.clone()
+        };
+        assert_eq!(
+            leak_recovery_confirmed_prefix_from_ledger(&other_turn),
+            None,
+            "another turn using the same channel/message id must not inherit confirmations"
+        );
+    }
 
     fn local_string(unix: i64) -> String {
         chrono::Local

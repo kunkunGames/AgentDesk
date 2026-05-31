@@ -13,6 +13,13 @@ use super::dispatch_context::validate_dispatch_completion_evidence_on_conn;
 use super::dispatch_query::query_dispatch_row;
 use super::dispatch_query::query_dispatch_row_pg;
 
+pub(crate) const VALID_DISPATCH_STATUSES: &[&str] =
+    &["pending", "dispatched", "completed", "cancelled", "failed"];
+
+pub(crate) fn is_valid_dispatch_status(status: &str) -> bool {
+    VALID_DISPATCH_STATUSES.contains(&status)
+}
+
 /// #750: Sources whose completion path already writes ✅ to the Discord
 /// message via the command bot (turn_bridge / tmux watcher). For those, the
 /// announce-bot sync would only bump the reaction count; skip the enqueue.
@@ -2158,7 +2165,52 @@ fn check_entry_is_pass(entry: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod auto_queue_terminal_sync_policy_tests {
-    use super::should_skip_auto_queue_terminal_sync;
+    use super::{
+        VALID_DISPATCH_STATUSES, is_valid_dispatch_status, should_skip_auto_queue_terminal_sync,
+    };
+
+    #[test]
+    fn canonical_dispatch_status_set_rejects_typos() {
+        for status in VALID_DISPATCH_STATUSES {
+            assert!(is_valid_dispatch_status(status), "{status} should be valid");
+        }
+        for status in ["dispatchd", "complete", "canceled", "", " pending "] {
+            assert!(
+                !is_valid_dispatch_status(status),
+                "{status:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn task_dispatches_status_check_migration_quarantines_unknown_statuses() {
+        let sql = include_str!("../../migrations/postgres/0067_task_dispatches_status_check.sql");
+        assert!(
+            sql.contains("ELSE 'failed'"),
+            "dirty historical task_dispatches.status values must converge before CHECK install"
+        );
+        assert!(sql.contains("task_dispatches_status_known_check"));
+    }
+
+    #[test]
+    fn core_status_check_migration_normalizes_before_constraining() {
+        let sql = include_str!("../../migrations/postgres/0068_core_status_constraints.sql");
+        assert!(
+            sql.contains("agents_status_known_check")
+                && sql.contains("status IN ('idle', 'working', 'archived')"),
+            "agents.status must have a closed stable CHECK"
+        );
+        assert!(
+            sql.contains("WHEN lower(btrim(status)) IN ('active') THEN 'idle'"),
+            "legacy onboarding agents.status='active' must normalize to canonical idle before CHECK install"
+        );
+        assert!(
+            sql.contains("kanban_cards_status_slug_check")
+                && sql.contains("regexp_replace(lower(btrim(status))")
+                && sql.contains("qa_test"),
+            "kanban_cards.status must normalize fixture/runtime states before slug CHECK install"
+        );
+    }
 
     #[test]
     fn review_enabled_work_dispatches_hold_auto_queue_entry_until_card_terminal() {

@@ -41,8 +41,20 @@ scheduled wakeup/monitor path: the first turn must call `ScheduleWakeup`, and
 the automatic wake turn must relay `[E2E:E13:WAKE]` to Discord. It intentionally
 runs only on `claude-pipe`; `claude-tui` and `claude-e` keep normal relay
 coverage because this matrix does not create a persistent Claude Code wake
-session for those cells. `E-11` (cross-cell concurrency) is `cells: []` — the
-orchestrator owns that scenario.
+session for those cells. `E-16` and `E-17` are #2935 regression stubs: they are
+loaded by the relevant cells but skipped until the runtime/orchestrator exposes
+hooks to force Claude TUI completion-quiescence timeout and to hold a foreign
+active mailbox during a destructive restart attempt. `E-18` is a skipped
+destructive `cancel_turn` stop-mid-turn scenario for relay-backed pipe/TUI cells;
+it remains disabled until a deterministic provider hold hook can avoid the known
+late-sentinel race. `E-19` captures tmux pane identity across dcserver restart
+for TUI cells. `E-20` uses same-session near-concurrent prompt fan-out to
+pressure dispatch serialization while asserting both markers arrive once.
+`E-21` covers TUI direct input with an actual `C-u` key sequence: a stale draft
+marker is typed, cleared, and then the real prompt must relay with a complete
+head-to-tail body while the stale marker and terminal controls stay absent.
+`E-11` (cross-cell concurrency) is `cells: []` — the orchestrator owns that
+scenario.
 
 ## Driver
 
@@ -75,8 +87,64 @@ at one `--output` directory does not overwrite sibling reports. Per-cell lease
 files (`/tmp/agentdesk-e2e-relay.<cell>.lease`) let cells run in parallel from
 separate operator sessions.
 
-Destructive steps (`restart_dcserver`, `kill_pane`, `send_keys_no_enter`) are
-gated by both `--allow-destructive` and `AGENTDESK_E2E_ALLOW_DESTRUCTIVE=1`.
+Destructive steps (`restart_dcserver`, `kill_pane`, `send_keys_no_enter`,
+`cancel_turn`) are gated by both `--allow-destructive` and
+`AGENTDESK_E2E_ALLOW_DESTRUCTIVE=1`.
+Before a destructive restart, the driver now fails closed if
+`/api/health/detail.mailboxes` shows any foreign channel/provider with active
+mailbox state, cancel token, inflight state, queue depth, recovery/finalizing
+state, pending Discord callback, stale thread proof, or relay stall state.
+
+Health waits parse the JSON payload, not just HTTP 2xx. A run is considered
+ready only when the health body is healthy (`status: healthy`, `ok` not false,
+`fully_recovered` not false, and no unallowed degraded reasons). Degraded or
+unhealthy bodies keep polling until timeout and then fail with the last health
+summary.
+
+After every executed scenario, the driver also asserts the tested cell's
+mailbox is idle via `/api/health/detail`: `agent_turn_status=idle`,
+`queue_depth=0`, no cancel token, no inflight state, no active user message, no
+pending Discord callback, and no stale/relay-stall proof. It also checks the
+tested provider/channel's on-disk pending queue and queued placeholder files
+under the runtime root are empty.
+
+Scenario steps can also run an explicit `assert_health` probe. The probe reads
+`/api/health` and, when counter caps are requested, `/api/health/detail`; it can
+require `status: healthy`, forbid degraded reason substrings such as
+`global_active_counter_out_of_bounds`, and cap `global_active` /
+`global_finalizing`. Destructive scenarios use this after the tested turn has
+settled so counter underflow and stuck-finalizing regressions are visible in the
+E2E report.
+
+Control-flow steps include `cancel_turn` (POSTs
+`/api/turns/<channel_id>/cancel?force=<bool>` and remains destructive-gated),
+`send_prompts_concurrent` (starts multiple prompt dispatches without the normal
+per-step sleep), `capture_session_identity`, and `assert_session_preserved`
+(compares tmux session name, pane ids, pane pids, and cwd after restart).
+`send_keys_sequence` sends explicit tmux key args such as `C-u` and `C-m`.
+By default it uses one tmux `send-keys` call; scenarios can set
+`key_interval_s` to send the same ordered key list one key at a time when a TUI
+composer must process a control key before Enter. `E-21` uses that mode to
+cover direct TUI input where a stale draft is cleared by a real control key
+before the submitted prompt is relayed.
+
+Observation assertions now include negative and edit-aware primitives:
+`raw_text_absent`, `marker_absent`, `chrome_count`,
+`completion_chrome_after_body`, `raw_message_count_between_markers`,
+`body_not_overwritten`, and `no_suppressed_label_chrome`. The observation
+window updates messages by Discord id during final re-fetches, so assertions see
+the final edited body rather than only the first placeholder/chrome body.
+`completion_chrome_after_body` checks ordering by default and can set
+`required: true` when a scenario wants to fail on missing completion chrome.
+Latency budgets use the first prompt timestamp to make
+`relay_latency_within` meaningful even for one-response scenarios. If a prompt
+timestamp exists but no later timestamped relay body is observed, the assertion
+fails instead of silently no-oping. Current baselines are deliberately loose:
+simple/turn-separation cases use 240s, restart/compact/long-response cases use
+300s, scheduled wakeup uses 360s, and the tmux-kill/cancel guards use 180s to
+bound the prompt-to-first-relay phase before the destructive step. Raw-message
+budgets count status chrome but exclude harness-sent control/prompt messages
+unless a scenario opts into `include_our_send`.
 
 ## Orchestrator (`adk-e2e-orchestrator`)
 

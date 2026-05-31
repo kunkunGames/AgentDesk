@@ -12,7 +12,7 @@ use crate::db::{open_write_connection, schema};
 use crate::services::operator_connectors::{
     OptionalConnectorState, OptionalConnectorStatus, optional_connector_statuses,
 };
-use crate::services::provider::ProviderKind;
+use crate::services::provider::{ProviderKind, ProviderRuntimeProbe};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -2619,6 +2619,48 @@ fn provider_capability_summary(provider: &ProviderKind) -> String {
         .unwrap_or_else(|| "unsupported".to_string())
 }
 
+fn provider_credential_summary(probe: &ProviderRuntimeProbe) -> String {
+    match (probe.credential_present, probe.credential_source.as_deref()) {
+        (true, Some(source)) => {
+            format!("credentials=present source={source} (auth usability unverified)")
+        }
+        (true, None) => {
+            "credentials=present source=unknown (auth usability unverified)".to_string()
+        }
+        (false, _) => "credentials=not_observed (auth usability unverified)".to_string(),
+    }
+}
+
+fn provider_auth_check_command(provider: &ProviderKind, binary_name: &str) -> String {
+    provider
+        .registry_entry()
+        .and_then(|entry| entry.auth.auth_check_argv)
+        .map(|argv| argv.join(" "))
+        .unwrap_or_else(|| format!("{binary_name} auth status"))
+}
+
+fn provider_runtime_evidence(probe: &ProviderRuntimeProbe) -> Value {
+    json!({
+        "provider": probe.provider.as_str(),
+        "credential_present": probe.credential_present,
+        "credential_source": probe.credential_source.clone(),
+        "credential_status_basis": "presence_only",
+        "auth_usability_verified": false,
+        "auth_check_argv": probe
+            .provider
+            .registry_entry()
+            .and_then(|entry| entry.auth.auth_check_argv)
+            .map(|argv| argv.join(" ")),
+        "binary_source": probe.resolution.source.clone(),
+        "resolved_path": probe.resolution.resolved_path.clone(),
+        "canonical_path": probe.resolution.canonical_path.clone(),
+        "probe_failure_kind": probe.probe_failure_kind.clone(),
+        "resolution_failure_kind": probe.resolution.failure_kind.clone(),
+        "resolution_attempts": probe.resolution.attempts.clone(),
+        "skipped_candidate_failures": probe.skipped_candidate_failures.clone(),
+    })
+}
+
 fn check_provider_cli(
     provider: ProviderKind,
     configured: bool,
@@ -2638,7 +2680,10 @@ fn check_provider_cli(
     let log_hint = dcserver_log_hint();
     let binary_name = provider.as_str().to_string();
     match provider.probe_runtime() {
-        Some(probe) => match (probe.resolution.resolved_path.clone(), probe.version) {
+        Some(probe) => match (
+            probe.resolution.resolved_path.clone(),
+            probe.version.clone(),
+        ) {
             (Some(path), Some(ver)) => {
                 let health_note = match connected {
                     Some(true) => "health=connected".to_string(),
@@ -2650,8 +2695,10 @@ fn check_provider_cli(
                     .source
                     .as_deref()
                     .unwrap_or("unknown_source");
-                let detail =
-                    format!("{ver} — {path} [{source}; {capability_summary}; {health_note}]");
+                let auth_note = provider_credential_summary(&probe);
+                let detail = format!(
+                    "{ver} — {path} [{source}; {capability_summary}; {health_note}; {auth_note}]"
+                );
 
                 if !configured {
                     Check::ok(
@@ -2665,6 +2712,28 @@ fn check_provider_cli(
                         "provider configured only when used",
                         "binary exists but provider is unused",
                     )
+                    .with_evidence(provider_runtime_evidence(&probe))
+                    .with_security_exposure(SecurityExposure::CredentialMetadata)
+                } else if !probe.credential_present {
+                    Check::warn(
+                        id,
+                        CheckGroup::ProviderRuntime,
+                        name,
+                        detail,
+                        provider_runtime_guidance(&provider),
+                    )
+                    .with_path(path)
+                    .with_expected_actual(
+                        "provider credential visible to doctor (auth usability unverified)",
+                        "credential not observed by doctor process",
+                    )
+                    .with_next_steps(vec![
+                        provider_auth_check_command(&provider, &binary_name),
+                        format!("which {}", binary_name),
+                        format!("tail -n 200 {}", log_hint),
+                    ])
+                    .with_evidence(provider_runtime_evidence(&probe))
+                    .with_security_exposure(SecurityExposure::CredentialMetadata)
                 } else if connected == Some(false) {
                     Check::warn(
                         id,
@@ -2679,10 +2748,14 @@ fn check_provider_cli(
                         format!("which {}", binary_name),
                         format!("tail -n 200 {}", log_hint),
                     ])
+                    .with_evidence(provider_runtime_evidence(&probe))
+                    .with_security_exposure(SecurityExposure::CredentialMetadata)
                 } else {
                     Check::ok(id, CheckGroup::ProviderRuntime, name, detail)
                         .with_path(path)
                         .with_expected_actual("provider binary usable", "provider binary usable")
+                        .with_evidence(provider_runtime_evidence(&probe))
+                        .with_security_exposure(SecurityExposure::CredentialMetadata)
                 }
             }
             (Some(path), None) => {
@@ -2696,7 +2769,8 @@ fn check_provider_cli(
                     .clone()
                     .unwrap_or_else(|| "version_probe_failed".to_string());
                 let detail = format!(
-                    "{path} — version probe failed [{source}; {probe_failure_kind}; {capability_summary}]"
+                    "{path} — version probe failed [{source}; {probe_failure_kind}; {capability_summary}; {}]",
+                    provider_credential_summary(&probe)
                 );
                 if configured {
                     Check::fail(
@@ -2712,6 +2786,8 @@ fn check_provider_cli(
                         format!("which {}", binary_name),
                         format!("tail -n 200 {}", log_hint),
                     ])
+                    .with_evidence(provider_runtime_evidence(&probe))
+                    .with_security_exposure(SecurityExposure::CredentialMetadata)
                 } else {
                     Check::ok(id, CheckGroup::ProviderRuntime, name, detail)
                         .with_path(path)
@@ -2719,15 +2795,22 @@ fn check_provider_cli(
                             "provider probe required only when configured",
                             "version probe failed for unused provider",
                         )
+                        .with_evidence(provider_runtime_evidence(&probe))
+                        .with_security_exposure(SecurityExposure::CredentialMetadata)
                 }
             }
             (None, Some(ver)) => Check::ok(
                 id,
                 CheckGroup::ProviderRuntime,
                 name,
-                format!("{ver} — unknown path [{capability_summary}]"),
+                format!(
+                    "{ver} — unknown path [{capability_summary}; {}]",
+                    provider_credential_summary(&probe)
+                ),
             )
-            .with_expected_actual("provider path known", "version known but path unknown"),
+            .with_expected_actual("provider path known", "version known but path unknown")
+            .with_evidence(provider_runtime_evidence(&probe))
+            .with_security_exposure(SecurityExposure::CredentialMetadata),
             (None, None) => {
                 let failure_kind = probe
                     .resolution
@@ -2739,7 +2822,10 @@ fn check_provider_cli(
                         id,
                         CheckGroup::ProviderRuntime,
                         name,
-                        format!("not found in runtime PATH [{failure_kind}; {capability_summary}]"),
+                        format!(
+                            "not found in runtime PATH [{failure_kind}; {capability_summary}; {}]",
+                            provider_credential_summary(&probe)
+                        ),
                         provider_runtime_guidance(&provider),
                     )
                     .with_expected_actual(
@@ -2751,17 +2837,24 @@ fn check_provider_cli(
                         format!("which {}", binary_name),
                         format!("tail -n 200 {}", log_hint),
                     ])
+                    .with_evidence(provider_runtime_evidence(&probe))
+                    .with_security_exposure(SecurityExposure::CredentialMetadata)
                 } else {
                     Check::ok(
                         id,
                         CheckGroup::ProviderRuntime,
                         name,
-                        format!("not configured [{capability_summary}]"),
+                        format!(
+                            "not configured [{capability_summary}; {}]",
+                            provider_credential_summary(&probe)
+                        ),
                     )
                     .with_expected_actual(
                         "provider configured if needed",
                         "provider not configured",
                     )
+                    .with_evidence(provider_runtime_evidence(&probe))
+                    .with_security_exposure(SecurityExposure::CredentialMetadata)
                 }
             }
         },
@@ -3703,9 +3796,8 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
     match runtime.block_on(crate::db::postgres::connect(cfg)) {
         Ok(Some(pool)) => {
             let migration_status = runtime.block_on(crate::db::postgres::migration_status(&pool));
-            let checksum_mismatches = runtime.block_on(
-                crate::db::postgres::applied_migration_checksum_mismatches(&pool),
-            );
+            let checksum_mismatches = runtime
+                .block_on(crate::db::postgres::applied_migration_checksum_mismatch_details(&pool));
             drop(pool);
             match (migration_status, checksum_mismatches) {
                 (Ok(status), Ok(checksum_mismatches))
@@ -3727,7 +3819,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                         "applied_count": status.applied.len(),
                         "resolved_count": status.resolved_versions.len(),
                         "pending_versions": status.pending_versions,
-                        "checksum_mismatches": checksum_mismatches,
+                        "checksum_mismatches": checksum_mismatch_evidence(&checksum_mismatches),
                     }))
                     .with_expected_actual("postgres connection and migration metadata readable", "ok")
                 }
@@ -3736,10 +3828,10 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                     CheckGroup::Core,
                     "PostgreSQL",
                     format!(
-                        "{summary} — migration drift: missing_from_resolved={:?} unsuccessful={:?} checksum_mismatches={:?}",
+                        "{summary} — migration drift: missing_from_resolved={:?} unsuccessful={:?} checksum_mismatches={}",
                         status.missing_from_resolved,
                         unsuccessful_migration_versions(&status),
-                        checksum_mismatches
+                        format_checksum_mismatches(&checksum_mismatches)
                     ),
                     "Postgres _sqlx_migrations contains drift or unsuccessful migration records.",
                 )
@@ -3752,7 +3844,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                     "missing_from_resolved": status.missing_from_resolved,
                     "unsuccessful_versions": unsuccessful_migration_versions(&status),
                     "pending_versions": status.pending_versions,
-                    "checksum_mismatches": checksum_mismatches,
+                    "checksum_mismatches": checksum_mismatch_evidence(&checksum_mismatches),
                 }))
                 .with_expected_actual(
                     "applied migrations all exist in resolved migrations, succeeded, and checksum-matched",
@@ -3810,9 +3902,42 @@ fn unsuccessful_migration_versions(status: &crate::db::postgres::MigrationStatus
         .collect()
 }
 
+fn checksum_mismatch_evidence(
+    mismatches: &[crate::db::postgres::MigrationChecksumMismatch],
+) -> Vec<Value> {
+    mismatches
+        .iter()
+        .map(|mismatch| {
+            json!({
+                "version": mismatch.version,
+                "applied_checksum": mismatch.applied_checksum,
+                "resolved_checksum": mismatch.resolved_checksum,
+            })
+        })
+        .collect()
+}
+
+fn format_checksum_mismatches(
+    mismatches: &[crate::db::postgres::MigrationChecksumMismatch],
+) -> String {
+    if mismatches.is_empty() {
+        return "[]".to_string();
+    }
+    let parts = mismatches
+        .iter()
+        .map(|mismatch| {
+            format!(
+                "version={} applied_checksum={} resolved_checksum={}",
+                mismatch.version, mismatch.applied_checksum, mismatch.resolved_checksum
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", parts.join(", "))
+}
+
 fn postgres_migration_status_is_healthy(
     status: &crate::db::postgres::MigrationStatus,
-    checksum_mismatches: &[i64],
+    checksum_mismatches: &[crate::db::postgres::MigrationChecksumMismatch],
 ) -> bool {
     status.missing_from_resolved.is_empty()
         && unsuccessful_migration_versions(status).is_empty()
@@ -4306,7 +4431,7 @@ pub fn cmd_doctor(options: DoctorOptions) -> Result<(), String> {
 mod profile_filter_tests {
     use super::{
         Check, CheckGroup, DoctorOptions, build_json_report, check_group_from_report,
-        doctor_profile_includes_check,
+        checksum_mismatch_evidence, doctor_profile_includes_check, format_checksum_mismatches,
     };
     use crate::cli::doctor::contract::{DoctorProfile, RunContext};
 
@@ -4398,6 +4523,25 @@ mod profile_filter_tests {
             check_group_from_report("optional_connectors"),
             CheckGroup::OptionalConnectors
         );
+    }
+
+    #[test]
+    fn postgres_checksum_mismatch_detail_includes_applied_and_resolved_hashes() {
+        let mismatches = vec![crate::db::postgres::MigrationChecksumMismatch {
+            version: 1,
+            applied_checksum: "oldchecksum".to_string(),
+            resolved_checksum: "newchecksum".to_string(),
+        }];
+
+        let formatted = format_checksum_mismatches(&mismatches);
+        assert!(formatted.contains("version=1"));
+        assert!(formatted.contains("applied_checksum=oldchecksum"));
+        assert!(formatted.contains("resolved_checksum=newchecksum"));
+
+        let evidence = checksum_mismatch_evidence(&mismatches);
+        assert_eq!(evidence[0]["version"], 1);
+        assert_eq!(evidence[0]["applied_checksum"], "oldchecksum");
+        assert_eq!(evidence[0]["resolved_checksum"], "newchecksum");
     }
 }
 
@@ -4505,7 +4649,13 @@ mod tests {
                 ]
             }),
         );
-        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(
+            check.status,
+            CheckStatus::Pass,
+            "detail={} evidence={:?}",
+            check.detail,
+            check.evidence
+        );
         assert!(check.detail.contains("2/2 connected"));
     }
 
@@ -4750,6 +4900,7 @@ mod tests {
         let helper = temp.path().join("provider-helper");
         let provider = temp.path().join("codex");
         let original_path = std::env::var_os("PATH");
+        let original_openai_key = std::env::var_os("OPENAI_API_KEY");
 
         write_executable(&helper, "#!/bin/sh\nprintf 'codex-test 1.2.3\\n'\n");
         write_executable(
@@ -4760,6 +4911,7 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
             std::env::set_var("AGENTDESK_CODEX_PATH", &provider);
+            std::env::set_var("OPENAI_API_KEY", "doctor-test-key");
         }
 
         let snapshot = HealthSnapshot {
@@ -4772,6 +4924,11 @@ mod tests {
         assert_eq!(check.status, CheckStatus::Pass);
         assert!(check.detail.contains("codex-test 1.2.3"));
         assert!(check.detail.contains("env_override"));
+        assert!(check.detail.contains("credentials=present"));
+        assert!(check.detail.contains("auth usability unverified"));
+        let evidence = check.evidence.as_ref().unwrap();
+        assert_eq!(evidence["credential_present"], true);
+        assert_eq!(evidence["auth_usability_verified"], false);
         assert_eq!(
             check.path.as_deref(),
             Some(provider.to_string_lossy().as_ref())
@@ -4779,9 +4936,84 @@ mod tests {
 
         unsafe {
             std::env::remove_var("AGENTDESK_CODEX_PATH");
+            match original_openai_key {
+                Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+                None => std::env::remove_var("OPENAI_API_KEY"),
+            }
             match original_path {
                 Some(value) => std::env::set_var("PATH", value),
                 None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_runtime_check_skips_broken_priority_candidate() {
+        let _guard = crate::services::discord::runtime_store::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let broken_dir = temp.path().join("broken");
+        let working_dir = temp.path().join("working");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::create_dir_all(&working_dir).unwrap();
+
+        let broken = broken_dir.join("codex");
+        let working = working_dir.join("codex");
+        let original_path = std::env::var_os("PATH");
+        let original_override = std::env::var_os("AGENTDESK_CODEX_PATH");
+        let original_openai_key = std::env::var_os("OPENAI_API_KEY");
+        write_executable(&broken, "#!/bin/sh\nexit 2\n");
+        write_executable(
+            &working,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'codex-working 2.0\\n'\nelse\n  exit 64\nfi\n",
+        );
+
+        let path = std::env::join_paths([&broken_dir, &working_dir]).unwrap();
+        unsafe {
+            std::env::set_var("PATH", path);
+            std::env::remove_var("AGENTDESK_CODEX_PATH");
+            std::env::set_var("OPENAI_API_KEY", "doctor-test-key");
+        }
+
+        let snapshot = HealthSnapshot {
+            base: test_base_url(),
+            body: None,
+            error: None,
+        };
+        let check = check_provider_cli(ProviderKind::Codex, true, &snapshot);
+        let execution_resolution = crate::services::platform::resolve_provider_binary("codex");
+
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(
+            execution_resolution.resolved_path.as_deref(),
+            Some(working.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            check.path.as_deref(),
+            Some(working.to_string_lossy().as_ref())
+        );
+        assert!(check.detail.contains("codex-working 2.0"));
+        let evidence = check.evidence.as_ref().unwrap();
+        assert!(
+            evidence["skipped_candidate_failures"]
+                .as_array()
+                .is_some_and(|failures| failures.iter().any(|failure| failure
+                    .as_str()
+                    .is_some_and(|s| s.contains("version_probe_failed"))))
+        );
+
+        unsafe {
+            match original_path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            match original_override {
+                Some(value) => std::env::set_var("AGENTDESK_CODEX_PATH", value),
+                None => std::env::remove_var("AGENTDESK_CODEX_PATH"),
+            }
+            match original_openai_key {
+                Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+                None => std::env::remove_var("OPENAI_API_KEY"),
             }
         }
     }
@@ -5221,7 +5453,11 @@ mod tests {
 
         assert!(!postgres_migration_status_is_healthy(
             &status,
-            &[202604250001]
+            &[crate::db::postgres::MigrationChecksumMismatch {
+                version: 202604250001,
+                applied_checksum: "applied".to_string(),
+                resolved_checksum: "resolved".to_string(),
+            }]
         ));
     }
 

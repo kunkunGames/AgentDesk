@@ -396,6 +396,125 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
   assert.deepEqual(toPlain(state.executions[2].params), ["deadlock_check:" + sessionKey]);
 });
 
+test("timeouts active monitor opt-in review hang recovery retries stale review dispatches", () => {
+  const sessionKey = "provider:AgentDesk-claude-review-session";
+  const previousCheck = Date.now() - 16 * 60 * 1000;
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: {
+      server_port: 8791,
+      review_hang_auto_recovery_enabled: true,
+      review_hang_auto_recovery_stale_min: 15,
+      review_hang_auto_recovery_max_extensions: 1
+    },
+    inflights: [
+      {
+        provider: "claude",
+        channel_id: "review-channel",
+        channel_name: "project-agentdesk-review",
+        session_key: sessionKey,
+        tmux_session_name: "AgentDesk-claude-review-session",
+        started_at: timestampMinutesAgo(20),
+        updated_at: timestampMinutesAgo(16),
+        dispatch_id: "dispatch-review-1"
+      }
+    ],
+    dbQuery: createSqlRouter([
+      { match: "DELETE FROM kv_meta WHERE key IN", result: [] },
+      {
+        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        result: []
+      },
+      {
+        match: "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat FROM sessions WHERE status IN ('turn_active', 'working')",
+        result: [
+          {
+            session_key: sessionKey,
+            agent_id: "agent-review",
+            active_dispatch_id: "dispatch-review-1",
+            last_heartbeat: timestampMinutesAgo(16)
+          }
+        ]
+      },
+      {
+        match: "SELECT dispatch_type FROM task_dispatches WHERE id = ?",
+        result: [{ dispatch_type: "review" }]
+      },
+      {
+        match: "SELECT value FROM kv_meta WHERE key = ?",
+        result: [{ value: JSON.stringify({ count: 1, ts: previousCheck }) }]
+      },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_check:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_history:%'", result: [] }
+    ]),
+    exec() {
+      return "0\n";
+    },
+    httpPost() {
+      return {
+        ok: true,
+        tmux_killed: true,
+        inflight_cleared: true,
+        retry_dispatch_id: "retry-review-1"
+      };
+    }
+  });
+
+  policy._section_I();
+
+  assert.equal(state.httpPosts.length, 1);
+  assert.equal(
+    state.httpPosts[0].url,
+    "http://127.0.0.1:8791/api/sessions/" + encodeURIComponent(sessionKey) + "/force-kill"
+  );
+  assert.equal(state.httpPosts[0].body.retry, true);
+  assert.match(state.httpPosts[0].body.reason, /review hang timeout/);
+  assert.equal(state.deadlockAlerts.length, 1);
+  assert.match(state.deadlockAlerts[0].message, /재디스패치 완료/);
+});
+
+test("timeouts active monitor review fast path leaves non-review sessions on the normal threshold", () => {
+  const sessionKey = "provider:AgentDesk-codex-implementation-session";
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: {
+      server_port: 8791,
+      review_hang_auto_recovery_enabled: true,
+      review_hang_auto_recovery_stale_min: 15
+    },
+    dbQuery: createSqlRouter([
+      { match: "DELETE FROM kv_meta WHERE key IN", result: [] },
+      {
+        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        result: []
+      },
+      {
+        match: "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat FROM sessions WHERE status IN ('turn_active', 'working')",
+        result: [
+          {
+            session_key: sessionKey,
+            agent_id: "agent-impl",
+            active_dispatch_id: "dispatch-impl-1",
+            last_heartbeat: timestampMinutesAgo(16)
+          }
+        ]
+      },
+      {
+        match: "SELECT dispatch_type FROM task_dispatches WHERE id = ?",
+        result: [{ dispatch_type: "implementation" }]
+      },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_check:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_history:%'", result: [] }
+    ]),
+    exec() {
+      throw new Error("non-review session under 30 minutes should not probe tmux");
+    }
+  });
+
+  policy._section_I();
+
+  assert.equal(state.httpPosts.length, 0);
+  assert.equal(state.deadlockAlerts.length, 0);
+});
+
 test("timeouts orphan dispatch module emits orphan recovery signals", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     dbQuery: createSqlRouter([
@@ -625,15 +744,6 @@ test("timeouts idle-kill module calls kill-tmux API for expired idle sessions", 
         ]
       },
       {
-        // Thread-channel 8h batch — empty in this scenario.
-        match(sql) {
-          return sql.includes("WHERE status = 'idle'") &&
-            sql.includes("active_dispatch_id IS NULL") &&
-            sql.includes("INTERVAL '8 hours'");
-        },
-        result: []
-      },
-      {
         match(sql) {
           return sql.includes("WHERE status = 'idle'") &&
             sql.includes("active_dispatch_id IS NOT NULL") &&
@@ -655,11 +765,27 @@ test("timeouts idle-kill module calls kill-tmux API for expired idle sessions", 
   assert.match(state.logs.info.join("\n"), /idle kill: agent-idle-1/);
 });
 
-test("timeouts idle-kill module reaps thread-suffixed sessions after 8h idle", () => {
-  // Thread sessions now have their OWN 8h idle-kill batch (kill-tmux only, DB
-  // row preserved for resume). This is the backstop for thread tmux sessions
-  // whose inner CLI stayed alive as an interactive prompt — the dead-session
-  // reaper can never reach them because the pane never goes dead.
+test("timeouts idle-kill module does not let zombie (already-gone tmux) rows starve live idle sessions (#2861)", () => {
+  // Main idle batch has maxKills=3. Put 3 zombie rows (tmux already gone →
+  // tmux_killed:false) ahead of a genuinely-alive idle row. A no-op kill must
+  // NOT consume the budget, so the live row at position 4 still gets reaped.
+  const zombieKeys = [
+    "provider:AgentDesk-claude-zombie-1",
+    "provider:AgentDesk-claude-zombie-2",
+    "provider:AgentDesk-claude-zombie-3"
+  ];
+  const liveKey = "provider:AgentDesk-claude-live-4";
+  function row(session_key) {
+    return {
+      session_key,
+      agent_id: null,
+      provider: "claude",
+      active_dispatch_id: null,
+      thread_channel_id: null,
+      last_seen_at: "2000-01-01 00:00:00"
+    };
+  }
+
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     config: { server_port: 8791 },
     dbQuery: createSqlRouter([
@@ -672,61 +798,79 @@ test("timeouts idle-kill module reaps thread-suffixed sessions after 8h idle", (
         result: []
       },
       {
-        // Main-channel 6h batch — empty in this scenario.
         match(sql) {
-          return sql.includes("INTERVAL '6 hours'") &&
-            sql.includes("thread_channel_id IS NULL");
+          return sql.includes("WHERE status = 'idle'") &&
+            sql.includes("active_dispatch_id IS NULL") &&
+            sql.includes("INTERVAL '6 hours'");
         },
-        result: []
-      },
-      {
-        // Thread-channel 8h batch — one stuck thread session.
-        match(sql) {
-          return sql.includes("INTERVAL '8 hours'") &&
-            sql.includes("thread_channel_id IS NOT NULL");
-        },
-        result: [
-          {
-            session_key: "claude/discord_x/host:AgentDesk-claude-adk-cc-t1492434645395177545",
-            agent_id: "agent-thread-1",
-            provider: "claude",
-            active_dispatch_id: null,
-            thread_channel_id: null,
-            last_seen_at: "2000-01-01 00:00:00"
-          }
-        ]
+        result: [...zombieKeys.map(row), row(liveKey)]
       },
       {
         match(sql) {
-          return sql.includes("active_dispatch_id IS NOT NULL") &&
+          return sql.includes("WHERE status = 'idle'") &&
+            sql.includes("active_dispatch_id IS NOT NULL") &&
             sql.includes("INTERVAL '24 hours'");
         },
         result: []
-      },
-      {
-        // Agent resolution for the thread session.
-        match: "SELECT to_agent_id FROM task_dispatches WHERE thread_id = ?",
-        result: []
       }
     ]),
-    httpPost() {
-      return { ok: true, tmux_killed: true };
+    httpPost(url) {
+      // Zombie rows report tmux_was_alive:false (handler reconciled the stale
+      // row to disconnected); the live row is actually killed.
+      const tmuxGone = url.includes("live-4") === false;
+      return tmuxGone
+        ? { ok: true, tmux_was_alive: false, tmux_killed: false, session_row_disconnected: true }
+        : { ok: true, tmux_was_alive: true, tmux_killed: true };
     }
   });
 
   policy._section_O();
 
-  assert.equal(state.httpPosts.length, 1);
-  assert.match(
-    state.httpPosts[0].url,
-    /AgentDesk-claude-adk-cc-t1492434645395177545\/kill-tmux$/
-  );
-  assert.match(state.httpPosts[0].body.reason, /idle \d+(시간|일) 초과/);
-  // Thread sessions go through kill-tmux (resume preserved), never force-kill.
-  assert.equal(state.httpPosts[0].body.retry, undefined);
+  // All 4 rows get a kill-tmux call (zombies no longer break the budget early).
+  assert.equal(state.httpPosts.length, 4);
+  // The live row was reached and actually killed.
+  assert.ok(state.httpPosts.some((p) => p.url.includes("live-4")));
+  assert.match(state.logs.info.join("\n"), /Killed idle tmux .*live-4/);
 });
 
-test("timeouts idle-kill module reaps both main and thread idle rows in their batches", () => {
+test("timeouts idle-kill module counts genuine kill failures (tmux alive but kill failed) toward budget", () => {
+  // A live session whose `tmux kill-session` fails (tmux_was_alive:true,
+  // tmux_killed:false) is NOT a zombie — it must consume the budget so a stuck
+  // session is not retried unbounded every tick, and must be logged as an error.
+  const failKeys = [
+    "provider:AgentDesk-claude-stuck-1",
+    "provider:AgentDesk-claude-stuck-2",
+    "provider:AgentDesk-claude-stuck-3",
+    "provider:AgentDesk-claude-stuck-4"
+  ];
+  function row(session_key) {
+    return {
+      session_key, agent_id: null, provider: "claude",
+      active_dispatch_id: null, thread_channel_id: null,
+      last_seen_at: "2000-01-01 00:00:00"
+    };
+  }
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    config: { server_port: 8791 },
+    dbQuery: createSqlRouter([
+      { match: "SELECT id, name, name_ko, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx FROM agents", result: [] },
+      { match: "FROM sessions WHERE provider IN ('claude', 'codex', 'qwen') AND (agent_id IS NULL OR TRIM(agent_id) = '')", result: [] },
+      { match: (sql) => sql.includes("WHERE status = 'idle'") && sql.includes("active_dispatch_id IS NULL") && sql.includes("INTERVAL '6 hours'"), result: failKeys.map(row) },
+      { match: (sql) => sql.includes("WHERE status = 'idle'") && sql.includes("active_dispatch_id IS NOT NULL") && sql.includes("INTERVAL '24 hours'"), result: [] }
+    ]),
+    httpPost() {
+      return { ok: true, tmux_was_alive: true, tmux_killed: false };
+    }
+  });
+
+  policy._section_O();
+
+  // maxKills=3 for the main idle batch; failures count, so only 3 attempts.
+  assert.equal(state.httpPosts.length, 3);
+  assert.match(state.logs.error.join("\n"), /tmux was alive but kill failed/);
+});
+
+test("timeouts idle-kill module excludes thread idle rows from the main batch", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     config: { server_port: 8791 },
     dbQuery: createSqlRouter([
@@ -766,52 +910,12 @@ test("timeouts idle-kill module reaps both main and thread idle rows in their ba
         ]
       },
       {
-        // Thread-channel 8h batch — three thread-shaped rows, all reaped.
-        match(sql) {
-          return sql.includes("INTERVAL '8 hours'") &&
-            sql.includes("thread_channel_id IS NOT NULL");
-        },
-        result: [
-          {
-            // -t<id> suffix.
-            session_key: "claude/discord_x/host:AgentDesk-claude-adk-cc-t1492434645395177545",
-            agent_id: "agent-thread-1",
-            provider: "claude",
-            active_dispatch_id: null,
-            thread_channel_id: null,
-            last_seen_at: "2000-01-01 00:00:00"
-          },
-          {
-            // thread_channel_id populated, session_key looks main.
-            session_key: "claude/discord_x/host:AgentDesk-claude-other",
-            agent_id: "agent-thread-2",
-            provider: "claude",
-            active_dispatch_id: null,
-            thread_channel_id: "12345",
-            last_seen_at: "2000-01-01 00:00:00"
-          },
-          {
-            // -t<id>-dev suffix.
-            session_key: "claude/discord_x/host:AgentDesk-claude-adk-cc-t1492434645395177545-dev",
-            agent_id: "agent-thread-dev",
-            provider: "claude",
-            active_dispatch_id: null,
-            thread_channel_id: null,
-            last_seen_at: "2000-01-01 00:00:00"
-          }
-        ]
-      },
-      {
         match(sql) {
           return sql.includes("active_dispatch_id IS NOT NULL") &&
             sql.includes("INTERVAL '24 hours'");
         },
         result: []
       },
-      {
-        match: "SELECT to_agent_id FROM task_dispatches WHERE thread_id = ?",
-        result: []
-      }
     ]),
     httpPost() {
       return { ok: true, tmux_killed: true };
@@ -820,12 +924,12 @@ test("timeouts idle-kill module reaps both main and thread idle rows in their ba
 
   policy._section_O();
 
-  // Main row + 3 thread rows all reaped.
-  assert.equal(state.httpPosts.length, 4);
+  const idleSql = state.queries.map((q) => q.sql).join("\n");
+  assert.match(idleSql, /thread_channel_id IS NULL/);
+  assert.match(idleSql, /session_key !~ '-t\[0-9\]\{15,\}\(-dev\)\?\$'/);
+  assert.equal(state.httpPosts.length, 1);
   const urls = state.httpPosts.map((p) => p.url).join("\n");
   assert.match(urls, /AgentDesk-claude-adk-cc\/kill-tmux$/m);
-  assert.match(urls, /AgentDesk-claude-adk-cc-t1492434645395177545\/kill-tmux$/m);
-  assert.match(urls, /AgentDesk-claude-other\/kill-tmux$/m);
   // Reason text uses the human-readable formatter (hours, not minutes).
   state.httpPosts.forEach((p) => {
     assert.match(p.body.reason, /idle \d+(시간|일) 초과/);

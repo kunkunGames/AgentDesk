@@ -9,17 +9,25 @@ use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId};
 
 use super::SharedData;
+use super::gateway::{GatewayFuture, TurnGateway};
+use super::inflight::{InflightTurnState, RelayOwnerKind, TurnSource};
+use super::turn_bridge::{TurnBridgeContext, spawn_turn_bridge};
 use crate::services::agent_protocol::{RuntimeHandoffKind, StreamMessage};
 use crate::services::claude_tui::hook_server::{HookEventKind, subscribe_hook_events};
-use crate::services::provider::{ProviderKind, ReadOutputResult};
+use crate::services::memory::TokenUsage;
+use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::tui_prompt_dedupe::{
-    ObservedTuiPrompt, extract_prompt_from_hook_payload, observe_prompt_by_provider_session_at,
+    ExternalInputRelayLease, ExternalInputRelayOwner, ObservedTuiPrompt,
+    extract_prompt_from_hook_payload, observe_prompt_by_provider_session_at,
     subscribe_observed_prompts,
 };
+use tracing::Instrument;
 
 const SSH_DIRECT_PROMPT_PREVIEW_LIMIT: usize = 1500;
 const CODEX_IDLE_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const CLAUDE_IDLE_INFLIGHT_DRAIN_WAIT: Duration = Duration::from_secs(5);
+const CLAUDE_IDLE_INFLIGHT_DRAIN_POLL: Duration = Duration::from_millis(100);
 /// #2843: when the background idle relay loop discovers that a session's
 /// transcript path changed, scan this many bytes back from EOF (not from EOF
 /// itself) so a prompt already written to the freshly-resolved transcript is
@@ -50,6 +58,229 @@ struct CodexIdleTailDoneGuard {
     done_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
+struct TuiDirectExternalInputLeaseGuard {
+    provider: ProviderKind,
+    tmux_session_name: String,
+    channel_id: ChannelId,
+    lease: ExternalInputRelayLease,
+    active: bool,
+}
+
+impl TuiDirectExternalInputLeaseGuard {
+    fn new(
+        provider: ProviderKind,
+        tmux_session_name: &str,
+        channel_id: ChannelId,
+        lease: &ExternalInputRelayLease,
+    ) -> Self {
+        Self {
+            provider,
+            tmux_session_name: tmux_session_name.to_string(),
+            channel_id,
+            lease: lease.clone(),
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+
+    fn clear_if_current(&self) -> bool {
+        clear_external_input_bridge_lease_if_current(
+            &self.provider,
+            &self.tmux_session_name,
+            self.channel_id,
+            &self.lease,
+        )
+    }
+}
+
+impl Drop for TuiDirectExternalInputLeaseGuard {
+    fn drop(&mut self) {
+        // Match the exact lease so a slow timeout cannot clear a newer direct-input turn
+        // that reused the same provider/session/channel after this tail started.
+        if self.active {
+            self.clear_if_current();
+        }
+    }
+}
+
+fn clear_external_input_bridge_lease_if_current(
+    provider: &ProviderKind,
+    tmux_session_name: &str,
+    channel_id: ChannelId,
+    lease: &ExternalInputRelayLease,
+) -> bool {
+    if !bridge_adapter_owns_external_turn(lease.relay_owner) {
+        return false;
+    }
+    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_matches(
+        provider.as_str(),
+        tmux_session_name,
+        channel_id.get(),
+        lease,
+    )
+}
+
+struct TuiDirectBridgeGateway {
+    http: Arc<serenity::Http>,
+    shared: Arc<SharedData>,
+    provider: ProviderKind,
+}
+
+impl TurnGateway for TuiDirectBridgeGateway {
+    fn send_message<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<MessageId, String>> {
+        Box::pin(async move {
+            super::gateway::send_outbound_message(
+                self.http.clone(),
+                self.shared.clone(),
+                channel_id,
+                content,
+            )
+            .await
+        })
+    }
+
+    fn edit_message<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            super::gateway::edit_outbound_message(
+                self.http.clone(),
+                self.shared.clone(),
+                channel_id,
+                message_id,
+                content,
+            )
+            .await
+        })
+    }
+
+    fn delete_message<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            super::rate_limit_wait(&self.shared, channel_id).await;
+            channel_id
+                .delete_message(&self.http, message_id)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn replace_message_with_outcome<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<super::formatting::ReplaceLongMessageOutcome, String>> {
+        Box::pin(async move {
+            super::formatting::replace_long_message_raw_with_outcome(
+                &self.http,
+                channel_id,
+                message_id,
+                content,
+                &self.shared,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            super::formatting::add_reaction_raw(&self.http, channel_id, message_id, emoji).await;
+        })
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        emoji: char,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            super::formatting::remove_reaction_raw(&self.http, channel_id, message_id, emoji).await;
+        })
+    }
+
+    fn schedule_retry_with_history<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        user_message_id: MessageId,
+        _user_text: &'a str,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            tracing::warn!(
+                provider = %self.provider.as_str(),
+                channel_id = channel_id.get(),
+                user_message_id = user_message_id.get(),
+                "TUI-direct bridge adapter suppressed retry resubmission through Discord intake"
+            );
+        })
+    }
+
+    fn schedule_retry_with_history_with_completion<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        user_message_id: MessageId,
+        user_text: &'a str,
+        completion_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> GatewayFuture<'a, ()> {
+        Box::pin(async move {
+            self.schedule_retry_with_history(channel_id, user_message_id, user_text)
+                .await;
+            let _ = completion_tx.send(());
+        })
+    }
+
+    fn dispatch_queued_turn<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _intervention: &'a super::Intervention,
+        _request_owner_name: &'a str,
+        _has_more_queued_turns: bool,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(
+            async move { Err("TUI-direct bridge adapter cannot dispatch queued turns".into()) },
+        )
+    }
+
+    fn validate_live_routing<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+    ) -> GatewayFuture<'a, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn requester_mention(&self) -> Option<String> {
+        None
+    }
+
+    fn can_chain_locally(&self) -> bool {
+        true
+    }
+
+    fn bot_owner_provider(&self) -> Option<ProviderKind> {
+        Some(self.provider.clone())
+    }
+}
+
 impl Drop for CodexIdleTailDoneGuard {
     fn drop(&mut self) {
         if let Some(tmux_session_name) = self.tmux_session_name.take() {
@@ -68,10 +299,14 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
         spawn_claude_idle_transcript_relay(shared.clone());
     }
 
+    let provider_name = provider.as_str().to_string();
+    let observer_span = tracing::info_span!(
+        "tui_prompt_relay_observer",
+        provider = %provider_name
+    );
     super::task_supervisor::spawn_observed("tui_prompt_relay_observer", async move {
         let mut hook_rx = subscribe_hook_events();
         let mut observed_rx = subscribe_observed_prompts();
-        let provider_name = provider.as_str().to_string();
         loop {
             tokio::select! {
                 hook_event = hook_rx.recv() => {
@@ -123,7 +358,7 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
                 }
             }
         }
-    });
+    }.instrument(observer_span));
 }
 
 async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiPrompt) {
@@ -135,15 +370,27 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         );
         return;
     };
-    crate::services::tui_prompt_dedupe::record_external_input_relay_lease(
-        &prompt.provider,
-        &prompt.tmux_session_name,
-        Some(channel_id.get()),
-    );
+    let lease = record_observed_external_turn_lease(shared, &prompt, channel_id);
+    let mut lease_guard = ProviderKind::from_str(&prompt.provider).and_then(|provider| {
+        (matches!(provider, ProviderKind::Claude)
+            && bridge_adapter_owns_external_turn(lease.relay_owner))
+        .then(|| {
+            TuiDirectExternalInputLeaseGuard::new(
+                provider,
+                &prompt.tmux_session_name,
+                channel_id,
+                &lease,
+            )
+        })
+    });
     let Some(registry) = shared.health_registry() else {
         tracing::warn!(
             provider = %prompt.provider,
             channel_id = channel_id.get(),
+            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+            session_key = lease.session_key.as_deref().unwrap_or(""),
+            relay_owner = lease.relay_owner.as_str(),
+            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
             "skipping SSH-direct TUI prompt notify; health registry unavailable"
         );
         return;
@@ -154,6 +401,10 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             tracing::warn!(
                 provider = %prompt.provider,
                 channel_id = channel_id.get(),
+                turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                session_key = lease.session_key.as_deref().unwrap_or(""),
+                relay_owner = lease.relay_owner.as_str(),
+                runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
                 status = %status,
                 body = %body,
                 "skipping SSH-direct TUI prompt notify; notify bot unavailable"
@@ -172,6 +423,10 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             tracing::warn!(
                 provider = %prompt.provider,
                 channel_id = channel_id.get(),
+                turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                session_key = lease.session_key.as_deref().unwrap_or(""),
+                relay_owner = lease.relay_owner.as_str(),
+                runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
                 error = %error,
                 "failed to send SSH-direct TUI prompt notify"
             );
@@ -184,16 +439,215 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         channel_id.get(),
         anchor_message.id.get(),
     );
+    super::formatting::add_reaction_raw(&notify_http, channel_id, anchor_message.id, '⏳').await;
     tracing::info!(
         provider = %prompt.provider,
         channel_id = channel_id.get(),
         tmux_session_name = %prompt.tmux_session_name,
+        turn_id = lease.turn_id.as_deref().unwrap_or(""),
+        session_key = lease.session_key.as_deref().unwrap_or(""),
+        relay_owner = lease.relay_owner.as_str(),
+        runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
         anchor_message_id = anchor_message.id.get(),
         "SSH-direct TUI prompt notified; runtime relay will handle output without synthetic inflight"
     );
 
     #[cfg(unix)]
-    maybe_spawn_claude_idle_response_tail(shared.clone(), channel_id, &prompt).await;
+    {
+        if maybe_spawn_claude_idle_response_tail(shared.clone(), channel_id, &prompt, &lease).await
+            && let Some(guard) = lease_guard.as_mut()
+        {
+            guard.disarm();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &mut lease_guard;
+    }
+}
+
+fn record_observed_external_turn_lease(
+    shared: &Arc<SharedData>,
+    prompt: &ObservedTuiPrompt,
+    channel_id: ChannelId,
+) -> ExternalInputRelayLease {
+    let provider = ProviderKind::from_str(&prompt.provider);
+    let binding = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(
+        &prompt.tmux_session_name,
+    );
+    let runtime_kind = binding.as_ref().map(|binding| binding.runtime_kind);
+    let relay_output_path = binding.as_ref().map(|binding| {
+        #[cfg(unix)]
+        {
+            if prompt
+                .provider
+                .trim()
+                .eq_ignore_ascii_case(ProviderKind::Claude.as_str())
+                && binding.runtime_kind == RuntimeHandoffKind::ClaudeTui
+                && let Some(transcript_path) = resolved_claude_idle_relay_transcript_path(
+                    shared,
+                    &prompt.tmux_session_name,
+                    channel_id,
+                    binding,
+                )
+            {
+                return transcript_path;
+            }
+        }
+        PathBuf::from(binding.relay_output_path())
+    });
+    let relay_owner = external_input_relay_owner_for_output(
+        shared,
+        &prompt.tmux_session_name,
+        relay_output_path.as_deref(),
+    );
+    let session_key = provider.as_ref().map(|provider| {
+        super::adk_session::build_namespaced_session_key(
+            &shared.token_hash,
+            provider,
+            &prompt.tmux_session_name,
+        )
+    });
+    let lease = ExternalInputRelayLease {
+        channel_id: Some(channel_id.get()),
+        turn_id: Some(external_input_turn_id(
+            &prompt.provider,
+            channel_id,
+            &prompt.tmux_session_name,
+            prompt.observed_at,
+        )),
+        session_key,
+        relay_owner,
+        runtime_kind,
+    };
+    crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+        &prompt.provider,
+        &prompt.tmux_session_name,
+        lease.clone(),
+    );
+    tracing::info!(
+        provider = %prompt.provider,
+        channel_id = channel_id.get(),
+        tmux_session_name = %prompt.tmux_session_name,
+        turn_id = lease.turn_id.as_deref().unwrap_or(""),
+        session_key = lease.session_key.as_deref().unwrap_or(""),
+        relay_owner = lease.relay_owner.as_str(),
+        runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+        "observed TUI-direct input as already-submitted external turn"
+    );
+    lease
+}
+
+fn record_external_turn_lease_for_output(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    runtime_kind: RuntimeHandoffKind,
+    output_path: &Path,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> ExternalInputRelayLease {
+    let relay_owner =
+        external_input_relay_owner_for_output(shared, tmux_session_name, Some(output_path));
+    let lease = ExternalInputRelayLease {
+        channel_id: Some(channel_id.get()),
+        turn_id: Some(external_input_turn_id(
+            provider.as_str(),
+            channel_id,
+            tmux_session_name,
+            observed_at,
+        )),
+        session_key: Some(super::adk_session::build_namespaced_session_key(
+            &shared.token_hash,
+            provider,
+            tmux_session_name,
+        )),
+        relay_owner,
+        runtime_kind: Some(runtime_kind),
+    };
+    crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+        provider.as_str(),
+        tmux_session_name,
+        lease.clone(),
+    );
+    lease
+}
+
+fn external_input_turn_id(
+    provider: &str,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    observed_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "external:{}:{}:{}:{}",
+        provider.trim(),
+        channel_id.get(),
+        tmux_session_name.trim(),
+        observed_at.timestamp_millis()
+    )
+}
+
+fn external_input_relay_owner_for_output(
+    shared: &Arc<SharedData>,
+    tmux_session_name: &str,
+    output_path: Option<&Path>,
+) -> ExternalInputRelayOwner {
+    external_input_relay_owner_for_watchers(
+        &shared.tmux_watchers,
+        tmux_session_name,
+        output_path,
+        session_bound_discord_delivery_enabled(),
+    )
+}
+
+fn session_bound_discord_delivery_enabled() -> bool {
+    #[cfg(unix)]
+    {
+        super::session_relay_sink::session_bound_discord_delivery_enabled()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn external_input_relay_owner_for_watchers(
+    watchers: &super::TmuxWatcherRegistry,
+    tmux_session_name: &str,
+    output_path: Option<&Path>,
+    session_bound_discord_delivery_enabled: bool,
+) -> ExternalInputRelayOwner {
+    let watcher_alive = watchers
+        .tmux_session_is_stale(tmux_session_name)
+        .is_some_and(|stale| !stale);
+    if !watcher_alive {
+        return ExternalInputRelayOwner::BridgeAdapter;
+    }
+
+    let watcher_covers_output = match output_path {
+        Some(output_path) => watchers
+            .watcher_output_path(tmux_session_name)
+            .is_some_and(|watcher_path| Path::new(&watcher_path) == output_path),
+        None => true,
+    };
+    if !watcher_covers_output {
+        return ExternalInputRelayOwner::BridgeAdapter;
+    }
+
+    if session_bound_discord_delivery_enabled {
+        // TUI-direct observations do not create a foreground inflight row yet.
+        // A session-bound StreamRelay can only be the terminal owner for an
+        // external-input turn once such an inflight exists; otherwise the
+        // watcher can acknowledge frames without a Discord terminal commit.
+        ExternalInputRelayOwner::BridgeAdapter
+    } else {
+        ExternalInputRelayOwner::TmuxWatcher
+    }
+}
+
+fn bridge_adapter_owns_external_turn(owner: ExternalInputRelayOwner) -> bool {
+    matches!(owner, ExternalInputRelayOwner::BridgeAdapter)
 }
 
 #[cfg(unix)]
@@ -201,16 +655,41 @@ async fn maybe_spawn_claude_idle_response_tail(
     shared: Arc<SharedData>,
     channel_id: ChannelId,
     prompt: &ObservedTuiPrompt,
-) {
+    lease: &ExternalInputRelayLease,
+) -> bool {
     if !prompt
         .provider
         .trim()
         .eq_ignore_ascii_case(ProviderKind::Claude.as_str())
     {
-        return;
+        return false;
     }
-    if super::inflight::load_inflight_state(&ProviderKind::Claude, channel_id.get()).is_some() {
-        return;
+    if !bridge_adapter_owns_external_turn(lease.relay_owner) {
+        tracing::debug!(
+            provider = %prompt.provider,
+            channel_id = channel_id.get(),
+            tmux_session_name = %prompt.tmux_session_name,
+            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+            session_key = lease.session_key.as_deref().unwrap_or(""),
+            relay_owner = lease.relay_owner.as_str(),
+            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+            "skipping Claude idle response tail; external turn has another relay owner"
+        );
+        return false;
+    }
+    if !wait_for_claude_inflight_to_clear(channel_id).await {
+        tracing::warn!(
+            provider = %prompt.provider,
+            channel_id = channel_id.get(),
+            tmux_session_name = %prompt.tmux_session_name,
+            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+            session_key = lease.session_key.as_deref().unwrap_or(""),
+            relay_owner = lease.relay_owner.as_str(),
+            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+            wait_ms = CLAUDE_IDLE_INFLIGHT_DRAIN_WAIT.as_millis(),
+            "skipping Claude idle response tail; previous inflight did not drain"
+        );
+        return false;
     }
     let Some(binding) = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(
         &prompt.tmux_session_name,
@@ -219,19 +698,23 @@ async fn maybe_spawn_claude_idle_response_tail(
             tmux_session_name = %prompt.tmux_session_name,
             "skipping Claude idle response tail; no runtime binding"
         );
-        return;
+        return false;
     };
     if binding.runtime_kind != RuntimeHandoffKind::ClaudeTui {
-        return;
+        return false;
     }
 
     // #2843: resolve the freshest active transcript (the bound output_path can be
     // stale) and only let a non-stale tmux watcher suppress the tail when it
     // actually covers that transcript. Re-registers the binding if it changed.
-    let Some(transcript_path) =
-        resolve_idle_relay_transcript(&shared, &prompt.tmux_session_name, channel_id, &binding)
-    else {
-        return;
+    let Some(transcript_path) = resolve_idle_relay_transcript(
+        &shared,
+        &prompt.tmux_session_name,
+        channel_id,
+        &binding,
+        false,
+    ) else {
+        return false;
     };
 
     // #2843: if the path changed, don't trust the old binding offset (it indexes
@@ -253,7 +736,61 @@ async fn maybe_spawn_claude_idle_response_tail(
         channel_id,
         transcript_path,
         start_offset,
-    );
+        prompt.prompt.clone(),
+        lease.clone(),
+    )
+}
+
+#[cfg(unix)]
+async fn wait_for_claude_inflight_to_clear(channel_id: ChannelId) -> bool {
+    let mut observed_inflight = false;
+    let cleared = wait_for_transient_state_to_clear(
+        CLAUDE_IDLE_INFLIGHT_DRAIN_WAIT,
+        CLAUDE_IDLE_INFLIGHT_DRAIN_POLL,
+        || {
+            let present =
+                super::inflight::load_inflight_state(&ProviderKind::Claude, channel_id.get())
+                    .is_some();
+            observed_inflight |= present;
+            present
+        },
+    )
+    .await;
+    if observed_inflight && cleared {
+        tracing::info!(
+            provider = ProviderKind::Claude.as_str(),
+            channel_id = channel_id.get(),
+            wait_ms = CLAUDE_IDLE_INFLIGHT_DRAIN_WAIT.as_millis(),
+            "Claude idle response tail waited for previous inflight to drain"
+        );
+    }
+    cleared
+}
+
+#[cfg(unix)]
+async fn wait_for_transient_state_to_clear<F>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut is_present: F,
+) -> bool
+where
+    F: FnMut() -> bool,
+{
+    if !is_present() {
+        return true;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return !is_present();
+        }
+        tokio::time::sleep(poll_interval.min(deadline - now)).await;
+        if !is_present() {
+            return true;
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -295,6 +832,8 @@ fn spawn_claude_idle_response_tail_once(
     channel_id: ChannelId,
     transcript_path: PathBuf,
     start_offset: u64,
+    prompt_text: String,
+    lease: ExternalInputRelayLease,
 ) -> bool {
     {
         let mut active = CLAUDE_IDLE_RESPONSE_TAILS
@@ -305,19 +844,35 @@ fn spawn_claude_idle_response_tail_once(
         }
     }
 
-    super::task_supervisor::spawn_observed("claude_idle_response_tail", async move {
-        let _tail_guard = ClaudeIdleTailGuard {
-            tmux_session_name: tmux_session_name.clone(),
-        };
-        run_claude_idle_response_tail(
-            shared,
-            tmux_session_name.clone(),
-            channel_id,
-            transcript_path,
-            start_offset,
-        )
-        .await;
-    });
+    let span = tracing::info_span!(
+        "claude_idle_response_tail",
+        provider = ProviderKind::Claude.as_str(),
+        channel_id = channel_id.get(),
+        tmux_session_name = %tmux_session_name,
+        turn_id = lease.turn_id.as_deref().unwrap_or(""),
+        session_key = lease.session_key.as_deref().unwrap_or(""),
+        relay_owner = lease.relay_owner.as_str(),
+        runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+    );
+    super::task_supervisor::spawn_observed(
+        "claude_idle_response_tail",
+        async move {
+            let _tail_guard = ClaudeIdleTailGuard {
+                tmux_session_name: tmux_session_name.clone(),
+            };
+            run_claude_idle_response_tail(
+                shared,
+                tmux_session_name.clone(),
+                channel_id,
+                transcript_path,
+                start_offset,
+                prompt_text,
+                lease,
+            )
+            .await;
+        }
+        .instrument(span),
+    );
     true
 }
 
@@ -359,6 +914,7 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                     &tmux_session_name,
                     channel_id,
                     &binding,
+                    !session_bound_discord_delivery_enabled(),
                 ) else {
                     continue;
                 };
@@ -412,11 +968,13 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                         line_end_offset,
                         ..
                     } => {
+                        let observed_at = chrono::Utc::now();
                         let observation =
-                            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux(
+                            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_at(
                                 ProviderKind::Claude.as_str(),
                                 &tmux_session_name,
                                 &prompt,
+                                observed_at,
                             );
                         tracing::info!(
                             tmux_session_name = %tmux_session_name,
@@ -429,13 +987,52 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                             &transcript_path,
                             line_end_offset,
                         );
-                        if claude_idle_prompt_observation_should_tail_response(observation) {
-                            spawn_claude_idle_response_tail_once(
+                        if !claude_idle_prompt_observation_should_tail_response(observation) {
+                            continue;
+                        }
+                        let lease = record_external_turn_lease_for_output(
+                            &shared,
+                            &ProviderKind::Claude,
+                            channel_id,
+                            &tmux_session_name,
+                            binding.runtime_kind,
+                            &transcript_path,
+                            observed_at,
+                        );
+                        tracing::info!(
+                            tmux_session_name = %tmux_session_name,
+                            channel_id = channel_id.get(),
+                            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                            session_key = lease.session_key.as_deref().unwrap_or(""),
+                            relay_owner = lease.relay_owner.as_str(),
+                            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+                            "Claude idle transcript relay selected external turn owner"
+                        );
+                        if bridge_adapter_owns_external_turn(lease.relay_owner) {
+                            let tail_spawned = spawn_claude_idle_response_tail_once(
                                 shared.clone(),
                                 tmux_session_name.clone(),
                                 channel_id,
                                 transcript_path,
                                 line_end_offset,
+                                prompt,
+                                lease.clone(),
+                            );
+                            if !tail_spawned {
+                                clear_external_input_bridge_lease_if_current(
+                                    &ProviderKind::Claude,
+                                    &tmux_session_name,
+                                    channel_id,
+                                    &lease,
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                tmux_session_name = %tmux_session_name,
+                                channel_id = channel_id.get(),
+                                observation = ?observation,
+                                relay_owner = lease.relay_owner.as_str(),
+                                "Claude idle transcript relay yielded response tail"
                             );
                         }
                     }
@@ -444,7 +1041,12 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
 
             tokio::time::sleep(CODEX_IDLE_ROLLOUT_POLL_INTERVAL).await;
         }
-    });
+    }
+    .instrument(tracing::info_span!(
+        "claude_idle_transcript_relay",
+        provider = ProviderKind::Claude.as_str(),
+        runtime_kind = RuntimeHandoffKind::ClaudeTui.as_str(),
+    )));
 }
 
 #[cfg(unix)]
@@ -586,7 +1188,9 @@ fn transcript_mtime(path: &Path) -> std::time::SystemTime {
 /// discriminates this session's transcripts from older sessions' that share the
 /// same cwd.
 #[cfg(unix)]
-fn claude_tui_launch_context(tmux_session_name: &str) -> Option<(PathBuf, std::time::SystemTime)> {
+pub(in crate::services::discord) fn claude_tui_launch_context(
+    tmux_session_name: &str,
+) -> Option<(PathBuf, std::time::SystemTime)> {
     let launch_script_path = crate::services::tmux_common::resolve_session_temp_path(
         tmux_session_name,
         crate::services::tmux_common::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
@@ -610,7 +1214,7 @@ fn claude_tui_launch_context(tmux_session_name: &str) -> Option<(PathBuf, std::t
 ///      relay watcher.
 ///   3. Other sessions' registered runtime bindings — belt-and-suspenders.
 #[cfg(unix)]
-fn other_session_claimed_transcripts(
+pub(in crate::services::discord) fn other_session_claimed_transcripts(
     shared: &Arc<SharedData>,
     tmux_session_name: &str,
 ) -> std::collections::HashSet<PathBuf> {
@@ -727,6 +1331,34 @@ fn refresh_claude_runtime_binding(
     );
 }
 
+#[cfg(unix)]
+fn resolved_claude_idle_relay_transcript_path(
+    shared: &Arc<SharedData>,
+    tmux_session_name: &str,
+    channel_id: ChannelId,
+    binding: &crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
+) -> Option<PathBuf> {
+    let (transcript_path, resolved_session_id) =
+        freshest_claude_transcript_for_session(shared, tmux_session_name, binding).unwrap_or_else(
+            || {
+                (
+                    PathBuf::from(&binding.output_path),
+                    binding.session_id.clone(),
+                )
+            },
+        );
+
+    if Path::new(&binding.output_path) != transcript_path {
+        refresh_claude_runtime_binding(
+            tmux_session_name,
+            channel_id,
+            &transcript_path,
+            resolved_session_id,
+        );
+    }
+    Some(transcript_path)
+}
+
 /// #2843: decide whether the Claude idle relay should tail this session and on
 /// which transcript. Returns `Some(path)` to tail, or `None` to skip because a
 /// heartbeat-fresh watcher already covers the current transcript. Side effect:
@@ -742,16 +1374,14 @@ fn resolve_idle_relay_transcript(
     tmux_session_name: &str,
     channel_id: ChannelId,
     binding: &crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
+    allow_watcher_suppression: bool,
 ) -> Option<PathBuf> {
-    let (transcript_path, resolved_session_id) =
-        freshest_claude_transcript_for_session(shared, tmux_session_name, binding).unwrap_or_else(
-            || {
-                (
-                    PathBuf::from(&binding.output_path),
-                    binding.session_id.clone(),
-                )
-            },
-        );
+    let transcript_path =
+        resolved_claude_idle_relay_transcript_path(shared, tmux_session_name, channel_id, binding)?;
+
+    if !allow_watcher_suppression {
+        return Some(transcript_path);
+    }
 
     // #2843 (codex P0): a non-stale watcher may suppress the idle tail ONLY when
     // the watcher itself is tailing the freshest transcript. Comparing the
@@ -773,14 +1403,6 @@ fn resolve_idle_relay_transcript(
         return None;
     }
 
-    if Path::new(&binding.output_path) != transcript_path {
-        refresh_claude_runtime_binding(
-            tmux_session_name,
-            channel_id,
-            &transcript_path,
-            resolved_session_id,
-        );
-    }
     Some(transcript_path)
 }
 
@@ -1027,11 +1649,13 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                         prompt,
                         line_end_offset,
                     } => {
+                        let observed_at = chrono::Utc::now();
                         let observation =
-                            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux(
+                            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_at(
                                 ProviderKind::Codex.as_str(),
                                 &tmux_session_name,
                                 &prompt,
+                                observed_at,
                             );
                         tracing::info!(
                             tmux_session_name = %tmux_session_name,
@@ -1047,6 +1671,41 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                             );
                             continue;
                         }
+                        let lease = record_external_turn_lease_for_output(
+                            &shared,
+                            &ProviderKind::Codex,
+                            channel_id,
+                            &tmux_session_name,
+                            binding.runtime_kind,
+                            &rollout_path,
+                            observed_at,
+                        );
+                        tracing::info!(
+                            tmux_session_name = %tmux_session_name,
+                            channel_id = channel_id.get(),
+                            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                            session_key = lease.session_key.as_deref().unwrap_or(""),
+                            relay_owner = lease.relay_owner.as_str(),
+                            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+                            "codex idle rollout relay selected external turn owner"
+                        );
+                        if !bridge_adapter_owns_external_turn(lease.relay_owner) {
+                            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
+                                &tmux_session_name,
+                                &binding.output_path,
+                                line_end_offset,
+                            );
+                            tracing::debug!(
+                                tmux_session_name = %tmux_session_name,
+                                channel_id = channel_id.get(),
+                                turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                                session_key = lease.session_key.as_deref().unwrap_or(""),
+                                relay_owner = lease.relay_owner.as_str(),
+                                runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+                                "codex idle rollout relay yielded response tail to selected owner"
+                            );
+                            continue;
+                        }
 
                         crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                             &tmux_session_name,
@@ -1056,22 +1715,38 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                         active_tails.insert(tmux_session_name.clone());
                         let shared_for_tail = shared.clone();
                         let done_tx_for_tail = done_tx.clone();
+                        let tail_tmux_session_name = tmux_session_name.clone();
+                        let tail_rollout_path = rollout_path.clone();
+                        let tail_lease = lease.clone();
+                        let tail_span = tracing::info_span!(
+                            "codex_idle_response_tail",
+                            provider = ProviderKind::Codex.as_str(),
+                            channel_id = channel_id.get(),
+                            tmux_session_name = %tmux_session_name,
+                            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                            session_key = lease.session_key.as_deref().unwrap_or(""),
+                            relay_owner = lease.relay_owner.as_str(),
+                            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+                        );
                         super::task_supervisor::spawn_observed(
                             "codex_idle_response_tail",
                             async move {
                                 let _done_guard = CodexIdleTailDoneGuard {
-                                    tmux_session_name: Some(tmux_session_name.clone()),
+                                    tmux_session_name: Some(tail_tmux_session_name.clone()),
                                     done_tx: done_tx_for_tail,
                                 };
                                 run_codex_idle_response_tail(
                                     shared_for_tail,
-                                    tmux_session_name.clone(),
+                                    tail_tmux_session_name,
                                     channel_id,
-                                    rollout_path,
+                                    tail_rollout_path,
                                     line_end_offset,
+                                    prompt,
+                                    tail_lease,
                                 )
                                 .await;
-                            },
+                            }
+                            .instrument(tail_span),
                         );
                     }
                 }
@@ -1079,7 +1754,12 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
 
             tokio::time::sleep(CODEX_IDLE_ROLLOUT_POLL_INTERVAL).await;
         }
-    });
+    }
+    .instrument(tracing::info_span!(
+        "codex_idle_rollout_relay",
+        provider = ProviderKind::Codex.as_str(),
+        runtime_kind = RuntimeHandoffKind::CodexTui.as_str(),
+    )));
 }
 
 fn codex_idle_prompt_observation_should_tail_response(
@@ -1357,8 +2037,15 @@ async fn run_codex_idle_response_tail(
     channel_id: ChannelId,
     rollout_path: PathBuf,
     start_offset: u64,
+    prompt_text: String,
+    lease: ExternalInputRelayLease,
 ) {
-    let tail_started_at = chrono::Utc::now();
+    let _lease_guard = TuiDirectExternalInputLeaseGuard::new(
+        ProviderKind::Codex,
+        &tmux_session_name,
+        channel_id,
+        &lease,
+    );
     let tmux_for_tail = tmux_session_name.clone();
     let rollout_for_tail = rollout_path.clone();
     let tail_result = tokio::task::spawn_blocking(move || {
@@ -1397,13 +2084,16 @@ async fn run_codex_idle_response_tail(
         );
         return;
     }
-    let delivery_result = deliver_tui_idle_response(
+    let delivery_result = relay_tui_idle_response_through_bridge(
         &shared,
         ProviderKind::Codex,
         channel_id,
         &tmux_session_name,
+        &rollout_path,
+        start_offset,
+        &prompt_text,
         response,
-        tail_started_at,
+        &lease,
     )
     .await;
     if tui_idle_tail_should_commit_runtime_binding_offset(response, delivery_result.is_ok()) {
@@ -1476,8 +2166,15 @@ async fn run_claude_idle_response_tail(
     channel_id: ChannelId,
     transcript_path: PathBuf,
     start_offset: u64,
+    prompt_text: String,
+    lease: ExternalInputRelayLease,
 ) {
-    let tail_started_at = chrono::Utc::now();
+    let _lease_guard = TuiDirectExternalInputLeaseGuard::new(
+        ProviderKind::Claude,
+        &tmux_session_name,
+        channel_id,
+        &lease,
+    );
     let tmux_for_tail = tmux_session_name.clone();
     let transcript_for_tail = transcript_path.clone();
     let tail_result = tokio::task::spawn_blocking(move || {
@@ -1516,13 +2213,16 @@ async fn run_claude_idle_response_tail(
         );
         return;
     }
-    let delivery_result = deliver_tui_idle_response(
+    let delivery_result = relay_tui_idle_response_through_bridge(
         &shared,
         ProviderKind::Claude,
         channel_id,
         &tmux_session_name,
+        &transcript_path,
+        start_offset,
+        &prompt_text,
         response,
-        tail_started_at,
+        &lease,
     )
     .await;
     if tui_idle_tail_should_commit_runtime_binding_offset(response, delivery_result.is_ok()) {
@@ -1617,30 +2317,38 @@ fn compose_tui_idle_response(
 }
 
 #[cfg(unix)]
-async fn deliver_tui_idle_response(
+async fn relay_tui_idle_response_through_bridge(
     shared: &Arc<SharedData>,
     provider: ProviderKind,
     channel_id: ChannelId,
     tmux_session_name: &str,
+    output_path: &Path,
+    start_offset: u64,
+    prompt_text: &str,
     response: &str,
-    tail_started_at: chrono::DateTime<chrono::Utc>,
+    lease: &ExternalInputRelayLease,
 ) -> Result<(), String> {
+    let _lease_guard = TuiDirectExternalInputLeaseGuard::new(
+        provider.clone(),
+        tmux_session_name,
+        channel_id,
+        lease,
+    );
     let Some(http) = shared.serenity_http_or_token_fallback() else {
         tracing::warn!(
             channel_id = channel_id.get(),
             tmux_session_name = %tmux_session_name,
             provider = %provider.as_str(),
+            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+            session_key = lease.session_key.as_deref().unwrap_or(""),
+            relay_owner = lease.relay_owner.as_str(),
+            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
             "skipping TUI idle response relay; Discord HTTP unavailable"
         );
         return Err(format!(
             "discord http unavailable for provider {}",
             provider.as_str()
         ));
-    };
-    let formatted = if shared.status_panel_v2_enabled {
-        super::formatting::format_for_discord_with_status_panel(response, &provider)
-    } else {
-        super::formatting::format_for_discord_with_provider(response, &provider)
     };
     let anchor = prompt_anchor_for_response_after_wait(
         provider.as_str(),
@@ -1654,12 +2362,70 @@ async fn deliver_tui_idle_response(
             MessageId::new(anchor.message_id),
         )
     });
-    match super::formatting::send_long_message_raw_with_reference(
-        &http, channel_id, &formatted, shared, reference,
+    let current_msg_id = super::gateway::send_intake_placeholder(
+        http.clone(),
+        shared.clone(),
+        channel_id,
+        reference,
     )
-    .await
-    {
-        Ok(()) => {
+    .await?;
+    let user_msg_id = anchor
+        .map(|anchor| MessageId::new(anchor.message_id))
+        .unwrap_or(current_msg_id);
+    let (tx, rx) = mpsc::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let inflight_state = build_tui_direct_bridge_inflight_state(
+        provider.clone(),
+        channel_id,
+        user_msg_id,
+        current_msg_id,
+        prompt_text,
+        tmux_session_name,
+        output_path,
+        start_offset,
+        lease,
+    );
+    let bridge = TurnBridgeContext {
+        provider: provider.clone(),
+        gateway: Arc::new(TuiDirectBridgeGateway {
+            http,
+            shared: shared.clone(),
+            provider: provider.clone(),
+        }),
+        channel_id,
+        user_msg_id,
+        user_text_owned: prompt_text.to_string(),
+        request_owner_name: "TUI direct".to_string(),
+        role_binding: None,
+        adk_session_key: lease.session_key.clone(),
+        adk_session_name: Some(tmux_session_name.to_string()),
+        adk_session_info: None,
+        adk_cwd: None,
+        dispatch_id: None,
+        dispatch_kind: None,
+        memory_recall_usage: TokenUsage::default(),
+        context_window_tokens: 0,
+        context_compact_percent: 0,
+        current_msg_id,
+        response_sent_offset: 0,
+        full_response: String::new(),
+        tmux_last_offset: Some(start_offset),
+        new_session_id: None,
+        defer_watcher_resume: false,
+        reuse_status_panel_message: false,
+        completion_tx: Some(completion_tx),
+        inflight_state,
+    };
+
+    spawn_turn_bridge(shared.clone(), Arc::new(CancelToken::new()), rx, bridge);
+    for message in bridge_adapter_stream_messages(response, None) {
+        tx.send(message)
+            .map_err(|error| format!("send TUI-direct bridge stream event: {error}"))?;
+    }
+    drop(tx);
+
+    match tokio::time::timeout(Duration::from_secs(180), completion_rx).await {
+        Ok(_) => {
             if let Some(anchor) = anchor {
                 crate::services::tui_prompt_dedupe::clear_prompt_anchor_for_response(
                     provider.as_str(),
@@ -1667,64 +2433,77 @@ async fn deliver_tui_idle_response(
                     anchor,
                 );
             }
-            crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
-                provider.as_str(),
-                tmux_session_name,
-                channel_id.get(),
-            );
-            match super::inflight::clear_inflight_state_if_matches_tmux_response(
-                &provider,
-                channel_id.get(),
-                tmux_session_name,
-                response,
-            ) {
-                super::inflight::GuardedClearOutcome::Cleared => {
-                    tracing::info!(
-                        channel_id = channel_id.get(),
-                        tmux_session_name = %tmux_session_name,
-                        provider = %provider.as_str(),
-                        "TUI idle response relay cleared matching inflight state"
-                    );
-                }
-                super::inflight::GuardedClearOutcome::IoError => {
-                    tracing::warn!(
-                        channel_id = channel_id.get(),
-                        tmux_session_name = %tmux_session_name,
-                        provider = %provider.as_str(),
-                        "TUI idle response relay could not clear matching inflight state"
-                    );
-                }
-                _ => {}
-            }
-            post_tui_idle_response_session_idle(
-                shared,
-                &provider,
-                channel_id,
-                tmux_session_name,
-                tail_started_at,
-            )
-            .await;
             tracing::info!(
                 channel_id = channel_id.get(),
                 tmux_session_name = %tmux_session_name,
                 provider = %provider.as_str(),
-                chars = formatted.chars().count(),
-                prompt_anchor_message_id = reference.map(|(_, message_id)| message_id.get()),
-                "TUI idle response relayed"
+                turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                session_key = lease.session_key.as_deref().unwrap_or(""),
+                relay_owner = lease.relay_owner.as_str(),
+                runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+                current_msg_id = current_msg_id.get(),
+                prompt_anchor_message_id = anchor.map(|anchor| anchor.message_id),
+                "TUI-direct bridge adapter completed response relay"
             );
             Ok(())
         }
-        Err(error) => {
-            tracing::warn!(
-                channel_id = channel_id.get(),
-                tmux_session_name = %tmux_session_name,
-                provider = %provider.as_str(),
-                error = %error,
-                "failed to relay TUI idle response"
-            );
-            Err(error.to_string())
-        }
+        Err(_) => Err(format!(
+            "TUI-direct bridge adapter timed out waiting for completion for provider {}",
+            provider.as_str()
+        )),
     }
+}
+
+#[cfg(unix)]
+fn build_tui_direct_bridge_inflight_state(
+    provider: ProviderKind,
+    channel_id: ChannelId,
+    user_msg_id: MessageId,
+    current_msg_id: MessageId,
+    prompt_text: &str,
+    tmux_session_name: &str,
+    output_path: &Path,
+    start_offset: u64,
+    lease: &ExternalInputRelayLease,
+) -> InflightTurnState {
+    let mut state = InflightTurnState::new(
+        provider,
+        channel_id.get(),
+        None,
+        0,
+        user_msg_id.get(),
+        current_msg_id.get(),
+        prompt_text.to_string(),
+        None,
+        Some(tmux_session_name.to_string()),
+        output_path.to_str().map(str::to_string),
+        None,
+        start_offset,
+    );
+    state.current_msg_len = "...".len();
+    state.session_key = lease.session_key.clone();
+    state.runtime_kind = lease.runtime_kind;
+    state.turn_source = TurnSource::ExternalInput;
+    state.set_relay_owner_kind(RelayOwnerKind::None);
+    state
+}
+
+#[cfg(unix)]
+fn bridge_adapter_stream_messages(
+    response: &str,
+    session_id: Option<String>,
+) -> Vec<StreamMessage> {
+    let mut messages = Vec::new();
+    if !response.trim().is_empty() {
+        messages.push(StreamMessage::Text {
+            content: response.to_string(),
+        });
+    }
+    messages.push(StreamMessage::Done {
+        result: response.to_string(),
+        session_id,
+    });
+    messages
 }
 
 #[cfg(unix)]
@@ -1733,89 +2512,6 @@ fn tui_idle_tail_should_commit_runtime_binding_offset(
     discord_delivery_succeeded: bool,
 ) -> bool {
     response.trim().is_empty() || discord_delivery_succeeded
-}
-
-#[cfg(unix)]
-async fn post_tui_idle_response_session_idle(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    tmux_session_name: &str,
-    tail_started_at: chrono::DateTime<chrono::Utc>,
-) {
-    if shared.mailbox(channel_id).cancel_token().await.is_some() {
-        tracing::debug!(
-            channel_id = channel_id.get(),
-            tmux_session_name = %tmux_session_name,
-            provider = %provider.as_str(),
-            "skipping TUI idle response session-idle commit; mailbox turn is active"
-        );
-        return;
-    }
-
-    if super::inflight::load_inflight_state(provider, channel_id.get()).is_some() {
-        tracing::debug!(
-            channel_id = channel_id.get(),
-            tmux_session_name = %tmux_session_name,
-            provider = %provider.as_str(),
-            "skipping TUI idle response session-idle commit; inflight state is active"
-        );
-        return;
-    }
-
-    let session_key = super::adk_session::build_namespaced_session_key(
-        &shared.token_hash,
-        provider,
-        tmux_session_name,
-    );
-    let channel_name = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .and_then(|session| session.channel_name.clone())
-    };
-    let agent_id = super::resolve_channel_role_binding(channel_id, channel_name.as_deref())
-        .map(|binding| binding.role_id);
-
-    match super::internal_api::mark_session_idle_if_not_newer_live(
-        &session_key,
-        provider.as_str(),
-        agent_id.as_deref(),
-        tail_started_at,
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::debug!(
-                channel_id = channel_id.get(),
-                tmux_session_name = %tmux_session_name,
-                provider = %provider.as_str(),
-                session_key = %session_key,
-                "skipping TUI idle response session-idle commit; session row is absent or newer live"
-            );
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(
-                channel_id = channel_id.get(),
-                tmux_session_name = %tmux_session_name,
-                provider = %provider.as_str(),
-                session_key = %session_key,
-                error = %error,
-                "failed to commit TUI idle response session idle"
-            );
-            return;
-        }
-    }
-
-    tracing::info!(
-        channel_id = channel_id.get(),
-        tmux_session_name = %tmux_session_name,
-        provider = %provider.as_str(),
-        session_key = %session_key,
-        "TUI idle response committed session idle"
-    );
 }
 
 #[cfg(unix)]
@@ -1839,6 +2535,66 @@ async fn prompt_anchor_for_response_after_wait(
         }
         tokio::time::sleep(CODEX_IDLE_PROMPT_ANCHOR_POLL.min(deadline - now)).await;
     }
+}
+
+pub(super) fn should_complete_tui_direct_anchor_lifecycle(
+    terminal_output_committed: bool,
+    terminal_body_visible: bool,
+    anchor_or_lease_present: bool,
+    lifecycle_stage_paused: bool,
+    inflight_present: bool,
+) -> bool {
+    terminal_output_committed
+        && terminal_body_visible
+        && anchor_or_lease_present
+        && (lifecycle_stage_paused || !inflight_present)
+}
+
+pub(super) async fn complete_tui_direct_prompt_anchor_lifecycle_if_present(
+    http: &serenity::Http,
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: ChannelId,
+    reason: &str,
+) -> Option<crate::services::tui_prompt_dedupe::TuiPromptAnchor> {
+    let anchor = crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
+        provider,
+        tmux_session_name,
+        channel_id.get(),
+    )?;
+    let anchor_channel_id = ChannelId::new(anchor.channel_id);
+    let anchor_message_id = MessageId::new(anchor.message_id);
+    super::formatting::remove_reaction_raw(http, anchor_channel_id, anchor_message_id, '⏳').await;
+    let completion_reaction = serenity::ReactionType::Unicode('✅'.to_string());
+    if let Err(error) = anchor_channel_id
+        .create_reaction(http, anchor_message_id, completion_reaction)
+        .await
+    {
+        tracing::warn!(
+            provider = %provider,
+            channel_id = anchor.channel_id,
+            tmux_session_name = %tmux_session_name,
+            anchor_message_id = anchor.message_id,
+            reason,
+            error = %error,
+            "failed to complete TUI-direct prompt anchor reaction lifecycle; keeping anchor for retry"
+        );
+        return None;
+    }
+    crate::services::tui_prompt_dedupe::clear_prompt_anchor_for_response(
+        provider,
+        tmux_session_name,
+        anchor,
+    );
+    tracing::info!(
+        provider = %provider,
+        channel_id = anchor.channel_id,
+        tmux_session_name = %tmux_session_name,
+        anchor_message_id = anchor.message_id,
+        reason,
+        "completed TUI-direct prompt anchor reaction lifecycle"
+    );
+    Some(anchor)
 }
 
 fn owner_channel_for_prompt(
@@ -1977,6 +2733,498 @@ mod tests {
             );
         }
         assert!(output.contains("ringpagedelc1\n\tkeep"));
+    }
+
+    #[test]
+    fn direct_anchor_lifecycle_requires_visible_terminal_body() {
+        assert!(!should_complete_tui_direct_anchor_lifecycle(
+            true, false, true, true, false,
+        ));
+        assert!(!should_complete_tui_direct_anchor_lifecycle(
+            false, true, true, true, false,
+        ));
+        assert!(!should_complete_tui_direct_anchor_lifecycle(
+            true, true, false, true, false,
+        ));
+    }
+
+    #[test]
+    fn direct_anchor_lifecycle_uses_bridge_for_active_inflight_unless_paused() {
+        assert!(!should_complete_tui_direct_anchor_lifecycle(
+            true, true, true, false, true,
+        ));
+        assert!(should_complete_tui_direct_anchor_lifecycle(
+            true, true, true, true, true,
+        ));
+        assert!(should_complete_tui_direct_anchor_lifecycle(
+            true, true, true, false, false,
+        ));
+    }
+
+    #[test]
+    fn direct_anchor_lifecycle_does_not_complete_preserved_cleanup_retry() {
+        assert!(!should_complete_tui_direct_anchor_lifecycle(
+            false, true, true, false, true,
+        ));
+        assert!(!should_complete_tui_direct_anchor_lifecycle(
+            true, false, true, false, true,
+        ));
+    }
+
+    #[cfg(unix)]
+    fn test_watcher_handle(
+        tmux_session_name: &str,
+        output_path: &Path,
+    ) -> super::super::TmuxWatcherHandle {
+        super::super::TmuxWatcherHandle {
+            tmux_session_name: tmux_session_name.to_string(),
+            output_path: output_path.display().to_string(),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_offset: Arc::new(std::sync::Mutex::new(None)),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            turn_delivered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_heartbeat_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(
+                super::super::tmux_watcher_now_ms(),
+            )),
+            mailbox_finalize_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_input_owner_uses_resolved_claude_transcript_before_session_bound_owner() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stale_binding_path = dir.path().join("stale-binding.jsonl");
+        let resolved_fresh_path = dir.path().join("resolved-fresh.jsonl");
+        let tmux_session_name = "AgentDesk-claude-stale-binding-owner";
+        let watchers = super::super::TmuxWatcherRegistry::new();
+        watchers.insert(
+            ChannelId::new(940_000_000_000_001),
+            test_watcher_handle(tmux_session_name, &stale_binding_path),
+        );
+
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &watchers,
+                tmux_session_name,
+                Some(&stale_binding_path),
+                true,
+            ),
+            ExternalInputRelayOwner::BridgeAdapter,
+            "TUI-direct external turns have no synthetic inflight, so bridge tail owns response delivery"
+        );
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &watchers,
+                tmux_session_name,
+                Some(&resolved_fresh_path),
+                true,
+            ),
+            ExternalInputRelayOwner::BridgeAdapter,
+            "a heartbeat-fresh watcher may not own output for a different resolved transcript"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_input_owner_selects_one_relay_path_per_observed_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output_path = dir.path().join("output.jsonl");
+        let other_path = dir.path().join("other.jsonl");
+        let tmux_session_name = "AgentDesk-codex-owner-split";
+        let watchers = super::super::TmuxWatcherRegistry::new();
+
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &watchers,
+                tmux_session_name,
+                Some(&output_path),
+                true,
+            ),
+            ExternalInputRelayOwner::BridgeAdapter
+        );
+
+        watchers.insert(
+            ChannelId::new(940_000_000_000_002),
+            test_watcher_handle(tmux_session_name, &output_path),
+        );
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &watchers,
+                tmux_session_name,
+                Some(&output_path),
+                true,
+            ),
+            ExternalInputRelayOwner::BridgeAdapter
+        );
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &watchers,
+                tmux_session_name,
+                Some(&output_path),
+                false,
+            ),
+            ExternalInputRelayOwner::TmuxWatcher
+        );
+        assert_eq!(
+            external_input_relay_owner_for_watchers(
+                &watchers,
+                tmux_session_name,
+                Some(&other_path),
+                true,
+            ),
+            ExternalInputRelayOwner::BridgeAdapter
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_tail_resolution_bypasses_watcher_suppression_for_session_bound_external_turn() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let transcript_path = dir.path().join("claude-transcript.jsonl");
+        std::fs::write(&transcript_path, "").expect("write transcript");
+        let tmux_session_name = "AgentDesk-claude-session-bound-direct-input";
+        let channel_id = ChannelId::new(940_000_000_000_006);
+        let shared = super::super::make_shared_data_for_tests();
+        shared.tmux_watchers.insert(
+            channel_id,
+            test_watcher_handle(tmux_session_name, &transcript_path),
+        );
+        let binding = crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+            runtime_kind: RuntimeHandoffKind::ClaudeTui,
+            output_path: transcript_path.display().to_string(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: Some("claude-transcript".to_string()),
+            last_offset: 0,
+            relay_last_offset: None,
+        };
+
+        assert_eq!(
+            resolve_idle_relay_transcript(&shared, tmux_session_name, channel_id, &binding, false,),
+            Some(transcript_path.clone()),
+            "BridgeAdapter-owned direct input must tail even when the watcher covers the transcript"
+        );
+        assert_eq!(
+            resolve_idle_relay_transcript(&shared, tmux_session_name, channel_id, &binding, true,),
+            None,
+            "legacy watcher-owned mode may still suppress the bridge tail to avoid duplicates"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_adapter_tails_only_bridge_owned_external_turns() {
+        assert!(bridge_adapter_owns_external_turn(
+            ExternalInputRelayOwner::BridgeAdapter
+        ));
+        assert!(!bridge_adapter_owns_external_turn(
+            ExternalInputRelayOwner::SessionBoundRelay
+        ));
+        assert!(!bridge_adapter_owns_external_turn(
+            ExternalInputRelayOwner::TmuxWatcher
+        ));
+        assert!(!bridge_adapter_owns_external_turn(
+            ExternalInputRelayOwner::TuiPromptRelay
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_inflight_drain_wait_allows_transient_previous_turn() {
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_ref = probes.clone();
+
+        assert!(
+            wait_for_transient_state_to_clear(
+                Duration::from_millis(50),
+                Duration::from_millis(1),
+                move || probe_ref.fetch_add(1, Ordering::SeqCst) < 2,
+            )
+            .await,
+            "a short-lived previous inflight should not make the direct-input bridge tail give up"
+        );
+        assert!(
+            probes.load(Ordering::SeqCst) >= 3,
+            "the helper should re-check until the transient state clears"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_inflight_drain_wait_times_out_when_previous_turn_stays_active() {
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_ref = probes.clone();
+
+        assert!(
+            !wait_for_transient_state_to_clear(
+                Duration::from_millis(5),
+                Duration::from_millis(1),
+                move || {
+                    probe_ref.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .await,
+            "a persistent previous inflight should keep the guarded skip behavior"
+        );
+        assert!(
+            probes.load(Ordering::SeqCst) >= 2,
+            "timeout branch should poll instead of making a single stale decision"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_adapter_tail_guard_clears_only_current_external_lease() {
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let tmux = "AgentDesk-codex-bridge-guard";
+        let channel_id = ChannelId::new(940_000_000_000_003);
+        let original = ExternalInputRelayLease {
+            channel_id: Some(channel_id.get()),
+            turn_id: Some("external:codex:940000000000003:bridge-guard:1".to_string()),
+            session_key: Some("host:AgentDesk-codex-bridge-guard".to_string()),
+            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
+            runtime_kind: Some(RuntimeHandoffKind::CodexTui),
+        };
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Codex.as_str(),
+            tmux,
+            original.clone(),
+        );
+
+        {
+            let _guard = TuiDirectExternalInputLeaseGuard::new(
+                ProviderKind::Codex,
+                tmux,
+                channel_id,
+                &original,
+            );
+        }
+        assert!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+                ProviderKind::Codex.as_str(),
+                tmux,
+                channel_id.get(),
+            )
+            .is_none()
+        );
+
+        let newer = ExternalInputRelayLease {
+            turn_id: Some("external:codex:940000000000003:bridge-guard:2".to_string()),
+            ..original.clone()
+        };
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Codex.as_str(),
+            tmux,
+            original.clone(),
+        );
+        {
+            let _guard = TuiDirectExternalInputLeaseGuard::new(
+                ProviderKind::Codex,
+                tmux,
+                channel_id,
+                &original,
+            );
+            crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+                ProviderKind::Codex.as_str(),
+                tmux,
+                newer.clone(),
+            );
+        }
+        assert_eq!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+                ProviderKind::Codex.as_str(),
+                tmux,
+                channel_id.get(),
+            ),
+            Some(newer.clone())
+        );
+        assert!(
+            crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_matches(
+                ProviderKind::Codex.as_str(),
+                tmux,
+                channel_id.get(),
+                &newer,
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_bridge_lease_clears_when_tail_dedup_skips_spawn() {
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let tmux = "AgentDesk-claude-bridge-dedup-skip";
+        let channel_id = ChannelId::new(940_000_000_000_004);
+        let lease = ExternalInputRelayLease {
+            channel_id: Some(channel_id.get()),
+            turn_id: Some("external:claude:940000000000004:dedup-skip:2".to_string()),
+            session_key: Some("host:AgentDesk-claude-bridge-dedup-skip".to_string()),
+            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
+            runtime_kind: Some(RuntimeHandoffKind::ClaudeTui),
+        };
+        {
+            let mut active = CLAUDE_IDLE_RESPONSE_TAILS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            active.remove(tmux);
+            active.insert(tmux.to_string());
+        }
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Claude.as_str(),
+            tmux,
+            lease.clone(),
+        );
+
+        let spawned = spawn_claude_idle_response_tail_once(
+            super::super::make_shared_data_for_tests(),
+            tmux.to_string(),
+            channel_id,
+            PathBuf::from("/tmp/unused-claude-bridge-dedup-skip.jsonl"),
+            0,
+            "direct input while another tail is active".to_string(),
+            lease.clone(),
+        );
+        assert!(
+            !spawned,
+            "active tail dedup should reject the second Claude tail"
+        );
+        assert!(clear_external_input_bridge_lease_if_current(
+            &ProviderKind::Claude,
+            tmux,
+            channel_id,
+            &lease,
+        ));
+        assert!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+                ProviderKind::Claude.as_str(),
+                tmux,
+                channel_id.get(),
+            )
+            .is_none(),
+            "a dedup-skipped Claude BridgeAdapter lease must not block session-bound delivery until TTL"
+        );
+        CLAUDE_IDLE_RESPONSE_TAILS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(tmux);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let tmux = "AgentDesk-claude-bridge-no-binding";
+        let channel_id = ChannelId::new(940_000_000_000_005);
+        let prompt = ObservedTuiPrompt {
+            provider: ProviderKind::Claude.as_str().to_string(),
+            tmux_session_name: tmux.to_string(),
+            prompt: "direct input without runtime binding".to_string(),
+            observed_at: chrono::Utc::now(),
+        };
+        let lease = ExternalInputRelayLease {
+            channel_id: Some(channel_id.get()),
+            turn_id: Some("external:claude:940000000000005:no-binding:1".to_string()),
+            session_key: Some("host:AgentDesk-claude-bridge-no-binding".to_string()),
+            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
+            runtime_kind: Some(RuntimeHandoffKind::ClaudeTui),
+        };
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Claude.as_str(),
+            tmux,
+            lease.clone(),
+        );
+
+        let spawned;
+        {
+            let mut guard = TuiDirectExternalInputLeaseGuard::new(
+                ProviderKind::Claude,
+                tmux,
+                channel_id,
+                &lease,
+            );
+            spawned = maybe_spawn_claude_idle_response_tail(
+                super::super::make_shared_data_for_tests(),
+                channel_id,
+                &prompt,
+                &lease,
+            )
+            .await;
+            if spawned {
+                guard.disarm();
+            }
+        }
+
+        assert!(
+            !spawned,
+            "missing runtime binding is a pre-tail precondition skip"
+        );
+        assert!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+                ProviderKind::Claude.as_str(),
+                tmux,
+                channel_id.get(),
+            )
+            .is_none(),
+            "precondition skips before a tail guard exists must clear the recorded BridgeAdapter lease"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_adapter_emits_bridge_compatible_stream_events() {
+        let messages = bridge_adapter_stream_messages("assistant response", Some("sess-1".into()));
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            StreamMessage::Text { content } if content == "assistant response"
+        ));
+        assert!(matches!(
+            &messages[1],
+            StreamMessage::Done { result, session_id }
+                if result == "assistant response" && session_id.as_deref() == Some("sess-1")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_adapter_inflight_marks_external_input_as_bridge_owned() {
+        let output_path = PathBuf::from("/tmp/adk-bridge-adapter.jsonl");
+        let lease = ExternalInputRelayLease {
+            channel_id: Some(42),
+            turn_id: Some("external:codex:42:tmux:1".to_string()),
+            session_key: Some("token:AgentDesk-codex-owner-split".to_string()),
+            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
+            runtime_kind: Some(RuntimeHandoffKind::CodexTui),
+        };
+        let state = build_tui_direct_bridge_inflight_state(
+            ProviderKind::Codex,
+            ChannelId::new(42),
+            MessageId::new(101),
+            MessageId::new(202),
+            "typed in TUI",
+            "AgentDesk-codex-owner-split",
+            &output_path,
+            333,
+            &lease,
+        );
+
+        assert_eq!(state.turn_source, TurnSource::ExternalInput);
+        assert_eq!(state.effective_relay_owner_kind(), RelayOwnerKind::None);
+        assert_eq!(state.user_msg_id, 101);
+        assert_eq!(state.current_msg_id, 202);
+        assert_eq!(state.user_text, "typed in TUI");
+        assert_eq!(state.session_key.as_deref(), lease.session_key.as_deref());
+        assert_eq!(state.runtime_kind, Some(RuntimeHandoffKind::CodexTui));
+        assert_eq!(state.turn_start_offset, Some(333));
     }
 
     #[cfg(unix)]

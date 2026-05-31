@@ -27,6 +27,7 @@ use super::stale_resume::{
 };
 use super::{
     advance_tmux_relay_confirmed_end, bridge_should_reclaim_relay_from_missing_watcher,
+    complete_status_panel_v2, done_result_requires_full_terminal_replay,
     merge_task_notification_kind, monitor_handoff_tool_context, release_task_notification_kind,
     resolve_exact_completion_usage, should_delegate_bridge_relay_to_watcher,
     task_notification_closes_background_child, terminal_delivery_response_after_offset,
@@ -57,7 +58,7 @@ use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -94,6 +95,175 @@ struct CountingGateway {
     edit_count: Arc<AtomicUsize>,
     replace_count: Arc<AtomicUsize>,
     remove_reaction_count: Arc<AtomicUsize>,
+}
+
+struct StatusPanelFallbackGateway {
+    sent_messages: Arc<Mutex<Vec<String>>>,
+    edited_message_ids: Arc<Mutex<Vec<MessageId>>>,
+    edit_error: Option<String>,
+    send_id: MessageId,
+}
+
+impl StatusPanelFallbackGateway {
+    fn with_edit_error(error: &str) -> Self {
+        Self {
+            edit_error: Some(error.to_string()),
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for StatusPanelFallbackGateway {
+    fn default() -> Self {
+        Self {
+            sent_messages: Arc::new(Mutex::new(Vec::new())),
+            edited_message_ids: Arc::new(Mutex::new(Vec::new())),
+            edit_error: None,
+            send_id: MessageId::new(1_500_000_000_000_999),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordingLongGateway {
+    sent_messages: Arc<Mutex<Vec<String>>>,
+    long_chunks: Arc<Mutex<Vec<String>>>,
+    replace_bodies: Arc<Mutex<Vec<String>>>,
+    edit_bodies: Arc<Mutex<Vec<String>>>,
+    delete_count: Arc<AtomicUsize>,
+}
+
+impl TurnGateway for RecordingLongGateway {
+    fn send_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<MessageId, String>> {
+        let sent_messages = self.sent_messages.clone();
+        Box::pin(async move {
+            sent_messages
+                .lock()
+                .expect("sent messages lock")
+                .push(content.to_string());
+            Ok(MessageId::new(1487799916758827333))
+        })
+    }
+
+    fn send_long_message_with_rollback<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _rollback_anchor_msg_id: MessageId,
+        content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<Vec<MessageId>, String>> {
+        let long_chunks = self.long_chunks.clone();
+        Box::pin(async move {
+            let chunks = crate::services::discord::formatting::split_message(content);
+            let mut ids = Vec::new();
+            let mut guard = long_chunks.lock().expect("long chunks lock");
+            for (index, chunk) in chunks.into_iter().enumerate() {
+                guard.push(chunk);
+                ids.push(MessageId::new(1487799916758827400 + index as u64));
+            }
+            Ok(ids)
+        })
+    }
+
+    fn edit_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        let edit_bodies = self.edit_bodies.clone();
+        Box::pin(async move {
+            edit_bodies
+                .lock()
+                .expect("edit bodies lock")
+                .push(content.to_string());
+            Ok(())
+        })
+    }
+
+    fn delete_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        self.delete_count.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn replace_message_with_outcome<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
+        let replace_bodies = self.replace_bodies.clone();
+        Box::pin(async move {
+            replace_bodies
+                .lock()
+                .expect("replace bodies lock")
+                .push(content.to_string());
+            Ok(ReplaceLongMessageOutcome::EditedOriginal)
+        })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn schedule_retry_with_history<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _user_message_id: MessageId,
+        _user_text: &'a str,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn dispatch_queued_turn<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _intervention: &'a super::super::Intervention,
+        _request_owner_name: &'a str,
+        _has_more_queued_turns: bool,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn validate_live_routing<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn requester_mention(&self) -> Option<String> {
+        None
+    }
+
+    fn can_chain_locally(&self) -> bool {
+        true
+    }
+
+    fn bot_owner_provider(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::Codex)
+    }
 }
 
 impl TurnGateway for CountingGateway {
@@ -184,6 +354,109 @@ impl TurnGateway for CountingGateway {
     }
 }
 
+impl TurnGateway for StatusPanelFallbackGateway {
+    fn send_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<MessageId, String>> {
+        let sent_messages = self.sent_messages.clone();
+        let send_id = self.send_id;
+        Box::pin(async move {
+            sent_messages
+                .lock()
+                .expect("sent messages lock")
+                .push(content.to_string());
+            Ok(send_id)
+        })
+    }
+
+    fn edit_message<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        message_id: MessageId,
+        _content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        let edited_message_ids = self.edited_message_ids.clone();
+        let edit_error = self.edit_error.clone();
+        Box::pin(async move {
+            edited_message_ids
+                .lock()
+                .expect("edited ids lock")
+                .push(message_id);
+            match edit_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn replace_message_with_outcome<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _content: &'a str,
+    ) -> TestGatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
+        Box::pin(async { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+    }
+
+    fn add_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn remove_reaction<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _message_id: MessageId,
+        _emoji: char,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn schedule_retry_with_history<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _user_message_id: MessageId,
+        _user_text: &'a str,
+    ) -> TestGatewayFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn dispatch_queued_turn<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _intervention: &'a super::super::Intervention,
+        _request_owner_name: &'a str,
+        _has_more_queued_turns: bool,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn validate_live_routing<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+    ) -> TestGatewayFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn requester_mention(&self) -> Option<String> {
+        None
+    }
+
+    fn can_chain_locally(&self) -> bool {
+        true
+    }
+
+    fn bot_owner_provider(&self) -> Option<ProviderKind> {
+        Some(ProviderKind::Claude)
+    }
+}
+
 impl TurnGateway for CleanupFallbackQueueGateway {
     fn send_message<'a>(
         &'a self,
@@ -271,6 +544,268 @@ impl TurnGateway for CleanupFallbackQueueGateway {
     fn bot_owner_provider(&self) -> Option<ProviderKind> {
         Some(ProviderKind::Codex)
     }
+}
+
+fn make_status_panel_v2_shared_for_tests() -> Arc<crate::services::discord::SharedData> {
+    let mut shared = make_shared_data_for_tests();
+    Arc::get_mut(&mut shared)
+        .expect("fresh test shared data should be uniquely owned")
+        .status_panel_v2_enabled = true;
+    shared
+}
+
+#[tokio::test]
+async fn status_panel_completion_fallback_posts_when_message_id_is_synthetic() {
+    let shared = make_status_panel_v2_shared_for_tests();
+    let gateway = StatusPanelFallbackGateway::default();
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(1509350490461180105);
+    let mut last_status_panel_text = String::new();
+
+    let committed = complete_status_panel_v2(
+        shared.as_ref(),
+        &gateway,
+        channel_id,
+        Some(MessageId::new(9_100_000_000_000_000_123)),
+        &provider,
+        1_700_000_000,
+        &mut last_status_panel_text,
+        false,
+        "test_synthetic_status_panel_id",
+        1510319194921504929,
+    )
+    .await;
+
+    assert!(committed);
+    assert!(
+        gateway
+            .edited_message_ids
+            .lock()
+            .expect("edited ids lock")
+            .is_empty(),
+        "synthetic status-panel ids must not be edited through Discord"
+    );
+    let sent_messages = gateway
+        .sent_messages
+        .lock()
+        .expect("sent messages lock")
+        .clone();
+    assert_eq!(sent_messages.len(), 1);
+    assert!(sent_messages[0].contains("응답 완료"));
+    assert_eq!(last_status_panel_text, sent_messages[0]);
+
+    let committed = complete_status_panel_v2(
+        shared.as_ref(),
+        &gateway,
+        channel_id,
+        Some(MessageId::new(9_100_000_000_000_000_123)),
+        &provider,
+        1_700_000_000,
+        &mut last_status_panel_text,
+        false,
+        "test_synthetic_status_panel_id_retry",
+        1510319194921504929,
+    )
+    .await;
+
+    assert!(committed);
+    assert_eq!(
+        gateway
+            .sent_messages
+            .lock()
+            .expect("sent messages lock")
+            .len(),
+        1,
+        "same completed panel text must not send duplicate fallback panels"
+    );
+}
+
+#[tokio::test]
+async fn status_panel_completion_fallback_posts_after_unknown_message_edit() {
+    let shared = make_status_panel_v2_shared_for_tests();
+    let gateway = StatusPanelFallbackGateway::with_edit_error("Unknown Message");
+    let provider = ProviderKind::Claude;
+    let channel_id = ChannelId::new(1509350490461180105);
+    let stale_status_msg_id = MessageId::new(1_500_000_000_000_111);
+    let mut last_status_panel_text = String::new();
+
+    let committed = complete_status_panel_v2(
+        shared.as_ref(),
+        &gateway,
+        channel_id,
+        Some(stale_status_msg_id),
+        &provider,
+        1_700_000_000,
+        &mut last_status_panel_text,
+        false,
+        "test_unknown_status_panel_id",
+        1510319194921504929,
+    )
+    .await;
+
+    assert!(committed);
+    assert_eq!(
+        gateway
+            .edited_message_ids
+            .lock()
+            .expect("edited ids lock")
+            .as_slice(),
+        &[stale_status_msg_id]
+    );
+    let sent_messages = gateway
+        .sent_messages
+        .lock()
+        .expect("sent messages lock")
+        .clone();
+    assert_eq!(sent_messages.len(), 1);
+    assert!(sent_messages[0].contains("응답 완료"));
+    assert_eq!(last_status_panel_text, sent_messages[0]);
+}
+
+fn e15_long_body() -> String {
+    let mut body = String::from("[E2E:E15:BEGIN]\n");
+    for line in 1..=160 {
+        body.push_str(&format!("E15-LINE-{line:03}\n"));
+        if line == 80 {
+            body.push_str("[E2E:E15:MID]\n");
+        }
+    }
+    body.push_str("[E2E:E15:END]");
+    body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_done_replays_full_long_body_after_streaming_rollover_offset() {
+    let shared = make_shared_data_for_tests();
+    let provider = ProviderKind::Codex;
+    let channel_id = ChannelId::new(1509350778043895902);
+    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
+    let channel_name = format!("adk-cdx-t{}", channel_id.get());
+    let tmux_name = provider.build_tmux_session_name(&channel_name);
+    let user_msg_id = MessageId::new(1510319194921504929);
+    let current_msg_id = MessageId::new(1510319194921504930);
+    let body = e15_long_body();
+    assert!(body.len() > crate::services::discord::DISCORD_MSG_LIMIT);
+
+    let gateway = Arc::new(RecordingLongGateway::default());
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let inflight_state = InflightTurnState::new(
+        provider.clone(),
+        channel_id.get(),
+        Some(channel_name.clone()),
+        343742347365974026,
+        user_msg_id.get(),
+        current_msg_id.get(),
+        "long E15 turn".to_string(),
+        None,
+        Some(tmux_name.clone()),
+        Some("/tmp/agentdesk-e15-rollout-window-output.jsonl".to_string()),
+        Some("/tmp/agentdesk-e15-rollout-window-input.fifo".to_string()),
+        0,
+    );
+
+    super::spawn_turn_bridge(
+        shared,
+        Arc::new(CancelToken::new()),
+        stream_rx,
+        super::TurnBridgeContext {
+            provider: provider.clone(),
+            gateway: gateway.clone(),
+            channel_id,
+            user_msg_id,
+            user_text_owned: "long E15 turn".to_string(),
+            request_owner_name: "tester".to_string(),
+            role_binding: None,
+            adk_session_key: None,
+            adk_session_name: Some(channel_name),
+            adk_session_info: None,
+            adk_cwd: None,
+            dispatch_id: None,
+            dispatch_kind: None,
+            memory_recall_usage: TokenUsage::default(),
+            context_window_tokens: provider.default_context_window(),
+            context_compact_percent: 100,
+            current_msg_id,
+            response_sent_offset: 0,
+            full_response: String::new(),
+            tmux_last_offset: Some(0),
+            new_session_id: None,
+            defer_watcher_resume: false,
+            reuse_status_panel_message: false,
+            completion_tx: Some(completion_tx),
+            inflight_state,
+        },
+    );
+
+    stream_tx
+        .send(StreamMessage::Text {
+            content: body.clone(),
+        })
+        .expect("send full text");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    stream_tx
+        .send(StreamMessage::Done {
+            result: body.clone(),
+            session_id: None,
+        })
+        .expect("send done");
+    drop(stream_tx);
+
+    tokio::time::timeout(Duration::from_secs(5), completion_rx)
+        .await
+        .expect("turn bridge should finish")
+        .expect("completion sender should complete");
+
+    let sent_chunks = gateway
+        .long_chunks
+        .lock()
+        .expect("long chunks lock")
+        .clone();
+    assert!(
+        sent_chunks.len() > 1,
+        "full E15 body must use ordered chunks, got {sent_chunks:?}"
+    );
+    assert!(
+        !sent_chunks.concat().contains("⠙ Processing"),
+        "streaming rollover status placeholder should not be part of terminal body"
+    );
+    assert!(
+        !gateway
+            .sent_messages
+            .lock()
+            .expect("sent messages lock")
+            .is_empty(),
+        "test must exercise the streaming rollover path before Done"
+    );
+    assert!(
+        sent_chunks
+            .iter()
+            .all(|chunk| chunk.len() <= crate::services::discord::DISCORD_MSG_LIMIT),
+        "ordered chunks must respect Discord's per-message limit"
+    );
+    let delivered = sent_chunks.concat();
+    assert!(delivered.contains("[E2E:E15:BEGIN]"));
+    assert!(delivered.contains("[E2E:E15:MID]"));
+    assert!(delivered.contains("E15-LINE-001"));
+    assert!(delivered.contains("E15-LINE-149"));
+    assert!(delivered.contains("E15-LINE-150"));
+    assert!(delivered.contains("[E2E:E15:END]"));
+    assert!(
+        gateway
+            .replace_bodies
+            .lock()
+            .expect("replace bodies lock")
+            .is_empty(),
+        "tail-sized terminal replacement must not be used for the long body"
+    );
+    assert!(
+        gateway.delete_count.load(Ordering::Relaxed) >= 2,
+        "full replay should delete both the live placeholder and the frozen streamed prefix"
+    );
+
+    crate::services::discord::clear_inflight_state(&provider, channel_id.get());
 }
 
 fn test_watcher_handle(tmux_session_name: &str, paused: bool) -> super::super::TmuxWatcherHandle {
@@ -458,6 +993,9 @@ fn replace_fallback_records_failed_cleanup_and_does_not_commit_delivery() {
         Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
             edit_error: "HTTP 403 Forbidden: Missing Permissions".to_string(),
         }),
+        None,
+        None,
+        None,
         "unit_test",
     );
 
@@ -527,6 +1065,7 @@ async fn replace_fallback_preserves_cleanup_inflight_and_defers_queued_dispatch(
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         },
     )
@@ -3210,6 +3749,43 @@ fn done_keeps_full_response_when_no_tools_used() {
 }
 
 #[test]
+fn done_uses_terminal_result_when_streamed_response_is_tail_only() {
+    // Codex TUI can surface only the pane/rollout tail through live Text,
+    // while the terminal JSONL envelope carries the complete final answer.
+    // In that case the bridge must send the authoritative terminal body.
+    let streamed_tail = "E15-LINE-150\nE15-LINE-151\n[E2E:E15:END]";
+    let terminal_body =
+        "[E2E:E15:BEGIN]\nE15-LINE-001\nE15-LINE-002\nE15-LINE-150\nE15-LINE-151\n[E2E:E15:END]";
+    let res = resolve_done_response(streamed_tail, terminal_body, false, false);
+    assert_eq!(res, Some(terminal_body.to_string()));
+}
+
+#[test]
+fn done_replay_reset_only_applies_to_streamed_long_terminal_offsets() {
+    let body = e15_long_body();
+    let tail_offset = body.find("E15-LINE-150").expect("tail marker");
+
+    assert!(done_result_requires_full_terminal_replay(
+        &body,
+        &body,
+        tail_offset,
+        true
+    ));
+    assert!(!done_result_requires_full_terminal_replay(
+        &body,
+        &body,
+        tail_offset,
+        false
+    ));
+    assert!(!done_result_requires_full_terminal_replay(
+        "short body",
+        "short body",
+        5,
+        false
+    ));
+}
+
+#[test]
 fn done_noop_when_result_empty() {
     // Synthetic Done with empty result — nothing to replace with
     let res = resolve_done_response("중간 텍스트\n\n", "", true, false);
@@ -3750,6 +4326,7 @@ async fn watcher_does_not_kickoff_queue_when_dispatch_failed() {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         },
     )

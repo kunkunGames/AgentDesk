@@ -1413,8 +1413,9 @@ use stale_resume::{
     stream_error_requires_terminal_session_reset,
 };
 use terminal_delivery::{
-    should_complete_work_dispatch_after_terminal_delivery,
-    should_fail_dispatch_after_terminal_delivery, turn_bridge_replace_outcome_committed,
+    send_ordered_long_terminal_response, should_complete_work_dispatch_after_terminal_delivery,
+    should_fail_dispatch_after_terminal_delivery, terminal_delivery_should_send_new_chunks,
+    tui_quiescence_timeout_requires_inflight_retry, turn_bridge_replace_outcome_committed,
 };
 use tmux_runtime::is_dcserver_restart_command;
 use turn_analytics::{
@@ -1480,6 +1481,36 @@ fn should_finalize_cancel_after_recv(done: bool, cancel_requested: bool) -> bool
 fn should_suppress_headless_delivery_for_cancel(cancel_token: Option<&CancelToken>) -> bool {
     cancel_requested(cancel_token)
         && !cancel_token.is_some_and(crate::services::provider::CancelToken::is_completion_cleanup)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_record_final_turn_transcript(
+    is_prompt_too_long: bool,
+    resume_failure_detected: bool,
+    recovery_retry: bool,
+    rx_disconnected: bool,
+    tmux_handed_off: bool,
+    bridge_output_delegated: bool,
+    terminal_delivery_committed: bool,
+    preserve_inflight_for_cleanup_retry: bool,
+    full_response: &str,
+) -> bool {
+    !(is_prompt_too_long
+        || resume_failure_detected
+        || recovery_retry
+        || (rx_disconnected && tmux_handed_off && full_response.is_empty())
+        || bridge_output_delegated
+        || !terminal_delivery_committed
+        || preserve_inflight_for_cleanup_retry)
+        && !full_response.trim().is_empty()
+}
+
+fn status_panel_completion_ready_after_terminal_body(
+    terminal_delivery_committed: bool,
+    terminal_body_visible: bool,
+    preserve_inflight_for_cleanup_retry: bool,
+) -> bool {
+    terminal_delivery_committed && terminal_body_visible && !preserve_inflight_for_cleanup_retry
 }
 
 fn sync_inflight_restart_mode_from_cancel(
@@ -1826,13 +1857,11 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
     last_status_panel_text: &mut String,
     background: bool,
     source: &'static str,
+    expected_user_msg_id: u64,
 ) -> bool {
     if !shared.status_panel_v2_enabled {
         return true;
     }
-    let Some(status_msg_id) = status_panel_msg_id else {
-        return true;
-    };
     shared
         .placeholder_live_events
         .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
@@ -1840,32 +1869,93 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
         shared
             .placeholder_live_events
             .render_status_panel(channel_id, provider, started_at_unix);
-    if panel_text == *last_status_panel_text {
-        return true;
+
+    match status_panel_completion_action(status_panel_msg_id, last_status_panel_text, &panel_text) {
+        StatusPanelCompletionAction::AlreadyCommitted => true,
+        StatusPanelCompletionAction::SendFallback => {
+            complete_status_panel_v2_fallback_with_gateway(
+                shared,
+                gateway,
+                channel_id,
+                provider,
+                expected_user_msg_id,
+                last_status_panel_text,
+                panel_text,
+                source,
+            )
+            .await
+        }
+        StatusPanelCompletionAction::Edit(status_msg_id) => {
+            let edit_result = if gateway.can_chain_locally() {
+                gateway
+                    .edit_message(channel_id, status_msg_id, &panel_text)
+                    .await
+            } else if let Some(http) = shared.serenity_http_or_token_fallback() {
+                super::http::edit_channel_message(&http, channel_id, status_msg_id, &panel_text)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("no Discord HTTP available for status-panel-v2 completion edit".to_string())
+            };
+            match edit_result {
+                Ok(()) => {
+                    *last_status_panel_text = panel_text;
+                    true
+                }
+                Err(error) => {
+                    if status_panel_message_missing_error(&error) {
+                        return complete_status_panel_v2_fallback_with_gateway(
+                            shared,
+                            gateway,
+                            channel_id,
+                            provider,
+                            expected_user_msg_id,
+                            last_status_panel_text,
+                            panel_text,
+                            source,
+                        )
+                        .await;
+                    }
+                    tracing::warn!(
+                        "[turn_bridge] failed to finalize status-panel-v2 message {} in channel {} from {}: {}",
+                        status_msg_id,
+                        channel_id,
+                        source,
+                        error
+                    );
+                    false
+                }
+            }
+        }
     }
-    let edit_result = if gateway.can_chain_locally() {
-        gateway
-            .edit_message(channel_id, status_msg_id, &panel_text)
-            .await
-    } else if let Some(http) = shared.serenity_http_or_token_fallback() {
-        super::http::edit_channel_message(&http, channel_id, status_msg_id, &panel_text)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    } else {
-        gateway
-            .edit_message(channel_id, status_msg_id, &panel_text)
-            .await
-    };
-    match edit_result {
-        Ok(()) => {
+}
+
+async fn complete_status_panel_v2_fallback_with_gateway<G: TurnGateway + ?Sized>(
+    shared: &SharedData,
+    gateway: &G,
+    channel_id: ChannelId,
+    provider: &ProviderKind,
+    expected_user_msg_id: u64,
+    last_status_panel_text: &mut String,
+    panel_text: String,
+    source: &'static str,
+) -> bool {
+    match send_status_panel_v2_completion_fallback(shared, gateway, channel_id, &panel_text).await {
+        Ok(message_id) => {
+            persist_status_panel_completion_fallback_message_id(
+                provider,
+                channel_id,
+                Some(expected_user_msg_id),
+                message_id,
+                source,
+            );
             *last_status_panel_text = panel_text;
             true
         }
         Err(error) => {
             tracing::warn!(
-                "[turn_bridge] failed to finalize status-panel-v2 message {} in channel {} from {}: {}",
-                status_msg_id,
+                "[turn_bridge] failed to send fallback status-panel-v2 completion in channel {} from {}: {}",
                 channel_id,
                 source,
                 error
@@ -1873,6 +1963,220 @@ async fn complete_status_panel_v2<G: TurnGateway + ?Sized>(
             false
         }
     }
+}
+
+pub(in crate::services::discord) async fn complete_status_panel_v2_with_http(
+    shared: &std::sync::Arc<SharedData>,
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    status_panel_msg_id: Option<MessageId>,
+    provider: &ProviderKind,
+    started_at_unix: i64,
+    last_status_panel_text: &mut String,
+    background: bool,
+    source: &'static str,
+    expected_user_msg_id: Option<u64>,
+) -> bool {
+    if !shared.status_panel_v2_enabled {
+        return true;
+    }
+    shared
+        .placeholder_live_events
+        .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
+    let panel_text =
+        shared
+            .placeholder_live_events
+            .render_status_panel(channel_id, provider, started_at_unix);
+
+    match status_panel_completion_action(status_panel_msg_id, last_status_panel_text, &panel_text) {
+        StatusPanelCompletionAction::AlreadyCommitted => true,
+        StatusPanelCompletionAction::SendFallback => {
+            rate_limit_wait(shared, channel_id).await;
+            complete_status_panel_v2_fallback_with_http(
+                http,
+                channel_id,
+                provider,
+                expected_user_msg_id,
+                last_status_panel_text,
+                panel_text,
+                source,
+            )
+            .await
+        }
+        StatusPanelCompletionAction::Edit(status_msg_id) => {
+            rate_limit_wait(shared, channel_id).await;
+            match super::http::edit_channel_message(http, channel_id, status_msg_id, &panel_text)
+                .await
+            {
+                Ok(_) => {
+                    *last_status_panel_text = panel_text;
+                    true
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    if status_panel_message_missing_error(&error) {
+                        return complete_status_panel_v2_fallback_with_http(
+                            http,
+                            channel_id,
+                            provider,
+                            expected_user_msg_id,
+                            last_status_panel_text,
+                            panel_text,
+                            source,
+                        )
+                        .await;
+                    }
+                    tracing::warn!(
+                        "[turn_bridge] failed to finalize status-panel-v2 message {} in channel {} from {}: {}",
+                        status_msg_id,
+                        channel_id,
+                        source,
+                        error
+                    );
+                    false
+                }
+            }
+        }
+    }
+}
+
+async fn complete_status_panel_v2_fallback_with_http(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    provider: &ProviderKind,
+    expected_user_msg_id: Option<u64>,
+    last_status_panel_text: &mut String,
+    panel_text: String,
+    source: &'static str,
+) -> bool {
+    match send_status_panel_v2_completion_fallback_http(http, channel_id, &panel_text).await {
+        Ok(message_id) => {
+            persist_status_panel_completion_fallback_message_id(
+                provider,
+                channel_id,
+                expected_user_msg_id,
+                message_id,
+                source,
+            );
+            *last_status_panel_text = panel_text;
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[turn_bridge] failed to send fallback status-panel-v2 completion in channel {} from {}: {}",
+                channel_id,
+                source,
+                error
+            );
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPanelCompletionAction {
+    AlreadyCommitted,
+    Edit(MessageId),
+    SendFallback,
+}
+
+fn status_panel_completion_action(
+    status_panel_msg_id: Option<MessageId>,
+    last_status_panel_text: &str,
+    panel_text: &str,
+) -> StatusPanelCompletionAction {
+    if panel_text == last_status_panel_text {
+        return StatusPanelCompletionAction::AlreadyCommitted;
+    }
+    match normalize_status_panel_message_id(status_panel_msg_id) {
+        Some(message_id) => StatusPanelCompletionAction::Edit(message_id),
+        None => StatusPanelCompletionAction::SendFallback,
+    }
+}
+
+pub(in crate::services::discord) fn normalize_status_panel_message_id(
+    status_panel_msg_id: Option<MessageId>,
+) -> Option<MessageId> {
+    status_panel_msg_id.filter(|id| !is_synthetic_headless_message_id(*id))
+}
+
+fn persist_status_panel_completion_fallback_message_id(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    expected_user_msg_id: Option<u64>,
+    message_id: MessageId,
+    source: &'static str,
+) {
+    if is_synthetic_headless_message_id(message_id) {
+        return;
+    }
+    let Some(expected_user_msg_id) = expected_user_msg_id else {
+        return;
+    };
+    let Some(mut inflight_state) = super::inflight::load_inflight_state(provider, channel_id.get())
+    else {
+        return;
+    };
+    if inflight_state.user_msg_id != expected_user_msg_id {
+        tracing::debug!(
+            "[turn_bridge] skipped persisting status-panel-v2 fallback id {} in channel {} from {}: inflight user_msg_id {} != expected {}",
+            message_id,
+            channel_id,
+            source,
+            inflight_state.user_msg_id,
+            expected_user_msg_id
+        );
+        return;
+    }
+    if inflight_state.status_message_id == Some(message_id.get()) {
+        return;
+    }
+    inflight_state.status_message_id = Some(message_id.get());
+    if let Err(error) = super::inflight::save_inflight_state(&inflight_state) {
+        tracing::warn!(
+            "[turn_bridge] failed to persist fallback status-panel-v2 message {} in channel {} from {}: {}",
+            message_id,
+            channel_id,
+            source,
+            error
+        );
+    }
+}
+
+async fn send_status_panel_v2_completion_fallback_http(
+    http: &serenity::Http,
+    channel_id: ChannelId,
+    panel_text: &str,
+) -> Result<MessageId, String> {
+    super::http::send_channel_message(http, channel_id, panel_text)
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+async fn send_status_panel_v2_completion_fallback<G: TurnGateway + ?Sized>(
+    shared: &SharedData,
+    gateway: &G,
+    channel_id: ChannelId,
+    panel_text: &str,
+) -> Result<MessageId, String> {
+    if gateway.can_chain_locally() {
+        return gateway.send_message(channel_id, panel_text).await;
+    }
+    let Some(http) = shared.serenity_http_or_token_fallback() else {
+        return Err(
+            "no Discord HTTP available for status-panel-v2 completion fallback".to_string(),
+        );
+    };
+    super::http::send_channel_message(&http, channel_id, panel_text)
+        .await
+        .map(|message| message.id)
+        .map_err(|error| error.to_string())
+}
+
+fn status_panel_message_missing_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("unknown message") || normalized.contains("10008")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2293,7 +2597,12 @@ fn status_panel_message_id_for_turn(
     if !reuse_status_panel_message {
         inflight_state.status_message_id = None;
     }
-    inflight_state.status_message_id.map(MessageId::new)
+    let status_msg_id = inflight_state.status_message_id.map(MessageId::new)?;
+    if is_synthetic_headless_message_id(status_msg_id) {
+        inflight_state.status_message_id = None;
+        return None;
+    }
+    Some(status_msg_id)
 }
 
 fn response_portion_after_offset(full_response: &str, response_sent_offset: usize) -> &str {
@@ -2319,6 +2628,19 @@ fn terminal_delivery_response_after_offset(
         delivery_response = notice.to_string();
     }
     delivery_response
+}
+
+fn done_result_requires_full_terminal_replay(
+    full_response: &str,
+    result: &str,
+    response_sent_offset: usize,
+    streamed_assistant_text_this_turn: bool,
+) -> bool {
+    response_sent_offset > 0
+        && streamed_assistant_text_this_turn
+        && result.len() > super::DISCORD_MSG_LIMIT
+        && !result.trim().is_empty()
+        && full_response.trim() == result.trim()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2903,7 +3225,13 @@ fn maybe_refresh_active_turn_activity_heartbeat_at(
     };
     let thread_channel_id = active_turn_thread_channel_id(adk_session_name, inflight_state);
 
-    let legacy_db = super::tmux::sqlite_runtime_db(shared);
+    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+    let legacy_db = {
+        let SharedData { sqlite, .. } = shared;
+        sqlite.as_ref()
+    };
+    #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
+    let legacy_db = None::<&crate::db::Db>;
 
     if super::tmux::refresh_session_heartbeat_from_tmux_output(
         legacy_db,
@@ -2969,78 +3297,88 @@ async fn enqueue_headless_delivery(
                     session_key.map(str::trim).filter(|value| !value.is_empty())
                 {
                     let thread_channel_id = channel_id.get().to_string();
-                    // #2838 (codex review): once enqueue returned Ok(Some(outbox_id))
-                    // the outbox row exists and the message WILL be delivered.
+                    // #2838/#2950: once enqueue returned Ok(Some(outbox_id))
+                    // the outbox row exists, but visible completion must still
+                    // wait for the notify-bot worker to mark that row sent.
                     // The delivery marker below is best-effort dedup bookkeeping;
                     // propagating a marker failure as a delivery Err makes the
                     // caller preserve inflight, which then re-delivers via
                     // recovery (duplicate) AND stalls the queue. So every
-                    // post-enqueue marker failure logs and returns Ok (delivery
-                    // committed) — only a genuine non-delivery (no outbox row +
-                    // failed direct fallback, below) returns Err.
-                    let mut tx = match pool.begin().await {
-                        Ok(tx) => tx,
+                    // post-enqueue marker failure logs and still falls through
+                    // to the outbox visibility wait. Only genuine non-delivery
+                    // (failed outbox visibility or failed direct fallback below)
+                    // returns Err.
+                    match pool.begin().await {
+                        Ok(mut tx) => {
+                            if let Err(error) =
+                                sqlx::query("SELECT pg_advisory_xact_lock(1752, hashtext($1))")
+                                    .bind(&thread_channel_id)
+                                    .execute(&mut *tx)
+                                    .await
+                            {
+                                let _ = tx.rollback().await;
+                                tracing::warn!(
+                                    "[outbox] terminal delivery marker lock failed for session {session_key} (outbox {outbox_id} already enqueued; waiting for visible delivery): {error}"
+                                );
+                            } else {
+                                let active_user_message_id =
+                                    super::mailbox_snapshot(shared.as_ref(), channel_id)
+                                        .await
+                                        .active_user_message_id;
+                                if let Some(active_user_message_id) = active_user_message_id
+                                    && active_user_message_id != owning_user_msg_id
+                                {
+                                    tracing::warn!(
+                                        "[outbox] skipped terminal delivery marker {} for session {} because active turn message changed from {} to {}",
+                                        outbox_id,
+                                        session_key,
+                                        owning_user_msg_id.get(),
+                                        active_user_message_id.get()
+                                    );
+                                } else if let Err(error) = sqlx::query(
+                                    "UPDATE sessions
+                                            SET active_turn_delivery_outbox_id = $1
+                                          WHERE session_key = $2
+                                            AND thread_channel_id = $3
+                                            AND status IN ('turn_active', 'working')",
+                                )
+                                .bind(outbox_id)
+                                .bind(session_key)
+                                .bind(&thread_channel_id)
+                                .execute(&mut *tx)
+                                .await
+                                {
+                                    let _ = tx.rollback().await;
+                                    tracing::warn!(
+                                        "[outbox] terminal delivery marker write failed for session {session_key} row {outbox_id} (already enqueued; waiting for visible delivery): {error}"
+                                    );
+                                    return wait_for_headless_delivery_outbox_visible(
+                                        pool,
+                                        outbox_id,
+                                        HEADLESS_DELIVERY_OUTBOX_VISIBLE_TIMEOUT,
+                                    )
+                                    .await;
+                                }
+                                if let Err(error) = tx.commit().await {
+                                    tracing::warn!(
+                                        "[outbox] terminal delivery marker commit failed for session {session_key} (outbox {outbox_id} already enqueued; waiting for visible delivery): {error}"
+                                    );
+                                }
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(
-                                "[outbox] terminal delivery marker tx begin failed for session {session_key} (outbox {outbox_id} already enqueued; treating delivery as committed): {error}"
+                                "[outbox] terminal delivery marker tx begin failed for session {session_key} (outbox {outbox_id} already enqueued; waiting for visible delivery): {error}"
                             );
-                            return Ok(());
                         }
-                    };
-                    if let Err(error) =
-                        sqlx::query("SELECT pg_advisory_xact_lock(1752, hashtext($1))")
-                            .bind(&thread_channel_id)
-                            .execute(&mut *tx)
-                            .await
-                    {
-                        let _ = tx.rollback().await;
-                        tracing::warn!(
-                            "[outbox] terminal delivery marker lock failed for session {session_key} (outbox {outbox_id} already enqueued; treating delivery as committed): {error}"
-                        );
-                        return Ok(());
-                    }
-
-                    let active_user_message_id =
-                        super::mailbox_snapshot(shared.as_ref(), channel_id)
-                            .await
-                            .active_user_message_id;
-                    if let Some(active_user_message_id) = active_user_message_id
-                        && active_user_message_id != owning_user_msg_id
-                    {
-                        tracing::warn!(
-                            "[outbox] skipped terminal delivery marker {} for session {} because active turn message changed from {} to {}",
-                            outbox_id,
-                            session_key,
-                            owning_user_msg_id.get(),
-                            active_user_message_id.get()
-                        );
-                    } else if let Err(error) = sqlx::query(
-                        "UPDATE sessions
-                                SET active_turn_delivery_outbox_id = $1
-                              WHERE session_key = $2
-                                AND thread_channel_id = $3
-                                AND status IN ('turn_active', 'working')",
-                    )
-                    .bind(outbox_id)
-                    .bind(session_key)
-                    .bind(&thread_channel_id)
-                    .execute(&mut *tx)
-                    .await
-                    {
-                        let _ = tx.rollback().await;
-                        tracing::warn!(
-                            "[outbox] terminal delivery marker write failed for session {session_key} row {outbox_id} (already enqueued; treating delivery as committed): {error}"
-                        );
-                        return Ok(());
-                    }
-                    if let Err(error) = tx.commit().await {
-                        tracing::warn!(
-                            "[outbox] terminal delivery marker commit failed for session {session_key} (outbox {outbox_id} already enqueued; treating delivery as committed): {error}"
-                        );
-                        return Ok(());
                     }
                 }
-                return Ok(());
+                return wait_for_headless_delivery_outbox_visible(
+                    pool,
+                    outbox_id,
+                    HEADLESS_DELIVERY_OUTBOX_VISIBLE_TIMEOUT,
+                )
+                .await;
             }
             Ok(None) => {
                 tracing::info!(
@@ -3102,6 +3440,56 @@ async fn enqueue_headless_delivery(
         .await
         .map_err(|error| format!("headless direct delivery failed: {error}"))?;
     Ok(())
+}
+
+const HEADLESS_DELIVERY_OUTBOX_VISIBLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+const HEADLESS_DELIVERY_OUTBOX_VISIBLE_POLL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+async fn wait_for_headless_delivery_outbox_visible(
+    pool: &sqlx::PgPool,
+    outbox_id: i64,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let row = sqlx::query("SELECT status, error FROM message_outbox WHERE id = $1")
+            .bind(outbox_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|error| {
+                format!("poll headless delivery outbox row {outbox_id} failed: {error}")
+            })?;
+        let Some(row) = row else {
+            return Err(format!(
+                "headless delivery outbox row {outbox_id} disappeared before visible delivery"
+            ));
+        };
+        let status: String = row
+            .try_get("status")
+            .map_err(|error| format!("read headless outbox row {outbox_id} status: {error}"))?;
+        match status.as_str() {
+            "sent" => return Ok(()),
+            "failed" => {
+                let error: Option<String> = row.try_get("error").ok().flatten();
+                return Err(format!(
+                    "headless delivery outbox row {outbox_id} failed before visible delivery: {}",
+                    error.unwrap_or_else(|| "unknown error".to_string())
+                ));
+            }
+            _ => {}
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "headless delivery outbox row {outbox_id} remained {status} for {}s before visible delivery",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(HEADLESS_DELIVERY_OUTBOX_VISIBLE_POLL.min(deadline - now)).await;
+    }
 }
 
 fn total_model_input_tokens(
@@ -3610,6 +3998,13 @@ pub(super) fn spawn_turn_bridge(
     bridge: TurnBridgeContext,
 ) {
     use tracing::Instrument;
+    let bridge_turn_id = discord_turn_id(
+        &bridge.provider,
+        bridge.channel_id,
+        bridge.user_msg_id,
+        bridge.adk_session_key.as_deref(),
+    );
+    let bridge_session_key = bridge.adk_session_key.clone();
     // Attach the span via `.instrument(..)` on the async block instead of
     // holding a sync `Span::enter()` guard across `.await`. The sync-guard
     // pattern leaks the span into unrelated tasks scheduled on the same
@@ -3620,6 +4015,8 @@ pub(super) fn spawn_turn_bridge(
         channel_id = bridge.channel_id.get(),
         provider = bridge.provider.as_str(),
         dispatch_id = tracing::field::debug(bridge.dispatch_id.as_deref()),
+        session_key = tracing::field::debug(bridge_session_key.as_deref()),
+        turn_id = %bridge_turn_id,
     );
     super::task_supervisor::spawn_observed("discord_turn_bridge", async move {
         const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -3710,6 +4107,7 @@ pub(super) fn spawn_turn_bridge(
         let mut standby_relay_owns_output = matches!(
             initial_relay_owner_kind,
             super::inflight::RelayOwnerKind::StandbyRelay
+                | super::inflight::RelayOwnerKind::SessionBoundRelay
                 | super::inflight::RelayOwnerKind::Unknown
         );
         // #1452 (Codex iter 3 P1): track whether THIS turn published a
@@ -3798,6 +4196,9 @@ pub(super) fn spawn_turn_bridge(
         let mut terminal_control_drain_until: Option<std::time::Instant> = None;
         let mut current_msg_id = bridge.current_msg_id;
         let mut response_sent_offset = bridge.response_sent_offset;
+        let mut streamed_assistant_text_this_turn = false;
+        let mut streaming_rollover_frozen_msg_ids: Vec<MessageId> = Vec::new();
+        let mut terminal_full_replay_cleanup_msg_ids: Vec<MessageId> = Vec::new();
         let mut tmux_last_offset = bridge.tmux_last_offset;
         let mut watcher_owner_channel_id = channel_id;
         let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
@@ -3877,8 +4278,13 @@ pub(super) fn spawn_turn_bridge(
             let response_placeholder = super::formatting::build_processing_status_block(SPINNER[0]);
             match gateway.send_message(channel_id, &response_placeholder).await {
                 Ok(response_msg_id) => {
-                    status_panel_msg_id = Some(current_msg_id);
-                    inflight_state.status_message_id = Some(current_msg_id.get());
+                    if is_synthetic_headless_message_id(current_msg_id) {
+                        status_panel_msg_id = None;
+                        inflight_state.status_message_id = None;
+                    } else {
+                        status_panel_msg_id = Some(current_msg_id);
+                        inflight_state.status_message_id = Some(current_msg_id.get());
+                    }
                     current_msg_id = response_msg_id;
                     bridge_created_response_placeholder_msg_id = Some(response_msg_id);
                     last_edit_text = response_placeholder.to_string();
@@ -4168,6 +4574,7 @@ pub(super) fn spawn_turn_bridge(
                             if content.is_empty() {
                                 continue;
                             }
+                            streamed_assistant_text_this_turn = true;
                             full_response.push_str(&content);
                             if (watcher_owns_assistant_relay
                                 && watcher_relay_available_for_turn)
@@ -4831,6 +5238,26 @@ pub(super) fn spawn_turn_bridge(
                                 full_response = resolved;
                                 inflight_state.full_response = full_response.clone();
                             }
+                            if done_result_requires_full_terminal_replay(
+                                &full_response,
+                                &result,
+                                response_sent_offset,
+                                streamed_assistant_text_this_turn,
+                            ) {
+                                tracing::info!(
+                                    target: "agentdesk::codex_rollout_handoff",
+                                    provider = %provider.as_str(),
+                                    channel = channel_id.get(),
+                                    previous_response_sent_offset = response_sent_offset,
+                                    full_response_len = full_response.len(),
+                                    done_result_len = result.len(),
+                                    frozen_rollover_messages = streaming_rollover_frozen_msg_ids.len(),
+                                    "turn_bridge reset terminal delivery offset for authoritative Done body"
+                                );
+                                terminal_full_replay_cleanup_msg_ids =
+                                    streaming_rollover_frozen_msg_ids.clone();
+                                response_sent_offset = 0;
+                            }
                             if let Some(s) = sid {
                                 new_session_id = Some(s.clone());
                                 inflight_state.session_id = Some(s);
@@ -5004,7 +5431,7 @@ pub(super) fn spawn_turn_bridge(
                                     .as_deref()
                                     .or(new_session_id.as_deref())
                                     .or(inflight_state.session_id.as_deref());
-                                status_panel_dirty |= shared_owned
+                                let context_dirty = shared_owned
                                     .placeholder_live_events
                                     .set_context_panel_usage(
                                         channel_id,
@@ -5015,7 +5442,15 @@ pub(super) fn spawn_turn_bridge(
                                         context_window_tokens,
                                         context_compact_percent,
                                     );
+                                status_panel_dirty |= context_dirty;
                             }
+                        }
+                        StreamMessage::StatusEvents { events } => {
+                            status_panel_dirty |= record_status_panel_events(
+                                shared_owned.as_ref(),
+                                channel_id,
+                                events,
+                            );
                         }
                         StreamMessage::TmuxReady {
                             output_path,
@@ -5640,6 +6075,7 @@ pub(super) fn spawn_turn_bridge(
                                     "src/services/discord/turn_bridge/mod.rs:rollover_response_sent_offset",
                                 );
                                 response_sent_offset = next_response_sent_offset;
+                                streaming_rollover_frozen_msg_ids.push(current_msg_id);
                                 current_msg_id = next_msg_id;
                                 last_edit_text = status_block;
                                 last_status_edit = tokio::time::Instant::now() - status_interval;
@@ -6315,11 +6751,7 @@ pub(super) fn spawn_turn_bridge(
                     removed_token
                         .cancelled
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    let _ = shared_owned.global_active.fetch_update(
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                        |current| current.checked_sub(1),
-                    );
+                    super::saturating_decrement_global_active(&shared_owned);
                 }
                 super::clear_watchdog_deadline_override(channel_id.get()).await;
                 shared_owned
@@ -6424,9 +6856,7 @@ pub(super) fn spawn_turn_bridge(
                     removed_token
                         .cancelled
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    shared_owned
-                        .global_active
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    super::saturating_decrement_global_active(&shared_owned);
                 }
                 // Clean up any pending watchdog deadline override for this channel
                 super::clear_watchdog_deadline_override(channel_id.get()).await;
@@ -6450,6 +6880,7 @@ pub(super) fn spawn_turn_bridge(
         };
         let mut preserve_inflight_for_cleanup_retry = false;
         let mut terminal_delivery_committed = false;
+        let mut terminal_body_visible = false;
         let mut status_panel_terminal_committed = false;
         // #2161 (Codex round-2 H1): hoisted into the outer scope so the
         // bridge can run the TUI completion gate BEFORE dispatch completion
@@ -6680,6 +7111,9 @@ pub(super) fn spawn_turn_bridge(
                 gateway
                     .replace_message_with_outcome(channel_id, current_msg_id, &terminal_response)
                     .await,
+                dispatch_id.as_deref(),
+                adk_session_key.as_deref(),
+                Some(turn_id.as_str()),
                 "turn_bridge_cancelled_terminal_replace",
             );
             if replace_committed {
@@ -6717,6 +7151,9 @@ pub(super) fn spawn_turn_bridge(
                 gateway
                     .replace_message_with_outcome(channel_id, current_msg_id, &full_response)
                     .await,
+                dispatch_id.as_deref(),
+                adk_session_key.as_deref(),
+                Some(turn_id.as_str()),
                 "turn_bridge_prompt_too_long_replace",
             );
             if replace_committed {
@@ -7062,6 +7499,7 @@ pub(super) fn spawn_turn_bridge(
                     delivery_response.len()
                 );
                 terminal_delivery_committed = true;
+                terminal_body_visible = true;
                 advance_tmux_relay_confirmed_end(
                     shared_owned.as_ref(),
                     watcher_owner_channel_id,
@@ -7079,6 +7517,7 @@ pub(super) fn spawn_turn_bridge(
                     .is_ok()
                 {
                     terminal_delivery_committed = true;
+                    terminal_body_visible = true;
                 }
             } else {
                 delivery_response = if shared_owned.status_panel_v2_enabled {
@@ -7093,31 +7532,97 @@ pub(super) fn spawn_turn_bridge(
                     )
                 };
                 if can_chain_locally {
-                    let replace_committed = turn_bridge_replace_outcome_committed(
-                        shared_owned.as_ref(),
-                        &provider,
-                        channel_id,
-                        current_msg_id,
-                        inflight_state.tmux_session_name.as_deref(),
-                        gateway
+                    if terminal_delivery_should_send_new_chunks(
+                        can_chain_locally,
+                        &delivery_response,
+                    ) {
+                        match send_ordered_long_terminal_response(
+                            shared_owned.as_ref(),
+                            gateway.as_ref(),
+                            &provider,
+                            channel_id,
+                            current_msg_id,
+                            inflight_state.tmux_session_name.as_deref(),
+                            &delivery_response,
+                            dispatch_id.as_deref(),
+                            adk_session_key.as_deref(),
+                            Some(turn_id.as_str()),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                terminal_delivery_committed = true;
+                                terminal_body_visible = true;
+                                response_sent_offset = full_response.len();
+                                inflight_state.response_sent_offset = response_sent_offset;
+                                advance_tmux_relay_confirmed_end(
+                                    shared_owned.as_ref(),
+                                    watcher_owner_channel_id,
+                                    tmux_last_offset,
+                                    inflight_state.tmux_session_name.as_deref(),
+                                );
+                            }
+                            Err(error) => {
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                tracing::warn!(
+                                    "  [{ts}] ⚠ terminal long response send failed for channel {}: {} — preserving inflight for retry",
+                                    channel_id,
+                                    error
+                                );
+                                preserve_inflight_for_cleanup_retry = true;
+                            }
+                        }
+                    } else {
+                        let replace_outcome = gateway
                             .replace_message_with_outcome(
                                 channel_id,
                                 current_msg_id,
                                 &delivery_response,
                             )
-                            .await,
-                        "turn_bridge_terminal_replace",
-                    );
-                    if replace_committed {
-                        advance_tmux_relay_confirmed_end(
-                            shared_owned.as_ref(),
-                            watcher_owner_channel_id,
-                            tmux_last_offset,
-                            inflight_state.tmux_session_name.as_deref(),
+                            .await;
+                        // #2860: the answer reached the channel if the placeholder was
+                        // edited OR a fallback message was posted. A fallback posts the
+                        // full delivery_response as a fresh message and reports the
+                        // placeholder edit as non-committed; record it as delivered
+                        // (advance the offset) so this turn does not later present as a
+                        // never-delivered completed-stale leak and get re-delivered by
+                        // the stall-watchdog recovery.
+                        let fallback_delivered = matches!(
+                            &replace_outcome,
+                            Ok(super::formatting::ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { .. })
                         );
-                        terminal_delivery_committed = true;
-                    } else {
-                        preserve_inflight_for_cleanup_retry = true;
+                        let replace_committed = turn_bridge_replace_outcome_committed(
+                            shared_owned.as_ref(),
+                            &provider,
+                            channel_id,
+                            current_msg_id,
+                            inflight_state.tmux_session_name.as_deref(),
+                            replace_outcome,
+                            dispatch_id.as_deref(),
+                            adk_session_key.as_deref(),
+                            Some(turn_id.as_str()),
+                            "turn_bridge_terminal_replace",
+                        );
+                        if replace_committed {
+                            advance_tmux_relay_confirmed_end(
+                                shared_owned.as_ref(),
+                                watcher_owner_channel_id,
+                                tmux_last_offset,
+                                inflight_state.tmux_session_name.as_deref(),
+                            );
+                            terminal_delivery_committed = true;
+                            terminal_body_visible = true;
+                        } else {
+                            preserve_inflight_for_cleanup_retry = true;
+                            if fallback_delivered {
+                                // Mark the whole response delivered: the fallback
+                                // message carried it. The preserved-inflight save on
+                                // the `preserve_inflight_for_cleanup_retry` path below
+                                // persists this advanced offset, so the turn never
+                                // re-presents as a never-delivered leak for recovery.
+                                inflight_state.response_sent_offset = full_response.len();
+                            }
+                        }
                     }
                 } else {
                     match enqueue_headless_delivery(
@@ -7142,6 +7647,7 @@ pub(super) fn spawn_turn_bridge(
                             )
                             .await;
                             terminal_delivery_committed = true;
+                            terminal_body_visible = true;
                         }
                         Err(error) => {
                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -7165,6 +7671,44 @@ pub(super) fn spawn_turn_bridge(
             }
 
             if terminal_delivery_committed {
+                response_sent_offset = full_response.len();
+                inflight_state.response_sent_offset = response_sent_offset;
+                inflight_state.terminal_delivery_committed = true;
+                inflight_state.full_response = full_response.clone();
+                if let Err(error) = save_inflight_state(&inflight_state) {
+                    tracing::warn!(
+                        provider = %provider.as_str(),
+                        channel = channel_id.get(),
+                        error = %error,
+                        "turn bridge failed to mirror committed terminal delivery before cleanup"
+                    );
+                }
+                for frozen_msg_id in terminal_full_replay_cleanup_msg_ids.drain(..) {
+                    if frozen_msg_id == current_msg_id {
+                        continue;
+                    }
+                    match gateway.delete_message(channel_id, frozen_msg_id).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                target: "agentdesk::codex_rollout_handoff",
+                                provider = %provider.as_str(),
+                                channel = channel_id.get(),
+                                message_id = frozen_msg_id.get(),
+                                "turn_bridge removed streamed rollover prefix after full terminal replay"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "agentdesk::codex_rollout_handoff",
+                                provider = %provider.as_str(),
+                                channel = channel_id.get(),
+                                message_id = frozen_msg_id.get(),
+                                error = %error,
+                                "turn_bridge failed to remove streamed rollover prefix after full terminal replay"
+                            );
+                        }
+                    }
+                }
                 // #2236: look up the typed handoff marker stamped at dispatch
                 // time so multi-agent setups with overlapping background
                 // channels can be disambiguated by the stored agent_id. The
@@ -7324,7 +7868,15 @@ pub(super) fn spawn_turn_bridge(
                     bridge_gate_outcome,
                     super::tmux::TuiCompletionGateOutcome::TimedOut
                 ) {
-                    preserve_inflight_for_cleanup_retry = true;
+                    if tui_quiescence_timeout_requires_inflight_retry(terminal_delivery_committed) {
+                        preserve_inflight_for_cleanup_retry = true;
+                    } else {
+                        tracing::warn!(
+                            provider = %provider.as_str(),
+                            channel = channel_id.get(),
+                            "TUI completion quiescence timed out after terminal delivery committed; suppressing visible completion only and continuing inflight cleanup"
+                        );
+                    }
                 }
             }
 
@@ -7365,7 +7917,7 @@ pub(super) fn spawn_turn_bridge(
                 && !bridge_relay_delegated_to_watcher
                 && let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
             {
-                watcher.turn_delivered.store(true, Ordering::Relaxed);
+                watcher.turn_delivered.store(true, Ordering::Release);
             }
 
             if can_chain_locally
@@ -7380,8 +7932,11 @@ pub(super) fn spawn_turn_bridge(
             if let Ok(mut last) = shared_owned.last_turn_at.lock() {
                 *last = Some(chrono::Local::now().to_rfc3339());
             }
-            status_panel_terminal_committed =
-                terminal_delivery_committed && !preserve_inflight_for_cleanup_retry;
+            status_panel_terminal_committed = status_panel_completion_ready_after_terminal_body(
+                terminal_delivery_committed,
+                terminal_body_visible,
+                preserve_inflight_for_cleanup_retry,
+            );
         }
 
         let mut status_panel_completion_committed = true;
@@ -7435,6 +7990,7 @@ pub(super) fn spawn_turn_bridge(
                 &mut last_status_panel_text,
                 false,
                 "turn_terminal_delivery",
+                user_msg_id.get(),
             )
             .await;
         }
@@ -7493,12 +8049,17 @@ pub(super) fn spawn_turn_bridge(
             watcher.paused.store(false, Ordering::Relaxed);
         }
 
-        let should_record_final_turn = !(is_prompt_too_long
-            || resume_failure_detected
-            || recovery_retry
-            || (rx_disconnected && tmux_handed_off && full_response.is_empty())
-            || bridge_output_owner.is_some())
-            && !full_response.trim().is_empty();
+        let should_record_final_turn = should_record_final_turn_transcript(
+            is_prompt_too_long,
+            resume_failure_detected,
+            recovery_retry,
+            rx_disconnected,
+            tmux_handed_off,
+            bridge_output_owner.is_some(),
+            terminal_delivery_committed,
+            preserve_inflight_for_cleanup_retry,
+            &full_response,
+        );
 
         // Update in-memory session under lock.
         let mut should_persist_transcript = false;
@@ -7996,6 +8557,8 @@ pub(super) fn spawn_turn_bridge(
                 crate::services::observability::emit_relay_delivery(
                     provider.as_str(),
                     channel_id.get(),
+                    dispatch_id.as_deref(),
+                    adk_session_key.as_deref(),
                     Some(turn_id.as_str()),
                     Some(current_msg_id.get()),
                     "turn_bridge",
@@ -8081,7 +8644,16 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
 
-                    if let Some((intervention, has_more_queued_turns)) = next_intervention {
+                    if let Some(error) = next_intervention.persistence_error.as_ref() {
+                        tracing::error!(
+                            provider = bot_owner_provider.as_str(),
+                            channel_id = channel_id.get(),
+                            error = %error,
+                            "QUEUE-GUARD: preserving queued command after pending-queue persistence failure"
+                        );
+                    } else if let Some((intervention, has_more_queued_turns)) =
+                        next_intervention.into_intervention()
+                    {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!("  [{ts}] 📋 Processing next queued command");
                         if let Err(e) = gateway
@@ -8263,14 +8835,161 @@ mod task_notification_kind_lifecycle_tests {
 #[cfg(test)]
 mod status_panel_v2_rework_tests {
     use super::{
-        InflightTurnState, MessageId, ProviderKind,
-        should_open_long_running_placeholder_controller, status_panel_message_id_for_turn,
+        ChannelId, InflightTurnState, MessageId, ProviderKind, StatusPanelCompletionAction,
+        complete_status_panel_v2, should_open_long_running_placeholder_controller,
+        status_panel_completion_action, status_panel_completion_ready_after_terminal_body,
+        status_panel_message_id_for_turn,
     };
+    use crate::services::discord::formatting::ReplaceLongMessageOutcome;
+    use crate::services::discord::gateway::TurnGateway;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    type TestGatewayFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+    struct StatusPanelFallbackGateway {
+        sent_messages: Arc<Mutex<Vec<String>>>,
+        edited_message_ids: Arc<Mutex<Vec<MessageId>>>,
+        edit_error: Option<String>,
+        send_id: MessageId,
+    }
+
+    impl StatusPanelFallbackGateway {
+        fn with_edit_error(error: &str) -> Self {
+            Self {
+                edit_error: Some(error.to_string()),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Default for StatusPanelFallbackGateway {
+        fn default() -> Self {
+            Self {
+                sent_messages: Arc::new(Mutex::new(Vec::new())),
+                edited_message_ids: Arc::new(Mutex::new(Vec::new())),
+                edit_error: None,
+                send_id: MessageId::new(1_500_000_000_000_999),
+            }
+        }
+    }
+
+    impl TurnGateway for StatusPanelFallbackGateway {
+        fn send_message<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            content: &'a str,
+        ) -> TestGatewayFuture<'a, Result<MessageId, String>> {
+            let sent_messages = self.sent_messages.clone();
+            let send_id = self.send_id;
+            Box::pin(async move {
+                sent_messages
+                    .lock()
+                    .expect("sent messages lock")
+                    .push(content.to_string());
+                Ok(send_id)
+            })
+        }
+
+        fn edit_message<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            message_id: MessageId,
+            _content: &'a str,
+        ) -> TestGatewayFuture<'a, Result<(), String>> {
+            let edited_message_ids = self.edited_message_ids.clone();
+            let edit_error = self.edit_error.clone();
+            Box::pin(async move {
+                edited_message_ids
+                    .lock()
+                    .expect("edited ids lock")
+                    .push(message_id);
+                match edit_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })
+        }
+
+        fn replace_message_with_outcome<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _content: &'a str,
+        ) -> TestGatewayFuture<'a, Result<ReplaceLongMessageOutcome, String>> {
+            Box::pin(async { Ok(ReplaceLongMessageOutcome::EditedOriginal) })
+        }
+
+        fn add_reaction<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _emoji: char,
+        ) -> TestGatewayFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn remove_reaction<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _message_id: MessageId,
+            _emoji: char,
+        ) -> TestGatewayFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn schedule_retry_with_history<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _user_message_id: MessageId,
+            _user_text: &'a str,
+        ) -> TestGatewayFuture<'a, ()> {
+            Box::pin(async {})
+        }
+
+        fn dispatch_queued_turn<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+            _intervention: &'a super::super::Intervention,
+            _request_owner_name: &'a str,
+            _has_more_queued_turns: bool,
+        ) -> TestGatewayFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn validate_live_routing<'a>(
+            &'a self,
+            _channel_id: ChannelId,
+        ) -> TestGatewayFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn requester_mention(&self) -> Option<String> {
+            None
+        }
+
+        fn can_chain_locally(&self) -> bool {
+            true
+        }
+
+        fn bot_owner_provider(&self) -> Option<ProviderKind> {
+            Some(ProviderKind::Claude)
+        }
+    }
 
     #[test]
     fn status_panel_v2_disables_long_running_placeholder_controller() {
         assert!(!should_open_long_running_placeholder_controller(true));
         assert!(should_open_long_running_placeholder_controller(false));
+    }
+
+    fn make_status_panel_v2_shared_for_tests() -> Arc<crate::services::discord::SharedData> {
+        let mut shared = super::super::make_shared_data_for_tests();
+        Arc::get_mut(&mut shared)
+            .expect("fresh test shared data should be uniquely owned")
+            .status_panel_v2_enabled = true;
+        shared
     }
 
     fn test_inflight_state() -> InflightTurnState {
@@ -8310,6 +9029,267 @@ mod status_panel_v2_rework_tests {
 
         assert_eq!(status_panel_msg_id, Some(MessageId::new(99)));
         assert_eq!(state.status_message_id, Some(99));
+    }
+
+    #[test]
+    fn resume_turn_discards_synthetic_status_panel_message_id() {
+        let mut state = test_inflight_state();
+        state.status_message_id = Some(9_100_000_000_000_000_123);
+
+        let status_panel_msg_id = status_panel_message_id_for_turn(&mut state, true);
+
+        assert_eq!(status_panel_msg_id, None);
+        assert_eq!(state.status_message_id, None);
+    }
+
+    #[test]
+    fn completion_action_does_not_fallback_when_panel_text_already_committed() {
+        let panel_text = "응답 완료";
+
+        let action = status_panel_completion_action(None, panel_text, panel_text);
+
+        assert_eq!(action, StatusPanelCompletionAction::AlreadyCommitted);
+    }
+
+    #[test]
+    fn completion_action_treats_synthetic_id_as_missing_target() {
+        let action = status_panel_completion_action(
+            Some(MessageId::new(9_100_000_000_000_000_123)),
+            "",
+            "응답 완료",
+        );
+
+        assert_eq!(action, StatusPanelCompletionAction::SendFallback);
+    }
+
+    #[test]
+    fn completion_action_edits_real_status_panel_message_id() {
+        let message_id = MessageId::new(1510319194921504931);
+
+        let action = status_panel_completion_action(Some(message_id), "", "응답 완료");
+
+        assert_eq!(action, StatusPanelCompletionAction::Edit(message_id));
+    }
+
+    #[test]
+    fn status_panel_completion_waits_for_visible_terminal_body() {
+        assert!(
+            !status_panel_completion_ready_after_terminal_body(true, false, false),
+            "terminal delivery accepted by an async body path is not enough to post completion"
+        );
+        assert!(
+            status_panel_completion_ready_after_terminal_body(true, true, false),
+            "completion may post once the terminal body is visibly committed"
+        );
+        assert!(
+            !status_panel_completion_ready_after_terminal_body(true, true, true),
+            "cleanup retry preservation must still suppress visible completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_panel_fallback_completion_is_blocked_until_body_visible() {
+        let shared = make_status_panel_v2_shared_for_tests();
+        let gateway = StatusPanelFallbackGateway::default();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(1509350490461180105);
+        let mut last_status_panel_text = String::new();
+
+        if status_panel_completion_ready_after_terminal_body(true, false, false) {
+            let _ = complete_status_panel_v2(
+                shared.as_ref(),
+                &gateway,
+                channel_id,
+                Some(MessageId::new(9_100_000_000_000_000_123)),
+                &provider,
+                1_700_000_000,
+                &mut last_status_panel_text,
+                false,
+                "test_completion_before_body",
+                1510319194921504929,
+            )
+            .await;
+        }
+
+        assert!(
+            gateway
+                .sent_messages
+                .lock()
+                .expect("sent messages lock")
+                .is_empty(),
+            "fallback completion must not send before the terminal body is visible"
+        );
+
+        if status_panel_completion_ready_after_terminal_body(true, true, false) {
+            let committed = complete_status_panel_v2(
+                shared.as_ref(),
+                &gateway,
+                channel_id,
+                Some(MessageId::new(9_100_000_000_000_000_123)),
+                &provider,
+                1_700_000_000,
+                &mut last_status_panel_text,
+                false,
+                "test_completion_after_body",
+                1510319194921504929,
+            )
+            .await;
+            assert!(committed);
+        }
+
+        let sent_messages = gateway
+            .sent_messages
+            .lock()
+            .expect("sent messages lock")
+            .clone();
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("응답 완료"));
+    }
+
+    #[tokio::test]
+    async fn status_panel_completion_fallback_posts_when_message_id_is_synthetic() {
+        let shared = make_status_panel_v2_shared_for_tests();
+        let gateway = StatusPanelFallbackGateway::default();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(1509350490461180105);
+        let mut last_status_panel_text = String::new();
+
+        let committed = complete_status_panel_v2(
+            shared.as_ref(),
+            &gateway,
+            channel_id,
+            Some(MessageId::new(9_100_000_000_000_000_123)),
+            &provider,
+            1_700_000_000,
+            &mut last_status_panel_text,
+            false,
+            "test_synthetic_status_panel_id",
+            1510319194921504929,
+        )
+        .await;
+
+        assert!(committed);
+        assert!(
+            gateway
+                .edited_message_ids
+                .lock()
+                .expect("edited ids lock")
+                .is_empty(),
+            "synthetic status-panel ids must not be edited through Discord"
+        );
+        let sent_messages = gateway
+            .sent_messages
+            .lock()
+            .expect("sent messages lock")
+            .clone();
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("응답 완료"));
+        assert_eq!(last_status_panel_text, sent_messages[0]);
+
+        let committed = complete_status_panel_v2(
+            shared.as_ref(),
+            &gateway,
+            channel_id,
+            Some(MessageId::new(9_100_000_000_000_000_123)),
+            &provider,
+            1_700_000_000,
+            &mut last_status_panel_text,
+            false,
+            "test_synthetic_status_panel_id_retry",
+            1510319194921504929,
+        )
+        .await;
+
+        assert!(committed);
+        assert_eq!(
+            gateway
+                .sent_messages
+                .lock()
+                .expect("sent messages lock")
+                .len(),
+            1,
+            "same completed panel text must not send duplicate fallback panels"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_panel_completion_fallback_posts_after_unknown_message_edit() {
+        let shared = make_status_panel_v2_shared_for_tests();
+        let gateway = StatusPanelFallbackGateway::with_edit_error("Unknown Message");
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(1509350490461180105);
+        let stale_status_msg_id = MessageId::new(1_500_000_000_000_111);
+        let mut last_status_panel_text = String::new();
+
+        let committed = complete_status_panel_v2(
+            shared.as_ref(),
+            &gateway,
+            channel_id,
+            Some(stale_status_msg_id),
+            &provider,
+            1_700_000_000,
+            &mut last_status_panel_text,
+            false,
+            "test_unknown_status_panel_id",
+            1510319194921504929,
+        )
+        .await;
+
+        assert!(committed);
+        assert_eq!(
+            gateway
+                .edited_message_ids
+                .lock()
+                .expect("edited ids lock")
+                .as_slice(),
+            &[stale_status_msg_id]
+        );
+        let sent_messages = gateway
+            .sent_messages
+            .lock()
+            .expect("sent messages lock")
+            .clone();
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("응답 완료"));
+        assert_eq!(last_status_panel_text, sent_messages[0]);
+    }
+}
+
+#[cfg(test)]
+mod transcript_delivery_gate_tests {
+    use super::should_record_final_turn_transcript;
+
+    #[test]
+    fn generated_but_undelivered_dm_response_is_not_transcript_completion_evidence() {
+        assert!(
+            !should_record_final_turn_transcript(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                "오늘 윤호 수면 루틴에서 바뀐 점이 있을까요?",
+            ),
+            "a generated response with failed outbound delivery must stay retryable"
+        );
+    }
+
+    #[test]
+    fn delivered_dm_response_can_be_transcript_completion_evidence() {
+        assert!(should_record_final_turn_transcript(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            "오늘 윤호 수면 루틴에서 바뀐 점이 있을까요?",
+        ));
     }
 }
 

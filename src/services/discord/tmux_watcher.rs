@@ -59,6 +59,13 @@ fn watcher_should_suppress_streaming_after_bridge_delivery(
     bridge_delivered_turn && has_assistant_response
 }
 
+pub(super) fn watcher_lifecycle_terminal_delivery_observed(
+    terminal_delivery_observed: bool,
+    bridge_delivered_turn: bool,
+) -> bool {
+    terminal_delivery_observed || bridge_delivered_turn
+}
+
 #[cfg(test)]
 fn watcher_terminal_edit_consumes_placeholder(outcome: &ReplaceLongMessageOutcome) -> bool {
     matches!(outcome, ReplaceLongMessageOutcome::EditedOriginal)
@@ -146,7 +153,10 @@ fn adopt_watcher_terminal_message_ids_from_inflight(
         *placeholder_from_restored_inflight = true;
     }
     if status_panel_msg_id.is_none() {
-        *status_panel_msg_id = inflight.status_message_id.map(serenity::MessageId::new);
+        *status_panel_msg_id =
+            crate::services::discord::turn_bridge::normalize_status_panel_message_id(
+                inflight.status_message_id.map(serenity::MessageId::new),
+            );
     }
 }
 
@@ -906,6 +916,25 @@ fn watcher_should_direct_send_after_session_bound_ack(
     should_direct_send && !matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered)
 }
 
+fn watcher_terminal_response_for_direct_send<'a>(
+    full_response: &'a str,
+    response_sent_offset: usize,
+    session_bound_fallback_uses_full_body: bool,
+) -> &'a str {
+    if session_bound_fallback_uses_full_body {
+        return full_response;
+    }
+    full_response.get(response_sent_offset..).unwrap_or("")
+}
+
+fn watcher_should_send_ordered_new_chunks_for_terminal_fallback(
+    session_bound_fallback_uses_full_body: bool,
+    relay_text: &str,
+) -> bool {
+    session_bound_fallback_uses_full_body
+        && relay_text.len() > crate::services::discord::DISCORD_MSG_LIMIT
+}
+
 /// #2840 (relay-stability P1): RAII guard for the cross-watcher emission slot
 /// (`relay_coord.relay_slot`, an `Arc<AtomicU64>`: 0 = free, non-zero = a
 /// watcher is mid-emission with that start offset). The slot is shared across
@@ -1040,6 +1069,7 @@ async fn complete_watcher_status_panel_v2(
     started_at_unix: i64,
     last_status_panel_text: &mut String,
     background: bool,
+    expected_user_msg_id: Option<u64>,
 ) {
     // #2427 D wire (Codex round 2 HIGH-1): explicit-signal inflight cleanup
     // is intentionally NOT emitted from the watcher path. The watcher is
@@ -1052,41 +1082,19 @@ async fn complete_watcher_status_panel_v2(
     if !shared.status_panel_v2_enabled {
         return;
     }
-    let Some(status_msg_id) = status_panel_msg_id else {
-        return;
-    };
-    shared
-        .placeholder_live_events
-        .push_status_event(channel_id, StatusEvent::TurnCompleted { background });
-    let panel_text =
-        shared
-            .placeholder_live_events
-            .render_status_panel(channel_id, provider, started_at_unix);
-    if panel_text == *last_status_panel_text {
-        return;
-    }
-    rate_limit_wait(shared, channel_id).await;
-    match crate::services::discord::http::edit_channel_message(
+    let _committed = crate::services::discord::turn_bridge::complete_status_panel_v2_with_http(
+        shared,
         http,
         channel_id,
-        status_msg_id,
-        &panel_text,
+        status_panel_msg_id,
+        provider,
+        started_at_unix,
+        last_status_panel_text,
+        background,
+        "tmux_watcher",
+        expected_user_msg_id,
     )
-    .await
-    {
-        Ok(_) => {
-            *last_status_panel_text = panel_text;
-        }
-        Err(error) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                "  [{ts}] ⚠ tmux status-panel-v2 completion edit failed for msg {} in channel {}: {}",
-                status_msg_id.get(),
-                channel_id.get(),
-                error
-            );
-        }
-    }
+    .await;
 }
 
 /// #2161 — TUI completion gate. Callers ask `run_tui_completion_gate` to
@@ -1701,6 +1709,53 @@ mod matched_session_jsonl_gate_tests {
     }
 
     #[test]
+    fn session_bound_direct_fallback_selects_full_provider_body_over_tail_suffix() {
+        let body = format!(
+            "[E2E:E15:BEGIN]\n{}\n[E2E:E15:MID]\n{}\n[E2E:E15:END]",
+            (1..=149)
+                .map(|n| format!("E15-LINE-{n:03}\n"))
+                .collect::<String>(),
+            (150..=160)
+                .map(|n| format!("E15-LINE-{n:03}\n"))
+                .collect::<String>()
+        );
+        let tail_offset = body.find("E15-LINE-150").expect("tail marker");
+
+        let ordinary_watcher_suffix =
+            watcher_terminal_response_for_direct_send(&body, tail_offset, false);
+        assert!(!ordinary_watcher_suffix.contains("[E2E:E15:BEGIN]"));
+        assert!(ordinary_watcher_suffix.contains("E15-LINE-150"));
+        assert!(ordinary_watcher_suffix.contains("[E2E:E15:END]"));
+
+        let session_bound_fallback =
+            watcher_terminal_response_for_direct_send(&body, tail_offset, true);
+        assert!(session_bound_fallback.contains("[E2E:E15:BEGIN]"));
+        assert!(session_bound_fallback.contains("[E2E:E15:MID]"));
+        assert!(session_bound_fallback.contains("E15-LINE-150"));
+        assert!(session_bound_fallback.contains("[E2E:E15:END]"));
+        assert_eq!(session_bound_fallback, body);
+    }
+
+    #[test]
+    fn session_bound_full_body_fallback_uses_ordered_chunks_for_long_placeholder_response() {
+        let body = format!(
+            "[E2E:E15:BEGIN]\n{}\n[E2E:E15:MID]\n{}\n[E2E:E15:END]",
+            "E15-LINE-010\n".repeat(90),
+            "E15-LINE-150\n".repeat(90)
+        );
+
+        assert!(body.len() > crate::services::discord::DISCORD_MSG_LIMIT);
+        assert!(watcher_should_send_ordered_new_chunks_for_terminal_fallback(true, &body));
+        assert!(!watcher_should_send_ordered_new_chunks_for_terminal_fallback(false, &body));
+        assert!(
+            !watcher_should_send_ordered_new_chunks_for_terminal_fallback(
+                true,
+                "E15-LINE-150\n[E2E:E15:END]"
+            )
+        );
+    }
+
+    #[test]
     fn frame_accepted_without_terminal_commit_uses_watcher_direct_fallback() {
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
@@ -2095,6 +2150,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     let mut utf8_decoder = Utf8ChunkDecoder::default();
     let mut prompt_too_long_killed = false;
     let mut turn_result_relayed = false;
+    let mut terminal_delivery_observed = false;
     let mut last_activity_heartbeat_at: Option<std::time::Instant> = None;
     // #1137: 1-shot guard so the "post-terminal-success continuation" log
     // is emitted exactly once per dispatch. Real-world traces (codex
@@ -2185,7 +2241,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // the watcher from using a stale current_offset after unpausing.
         if let Some(new_offset) = resume_offset.lock().ok().and_then(|mut g| g.take()) {
             current_offset = new_offset;
-            let bridge_delivered_turn = turn_delivered.load(Ordering::Relaxed);
+            let bridge_delivered_turn = turn_delivered.load(Ordering::Acquire);
+            terminal_delivery_observed = watcher_lifecycle_terminal_delivery_observed(
+                terminal_delivery_observed,
+                bridge_delivered_turn,
+            );
             // If the bridge already delivered the previous turn, treat this resume
             // point as already consumed once so the watcher doesn't re-relay the
             // same batch after unpausing.
@@ -2262,7 +2322,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         &output_path,
                         &watcher_provider,
                         prompt_too_long_killed,
-                        turn_result_relayed,
+                        watcher_lifecycle_terminal_delivery_observed(
+                            terminal_delivery_observed,
+                            turn_delivered.load(Ordering::Acquire),
+                        ),
                     )
                     .await;
                     break;
@@ -2387,7 +2450,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             &output_path,
                             &watcher_provider,
                             prompt_too_long_killed,
-                            turn_result_relayed,
+                            watcher_lifecycle_terminal_delivery_observed(
+                                terminal_delivery_observed,
+                                turn_delivered.load(Ordering::Acquire),
+                            ),
                         )
                         .await;
                         break;
@@ -2438,7 +2504,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     &output_path,
                     &watcher_provider,
                     prompt_too_long_killed,
-                    turn_result_relayed,
+                    watcher_lifecycle_terminal_delivery_observed(
+                        terminal_delivery_observed,
+                        turn_delivered.load(Ordering::Acquire),
+                    ),
                 )
                 .await;
                 break;
@@ -3651,7 +3720,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     &output_path,
                     &watcher_provider,
                     prompt_too_long_killed,
-                    turn_result_relayed,
+                    watcher_lifecycle_terminal_delivery_observed(
+                        terminal_delivery_observed,
+                        turn_delivered.load(Ordering::Acquire),
+                    ),
                 )
                 .await;
                 break 'watcher_loop;
@@ -4775,15 +4847,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             .as_ref()
             .map(|producer| producer.session_name());
         let mut session_bound_ack_outcome = SessionBoundRelayAckOutcome::MissingTarget;
-        let session_bound_relay_owns_terminal_delivery =
-            if session_bound_relay_should_own_terminal_delivery(
+        let session_bound_terminal_delivery_attempted =
+            session_bound_relay_should_own_terminal_delivery(
                 relay_decision.should_direct_send,
                 session_bound_discord_delivery_enabled,
                 session_bound_relay_turn_fully_mirrored,
                 relay_producer_session_name,
                 inflight_before_relay.as_ref(),
                 &tmux_session_name,
-            ) {
+            );
+        let session_bound_relay_owns_terminal_delivery =
+            if session_bound_terminal_delivery_attempted {
                 let ack_outcome = wait_for_session_bound_relay_delivery_ack(
                     all_data_session_bound_relay_ack.as_ref(),
                     std::time::Duration::from_secs(10),
@@ -4819,6 +4893,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 relay_decision.should_direct_send,
                 session_bound_ack_outcome,
             );
+        let session_bound_fallback_uses_full_body = session_bound_terminal_delivery_attempted
+            && watcher_direct_fallback_after_session_bound_ack;
+        let direct_terminal_response = watcher_terminal_response_for_direct_send(
+            &full_response,
+            response_sent_offset,
+            session_bound_fallback_uses_full_body,
+        );
+        let has_direct_terminal_response = !direct_terminal_response.trim().is_empty();
         // #2838 (relay-stability P0-1): count the primary duplicate-emit vector.
         // The 10s session-bound terminal ACK timed out yet the watcher proceeds
         // to direct-send, so the StreamRelay sink may have actually posted (just
@@ -4876,6 +4958,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             "relay flight recorder"
         );
         let mut watcher_direct_terminal_idle_committed = false;
+        let mut tui_direct_anchor_terminal_body_visible = false;
+        let mut tui_direct_anchor_or_lease_present_for_lifecycle =
+            prompt_anchor_present_before_relay || external_input_lease_before_relay;
         let relay_ok = if session_bound_relay_owns_terminal_delivery {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -4887,6 +4972,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     .unwrap_or("none")
             );
             if has_current_response {
+                tui_direct_anchor_terminal_body_visible = true;
                 last_relayed_offset = Some(turn_data_start_offset);
                 last_observed_generation_mtime_ns =
                     Some(read_generation_file_mtime_ns(&tmux_session_name));
@@ -4913,12 +4999,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         } else if watcher_direct_fallback_after_session_bound_ack {
             let formatted = if shared.status_panel_v2_enabled {
                 crate::services::discord::formatting::format_for_discord_with_status_panel(
-                    current_response,
+                    direct_terminal_response,
                     &watcher_provider,
                 )
             } else {
                 crate::services::discord::formatting::format_for_discord_with_provider(
-                    current_response,
+                    direct_terminal_response,
                     &watcher_provider,
                 )
             };
@@ -4942,72 +5028,27 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let mut external_input_lease_consumed_by_relay = false;
             match placeholder_msg_id {
                 Some(msg_id) => {
-                    if has_current_response {
-                        match replace_long_message_raw_with_outcome(
-                            &http,
-                            channel_id,
-                            msg_id,
+                    if has_direct_terminal_response {
+                        if watcher_should_send_ordered_new_chunks_for_terminal_fallback(
+                            session_bound_fallback_uses_full_body,
                             &relay_text,
-                            &shared,
-                        )
-                        .await
-                        {
-                            Ok(ReplaceLongMessageOutcome::EditedOriginal) => {
-                                direct_send_delivered = true;
-                                external_input_lease_consumed_by_relay =
-                                    watcher_inflight_represents_external_input(
-                                        inflight_before_relay.as_ref(),
-                                    );
-                                placeholder_msg_id = None;
-                                placeholder_from_restored_inflight = false;
-                                last_edit_text.clear();
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::info!(
-                                    "  [{ts}] 👁 ✓ relayed terminal response (edit) channel {} msg {} ({} chars)",
-                                    channel_id.get(),
-                                    msg_id.get(),
-                                    relay_text.len()
-                                );
-                                record_placeholder_cleanup(
-                                    &shared,
-                                    &watcher_provider,
-                                    channel_id,
-                                    msg_id,
-                                    &tmux_session_name,
-                                    PlaceholderCleanupOperation::EditTerminal,
-                                    PlaceholderCleanupOutcome::Succeeded,
-                                    "watcher_terminal_relay",
-                                );
-                            }
-                            Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
-                                edit_error,
-                            }) => {
-                                direct_send_delivered = true;
-                                external_input_lease_consumed_by_relay =
-                                    watcher_inflight_represents_external_input(
-                                        inflight_before_relay.as_ref(),
-                                    );
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::info!(
-                                    "  [{ts}] 👁 ✓ relayed terminal response (fallback send after edit failure) channel {} msg {} ({} chars, edit_error={edit_error})",
-                                    channel_id.get(),
-                                    msg_id.get(),
-                                    relay_text.len()
-                                );
-                                record_placeholder_cleanup(
-                                    &shared,
-                                    &watcher_provider,
-                                    channel_id,
-                                    msg_id,
-                                    &tmux_session_name,
-                                    PlaceholderCleanupOperation::EditTerminal,
-                                    PlaceholderCleanupOutcome::failed(edit_error),
-                                    "watcher_terminal_relay",
-                                );
-                                if watcher_fallback_edit_failure_can_delete_original_placeholder(
-                                    response_sent_offset,
-                                    &last_edit_text,
-                                ) {
+                        ) {
+                            match crate::services::discord::formatting::send_long_message_raw_with_rollback(
+                                &http,
+                                channel_id,
+                                msg_id,
+                                &relay_text,
+                                &shared,
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    direct_send_delivered = true;
+                                    tui_direct_anchor_terminal_body_visible = true;
+                                    external_input_lease_consumed_by_relay =
+                                        watcher_inflight_represents_external_input(
+                                            inflight_before_relay.as_ref(),
+                                        );
                                     let cleanup = delete_terminal_placeholder(
                                         &http,
                                         channel_id,
@@ -5015,78 +5056,179 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         &watcher_provider,
                                         &tmux_session_name,
                                         msg_id,
-                                        "watcher_terminal_relay_fallback_cleanup",
+                                        "watcher_terminal_relay_full_body_fallback_cleanup",
                                     )
                                     .await;
-                                    match fallback_placeholder_cleanup_decision(&cleanup) {
-                                        FallbackPlaceholderCleanupDecision::RelayCommitted => {
-                                            placeholder_msg_id = None;
-                                            placeholder_from_restored_inflight = false;
-                                            last_edit_text.clear();
-                                        }
-                                        FallbackPlaceholderCleanupDecision::PreserveInflightForCleanupRetry => {
-                                            relay_ok = false;
-                                            let ts = chrono::Local::now().format("%H:%M:%S");
-                                            tracing::warn!(
-                                                "  [{ts}] ⚠ watcher: terminal response was delivered via fallback send, but stale placeholder cleanup did not commit for channel {} msg {}",
-                                                channel_id.get(),
-                                                msg_id.get()
-                                            );
-                                        }
+                                    if cleanup.is_committed() {
+                                        placeholder_msg_id = None;
+                                        placeholder_from_restored_inflight = false;
+                                        last_edit_text.clear();
                                     }
-                                } else {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::info!(
+                                        "  [{ts}] 👁 ✓ relayed full terminal response after session-bound fallback (ordered chunks) channel {} msg {} ({} chars)",
+                                        channel_id.get(),
+                                        msg_id.get(),
+                                        relay_text.len()
+                                    );
+                                }
+                                Err(e) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::info!(
+                                        "  [{ts}] 👁 Failed to relay ordered terminal chunks: {e}"
+                                    );
+                                    relay_ok = false;
+                                }
+                            }
+                        } else {
+                            match replace_long_message_raw_with_outcome(
+                                &http,
+                                channel_id,
+                                msg_id,
+                                &relay_text,
+                                &shared,
+                            )
+                            .await
+                            {
+                                Ok(ReplaceLongMessageOutcome::EditedOriginal) => {
+                                    direct_send_delivered = true;
+                                    tui_direct_anchor_terminal_body_visible = true;
+                                    external_input_lease_consumed_by_relay =
+                                        watcher_inflight_represents_external_input(
+                                            inflight_before_relay.as_ref(),
+                                        );
                                     placeholder_msg_id = None;
                                     placeholder_from_restored_inflight = false;
                                     last_edit_text.clear();
                                     let ts = chrono::Local::now().format("%H:%M:%S");
-                                    tracing::warn!(
-                                        "  [{ts}] ⚠ watcher: terminal response delivered via fallback send; preserving original msg {} in channel {} because it may contain streamed response content (#2757)",
+                                    tracing::info!(
+                                        "  [{ts}] 👁 ✓ relayed terminal response (edit) channel {} msg {} ({} chars)",
+                                        channel_id.get(),
                                         msg_id.get(),
-                                        channel_id.get()
+                                        relay_text.len()
+                                    );
+                                    record_placeholder_cleanup(
+                                        &shared,
+                                        &watcher_provider,
+                                        channel_id,
+                                        msg_id,
+                                        &tmux_session_name,
+                                        PlaceholderCleanupOperation::EditTerminal,
+                                        PlaceholderCleanupOutcome::Succeeded,
+                                        "watcher_terminal_relay",
                                     );
                                 }
-                            }
-                            Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
-                                sent_chunks,
-                                total_chunks,
-                                failed_chunk_index,
-                                sent_continuation_message_ids,
-                                cleanup_errors,
-                                error,
-                            }) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::warn!(
-                                    "  [{ts}] ⚠ watcher: terminal response partially delivered in channel {} msg {} (sent_chunks={}, total_chunks={}, failed_chunk_index={}, cleaned_continuations={}, cleanup_errors={}, error={}); preserving inflight for retry",
-                                    channel_id.get(),
-                                    msg_id.get(),
+                                Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
+                                    edit_error,
+                                }) => {
+                                    direct_send_delivered = true;
+                                    tui_direct_anchor_terminal_body_visible = true;
+                                    external_input_lease_consumed_by_relay =
+                                        watcher_inflight_represents_external_input(
+                                            inflight_before_relay.as_ref(),
+                                        );
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::info!(
+                                        "  [{ts}] 👁 ✓ relayed terminal response (fallback send after edit failure) channel {} msg {} ({} chars, edit_error={edit_error})",
+                                        channel_id.get(),
+                                        msg_id.get(),
+                                        relay_text.len()
+                                    );
+                                    record_placeholder_cleanup(
+                                        &shared,
+                                        &watcher_provider,
+                                        channel_id,
+                                        msg_id,
+                                        &tmux_session_name,
+                                        PlaceholderCleanupOperation::EditTerminal,
+                                        PlaceholderCleanupOutcome::failed(edit_error),
+                                        "watcher_terminal_relay",
+                                    );
+                                    if watcher_fallback_edit_failure_can_delete_original_placeholder(
+                                        response_sent_offset,
+                                        &last_edit_text,
+                                    ) {
+                                        let cleanup = delete_terminal_placeholder(
+                                            &http,
+                                            channel_id,
+                                            &shared,
+                                            &watcher_provider,
+                                            &tmux_session_name,
+                                            msg_id,
+                                            "watcher_terminal_relay_fallback_cleanup",
+                                        )
+                                        .await;
+                                        match fallback_placeholder_cleanup_decision(&cleanup) {
+                                            FallbackPlaceholderCleanupDecision::RelayCommitted => {
+                                                placeholder_msg_id = None;
+                                                placeholder_from_restored_inflight = false;
+                                                last_edit_text.clear();
+                                            }
+                                            FallbackPlaceholderCleanupDecision::PreserveInflightForCleanupRetry => {
+                                                relay_ok = false;
+                                                tui_direct_anchor_terminal_body_visible = false;
+                                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                                tracing::warn!(
+                                                    "  [{ts}] ⚠ watcher: terminal response was delivered via fallback send, but stale placeholder cleanup did not commit for channel {} msg {}",
+                                                    channel_id.get(),
+                                                    msg_id.get()
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        placeholder_msg_id = None;
+                                        placeholder_from_restored_inflight = false;
+                                        last_edit_text.clear();
+                                        let ts = chrono::Local::now().format("%H:%M:%S");
+                                        tracing::warn!(
+                                            "  [{ts}] ⚠ watcher: terminal response delivered via fallback send; preserving original msg {} in channel {} because it may contain streamed response content (#2757)",
+                                            msg_id.get(),
+                                            channel_id.get()
+                                        );
+                                    }
+                                }
+                                Ok(ReplaceLongMessageOutcome::PartialContinuationFailure {
                                     sent_chunks,
                                     total_chunks,
                                     failed_chunk_index,
-                                    sent_continuation_message_ids.len(),
-                                    cleanup_errors.len(),
-                                    error
-                                );
-                                record_placeholder_cleanup(
-                                    &shared,
-                                    &watcher_provider,
-                                    channel_id,
-                                    msg_id,
-                                    &tmux_session_name,
-                                    PlaceholderCleanupOperation::EditTerminal,
-                                    PlaceholderCleanupOutcome::failed(format!(
-                                        "{error}; cleaned_continuations={}; cleanup_errors={}",
+                                    sent_continuation_message_ids,
+                                    cleanup_errors,
+                                    error,
+                                }) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::warn!(
+                                        "  [{ts}] ⚠ watcher: terminal response partially delivered in channel {} msg {} (sent_chunks={}, total_chunks={}, failed_chunk_index={}, cleaned_continuations={}, cleanup_errors={}, error={}); preserving inflight for retry",
+                                        channel_id.get(),
+                                        msg_id.get(),
+                                        sent_chunks,
+                                        total_chunks,
+                                        failed_chunk_index,
                                         sent_continuation_message_ids.len(),
-                                        cleanup_errors.len()
-                                    )),
-                                    "watcher_terminal_relay_partial_continuation_failure",
-                                );
-                                relay_ok = false;
-                                retry_terminal_delivery_from_offset = true;
-                            }
-                            Err(e) => {
-                                let ts = chrono::Local::now().format("%H:%M:%S");
-                                tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
-                                relay_ok = false;
+                                        cleanup_errors.len(),
+                                        error
+                                    );
+                                    record_placeholder_cleanup(
+                                        &shared,
+                                        &watcher_provider,
+                                        channel_id,
+                                        msg_id,
+                                        &tmux_session_name,
+                                        PlaceholderCleanupOperation::EditTerminal,
+                                        PlaceholderCleanupOutcome::failed(format!(
+                                            "{error}; cleaned_continuations={}; cleanup_errors={}",
+                                            sent_continuation_message_ids.len(),
+                                            cleanup_errors.len()
+                                        )),
+                                        "watcher_terminal_relay_partial_continuation_failure",
+                                    );
+                                    relay_ok = false;
+                                    retry_terminal_delivery_from_offset = true;
+                                }
+                                Err(e) => {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    tracing::info!("  [{ts}] 👁 Failed to relay: {e}");
+                                    relay_ok = false;
+                                }
                             }
                         }
                     } else {
@@ -5110,7 +5252,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     }
                 }
                 None => {
-                    if has_current_response {
+                    if has_direct_terminal_response {
                         let prompt_anchor =
                             crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
                                 watcher_provider.as_str(),
@@ -5133,16 +5275,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         .await
                         {
                             Ok(_) => {
+                                tui_direct_anchor_or_lease_present_for_lifecycle |=
+                                    prompt_anchor.is_some();
                                 external_input_lease_consumed_by_relay =
                                     external_input_lease_before_relay || prompt_anchor.is_some();
-                                if let Some(prompt_anchor) = prompt_anchor {
-                                    crate::services::tui_prompt_dedupe::clear_prompt_anchor_for_response(
-                                        watcher_provider.as_str(),
-                                        &tmux_session_name,
-                                        prompt_anchor,
-                                    );
-                                }
                                 direct_send_delivered = true;
+                                tui_direct_anchor_terminal_body_visible = true;
                                 let ts = chrono::Local::now().format("%H:%M:%S");
                                 tracing::info!(
                                     "  [{ts}] 👁 ✓ relayed terminal response (new message) channel {} ({} chars, prompt_anchor_message_id={:?})",
@@ -5161,7 +5299,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 }
             }
             if relay_ok {
-                if direct_send_delivered || !has_current_response {
+                if direct_send_delivered || !has_direct_terminal_response {
                     if direct_send_delivered {
                         if external_input_lease_consumed_by_relay {
                             crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
@@ -5361,6 +5499,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         };
         let relay_suppressed = relay_decision.suppressed;
         let terminal_output_committed = relay_ok || relay_suppressed;
+        if terminal_output_committed {
+            terminal_delivery_observed = true;
+        }
         let runtime_binding_candidate_offset = terminal_output_committed
             .then(|| terminal_event_consumed_offset(current_offset, &all_data));
 
@@ -5482,6 +5623,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // path). The recovery_engine D wire is preserved because its
             // `state.user_msg_id` is captured from the inflight snapshot
             // pinned at recovery entry, not re-read at completion time.
+            let status_panel_completion_user_msg_id =
+                inflight_before_relay.as_ref().and_then(|inflight| {
+                    let matches_current_watcher_session = inflight
+                        .tmux_session_name
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|name| !name.is_empty() && name == tmux_session_name);
+                    if !inflight.rebind_origin
+                        && inflight.user_msg_id != 0
+                        && matches_current_watcher_session
+                    {
+                        Some(inflight.user_msg_id)
+                    } else {
+                        None
+                    }
+                });
             complete_watcher_status_panel_v2(
                 &http,
                 &shared,
@@ -5494,6 +5651,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     task_notification_kind,
                     Some(TaskNotificationKind::Background | TaskNotificationKind::MonitorAutoTurn)
                 ),
+                status_panel_completion_user_msg_id,
             )
             .await;
         }
@@ -5556,6 +5714,27 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 "  [{ts}] ⚠ watcher: inflight state missing for channel {} — using DB dispatch fallback",
                 channel_id.get()
             );
+        }
+
+        if crate::services::discord::tui_prompt_relay::should_complete_tui_direct_anchor_lifecycle(
+            terminal_output_committed,
+            tui_direct_anchor_terminal_body_visible,
+            tui_direct_anchor_or_lease_present_for_lifecycle,
+            lifecycle_stage_paused,
+            inflight_state.is_some(),
+        ) {
+            let _ = crate::services::discord::tui_prompt_relay::complete_tui_direct_prompt_anchor_lifecycle_if_present(
+                &http,
+                watcher_provider.as_str(),
+                &tmux_session_name,
+                channel_id,
+                if lifecycle_stage_paused {
+                    "watcher_terminal_delivery_visible_completion_suppressed"
+                } else {
+                    "watcher_terminal_delivery_visible_without_inflight"
+                },
+            )
+            .await;
         }
 
         // Mark user message as completed: ⏳ → ✅ when inflight metadata is
@@ -5993,7 +6172,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &output_path,
                 &watcher_provider,
                 prompt_too_long_killed,
-                turn_result_relayed,
+                watcher_lifecycle_terminal_delivery_observed(
+                    terminal_delivery_observed,
+                    turn_delivered.load(Ordering::Acquire),
+                ),
             )
             .await;
             break 'watcher_loop;
@@ -6503,6 +6685,41 @@ mod tests {
         assert_eq!(placeholder_msg_id, Some(MessageId::new(2002)));
         assert!(placeholder_from_restored_inflight);
         assert_eq!(status_panel_msg_id, Some(MessageId::new(3003)));
+    }
+
+    #[test]
+    fn terminal_relay_does_not_adopt_synthetic_status_panel_message_id() {
+        let mut inflight = InflightTurnState::new(
+            ProviderKind::Claude,
+            123,
+            Some("adk-cc".to_string()),
+            42,
+            1001,
+            2002,
+            "prompt".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-claude-adk-cc".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        );
+        inflight.status_message_id = Some(9_100_000_000_000_000_123);
+
+        let mut placeholder_msg_id = None;
+        let mut placeholder_from_restored_inflight = false;
+        let mut status_panel_msg_id = None;
+
+        adopt_watcher_terminal_message_ids_from_inflight(
+            &mut placeholder_msg_id,
+            &mut placeholder_from_restored_inflight,
+            &mut status_panel_msg_id,
+            &inflight,
+            "AgentDesk-claude-adk-cc",
+        );
+
+        assert_eq!(placeholder_msg_id, Some(MessageId::new(2002)));
+        assert!(placeholder_from_restored_inflight);
+        assert_eq!(status_panel_msg_id, None);
     }
 
     #[test]

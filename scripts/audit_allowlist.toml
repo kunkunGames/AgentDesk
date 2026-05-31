@@ -46,6 +46,10 @@ direct_discord_sends = [
   "src/services/discord/monitoring_status.rs#direct_discord_sends:6911fe26869c481d",
   "src/services/discord/monitoring_status.rs#direct_discord_sends:9ea6e87eaf2dcfcb",
   "src/services/discord/placeholder_controller.rs#direct_discord_sends:94892504c53d1b42",
+  # issue announcements keep this typed PATCH until the #1448 legacy
+  # announce-token fallback is removed; deliver_outbound currently collapses
+  # HTTP status / Discord error code into a string on edit failures.
+  "src/services/issue_announcements.rs#direct_discord_sends:c953e696eec38deb",
   "src/services/discord/router/intake_gate.rs#direct_discord_sends:0a2beaabe9619b4f",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:403e086784912951",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:360a790ca3e3dbc3",
@@ -58,7 +62,10 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:b4849c24f5cb7d09",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:1c6f6dcd93167903",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:f950efca7abd900a",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:26d4f3ea346a4c7b"
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:26d4f3ea346a4c7b",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:d2a63e6f1c91c479",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:c4f1e0c4fddb4380",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9b9526b38f0691a8"
 ]
 
 # Manual JSON row mapping: legacy mapping callsites pending typed migration.
@@ -74,15 +81,9 @@ git_subprocess_callsites = [
 ]
 
 # Legacy SQLite references: cli/migrate, compat, and db/legacy_sqlite are
-# exempt by path rule already. Baseline cleared in #1440 — keep this list
-# empty; new violations should be removed from production sources rather
-# than allowlisted. The two entries below are `#[cfg(all(test, feature =
-# "legacy-sqlite-tests"))]`-gated test helpers (`shared.sqlite.as_ref()`
-# fallback path); the audit regex `\.sqlite\b` cannot see the cfg gate, so
-# we pin them by file:line.
+# exempt by path rule already. Baseline cleared in #1440 - new violations
+# should be removed from production sources rather than allowlisted.
 legacy_sqlite_refs = [
-  "src/services/discord/turn_bridge/mod.rs:2907",
-  "src/services/discord/watchers/lifecycle.rs:370",
 ]
 
 # Source-of-truth alias writes: runtime_layout is already exempt.

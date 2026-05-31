@@ -206,6 +206,7 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            pending_uploads: Vec::new(),
             voice_announcement: None,
         }
     }
@@ -257,6 +258,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                pending_uploads: Vec::new(),
                 voice_announcement: None,
             }],
         );
@@ -287,6 +289,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                pending_uploads: Vec::new(),
                 voice_announcement: None,
             }],
         );
@@ -316,6 +319,7 @@ mod tests {
                 reply_context: None,
                 has_reply_boundary: false,
                 merge_consecutive: false,
+                pending_uploads: Vec::new(),
                 voice_announcement: None,
             }],
         );
@@ -355,7 +359,7 @@ mod tests {
         let channel_id = ChannelId::new(999);
 
         let queue = vec![make_intervention("hello")];
-        save_channel_queue(&provider, token_hash, channel_id, &queue, None);
+        save_channel_queue(&provider, token_hash, channel_id, &queue, None).unwrap();
 
         let expected = tmp
             .path()
@@ -399,7 +403,8 @@ mod tests {
             channel_id,
             &[make_intervention("from A")],
             None,
-        );
+        )
+        .unwrap();
 
         let (result, _overrides) = load_pending_queues(&provider, "hash_bot_b");
         assert!(result.is_empty(), "bot B must not restore bot A's queue");
@@ -433,7 +438,7 @@ mod tests {
             vec![make_intervention("msg2a"), make_intervention("msg2b")],
         );
 
-        save_pending_queues(&provider, token_hash, &queues, &dashmap::DashMap::new());
+        save_pending_queues(&provider, token_hash, &queues, &dashmap::DashMap::new()).unwrap();
 
         let (restored, _restored_overrides) = load_pending_queues(&provider, token_hash);
         assert_eq!(restored.get(&ch1).map(|v| v.len()), Some(1));
@@ -474,7 +479,7 @@ mod tests {
         );
         let overrides: dashmap::DashMap<ChannelId, ChannelId> = dashmap::DashMap::new();
         overrides.insert(channel_id, alt_channel);
-        save_pending_queues(&provider, token_hash, &queues, &overrides);
+        save_pending_queues(&provider, token_hash, &queues, &overrides).unwrap();
 
         let (popped, has_more) = take_next_soft_intervention_persisted(
             &provider,
@@ -545,6 +550,7 @@ mod tests {
             reply_context: Some("[Reply context]".to_string()),
             has_reply_boundary: true,
             merge_consecutive: true,
+            pending_uploads: Vec::new(),
             channel_id: Some(42),
             channel_name: Some("test-channel".to_string()),
             override_channel_id: None,
@@ -571,8 +577,8 @@ mod tests {
         let provider = ProviderKind::Claude;
         let ch = ChannelId::new(77);
 
-        save_channel_queue(&provider, "hash_x", ch, &[make_intervention("bot-x")], None);
-        save_channel_queue(&provider, "hash_y", ch, &[make_intervention("bot-y")], None);
+        save_channel_queue(&provider, "hash_x", ch, &[make_intervention("bot-x")], None).unwrap();
+        save_channel_queue(&provider, "hash_y", ch, &[make_intervention("bot-y")], None).unwrap();
 
         let (result_x, _) = load_pending_queues(&provider, "hash_x");
         let (result_y, _) = load_pending_queues(&provider, "hash_y");
@@ -602,7 +608,8 @@ mod tests {
             thread_channel,
             &[make_intervention("review msg")],
             Some(alt_channel.get()),
-        );
+        )
+        .unwrap();
 
         let (queues, overrides) = load_pending_queues(&provider, token_hash);
         assert_eq!(queues.get(&thread_channel).map(|v| v.len()), Some(1));
@@ -633,7 +640,7 @@ mod tests {
         let overrides: dashmap::DashMap<ChannelId, ChannelId> = dashmap::DashMap::new();
         overrides.insert(ch, alt_ch);
 
-        save_pending_queues(&provider, token_hash, &queues, &overrides);
+        save_pending_queues(&provider, token_hash, &queues, &overrides).unwrap();
 
         let dir = tmp
             .path()
@@ -676,6 +683,7 @@ mod tests {
             reply_context: None,
             has_reply_boundary: false,
             merge_consecutive: false,
+            pending_uploads: Vec::new(),
             channel_id: None,
             channel_name: None,
             override_channel_id: None,

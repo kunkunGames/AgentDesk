@@ -32,6 +32,19 @@ pub(super) trait TurnGateway: Send + Sync {
         content: &'a str,
     ) -> GatewayFuture<'a, Result<MessageId, String>>;
 
+    fn send_long_message_with_rollback<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        rollback_anchor_msg_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
+        Box::pin(async move {
+            let message_id = TurnGateway::send_message(self, channel_id, content).await?;
+            let _ = rollback_anchor_msg_id;
+            Ok(vec![message_id])
+        })
+    }
+
     fn edit_message<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -413,6 +426,18 @@ pub(super) async fn send_intake_placeholder(
         .ok_or_else(|| "intake placeholder delivery was skipped".to_string())
 }
 
+pub(super) async fn send_outbound_message(
+    http: Arc<serenity::Http>,
+    shared: Arc<SharedData>,
+    channel_id: ChannelId,
+    content: &str,
+) -> Result<MessageId, String> {
+    let client = SerenityTurnOutboundClient { http, shared };
+    let msg = gateway_outbound_message(channel_id, content);
+    outbound_delivery_error(deliver_outbound(&client, shared_outbound_deduper(), msg, None).await)?
+        .ok_or_else(|| "message delivery was skipped".to_string())
+}
+
 pub(super) async fn edit_outbound_message(
     http: Arc<serenity::Http>,
     shared: Arc<SharedData>,
@@ -444,15 +469,26 @@ impl TurnGateway for DiscordGateway {
         content: &'a str,
     ) -> GatewayFuture<'a, Result<MessageId, String>> {
         Box::pin(async move {
-            let client = SerenityTurnOutboundClient {
-                http: self.http.clone(),
-                shared: self.shared.clone(),
-            };
-            let msg = gateway_outbound_message(channel_id, content);
-            outbound_delivery_error(
-                deliver_outbound(&client, shared_outbound_deduper(), msg, None).await,
-            )?
-            .ok_or_else(|| "message delivery was skipped".to_string())
+            send_outbound_message(self.http.clone(), self.shared.clone(), channel_id, content).await
+        })
+    }
+
+    fn send_long_message_with_rollback<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        rollback_anchor_msg_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
+        Box::pin(async move {
+            formatting::send_long_message_raw_with_rollback(
+                &self.http,
+                channel_id,
+                rollback_anchor_msg_id,
+                content,
+                &self.shared,
+            )
+            .await
+            .map_err(|error| error.to_string())
         })
     }
 
@@ -733,6 +769,19 @@ impl TurnGateway for HeadlessGateway {
         _content: &'a str,
     ) -> GatewayFuture<'a, Result<MessageId, String>> {
         Box::pin(async move { Ok(next_headless_message_id()) })
+    }
+
+    fn send_long_message_with_rollback<'a>(
+        &'a self,
+        _channel_id: ChannelId,
+        _rollback_anchor_msg_id: MessageId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
+        Box::pin(async move {
+            let chunks = formatting::split_message(content);
+            let count = chunks.len().max(1);
+            Ok((0..count).map(|_| next_headless_message_id()).collect())
+        })
     }
 
     fn edit_message<'a>(
