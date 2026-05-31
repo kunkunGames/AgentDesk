@@ -374,15 +374,15 @@ pub(crate) async fn dispatch_delivery_event_reconcile_report_pg(
         if rows.is_empty() {
             break;
         }
-        for row in &rows {
-            stats.kv_reserving_checked += row.reserving_count.max(0) as usize;
-            stats.kv_notified_checked += row.notified_count.max(0) as usize;
-            classify_delivery_kv_guard_mismatches(&mut stats, &mut mismatches, row);
-        }
         if let Some(last_row) = rows.last() {
             cursor.clone_from(&last_row.dispatch_id);
         } else {
             cursor.clear();
+        }
+        for row in rows {
+            stats.kv_reserving_checked += row.reserving_count.max(0) as usize;
+            stats.kv_notified_checked += row.notified_count.max(0) as usize;
+            classify_delivery_kv_guard_mismatches(&mut stats, &mut mismatches, row);
         }
     }
 
@@ -397,14 +397,14 @@ pub(crate) async fn dispatch_delivery_event_reconcile_report_pg(
         if rows.is_empty() {
             break;
         }
-        for row in &rows {
-            stats.typed_events_checked += 1;
-            classify_delivery_typed_guard_mismatches(&mut stats, &mut mismatches, row);
-        }
         if let Some(last_row) = rows.last() {
             cursor.clone_from(&last_row.dispatch_id);
         } else {
             cursor.clear();
+        }
+        for row in rows {
+            stats.typed_events_checked += 1;
+            classify_delivery_typed_guard_mismatches(&mut stats, &mut mismatches, row);
         }
     }
 
@@ -414,14 +414,14 @@ pub(crate) async fn dispatch_delivery_event_reconcile_report_pg(
 fn classify_delivery_kv_guard_mismatches(
     stats: &mut DispatchDeliveryEventReconcileStats,
     mismatches: &mut Vec<DispatchDeliveryEventMismatch>,
-    row: &DeliveryKvGuardRow,
+    row: DeliveryKvGuardRow,
 ) {
     let has_notified = row.notified_count > 0;
     let typed_status = row.typed_status.as_deref();
     if typed_status.is_none() {
         let expected = if has_notified { "sent" } else { "reserved" };
         let mismatch =
-            DispatchDeliveryEventMismatch::missing_typed(row.dispatch_id.clone(), expected);
+            DispatchDeliveryEventMismatch::missing_typed(row.dispatch_id, expected);
         stats.record_mismatch(&mismatch.kind);
         mismatches.push(mismatch);
         return;
@@ -437,8 +437,8 @@ fn classify_delivery_kv_guard_mismatches(
             return;
         }
         let mismatch = DispatchDeliveryEventMismatch::notified_status(
-            row.dispatch_id.clone(),
-            row.typed_status.clone(),
+            row.dispatch_id,
+            row.typed_status,
         );
         stats.record_mismatch(&mismatch.kind);
         mismatches.push(mismatch);
@@ -449,7 +449,7 @@ fn classify_delivery_kv_guard_mismatches(
 fn classify_delivery_typed_guard_mismatches(
     stats: &mut DispatchDeliveryEventReconcileStats,
     mismatches: &mut Vec<DispatchDeliveryEventMismatch>,
-    row: &DeliveryTypedGuardRow,
+    row: DeliveryTypedGuardRow,
 ) {
     if row.has_reserving || row.has_notified {
         return;
@@ -464,13 +464,13 @@ fn classify_delivery_typed_guard_mismatches(
                 return;
             }
             let mismatch =
-                DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id.clone(), "reserved");
+                DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id, "reserved");
             stats.record_mismatch(&mismatch.kind);
             mismatches.push(mismatch);
         }
         "sent" => {
             let mismatch =
-                DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id.clone(), "sent");
+                DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id, "sent");
             stats.record_mismatch(&mismatch.kind);
             mismatches.push(mismatch);
         }
