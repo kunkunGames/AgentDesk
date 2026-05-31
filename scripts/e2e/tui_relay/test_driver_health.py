@@ -335,6 +335,124 @@ class PostScenarioIdle(unittest.TestCase):
         self.assertEqual(result["status"], "idle")
         self.assertEqual(result["mailboxes_seen"], 1)
 
+    def test_claude_tui_idle_draft_guard_detects_stuck_prompt(self):
+        pane = "\n".join(
+            [
+                "✻ Baked for 10m 9s",
+                "────────────────────────────────────────────────────────────────────────────",
+                "❯\u00a0응답에 정확히 한 줄로 [E2E:E6:AFTER] 만 출력해줘.",
+                "────────────────────────────────────────────────────────────────────────────",
+                "  CLAUDE.md: 1, MCP: 2 │ Tools: 5 done",
+                "  ⏵⏵ bypass permissions on",
+            ]
+        )
+        payloads = {
+            "/api/health/detail": [
+                (200, _health_detail(_idle_mailbox("42", provider="claude")))
+            ]
+        }
+
+        with (
+            patch("run_tui_relay.urllib.request.urlopen", _fake_urlopen_for(payloads)),
+            patch("run_tui_relay.tmux.capture_pane", return_value=pane),
+        ):
+            with self.assertRaises(assertions.AssertionError) as ctx:
+                driver._raise_if_tui_prompt_stuck_while_idle(  # noqa: SLF001
+                    base_url="http://agentdesk.test",
+                    channel_id="42",
+                    cell="claude-tui",
+                    prompt="응답에 정확히 한 줄로 [E2E:E6:AFTER] 만 출력해줘.",
+                    thread_channel_id=None,
+                )
+
+        self.assertIn("prompt remained in Claude TUI input buffer", str(ctx.exception))
+        self.assertIn("mailbox", str(ctx.exception))
+
+    def test_claude_tui_idle_draft_guard_ignores_busy_mailbox(self):
+        payloads = {
+            "/api/health/detail": [
+                (503, _health_detail(_busy_mailbox("42", provider="claude")))
+            ]
+        }
+
+        with (
+            patch("run_tui_relay.urllib.request.urlopen", _fake_urlopen_for(payloads)),
+            patch("run_tui_relay.tmux.capture_pane") as capture,
+        ):
+            driver._raise_if_tui_prompt_stuck_while_idle(  # noqa: SLF001
+                base_url="http://agentdesk.test",
+                channel_id="42",
+                cell="claude-tui",
+                prompt="응답에 정확히 한 줄로 [E2E:E6:AFTER] 만 출력해줘.",
+                thread_channel_id=None,
+            )
+
+        capture.assert_not_called()
+
+    def test_wait_timeout_diagnostics_preserve_body_truncation_evidence(self):
+        window = assertions.Window(setup_marker_id="1")
+        window.add(
+            {
+                "id": "2",
+                "content": "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\nfinal prompt\n```",
+                "author": {"id": "agentdesk", "bot": True},
+                "type": 0,
+            }
+        )
+        window.add(
+            {
+                "id": "3",
+                "content": "[E2E:E21:HEAD]\nDIRECT_E21_OK",
+                "author": {"id": "agentdesk", "bot": True},
+                "type": 0,
+            }
+        )
+        scenario = {
+            "id": "E-21",
+            "assertions": [
+                {
+                    "body_complete": {
+                        "head": "[E2E:E21:HEAD]",
+                        "tail": "[E2E:E21:TAIL]",
+                    }
+                }
+            ],
+        }
+        payloads = {
+            "/api/health/detail": [
+                (200, _health_detail(_idle_mailbox("42", provider="claude")))
+            ]
+        }
+
+        with (
+            patch("run_tui_relay.urllib.request.urlopen", _fake_urlopen_for(payloads)),
+            patch("run_tui_relay.tmux.capture_pane", return_value="❯\u00a0"),
+        ):
+            diagnostic = driver._collect_wait_timeout_diagnostics(  # noqa: SLF001
+                base_url="http://agentdesk.test",
+                channel_id="42",
+                cell="claude-tui",
+                scenario=scenario,
+                thread_channel_id=None,
+                after_id="1",
+                wait_kind="relay",
+                needle="[E2E:E21:TAIL]",
+                prompt="final prompt",
+                window=window,
+            )
+
+        self.assertEqual(
+            diagnostic["classification"],
+            "body_truncated_or_tail_missing_after_head",
+        )
+        self.assertTrue(
+            diagnostic["marker_presence"]["[E2E:E21:HEAD]"]["relay"]
+        )
+        self.assertFalse(
+            diagnostic["marker_presence"]["[E2E:E21:TAIL]"]["relay"]
+        )
+        self.assertEqual(diagnostic["tmux"]["prompt_draft_present"], False)
+
     def test_assert_cell_idle_requires_matching_mailbox(self):
         payloads = {"/api/health/detail": [(200, _health_detail())]}
 
@@ -568,6 +686,94 @@ class ScenarioHealthProbe(unittest.TestCase):
         self.assertEqual(result["global_active"], 0)
         self.assertEqual(result["global_finalizing"], 0)
         sleep.assert_called_once_with(0.0)
+
+    def test_assert_health_polls_healthy_status_until_same_cell_finalizing_drains(self):
+        payloads = {
+            "/api/health/detail": [
+                (
+                    200,
+                    {
+                        **_health_detail(_idle_mailbox("42", provider="codex")),
+                        "global_finalizing": 1,
+                    },
+                ),
+                (200, _health_detail(_idle_mailbox("42", provider="codex"))),
+            ],
+            "/api/health": [
+                (
+                    200,
+                    {
+                        "status": "healthy",
+                        "ok": True,
+                        "fully_recovered": True,
+                        "degraded_reasons": [],
+                    },
+                ),
+                (
+                    200,
+                    {
+                        "status": "healthy",
+                        "ok": True,
+                        "fully_recovered": True,
+                        "degraded_reasons": [],
+                    },
+                ),
+            ],
+        }
+
+        with (
+            patch("run_tui_relay.urllib.request.urlopen", _fake_urlopen_for(payloads)),
+            patch("run_tui_relay.time.sleep", return_value=None) as sleep,
+        ):
+            result = driver.assert_health(
+                "http://agentdesk.test",
+                {
+                    "timeout_s": 1,
+                    "poll_interval_s": 0,
+                    "global_active_max": 0,
+                    "global_finalizing_max": 0,
+                },
+            )
+
+        self.assertEqual(result["status"], "healthy")
+        self.assertEqual(result["global_active"], 0)
+        self.assertEqual(result["global_finalizing"], 0)
+        sleep.assert_called_once_with(0.0)
+
+    def test_assert_health_times_out_when_healthy_status_finalizing_persists(self):
+        healthy_payload = {
+            "status": "healthy",
+            "ok": True,
+            "fully_recovered": True,
+            "degraded_reasons": [],
+        }
+        stuck_detail = {
+            **_health_detail(_idle_mailbox("42", provider="codex")),
+            "global_finalizing": 1,
+        }
+        payloads = {
+            "/api/health/detail": [(200, stuck_detail) for _ in range(4)],
+            "/api/health": [(200, healthy_payload) for _ in range(4)],
+        }
+
+        with (
+            patch("run_tui_relay.urllib.request.urlopen", _fake_urlopen_for(payloads)),
+            patch("run_tui_relay.time.sleep", return_value=None),
+        ):
+            with self.assertRaises(assertions.AssertionError) as ctx:
+                driver.assert_health(
+                    "http://agentdesk.test",
+                    {
+                        "timeout_s": 0.2,
+                        "poll_interval_s": 0.1,
+                        "global_active_max": 0,
+                        "global_finalizing_max": 0,
+                    },
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("assert_health did not pass within 0.2s", message)
+        self.assertIn("global_finalizing=1 > 0", message)
 
     def test_assert_health_forbid_only_allows_unrelated_transitional_reasons(self):
         payloads = {
@@ -873,6 +1079,51 @@ class ControlFlowPrimitives(unittest.TestCase):
 
         self.assertIn("dispatch_id", str(ctx.exception))
 
+    def test_wait_for_provider_hold_state_fails_if_current_turn_disappears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "discord_inflight" / "claude" / "42.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "channel_id": 42,
+                        "user_msg_id": 222,
+                        "full_response": "[E2E:E18:OK]\n\n",
+                        "any_tool_used": False,
+                        "has_post_tool_text": False,
+                        "terminal_delivery_committed": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def remove_current_turn() -> None:
+                threading.Event().wait(0.03)
+                path.unlink(missing_ok=True)
+
+            remover = threading.Thread(target=remove_current_turn)
+            remover.start()
+            try:
+                with self.assertRaises(assertions.AssertionError) as ctx:
+                    driver.wait_for_provider_hold_state(
+                        runtime_root=tmp,
+                        provider="claude",
+                        channel_id="42",
+                        expected_identity={
+                            "channel_id": "42",
+                            "user_msg_id": "222",
+                        },
+                        ok_marker="[E2E:E18:OK]",
+                        late_marker="[E2E:E18:LATE]",
+                        timeout_s=0.5,
+                        poll_interval_s=0.01,
+                    )
+            finally:
+                remover.join(timeout=1.0)
+
+        self.assertIn("disappeared before cancel", str(ctx.exception))
+        self.assertIn("last_current_state=", str(ctx.exception))
+
     def test_wait_for_provider_hold_state_rejects_delivered_current_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "discord_inflight" / "claude" / "42.json"
@@ -1001,6 +1252,83 @@ class ControlFlowPrimitives(unittest.TestCase):
             "9100000000000000123",
         )
 
+    def test_run_one_cell_local_fixture_does_not_touch_client_or_health(self):
+        class ForbiddenClient:
+            base_url = "http://agentdesk.test"
+
+            def send_control(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("local fixture must not send control messages")
+
+            def fetch_messages(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("local fixture must not fetch Discord messages")
+
+            def send_prompt(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("local fixture must not send prompts")
+
+        args = Namespace(
+            cell="codex-tui",
+            channel_id="42",
+            thread_channel_id=None,
+            queue_runtime_root="/tmp/agentdesk-e2e-test-runtime",
+        )
+        scenario = {
+            "id": "E-25",
+            "execution": "fixture",
+            "steps": [
+                {
+                    "replay_fixture": {
+                        "kind": "codex_modern_schema",
+                        "provider": "codex",
+                        "frames": [
+                            {"type": "thread.started", "thread_id": "thread-1"},
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        {"type": "output_text", "text": "partial"}
+                                    ],
+                                },
+                            },
+                            {
+                                "type": "event_msg",
+                                "payload": {
+                                    "type": "task_complete",
+                                    "turn_id": "turn-1",
+                                    "last_agent_message": "[E2E:E25:FINAL]",
+                                },
+                            },
+                        ],
+                    }
+                },
+                {"fixture_followup_probe": {"prompt": "next"}},
+            ],
+            "assertions": [
+                {"text_present": "[E2E:E25:FINAL]"},
+                {"fixture_task_complete_finalized": {"turn_id": "turn-1"}},
+                {"fixture_followup_ready": True},
+                {"fixture_no_health_degradation": True},
+            ],
+        }
+
+        with patch("run_tui_relay.assert_cell_idle") as idle:
+            record = driver.run_one_cell(
+                scenario=scenario,
+                cell="codex-tui",
+                channel_id="42",
+                client=ForbiddenClient(),  # type: ignore[arg-type]
+                run_id="run-1",
+                dry_run=False,
+                args=args,
+            )
+
+        idle.assert_not_called()
+        self.assertTrue(record["local_fixture"])
+        self.assertEqual(record["relay_count"], 1)
+        self.assertEqual(record["post_scenario_idle"]["source"], "local_fixture")
+        self.assertTrue(record["fixture_state"]["followup_probe_accepted"])
+
     def test_run_one_cell_waits_for_hold_state_before_cancel(self):
         class FakeClient:
             base_url = "http://agentdesk.test"
@@ -1105,6 +1433,51 @@ class ControlFlowPrimitives(unittest.TestCase):
                 "passed": True,
             },
         )
+
+    def test_e18_contract_allows_zero_relay_surface_messages_before_cancel(self):
+        scenarios_dir = ROOT / "tests" / "e2e" / "tui_relay" / "scenarios"
+        e18 = next(
+            scenario
+            for scenario in driver.load_scenarios(scenarios_dir, cell="claude-pipe")
+            if scenario.get("id") == "E-18"
+        )
+        window = assertions.Window(setup_marker_id="setup")
+        record = {
+            "provider_hold_states": [
+                {
+                    "ok_marker": "[E2E:E18:OK]",
+                    "ok_marker_seen": True,
+                    "late_marker": "[E2E:E18:LATE]",
+                    "late_marker_seen": False,
+                }
+            ]
+        }
+
+        for spec in e18["assertions"]:
+            driver.run_assertion(spec, window=window, record=record)
+
+    def test_e18_late_marker_absence_still_fails_on_relay_surface(self):
+        window = assertions.Window(setup_marker_id="setup")
+        window.add(
+            {
+                "id": "1",
+                "content": "[E2E:E18:LATE]",
+                "author": {"id": "agentdesk", "bot": True},
+                "type": 0,
+            }
+        )
+
+        with self.assertRaises(assertions.AssertionError):
+            driver.run_assertion(
+                {
+                    "marker_absent": {
+                        "marker": "[E2E:E18:LATE]",
+                        "surface": "relay",
+                    }
+                },
+                window=window,
+                record={"provider_hold_states": []},
+            )
 
     def test_send_prompts_concurrent_overlaps_dispatches(self):
         class FakeClient:
@@ -1239,6 +1612,10 @@ class ControlFlowPrimitives(unittest.TestCase):
             record["tmux_key_sequences"],
             [{"session": sent[0][0], "count": 4, "mode": "single_call"}],
         )
+        self.assertEqual(
+            record["direct_input_prompts"],
+            [{"mode": "send_keys_sequence", "prompt_preview": "final prompt"}],
+        )
 
     def test_send_keys_sequence_can_pause_between_control_keys(self):
         class FakeClient:
@@ -1314,6 +1691,64 @@ class ControlFlowPrimitives(unittest.TestCase):
                 }
             ],
         )
+
+    def test_send_keys_sequence_wait_guard_uses_inferred_direct_prompt(self):
+        class FakeClient:
+            base_url = "http://agentdesk.test"
+
+            def send_control(self, channel_id, content):  # noqa: ARG002
+                return {"id": "1"}
+
+            def fetch_messages(self, channel_id, *, limit=50, after_id=None):  # noqa: ARG002
+                return []
+
+        args = Namespace(
+            cell="claude-tui",
+            channel_id="42",
+            thread_channel_id=None,
+            queue_runtime_root="/tmp/agentdesk-e2e-test-runtime",
+        )
+        scenario = {
+            "id": "E-21",
+            "steps": [
+                {
+                    "send_keys_sequence": {
+                        "keys": ["STALE_DRAFT", "C-u", "final prompt", "C-m"],
+                    }
+                },
+                {"wait_for_discord_text": "TAIL", "timeout_s": 1},
+            ],
+            "assertions": [],
+        }
+        prompts: list[str | None] = []
+
+        def fake_wait(**kwargs):
+            prompts.append(kwargs.get("prompt"))
+            return {"id": "2", "content": "TAIL", "author": {"bot": True}}, []
+
+        with (
+            patch("run_tui_relay.time.sleep", return_value=None),
+            patch("run_tui_relay.tmux.send_keys", return_value=True),
+            patch(
+                "run_tui_relay.wait_for_discord_text_with_tui_idle_draft_guard",
+                side_effect=fake_wait,
+            ),
+            patch(
+                "run_tui_relay.assert_cell_idle",
+                return_value={"status": "idle", "mailboxes_seen": 1},
+            ),
+        ):
+            driver.run_one_cell(
+                scenario=scenario,
+                cell="claude-tui",
+                channel_id="42",
+                client=FakeClient(),  # type: ignore[arg-type]
+                run_id="run-1",
+                dry_run=False,
+                args=args,
+            )
+
+        self.assertEqual(prompts, ["final prompt"])
 
     def test_assert_session_preserved_detects_recreated_tmux_session(self):
         before = {
@@ -1411,6 +1846,56 @@ class ScenarioTeardown(unittest.TestCase):
         self.assertEqual(result["health_assertions"], [{"status": "healthy"}])
         self.assertEqual(result["relay_count"], 0)
         self.assertEqual(result["raw_count"], 1)
+
+    def test_run_scenario_includes_partial_record_on_step_assertion_failure(self):
+        class FakeClient:
+            base_url = "http://agentdesk.test"
+
+            def __init__(self):
+                self.control_messages: list[str] = []
+
+            def send_control(self, channel_id, content):  # noqa: ARG002
+                self.control_messages.append(content)
+                return {"id": str(len(self.control_messages))}
+
+        args = Namespace(
+            cell="claude-tui",
+            channel_id="42",
+            thread_channel_id=None,
+            reset_before_each=False,
+            dry_run=False,
+            queue_runtime_root="/tmp/agentdesk-e2e-test-runtime",
+            hard_reset_session_each=False,
+            allow_destructive=False,
+        )
+        scenario = {"id": "E-21", "steps": [], "assertions": []}
+        partial = {
+            "assertions": [],
+            "relay_count": 1,
+            "raw_count": 2,
+            "tmux_key_sequences": [{"mode": "per_key", "count": 4}],
+            "wait_timeouts": [{"classification": "direct_input_notified_no_tail_observed"}],
+        }
+
+        with patch(
+            "run_tui_relay.run_one_cell",
+            side_effect=driver.ScenarioStepAssertionError(
+                "timeout waiting for Discord text '[E2E:E21:TAIL]'",
+                record=partial,
+            ),
+        ):
+            result = driver.run_scenario(
+                scenario,
+                args=args,
+                run_id="run-1",
+                client=FakeClient(),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["relay_count"], 1)
+        self.assertEqual(result["raw_count"], 2)
+        self.assertEqual(result["tmux_key_sequences"], partial["tmux_key_sequences"])
+        self.assertEqual(result["wait_timeouts"], partial["wait_timeouts"])
 
     def test_run_scenario_posts_teardown_when_idle_assertion_fails(self):
         class FakeClient:
