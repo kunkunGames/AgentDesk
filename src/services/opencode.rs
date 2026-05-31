@@ -308,13 +308,11 @@ fn drain_startup_output<R>(
                 Err(_) => break,
             };
             let chunk = String::from_utf8_lossy(&buffer[..read]);
-            let mut output = output.lock().unwrap_or_else(|e| {
-                tracing::warn!("Recovered poisoned output lock in opencode startup output stream");
-                e.into_inner()
-            });
-            match stream {
-                StartupStream::Stdout => append_bounded(&mut output.stdout, &chunk),
-                StartupStream::Stderr => append_bounded(&mut output.stderr, &chunk),
+            if let Ok(mut output) = output.lock() {
+                match stream {
+                    StartupStream::Stdout => append_bounded(&mut output.stdout, &chunk),
+                    StartupStream::Stderr => append_bounded(&mut output.stderr, &chunk),
+                }
             }
         }
     });
@@ -333,10 +331,9 @@ fn append_bounded(target: &mut String, chunk: &str) {
 }
 
 fn summarize_startup_output(output: &Arc<Mutex<OpenCodeStartupOutput>>) -> String {
-    let output = output.lock().unwrap_or_else(|e| {
-        tracing::warn!("Recovered poisoned output lock in opencode startup output summary");
-        e.into_inner()
-    });
+    let Ok(output) = output.lock() else {
+        return String::new();
+    };
     let stdout = compact_log_fragment(&output.stdout);
     let stderr = compact_log_fragment(&output.stderr);
     match (stdout.is_empty(), stderr.is_empty()) {
@@ -854,11 +851,8 @@ fn consume_sse(
                         // behaviour. PID is registered via
                         // `register_child_pid` during server startup.
                         if !stop.load(Ordering::Relaxed)
-                            && let Some(pid) =
-                                *cancel.child_pid.lock().unwrap_or_else(|e| {
-                                    tracing::warn!("Recovered poisoned child_pid lock in opencode watchdog");
-                                    e.into_inner()
-                                })
+                            && let Ok(guard) = cancel.child_pid.lock()
+                            && let Some(pid) = *guard
                         {
                             kill_pid_tree(pid);
                         }
