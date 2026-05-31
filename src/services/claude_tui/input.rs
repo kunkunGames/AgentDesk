@@ -24,6 +24,11 @@ const PROMPT_READY_POST_EVENT_SETTLE: Duration = Duration::from_millis(50);
 const PROMPT_SUBMIT_INITIAL_SETTLE: Duration = Duration::from_millis(120);
 const PROMPT_SUBMIT_RETRY_SETTLE: Duration = Duration::from_millis(350);
 const PROMPT_SUBMIT_CONFIRM_RETRIES: usize = 2;
+/// Maximum number of times the readiness wait will try to clear a stranded
+/// composer draft (leftover, unsent prompt text that blocks `marker && !draft`
+/// readiness) before giving up and letting the timeout fire. See
+/// `wait_for_prompt_ready_polling`.
+const PROMPT_READY_STRANDED_DRAFT_CLEAR_ATTEMPTS: usize = 3;
 const PROMPT_READY_TIMEOUT_ERROR_PREFIX: &str = "timeout waiting for claude tui";
 pub const PROMPT_READY_CANCELLED_ERROR: &str = "claude tui prompt readiness wait cancelled";
 
@@ -326,7 +331,7 @@ fn confirm_prompt_submission_left_editor(
             }
             PromptSubmitConfirmationDecision::FailedDraftStuck => {
                 log_prompt_submit_left_draft(session_name, &snapshot);
-                clear_prompt_draft_before_error(session_name, cancel_token);
+                clear_claude_tui_prompt_draft_keys(session_name, cancel_token);
                 return Err(format!(
                     "claude tui prompt submit left draft after {} enter retries; prompt_marker_detected={}; prompt_draft_detected={}; capture_available={}",
                     PROMPT_SUBMIT_CONFIRM_RETRIES,
@@ -390,7 +395,11 @@ fn prompt_submit_settle_for_attempt(attempt: usize) -> Duration {
     }
 }
 
-fn clear_prompt_draft_before_error(session_name: &str, cancel_token: Option<&CancelToken>) {
+/// Best-effort clear of whatever editable text sits in the Claude TUI composer:
+/// press Escape, then backspace over the budgeted draft width. Used both after a
+/// failed submission and by the readiness wait when it finds a stranded draft
+/// blocking an otherwise-idle prompt.
+fn clear_claude_tui_prompt_draft_keys(session_name: &str, cancel_token: Option<&CancelToken>) {
     let snapshot = prompt_readiness_snapshot(session_name);
     let mut actions = vec![TuiInputAction::Escape];
     if let Some(count) = claude_prompt_draft_backspace_budget_from_tail(&snapshot.pane_tail) {
@@ -400,7 +409,7 @@ fn clear_prompt_draft_before_error(session_name: &str, cancel_token: Option<&Can
         tracing::warn!(
             tmux_session_name = session_name,
             error = %error,
-            "failed to clear Claude TUI draft after prompt submit retries"
+            "failed to clear Claude TUI draft"
         );
     }
 }
@@ -773,6 +782,8 @@ fn wait_for_prompt_ready_polling(
     transcript_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let mut wait_interval = Duration::from_millis(100);
+    let mut stranded_draft_clear_attempts = 0usize;
+    let mut prior_snapshot_had_stranded_draft = false;
     loop {
         check_prompt_cancel(cancel_token)?;
         if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
@@ -798,6 +809,38 @@ fn wait_for_prompt_ready_polling(
             );
             return Ok(());
         }
+        // An idle Claude TUI that still holds leftover composer text (a stranded
+        // draft from a prior interaction, or a submission whose Enter never
+        // registered) can never satisfy `prompt_marker_confirms_prompt_ready`,
+        // which requires an empty composer. Without active recovery the wait
+        // just polls until the 45s/120s timeout and the user is told the bot
+        // "can't reply", even though the TUI is sitting at a ready prompt. Clear
+        // the stranded draft and re-poll. We only act once the same stranded
+        // signature has been observed on two consecutive snapshots (so a
+        // one-frame streaming artifact is never mistaken for a stuck draft) and
+        // cap the number of clears so a genuinely stuck composer still times out.
+        let stranded_draft_now = snapshot_has_stranded_prompt_draft(&snapshot);
+        if stranded_draft_now
+            && prior_snapshot_had_stranded_draft
+            && stranded_draft_clear_attempts < PROMPT_READY_STRANDED_DRAFT_CLEAR_ATTEMPTS
+        {
+            stranded_draft_clear_attempts += 1;
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                attempt = stranded_draft_clear_attempts,
+                max_attempts = PROMPT_READY_STRANDED_DRAFT_CLEAR_ATTEMPTS,
+                "claude_tui prompt-ready blocked by a stranded composer draft; clearing it before timeout"
+            );
+            clear_claude_tui_prompt_draft_keys(session_name, cancel_token);
+            check_prompt_cancel(cancel_token)?;
+            // Require a fresh confirming observation after the clear before any
+            // further clear attempt.
+            prior_snapshot_had_stranded_draft = false;
+            std::thread::sleep(PROMPT_SUBMIT_RETRY_SETTLE);
+            continue;
+        }
+        prior_snapshot_had_stranded_draft = stranded_draft_now;
         if !snapshot.tmux_pane_alive {
             check_prompt_cancel(cancel_token)?;
             return Err("claude tui session died before prompt input was ready".to_string());
@@ -805,16 +848,49 @@ fn wait_for_prompt_ready_polling(
         if start.elapsed() >= timeout {
             check_prompt_cancel(cancel_token)?;
             log_prompt_ready_timeout(session_name, readiness, timeout, &snapshot);
+            let previous_tui_turn_still_running =
+                snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected;
             return Err(format!(
-                "{PROMPT_READY_TIMEOUT_ERROR_PREFIX} {} prompt input readiness after {}s; reason=prompt_marker_not_detected; previous_tui_turn_still_running=true; capture_available={}",
+                "{PROMPT_READY_TIMEOUT_ERROR_PREFIX} {} prompt input readiness after {}s; reason={}; previous_tui_turn_still_running={}; capture_available={}",
                 readiness.label(),
                 timeout.as_secs(),
+                prompt_ready_timeout_reason(&snapshot),
+                previous_tui_turn_still_running,
                 snapshot.capture_available
             ));
         }
         std::thread::sleep(wait_interval);
         check_prompt_cancel(cancel_token)?;
         wait_interval = std::cmp::min(wait_interval * 2, Duration::from_millis(1000));
+    }
+}
+
+/// True when the pane shows an idle Claude prompt that still holds editable
+/// composer text (a stranded draft). This is the same signature the submission
+/// path already treats as a stuck draft (`prompt_submit_needs_enter_retry`): a
+/// live pane, a detected prompt marker, and detected draft text. The
+/// prompt-marker detector returns false while Claude is actively working, so a
+/// detected marker also implies the turn is not mid-stream — the draft is
+/// genuinely leftover and safe to clear. (Note: a real stranded draft sits
+/// inside the normal idle composer box, so we must NOT exclude the
+/// "idle suggestion" chrome here — that chrome is just the idle prompt border.)
+fn snapshot_has_stranded_prompt_draft(snapshot: &PromptReadinessSnapshot) -> bool {
+    snapshot.tmux_pane_alive
+        && snapshot.capture_available
+        && snapshot.prompt_marker_detected
+        && snapshot.prompt_draft_detected
+}
+
+/// Human-readable reason for a prompt-readiness timeout, derived from the actual
+/// final snapshot instead of a hardcoded string, so the surfaced error reflects
+/// what was really on screen (e.g. a stranded draft vs. a missing prompt marker).
+fn prompt_ready_timeout_reason(snapshot: &PromptReadinessSnapshot) -> &'static str {
+    if snapshot.prompt_marker_detected && snapshot.prompt_draft_detected {
+        "stranded_prompt_draft"
+    } else if !snapshot.prompt_marker_detected {
+        "prompt_marker_not_detected"
+    } else {
+        "prompt_not_ready"
     }
 }
 
@@ -1071,6 +1147,77 @@ mod tests {
         };
 
         assert!(!prompt_marker_confirms_prompt_ready(&snapshot));
+    }
+
+    #[test]
+    fn stranded_prompt_draft_detected_only_for_idle_marker_with_draft() {
+        // The dominant real-world deadlock: idle TUI sitting at a ready prompt
+        // that still holds leftover composer text (e.g. "❯ 1번으로 롤백해줘").
+        let stranded = PromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            prompt_draft_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "\u{276f} 1번으로 롤백해줘".to_string(),
+        };
+        assert!(snapshot_has_stranded_prompt_draft(&stranded));
+
+        // No draft → an empty ready prompt must never be cleared.
+        let empty_ready = PromptReadinessSnapshot {
+            prompt_draft_detected: false,
+            ..stranded.clone()
+        };
+        assert!(!snapshot_has_stranded_prompt_draft(&empty_ready));
+
+        // No marker → genuinely busy / mid-stream, do not touch the composer.
+        let no_marker = PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            ..stranded.clone()
+        };
+        assert!(!snapshot_has_stranded_prompt_draft(&no_marker));
+
+        // Dead pane or unavailable capture → nothing actionable.
+        let dead = PromptReadinessSnapshot {
+            tmux_pane_alive: false,
+            ..stranded.clone()
+        };
+        assert!(!snapshot_has_stranded_prompt_draft(&dead));
+        let no_capture = PromptReadinessSnapshot {
+            capture_available: false,
+            ..stranded.clone()
+        };
+        assert!(!snapshot_has_stranded_prompt_draft(&no_capture));
+    }
+
+    #[test]
+    fn prompt_ready_timeout_reason_reflects_actual_snapshot() {
+        let stranded = PromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            prompt_draft_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "\u{276f} leftover".to_string(),
+        };
+        assert_eq!(prompt_ready_timeout_reason(&stranded), "stranded_prompt_draft");
+
+        let no_marker = PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            ..stranded.clone()
+        };
+        assert_eq!(
+            prompt_ready_timeout_reason(&no_marker),
+            "prompt_marker_not_detected"
+        );
+
+        // Marker present but draft cleared and still not confirmed ready (e.g.
+        // a transient redraw) — neither a stranded draft nor a missing marker.
+        let marker_only = PromptReadinessSnapshot {
+            prompt_marker_detected: true,
+            prompt_draft_detected: false,
+            ..stranded.clone()
+        };
+        assert_eq!(prompt_ready_timeout_reason(&marker_only), "prompt_not_ready");
     }
 
     #[test]
