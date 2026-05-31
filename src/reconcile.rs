@@ -1625,7 +1625,7 @@ mod dispatch_delivery_reconcile_tests {
         classify_delivery_kv_guard_mismatches(
             &mut stats,
             &mut mismatches,
-            &DeliveryKvGuardRow {
+            DeliveryKvGuardRow {
                 dispatch_id: "dispatch-missing-typed".to_string(),
                 reserving_count: 1,
                 notified_count: 0,
@@ -1636,7 +1636,7 @@ mod dispatch_delivery_reconcile_tests {
         classify_delivery_kv_guard_mismatches(
             &mut stats,
             &mut mismatches,
-            &DeliveryKvGuardRow {
+            DeliveryKvGuardRow {
                 dispatch_id: "dispatch-notified-status".to_string(),
                 reserving_count: 0,
                 notified_count: 1,
@@ -1647,7 +1647,7 @@ mod dispatch_delivery_reconcile_tests {
         classify_delivery_typed_guard_mismatches(
             &mut stats,
             &mut mismatches,
-            &DeliveryTypedGuardRow {
+            DeliveryTypedGuardRow {
                 dispatch_id: "dispatch-typed-only".to_string(),
                 typed_status: "sent".to_string(),
                 reserved_until: None,
