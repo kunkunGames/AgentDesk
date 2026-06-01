@@ -122,7 +122,9 @@ fn configured_repo_dir(repo_id: &str) -> Option<String> {
     }
 
     let expanded = if raw == "~" || raw.starts_with("~/") {
-        crate::runtime_layout::expand_user_path(raw).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| raw.to_string())
+        crate::runtime_layout::expand_user_path(raw)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw.to_string())
     } else {
         raw.to_string()
     };
@@ -206,7 +208,9 @@ pub fn resolve_repo_dir_for_target(target_repo: Option<&str>) -> Result<Option<S
 
     if looks_like_explicit_repo_path(requested) {
         let expanded = if requested == "~" || requested.starts_with("~/") {
-            crate::runtime_layout::expand_user_path(requested).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| requested.to_string())
+            crate::runtime_layout::expand_user_path(requested)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| requested.to_string())
         } else {
             requested.to_string()
         };
