@@ -672,37 +672,60 @@ async fn do_finalize(
         super::saturating_decrement_global_active(shared);
     }
 
-    // (D) trailing terminal side-effects that today follow `mailbox_finish_turn`
-    //     inline at the bridge/watcher call-sites. Moved here so they cannot
-    //     diverge between the routed paths.
-    super::clear_watchdog_deadline_override(channel_id.get()).await;
-    shared
-        .dispatch_thread_parents
-        .retain(|_, thread| *thread != channel_id);
+    // The CHANNEL-SCOPED trailing side-effects (D)/(E) below mutate per-channel
+    // routing/watchdog state that belongs to whatever turn is CURRENTLY active
+    // in the channel. They are safe to run when this finalize actually finished
+    // the turn (`removed_token.is_some()`), and harmlessly idempotent on the
+    // legacy unguarded id-0 path (which always ran them). But when the
+    // IDENTITY-GUARDED finish MISSED — a real `user_msg_id` that did NOT match
+    // the live active turn, so `removed_token` is `None` — a DIFFERENT (newer)
+    // turn owns the channel. Running these would clear the newer turn's
+    // watchdog override, drop its `dispatch_thread_parents` / `dispatch_role_
+    // overrides`, and drain its voice deferrals, corrupting a turn this stale
+    // terminal does not own (Codex P2). So when the guard was used and missed,
+    // skip the channel cleanup entirely — exactly as we already skip the token
+    // release and counter decrement. (An id-0 orphan keeps today's behaviour.)
+    let guarded_finish_missed = key.user_msg_id != 0 && finish.removed_token.is_none();
 
-    let voice_deferred_enqueued = if ctx.drain_voice {
-        shared
-            .voice_barge_in
-            .drain_deferred_after_turn(shared, &provider, channel_id)
-            .await
+    let has_pending_after_voice = if guarded_finish_missed {
+        // No-op finalize on a stale terminal: leave the live newer turn's
+        // channel state untouched. Surface the no-op's pending flag only for
+        // the returned outcome; do NOT mutate role-overrides or kick a queue.
+        finish.has_pending
     } else {
-        false
-    };
-    let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
-    if !has_pending_after_voice {
-        shared.dispatch_role_overrides.remove(&channel_id);
-    }
+        // (D) trailing terminal side-effects that today follow
+        //     `mailbox_finish_turn` inline at the bridge/watcher call-sites.
+        //     Moved here so they cannot diverge between the routed paths.
+        super::clear_watchdog_deadline_override(channel_id.get()).await;
+        shared
+            .dispatch_thread_parents
+            .retain(|_, thread| *thread != channel_id);
 
-    // (E) optional deferred queue kickoff (watcher path), gated exactly as
-    //     `finish_restored_watcher_active_turn` did.
-    if ctx.kickoff_queue && finish.mailbox_online && has_pending_after_voice {
-        super::schedule_deferred_idle_queue_kickoff(
-            shared.clone(),
-            provider.clone(),
-            channel_id,
-            "turn_finalizer terminal completion with queued backlog",
-        );
-    }
+        let voice_deferred_enqueued = if ctx.drain_voice {
+            shared
+                .voice_barge_in
+                .drain_deferred_after_turn(shared, &provider, channel_id)
+                .await
+        } else {
+            false
+        };
+        let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
+        if !has_pending_after_voice {
+            shared.dispatch_role_overrides.remove(&channel_id);
+        }
+
+        // (E) optional deferred queue kickoff (watcher path), gated exactly as
+        //     `finish_restored_watcher_active_turn` did.
+        if ctx.kickoff_queue && finish.mailbox_online && has_pending_after_voice {
+            super::schedule_deferred_idle_queue_kickoff(
+                shared.clone(),
+                provider.clone(),
+                channel_id,
+                "turn_finalizer terminal completion with queued backlog",
+            );
+        }
+        has_pending_after_voice
+    };
 
     // (F) relay-miss observability — emitted from inside the finalizer so the
     //     signal fires exactly once per finalize regardless of submitter.
@@ -1463,6 +1486,17 @@ mod tests {
             )
             .await;
 
+        // Channel-scoped routing state that belongs to the LIVE turn-2. A stale
+        // turn-1 terminal must not clear any of it (Codex P2 — the trailing
+        // side-effects must be skipped when the identity guard misses).
+        //   * dispatch_thread_parents is cleaned via `retain(|_, v| *v != ch)`,
+        //     so seed an entry whose VALUE is `ch` (a thread routing TO it).
+        //   * dispatch_role_overrides is keyed BY `ch`.
+        let thread_ch = ChannelId::new(1314);
+        let override_ch = ChannelId::new(1315);
+        shared.dispatch_thread_parents.insert(thread_ch, ch);
+        shared.dispatch_role_overrides.insert(ch, override_ch);
+
         let fin = TurnFinalizer::spawn();
         // A STALE terminal for turn-1 (its real id) arrives. The finalizer
         // ledger has no entry for it (turn-1's entry was GC'd / never here), so
@@ -1507,6 +1541,24 @@ mod tests {
             shared.global_active.load(Ordering::Relaxed),
             1,
             "global_active must not be decremented for the wrong turn"
+        );
+
+        // Codex P2: the live turn-2's channel-scoped routing state survives the
+        // stale terminal — the guard-missed finalize must skip the trailing
+        // side-effects, not corrupt the newer turn's routing/watchdog metadata.
+        assert!(
+            shared
+                .dispatch_thread_parents
+                .get(&thread_ch)
+                .is_some_and(|v| *v == ch),
+            "stale terminal must NOT drop turn-2's dispatch_thread_parents entry"
+        );
+        assert!(
+            shared
+                .dispatch_role_overrides
+                .get(&ch)
+                .is_some_and(|v| *v == override_ch),
+            "stale terminal must NOT drop turn-2's dispatch_role_overrides entry"
         );
 
         // And turn-2 finalizes correctly on its OWN matching terminal.
