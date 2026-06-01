@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .. import common
-from ..common import Finding, read_text, rel_posix, strip_rust_comments
+from ..common import Finding, is_allowlisted, read_text, rel_posix, strip_rust_comments
 from . import CheckSpec
 
 ROUTE_DIR_PARTS = ("server", "routes")
@@ -66,7 +66,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
                         extra={"mutation_sql": str(mutations)},
                     )
                 )
-        if rel in allowlist:
+        if is_allowlisted(allowlist, rel, rule="route_srp_violations"):
             continue
         sql = len(SQL_HINT.findall(text))
         js = len(JSON_HINT.findall(text))

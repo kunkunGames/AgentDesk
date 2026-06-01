@@ -10,7 +10,14 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from ..common import Finding, is_allowlisted, line_of, read_text, rel_posix, strip_rust_comments
+from ..common import (
+    Finding,
+    is_allowlisted,
+    line_of,
+    read_text,
+    rel_posix,
+    strip_rust_comments,
+)
 from . import CheckSpec
 
 ALLOWED_PARENTS = (
@@ -33,12 +40,12 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         rel = rel_posix(path)
         if any(rel.startswith(parent) for parent in ALLOWED_PARENTS):
             continue
-        if rel in allowlist:
+        if is_allowlisted(allowlist, rel, rule="git_subprocess_callsites"):
             continue
         text = strip_rust_comments(read_text(path))
         for match in PATTERN.finditer(text):
             line = line_of(text, match.start())
-            if is_allowlisted(allowlist, rel, line):
+            if is_allowlisted(allowlist, rel, line, rule="git_subprocess_callsites"):
                 continue
             findings.append(
                 Finding(

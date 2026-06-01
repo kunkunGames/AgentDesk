@@ -85,7 +85,9 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
     for path in common.production_rust_files():
         rel = common.rel_posix(path)
         cap = matching_namespace_cap(rel, caps)
-        if cap is None or common.is_allowlisted(allowlist, rel):
+        if cap is None or common.is_allowlisted(
+            allowlist, rel, rule="namespace_size_caps"
+        ):
             continue
         loc = count_lines(common.read_text(path))
         if loc <= cap.max_lines:

@@ -87,7 +87,13 @@ def stable_finding_key(rule: str, file: str, context: str) -> str:
     return f"{file}#{rule}:{digest}"
 
 
-USED_ALLOWLIST: set[str] = set()
+USED_ALLOWLIST: set[tuple[str, str]] = set()
+
+
+def record_allowlist_use(rule: str, entry: str) -> None:
+    """Record that ``entry`` was actually used by ``rule`` during a run."""
+
+    USED_ALLOWLIST.add((rule, entry))
 
 
 def is_allowlisted(
@@ -95,19 +101,23 @@ def is_allowlisted(
     file: str,
     line: int | None = None,
     stable_key: str | None = None,
+    rule: str | None = None,
 ) -> bool:
     """Return true when a finding is covered by a path, line, or stable key."""
 
     if file in allowlist:
-        USED_ALLOWLIST.add(file)
+        if rule is not None:
+            record_allowlist_use(rule, file)
         return True
     if stable_key is not None and stable_key in allowlist:
-        USED_ALLOWLIST.add(stable_key)
+        if rule is not None:
+            record_allowlist_use(rule, stable_key)
         return True
     if line is not None:
         line_key = f"{file}:{line}"
         if line_key in allowlist:
-            USED_ALLOWLIST.add(line_key)
+            if rule is not None:
+                record_allowlist_use(rule, line_key)
             return True
     return False
 

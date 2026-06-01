@@ -53,7 +53,9 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         for fragment in ALIAS_FRAGMENTS:
             for match in re.finditer(re.escape(fragment), text):
                 line = line_of(text, match.start())
-                if is_allowlisted(allowlist, rel, line):
+                if is_allowlisted(
+                    allowlist, rel, line, rule="source_of_truth_alias_writes"
+                ):
                     continue
                 findings.append(
                     Finding(
