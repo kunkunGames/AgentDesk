@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { X, Plus, Trash2, UserPlus, UserMinus, Settings2 } from "lucide-react";
 import type { Office, Agent } from "../types";
 import AgentAvatar from "./AgentAvatar";
@@ -35,6 +35,8 @@ export default function OfficeManagerModal({
   const [view, setView] = useState<ModalView>("list");
   const [editOffice, setEditOffice] = useState<Office | null>(null);
   const [agentsOffice, setAgentsOffice] = useState<Office | null>(null);
+  const iconRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const colorRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const {
     deleteOffice,
     draft,
@@ -306,13 +308,32 @@ export default function OfficeManagerModal({
                     >
                       {tr("아이콘", "Icon")}
                     </label>
-                    <div className="flex gap-1.5 flex-wrap">
-                      {OFFICE_ICONS.map((ic) => (
+                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-label={tr("아이콘", "Icon")}>
+                      {OFFICE_ICONS.map((ic, idx) => (
                         <button
                           key={ic}
+                          ref={(el) => {
+                            iconRefs.current[idx] = el;
+                          }}
                           type="button"
+                          role="radio"
                           aria-label={tr(`아이콘 ${ic}`, `Icon ${ic}`)}
-                          aria-pressed={draft.icon === ic}
+                          aria-checked={draft.icon === ic}
+                          tabIndex={draft.icon === ic || (!OFFICE_ICONS.includes(draft.icon) && idx === 0) ? 0 : -1}
+                          onKeyDown={(e) => {
+                            let nextIdx = idx;
+                            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                              e.preventDefault();
+                              nextIdx = (idx + 1) % OFFICE_ICONS.length;
+                            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                              e.preventDefault();
+                              nextIdx = (idx - 1 + OFFICE_ICONS.length) % OFFICE_ICONS.length;
+                            }
+                            if (nextIdx !== idx) {
+                              setDraft((prev) => ({ ...prev, icon: OFFICE_ICONS[nextIdx] }));
+                              iconRefs.current[nextIdx]?.focus();
+                            }
+                          }}
                           onClick={() => setDraft((prev) => ({ ...prev, icon: ic }))}
                           className="flex h-8 w-8 items-center justify-center rounded text-base transition-all"
                           style={{
@@ -338,13 +359,32 @@ export default function OfficeManagerModal({
                     >
                       {tr("색상", "Color")}
                     </label>
-                    <div className="flex gap-1.5 flex-wrap">
-                      {OFFICE_COLORS.map((c) => (
+                    <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-label={tr("색상", "Color")}>
+                      {OFFICE_COLORS.map((c, idx) => (
                         <button
                           key={c}
+                          ref={(el) => {
+                            colorRefs.current[idx] = el;
+                          }}
                           type="button"
+                          role="radio"
                           aria-label={tr(`색상 ${c}`, `Color ${c}`)}
-                          aria-pressed={draft.color === c}
+                          aria-checked={draft.color === c}
+                          tabIndex={draft.color === c || (!OFFICE_COLORS.includes(draft.color) && idx === 0) ? 0 : -1}
+                          onKeyDown={(e) => {
+                            let nextIdx = idx;
+                            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                              e.preventDefault();
+                              nextIdx = (idx + 1) % OFFICE_COLORS.length;
+                            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                              e.preventDefault();
+                              nextIdx = (idx - 1 + OFFICE_COLORS.length) % OFFICE_COLORS.length;
+                            }
+                            if (nextIdx !== idx) {
+                              setDraft((prev) => ({ ...prev, color: OFFICE_COLORS[nextIdx] }));
+                              colorRefs.current[nextIdx]?.focus();
+                            }
+                          }}
                           onClick={() => setDraft((prev) => ({ ...prev, color: c }))}
                           className={`w-7 h-7 rounded-full transition-all ${
                             draft.color === c

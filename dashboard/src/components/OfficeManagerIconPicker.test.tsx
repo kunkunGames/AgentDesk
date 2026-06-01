@@ -74,11 +74,11 @@ describe("Office manager icon picker accessibility", () => {
 
     const selectedIcon = queryIconButton(target, "Icon 🎮");
     expect(selectedIcon.getAttribute("type")).toBe("button");
-    expect(selectedIcon.getAttribute("aria-pressed")).toBe("true");
+    expect(selectedIcon.getAttribute("aria-checked")).toBe("true");
 
     const unselectedIcon = queryIconButton(target, "Icon 🏢");
     expect(unselectedIcon.getAttribute("type")).toBe("button");
-    expect(unselectedIcon.getAttribute("aria-pressed")).toBe("false");
+    expect(unselectedIcon.getAttribute("aria-checked")).toBe("false");
   });
 
   it("renders modal create icon buttons as non-submit toggle buttons with Korean labels", async () => {
@@ -103,6 +103,6 @@ describe("Office manager icon picker accessibility", () => {
 
     const defaultIcon = queryIconButton(target, "아이콘 🏢");
     expect(defaultIcon.getAttribute("type")).toBe("button");
-    expect(defaultIcon.getAttribute("aria-pressed")).toBe("true");
+    expect(defaultIcon.getAttribute("aria-checked")).toBe("true");
   });
 });

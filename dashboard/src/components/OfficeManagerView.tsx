@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { ArrowDown, ArrowUp, Building2, Plus, Save, Trash2, UserPlus, Users } from "lucide-react";
 import type { Agent, Office } from "../types";
 import * as api from "../api/client";
@@ -39,6 +39,8 @@ export default function OfficeManagerView({
   const [selectedId, setSelectedId] = useState<string | null>(selectedOfficeId ?? offices[0]?.id ?? null);
   const [creating, setCreating] = useState(false);
   const [orderSaving, setOrderSaving] = useState(false);
+  const iconRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const colorRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const {
     clearMembers,
     deleteOffice: removeOffice,
@@ -375,13 +377,32 @@ export default function OfficeManagerView({
                     <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("아이콘", "Icon")}
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      {OFFICE_ICONS.map((icon) => (
+                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={tr("아이콘", "Icon")}>
+                      {OFFICE_ICONS.map((icon, idx) => (
                         <button
                           key={icon}
+                          ref={(el) => {
+                            iconRefs.current[idx] = el;
+                          }}
                           type="button"
+                          role="radio"
                           aria-label={tr(`아이콘 ${icon}`, `Icon ${icon}`)}
-                          aria-pressed={draft.icon === icon}
+                          aria-checked={draft.icon === icon}
+                          tabIndex={draft.icon === icon || (!OFFICE_ICONS.includes(draft.icon) && idx === 0) ? 0 : -1}
+                          onKeyDown={(e) => {
+                            let nextIdx = idx;
+                            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                              e.preventDefault();
+                              nextIdx = (idx + 1) % OFFICE_ICONS.length;
+                            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                              e.preventDefault();
+                              nextIdx = (idx - 1 + OFFICE_ICONS.length) % OFFICE_ICONS.length;
+                            }
+                            if (nextIdx !== idx) {
+                              setDraft((prev) => ({ ...prev, icon: OFFICE_ICONS[nextIdx] }));
+                              iconRefs.current[nextIdx]?.focus();
+                            }
+                          }}
                           onClick={() => setDraft((prev) => ({ ...prev, icon }))}
                           className="flex h-10 w-10 items-center justify-center rounded-xl text-lg transition-colors"
                           style={{
@@ -403,13 +424,32 @@ export default function OfficeManagerView({
                     <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("대표 색상", "Accent Color")}
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      {OFFICE_COLORS.map((color) => (
+                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={tr("대표 색상", "Accent Color")}>
+                      {OFFICE_COLORS.map((color, idx) => (
                         <button
                           key={color}
+                          ref={(el) => {
+                            colorRefs.current[idx] = el;
+                          }}
                           type="button"
+                          role="radio"
                           aria-label={tr(`색상 ${color}`, `Color ${color}`)}
-                          aria-pressed={draft.color === color}
+                          aria-checked={draft.color === color}
+                          tabIndex={draft.color === color || (!OFFICE_COLORS.includes(draft.color) && idx === 0) ? 0 : -1}
+                          onKeyDown={(e) => {
+                            let nextIdx = idx;
+                            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                              e.preventDefault();
+                              nextIdx = (idx + 1) % OFFICE_COLORS.length;
+                            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                              e.preventDefault();
+                              nextIdx = (idx - 1 + OFFICE_COLORS.length) % OFFICE_COLORS.length;
+                            }
+                            if (nextIdx !== idx) {
+                              setDraft((prev) => ({ ...prev, color: OFFICE_COLORS[nextIdx] }));
+                              colorRefs.current[nextIdx]?.focus();
+                            }
+                          }}
                           onClick={() => setDraft((prev) => ({ ...prev, color }))}
                           className="h-9 w-9 rounded-full border-2 transition-transform hover:scale-105"
                           style={{
