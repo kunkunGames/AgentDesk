@@ -689,9 +689,13 @@ async fn do_finalize(
 
     let has_pending_after_voice = if guarded_finish_missed {
         // No-op finalize on a stale terminal: leave the live newer turn's
-        // channel state untouched. Surface the no-op's pending flag only for
-        // the returned outcome; do NOT mutate role-overrides or kick a queue.
-        finish.has_pending
+        // channel state untouched. Report NO backlog (Codex P2): the newer turn
+        // is still active and owns its queue. Surfacing `finish.has_pending`
+        // here would let the bridge propagate `has_queued_turns` and later drain
+        // a queued soft message behind the live turn — concurrently dispatching
+        // a follow-up this stale terminal does not own. A guarded miss is a true
+        // no-op: no queue kickoff, no backlog reporting.
+        false
     } else {
         // (D) trailing terminal side-effects that today follow
         //     `mailbox_finish_turn` inline at the bridge/watcher call-sites.
@@ -1465,6 +1469,7 @@ mod tests {
     /// turn-2's token.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stale_real_id_terminal_does_not_release_newer_turn_token() {
+        use crate::services::turn_orchestrator::{Intervention, InterventionMode};
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
@@ -1483,6 +1488,29 @@ mod tests {
                 turn2_token.clone(),
                 UserId::new(7),
                 MessageId::new(turn2_id),
+            )
+            .await;
+        // A queued soft follow-up sits behind turn-2. If the stale terminal
+        // surfaced `has_pending`, the bridge could drain THIS message behind the
+        // live turn — so the guard-miss path must report no backlog (Codex P2).
+        shared
+            .mailbox(ch)
+            .replace_queue(
+                vec![Intervention {
+                    author_id: UserId::new(1),
+                    author_is_bot: false,
+                    message_id: MessageId::new(5003),
+                    source_message_ids: vec![MessageId::new(5003)],
+                    text: "queued behind turn-2".to_string(),
+                    mode: InterventionMode::Soft,
+                    created_at: std::time::Instant::now(),
+                    reply_context: None,
+                    has_reply_boundary: false,
+                    merge_consecutive: false,
+                    pending_uploads: Vec::new(),
+                    voice_announcement: None,
+                }],
+                super::super::queue_persistence_context(&shared, &ProviderKind::Claude, ch),
             )
             .await;
 
@@ -1513,10 +1541,20 @@ mod tests {
             .await;
 
         match outcome {
-            FinalizeOutcome::Finalized { removed_token, .. } => {
+            FinalizeOutcome::Finalized {
+                removed_token,
+                has_pending,
+                ..
+            } => {
                 assert!(
                     removed_token.is_none(),
                     "stale turn-1 terminal must NOT release turn-2's mailbox token"
+                );
+                // Codex P2: a guarded miss must report NO backlog so the bridge
+                // does not drain a queued soft message behind the live turn-2.
+                assert!(
+                    !has_pending,
+                    "stale terminal must report no pending backlog (turn-2 owns its queue)"
                 );
             }
             other => panic!(
