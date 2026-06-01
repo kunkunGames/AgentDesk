@@ -50,7 +50,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         text = strip_rust_comments(read_text(path))
         for match in PATTERN.finditer(text):
             line = line_of(text, match.start())
-            if is_allowlisted(allowlist, rel, line, rule="legacy_sqlite_refs"):
+            if is_allowlisted(allowlist, rel, line):
                 continue
             findings.append(
                 Finding(
@@ -66,7 +66,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         text = read_text(path)
         for match in SCRIPT_PATTERN.finditer(text):
             line = line_of(text, match.start())
-            if is_allowlisted(allowlist, rel, line, rule="legacy_sqlite_refs"):
+            if is_allowlisted(allowlist, rel, line):
                 continue
             findings.append(
                 Finding(

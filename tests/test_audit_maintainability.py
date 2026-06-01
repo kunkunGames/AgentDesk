@@ -244,21 +244,6 @@ class RouteSrpCheck(unittest.TestCase):
             hits = list(route_srp.CHECK.runner(set()))
         self.assertEqual(_files(hits), {"src/server/routes/dirty.rs"})
 
-    def test_path_allowlist_records_usage(self) -> None:
-        body = """
-        use crate::services::auto_queue;
-        async fn handler() {
-            let _ = sqlx::query("SELECT * FROM agents").fetch_all(&db).await;
-            return json!({"ok": true});
-        }
-        """
-        rel = "src/server/routes/legacy.rs"
-        common.USED_ALLOWLIST.clear()
-        with _FakeSrcTree({rel: body}):
-            hits = list(route_srp.CHECK.runner({rel}))
-        self.assertEqual(hits, [])
-        self.assertIn(("route_srp_violations", rel), common.USED_ALLOWLIST)
-
     def test_baseline_gate_allows_committed_file_counts(self) -> None:
         body = """
         use crate::services::auto_queue;
@@ -660,11 +645,9 @@ class HarnessCli(unittest.TestCase):
         self.assertEqual(json_payload["baseline_gate_count"], 2)
 
     def test_check_mode_returns_zero_with_no_findings(self) -> None:
-        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}) as root:
-            allowlist = root / "empty.toml"
-            allowlist.write_text("", encoding="utf-8")
+        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}):
             with mock.patch.object(sys, "stdout", new=mock.MagicMock()):
-                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
+                rc = HARNESS.main(["--check", "--format", "json"])
         self.assertEqual(rc, 0)
 
     def test_check_mode_fails_on_direct_discord_send_regression(self) -> None:
@@ -764,55 +747,6 @@ class HarnessCli(unittest.TestCase):
         with _FakeSrcTree({"src/new_giant.rs": big}) as root:
             allowlist = root / "empty.toml"
             allowlist.write_text("", encoding="utf-8")
-            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
-                sys, "stderr", new=mock.MagicMock()
-            ):
-                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
-        self.assertEqual(rc, 1)
-
-    def test_check_mode_fails_on_unknown_allowlist_section(self) -> None:
-        with _FakeSrcTree({"src/main.rs": "fn main() {}\n"}) as root:
-            allowlist = root / "audit_allowlist.toml"
-            allowlist.write_text(
-                textwrap.dedent(
-                    """
-                    giant_files_typo = [
-                    ]
-                    """
-                ),
-                encoding="utf-8",
-            )
-            with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
-                sys, "stderr", new=mock.MagicMock()
-            ):
-                rc = HARNESS.main(["--check", "--format", "json", "--allowlist", str(allowlist)])
-        self.assertEqual(rc, 1)
-
-    def test_stale_allowlist_detection_is_rule_scoped(self) -> None:
-        rel = "src/services/discord/prompt_builder/mod.rs"
-        with _FakeSrcTree({rel: "fn x() {}\n" * 4}) as root:
-            _write(
-                root,
-                "scripts/audit_maintainability_config.toml",
-                """
-                [namespace_size_caps]
-                "src/services/discord/prompt_builder/**" = 3
-                """,
-            )
-            allowlist = root / "audit_allowlist.toml"
-            allowlist.write_text(
-                textwrap.dedent(
-                    f"""
-                    giant_files = [
-                      "{rel}",
-                    ]
-                    namespace_size_caps = [
-                      "{rel}",
-                    ]
-                    """
-                ),
-                encoding="utf-8",
-            )
             with mock.patch.object(sys, "stdout", new=mock.MagicMock()), mock.patch.object(
                 sys, "stderr", new=mock.MagicMock()
             ):

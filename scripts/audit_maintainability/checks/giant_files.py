@@ -81,7 +81,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
         rel = rel_posix(path)
         if matching_namespace_cap(rel, namespace_caps) is not None:
             continue
-        if rel in documented or is_allowlisted(allowlist, rel, rule="giant_files"):
+        if rel in documented or is_allowlisted(allowlist, rel):
             continue
         findings.append(
             Finding(

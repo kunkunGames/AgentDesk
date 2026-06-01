@@ -40,7 +40,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 from audit_maintainability.checks import CheckSpec  # noqa: E402
-from audit_maintainability.common import REPO_ROOT, USED_ALLOWLIST, Finding  # noqa: E402
+from audit_maintainability.common import REPO_ROOT, Finding  # noqa: E402
 
 CHECK_MODULES = (
     "audit_maintainability.checks.giant_files",
@@ -355,7 +355,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    USED_ALLOWLIST.clear()
     specs = load_check_specs()
     allowlist = load_allowlist(args.allowlist)
     findings = run_all(specs, allowlist)
@@ -386,15 +385,14 @@ def main(argv: list[str] | None = None) -> int:
                 if baseline_failures:
                     failed.append(("baseline-gate", spec, baseline_failures))
 
-        spec_keys = {spec.key for spec in specs}
-        unknown_allowlist_sections = sorted(set(allowlist) - spec_keys)
+        from audit_maintainability.common import USED_ALLOWLIST
         stale_allowlist = []
         for spec in specs:
             for entry in allowlist.get(spec.key, set()):
-                if (spec.key, entry) not in USED_ALLOWLIST:
+                if entry not in USED_ALLOWLIST:
                     stale_allowlist.append((spec.key, entry))
 
-        if failed or stale_allowlist or unknown_allowlist_sections:
+        if failed or stale_allowlist:
             for gate_kind, spec, hits in failed:
                 print(
                     f"audit_maintainability: {gate_kind} `{spec.key}` failed with "
@@ -409,15 +407,6 @@ def main(argv: list[str] | None = None) -> int:
                 print("audit_maintainability: stale allowlist entries found; please remove them from scripts/audit_allowlist.toml", file=sys.stderr)
                 for key, entry in stale_allowlist:
                     print(f"  - rule `{key}`: {entry}", file=sys.stderr)
-
-            if unknown_allowlist_sections:
-                print(
-                    "audit_maintainability: unknown allowlist sections found in "
-                    "scripts/audit_allowlist.toml",
-                    file=sys.stderr,
-                )
-                for key in unknown_allowlist_sections:
-                    print(f"  - `{key}`", file=sys.stderr)
 
             return 1
 

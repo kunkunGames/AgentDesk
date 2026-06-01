@@ -21,14 +21,7 @@ import re
 from collections import defaultdict
 from typing import Iterable
 
-from ..common import (
-    Finding,
-    is_allowlisted,
-    line_of,
-    read_text,
-    rel_posix,
-    strip_rust_comments,
-)
+from ..common import Finding, line_of, read_text, rel_posix, strip_rust_comments
 from . import CheckSpec
 
 PATTERN = re.compile(
@@ -53,7 +46,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
     by_signature: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
     for path in production_rust_files():
         rel = rel_posix(path)
-        if is_allowlisted(allowlist, rel, rule="limit_clamp_duplication"):
+        if rel in allowlist:
             continue
         raw = read_text(path)
         # Honour the helper-definition opt-out before stripping comments so

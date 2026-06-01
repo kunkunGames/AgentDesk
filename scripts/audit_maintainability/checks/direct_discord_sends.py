@@ -73,9 +73,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
                 rel,
                 _snippet_context(stripped, match.start(), match_text),
             )
-            if is_allowlisted(
-                allowlist, rel, line, key, rule="direct_discord_sends"
-            ):
+            if is_allowlisted(allowlist, rel, line, key):
                 continue
             findings.append(
                 Finding(

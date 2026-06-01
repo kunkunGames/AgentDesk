@@ -12,14 +12,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from ..common import (
-    Finding,
-    is_allowlisted,
-    line_of,
-    read_text,
-    rel_posix,
-    strip_rust_comments,
-)
+from ..common import Finding, line_of, read_text, rel_posix, strip_rust_comments
 from . import CheckSpec
 
 PATTERN = re.compile(
@@ -34,7 +27,7 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
     findings: list[Finding] = []
     for path in production_rust_files():
         rel = rel_posix(path)
-        if is_allowlisted(allowlist, rel, rule="manual_json_row_mapping"):
+        if rel in allowlist:
             continue
         text = strip_rust_comments(read_text(path))
         for match in PATTERN.finditer(text):
