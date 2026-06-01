@@ -17,6 +17,7 @@ Every PR must include:
 - Risk and rollback notes
 
 ## Verification Commands
+- **Honest Verification:** Never claim PostgreSQL, Discord, tmux, provider runtime, browser, or CI verification in PR bodies unless it was actually executed locally.
 - **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`
 - **Dashboard Changes:** `./scripts/verify-dashboard.sh`
 - **Policy Changes:** `npm run test:policies`
