@@ -79,6 +79,7 @@ mod tmux_reaper;
 mod tmux_restart_handoff;
 mod tui_prompt_relay;
 mod turn_bridge;
+mod turn_finalizer;
 mod voice_background_driver;
 mod voice_barge_in;
 mod voice_routing;
@@ -1570,6 +1571,13 @@ pub(crate) struct SharedData {
     /// Process-global active turn counter shared across all providers.
     /// Deferred restart checks this instead of provider-local cancel_tokens.len().
     pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// EPIC #3016 — single-authority turn finalizer. The only code path that
+    /// owns the four finalize side-effects (inflight clear, mailbox
+    /// cancel_token release, `global_active` decrement, trailing terminal
+    /// side-effects) as an atomic, exactly-once unit. Bridge/watcher terminals
+    /// submit terminal events here instead of finalizing inline.
+    pub(in crate::services::discord) turn_finalizer:
+        Arc<turn_finalizer::TurnFinalizer>,
     /// Process-global finalizing turn counter shared across all providers.
     pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of providers still needing to complete shutdown.
@@ -2347,6 +2355,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         recovery_started_at: std::time::Instant::now(),
         recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
         global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        turn_finalizer: turn_finalizer::TurnFinalizer::spawn(),
         global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         shutdown_counted: std::sync::atomic::AtomicBool::new(false),
