@@ -3410,19 +3410,25 @@ mod codex_fifo_followup_transport_tests {
         let prompt = "[E2E:E2:TURN-2]\nreply json";
         let expected = super::codex_pipe_prompt_buffer_text(prompt);
 
-        // A FIFO write blocks until a reader opens, so read on another thread.
-        let reader_path = fifo_path_str.clone();
-        let reader = std::thread::spawn(move || {
-            let mut file = std::fs::File::open(&reader_path).expect("open fifo for read");
-            let mut contents = String::new();
-            file.read_to_string(&mut contents).expect("read fifo");
-            contents
-        });
+        // In production the codex wrapper holds the input FIFO open `O_RDWR`, so
+        // the reused-wrapper write side — which opens `O_NONBLOCK` and fails fast
+        // with ENXIO when no reader is attached (see `send_codex_pipe_prompt_to_fifo`)
+        // — always finds a reader. Mirror that here by holding a reader fd open
+        // BEFORE writing; a separate reader thread races the non-blocking open and
+        // fails ENXIO. `O_RDWR` attaches a reader without blocking and without an
+        // EOF race, so read exactly the bytes we expect.
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo_path)
+            .expect("open fifo O_RDWR to attach a reader");
 
         super::send_codex_pipe_prompt_to_fifo(&fifo_path_str, prompt)
             .expect("write follow-up sentinel to FIFO");
 
-        let received = reader.join().expect("reader thread joined");
+        let mut buf = vec![0u8; expected.len()];
+        reader.read_exact(&mut buf).expect("read fifo");
+        let received = String::from_utf8(buf).expect("fifo bytes are utf-8");
         assert_eq!(
             received, expected,
             "the wrapper must receive the exact newline-terminated base64 sentinel via the FIFO"
