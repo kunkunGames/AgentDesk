@@ -9,6 +9,7 @@
 ## PR Body Requirements
 Every PR must include:
 - What changed
+- **Verification Honesty:** Never claim PostgreSQL, Discord, tmux, provider runtime, browser, or CI verification unless it was actually executed locally.
 - Why
 - WorkFingerprint (Agent, Boundary, Primary files, Queue hygiene invariant, Related PRs/issues, Non-overlapping reason)
 - Duplicate/overlap check
