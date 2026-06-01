@@ -597,17 +597,56 @@ async fn do_finalize(
 ) -> FinalizeOutcome {
     let channel_id = key.channel_id;
 
-    // (A) inflight clear — per-site behaviour preserved. Watcher cleared
-    //     inflight inline before finalizing; bridge clears it elsewhere.
+    // (A) inflight clear. Only the deadline-armed gate-timeout backstop and the
+    //     immediate no-owner restored-watcher path set `clear_inflight` (every
+    //     live-caller bridge/watcher site clears inflight inline and passes
+    //     `false`). Those two paths CONSOLIDATE the pre-#3016 1800s placeholder
+    //     sweeper, which was IDENTITY-GUARDED: it re-checked the on-disk
+    //     `user_msg_id` still named the same turn and refused to delete a
+    //     different (newer) turn's inflight, and never wiped a planned-restart /
+    //     rebind-origin marker. So when this finalize carries a real identity
+    //     (`user_msg_id != 0`) we reproduce that guard via
+    //     `clear_inflight_state_if_matches` — finalize NEVER deletes a newer
+    //     turn's inflight and preserves `PlannedRestartSkipped` /
+    //     `RebindOriginSkipped`. A true orphan (`user_msg_id == 0`, no identity
+    //     to authenticate against) falls back to the unguarded clear, exactly as
+    //     the orphan paths always had to.
     if ctx.clear_inflight {
-        super::inflight::clear_inflight_state(&provider, channel_id.get());
+        if key.user_msg_id != 0 {
+            let _ = super::inflight::clear_inflight_state_if_matches(
+                &provider,
+                channel_id.get(),
+                key.user_msg_id,
+            );
+        } else {
+            super::inflight::clear_inflight_state(&provider, channel_id.get());
+        }
     }
 
     // (B) mailbox cancel_token release — the routed sites' single
     //     `mailbox_finish_turn`. Idempotent: returns `removed_token = None` on
     //     a second call, which is what makes a transitional double-finalize a
     //     no-op during Phases 2-3.
-    let finish = super::mailbox_finish_turn(shared, &provider, channel_id).await;
+    //
+    //     #3016 root-cause: when the terminal carries a real identity, use the
+    //     IDENTITY-GUARDED finish so finalize only releases the token of the
+    //     turn it actually owns. This closes the wrong-turn race where a stale
+    //     channel-scoped terminal arriving after this turn finalized but before
+    //     the next turn registered (or after ledger GC) would otherwise release
+    //     the NEWER turn's token and decrement `global_active`. An ambiguous
+    //     id-0 (recovery/orphan) terminal keeps the channel-scoped finish — the
+    //     ledger gate + id-0 no-op guard already bound those.
+    let finish = if key.user_msg_id != 0 {
+        super::mailbox_finish_turn_if_matches(
+            shared,
+            &provider,
+            channel_id,
+            serenity::model::id::MessageId::new(key.user_msg_id),
+        )
+        .await
+    } else {
+        super::mailbox_finish_turn(shared, &provider, channel_id).await
+    };
 
     if let Some(token) = finish.removed_token.as_ref() {
         // A normal completion releases lingering token observers via
@@ -1389,6 +1428,174 @@ mod tests {
         }
         // Counter decremented exactly once (token was removed).
         assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
+        }).await;
+    }
+
+    /// #3016 root-cause regression (the escalated [P1] wrong-turn race): a
+    /// terminal carrying turn-1's real `user_msg_id` arriving AFTER turn-1
+    /// finalized and turn-2 is the live active mailbox turn must NOT release
+    /// turn-2's token or decrement `global_active`. The identity-guarded
+    /// `mailbox_finish_turn_if_matches` no-ops because the mailbox's active
+    /// `user_message_id` (turn-2) does not match the terminal's (turn-1). This
+    /// is the channel-scoped-`mailbox_finish_turn` hazard the guard closes:
+    /// before this fix, `do_finalize` would have channel-scoped-finished
+    /// turn-2's token.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stale_real_id_terminal_does_not_release_newer_turn_token() {
+        use serenity::model::id::{MessageId, UserId};
+
+        with_isolated_runtime_root(|| async move {
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let ch = ChannelId::new(1313);
+        let turn1_id = 5001u64;
+        let turn2_id = 5002u64;
+
+        // turn-2 is the CURRENT live active turn in the mailbox (a fresh turn
+        // that started after turn-1 finalized — its identity is turn2_id).
+        let turn2_token = Arc::new(CancelToken::new());
+        shared.global_active.store(1, Ordering::Relaxed);
+        shared
+            .mailbox(ch)
+            .restore_active_turn(
+                turn2_token.clone(),
+                UserId::new(7),
+                MessageId::new(turn2_id),
+            )
+            .await;
+
+        let fin = TurnFinalizer::spawn();
+        // A STALE terminal for turn-1 (its real id) arrives. The finalizer
+        // ledger has no entry for it (turn-1's entry was GC'd / never here), so
+        // it creates a Pending entry and finalizes — but the identity-guarded
+        // mailbox finish must refuse to touch turn-2's token.
+        let outcome = fin
+            .submit_terminal(
+                TurnKey::new(ch, turn1_id, 0),
+                ProviderKind::Claude,
+                TerminalEvent::Complete,
+                FinalizeContext::bridge(),
+                shared.clone(),
+            )
+            .await;
+
+        match outcome {
+            FinalizeOutcome::Finalized { removed_token, .. } => {
+                assert!(
+                    removed_token.is_none(),
+                    "stale turn-1 terminal must NOT release turn-2's mailbox token"
+                );
+            }
+            other => panic!(
+                "stale terminal still flows through the ledger gate as Finalized, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // turn-2's token is untouched and the global counter was NOT
+        // decremented for a turn this terminal did not own.
+        assert!(
+            !turn2_token
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "turn-2 must not be cancelled by a stale turn-1 terminal"
+        );
+        assert!(
+            shared.mailbox(ch).has_active_turn().await,
+            "turn-2 must remain the live active turn"
+        );
+        assert_eq!(
+            shared.global_active.load(Ordering::Relaxed),
+            1,
+            "global_active must not be decremented for the wrong turn"
+        );
+
+        // And turn-2 finalizes correctly on its OWN matching terminal.
+        let f2 = fin
+            .submit_terminal(
+                TurnKey::new(ch, turn2_id, 0),
+                ProviderKind::Claude,
+                TerminalEvent::Complete,
+                FinalizeContext::bridge(),
+                shared.clone(),
+            )
+            .await;
+        match f2 {
+            FinalizeOutcome::Finalized { removed_token, .. } => {
+                assert!(
+                    removed_token.is_some(),
+                    "turn-2's own terminal must release turn-2's token"
+                );
+            }
+            other => panic!("turn-2 must finalize on its own id, got {:?}", std::mem::discriminant(&other)),
+        }
+        assert_eq!(
+            shared.global_active.load(Ordering::Relaxed),
+            0,
+            "now turn-2 is finalized exactly once"
+        );
+        }).await;
+    }
+
+    /// #3016 Task 1 regression: the guarded inflight clear (the deadline-armed
+    /// gate-timeout / restored-watcher backstop, which passes
+    /// `clear_inflight = true`) must NOT delete a DIFFERENT (next) turn's
+    /// inflight file. A backstop firing with turn-1's identity after turn-2 has
+    /// written its inflight must preserve turn-2's inflight — exactly as the
+    /// pre-#3016 identity-guarded placeholder sweeper did via
+    /// `inflight_state_still_same_turn`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn guarded_inflight_clear_preserves_next_turn_inflight() {
+        use crate::services::discord::inflight::{save_inflight_state, InflightTurnState};
+
+        with_isolated_runtime_root(|| async move {
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let ch = ChannelId::new(1414);
+        let turn1_id = 6001u64;
+        let turn2_id = 6002u64;
+
+        // turn-2 has already written its inflight for this channel (it took
+        // over after turn-1 finalized).
+        let next = InflightTurnState::new(
+            ProviderKind::Claude,
+            ch.get(),
+            None,
+            7,
+            turn2_id,
+            turn2_id,
+            "turn-2 text".to_string(),
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+        save_inflight_state(&next).expect("persist turn-2 inflight for test");
+
+        let fin = TurnFinalizer::spawn();
+        // A backstop-style finalize carrying turn-1's identity with
+        // `clear_inflight = true` (gate_backstop semantics). It must NOT delete
+        // turn-2's inflight because the on-disk id (turn-2) does not match.
+        let _ = fin
+            .submit_terminal(
+                TurnKey::new(ch, turn1_id, 0),
+                ProviderKind::Claude,
+                TerminalEvent::GateTimeout {
+                    pane_quiescent: Some(true),
+                },
+                FinalizeContext::gate_backstop(),
+                shared.clone(),
+            )
+            .await;
+
+        // turn-2's inflight survives the wrong-turn backstop clear.
+        let surviving = crate::services::discord::inflight::load_inflight_state(
+            &ProviderKind::Claude,
+            ch.get(),
+        );
+        assert!(
+            surviving.is_some_and(|s| s.user_msg_id == turn2_id),
+            "guarded inflight clear must preserve turn-2's inflight when finalize carries turn-1's identity"
+        );
         }).await;
     }
 }
