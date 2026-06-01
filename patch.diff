@@ -1,40 +1,32 @@
 --- src/services/git/repo_resolver.rs
 +++ src/services/git/repo_resolver.rs
-@@ -56,15 +56,6 @@
-     }
-     legacy.map(|p| p.to_string_lossy().into_owned())
- }
--
--fn expand_tilde(path: &str) -> String {
--    if path == "~" || path.starts_with("~/") {
--        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
--            return expanded.to_string_lossy().into_owned();
--        }
--    }
--    path.to_string()
--}
-
- pub(crate) fn looks_like_explicit_repo_path(raw: &str) -> bool {
-     let trimmed = raw.trim();
-@@ -130,7 +121,9 @@
+@@ -121,9 +121,11 @@
          return None;
      }
 
--    let expanded = expand_tilde(raw);
-+    let expanded = crate::runtime_layout::expand_user_path(raw)
-+        .map(|p| p.to_string_lossy().into_owned())
-+        .unwrap_or_else(|| raw.to_string());
+-    let expanded = crate::runtime_layout::expand_user_path(raw)
+-        .map(|p| p.to_string_lossy().into_owned())
+-        .unwrap_or_else(|| raw.to_string());
++    let expanded = if raw == "~" || raw.starts_with("~/") {
++        crate::runtime_layout::expand_user_path(raw).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| raw.to_string())
++    } else {
++        raw.to_string()
++    };
      let path = PathBuf::from(expanded);
      let resolved = if path.is_relative() {
          base_dir.join(path)
-@@ -210,7 +203,9 @@
+@@ -203,9 +205,11 @@
      };
 
      if looks_like_explicit_repo_path(requested) {
--        let expanded = expand_tilde(requested);
-+        let expanded = crate::runtime_layout::expand_user_path(requested)
-+            .map(|p| p.to_string_lossy().into_owned())
-+            .unwrap_or_else(|| requested.to_string());
+-        let expanded = crate::runtime_layout::expand_user_path(requested)
+-            .map(|p| p.to_string_lossy().into_owned())
+-            .unwrap_or_else(|| requested.to_string());
++        let expanded = if requested == "~" || requested.starts_with("~/") {
++            crate::runtime_layout::expand_user_path(requested).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| requested.to_string())
++        } else {
++            requested.to_string()
++        };
          let path = PathBuf::from(expanded);
          let resolved = if path.is_relative() {
              std::env::current_dir()
