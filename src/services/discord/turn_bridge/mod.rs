@@ -2190,6 +2190,14 @@ fn is_synthetic_headless_message_id(message_id: MessageId) -> bool {
     message_id.get() >= 8_000_000_000_000_000_000
 }
 
+/// Synthetic placeholder id used when a recovery turn has no anchored Discord
+/// placeholder (current_msg_id == 0) and creating a fresh one failed. It sits in
+/// the synthetic-headless range so `is_synthetic_headless_message_id` already
+/// treats it as "no real Discord message to edit", driving placeholder
+/// (re)creation on first streamed output instead of a doomed edit of a
+/// nonexistent message. (A real Discord message id never reaches this range.)
+const SYNTHETIC_HEADLESS_RECOVERY_PLACEHOLDER_ID: u64 = 8_000_000_000_000_000_001;
+
 fn is_codex_tool_log_marker_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix('[') else {
@@ -2435,7 +2443,10 @@ pub(super) struct TurnBridgeContext {
     pub(super) provider: ProviderKind,
     pub(super) gateway: Arc<dyn TurnGateway>,
     pub(super) channel_id: ChannelId,
-    pub(super) user_msg_id: MessageId,
+    /// `None` for a recovery turn with no anchored Discord user message
+    /// (user_msg_id == 0, e.g. a TUI-direct turn). All Discord-message side
+    /// effects keyed on it (reactions, analytics row, voice link) are skipped.
+    pub(super) user_msg_id: Option<MessageId>,
     pub(super) user_text_owned: String,
     pub(super) request_owner_name: String,
     pub(super) role_binding: Option<RoleBinding>,
@@ -2448,7 +2459,10 @@ pub(super) struct TurnBridgeContext {
     pub(super) memory_recall_usage: TokenUsage,
     pub(super) context_window_tokens: u64,
     pub(super) context_compact_percent: u64,
-    pub(super) current_msg_id: MessageId,
+    /// `None` for a recovery turn that never anchored a Discord placeholder
+    /// (current_msg_id == 0, e.g. a TUI-direct turn). The bridge then creates a
+    /// fresh placeholder on first output instead of editing a nonexistent one.
+    pub(super) current_msg_id: Option<MessageId>,
     pub(super) response_sent_offset: usize,
     pub(super) full_response: String,
     pub(super) tmux_last_offset: Option<u64>,
@@ -3259,7 +3273,8 @@ fn maybe_refresh_active_turn_activity_heartbeat_at(
 async fn enqueue_headless_delivery(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
-    owning_user_msg_id: MessageId,
+    // `None` for a recovery turn with no anchored user message (user_msg_id == 0).
+    owning_user_msg_id: Option<MessageId>,
     session_key: Option<&str>,
     delivery_bot: Option<&str>,
     content: &str,
@@ -3326,13 +3341,13 @@ async fn enqueue_headless_delivery(
                                         .await
                                         .active_user_message_id;
                                 if let Some(active_user_message_id) = active_user_message_id
-                                    && active_user_message_id != owning_user_msg_id
+                                    && Some(active_user_message_id) != owning_user_msg_id
                                 {
                                     tracing::warn!(
-                                        "[outbox] skipped terminal delivery marker {} for session {} because active turn message changed from {} to {}",
+                                        "[outbox] skipped terminal delivery marker {} for session {} because active turn message changed from {:?} to {}",
                                         outbox_id,
                                         session_key,
-                                        owning_user_msg_id.get(),
+                                        owning_user_msg_id.map(|id| id.get()),
                                         active_user_message_id.get()
                                     );
                                 } else if let Err(error) = sqlx::query(
@@ -3631,7 +3646,7 @@ pub(super) fn persist_turn_analytics_row_with_handles(
                 .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name)
                 .map(|value| value.to_string())
         });
-    let turn_id = discord_turn_id(provider, channel_id, user_msg_id, session_key);
+    let turn_id = discord_turn_id(provider, channel_id, Some(user_msg_id), session_key, None);
     let session_key = session_key.map(str::to_string);
     let thread_title = inflight_state.thread_title.clone();
     let persisted_channel_id = inflight_state
@@ -4021,6 +4036,7 @@ pub(super) fn spawn_turn_bridge(
         bridge.channel_id,
         bridge.user_msg_id,
         bridge.adk_session_key.as_deref(),
+        bridge.inflight_state.turn_start_offset,
     );
     let bridge_session_key = bridge.adk_session_key.clone();
     // Attach the span via `.instrument(..)` on the async block instead of
@@ -4048,6 +4064,7 @@ pub(super) fn spawn_turn_bridge(
             bridge.channel_id,
             bridge.user_msg_id,
             bridge.adk_session_key.as_deref(),
+            bridge.inflight_state.turn_start_offset,
         );
         let user_text_owned = bridge.user_text_owned.clone();
         let request_owner_name = bridge.request_owner_name.clone();
@@ -4065,7 +4082,7 @@ pub(super) fn spawn_turn_bridge(
                 resolve_voice_turn_link_for_playback(
                     shared_owned.pg_pool.as_ref(),
                     dispatch_id.as_deref(),
-                    Some(user_msg_id),
+                    user_msg_id,
                     Some(&turn_id),
                 )
                 .await
@@ -4212,14 +4229,45 @@ pub(super) fn spawn_turn_bridge(
         let mut last_activity_heartbeat_at: Option<std::time::Instant> = None;
         let mut terminal_control_ready_observed = false;
         let mut terminal_control_drain_until: Option<std::time::Instant> = None;
-        let mut current_msg_id = bridge.current_msg_id;
+        let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
+        // A recovery turn with no anchored placeholder (current_msg_id == 0,
+        // e.g. a TUI-direct turn) reaches the bridge with `None`. The bridge
+        // streams into a concrete placeholder, so create a fresh one now; if
+        // creation fails we fall back to the channel and the first streaming
+        // edit re-creates it. This keeps the working `current_msg_id` a real
+        // `MessageId` for the ~30 downstream relay sites without panicking on
+        // `MessageId::new(0)`.
+        let mut current_msg_id = match bridge.current_msg_id {
+            Some(id) => id,
+            None => {
+                let placeholder =
+                    super::formatting::build_processing_status_block(SPINNER[0]).to_string();
+                match gateway.send_message(channel_id, &placeholder).await {
+                    Ok(created) => {
+                        bridge_created_response_placeholder_msg_id = Some(created);
+                        created
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            channel = channel_id.get(),
+                            "[turn_bridge] recovery turn has no anchored placeholder and creating one failed: {error}; continuing — streaming will retry placeholder creation"
+                        );
+                        // No placeholder yet. Use a synthetic-headless sentinel
+                        // so the established `is_synthetic_headless_message_id`
+                        // path (which already means "no real Discord message to
+                        // edit") drives placeholder (re)creation on first output
+                        // instead of editing a nonexistent message.
+                        MessageId::new(SYNTHETIC_HEADLESS_RECOVERY_PLACEHOLDER_ID)
+                    }
+                }
+            }
+        };
         let mut response_sent_offset = bridge.response_sent_offset;
         let mut streamed_assistant_text_this_turn = false;
         let mut streaming_rollover_frozen_msg_ids: Vec<MessageId> = Vec::new();
         let mut terminal_full_replay_cleanup_msg_ids: Vec<MessageId> = Vec::new();
         let mut tmux_last_offset = bridge.tmux_last_offset;
         let mut watcher_owner_channel_id = channel_id;
-        let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
         let mut new_session_id = bridge.new_session_id.clone();
         let mut new_raw_provider_session_id: Option<String> = None;
         let defer_watcher_resume = bridge.defer_watcher_resume;
@@ -4276,6 +4324,21 @@ pub(super) fn spawn_turn_bridge(
         };
 
         let mut inflight_state = bridge.inflight_state.clone();
+        // Codex P2: a no-anchor recovery turn (bridge.current_msg_id == None)
+        // had a fresh placeholder created above into the working `current_msg_id`,
+        // but the cloned inflight still carries `current_msg_id == 0`. Mirror the
+        // real id back NOW so the `save_inflight_state` below persists it; without
+        // this, a restart before the first streaming edit would see id 0 again,
+        // re-create a placeholder, and orphan the spinner we just sent. The
+        // synthetic-headless fallback (creation failed) is intentionally NOT
+        // persisted — it is not a real Discord message and the streaming path
+        // re-creates a placeholder on first output.
+        if bridge.current_msg_id.is_none()
+            && !is_synthetic_headless_message_id(current_msg_id)
+            && inflight_state.current_msg_id == 0
+        {
+            inflight_state.current_msg_id = current_msg_id.get();
+        }
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
         let mut last_session_panel_lifecycle_refresh =
@@ -4372,7 +4435,7 @@ pub(super) fn spawn_turn_bridge(
             role_binding.as_ref(),
             "turn_start",
             serde_json::json!({
-                "user_msg_id": user_msg_id.get(),
+                "user_msg_id": user_msg_id.map(|id| id.get()),
                 "request_owner_name": request_owner_name.as_str(),
             }),
         );
@@ -6780,7 +6843,10 @@ pub(super) fn spawn_turn_bridge(
                     .submit_terminal(
                         super::turn_finalizer::TurnKey::new(
                             channel_id,
-                            user_msg_id.get(),
+                            // user_msg_id == 0 collapses to the channel-only
+                            // terminal that `turn_finalizer` already supports
+                            // (recovery/orphan path) instead of panicking.
+                            user_msg_id.map(|id| id.get()).unwrap_or(0),
                             shared_owned.current_generation,
                         ),
                         provider.clone(),
@@ -6885,7 +6951,9 @@ pub(super) fn spawn_turn_bridge(
                 .submit_terminal(
                     super::turn_finalizer::TurnKey::new(
                         channel_id,
-                        user_msg_id.get(),
+                        // user_msg_id == 0 → channel-only terminal key, which
+                        // turn_finalizer already supports (recovery/orphan path).
+                        user_msg_id.map(|id| id.get()).unwrap_or(0),
                         shared_owned.current_generation,
                     ),
                     provider.clone(),
@@ -6966,6 +7034,7 @@ pub(super) fn spawn_turn_bridge(
         if !bridge_output_owner
             .map(|owner| owner.skips_bridge_spinner_cleanup())
             .unwrap_or(false)
+            && let Some(user_msg_id) = user_msg_id
         {
             gateway.remove_reaction(channel_id, user_msg_id, '⏳').await;
         }
@@ -6991,12 +7060,16 @@ pub(super) fn spawn_turn_bridge(
             // #2452 H6: schedule the auto-retry via the explicit
             // completion path so the dedup lockout is released as soon
             // as scheduling resolves (≤ 120s safety net inside helper).
-            spawn_retry_with_history_with_release(
-                gateway.clone(),
-                channel_id,
-                user_msg_id,
-                user_text_owned.clone(),
-            );
+            // A recovery turn with no anchored user message (user_msg_id == 0)
+            // has no message to retry-with-history against, so skip scheduling.
+            if let Some(user_msg_id) = user_msg_id {
+                spawn_retry_with_history_with_release(
+                    gateway.clone(),
+                    channel_id,
+                    user_msg_id,
+                    user_text_owned.clone(),
+                );
+            }
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
             let _ = gateway
                 .edit_message(
@@ -7198,7 +7271,9 @@ pub(super) fn spawn_turn_bridge(
                 preserve_inflight_for_cleanup_retry = true;
             }
 
-            if preserved_restart_mode.is_none() {
+            if preserved_restart_mode.is_none()
+                && let Some(user_msg_id) = user_msg_id
+            {
                 gateway.add_reaction(channel_id, user_msg_id, '🛑').await;
             }
 
@@ -7238,7 +7313,9 @@ pub(super) fn spawn_turn_bridge(
                 preserve_inflight_for_cleanup_retry = true;
             }
 
-            gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
+            if let Some(user_msg_id) = user_msg_id {
+                gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
+            }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
@@ -7333,12 +7410,16 @@ pub(super) fn spawn_turn_bridge(
                 )
                 .await;
                 // #2452 H6: explicit completion path — see helper docs.
-                spawn_retry_with_history_with_release(
-                    gateway.clone(),
-                    channel_id,
-                    user_msg_id,
-                    user_text_owned.clone(),
-                );
+                // Skip retry-with-history when the recovery turn has no anchored
+                // user message (user_msg_id == 0).
+                if let Some(user_msg_id) = user_msg_id {
+                    spawn_retry_with_history_with_release(
+                        gateway.clone(),
+                        channel_id,
+                        user_msg_id,
+                        user_text_owned.clone(),
+                    );
+                }
                 full_response = String::new(); // Suppress error message to user
             } else if full_response.is_empty() {
                 // #2451 H5 graduation: the authoritative resume-failure
@@ -7412,12 +7493,14 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
                     // #2452 H6: explicit completion path — see helper docs.
-                    spawn_retry_with_history_with_release(
-                        gateway.clone(),
-                        channel_id,
-                        user_msg_id,
-                        user_text_owned.clone(),
-                    );
+                    if let Some(user_msg_id) = user_msg_id {
+                        spawn_retry_with_history_with_release(
+                            gateway.clone(),
+                            channel_id,
+                            user_msg_id,
+                            user_text_owned.clone(),
+                        );
+                    }
                     full_response = String::new();
                 } else {
                     // Check for resume failure via other methods
@@ -7448,12 +7531,14 @@ pub(super) fn spawn_turn_bridge(
                         )
                         .await;
                         // #2452 H6: explicit completion path — see helper.
-                        spawn_retry_with_history_with_release(
-                            gateway.clone(),
-                            channel_id,
-                            user_msg_id,
-                            user_text_owned.clone(),
-                        );
+                        if let Some(user_msg_id) = user_msg_id {
+                            spawn_retry_with_history_with_release(
+                                gateway.clone(),
+                                channel_id,
+                                user_msg_id,
+                                user_text_owned.clone(),
+                            );
+                        }
                         full_response = String::new();
                     }
                     // #2451 H5 Method 2: authoritative resume-failure
@@ -7493,12 +7578,14 @@ pub(super) fn spawn_turn_bridge(
                             )
                             .await;
                             // #2452 H6: explicit completion path.
-                            spawn_retry_with_history_with_release(
-                                gateway.clone(),
-                                channel_id,
-                                user_msg_id,
-                                user_text_owned.clone(),
-                            );
+                            if let Some(user_msg_id) = user_msg_id {
+                                spawn_retry_with_history_with_release(
+                                    gateway.clone(),
+                                    channel_id,
+                                    user_msg_id,
+                                    user_text_owned.clone(),
+                                );
+                            }
                             full_response = String::new();
                         }
                     }
@@ -7789,87 +7876,93 @@ pub(super) fn spawn_turn_bridge(
                 // #2274: if the in-memory marker is absent (dcserver
                 // restarted mid-turn, or rehydration has not yet completed)
                 // fall back to the durable PG row for the agent_id lookup.
-                let pg_pool_for_handoff = shared_owned.pg_pool.as_ref();
-                let in_memory_handoff_agent_id =
-                    crate::voice::announce_meta::global_store()
-                        .get_handoff(user_msg_id)
-                        .and_then(|meta| meta.agent_id);
-                let stored_handoff_agent_id = match in_memory_handoff_agent_id {
-                    Some(agent_id) => Some(agent_id),
-                    None => match pg_pool_for_handoff {
-                        Some(pool) => crate::voice::announce_meta::load_handoff_durable(
-                            pool,
-                            user_msg_id,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|meta| meta.agent_id),
-                        None => None,
-                    },
-                };
-                let mapped_voice_channel_id = shared_owned
-                    .voice_barge_in
-                    .voice_channel_for_background(channel_id, stored_handoff_agent_id.as_deref())
-                    .await;
-                if let Some(voice_channel_id) = voice_background_completion_target(
-                    mapped_voice_channel_id,
-                    dispatch_id.as_deref(),
-                    user_msg_id,
-                    Some(&turn_id),
-                    &user_text_owned,
-                    channel_id,
-                    pg_pool_for_handoff,
-                )
-                .await
-                {
-                    if !inflight_state.silent_turn {
-                        let voice_barge_in = shared_owned.voice_barge_in.clone();
-                        let shared_for_voice = shared_owned.clone();
-                        let summary_source = spoken_delivery_response.clone();
-                        let background_channel_id = channel_id;
-                        let failed = cancelled
-                            || is_prompt_too_long
-                            || transport_error
-                            || recovery_retry
-                            || resume_failure_detected;
-                        super::task_supervisor::spawn_observed("voice_background_completion_summary", async move {
-                            voice_barge_in
-                                .speak_voice_background_completion_summary(
-                                    &shared_for_voice,
-                                    voice_channel_id,
+                // A recovery turn with no anchored user message (user_msg_id ==
+                // 0) is never a voice turn — voice turns carry a synthetic,
+                // non-zero voice message id — so the voice-handoff completion
+                // routing (all keyed on the user message id) does not apply.
+                if let Some(user_msg_id) = user_msg_id {
+                    let pg_pool_for_handoff = shared_owned.pg_pool.as_ref();
+                    let in_memory_handoff_agent_id =
+                        crate::voice::announce_meta::global_store()
+                            .get_handoff(user_msg_id)
+                            .and_then(|meta| meta.agent_id);
+                    let stored_handoff_agent_id = match in_memory_handoff_agent_id {
+                        Some(agent_id) => Some(agent_id),
+                        None => match pg_pool_for_handoff {
+                            Some(pool) => crate::voice::announce_meta::load_handoff_durable(
+                                pool,
+                                user_msg_id,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|meta| meta.agent_id),
+                            None => None,
+                        },
+                    };
+                    let mapped_voice_channel_id = shared_owned
+                        .voice_barge_in
+                        .voice_channel_for_background(channel_id, stored_handoff_agent_id.as_deref())
+                        .await;
+                    if let Some(voice_channel_id) = voice_background_completion_target(
+                        mapped_voice_channel_id,
+                        dispatch_id.as_deref(),
+                        user_msg_id,
+                        Some(&turn_id),
+                        &user_text_owned,
+                        channel_id,
+                        pg_pool_for_handoff,
+                    )
+                    .await
+                    {
+                        if !inflight_state.silent_turn {
+                            let voice_barge_in = shared_owned.voice_barge_in.clone();
+                            let shared_for_voice = shared_owned.clone();
+                            let summary_source = spoken_delivery_response.clone();
+                            let background_channel_id = channel_id;
+                            let failed = cancelled
+                                || is_prompt_too_long
+                                || transport_error
+                                || recovery_retry
+                                || resume_failure_detected;
+                            super::task_supervisor::spawn_observed("voice_background_completion_summary", async move {
+                                voice_barge_in
+                                    .speak_voice_background_completion_summary(
+                                        &shared_for_voice,
+                                        voice_channel_id,
+                                        background_channel_id,
+                                        &summary_source,
+                                        failed,
+                                    )
+                                    .await;
+                                voice_barge_in.publish_progress_for_playback(
                                     background_channel_id,
-                                    &summary_source,
-                                    failed,
-                                )
-                                .await;
-                            voice_barge_in.publish_progress_for_playback(
-                                background_channel_id,
+                                    Some(voice_channel_id),
+                                    "agent:done",
+                                );
+                            });
+                        } else {
+                            shared_owned.voice_barge_in.publish_progress_for_playback(
+                                channel_id,
                                 Some(voice_channel_id),
                                 "agent:done",
                             );
-                        });
-                    } else {
-                        shared_owned.voice_barge_in.publish_progress_for_playback(
-                            channel_id,
-                            Some(voice_channel_id),
-                            "agent:done",
-                        );
-                    }
-                } else if inflight_state.source == crate::dispatch::Source::Voice {
-                    if !inflight_state.silent_turn {
+                        }
+                    } else if inflight_state.source == crate::dispatch::Source::Voice {
+                        if !inflight_state.silent_turn {
+                            shared_owned
+                                .voice_barge_in
+                                .spawn_spoken_result_playback(
+                                    &shared_owned,
+                                    channel_id,
+                                    &spoken_delivery_response,
+                                )
+                                .await;
+                        }
                         shared_owned
                             .voice_barge_in
-                            .spawn_spoken_result_playback(
-                                &shared_owned,
-                                channel_id,
-                                &spoken_delivery_response,
-                            )
-                            .await;
+                            .publish_progress(channel_id, "agent:done");
                     }
-                    shared_owned
-                        .voice_barge_in
-                        .publish_progress(channel_id, "agent:done");
                 }
             }
 
@@ -7993,6 +8086,7 @@ pub(super) fn spawn_turn_bridge(
             if can_chain_locally
                 && !preserve_inflight_for_cleanup_retry
                 && !delivery_response.trim().is_empty()
+                && let Some(user_msg_id) = user_msg_id
             {
                 gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
@@ -8060,7 +8154,7 @@ pub(super) fn spawn_turn_bridge(
                 &mut last_status_panel_text,
                 false,
                 "turn_terminal_delivery",
-                user_msg_id.get(),
+                user_msg_id.map(|id| id.get()).unwrap_or(0),
             )
             .await;
         }
@@ -8389,7 +8483,11 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        if None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some() {
+        // No user message (user_msg_id == 0) → no analytics row to key
+        // (`discord:<channel>:0` is the bogus form); skip the persist.
+        if (None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some())
+            && let Some(user_msg_id) = user_msg_id
+        {
             persist_turn_analytics_row_with_handles(
                 None::<&crate::db::Db>,
                 shared_owned.pg_pool.as_ref(),

@@ -3887,12 +3887,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 result.card_marked,
                                 result.human_alert_sent
                             );
+                            // Skip rebind-origin (synthetic, no real user
+                            // message) and user_msg_id == 0 (a TUI-direct turn
+                            // with no anchored Discord user message): there is
+                            // no message to react against, and
+                            // `MessageId::new(0)` would panic.
                             if let Some(state) =
                                 crate::services::discord::inflight::load_inflight_state(
                                     &watcher_provider,
                                     channel_id.get(),
                                 )
-                                .filter(|state| !state.rebind_origin)
+                                .filter(|state| !state.rebind_origin && state.user_msg_id != 0)
                             {
                                 let user_msg_id = serenity::MessageId::new(state.user_msg_id);
                                 crate::services::discord::formatting::remove_reaction_raw(
@@ -4152,8 +4157,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // inflights — their `user_msg_id=0` identifies no real Discord
             // message so issuing reactions against it just produces API
             // errors. The synthetic state was created by
-            // `/api/inflight/rebind` to adopt a live tmux session.
-            if let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin) {
+            // `/api/inflight/rebind` to adopt a live tmux session. The same
+            // holds for any user_msg_id == 0 (e.g. a TUI-direct turn) — there
+            // is no message to react against and `MessageId::new(0)` panics.
+            if let Some(state) = inflight_state
+                .as_ref()
+                .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
+            {
                 let user_msg_id = serenity::MessageId::new(state.user_msg_id);
                 crate::services::discord::formatting::remove_reaction_raw(
                     &http,
@@ -4309,8 +4319,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
 
             // #897 round-3 Medium: skip reaction + retry scheduling for
             // `rebind_origin` inflights — they have no real user message
-            // to react against and no real user text to re-prompt.
-            if let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin) {
+            // to react against and no real user text to re-prompt. The same
+            // holds for user_msg_id == 0 (e.g. a TUI-direct turn): no message
+            // to react against, and `MessageId::new(0)` would panic.
+            if let Some(state) = inflight_state
+                .as_ref()
+                .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
+            {
                 let user_msg_id = serenity::MessageId::new(state.user_msg_id);
                 crate::services::discord::formatting::remove_reaction_raw(
                     &http,
@@ -4341,7 +4356,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     fingerprint,
                 } => {
                     if let Some(retry_text) = retry_text {
-                        if let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin) {
+                        // A turn with no anchored user message (rebind_origin or
+                        // user_msg_id == 0, e.g. a TUI-direct turn) has no
+                        // message to re-prompt against; clear retry state
+                        // instead of building `MessageId::new(0)` (panics).
+                        if let Some(state) = inflight_state
+                            .as_ref()
+                            .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
+                        {
                             schedule_provider_overload_retry(
                                 shared.clone(),
                                 http.clone(),
@@ -4635,10 +4657,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &watcher_provider,
                 channel_id.get(),
             ) {
-                Some(state) if state.rebind_origin => {
+                Some(state) if state.rebind_origin || state.user_msg_id == 0 => {
+                    // rebind_origin and user_msg_id == 0 (e.g. a TUI-direct
+                    // turn) both have no anchored user message to retry against;
+                    // `MessageId::new(0)` would panic.
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::warn!(
-                        "  [{ts}] ⚠ Watcher auto-retry skipped for channel {} — rebind_origin inflight has no user message to retry",
+                        "  [{ts}] ⚠ Watcher auto-retry skipped for channel {} — inflight has no user message to retry",
                         channel_id
                     );
                 }
@@ -5917,9 +5942,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // JSONL offset; while the pane is still busy past the gate timeout
         // they would either lie about completion (✅) or write a row that
         // gets contradicted by the next pass (transcript / analytics).
+        // Skip rebind_origin (synthetic) and user_msg_id == 0 (e.g. a
+        // TUI-direct turn with no anchored Discord user message): there is no
+        // message to react against, `discord:<channel>:0` would be a bogus
+        // analytics/turn-id key, and `MessageId::new(0)` would panic. The
+        // recovered response was already delivered via the notify-bot outbox
+        // enqueue above, so skipping the reaction/analytics step is safe.
         if terminal_output_committed
             && !lifecycle_stage_paused
-            && let Some(state) = inflight_state.as_ref().filter(|s| !s.rebind_origin)
+            && let Some(state) = inflight_state
+                .as_ref()
+                .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
         {
             let user_msg_id = serenity::MessageId::new(state.user_msg_id);
             crate::services::discord::formatting::remove_reaction_raw(

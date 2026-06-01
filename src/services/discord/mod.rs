@@ -2728,7 +2728,9 @@ async fn mailbox_recovery_kickoff(
     channel_id: ChannelId,
     cancel_token: Arc<CancelToken>,
     request_owner: UserId,
-    user_message_id: MessageId,
+    // `None` when the recovery turn has no anchored user message
+    // (user_msg_id == 0, e.g. a TUI-direct turn).
+    user_message_id: Option<MessageId>,
 ) -> RecoveryKickoffResult {
     // #2443 — reset the per-channel `recovery_done` latch BEFORE the
     // recovery actually starts. A stale "done" flag from a previous cycle

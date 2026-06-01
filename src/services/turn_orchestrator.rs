@@ -1293,7 +1293,10 @@ impl ChannelMailboxHandle {
         &self,
         cancel_token: Arc<CancelToken>,
         request_owner: UserId,
-        user_message_id: MessageId,
+        // `None` for a recovery turn that carries no user message
+        // (user_msg_id == 0, e.g. a TUI-direct turn) — there is then no
+        // `active_user_message_id` to bind. `MessageId::new(0)` would panic.
+        user_message_id: Option<MessageId>,
     ) -> RecoveryKickoffResult {
         self.request(
             |reply| ChannelMailboxMsg::RecoveryKickoff {
@@ -1921,7 +1924,7 @@ enum ChannelMailboxMsg {
     RecoveryKickoff {
         cancel_token: Arc<CancelToken>,
         request_owner: UserId,
-        user_message_id: MessageId,
+        user_message_id: Option<MessageId>,
         reply: oneshot::Sender<RecoveryKickoffResult>,
     },
     ClearRecoveryMarker {
@@ -2547,7 +2550,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     let activated_turn = state.cancel_token.is_none();
                     state.cancel_token = Some(cancel_token);
                     state.active_request_owner = Some(request_owner);
-                    state.active_user_message_id = Some(user_message_id);
+                    state.active_user_message_id = user_message_id;
                     state.recovery_started_at = Some(Instant::now());
                     if activated_turn || state.turn_started_at.is_none() {
                         state.turn_started_at = Some(Utc::now());
@@ -4570,7 +4573,7 @@ mod tests {
             .recovery_kickoff(
                 Arc::new(CancelToken::new()),
                 UserId::new(5),
-                MessageId::new(55),
+                Some(MessageId::new(55)),
             )
             .await;
         assert!(kickoff.activated_turn);

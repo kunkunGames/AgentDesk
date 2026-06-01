@@ -60,6 +60,26 @@ const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
 /// slightly delayed recovery (issue #1446).
 pub(super) const INFLIGHT_STALENESS_THRESHOLD_SECS: u64 = 300;
 
+/// Build an optional `serenity::MessageId` from a possibly-zero raw inflight id.
+///
+/// `current_msg_id == 0` is a LEGITIMATE state: a TUI-direct / recovery turn
+/// (`runtime_kind = claude_tui`, `status_message_id = None`) that never anchored
+/// a Discord placeholder message. `serenity::MessageId::new(0)` PANICS
+/// ("Attempted to call MessageId::new with invalid (0) value"), so every
+/// recovery/relay path that derives a placeholder id from a possibly-zero
+/// inflight field must funnel through this helper and treat `None` as
+/// "no anchored placeholder" — skipping the placeholder-specific step while
+/// still performing watcher/session recovery — rather than panicking.
+pub(in crate::services::discord) fn optional_message_id(
+    raw: u64,
+) -> Option<poise::serenity_prelude::MessageId> {
+    if raw == 0 {
+        None
+    } else {
+        Some(poise::serenity_prelude::MessageId::new(raw))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InflightTurnState {
     pub version: u32,
