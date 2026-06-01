@@ -87,6 +87,9 @@ def stable_finding_key(rule: str, file: str, context: str) -> str:
     return f"{file}#{rule}:{digest}"
 
 
+USED_ALLOWLIST: set[str] = set()
+
+
 def is_allowlisted(
     allowlist: set[str],
     file: str,
@@ -96,10 +99,17 @@ def is_allowlisted(
     """Return true when a finding is covered by a path, line, or stable key."""
 
     if file in allowlist:
+        USED_ALLOWLIST.add(file)
         return True
     if stable_key is not None and stable_key in allowlist:
+        USED_ALLOWLIST.add(stable_key)
         return True
-    return line is not None and f"{file}:{line}" in allowlist
+    if line is not None:
+        line_key = f"{file}:{line}"
+        if line_key in allowlist:
+            USED_ALLOWLIST.add(line_key)
+            return True
+    return False
 
 
 # Strip ``// ...`` line comments and ``/* ... */`` block comments. Cheap

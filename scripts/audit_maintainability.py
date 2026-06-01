@@ -384,7 +384,15 @@ def main(argv: list[str] | None = None) -> int:
                 baseline_failures = list(spec.baseline_gate(findings.get(spec.key, [])))
                 if baseline_failures:
                     failed.append(("baseline-gate", spec, baseline_failures))
-        if failed:
+
+        from audit_maintainability.common import USED_ALLOWLIST
+        stale_allowlist = []
+        for spec in specs:
+            for entry in allowlist.get(spec.key, set()):
+                if entry not in USED_ALLOWLIST:
+                    stale_allowlist.append((spec.key, entry))
+
+        if failed or stale_allowlist:
             for gate_kind, spec, hits in failed:
                 print(
                     f"audit_maintainability: {gate_kind} `{spec.key}` failed with "
@@ -394,6 +402,12 @@ def main(argv: list[str] | None = None) -> int:
                 for hit in hits:
                     loc = hit.file if hit.line is None else f"{hit.file}:{hit.line}"
                     print(f"  - {loc}: {hit.message}", file=sys.stderr)
+
+            if stale_allowlist:
+                print("audit_maintainability: stale allowlist entries found; please remove them from scripts/audit_allowlist.toml", file=sys.stderr)
+                for key, entry in stale_allowlist:
+                    print(f"  - rule `{key}`: {entry}", file=sys.stderr)
+
             return 1
 
     return 0
