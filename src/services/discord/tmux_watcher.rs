@@ -5744,13 +5744,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 // (with the Watcher owner) and thus DEFERS to the backstop. A
                 // channel-only id-0 here would risk resolving onto a different
                 // live entry; the real id keys exactly.
-                let gate_user_msg_id =
-                    crate::services::discord::inflight::load_inflight_state(
-                        &watcher_provider,
-                        channel_id.get(),
-                    )
-                    .map(|s| s.user_msg_id)
-                    .unwrap_or(0);
+                let gate_user_msg_id = crate::services::discord::inflight::load_inflight_state(
+                    &watcher_provider,
+                    channel_id.get(),
+                )
+                .map(|s| s.user_msg_id)
+                .unwrap_or(0);
                 let _ = shared
                     .turn_finalizer
                     .submit_terminal(
@@ -6220,10 +6219,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // #3016: the in-memory `inflight_state` (loaded at L~5860) still
             // holds the real id even though the on-disk file was cleared above,
             // so pass it for an exact ledger match.
-            let restored_user_msg_id = inflight_state
-                .as_ref()
-                .map(|s| s.user_msg_id)
-                .unwrap_or(0);
+            let restored_user_msg_id = inflight_state.as_ref().map(|s| s.user_msg_id).unwrap_or(0);
             finish_restored_watcher_active_turn(
                 &shared,
                 &provider_kind,

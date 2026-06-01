@@ -41,8 +41,8 @@ use std::time::Duration;
 use serenity::model::id::ChannelId;
 // `tokio::time::Instant` (not `std::time::Instant`) so deadlines respect the
 // paused/virtual test clock and the production `interval` clock alike.
-use tokio::time::Instant;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::services::discord::inflight::RelayOwnerKind;
 use crate::services::provider::{CancelToken, ProviderKind};
@@ -135,10 +135,7 @@ struct LedgerKey {
 ///   (an orphan no-op: idempotent `mailbox_finish_turn` returns `None`, so the
 ///   live turn is untouched). With no recent finalize, the single live entry is
 ///   unambiguously the turn this orphan terminal belongs to.
-fn resolve_ledger_key(
-    ledger: &HashMap<LedgerKey, LedgerEntry>,
-    key: TurnKey,
-) -> LedgerKey {
+fn resolve_ledger_key(ledger: &HashMap<LedgerKey, LedgerEntry>, key: TurnKey) -> LedgerKey {
     if key.user_msg_id != 0 {
         return key.exact_key();
     }
@@ -899,34 +896,35 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn exactly_once_complete_then_late_complete() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        shared.global_active.store(1, Ordering::Relaxed);
-        let fin = TurnFinalizer::spawn();
-        let k = key(101);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            shared.global_active.store(1, Ordering::Relaxed);
+            let fin = TurnFinalizer::spawn();
+            let k = key(101);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        let first = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(first, FinalizeOutcome::Finalized { .. }));
+            let first = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(first, FinalizeOutcome::Finalized { .. }));
 
-        let second = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(second, FinalizeOutcome::AlreadyFinalized));
-        }).await;
+            let second = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(second, FinalizeOutcome::AlreadyFinalized));
+        })
+        .await;
     }
 
     /// A turn registered with the real `user_msg_id` and a terminal submitted
@@ -938,37 +936,38 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn unknown_user_msg_id_collapses_onto_registered_turn() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let ch = ChannelId::new(606);
-        let registered = TurnKey::new(ch, 99_999, 0);
-        let channel_only = TurnKey::new(ch, 0, 0);
-        fin.register_start(registered, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let ch = ChannelId::new(606);
+            let registered = TurnKey::new(ch, 99_999, 0);
+            let channel_only = TurnKey::new(ch, 0, 0);
+            fin.register_start(registered, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        // Channel-only (id 0) terminal finalizes the registered turn.
-        let first = fin
-            .submit_terminal(
-                channel_only,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(first, FinalizeOutcome::Finalized { .. }));
+            // Channel-only (id 0) terminal finalizes the registered turn.
+            let first = fin
+                .submit_terminal(
+                    channel_only,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(first, FinalizeOutcome::Finalized { .. }));
 
-        // Real-id terminal now hits the same entry → AlreadyFinalized.
-        let second = fin
-            .submit_terminal(
-                registered,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(second, FinalizeOutcome::AlreadyFinalized));
-        }).await;
+            // Real-id terminal now hits the same entry → AlreadyFinalized.
+            let second = fin
+                .submit_terminal(
+                    registered,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(second, FinalizeOutcome::AlreadyFinalized));
+        })
+        .await;
     }
 
     /// Two SEQUENTIAL turns in the SAME channel within `FINALIZED_TTL` must be
@@ -979,41 +978,42 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sequential_same_channel_turns_each_finalize() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let ch = ChannelId::new(909);
-        let turn1 = TurnKey::new(ch, 1001, 0);
-        let turn2 = TurnKey::new(ch, 1002, 0);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let ch = ChannelId::new(909);
+            let turn1 = TurnKey::new(ch, 1001, 0);
+            let turn2 = TurnKey::new(ch, 1002, 0);
 
-        fin.register_start(turn1, ProviderKind::Claude, RelayOwnerKind::Watcher);
-        let f1 = fin
-            .submit_terminal(
-                turn1,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(f1, FinalizeOutcome::Finalized { .. }));
+            fin.register_start(turn1, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let f1 = fin
+                .submit_terminal(
+                    turn1,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(f1, FinalizeOutcome::Finalized { .. }));
 
-        // turn-2 starts immediately (well within the 60s Finalized TTL) and
-        // must finalize on its own, not be swallowed by turn-1's entry.
-        fin.register_start(turn2, ProviderKind::Claude, RelayOwnerKind::Watcher);
-        let f2 = fin
-            .submit_terminal(
-                turn2,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-        assert!(
-            matches!(f2, FinalizeOutcome::Finalized { .. }),
-            "turn-2 must finalize independently of turn-1"
-        );
-        }).await;
+            // turn-2 starts immediately (well within the 60s Finalized TTL) and
+            // must finalize on its own, not be swallowed by turn-1's entry.
+            fin.register_start(turn2, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let f2 = fin
+                .submit_terminal(
+                    turn2,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(
+                matches!(f2, FinalizeOutcome::Finalized { .. }),
+                "turn-2 must finalize independently of turn-1"
+            );
+        })
+        .await;
     }
 
     /// Cross-turn safety: a STALE channel-only (id-0) terminal arriving after
@@ -1024,61 +1024,62 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stale_channel_only_terminal_does_not_finalize_next_turn() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let ch = ChannelId::new(919);
-        let turn1 = TurnKey::new(ch, 2001, 0);
-        let turn2 = TurnKey::new(ch, 2002, 0);
-        let channel_only = TurnKey::new(ch, 0, 0);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let ch = ChannelId::new(919);
+            let turn1 = TurnKey::new(ch, 2001, 0);
+            let turn2 = TurnKey::new(ch, 2002, 0);
+            let channel_only = TurnKey::new(ch, 0, 0);
 
-        fin.register_start(turn1, ProviderKind::Claude, RelayOwnerKind::Watcher);
-        let _ = fin
-            .submit_terminal(
-                turn1,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
+            fin.register_start(turn1, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let _ = fin
+                .submit_terminal(
+                    turn1,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
 
-        // turn-2 registers (queued follow-up now live).
-        fin.register_start(turn2, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            // turn-2 registers (queued follow-up now live).
+            fin.register_start(turn2, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        // A STALE id-0 terminal (from turn-1's watcher) arrives. Because a
-        // Finalized entry exists AND a different live entry (turn-2) exists,
-        // the ambiguous-channel-only guard returns it as a no-op
-        // (AlreadyFinalized) WITHOUT running channel-scoped cleanup — so it
-        // cannot release turn-2's token.
-        let stale = fin
-            .submit_terminal(
-                channel_only,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(
-            matches!(stale, FinalizeOutcome::AlreadyFinalized),
-            "ambiguous stale id-0 terminal must be a no-op"
-        );
+            // A STALE id-0 terminal (from turn-1's watcher) arrives. Because a
+            // Finalized entry exists AND a different live entry (turn-2) exists,
+            // the ambiguous-channel-only guard returns it as a no-op
+            // (AlreadyFinalized) WITHOUT running channel-scoped cleanup — so it
+            // cannot release turn-2's token.
+            let stale = fin
+                .submit_terminal(
+                    channel_only,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(
+                matches!(stale, FinalizeOutcome::AlreadyFinalized),
+                "ambiguous stale id-0 terminal must be a no-op"
+            );
 
-        // turn-2 is still live: its own terminal finalizes it.
-        let f2 = fin
-            .submit_terminal(
-                turn2,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(
-            matches!(f2, FinalizeOutcome::Finalized { .. }),
-            "turn-2 must still be live after the stale id-0 terminal"
-        );
-        }).await;
+            // turn-2 is still live: its own terminal finalizes it.
+            let f2 = fin
+                .submit_terminal(
+                    turn2,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(
+                matches!(f2, FinalizeOutcome::Finalized { .. }),
+                "turn-2 must still be live after the stale id-0 terminal"
+            );
+        })
+        .await;
     }
 
     /// The counter is decremented at most once even under a double terminal
@@ -1087,34 +1088,35 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn no_underflow_on_double_terminal() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        // No active mailbox turn → mailbox_finish_turn returns removed_token=None.
-        shared.global_active.store(0, Ordering::Relaxed);
-        let fin = TurnFinalizer::spawn();
-        let k = key(202);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            // No active mailbox turn → mailbox_finish_turn returns removed_token=None.
+            shared.global_active.store(0, Ordering::Relaxed);
+            let fin = TurnFinalizer::spawn();
+            let k = key(202);
 
-        let _ = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-        let _ = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
+            let _ = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+            let _ = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
 
-        // Never underflows below zero.
-        assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
-        }).await;
+            // Never underflows below zero.
+            assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
+        })
+        .await;
     }
 
     /// A gate-timeout with a busy pane and a live relay owner defers; once the
@@ -1122,65 +1124,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_busy_finalizes_after_backstop() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let k = key(303);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let k = key(303);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        let deferred = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::GateTimeout {
-                    pane_quiescent: Some(false),
-                },
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(deferred, FinalizeOutcome::Deferred));
-
-        // Sleep past GATE_BACKSTOP. Under `start_paused` the runtime
-        // auto-advances the clock once all tasks are idle on timers, which lets
-        // the actor's own reconcile interval fire and finalize the deferred
-        // entry. A couple of extra reconcile intervals guarantees the pass ran.
-        tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 3).await;
-        tokio::task::yield_now().await;
-
-        // A late terminal now sees Finalized → AlreadyFinalized, proving the
-        // reconciler finalized the deferred entry.
-        let late = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
-        }).await;
-    }
-
-    /// Repeated gate-timeouts (the watcher submits one per pass while the pane
-    /// stays busy) must NOT push the backstop deadline forward — otherwise a
-    /// persistently busy pane never finalizes. The deadline is armed once; even
-    /// with re-submissions arriving every ~half-backstop, the original deadline
-    /// elapses and the reconciler finalizes.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn repeated_gate_timeout_does_not_postpone_backstop() {
-        with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let k = key(313);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
-
-        // Re-submit gate-timeouts at ~1/3 of the backstop apart, three times,
-        // staying UNDER the single backstop window in total. Each is Deferred;
-        // critically, the re-submissions must not reset the original deadline.
-        let third = GATE_BACKSTOP / 3;
-        for _ in 0..3 {
-            let d = fin
+            let deferred = fin
                 .submit_terminal(
                     k,
                     ProviderKind::Claude,
@@ -1191,30 +1140,85 @@ mod tests {
                     shared.clone(),
                 )
                 .await;
-            assert!(matches!(d, FinalizeOutcome::Deferred));
-            tokio::time::sleep(third).await;
-        }
-        // ~GATE_BACKSTOP has now elapsed since the FIRST (and only effective)
-        // arming. If re-submissions had postponed it, the deadline would still
-        // be ~third away. Sleep a hair more to cross the original deadline and
-        // let the reconciler run.
-        tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 2).await;
-        tokio::task::yield_now().await;
+            assert!(matches!(deferred, FinalizeOutcome::Deferred));
 
-        let late = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(
-            matches!(late, FinalizeOutcome::AlreadyFinalized),
-            "the backstop must have finalized despite repeated gate-timeouts"
-        );
-        }).await;
+            // Sleep past GATE_BACKSTOP. Under `start_paused` the runtime
+            // auto-advances the clock once all tasks are idle on timers, which lets
+            // the actor's own reconcile interval fire and finalize the deferred
+            // entry. A couple of extra reconcile intervals guarantees the pass ran.
+            tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 3).await;
+            tokio::task::yield_now().await;
+
+            // A late terminal now sees Finalized → AlreadyFinalized, proving the
+            // reconciler finalized the deferred entry.
+            let late = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
+        })
+        .await;
+    }
+
+    /// Repeated gate-timeouts (the watcher submits one per pass while the pane
+    /// stays busy) must NOT push the backstop deadline forward — otherwise a
+    /// persistently busy pane never finalizes. The deadline is armed once; even
+    /// with re-submissions arriving every ~half-backstop, the original deadline
+    /// elapses and the reconciler finalizes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn repeated_gate_timeout_does_not_postpone_backstop() {
+        with_isolated_runtime_root(|| async move {
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let k = key(313);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+
+            // Re-submit gate-timeouts at ~1/3 of the backstop apart, three times,
+            // staying UNDER the single backstop window in total. Each is Deferred;
+            // critically, the re-submissions must not reset the original deadline.
+            let third = GATE_BACKSTOP / 3;
+            for _ in 0..3 {
+                let d = fin
+                    .submit_terminal(
+                        k,
+                        ProviderKind::Claude,
+                        TerminalEvent::GateTimeout {
+                            pane_quiescent: Some(false),
+                        },
+                        FinalizeContext::watcher(),
+                        shared.clone(),
+                    )
+                    .await;
+                assert!(matches!(d, FinalizeOutcome::Deferred));
+                tokio::time::sleep(third).await;
+            }
+            // ~GATE_BACKSTOP has now elapsed since the FIRST (and only effective)
+            // arming. If re-submissions had postponed it, the deadline would still
+            // be ~third away. Sleep a hair more to cross the original deadline and
+            // let the reconciler run.
+            tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 2).await;
+            tokio::task::yield_now().await;
+
+            let late = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(
+                matches!(late, FinalizeOutcome::AlreadyFinalized),
+                "the backstop must have finalized despite repeated gate-timeouts"
+            );
+        })
+        .await;
     }
 
     /// A gate-timeout whose pane is already quiescent finalizes immediately
@@ -1222,24 +1226,25 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_pane_quiescent_finalizes_now() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let k = key(404);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let k = key(404);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        let outcome = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::GateTimeout {
-                    pane_quiescent: Some(true),
-                },
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(outcome, FinalizeOutcome::Finalized { .. }));
-        }).await;
+            let outcome = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::GateTimeout {
+                        pane_quiescent: Some(true),
+                    },
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(outcome, FinalizeOutcome::Finalized { .. }));
+        })
+        .await;
     }
 
     /// A cancel submission does not double-apply completion cleanup and yields
@@ -1247,33 +1252,34 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_then_late_complete_already_finalized() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let k = key(505);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let k = key(505);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        let cancelled = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Cancel,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(cancelled, FinalizeOutcome::Finalized { .. }));
+            let cancelled = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Cancel,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(cancelled, FinalizeOutcome::Finalized { .. }));
 
-        let late = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
-        }).await;
+            let late = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
+        })
+        .await;
     }
 
     /// Phase 3 race: the watcher (`FinalizeContext::watcher`) and the bridge
@@ -1285,44 +1291,45 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn bridge_watcher_race_finalizes_exactly_once() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        shared.global_active.store(0, Ordering::Relaxed);
-        let fin = TurnFinalizer::spawn();
-        let k = key(707);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            shared.global_active.store(0, Ordering::Relaxed);
+            let fin = TurnFinalizer::spawn();
+            let k = key(707);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        let watcher = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        let bridge = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
+            let watcher = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            let bridge = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
 
-        // Exactly one Finalized, exactly one AlreadyFinalized.
-        let finalized = [&watcher, &bridge]
-            .iter()
-            .filter(|o| matches!(o, FinalizeOutcome::Finalized { .. }))
-            .count();
-        let already = [&watcher, &bridge]
-            .iter()
-            .filter(|o| matches!(o, FinalizeOutcome::AlreadyFinalized))
-            .count();
-        assert_eq!(finalized, 1, "exactly one submission performs the finalize");
-        assert_eq!(already, 1, "the loser receives AlreadyFinalized");
-        assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
-        }).await;
+            // Exactly one Finalized, exactly one AlreadyFinalized.
+            let finalized = [&watcher, &bridge]
+                .iter()
+                .filter(|o| matches!(o, FinalizeOutcome::Finalized { .. }))
+                .count();
+            let already = [&watcher, &bridge]
+                .iter()
+                .filter(|o| matches!(o, FinalizeOutcome::AlreadyFinalized))
+                .count();
+            assert_eq!(finalized, 1, "exactly one submission performs the finalize");
+            assert_eq!(already, 1, "the loser receives AlreadyFinalized");
+            assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
+        })
+        .await;
     }
 
     /// Phase 3 gate-timeout then watcher-complete-before-deadline: a
@@ -1333,52 +1340,53 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn gate_timeout_then_complete_before_deadline_no_double() {
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let fin = TurnFinalizer::spawn();
-        let k = key(808);
-        fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let fin = TurnFinalizer::spawn();
+            let k = key(808);
+            fin.register_start(k, ProviderKind::Claude, RelayOwnerKind::Watcher);
 
-        let deferred = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::GateTimeout {
-                    pane_quiescent: Some(false),
-                },
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(deferred, FinalizeOutcome::Deferred));
+            let deferred = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::GateTimeout {
+                        pane_quiescent: Some(false),
+                    },
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(deferred, FinalizeOutcome::Deferred));
 
-        // Pane quiesced: the watcher's next pass submits Complete well before
-        // the backstop deadline.
-        let complete = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(complete, FinalizeOutcome::Finalized { .. }));
+            // Pane quiesced: the watcher's next pass submits Complete well before
+            // the backstop deadline.
+            let complete = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(complete, FinalizeOutcome::Finalized { .. }));
 
-        // Let the backstop elapse; the reconciler must NOT finalize again.
-        tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 3).await;
-        tokio::task::yield_now().await;
+            // Let the backstop elapse; the reconciler must NOT finalize again.
+            tokio::time::sleep(GATE_BACKSTOP + RECONCILE_INTERVAL * 3).await;
+            tokio::task::yield_now().await;
 
-        let late = fin
-            .submit_terminal(
-                k,
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
-        }).await;
+            let late = fin
+                .submit_terminal(
+                    k,
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
+            assert!(matches!(late, FinalizeOutcome::AlreadyFinalized));
+        })
+        .await;
     }
 
     /// Restored/unregistered-watcher gate-timeout (#3016 P2 regression): a
@@ -1400,82 +1408,83 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        shared.global_active.store(1, Ordering::Relaxed);
-        let ch = ChannelId::new(1101);
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            shared.global_active.store(1, Ordering::Relaxed);
+            let ch = ChannelId::new(1101);
 
-        // An active turn (live cancel token) so `mailbox_finish_turn` returns
-        // `removed_token = Some` — the orphan/restored turn whose token must be
-        // released by the immediate finalize.
-        let active_token = Arc::new(CancelToken::new());
-        shared
-            .mailbox(ch)
-            .restore_active_turn(active_token.clone(), UserId::new(7), MessageId::new(70))
-            .await;
-        // A queued soft follow-up behind the active turn so `has_pending` is
-        // true; the immediate-no-owner path must surface it (kickoff_queue).
-        shared
-            .mailbox(ch)
-            .replace_queue(
-                vec![Intervention {
-                    author_id: UserId::new(1),
-                    author_is_bot: false,
-                    message_id: MessageId::new(71),
-                    source_message_ids: vec![MessageId::new(71)],
-                    text: "queued follow-up".to_string(),
-                    mode: InterventionMode::Soft,
-                    created_at: std::time::Instant::now(),
-                    reply_context: None,
-                    has_reply_boundary: false,
-                    merge_consecutive: false,
-                    pending_uploads: Vec::new(),
-                    voice_announcement: None,
-                }],
-                super::super::queue_persistence_context(&shared, &ProviderKind::Claude, ch),
-            )
-            .await;
+            // An active turn (live cancel token) so `mailbox_finish_turn` returns
+            // `removed_token = Some` — the orphan/restored turn whose token must be
+            // released by the immediate finalize.
+            let active_token = Arc::new(CancelToken::new());
+            shared
+                .mailbox(ch)
+                .restore_active_turn(active_token.clone(), UserId::new(7), MessageId::new(70))
+                .await;
+            // A queued soft follow-up behind the active turn so `has_pending` is
+            // true; the immediate-no-owner path must surface it (kickoff_queue).
+            shared
+                .mailbox(ch)
+                .replace_queue(
+                    vec![Intervention {
+                        author_id: UserId::new(1),
+                        author_is_bot: false,
+                        message_id: MessageId::new(71),
+                        source_message_ids: vec![MessageId::new(71)],
+                        text: "queued follow-up".to_string(),
+                        mode: InterventionMode::Soft,
+                        created_at: std::time::Instant::now(),
+                        reply_context: None,
+                        has_reply_boundary: false,
+                        merge_consecutive: false,
+                        pending_uploads: Vec::new(),
+                        voice_announcement: None,
+                    }],
+                    super::super::queue_persistence_context(&shared, &ProviderKind::Claude, ch),
+                )
+                .await;
 
-        let fin = TurnFinalizer::spawn();
-        // NOTE: no `register_start` — this is the restored/unregistered watcher.
-        // The watcher submits with `FinalizeContext::watcher()` exactly as the
-        // tmux_watcher gate-timeout call-site does, and discards the outcome.
-        let outcome = fin
-            .submit_terminal(
-                TurnKey::new(ch, 0, 0),
-                ProviderKind::Claude,
-                TerminalEvent::GateTimeout {
-                    pane_quiescent: Some(false),
-                },
-                FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
+            let fin = TurnFinalizer::spawn();
+            // NOTE: no `register_start` — this is the restored/unregistered watcher.
+            // The watcher submits with `FinalizeContext::watcher()` exactly as the
+            // tmux_watcher gate-timeout call-site does, and discards the outcome.
+            let outcome = fin
+                .submit_terminal(
+                    TurnKey::new(ch, 0, 0),
+                    ProviderKind::Claude,
+                    TerminalEvent::GateTimeout {
+                        pane_quiescent: Some(false),
+                    },
+                    FinalizeContext::watcher(),
+                    shared.clone(),
+                )
+                .await;
 
-        match outcome {
-            FinalizeOutcome::Finalized {
-                removed_token,
-                has_pending,
-                ..
-            } => {
-                assert!(
-                    removed_token.is_some(),
-                    "restored watcher gate-timeout must release the active mailbox token, \
-                     not leave it orphaned"
-                );
-                assert!(
+            match outcome {
+                FinalizeOutcome::Finalized {
+                    removed_token,
                     has_pending,
-                    "the queued follow-up must be honored so the finalizer kicks off the queue"
-                );
-            }
-            other => panic!(
-                "restored/unregistered-watcher gate-timeout must finalize immediately \
+                    ..
+                } => {
+                    assert!(
+                        removed_token.is_some(),
+                        "restored watcher gate-timeout must release the active mailbox token, \
+                     not leave it orphaned"
+                    );
+                    assert!(
+                        has_pending,
+                        "the queued follow-up must be honored so the finalizer kicks off the queue"
+                    );
+                }
+                other => panic!(
+                    "restored/unregistered-watcher gate-timeout must finalize immediately \
                  (not stay stuck), got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-        // Counter decremented exactly once (token was removed).
-        assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
-        }).await;
+                    std::mem::discriminant(&other)
+                ),
+            }
+            // Counter decremented exactly once (token was removed).
+            assert_eq!(shared.global_active.load(Ordering::Relaxed), 0);
+        })
+        .await;
     }
 
     /// #3016 root-cause regression (the escalated [P1] wrong-turn race): a
@@ -1493,157 +1502,161 @@ mod tests {
         use serenity::model::id::{MessageId, UserId};
 
         with_isolated_runtime_root(|| async move {
-        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
-        let ch = ChannelId::new(1313);
-        let turn1_id = 5001u64;
-        let turn2_id = 5002u64;
+            let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+            let ch = ChannelId::new(1313);
+            let turn1_id = 5001u64;
+            let turn2_id = 5002u64;
 
-        // turn-2 is the CURRENT live active turn in the mailbox (a fresh turn
-        // that started after turn-1 finalized — its identity is turn2_id).
-        let turn2_token = Arc::new(CancelToken::new());
-        shared.global_active.store(1, Ordering::Relaxed);
-        shared
-            .mailbox(ch)
-            .restore_active_turn(
-                turn2_token.clone(),
-                UserId::new(7),
-                MessageId::new(turn2_id),
-            )
-            .await;
-        // A queued soft follow-up sits behind turn-2. If the stale terminal
-        // surfaced `has_pending`, the bridge could drain THIS message behind the
-        // live turn — so the guard-miss path must report no backlog (Codex P2).
-        shared
-            .mailbox(ch)
-            .replace_queue(
-                vec![Intervention {
-                    author_id: UserId::new(1),
-                    author_is_bot: false,
-                    message_id: MessageId::new(5003),
-                    source_message_ids: vec![MessageId::new(5003)],
-                    text: "queued behind turn-2".to_string(),
-                    mode: InterventionMode::Soft,
-                    created_at: std::time::Instant::now(),
-                    reply_context: None,
-                    has_reply_boundary: false,
-                    merge_consecutive: false,
-                    pending_uploads: Vec::new(),
-                    voice_announcement: None,
-                }],
-                super::super::queue_persistence_context(&shared, &ProviderKind::Claude, ch),
-            )
-            .await;
-
-        // Channel-scoped routing state that belongs to the LIVE turn-2. A stale
-        // turn-1 terminal must not clear any of it (Codex P2 — the trailing
-        // side-effects must be skipped when the identity guard misses).
-        //   * dispatch_thread_parents is cleaned via `retain(|_, v| *v != ch)`,
-        //     so seed an entry whose VALUE is `ch` (a thread routing TO it).
-        //   * dispatch_role_overrides is keyed BY `ch`.
-        let thread_ch = ChannelId::new(1314);
-        let override_ch = ChannelId::new(1315);
-        shared.dispatch_thread_parents.insert(thread_ch, ch);
-        shared.dispatch_role_overrides.insert(ch, override_ch);
-
-        let fin = TurnFinalizer::spawn();
-        // A STALE terminal for turn-1 (its real id) arrives. The finalizer
-        // ledger has no entry for it (turn-1's entry was GC'd / never here), so
-        // it creates a Pending entry and finalizes — but the identity-guarded
-        // mailbox finish must refuse to touch turn-2's token.
-        let outcome = fin
-            .submit_terminal(
-                TurnKey::new(ch, turn1_id, 0),
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-
-        match outcome {
-            FinalizeOutcome::Finalized {
-                removed_token,
-                has_pending,
-                ..
-            } => {
-                assert!(
-                    removed_token.is_none(),
-                    "stale turn-1 terminal must NOT release turn-2's mailbox token"
-                );
-                // Codex P2: a guarded miss must report NO backlog so the bridge
-                // does not drain a queued soft message behind the live turn-2.
-                assert!(
-                    !has_pending,
-                    "stale terminal must report no pending backlog (turn-2 owns its queue)"
-                );
-            }
-            other => panic!(
-                "stale terminal still flows through the ledger gate as Finalized, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-
-        // turn-2's token is untouched and the global counter was NOT
-        // decremented for a turn this terminal did not own.
-        assert!(
-            !turn2_token
-                .cancelled
-                .load(std::sync::atomic::Ordering::Relaxed),
-            "turn-2 must not be cancelled by a stale turn-1 terminal"
-        );
-        assert!(
-            shared.mailbox(ch).has_active_turn().await,
-            "turn-2 must remain the live active turn"
-        );
-        assert_eq!(
-            shared.global_active.load(Ordering::Relaxed),
-            1,
-            "global_active must not be decremented for the wrong turn"
-        );
-
-        // Codex P2: the live turn-2's channel-scoped routing state survives the
-        // stale terminal — the guard-missed finalize must skip the trailing
-        // side-effects, not corrupt the newer turn's routing/watchdog metadata.
-        assert!(
+            // turn-2 is the CURRENT live active turn in the mailbox (a fresh turn
+            // that started after turn-1 finalized — its identity is turn2_id).
+            let turn2_token = Arc::new(CancelToken::new());
+            shared.global_active.store(1, Ordering::Relaxed);
             shared
-                .dispatch_thread_parents
-                .get(&thread_ch)
-                .is_some_and(|v| *v == ch),
-            "stale terminal must NOT drop turn-2's dispatch_thread_parents entry"
-        );
-        assert!(
+                .mailbox(ch)
+                .restore_active_turn(
+                    turn2_token.clone(),
+                    UserId::new(7),
+                    MessageId::new(turn2_id),
+                )
+                .await;
+            // A queued soft follow-up sits behind turn-2. If the stale terminal
+            // surfaced `has_pending`, the bridge could drain THIS message behind the
+            // live turn — so the guard-miss path must report no backlog (Codex P2).
             shared
-                .dispatch_role_overrides
-                .get(&ch)
-                .is_some_and(|v| *v == override_ch),
-            "stale terminal must NOT drop turn-2's dispatch_role_overrides entry"
-        );
+                .mailbox(ch)
+                .replace_queue(
+                    vec![Intervention {
+                        author_id: UserId::new(1),
+                        author_is_bot: false,
+                        message_id: MessageId::new(5003),
+                        source_message_ids: vec![MessageId::new(5003)],
+                        text: "queued behind turn-2".to_string(),
+                        mode: InterventionMode::Soft,
+                        created_at: std::time::Instant::now(),
+                        reply_context: None,
+                        has_reply_boundary: false,
+                        merge_consecutive: false,
+                        pending_uploads: Vec::new(),
+                        voice_announcement: None,
+                    }],
+                    super::super::queue_persistence_context(&shared, &ProviderKind::Claude, ch),
+                )
+                .await;
 
-        // And turn-2 finalizes correctly on its OWN matching terminal.
-        let f2 = fin
-            .submit_terminal(
-                TurnKey::new(ch, turn2_id, 0),
-                ProviderKind::Claude,
-                TerminalEvent::Complete,
-                FinalizeContext::bridge(),
-                shared.clone(),
-            )
-            .await;
-        match f2 {
-            FinalizeOutcome::Finalized { removed_token, .. } => {
-                assert!(
-                    removed_token.is_some(),
-                    "turn-2's own terminal must release turn-2's token"
-                );
+            // Channel-scoped routing state that belongs to the LIVE turn-2. A stale
+            // turn-1 terminal must not clear any of it (Codex P2 — the trailing
+            // side-effects must be skipped when the identity guard misses).
+            //   * dispatch_thread_parents is cleaned via `retain(|_, v| *v != ch)`,
+            //     so seed an entry whose VALUE is `ch` (a thread routing TO it).
+            //   * dispatch_role_overrides is keyed BY `ch`.
+            let thread_ch = ChannelId::new(1314);
+            let override_ch = ChannelId::new(1315);
+            shared.dispatch_thread_parents.insert(thread_ch, ch);
+            shared.dispatch_role_overrides.insert(ch, override_ch);
+
+            let fin = TurnFinalizer::spawn();
+            // A STALE terminal for turn-1 (its real id) arrives. The finalizer
+            // ledger has no entry for it (turn-1's entry was GC'd / never here), so
+            // it creates a Pending entry and finalizes — but the identity-guarded
+            // mailbox finish must refuse to touch turn-2's token.
+            let outcome = fin
+                .submit_terminal(
+                    TurnKey::new(ch, turn1_id, 0),
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+
+            match outcome {
+                FinalizeOutcome::Finalized {
+                    removed_token,
+                    has_pending,
+                    ..
+                } => {
+                    assert!(
+                        removed_token.is_none(),
+                        "stale turn-1 terminal must NOT release turn-2's mailbox token"
+                    );
+                    // Codex P2: a guarded miss must report NO backlog so the bridge
+                    // does not drain a queued soft message behind the live turn-2.
+                    assert!(
+                        !has_pending,
+                        "stale terminal must report no pending backlog (turn-2 owns its queue)"
+                    );
+                }
+                other => panic!(
+                    "stale terminal still flows through the ledger gate as Finalized, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
             }
-            other => panic!("turn-2 must finalize on its own id, got {:?}", std::mem::discriminant(&other)),
-        }
-        assert_eq!(
-            shared.global_active.load(Ordering::Relaxed),
-            0,
-            "now turn-2 is finalized exactly once"
-        );
-        }).await;
+
+            // turn-2's token is untouched and the global counter was NOT
+            // decremented for a turn this terminal did not own.
+            assert!(
+                !turn2_token
+                    .cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                "turn-2 must not be cancelled by a stale turn-1 terminal"
+            );
+            assert!(
+                shared.mailbox(ch).has_active_turn().await,
+                "turn-2 must remain the live active turn"
+            );
+            assert_eq!(
+                shared.global_active.load(Ordering::Relaxed),
+                1,
+                "global_active must not be decremented for the wrong turn"
+            );
+
+            // Codex P2: the live turn-2's channel-scoped routing state survives the
+            // stale terminal — the guard-missed finalize must skip the trailing
+            // side-effects, not corrupt the newer turn's routing/watchdog metadata.
+            assert!(
+                shared
+                    .dispatch_thread_parents
+                    .get(&thread_ch)
+                    .is_some_and(|v| *v == ch),
+                "stale terminal must NOT drop turn-2's dispatch_thread_parents entry"
+            );
+            assert!(
+                shared
+                    .dispatch_role_overrides
+                    .get(&ch)
+                    .is_some_and(|v| *v == override_ch),
+                "stale terminal must NOT drop turn-2's dispatch_role_overrides entry"
+            );
+
+            // And turn-2 finalizes correctly on its OWN matching terminal.
+            let f2 = fin
+                .submit_terminal(
+                    TurnKey::new(ch, turn2_id, 0),
+                    ProviderKind::Claude,
+                    TerminalEvent::Complete,
+                    FinalizeContext::bridge(),
+                    shared.clone(),
+                )
+                .await;
+            match f2 {
+                FinalizeOutcome::Finalized { removed_token, .. } => {
+                    assert!(
+                        removed_token.is_some(),
+                        "turn-2's own terminal must release turn-2's token"
+                    );
+                }
+                other => panic!(
+                    "turn-2 must finalize on its own id, got {:?}",
+                    std::mem::discriminant(&other)
+                ),
+            }
+            assert_eq!(
+                shared.global_active.load(Ordering::Relaxed),
+                0,
+                "now turn-2 is finalized exactly once"
+            );
+        })
+        .await;
     }
 
     /// #3016 Task 1 regression: the guarded inflight clear (the deadline-armed
@@ -1655,7 +1668,7 @@ mod tests {
     /// `inflight_state_still_same_turn`.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn guarded_inflight_clear_preserves_next_turn_inflight() {
-        use crate::services::discord::inflight::{save_inflight_state, InflightTurnState};
+        use crate::services::discord::inflight::{InflightTurnState, save_inflight_state};
 
         with_isolated_runtime_root(|| async move {
         let shared = super::super::make_shared_data_for_tests_with_storage(None, None);

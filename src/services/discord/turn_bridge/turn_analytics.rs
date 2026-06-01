@@ -86,7 +86,10 @@ pub(super) fn discord_turn_id(
             None => "recovery".to_string(),
         };
         return match session_key {
-            Some(key) => format!("discord:{}:session:{key}:{turn_discriminator}", channel_id.get()),
+            Some(key) => format!(
+                "discord:{}:session:{key}:{turn_discriminator}",
+                channel_id.get()
+            ),
             None => format!("discord:{}:recovery:{turn_discriminator}", channel_id.get()),
         };
     };
@@ -219,8 +222,13 @@ mod discord_turn_id_no_user_message_tests {
 
     #[test]
     fn none_user_msg_id_and_no_session_uses_recovery_marker() {
-        let turn_id =
-            discord_turn_id(&ProviderKind::Claude, ChannelId::new(4243), None, None, Some(512));
+        let turn_id = discord_turn_id(
+            &ProviderKind::Claude,
+            ChannelId::new(4243),
+            None,
+            None,
+            Some(512),
+        );
         assert_eq!(turn_id, "discord:4243:recovery:off512");
     }
 

@@ -2384,11 +2384,7 @@ async fn finish_restored_watcher_active_turn(
     let outcome = shared
         .turn_finalizer
         .submit_terminal(
-            super::turn_finalizer::TurnKey::new(
-                channel_id,
-                user_msg_id,
-                shared.current_generation,
-            ),
+            super::turn_finalizer::TurnKey::new(channel_id, user_msg_id, shared.current_generation),
             provider.clone(),
             super::turn_finalizer::TerminalEvent::Complete,
             super::turn_finalizer::FinalizeContext::watcher(),

@@ -1576,8 +1576,7 @@ pub(crate) struct SharedData {
     /// cancel_token release, `global_active` decrement, trailing terminal
     /// side-effects) as an atomic, exactly-once unit. Bridge/watcher terminals
     /// submit terminal events here instead of finalizing inline.
-    pub(in crate::services::discord) turn_finalizer:
-        Arc<turn_finalizer::TurnFinalizer>,
+    pub(in crate::services::discord) turn_finalizer: Arc<turn_finalizer::TurnFinalizer>,
     /// Process-global finalizing turn counter shared across all providers.
     pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of providers still needing to complete shutdown.

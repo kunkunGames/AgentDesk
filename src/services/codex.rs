@@ -29,8 +29,8 @@ use crate::services::session_backend::{
 };
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error, tmux_session_exists,
-    tmux_session_has_live_pane,
+    record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
+    tmux_session_exists, tmux_session_has_live_pane,
 };
 
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
@@ -3277,7 +3277,9 @@ mod tui_hosting_tests {
         assert!(!codex_fifo_wrapper_session_usable(false, true, Fifo, true));
         assert!(!codex_fifo_wrapper_session_usable(true, false, Fifo, true));
         assert!(!codex_fifo_wrapper_session_usable(true, true, Pipe, true));
-        assert!(!codex_fifo_wrapper_session_usable(true, true, Unknown, true));
+        assert!(!codex_fifo_wrapper_session_usable(
+            true, true, Unknown, true
+        ));
         assert!(!codex_fifo_wrapper_session_usable(true, true, Fifo, false));
     }
 
