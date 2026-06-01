@@ -2148,6 +2148,14 @@ async fn reconcile_orphan_suppressed_placeholder_for_restored_watcher(
     let Some(state) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
         return;
     };
+    // A restored inflight with no current message id (current_msg_id == 0 — e.g. a
+    // TUI-direct/recovery turn that never anchored a Discord placeholder) has no
+    // placeholder message to reconcile, and `MessageId::new(0)` panics. Skip it so
+    // a single such orphan cannot abort startup watcher reconciliation (which would
+    // leave `reconcile_done` stuck false and the provider permanently degraded).
+    if state.current_msg_id == 0 {
+        return;
+    }
     let ctx = PlaceholderSuppressContext {
         origin: PlaceholderSuppressOrigin::OrphanRestartHandoff,
         placeholder_msg_id: Some(MessageId::new(state.current_msg_id)),
