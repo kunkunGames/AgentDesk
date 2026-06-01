@@ -3367,6 +3367,40 @@ async fn mailbox_finish_turn(
     result
 }
 
+/// #3016 — identity-guarded variant of [`mailbox_finish_turn`]. Finalizes the
+/// channel's active turn ONLY when the mailbox's current
+/// `active_user_message_id` still matches `expected_user_message_id`. Used by
+/// the `TurnFinalizer` when the terminal carries a real `user_msg_id` so a
+/// stale / channel-only terminal arriving in the narrow window between one
+/// turn finalizing and the next turn's `try_start_turn` (or after ledger GC)
+/// cannot release the WRONG (newer) turn's token or decrement `global_active`.
+/// On mismatch it returns `removed_token = None`, exactly like an idempotent
+/// second `mailbox_finish_turn`, so the finalizer's counter-decrement gate is
+/// a no-op.
+async fn mailbox_finish_turn_if_matches(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    expected_user_message_id: serenity::model::id::MessageId,
+) -> FinishTurnResult {
+    let result = shared
+        .mailbox(channel_id)
+        .finish_turn_if_matches(
+            expected_user_message_id,
+            queue_persistence_context(shared, provider, channel_id),
+        )
+        .await;
+    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+    // Mirror `mailbox_finish_turn`: a successful guarded finish is also a
+    // recovery-engine success exit. Only mark `recovery_done` when this call
+    // actually finalized (removed a token); a mismatch no-op must not free a
+    // watcher waiting on a turn that is still live.
+    if result.removed_token.is_some() {
+        shared.mailboxes.recovery_done(channel_id).mark_done();
+    }
+    result
+}
+
 async fn mailbox_finish_cancelled_turn(
     shared: &SharedData,
     channel_id: ChannelId,
