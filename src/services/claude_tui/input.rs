@@ -72,6 +72,10 @@ impl PromptReadinessKind {
 /// marker was already visible when we checked, after enabling the Notify
 /// permit so no concurrent Stop is dropped).
 ///
+/// `PreSnapshotIdleTranscript` also short-circuits without waiting for a hook:
+/// the transcript already says the turn is idle and the subscribed
+/// pre-snapshot has no prompt blocker.
+///
 /// `PreSnapshotSessionDead` propagates a tmux-died error to the caller.
 ///
 /// `Ready` means a Stop/SubagentStop hook fired within the event budget after
@@ -83,6 +87,7 @@ impl PromptReadinessKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookFastPathOutcome {
     PreSnapshotReady,
+    PreSnapshotIdleTranscript,
     PreSnapshotSessionDead,
     Ready,
     Pending,
@@ -194,7 +199,7 @@ pub fn prompt_readiness_snapshot(session_name: &str) -> PromptReadinessSnapshot 
     let prompt_marker_detected = pane.as_deref().is_some_and(pane_looks_ready_for_prompt);
     let prompt_draft_detected = pane
         .as_deref()
-        .is_some_and(crate::services::tmux_common::tmux_capture_indicates_claude_tui_prompt_draft);
+        .is_some_and(capture_has_editable_prompt_draft);
     let pane_tail = pane
         .as_deref()
         .map(prompt_ready_debug_tail)
@@ -560,8 +565,12 @@ fn wait_for_prompt_ready_inner(
     // guaranteed to wake this specific permit, even if the wait has not yet
     // been polled. See issue #2445.
     let notify = crate::services::claude_tui::hook_server::prompt_ready_notify();
-    let (fast_path, post_event_snapshot) =
-        run_prompt_ready_fast_path(notify, session_name.to_string(), readiness.event_budget());
+    let (fast_path, post_event_snapshot) = run_prompt_ready_fast_path(
+        notify,
+        session_name.to_string(),
+        readiness.event_budget(),
+        transcript_path.map(std::path::Path::to_path_buf),
+    );
 
     match fast_path {
         HookFastPathOutcome::PreSnapshotReady => {
@@ -571,6 +580,16 @@ fn wait_for_prompt_ready_inner(
                 readiness = readiness.label(),
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "claude_tui prompt ready on pre-snapshot (no event wait needed)"
+            );
+            return Ok(());
+        }
+        HookFastPathOutcome::PreSnapshotIdleTranscript => {
+            check_prompt_cancel(cancel_token)?;
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "claude_tui prompt ready via idle transcript fallback before hook wait"
             );
             return Ok(());
         }
@@ -594,9 +613,7 @@ fn wait_for_prompt_ready_inner(
             );
             return Ok(());
         }
-        let snapshot_has_prompt_blocker = snapshot_has_stranded_prompt_draft(&snapshot)
-            || blocking_dialog_dismissal_actions(&snapshot).is_some();
-        if !snapshot_has_prompt_blocker
+        if !snapshot_has_prompt_blocker(&snapshot)
             && transcript_idle_confirms_prompt_ready(&snapshot, transcript_path)
         {
             check_prompt_cancel(cancel_token)?;
@@ -670,6 +687,7 @@ fn run_prompt_ready_fast_path(
     notify: Arc<Notify>,
     session_name: String,
     budget: Duration,
+    transcript_path: Option<std::path::PathBuf>,
 ) -> (HookFastPathOutcome, Option<PromptReadinessSnapshot>) {
     let fut = async move {
         let notified = notify.notified();
@@ -687,6 +705,11 @@ fn run_prompt_ready_fast_path(
         }
         if !pre_snapshot.tmux_pane_alive {
             return (HookFastPathOutcome::PreSnapshotSessionDead, None);
+        }
+        if !snapshot_has_prompt_blocker(&pre_snapshot)
+            && transcript_idle_confirms_prompt_ready(&pre_snapshot, transcript_path.as_deref())
+        {
+            return (HookFastPathOutcome::PreSnapshotIdleTranscript, None);
         }
 
         let fast_path = tokio::select! {
@@ -851,30 +874,31 @@ fn wait_for_prompt_ready_polling(
         // survey is deliberately NOT dismissed — it only appears alongside a
         // genuinely running turn, where waiting is correct and sending keys
         // would interrupt real work (see `blocking_dialog_dismissal_actions`).
-        if dialog_dismiss_attempts < PROMPT_READY_DIALOG_DISMISS_ATTEMPTS
-            && let Some(actions) = blocking_dialog_dismissal_actions(&snapshot)
-        {
-            dialog_dismiss_attempts += 1;
-            tracing::info!(
-                tmux_session_name = session_name,
-                readiness = readiness.label(),
-                attempt = dialog_dismiss_attempts,
-                max_attempts = PROMPT_READY_DIALOG_DISMISS_ATTEMPTS,
-                reason = prompt_ready_timeout_reason(&snapshot),
-                "claude_tui prompt-ready blocked by a startup modal; auto-confirming it before timeout"
-            );
-            if let Err(error) = run_actions(session_name, &actions, cancel_token) {
-                tracing::warn!(
+        let blocking_dialog_actions = blocking_dialog_dismissal_actions(&snapshot);
+        if let Some(actions) = &blocking_dialog_actions {
+            if dialog_dismiss_attempts < PROMPT_READY_DIALOG_DISMISS_ATTEMPTS {
+                dialog_dismiss_attempts += 1;
+                tracing::info!(
                     tmux_session_name = session_name,
-                    error = %error,
-                    "failed to send keystroke to dismiss Claude TUI startup modal"
+                    readiness = readiness.label(),
+                    attempt = dialog_dismiss_attempts,
+                    max_attempts = PROMPT_READY_DIALOG_DISMISS_ATTEMPTS,
+                    reason = prompt_ready_timeout_reason(&snapshot),
+                    "claude_tui prompt-ready blocked by a startup modal; auto-confirming it before timeout"
                 );
+                if let Err(error) = run_actions(session_name, actions, cancel_token) {
+                    tracing::warn!(
+                        tmux_session_name = session_name,
+                        error = %error,
+                        "failed to send keystroke to dismiss Claude TUI startup modal"
+                    );
+                }
+                check_prompt_cancel(cancel_token)?;
+                std::thread::sleep(PROMPT_SUBMIT_RETRY_SETTLE);
+                continue;
             }
-            check_prompt_cancel(cancel_token)?;
-            std::thread::sleep(PROMPT_SUBMIT_RETRY_SETTLE);
-            continue;
         }
-        if transcript_idle_confirms_prompt_ready(&snapshot, transcript_path) {
+        if snapshot_allows_idle_transcript_fallback(&snapshot, transcript_path) {
             tracing::info!(
                 tmux_session_name = session_name,
                 readiness = readiness.label(),
@@ -921,6 +945,11 @@ fn snapshot_has_stranded_prompt_draft(snapshot: &PromptReadinessSnapshot) -> boo
         && snapshot.prompt_marker_detected
         && snapshot.prompt_draft_detected
         && !claude_prompt_draft_is_idle_suggestion_tail(&snapshot.pane_tail)
+}
+
+fn snapshot_has_prompt_blocker(snapshot: &PromptReadinessSnapshot) -> bool {
+    snapshot_has_stranded_prompt_draft(snapshot)
+        || blocking_dialog_dismissal_actions(snapshot).is_some()
 }
 
 /// Keystrokes that confirm a blocking startup modal, or `None` when there is
@@ -973,6 +1002,11 @@ fn pane_looks_ready_for_prompt(pane: &str) -> bool {
     crate::services::tmux_common::tmux_capture_indicates_claude_tui_ready_for_input(pane)
 }
 
+fn capture_has_editable_prompt_draft(pane: &str) -> bool {
+    crate::services::tmux_common::tmux_capture_indicates_claude_tui_prompt_draft(pane)
+        && !crate::services::tmux_common::tmux_capture_indicates_claude_tui_idle_suggestion(pane)
+}
+
 fn prompt_marker_confirms_prompt_ready(snapshot: &PromptReadinessSnapshot) -> bool {
     snapshot.prompt_marker_detected && !snapshot.prompt_draft_detected
 }
@@ -1007,6 +1041,14 @@ fn transcript_idle_confirms_prompt_ready(
         crate::services::claude_tui::transcript_tail::observe_transcript_turn_state(path)
             == crate::services::tui_turn_state::TuiTurnState::Idle
     })
+}
+
+fn snapshot_allows_idle_transcript_fallback(
+    snapshot: &PromptReadinessSnapshot,
+    transcript_path: Option<&std::path::Path>,
+) -> bool {
+    blocking_dialog_dismissal_actions(snapshot).is_none()
+        && transcript_idle_confirms_prompt_ready(snapshot, transcript_path)
 }
 
 fn log_prompt_ready_timeout(
@@ -1519,6 +1561,32 @@ line 13";
     }
 
     #[test]
+    fn editable_draft_detector_uses_full_capture_for_idle_suggestions() {
+        let capture = format!(
+            "\
+✻ Worked for 2s
+────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}좋아, 잘 동작하네
+────────────────────────────────────────────────────────────────────────────
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
+{}",
+            "status\n".repeat(PROMPT_READY_DEBUG_TAIL_LINES + 1)
+        );
+        let debug_tail = prompt_ready_debug_tail(&capture);
+
+        assert!(
+            crate::services::tmux_common::tmux_capture_indicates_claude_tui_prompt_draft(&capture)
+        );
+        assert!(
+            crate::services::tmux_common::tmux_capture_indicates_claude_tui_idle_suggestion(
+                &capture
+            )
+        );
+        assert!(!claude_prompt_draft_is_idle_suggestion_tail(&debug_tail));
+        assert!(!capture_has_editable_prompt_draft(&capture));
+    }
+
+    #[test]
     fn idle_transcript_can_confirm_readiness_when_prompt_marker_is_absent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -1535,6 +1603,36 @@ line 13";
         };
 
         assert!(transcript_idle_confirms_prompt_ready(
+            &snapshot,
+            Some(file.path())
+        ));
+    }
+
+    #[test]
+    fn idle_transcript_does_not_override_blocking_startup_modal() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{"type":"system","subtype":"turn_duration","sessionId":"s"}"#,
+        )
+        .unwrap();
+        let snapshot = PromptReadinessSnapshot {
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: "\u{276f} 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm \u{00b7} Esc to cancel".to_string(),
+        };
+
+        assert_eq!(
+            blocking_dialog_dismissal_actions(&snapshot),
+            Some(vec![TuiInputAction::Enter])
+        );
+        assert!(transcript_idle_confirms_prompt_ready(
+            &snapshot,
+            Some(file.path())
+        ));
+        assert!(!snapshot_allows_idle_transcript_fallback(
             &snapshot,
             Some(file.path())
         ));

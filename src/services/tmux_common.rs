@@ -178,19 +178,22 @@ pub(crate) fn tmux_capture_claude_tui_blocking_dialog(
         .map(trim_prompt_line)
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>();
-    let has = |needle: &str| recent.iter().any(|l| l.contains(needle));
-
-    let confirm_footer = has("Enter to confirm");
-    if confirm_footer && has("trust this folder") {
-        return Some(ClaudeTuiBlockingDialog::TrustFolder);
+    let mut current_dialog = None;
+    for (idx, line) in recent.iter().enumerate() {
+        if line.contains("Enter to confirm") {
+            let context_start = idx.saturating_sub(8);
+            let context = &recent[context_start..=idx];
+            let has = |needle: &str| context.iter().any(|l| l.contains(needle));
+            if has("trust this folder") {
+                current_dialog = Some(ClaudeTuiBlockingDialog::TrustFolder);
+            } else if has("Resume from summary") || has("Resume full session") {
+                current_dialog = Some(ClaudeTuiBlockingDialog::ResumeSession);
+            }
+        } else if line.contains("How is Claude doing this session") {
+            current_dialog = Some(ClaudeTuiBlockingDialog::FeedbackSurvey);
+        }
     }
-    if confirm_footer && (has("Resume from summary") || has("Resume full session")) {
-        return Some(ClaudeTuiBlockingDialog::ResumeSession);
-    }
-    if has("How is Claude doing this session") {
-        return Some(ClaudeTuiBlockingDialog::FeedbackSurvey);
-    }
-    None
+    current_dialog
 }
 
 fn tmux_recent_lines_show_claude_tui_active_work(lines: &[&str]) -> bool {
@@ -746,6 +749,23 @@ This session is 1d old and 141.7k tokens.
         assert_eq!(
             tmux_capture_claude_tui_blocking_dialog(pane),
             Some(ClaudeTuiBlockingDialog::ResumeSession)
+        );
+    }
+
+    #[test]
+    fn blocking_dialog_prefers_current_survey_over_stale_actionable_modal() {
+        let pane = "\
+This session is 1d old and 141.7k tokens.
+  \u{276f} 1. Resume from summary (recommended)
+    2. Resume full session as-is
+  Enter to confirm \u{00b7} Esc to cancel
+
+\u{25cf} How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+\u{276f} ";
+        assert_eq!(
+            tmux_capture_claude_tui_blocking_dialog(pane),
+            Some(ClaudeTuiBlockingDialog::FeedbackSurvey)
         );
     }
 
