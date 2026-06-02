@@ -13,6 +13,9 @@ pub(crate) fn split_for_tts(text: &str, max_chars: usize) -> Vec<String> {
     pack_sentence_segments(sentence_segments(text), max_chars)
 }
 
+// reason: incremental TTS chunking is wired only when voice config is enabled;
+// no compile target exercises it. See #3034.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct IncrementalTtsChunkQueue {
     max_chars: usize,
@@ -20,6 +23,9 @@ pub(crate) struct IncrementalTtsChunkQueue {
     ready_chunks: VecDeque<String>,
 }
 
+// reason: incremental TTS chunking is wired only when voice config is enabled;
+// no compile target exercises it. See #3034.
+#[allow(dead_code)]
 impl IncrementalTtsChunkQueue {
     pub(crate) fn new(max_chars: usize) -> Self {
         let max_chars = if max_chars == 0 {
@@ -243,6 +249,9 @@ fn is_closing_punctuation(ch: char) -> bool {
     )
 }
 
+// reason: incremental TTS chunking is wired only when voice config is enabled;
+// no compile target exercises it. See #3034.
+#[allow(dead_code)]
 fn ends_with_sentence_boundary(text: &str) -> bool {
     for ch in text.chars().rev() {
         if ch == '\n' || ch == '\r' {

@@ -43,6 +43,7 @@ pub enum VoiceTurnLinkStatus {
 }
 
 impl VoiceTurnLinkStatus {
+    #[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
     pub fn as_str(self) -> &'static str {
         match self {
             VoiceTurnLinkStatus::Active => "active",
@@ -184,6 +185,7 @@ const RETURNING_COLUMNS: &str = "id, guild_id, voice_channel_id, background_chan
 /// [`retarget_voice_turn_link_pg`].
 ///
 /// Returns the inserted row on success, or `None` on idempotent dedup.
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn insert_voice_turn_link_pg(
     pool: &PgPool,
     insert: &VoiceTurnLinkInsert,
@@ -603,6 +605,7 @@ pub async fn attach_voice_turn_link_ids_pg(
     }
 }
 
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn attach_announce_message_id_voice_turn_link_pg(
     pool: &PgPool,
     guild_id: u64,
@@ -630,6 +633,7 @@ pub async fn attach_announce_message_id_voice_turn_link_pg(
     }
 }
 
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn attach_dispatch_id_voice_turn_link_pg(
     pool: &PgPool,
     guild_id: u64,
@@ -657,6 +661,7 @@ pub async fn attach_dispatch_id_voice_turn_link_pg(
     }
 }
 
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn attach_turn_id_voice_turn_link_pg(
     pool: &PgPool,
     guild_id: u64,
@@ -725,6 +730,7 @@ fn advisory_lock_key(guild_id: u64, voice_channel_id: u64, utterance_id: &str) -
 /// because dispatch_id is a globally unique opaque token, but the
 /// `ORDER BY updated_at DESC` is defensive against any future scheme where
 /// a single dispatch is reused.
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn lookup_voice_turn_link_by_dispatch_id_pg(
     pool: &PgPool,
     dispatch_id: &str,
@@ -765,6 +771,7 @@ pub async fn lookup_active_voice_turn_link_by_dispatch_id_pg(
 /// Reverse lookup by `announce_message_id`. Same shape as the
 /// dispatch_id lookup; primarily used by barge-in cancel resolution when
 /// only the announce message anchor is available.
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn lookup_voice_turn_link_by_announce_message_id_pg(
     pool: &PgPool,
     announce_message_id: u64,
@@ -802,6 +809,7 @@ pub async fn lookup_active_voice_turn_link_by_announce_message_id_pg(
     Ok(row.as_ref().map(row_to_link))
 }
 
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn lookup_voice_turn_link_by_turn_id_pg(
     pool: &PgPool,
     turn_id: &str,
@@ -862,6 +870,7 @@ pub async fn lookup_active_voice_turn_link_by_utterance_pg(
 /// If multiple utterances are active in that voice channel, the most recently
 /// updated link wins; callers with an utterance id should use
 /// [`lookup_active_voice_turn_link_by_utterance_pg`] for an exact match.
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn resolve_active_voice_turn_target_pg(
     pool: &PgPool,
     guild_id: u64,
@@ -885,6 +894,7 @@ pub async fn resolve_active_voice_turn_target_pg(
 }
 
 /// Resolve the active source voice channel for a background text channel.
+#[allow(dead_code)] // voice turn-link helper; wired only when voice config enabled. See #3034
 pub async fn resolve_active_voice_turn_source_pg(
     pool: &PgPool,
     guild_id: u64,

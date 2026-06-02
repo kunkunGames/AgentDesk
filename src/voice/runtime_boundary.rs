@@ -1,6 +1,11 @@
 //! Serializable command/event contracts for moving voice runtime work across a
 //! process boundary.
 
+// reason: out-of-process voice runtime boundary; the whole protocol surface is
+// wired only once the voice runtime process is enabled, which no compile target
+// exercises today. See #3034.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 use crate::voice::barge_in::BargeInSensitivity;

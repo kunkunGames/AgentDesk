@@ -126,6 +126,9 @@ pub fn list_daily_stats(conn: &Connection) -> Result<Vec<MementoFeedbackDailySta
     Ok(rows.collect::<sqlite_test::Result<Vec<_>>>()?)
 }
 
+// reason: only caller is the legacy-sqlite-tests-gated upsert_turn_stat_on_conn;
+// dead in the production build. See #3034 / #3035.
+#[allow(dead_code)]
 fn validate_turn_stat(stat: &MementoFeedbackTurnStat) -> Result<()> {
     if stat.turn_id.trim().is_empty() {
         return Err(anyhow!("memento feedback stats require non-empty turn_id"));

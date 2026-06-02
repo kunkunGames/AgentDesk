@@ -55,6 +55,9 @@ pub const CANCEL_TOMBSTONE_FALLBACK_TTL_SECS: i64 = 60;
 /// death is no longer attributable to the cancel.
 pub const CANCEL_TEARDOWN_GRACE_BYTES: i64 = 4 * 1024;
 
+// reason: public cancel-tombstone DTO for the read path; consumers are wired on
+// selected cancel-attribution routes, not every compile target. See #3034.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct CancelTombstone {
     pub channel_id: i64,

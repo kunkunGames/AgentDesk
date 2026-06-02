@@ -161,9 +161,20 @@
     lobby routing, progress mirroring, and barge-in orchestration surface;
     tracked decompose target — see `giant-file-registry.md` (owner
     `voice-runtime`, deadline 2026-08-31, #3036)).
-  - `src/voice/receiver.rs` (1046 lines; voice receive pipeline, utterance
+  - `src/voice/receiver.rs` (1052 lines; voice receive pipeline, utterance
     segmentation, artifact cleanup, and retention policy surface; split before
     adding non-bugfix behavior).
+  - `src/voice/announce_meta.rs` (1001 lines; voice announcement durability /
+    handoff metadata surface; crossed the giant threshold when #3034 restored
+    per-item dead_code reasoning on the runtime-gated durable helpers; tracked
+    decompose target — see `giant-file-registry.md` (owner `voice-runtime`,
+    deadline 2026-08-31, #3036)).
+  - `src/db/automation_candidates.rs` (1003 lines; pipeline-v2 automation
+    candidate iteration repository surface (#2064); crossed the giant threshold
+    when #3034 restored per-item dead_code reasoning on the still-unwired
+    iteration-loop helpers; tracked decompose target — see
+    `giant-file-registry.md` (owner `automation-pipeline`, deadline
+    2026-08-31, #3036)).
   - `src/services/discord/commands/config.rs` (1894 lines).
   - `src/services/discord/{commands/text_commands.rs, commands/diagnostics.rs,
     discord_config_audit.rs, router/intake_gate.rs, inflight.rs}`
@@ -289,7 +300,7 @@
   - `src/db/auto_queue/tests.rs` is the migrated auto-queue test harness; it is a
     dedicated `*_tests.rs` file (excluded from the production giant-file count),
     so add coverage freely but keep it split-friendly.
-  - `src/db/auto_queue/entries.rs` (1505 lines; awaiting follow-up split per
+  - `src/db/auto_queue/entries.rs` (1508 lines; awaiting follow-up split per
     auto-queue decompose epic #1782).
   - `src/db/auto_queue/phase_gates.rs` (1639 lines after #1980 durable
     reconciliation, production LoC; PG-backed tests for `current_batch_phase_pg`
@@ -302,8 +313,8 @@
     adding new feature logic).
   - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
     GitHub sync lookup surface).
-  - `src/db/postgres.rs` (1006 lines).
-  - `src/db/dispatched_sessions.rs` (1639 lines; dispatched session
+  - `src/db/postgres.rs` (1009 lines).
+  - `src/db/dispatched_sessions.rs` (1630 lines; dispatched session
     persistence helpers).
   - `src/db/session_transcripts.rs` is a retained PG-cleanup surface (now below
     the giant-file threshold; bugfix only).

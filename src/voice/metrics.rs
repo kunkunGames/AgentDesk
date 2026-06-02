@@ -119,6 +119,9 @@ pub fn finish_agent_start(channel_id: u64) -> Option<u64> {
 /// when the turn fails before the answer is ready (e.g. `start_voice_turn`
 /// errors out) so the next turn's `mark_agent_start` doesn't carry a stale
 /// instant.
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 pub fn discard_agent_start(channel_id: u64) {
     if let Ok(mut map) = agent_start_registry().lock() {
         map.remove(&channel_id);

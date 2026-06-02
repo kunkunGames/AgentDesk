@@ -342,6 +342,9 @@ pub(crate) fn voice_transcript_announcement_meta(
     }
 }
 
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) fn parse_voice_transcript_announcement(
     text: &str,
 ) -> Option<VoiceTranscriptAnnouncement> {
@@ -460,6 +463,9 @@ fn voice_background_handoff_header_line(line: &str) -> Option<&str> {
         .then_some(unspoiled)
 }
 
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) fn parse_authorized_voice_transcript_announcement(
     text: &str,
     author_id: u64,
@@ -481,6 +487,9 @@ fn readable_transcript_line(text: &str) -> String {
     escape_discord_mentions(&text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 fn unescape_discord_mentions(text: &str) -> String {
     text.replace("@\u{200B}", "@")
 }
@@ -505,6 +514,9 @@ fn nonce_bound_transcript_close(nonce: &str) -> String {
     format!("</{TRANSCRIPT_TAG_PREFIX}{nonce}>")
 }
 
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 fn is_valid_transcript_nonce(nonce: &str) -> bool {
     !nonce.is_empty()
         && nonce
@@ -519,6 +531,9 @@ fn is_valid_voice_background_handoff_correlation_id(correlation_id: &str) -> boo
     raw.len() == 32 && raw.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 fn extract_transcript_between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
     Some(text.split_once(open)?.1.split_once(close)?.0)
 }
