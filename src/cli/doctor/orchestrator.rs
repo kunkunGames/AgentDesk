@@ -1677,12 +1677,8 @@ fn check_voice_cli_present(
         .with_severity(Severity::Error);
     }
     let resolved = if trimmed.contains('/') || trimmed.starts_with('~') {
-        let expanded = if trimmed.starts_with("~/") || trimmed == "~" {
-            crate::runtime_layout::expand_user_path(trimmed)
-                .unwrap_or_else(|| std::path::PathBuf::from(trimmed))
-        } else {
-            std::path::PathBuf::from(trimmed)
-        };
+        let expanded = crate::runtime_layout::expand_user_path(trimmed)
+            .unwrap_or_else(|| std::path::PathBuf::from(trimmed));
         if expanded.is_file() {
             Some(expanded)
         } else {
