@@ -150,13 +150,27 @@ def _strip_toml_comment(line: str) -> str:
     return line
 
 
+class TrackingSet(set):
+    def __init__(self, iterable=()):
+        super().__init__(iterable)
+        self.used = set()
+
+    def __contains__(self, item):
+        res = super().__contains__(item)
+        if res:
+            self.used.add(item)
+        return res
+
 def run_all(
     specs: list[CheckSpec], allowlist: dict[str, set[str]]
-) -> dict[str, list[Finding]]:
+) -> tuple[dict[str, list[Finding]], dict[str, set[str]]]:
     out: dict[str, list[Finding]] = {}
+    used_allowlist: dict[str, set[str]] = {}
     for spec in specs:
-        out[spec.key] = list(spec.runner(allowlist.get(spec.key, set())))
-    return out
+        spec_allowlist = TrackingSet(allowlist.get(spec.key, set()))
+        out[spec.key] = list(spec.runner(spec_allowlist))
+        used_allowlist[spec.key] = spec_allowlist.used
+    return out, used_allowlist
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +371,7 @@ def main(argv: list[str] | None = None) -> int:
 
     specs = load_check_specs()
     allowlist = load_allowlist(args.allowlist)
-    findings = run_all(specs, allowlist)
+    findings, used_allowlist = run_all(specs, allowlist)
 
     if args.format == "yaml":
         rendered = render_yaml(specs, findings)
@@ -377,13 +391,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         failed: list[tuple[str, CheckSpec, list[Finding]]] = []
+        stale_allowlist: list[tuple[str, str]] = []
         for spec in specs:
+            spec_allowlist = allowlist.get(spec.key, set())
+            spec_used = used_allowlist.get(spec.key, set())
+            for item in sorted(spec_allowlist - spec_used):
+                stale_allowlist.append((spec.key, item))
             if spec.hard_gate and findings.get(spec.key):
                 failed.append(("hard-gate", spec, findings[spec.key]))
             if spec.baseline_gate:
                 baseline_failures = list(spec.baseline_gate(findings.get(spec.key, [])))
                 if baseline_failures:
                     failed.append(("baseline-gate", spec, baseline_failures))
+        if stale_allowlist:
+            print(
+                f"audit_maintainability: found {len(stale_allowlist)} stale allowlist entry(s) (guard debt)",
+                file=sys.stderr,
+            )
+            for key, item in stale_allowlist:
+                print(f"  - [{key}] {item}", file=sys.stderr)
+            print("Please remove these stale entries from scripts/audit_allowlist.toml.", file=sys.stderr)
+
         if failed:
             for gate_kind, spec, hits in failed:
                 print(
@@ -394,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
                 for hit in hits:
                     loc = hit.file if hit.line is None else f"{hit.file}:{hit.line}"
                     print(f"  - {loc}: {hit.message}", file=sys.stderr)
+
+        if failed or stale_allowlist:
             return 1
 
     return 0
