@@ -40,9 +40,8 @@ pub use recovery::{
     HardStopRuntimeResult, IdleTmuxStaleTurnRepairResult, PendingQueueSnapshot,
     PostCancelDrainOutcome, ProviderMailboxState, RuntimeTurnStopResult,
     clear_idle_tmux_stale_turn, clear_provider_channel_runtime,
-    finish_cancelled_provider_channel_mailbox, force_kill_provider_channel_runtime,
-    handle_rebind_inflight, handle_relay_recovery, hard_stop_runtime_turn,
-    provider_channel_mailbox_state, resolve_tmux_session_for_cancel,
+    force_kill_provider_channel_runtime, handle_rebind_inflight, handle_relay_recovery,
+    hard_stop_runtime_turn, provider_channel_mailbox_state, resolve_tmux_session_for_cancel,
     schedule_pending_queue_drain_after_cancel, snapshot_pending_queue_state, spawn_stall_watchdog,
     spawn_watchdog, stop_provider_channel_runtime, stop_runtime_turn_preserving_watcher,
 };
@@ -438,7 +437,6 @@ impl TestHealthHarness {
             recovery_started_at: Instant::now(),
             recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
             global_active,
-            turn_finalizer: super::turn_finalizer::TurnFinalizer::spawn(),
             global_finalizing,
             shutdown_remaining,
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),
@@ -533,12 +531,6 @@ impl TestHealthHarness {
         self.shared
             .deferred_hook_backlog
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn global_active_count(&self) -> usize {
-        self.shared
-            .global_active
-            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn set_recovery_duration_ms(&self, duration_ms: u64) {

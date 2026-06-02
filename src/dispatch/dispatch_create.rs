@@ -735,6 +735,7 @@ fn dispatch_required_capabilities(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_dispatch_core_internal(
     pg_pool: &PgPool,
     dispatch_id: &str,
@@ -990,6 +991,7 @@ pub async fn create_dispatch_core(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_dispatch_core_with_options(
     pg_pool: &PgPool,
     kanban_card_id: &str,
@@ -1035,6 +1037,7 @@ pub async fn create_dispatch_core_with_id(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_dispatch_core_with_id_and_options(
     pg_pool: &PgPool,
     dispatch_id: &str,
@@ -1059,6 +1062,7 @@ pub async fn create_dispatch_core_with_id_and_options(
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_dispatch_record_sqlite_test(
     db: &Db,
     kanban_card_id: &str,
@@ -1082,6 +1086,7 @@ pub(crate) fn create_dispatch_record_sqlite_test(
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_dispatch_record_with_id_sqlite_test(
     db: &Db,
     dispatch_id: &str,
@@ -1325,6 +1330,7 @@ pub fn create_dispatch(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_dispatch_with_options_pg_backed(
     db: Option<&Db>,
     pool: &PgPool,
@@ -1418,6 +1424,7 @@ fn create_dispatch_with_options_pg_backed(
     Ok(dispatch)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_dispatch_with_options(
     db: &Db,
     pg_pool: Option<&PgPool>,
@@ -1468,6 +1475,7 @@ pub fn create_dispatch_with_options(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_dispatch_pg_only(
     pg_pool: &PgPool,
     engine: &PolicyEngine,
@@ -1489,6 +1497,7 @@ pub fn create_dispatch_pg_only(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_dispatch_with_options_pg_only(
     pg_pool: &PgPool,
     engine: &PolicyEngine,
@@ -1517,6 +1526,7 @@ pub fn create_dispatch_with_options_pg_only(
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[allow(clippy::too_many_arguments)]
 fn create_dispatch_with_options_sqlite_test(
     db: &Db,
     engine: &PolicyEngine,
@@ -1578,6 +1588,7 @@ fn create_dispatch_with_options_sqlite_test(
 /// / `apply_dispatch_attached_intents_on_pg_tx`). This wrapper remains only
 /// for sqlite-backed test fixtures.
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[allow(clippy::too_many_arguments)]
 fn apply_dispatch_attached_intents(
     conn: &sqlite_test::Connection,
     card_id: &str,
@@ -1757,6 +1768,7 @@ async fn cancel_stale_review_decisions_pg_tx(
     Ok(cancelled)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_dispatch_attached_intents_pg(
     pool: &PgPool,
     card_id: &str,
@@ -1826,6 +1838,7 @@ pub(crate) async fn apply_dispatch_attached_intents_pg(
 ///
 /// This exists for callers like review-automation handoff paths that need to
 /// compose dispatch creation with surrounding PG updates in one atomic unit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_dispatch_attached_intents_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     card_id: &str,
@@ -1947,6 +1960,7 @@ pub(crate) async fn apply_dispatch_attached_intents_on_pg_tx(
 /// This exists only for sqlite-backed test fixtures that still exercise the
 /// old connection-local transition plumbing.
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
+#[allow(clippy::too_many_arguments)]
 fn apply_dispatch_attached_intents_on_conn(
     conn: &sqlite_test::Connection,
     card_id: &str,
@@ -2231,6 +2245,7 @@ mod tests {
     use crate::pipeline::ClockConfig;
     use std::collections::HashMap;
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_dispatch_attached_intents_pg<F>(
         tx: &mut sqlx::Transaction<'_, Postgres>,
         card_id: &str,
@@ -2268,6 +2283,7 @@ mod tests {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_dispatch_core_with_id_and_options_pg(
         _db: &Db,
         pg_pool: Option<&PgPool>,

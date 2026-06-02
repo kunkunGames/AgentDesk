@@ -131,6 +131,7 @@ fn execute_simple_blocking_inner(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_structured(
     provider: ProviderKind,
     prompt: String,
@@ -155,6 +156,7 @@ pub async fn execute_structured(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_structured_with_context(
     provider: ProviderKind,
     prompt: String,

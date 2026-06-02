@@ -230,6 +230,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_single<C>(
     client: &C,
     dedup: &OutboundDeduper,
@@ -334,6 +335,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn retry_minimal_fallback<C>(
     client: &C,
     dedup: &OutboundDeduper,
@@ -400,6 +402,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_split<C>(
     client: &C,
     dedup: &OutboundDeduper,

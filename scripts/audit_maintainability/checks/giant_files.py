@@ -1,17 +1,8 @@
-"""Check: giant Rust files missing from the change-surfaces map.
-
-The giant-file signal keys off *production* LoC (lines outside
-``#[cfg(test)] mod`` blocks) so a module that is only large because of inline
-test fixtures is not flagged or frozen (#3036). The production/test split is
-shared with ``scripts/generate_inventory_docs.py`` so both surfaces agree.
-"""
+"""Check: giant Rust files missing from the change-surfaces map."""
 
 from __future__ import annotations
 
-import importlib.util
 import re
-import sys
-from pathlib import Path
 from typing import Iterable
 
 from .. import common
@@ -25,91 +16,12 @@ from ..common import (
 )
 from . import CheckSpec
 from .namespace_size_caps import (
+    count_lines,
     load_namespace_size_caps,
     matching_namespace_cap,
 )
 
 THRESHOLD = 1000
-
-
-def _load_inventory_generator():
-    name = "generate_inventory_docs"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(
-        name,
-        common.REPO_ROOT / "scripts" / "generate_inventory_docs.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    # Register before exec so the module's @dataclass definitions resolve their
-    # own module namespace during import.
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_INVENTORY = _load_inventory_generator()
-
-
-def _test_only_module_files() -> set[Path]:
-    """Files reached only through a test-gated parent ``mod`` declaration.
-
-    Mirrors ``generate_inventory_docs.test_only_module_files`` but iterates the
-    audit's (patchable) ``common.production_rust_files`` so the production/test
-    split — including cross-file test-only subtrees — stays consistent (#3036).
-    """
-
-    files = list(production_rust_files())
-    test_targets: set[Path] = set()
-    prod_targets: set[Path] = set()
-    for path in files:
-        text = read_text(path)
-        for match in _INVENTORY._MOD_DECL_RE.finditer(text):
-            predicate = match.group("predicate")
-            requires_test = predicate is not None and _INVENTORY.cfg_requires_test(
-                predicate
-            )
-            base = path.parent
-            for child in (base / f"{match.group('name')}.rs", base / match.group("name") / "mod.rs"):
-                (test_targets if requires_test else prod_targets).add(child.resolve())
-
-    test_only_dirs: list[Path] = []
-    test_only_files: set[Path] = set()
-    for target in test_targets - prod_targets:
-        if target.name == "mod.rs":
-            test_only_dirs.append(target.parent)
-        test_only_files.add(target)
-
-    result: set[Path] = set()
-    for path in files:
-        resolved = path.resolve()
-        if resolved in test_only_files or any(
-            directory in resolved.parents for directory in test_only_dirs
-        ):
-            result.add(path)
-    return result
-
-
-def giant_production_loc() -> dict[str, int]:
-    """Map each prod-giant file path to its production LoC.
-
-    Reuses the generator's production/test split (including cross-file test-only
-    subtree handling) so the audit, the inventory, and the giant-file registry
-    agree on which files are production giants (#3036).
-    """
-
-    test_only = _test_only_module_files()
-    giants: dict[str, int] = {}
-    for path in production_rust_files():
-        if path in test_only:
-            continue
-        prod, _test = _INVENTORY.split_prod_test_lines(read_text(path))
-        if prod >= THRESHOLD:
-            giants[rel_posix(path)] = prod
-    return giants
-
-
 CHANGE_SURFACES_DOC = "docs/agent-maintenance/change-surfaces.md"
 
 _BACKTICK_SPAN = re.compile(r"`([^`]+)`", re.DOTALL)
@@ -161,7 +73,12 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
     findings: list[Finding] = []
     documented = documented_change_surface_paths()
     namespace_caps = load_namespace_size_caps()
-    for rel, loc in giant_production_loc().items():
+    for path in production_rust_files():
+        text = read_text(path)
+        loc = count_lines(text)
+        if loc < THRESHOLD:
+            continue
+        rel = rel_posix(path)
         if matching_namespace_cap(rel, namespace_caps) is not None:
             continue
         if rel in documented or is_allowlisted(allowlist, rel):
@@ -173,8 +90,8 @@ def _run(allowlist: set[str]) -> Iterable[Finding]:
                 file=rel,
                 line=None,
                 message=(
-                    f"{loc} production LoC >= {THRESHOLD} threshold and is "
-                    f"missing from {CHANGE_SURFACES_DOC}"
+                    f"{loc} LoC >= {THRESHOLD} threshold and is missing from "
+                    f"{CHANGE_SURFACES_DOC}"
                 ),
                 extra={"loc": str(loc), "source_of_truth": CHANGE_SURFACES_DOC},
             )

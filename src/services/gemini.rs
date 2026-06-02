@@ -345,6 +345,7 @@ pub(crate) fn delete_project_session(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_command_streaming(
     prompt: &str,
     session_id: Option<&str>,
