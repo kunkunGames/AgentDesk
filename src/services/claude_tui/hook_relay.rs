@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use url::Url;
 
 const RELAY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -157,7 +157,10 @@ fn memento_search_tool_name(payload: &Value) -> Option<String> {
     // Match the trailing tool segment exactly so both `mcp__memento__recall` and
     // the dotted `memento.recall` form qualify, while `recall_context_combined`
     // or a non-memento server's `recall` do not.
-    let leaf = tool_name.rsplit(|c| c == '_' || c == '.').next().unwrap_or("");
+    let leaf = tool_name
+        .rsplit(|c| c == '_' || c == '.')
+        .next()
+        .unwrap_or("");
     matches!(leaf, "recall" | "context").then_some(tool_name)
 }
 
@@ -530,10 +533,7 @@ mod tests {
             r#"{"suppressOutput":true}"#
         );
         // Right event + search tool, but Codex stays observational.
-        assert_eq!(
-            hook_stdout("codex", "PostToolUse", &recall),
-            "{}"
-        );
+        assert_eq!(hook_stdout("codex", "PostToolUse", &recall), "{}");
     }
 
     #[test]
@@ -556,10 +556,7 @@ mod tests {
     #[test]
     fn scan_search_event_id_rejects_false_positives() {
         // Longer key that merely starts with the marker.
-        assert_eq!(
-            scan_search_event_id(r#"{"searchEventIdHash":"99"}"#),
-            None
-        );
+        assert_eq!(scan_search_event_id(r#"{"searchEventIdHash":"99"}"#), None);
         // Bare-word mention inside fragment text (no key colon follows).
         assert_eq!(
             scan_search_event_id(r#"{"text":"the searchEventId was 4242 last time"}"#),
@@ -578,9 +575,8 @@ mod tests {
 
     #[test]
     fn memento_search_tool_name_matches_both_forms_and_rejects_lookalikes() {
-        let target = |name: &str| {
-            memento_search_tool_name(&serde_json::json!({ "tool_name": name }))
-        };
+        let target =
+            |name: &str| memento_search_tool_name(&serde_json::json!({ "tool_name": name }));
         assert!(target("mcp__memento__recall").is_some());
         assert!(target("mcp__memento__context").is_some());
         assert!(target("memento.recall").is_some());
