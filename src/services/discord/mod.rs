@@ -63,6 +63,7 @@ mod session_runtime;
 pub(crate) mod settings;
 pub(crate) mod shared_memory;
 mod stall_recovery;
+mod status_panel_orphan_store;
 pub(in crate::services::discord) mod streaming_finalizer;
 pub(in crate::services::discord) mod task_supervisor;
 #[cfg(unix)]
@@ -635,6 +636,7 @@ pub(in crate::services::discord) fn advance_last_message_checkpoint(
 }
 
 pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff;
+pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff_immediate;
 /// Minimum interval between Discord placeholder edits for progress status.
 /// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
 pub(super) fn status_update_interval() -> Duration {
