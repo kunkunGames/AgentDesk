@@ -238,3 +238,10 @@ file = "src/services/discord/voice_barge_in.rs"
 owner = "voice-runtime"
 deadline = "2026-08-31"
 decompose_issue = "#3036"
+
+[[entry]]
+# Added to fix giant-file registry drift.
+file = "src/server/worker_registry.rs"
+owner = "worker-registry"
+deadline = "2026-09-30"
+decompose_issue = "#3036"
