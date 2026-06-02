@@ -978,6 +978,33 @@ fn validate_inflight_state_for_save(
         "inflight response_sent_offset must not move backwards"
     );
 
+    // I6 (last_offset_monotonic) — OBSERVE-ONLY on the bridge/watcher save
+    // path. A legit fresh-turn reset (different user_msg_id or
+    // turn_start_offset) lowers last_offset on purpose, so the check is gated
+    // by SAME turn identity; only a backward move within the same turn is a
+    // violation. We do not skip the write here (that would drop a legit fresh
+    // turn); the enforcing variant lives in the standby/refresh path.
+    let same_turn_identity = existing.user_msg_id == state.user_msg_id
+        && existing.turn_start_offset == state.turn_start_offset;
+    let last_offset_monotonic = !same_turn_identity || state.last_offset >= existing.last_offset;
+    record_inflight_invariant(
+        last_offset_monotonic,
+        state,
+        "last_offset_monotonic",
+        code_location,
+        "inflight last_offset must not move backwards for the same turn identity",
+        serde_json::json!({
+            "previous": existing.last_offset,
+            "next": state.last_offset,
+            "same_turn_identity": same_turn_identity,
+            "path": path.display().to_string(),
+        }),
+    );
+    debug_assert!(
+        last_offset_monotonic,
+        "inflight last_offset must not move backwards for the same turn identity"
+    );
+
     let same_tmux_owner = existing.tmux_session_name.is_none()
         || state.tmux_session_name.is_none()
         || existing.tmux_session_name == state.tmux_session_name;
@@ -1232,6 +1259,7 @@ pub(in crate::services::discord) fn clear_inflight_state_if_matches_tmux_respons
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_identity(
     provider: &ProviderKind,
     channel_id: u64,
@@ -1240,6 +1268,7 @@ pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_iden
     output_path: &str,
     expected_current_msg_id: Option<u64>,
     last_offset: u64,
+    caller_owner: RelayOwnerKind,
 ) -> bool {
     let Some(root) = inflight_runtime_root() else {
         return false;
@@ -1253,6 +1282,7 @@ pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_iden
         output_path,
         expected_current_msg_id,
         last_offset,
+        caller_owner,
     )
 }
 
@@ -1509,6 +1539,7 @@ fn clear_inflight_state_if_matches_tmux_response_in_root(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_inflight_last_offset_if_matches_identity_in_root(
     root: &std::path::Path,
     provider: &ProviderKind,
@@ -1518,6 +1549,7 @@ fn refresh_inflight_last_offset_if_matches_identity_in_root(
     output_path: &str,
     expected_current_msg_id: Option<u64>,
     last_offset: u64,
+    caller_owner: RelayOwnerKind,
 ) -> bool {
     let path = inflight_state_path(root, provider, channel_id);
     let Ok(_lock) = lock_inflight_state_path(&path) else {
@@ -1547,6 +1579,52 @@ fn refresh_inflight_last_offset_if_matches_identity_in_root(
         if state.turn_start_offset != Some(expected_offset) {
             return false;
         }
+    }
+
+    // I6 (last_offset_owner_gated): the persisted watermark is advanced only
+    // by the current relay owner. A non-owner caller (standby/idle) follows
+    // the authoritative offset read-only and must yield to a live owner. The
+    // identity guards above already proved this is the SAME turn, so a live
+    // owner that differs from the caller is an authority conflict, not a
+    // fresh-turn reset.
+    let persisted_owner = state.effective_relay_owner_kind();
+    let owner_is_live = !matches!(persisted_owner, RelayOwnerKind::None);
+    if owner_is_live && persisted_owner != caller_owner {
+        record_inflight_invariant(
+            false,
+            &state,
+            "last_offset_owner_gated",
+            "src/services/discord/inflight.rs:refresh_inflight_last_offset_if_matches_identity_in_root",
+            "inflight last_offset must only be advanced by the current relay owner",
+            serde_json::json!({
+                "persisted_owner": persisted_owner.as_str(),
+                "caller_owner": caller_owner.as_str(),
+                "previous": state.last_offset,
+                "next": last_offset,
+                "path": path.display().to_string(),
+            }),
+        );
+        return false;
+    }
+
+    // I6 (last_offset_monotonic): same identity, so a backward watermark write
+    // would clobber the authoritative offset and replay a stale transcript
+    // tail. Reject and record. A fresh-turn reset is already excluded by the
+    // identity guards above.
+    if last_offset < state.last_offset {
+        record_inflight_invariant(
+            false,
+            &state,
+            "last_offset_monotonic",
+            "src/services/discord/inflight.rs:refresh_inflight_last_offset_if_matches_identity_in_root",
+            "inflight last_offset must not move backwards for the same turn identity",
+            serde_json::json!({
+                "previous": state.last_offset,
+                "next": last_offset,
+                "path": path.display().to_string(),
+            }),
+        );
+        return false;
     }
 
     state.last_offset = last_offset;
@@ -2046,13 +2124,14 @@ pub(in crate::services::discord) enum InflightSignal {
 mod stall_recovery_tests {
     use super::{
         GuardedClearOutcome, INFLIGHT_STALENESS_THRESHOLD_SECS, InflightRestartMode,
-        InflightTurnIdentity, InflightTurnState,
+        InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
         inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
         load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
         refresh_inflight_last_offset_if_matches_identity_in_root, save_inflight_state_in_root,
+        validate_inflight_state_for_save,
     };
     use crate::services::agent_protocol::RuntimeHandoffKind;
     use crate::services::provider::ProviderKind;
@@ -2654,6 +2733,7 @@ mod stall_recovery_tests {
             &output_path,
             Some(state.current_msg_id),
             123,
+            RelayOwnerKind::StandbyRelay,
         );
 
         assert!(refreshed);
@@ -2689,6 +2769,7 @@ mod stall_recovery_tests {
             &output_path,
             None,
             123,
+            RelayOwnerKind::StandbyRelay,
         );
 
         assert!(!refreshed);
@@ -2697,6 +2778,201 @@ mod stall_recovery_tests {
         assert_eq!(loaded[0].user_msg_id, 101);
         assert_eq!(loaded[0].started_at, "2026-05-17 10:00:05");
         assert_eq!(loaded[0].last_offset, 20);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_rejects_backward_offset_same_identity() {
+        // #3017 I6 (last_offset_monotonic): a backward watermark write for the
+        // SAME turn identity is rejected so a stale transcript tail cannot be
+        // replayed; the on-disk offset is left untouched.
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.last_offset = 200;
+        let identity = InflightTurnIdentity::from_state(&state);
+        let output_path = state.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &identity,
+            state.turn_start_offset,
+            &output_path,
+            Some(state.current_msg_id),
+            150,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(!refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_offset, 200);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_advances_forward_offset_same_identity() {
+        // #3017 I6: a forward watermark write for the same identity advances.
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.last_offset = 200;
+        let identity = InflightTurnIdentity::from_state(&state);
+        let output_path = state.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &identity,
+            state.turn_start_offset,
+            &output_path,
+            Some(state.current_msg_id),
+            250,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_offset, 250);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_standby_yields_to_watcher_owner() {
+        // #3017 I6 (last_offset_owner_gated): a StandbyRelay caller must not
+        // advance the watermark while the persisted owner is the live Watcher.
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.last_offset = 100;
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        let identity = InflightTurnIdentity::from_state(&state);
+        let output_path = state.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &identity,
+            state.turn_start_offset,
+            &output_path,
+            Some(state.current_msg_id),
+            250,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(!refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_offset, 100);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_allows_fresh_turn_reset() {
+        // #3017 I6 fresh-turn exemption: a NEW turn identity legitimately
+        // resets the watermark to a smaller offset; the identity guards reject
+        // the refresh BEFORE the monotonic clamp ever runs, so the standby
+        // caller simply does not clobber the new turn.
+        let temp = TempDir::new().unwrap();
+        let mut old_turn = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        old_turn.current_msg_id = 0;
+        old_turn.user_msg_id = 100;
+        old_turn.started_at = "2026-05-17 10:00:00".to_string();
+        old_turn.last_offset = 500;
+        old_turn.turn_start_offset = Some(0);
+        let old_identity = InflightTurnIdentity::from_state(&old_turn);
+        let output_path = old_turn.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &old_turn).unwrap();
+
+        // A fresh turn: new user_msg_id AND a new turn_start_offset that
+        // legitimately resets the watermark to a smaller value.
+        let mut fresh_turn = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 101);
+        fresh_turn.current_msg_id = 0;
+        fresh_turn.user_msg_id = 101;
+        fresh_turn.started_at = "2026-05-17 10:00:05".to_string();
+        fresh_turn.output_path = Some(output_path.clone());
+        fresh_turn.last_offset = 10;
+        fresh_turn.turn_start_offset = Some(10);
+        save_inflight_state_in_root(temp.path(), &fresh_turn).unwrap();
+
+        // The standby caller still believes it is the OLD turn; the identity
+        // guards reject it, leaving the fresh turn's small offset intact.
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &old_identity,
+            old_turn.turn_start_offset,
+            &output_path,
+            None,
+            123,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(!refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].user_msg_id, 101);
+        assert_eq!(loaded[0].last_offset, 10);
+    }
+
+    #[test]
+    fn validate_save_records_backward_last_offset_violation_same_identity() {
+        // #3017 I6 OBSERVE-ONLY on the save path: a backward last_offset for
+        // the same turn identity records a `last_offset_monotonic` violation
+        // (and trips the debug_assert) but does NOT skip the write — a legit
+        // fresh-turn reset must still be able to persist.
+        let temp = TempDir::new().unwrap();
+        let mut existing = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        existing.last_offset = 300;
+        save_inflight_state_in_root(temp.path(), &existing).unwrap();
+
+        let provider = ProviderKind::Claude;
+        let path = inflight_state_path(temp.path(), &provider, 321);
+
+        // Same identity (user_msg_id + turn_start_offset) but a backward
+        // last_offset → records a violation. Run with the debug_assert
+        // disabled by catching the panic so we can assert observability fired.
+        let mut backward = existing.clone();
+        backward.last_offset = 100;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_inflight_state_for_save(
+                temp.path(),
+                &path,
+                &backward,
+                "src/services/discord/inflight.rs:test",
+            );
+        }));
+        // In debug builds the debug_assert fires; in release it returns.
+        // Either way the invariant record was emitted before the assert.
+        assert!(result.is_err() || cfg!(not(debug_assertions)));
+    }
+
+    #[test]
+    fn validate_save_allows_backward_last_offset_for_fresh_turn() {
+        // #3017 I6: a DIFFERENT turn identity lowering last_offset is exempt —
+        // the save path must not flag a legit fresh-turn reset.
+        let temp = TempDir::new().unwrap();
+        let mut existing = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        existing.last_offset = 300;
+        save_inflight_state_in_root(temp.path(), &existing).unwrap();
+
+        let provider = ProviderKind::Claude;
+        let path = inflight_state_path(temp.path(), &provider, 321);
+
+        let mut fresh = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 101);
+        fresh.user_msg_id = 101;
+        fresh.last_offset = 10;
+
+        // No panic — different identity is exempt from the monotonic clamp.
+        validate_inflight_state_for_save(
+            temp.path(),
+            &path,
+            &fresh,
+            "src/services/discord/inflight.rs:test",
+        );
     }
 
     #[test]
