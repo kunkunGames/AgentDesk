@@ -1838,15 +1838,6 @@ pub(crate) struct UpdateSessionParams<'a> {
     pub(crate) session_info: Option<&'a str>,
 }
 
-pub(crate) async fn session_exists_pg(pool: &PgPool, session_key: &str) -> Result<bool, String> {
-    sqlx::query("SELECT 1 FROM sessions WHERE session_key = $1 LIMIT 1")
-        .bind(session_key)
-        .fetch_optional(pool)
-        .await
-        .map(|row| row.is_some())
-        .map_err(|error| format!("load postgres session existence for {session_key}: {error}"))
-}
-
 /// Upsert a hook session row.
 ///
 /// #2045 Finding 7 (P2): the helper now returns whether the row was inserted

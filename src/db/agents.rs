@@ -13,6 +13,9 @@ use crate::config::{AgentChannel, AgentDef};
 use crate::db::Db;
 use crate::services::provider::ProviderKind;
 
+// reason: used only by the legacy-sqlite-tests-gated agent alias path below;
+// the production copy lives in db/postgres.rs. See #3034 / #3035.
+#[allow(dead_code)]
 const LEGACY_AGENT_PREFIX: &str = "openclaw-";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

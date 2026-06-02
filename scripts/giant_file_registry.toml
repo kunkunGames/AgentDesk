@@ -238,3 +238,20 @@ file = "src/services/discord/voice_barge_in.rs"
 owner = "voice-runtime"
 deadline = "2026-08-31"
 decompose_issue = "#3036"
+
+[[entry]]
+# Crossed the 1000-prod-LoC threshold when #3034 restored per-item dead_code
+# reasoning on the (still-unwired) automation-candidate iteration repo helpers.
+# Active pipeline-v2 surface (#2064); decompose once the iteration loop is wired.
+file = "src/db/automation_candidates.rs"
+owner = "automation-pipeline"
+deadline = "2026-08-31"
+decompose_issue = "#3036"
+
+[[entry]]
+# Crossed the 1000-prod-LoC threshold when #3034 restored per-item dead_code
+# reasoning on the runtime-gated voice announcement durability helpers.
+file = "src/voice/announce_meta.rs"
+owner = "voice-runtime"
+deadline = "2026-08-31"
+decompose_issue = "#3036"

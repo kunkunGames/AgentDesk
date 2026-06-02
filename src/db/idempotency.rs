@@ -32,6 +32,9 @@ pub enum IdempotencyOutcome {
     Replay {
         status: u16,
         body: Value,
+        // reason: carried for the replay-response route layer that consumes it
+        // on selected idempotent paths. See #3034.
+        #[allow(dead_code)]
         completed_at: DateTime<Utc>,
     },
     /// Another caller holds the key but has not finished yet. The right
@@ -39,7 +42,12 @@ pub enum IdempotencyOutcome {
     InFlight,
     /// The key was reused with a different request body. The right
     /// response at the route layer is `422 Unprocessable Entity`.
-    FingerprintMismatch { stored_fingerprint: String },
+    FingerprintMismatch {
+        // reason: carried for the 422 route layer that consumes it on selected
+        // idempotent paths. See #3034.
+        #[allow(dead_code)]
+        stored_fingerprint: String,
+    },
 }
 
 /// Attempt to take ownership of `(scope, key)` for a new request.
@@ -153,6 +161,9 @@ pub async fn record_response(
 /// permanently occupy the slot until `expires_at`. Callers can invoke
 /// this when they hit a code path that wants to release ownership
 /// (e.g. validation failed before any business mutation ran).
+// reason: best-effort idempotency-slot cleanup invoked on selected validation
+// failure paths, not every compile target. See #3034.
+#[allow(dead_code)]
 pub async fn release_unclaimed(pool: &PgPool, scope: &str, key: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DELETE FROM idempotency_keys

@@ -54,6 +54,9 @@ pub struct PersistSessionTranscript<'a> {
     pub duration_ms: Option<i64>,
 }
 
+// reason: public transcript record for the read/fetch route; the pg-side load
+// path that builds it is wired only on selected API paths. See #3034.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionTranscriptRecord {
     pub id: i64,
@@ -506,6 +509,9 @@ fn normalize_search_query(raw_query: &str) -> Option<String> {
     }
 }
 
+// reason: transcript read-side helper that feeds SessionTranscriptRecord; wired
+// only on the selected transcript-fetch path. See #3034.
+#[allow(dead_code)]
 fn parse_events_json(raw: Option<&str>) -> Vec<SessionTranscriptEvent> {
     raw.and_then(|value| {
         let trimmed = value.trim();

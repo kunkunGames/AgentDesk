@@ -37,6 +37,9 @@ impl PromptManifestBuilder {
         self
     }
 
+    // reason: builder convenience exercised by the prompt-manifest test suite;
+    // production callers use the lower-level `layer` API. See #3034.
+    #[allow(dead_code)]
     pub fn content_layer(
         self,
         layer_name: impl Into<String>,

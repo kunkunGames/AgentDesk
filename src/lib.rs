@@ -92,7 +92,6 @@ mod config;
 pub(crate) mod credential;
 // Database repositories intentionally expose cross-route helpers that are only
 // wired from selected API/maintenance paths.
-#[allow(dead_code)]
 mod db;
 mod dispatch;
 // Policy-engine loader/runtime helpers cover hot-reload and test-only entry
@@ -131,7 +130,6 @@ mod ui;
 mod utils;
 // Voice runtime is an optional provider feature; most entry points are wired
 // only when voice config is enabled.
-#[allow(dead_code)]
 pub(crate) mod voice;
 
 #[cfg(test)]

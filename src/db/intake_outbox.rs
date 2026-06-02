@@ -39,9 +39,15 @@ pub(crate) struct IntakeOutboxRow {
     pub wait_for_completion: bool,
     pub agent_id: String,
     pub status: String,
+    // reason: intake-outbox row column consumed by select claim/retry routes,
+    // not every compile target. See #3034.
+    #[allow(dead_code)]
     pub claim_owner: Option<String>,
     pub attempt_no: i32,
     pub parent_outbox_id: Option<i64>,
+    // reason: intake-outbox row column consumed by select claim/retry routes,
+    // not every compile target. See #3034.
+    #[allow(dead_code)]
     pub retry_count: i32,
 }
 
@@ -171,6 +177,9 @@ pub(crate) fn classify_insert_pending_error(error: &sqlx::Error) -> Option<Intak
 /// Compute `MAX(attempt_no)` for a `(channel_id, user_msg_id)` family,
 /// or 0 if no row exists yet. Used by retry-on-`failed_pre_accept` to
 /// allocate `attempt_no = family_max + 1` (round-4 P0 — monotonic).
+// reason: intake-outbox retry helper exercised only by the pg-integration test
+// suite; production retry path wired on select routes. See #3034.
+#[allow(dead_code)]
 pub(crate) async fn family_max_attempt(
     pool: &PgPool,
     channel_id: &str,
@@ -394,6 +403,9 @@ pub(crate) async fn mark_failed_post_accept(
 ///
 /// Returns the number of rows reset. Phase 4 emits this count as a
 /// metric for operator monitoring.
+// reason: leader-sweep maintenance helper exercised by the pg-integration test
+// suite; production sweep wired on the leader path. See #3034.
+#[allow(dead_code)]
 pub(crate) async fn sweep_stale_pre_accept_claims(
     pool: &PgPool,
     stale_after_secs: i64,
@@ -595,6 +607,9 @@ pub(crate) async fn list_recent_rows(
 /// `sla_secs` without reaching `spawned`. Round-3 P1 #3: the operator
 /// alert IS the recovery signal — auto-retry forbidden post-accept.
 /// Returns `(id, accepted_at)` tuples for each row exceeding the SLA.
+// reason: SLA-alert maintenance helper exercised by the pg-integration test
+// suite; production alert path wired on the leader sweep. See #3034.
+#[allow(dead_code)]
 pub(crate) async fn list_accepted_unspawned_sla(
     pool: &PgPool,
     sla_secs: i64,

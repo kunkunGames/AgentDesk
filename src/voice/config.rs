@@ -104,6 +104,9 @@ impl VoiceConfig {
             .and_then(|value| value.parse::<u64>().ok())
     }
 
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn is_lobby_channel(&self, channel_id: u64) -> bool {
         self.lobby_channel_id_u64() == Some(channel_id)
     }

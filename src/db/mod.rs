@@ -58,9 +58,15 @@ impl std::error::Error for LegacySqliteError {}
 #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
 pub struct LegacySqliteConnection;
 
+// reason: production-side shim mirroring the legacy-sqlite-tests API surface;
+// constructed only under the legacy-sqlite-tests feature. See #3034 / #3035.
+#[allow(dead_code)]
 #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
 pub struct LegacySqliteStatement;
 
+// reason: production-side shim mirroring the legacy-sqlite-tests API surface;
+// constructed only under the legacy-sqlite-tests feature. See #3034 / #3035.
+#[allow(dead_code)]
 #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
 pub struct LegacySqliteRows;
 
@@ -73,10 +79,16 @@ impl LegacySqliteDisabled {
         Err(LegacySqliteError)
     }
 
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn read_conn(&self) -> Result<LegacySqliteConnection, LegacySqliteError> {
         Err(LegacySqliteError)
     }
 
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn separate_conn(&self) -> Result<LegacySqliteConnection, LegacySqliteError> {
         Err(LegacySqliteError)
     }
@@ -88,10 +100,16 @@ impl LegacySqliteConnection {
         Err(LegacySqliteError)
     }
 
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn execute_batch(&self, _sql: &str) -> Result<(), LegacySqliteError> {
         Err(LegacySqliteError)
     }
 
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn prepare(&self, _sql: &str) -> Result<LegacySqliteStatement, LegacySqliteError> {
         Err(LegacySqliteError)
     }
@@ -106,10 +124,16 @@ impl LegacySqliteConnection {
 
 #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
 impl LegacySqliteStatement {
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn query<P>(&mut self, _params: P) -> Result<LegacySqliteRows, LegacySqliteError> {
         Err(LegacySqliteError)
     }
 
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn query_map<P, F, T>(
         &mut self,
         _params: P,
@@ -124,6 +148,9 @@ impl LegacySqliteStatement {
 
 #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
 impl LegacySqliteRows {
+    // reason: legacy-sqlite API parity shim; exercised only under
+    // legacy-sqlite-tests. See #3034 / #3035.
+    #[allow(dead_code)]
     pub fn next(&mut self) -> Result<Option<LegacySqliteRow>, LegacySqliteError> {
         Err(LegacySqliteError)
     }

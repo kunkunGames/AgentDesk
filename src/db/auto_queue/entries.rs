@@ -22,6 +22,9 @@ pub const ENTRY_STATUS_USER_CANCELLED: &str = "user_cancelled";
 /// tick to pick up and dispatch. Exposed as a small shim so callers can
 /// treat `user_cancelled` uniformly alongside other non-dispatchable states
 /// (#815).
+// reason: auto-queue dispatchability shim wired on select tick paths; current
+// callers live in the dispatch-cancel test surface. See #3034.
+#[allow(dead_code)]
 pub fn is_dispatchable_entry_status(status: &str) -> bool {
     matches!(status.trim(), ENTRY_STATUS_PENDING)
 }
