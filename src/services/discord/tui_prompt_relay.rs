@@ -3274,11 +3274,7 @@ mod tests {
     #[test]
     fn registry_miss_but_dedupe_hit_drops_and_does_not_use_mirror() {
         assert_eq!(
-            resolve_owner_channel_authoritatively(
-                "tmux-drift",
-                None,
-                Some(456_000_000_000_000),
-            ),
+            resolve_owner_channel_authoritatively("tmux-drift", None, Some(456_000_000_000_000),),
             None,
             "dedupe mirror must never act as a reverse routing authority"
         );

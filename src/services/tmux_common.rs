@@ -75,7 +75,9 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
         // banner are the genuine idle markers; mirrors the `!Tools: 0 done` guard
         // in `..._show_completed_history`.
         line.contains("bypass permissions")
-            || (line.contains("Tools:") && line.contains(" done") && !line.contains("Tools: 0 done"))
+            || (line.contains("Tools:")
+                && line.contains(" done")
+                && !line.contains("Tools: 0 done"))
     });
     separator && idle_footer
 }

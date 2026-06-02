@@ -121,23 +121,23 @@
     lifecycle behavior).
   - `src/services/discord/tmux.rs` (2206 lines after #2558 dead-code sweep;
     failover guard; still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (6056 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (6725 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires; split loop helpers
     further before adding behavior).
-  - `src/services/discord/tui_prompt_relay.rs` (3184 lines; SSH-direct TUI
+  - `src/services/discord/tui_prompt_relay.rs` (3241 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
     outside an extraction plan).
   - `src/services/codex_tmux_wrapper.rs` (1223 lines; Codex tmux wrapper JSON
     event parser and relay bridge for native Codex session events — bugfix only
     outside an extraction plan).
-  - `src/services/tui_prompt_dedupe.rs` (1020 lines; shared TUI prompt
+  - `src/services/tui_prompt_dedupe.rs` (1029 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
     outside an extraction plan).
   - `src/services/discord/recovery_engine.rs` (3958 lines).
   - `src/services/discord/health.rs` (2817 lines after #1879 snapshot/mailbox
     extraction).
-  - `src/services/discord/health/recovery.rs` (2382 lines; health recovery
+  - `src/services/discord/health/recovery.rs` (2425 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior).
   - `src/services/discord/router/message_handler/intake_turn.rs` (3613 lines;
     Discord message intake turn orchestration split from the router message
@@ -146,12 +146,12 @@
     headless Discord turn launch/terminal-response path split from the router
     message handler; bugfix only outside a further extraction plan).
   - `src/services/discord/meeting_orchestrator.rs` (3228 lines).
-  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1132 lines; provider
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1243 lines; provider
     stop-token/tmux binding runtime + PID-exit observation helper (#2426),
     split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1909 lines).
-  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1132 lines).
-  - `src/services/discord/formatting.rs` (2708 lines).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1243 lines).
+  - `src/services/discord/formatting.rs` (2713 lines).
   - `src/services/discord/settings.rs` (2479 lines).
   - `src/services/discord/prompt_builder/` (directory, refactored).
   - `src/services/discord/runtime_bootstrap.rs` (2564 lines after #2558
@@ -332,7 +332,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
 - `src/services/onboarding/mod.rs` (4955),
-  `src/services/dispatched_sessions.rs` (3347), and
+  `src/services/dispatched_sessions.rs` (3393), and
   `src/services/settings.rs` (1089) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`
   and `src/services/api_friction.rs` have been removed/decomposed.)
@@ -356,7 +356,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   readiness/cancel contract.
 - `src/services/memory/memento.rs` (3062).
 - `src/services/observability/pg_io.rs` (1047).
-- `src/services/dispatched_sessions.rs` (3347) — dispatched session domain
+- `src/services/dispatched_sessions.rs` (3393) — dispatched session domain
   service. This is the post-#1515 SRP extraction target for route/database
   callsites, but the module itself is now giant-file territory; split focused
   helpers before adding non-bugfix behavior.
@@ -369,9 +369,9 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
 - `src/services/platform/binary_resolver.rs` (1936).
-- `src/services/discord/mod.rs` (5835),
+- `src/services/discord/mod.rs` (5837),
   `src/services/discord_config_audit.rs` (1318).
-- `src/services/turn_orchestrator.rs` (2866).
+- `src/services/turn_orchestrator.rs` (2932).
 
 Decomposed below the giant-file threshold (no longer frozen; bugfix-scoped but
 normal test growth is allowed): `src/services/analytics.rs`,

@@ -708,7 +708,8 @@ mod pg_observability_tests {
         let pool = pg_db.connect_and_migrate().await;
 
         let dispatch_id = "dispatch-cancel-obs-3039";
-        crate::dispatch::test_support::seed_pg_dispatch(&pool, dispatch_id, "Cancel obs test").await;
+        crate::dispatch::test_support::seed_pg_dispatch(&pool, dispatch_id, "Cancel obs test")
+            .await;
 
         let changed = cancel_dispatch_and_reset_auto_queue_on_pg(
             &pool,
@@ -722,8 +723,7 @@ mod pg_observability_tests {
         let event = crate::services::observability::events::recent(64)
             .into_iter()
             .find(|event| {
-                event.event_type == "dispatch_result"
-                    && event.payload["dispatch_id"] == dispatch_id
+                event.event_type == "dispatch_result" && event.payload["dispatch_id"] == dispatch_id
             })
             .expect("cancel must record a dispatch_result observability event (#3039)");
         assert_eq!(event.payload["to_status"], "cancelled");
