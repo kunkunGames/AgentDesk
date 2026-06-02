@@ -445,6 +445,7 @@ fn refresh_standby_inflight_heartbeat(
         output_path,
         expected_current_msg_id,
         current_offset,
+        super::inflight::RelayOwnerKind::StandbyRelay,
     );
 }
 

@@ -110,6 +110,45 @@ delivered through any other authorised path. Any sub-issue under
 #1222 that touches relay must reaffirm this invariant in its test
 plan.
 
+## I6. `last_offset` watermark is owner-gated and monotonic per turn (#3017)
+
+- Definition: `InflightTurnState::last_offset`
+  (`src/services/discord/inflight.rs`).
+- Producers (the three writers #3017 unifies):
+  - `turn_bridge` in-memory `inflight_state.last_offset = …` then
+    `save_inflight_state` (`src/services/discord/turn_bridge/mod.rs`).
+  - `watcher` via the same `save_inflight_state` durable writer.
+  - standby JSONL relay via
+    `refresh_inflight_last_offset_if_matches_identity`
+    (`src/services/discord/standby_relay.rs` →
+    `refresh_inflight_last_offset_if_matches_identity_in_root`).
+- Validation:
+  - ENFORCING in the standby/refresh path
+    (`refresh_inflight_last_offset_if_matches_identity_in_root`): the
+    write is skipped (returns `false`, on-disk state unchanged) when
+    (a) the caller is not the live relay owner
+    (`effective_relay_owner_kind()`), or
+    (b) `last_offset` would move backwards for the SAME turn identity.
+  - OBSERVE-ONLY on the bridge/watcher save path
+    (`validate_inflight_state_for_save`): a backward `last_offset` for
+    the same turn identity records the violation + `debug_assert` but
+    does not drop the write, so a legit fresh-turn reset can still
+    persist.
+- Invariant: for a given (provider, channel, turn identity) the persisted
+  `last_offset` is MONOTONIC non-decreasing AND is advanced only by the
+  current relay owner; a non-owner (standby/idle) follows the
+  authoritative offset read-only. A NEW turn (different `user_msg_id` /
+  `turn_start_offset`) legitimately resetting the watermark is EXEMPT —
+  the identity guards distinguish this from a backward clobber.
+- Violation surface: a non-owner or backward write clobbers the
+  watermark → stale transcript tail re-emitted (#2843) or relay bound to
+  the wrong session / frozen binding offset (#2789).
+- Invariant keys:
+  - `last_offset_monotonic` — must not move backwards for the same turn
+    identity.
+  - `last_offset_owner_gated` — only the current relay owner may advance
+    it; standby yields to a live Watcher.
+
 ---
 
 ## How to add a new invariant
