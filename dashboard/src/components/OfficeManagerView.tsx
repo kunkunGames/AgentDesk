@@ -161,6 +161,71 @@ export default function OfficeManagerView({
     color: "var(--th-text-primary)",
   } as const;
 
+  const selectedIconIndex = Math.max(0, OFFICE_ICONS.indexOf(draft.icon));
+  const selectedColorIndex = Math.max(0, OFFICE_COLORS.indexOf(draft.color));
+
+  const handleIconKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    switch (event.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        event.preventDefault();
+        nextIndex = (index + 1) % OFFICE_ICONS.length;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        event.preventDefault();
+        nextIndex = (index - 1 + OFFICE_ICONS.length) % OFFICE_ICONS.length;
+        break;
+      case "Home":
+        event.preventDefault();
+        nextIndex = 0;
+        break;
+      case "End":
+        event.preventDefault();
+        nextIndex = OFFICE_ICONS.length - 1;
+        break;
+      default:
+        return;
+    }
+    const nextIcon = OFFICE_ICONS[nextIndex];
+    setDraft((prev) => ({ ...prev, icon: nextIcon }));
+    setTimeout(() => {
+      document.getElementById(`office-view-icon-${nextIndex}`)?.focus();
+    }, 0);
+  };
+
+  const handleColorKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    switch (event.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        event.preventDefault();
+        nextIndex = (index + 1) % OFFICE_COLORS.length;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        event.preventDefault();
+        nextIndex = (index - 1 + OFFICE_COLORS.length) % OFFICE_COLORS.length;
+        break;
+      case "Home":
+        event.preventDefault();
+        nextIndex = 0;
+        break;
+      case "End":
+        event.preventDefault();
+        nextIndex = OFFICE_COLORS.length - 1;
+        break;
+      default:
+        return;
+    }
+    const nextColor = OFFICE_COLORS[nextIndex];
+    setDraft((prev) => ({ ...prev, color: nextColor }));
+    setTimeout(() => {
+      document.getElementById(`office-view-color-${nextIndex}`)?.focus();
+    }, 0);
+  };
+
   return (
     <div
       className="mx-auto w-full max-w-5xl min-w-0 space-y-4 overflow-x-hidden p-4 pb-40 sm:h-full sm:overflow-y-auto sm:p-6"
@@ -371,17 +436,21 @@ export default function OfficeManagerView({
                   description={tr("아이콘, 대표 색상, 미리보기를 한 곳에서 조정합니다.", "Adjust icon, accent color, and preview together.")}
                 >
                   <div className="space-y-3">
-                  <div>
-                    <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
+                  <div role="radiogroup" aria-labelledby="office-view-icon-label">
+                    <div id="office-view-icon-label" className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("아이콘", "Icon")}
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      {OFFICE_ICONS.map((icon) => (
+                      {OFFICE_ICONS.map((icon, index) => (
                         <button
                           key={icon}
+                          id={`office-view-icon-${index}`}
                           type="button"
+                          role="radio"
                           aria-label={tr(`아이콘 ${icon}`, `Icon ${icon}`)}
-                          aria-pressed={draft.icon === icon}
+                          aria-checked={draft.icon === icon}
+                          tabIndex={index === selectedIconIndex ? 0 : -1}
+                          onKeyDown={(e) => handleIconKeyDown(e, index)}
                           onClick={() => setDraft((prev) => ({ ...prev, icon }))}
                           className="flex h-10 w-10 items-center justify-center rounded-xl text-lg transition-colors"
                           style={{
@@ -399,17 +468,21 @@ export default function OfficeManagerView({
                     </div>
                   </div>
 
-                  <div>
-                    <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
+                  <div role="radiogroup" aria-labelledby="office-view-color-label">
+                    <div id="office-view-color-label" className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("대표 색상", "Accent Color")}
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      {OFFICE_COLORS.map((color) => (
+                      {OFFICE_COLORS.map((color, index) => (
                         <button
                           key={color}
+                          id={`office-view-color-${index}`}
                           type="button"
+                          role="radio"
                           aria-label={tr(`색상 ${color}`, `Color ${color}`)}
-                          aria-pressed={draft.color === color}
+                          aria-checked={draft.color === color}
+                          tabIndex={index === selectedColorIndex ? 0 : -1}
+                          onKeyDown={(e) => handleColorKeyDown(e, index)}
                           onClick={() => setDraft((prev) => ({ ...prev, color }))}
                           className="h-9 w-9 rounded-full border-2 transition-transform hover:scale-105"
                           style={{

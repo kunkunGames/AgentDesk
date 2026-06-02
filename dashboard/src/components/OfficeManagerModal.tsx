@@ -100,6 +100,71 @@ export default function OfficeManagerModal({
     }
   };
 
+  const selectedIconIndex = Math.max(0, OFFICE_ICONS.indexOf(draft.icon));
+  const selectedColorIndex = Math.max(0, OFFICE_COLORS.indexOf(draft.color));
+
+  const handleIconKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    switch (event.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        event.preventDefault();
+        nextIndex = (index + 1) % OFFICE_ICONS.length;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        event.preventDefault();
+        nextIndex = (index - 1 + OFFICE_ICONS.length) % OFFICE_ICONS.length;
+        break;
+      case "Home":
+        event.preventDefault();
+        nextIndex = 0;
+        break;
+      case "End":
+        event.preventDefault();
+        nextIndex = OFFICE_ICONS.length - 1;
+        break;
+      default:
+        return;
+    }
+    const nextIcon = OFFICE_ICONS[nextIndex];
+    setDraft((prev) => ({ ...prev, icon: nextIcon }));
+    setTimeout(() => {
+      document.getElementById(`office-modal-icon-${nextIndex}`)?.focus();
+    }, 0);
+  };
+
+  const handleColorKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex = index;
+    switch (event.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        event.preventDefault();
+        nextIndex = (index + 1) % OFFICE_COLORS.length;
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        event.preventDefault();
+        nextIndex = (index - 1 + OFFICE_COLORS.length) % OFFICE_COLORS.length;
+        break;
+      case "Home":
+        event.preventDefault();
+        nextIndex = 0;
+        break;
+      case "End":
+        event.preventDefault();
+        nextIndex = OFFICE_COLORS.length - 1;
+        break;
+      default:
+        return;
+    }
+    const nextColor = OFFICE_COLORS[nextIndex];
+    setDraft((prev) => ({ ...prev, color: nextColor }));
+    setTimeout(() => {
+      document.getElementById(`office-modal-color-${nextIndex}`)?.focus();
+    }, 0);
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center"
@@ -299,20 +364,25 @@ export default function OfficeManagerModal({
                 description={tr("아이콘과 대표 색상을 선택합니다.", "Choose the office icon and accent color.")}
               >
                 <div className="space-y-4">
-                  <div>
+                  <div role="radiogroup" aria-labelledby="office-modal-icon-label">
                     <label
+                      id="office-modal-icon-label"
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("아이콘", "Icon")}
                     </label>
                     <div className="flex gap-1.5 flex-wrap">
-                      {OFFICE_ICONS.map((ic) => (
+                      {OFFICE_ICONS.map((ic, index) => (
                         <button
                           key={ic}
+                          id={`office-modal-icon-${index}`}
                           type="button"
+                          role="radio"
                           aria-label={tr(`아이콘 ${ic}`, `Icon ${ic}`)}
-                          aria-pressed={draft.icon === ic}
+                          aria-checked={draft.icon === ic}
+                          tabIndex={index === selectedIconIndex ? 0 : -1}
+                          onKeyDown={(e) => handleIconKeyDown(e, index)}
                           onClick={() => setDraft((prev) => ({ ...prev, icon: ic }))}
                           className="flex h-8 w-8 items-center justify-center rounded text-base transition-all"
                           style={{
@@ -331,20 +401,25 @@ export default function OfficeManagerModal({
                       ))}
                     </div>
                   </div>
-                  <div>
+                  <div role="radiogroup" aria-labelledby="office-modal-color-label">
                     <label
+                      id="office-modal-color-label"
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("색상", "Color")}
                     </label>
                     <div className="flex gap-1.5 flex-wrap">
-                      {OFFICE_COLORS.map((c) => (
+                      {OFFICE_COLORS.map((c, index) => (
                         <button
                           key={c}
+                          id={`office-modal-color-${index}`}
                           type="button"
+                          role="radio"
                           aria-label={tr(`색상 ${c}`, `Color ${c}`)}
-                          aria-pressed={draft.color === c}
+                          aria-checked={draft.color === c}
+                          tabIndex={index === selectedColorIndex ? 0 : -1}
+                          onKeyDown={(e) => handleColorKeyDown(e, index)}
                           onClick={() => setDraft((prev) => ({ ...prev, color: c }))}
                           className={`w-7 h-7 rounded-full transition-all ${
                             draft.color === c
