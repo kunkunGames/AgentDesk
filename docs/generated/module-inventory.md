@@ -91,7 +91,7 @@
 | `db::automation_candidates` | `src/db/automation_candidates.rs` | 995 | 995 | 0 |  |
 | `db::cancel_tombstones` | `src/db/cancel_tombstones.rs` | 456 | 199 | 257 |  |
 | `db::dispatch_semaphores` | `src/db/dispatch_semaphores.rs` | 331 | 298 | 33 |  |
-| `db::dispatched_sessions` | `src/db/dispatched_sessions.rs` | 2081 | 1597 | 484 | giant-file |
+| `db::dispatched_sessions` | `src/db/dispatched_sessions.rs` | 2084 | 1597 | 487 | giant-file |
 | `db::dispatches` | `src/db/dispatches/mod.rs` | 1065 | 1065 | 0 | giant-file |
 | `db::dispatches::delivery_events` | `src/db/dispatches/delivery_events.rs` | 479 | 240 | 239 |  |
 | `db::dispatches::metadata` | `src/db/dispatches/metadata.rs` | 262 | 235 | 27 |  |
