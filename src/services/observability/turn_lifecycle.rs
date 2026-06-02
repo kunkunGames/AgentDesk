@@ -70,6 +70,7 @@ pub struct TurnCancellationDetails {
 }
 
 impl TurnCancellationDetails {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         reason: &str,
         surface: &str,
@@ -93,6 +94,7 @@ impl TurnCancellationDetails {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_no_op(
         reason: &str,
         surface: &str,

@@ -315,6 +315,7 @@ pub fn execute_command_simple_cancellable(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_command_streaming(
     prompt: &str,
     session_id: Option<&str>,
@@ -416,6 +417,7 @@ pub fn execute_command_streaming(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_qwen_streaming_attempt(
     qwen_bin: &str,
     resolution: &crate::services::platform::BinaryResolution,
@@ -1170,6 +1172,7 @@ fn should_preserve_live_reused_provider_session(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn execute_streaming_local_tmux(
     prompt: &str,
     model: Option<&str>,

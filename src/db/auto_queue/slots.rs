@@ -1,9 +1,5 @@
 use sqlx::PgPool;
 
-use super::slot_predicate::{
-    DispatchSlotPolarity, active_dispatch_on_slot_predicate, dispatch_slot_index_expr,
-};
-
 // Give the provider bridge a short cleanup window after a terminal turn before
 // reusing the same slot/thread. The auto-queue tick retries roughly every
 // minute, so 45s avoids immediate same-thread delivery without adding another
@@ -83,27 +79,26 @@ pub async fn slot_has_recent_terminal_auto_queue_dispatch_pg(
     agent_id: &str,
     slot_index: i64,
 ) -> Result<bool, sqlx::Error> {
-    let slot_index_expr = dispatch_slot_index_expr("d.context");
-    let query = format!(
+    sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
              SELECT 1
              FROM task_dispatches d
+             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{}')::jsonb AS ctx) c
              WHERE d.to_agent_id = $1
                AND d.status IN ('completed', 'failed', 'cancelled')
-               AND {slot_index_expr} = $2
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'auto_queue')::BOOLEAN, FALSE) = TRUE
-               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-               AND (COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->'phase_gate' IS NULL
+               AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = $2
+               AND COALESCE((c.ctx->>'auto_queue')::BOOLEAN, FALSE) = TRUE
+               AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+               AND c.ctx->'phase_gate' IS NULL
                AND COALESCE(d.completed_at, d.updated_at, d.created_at)
                    >= NOW() - make_interval(secs => $3::INT)
-         )"
-    );
-    sqlx::query_scalar::<_, bool>(&query)
-        .bind(agent_id)
-        .bind(slot_index)
-        .bind(SLOT_TERMINAL_DISPATCH_COOLDOWN_SECONDS)
-        .fetch_one(pool)
-        .await
+         )",
+    )
+    .bind(agent_id)
+    .bind(slot_index)
+    .bind(SLOT_TERMINAL_DISPATCH_COOLDOWN_SECONDS)
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn release_slot_for_group_agent_pg(
@@ -170,19 +165,32 @@ pub async fn slot_has_active_dispatch_excluding_pg(
         return Ok(true);
     }
 
-    let active_dispatch_exists = active_dispatch_on_slot_predicate(
-        "$1",
-        "$2",
-        DispatchSlotPolarity::Exists,
-        Some("d.id != $3"),
-    );
-    let query = format!("SELECT {active_dispatch_exists}");
-    sqlx::query_scalar::<_, bool>(&query)
-        .bind(agent_id)
-        .bind(slot_index)
-        .bind(exclude_id)
-        .fetch_one(pool)
-        .await
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*) > 0
+         FROM task_dispatches
+         CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(context, ''), '{}')::jsonb AS ctx) c
+         WHERE to_agent_id = $1
+           AND status IN ('pending', 'dispatched')
+           AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = $2
+           AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+           AND c.ctx->'phase_gate' IS NULL
+           AND id != $3
+           AND (
+               COALESCE(dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
+               OR status = 'pending'
+               OR EXISTS (
+                   SELECT 1
+                   FROM sessions s
+                   WHERE s.active_dispatch_id = task_dispatches.id
+                     AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
+               )
+           )",
+    )
+    .bind(agent_id)
+    .bind(slot_index)
+    .bind(exclude_id)
+    .fetch_one(pool)
+    .await
 }
 
 pub(crate) async fn release_run_slots_on_pg_tx(
