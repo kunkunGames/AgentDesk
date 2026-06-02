@@ -77,11 +77,17 @@ python3 -m unittest \
   tests.test_portable_path_lint \
   tests.test_install_bootstrap_portable
 
-echo "=== Generate inventory docs ==="
+echo "=== Generate inventory docs (also gates giant-file registry, #3036) ==="
+# The generator hard-fails (exit 2) on giant-file registry drift: unregistered
+# new giants, ghost registrations left after decomposition, or deadline-less
+# [[entry]] tables in scripts/giant_file_registry.toml.
 python3 scripts/generate_inventory_docs.py
 
-echo "=== Agent maintenance freshness gate (warn, #1432) ==="
-python3 scripts/check_agent_maintenance_docs.py --warning-only
+echo "=== Agent maintenance freshness gate (warn, #1432; LoC hard-gate, #3036) ==="
+# --warning-only keeps the #1432 freshness/touch rollout non-fatal, while
+# --line-count-gate hard-fails on change-surfaces.md production-LoC drift, ghost
+# freeze entries, and decomposition regressions.
+python3 scripts/check_agent_maintenance_docs.py --warning-only --line-count-gate
 
 echo "=== Agent maintenance freshness tests ==="
 python3 -m unittest tests.test_agent_maintenance_docs
