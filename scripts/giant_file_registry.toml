@@ -238,3 +238,11 @@ file = "src/services/discord/voice_barge_in.rs"
 owner = "voice-runtime"
 deadline = "2026-08-31"
 decompose_issue = "#3036"
+
+[[entry]]
+# Supervised-worker registry / leader-only lifecycle surface; crossed the
+# prod-LoC threshold during runtime-core worker additions.
+file = "src/server/worker_registry.rs"
+owner = "runtime_core"
+deadline = "2026-09-30"
+decompose_issue = "#563"

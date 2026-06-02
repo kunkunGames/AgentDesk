@@ -90,12 +90,12 @@
 | `POST` | `/api/dispatched-sessions/webhook` | `dispatched_sessions::hook_session` | `src/server/routes/dispatched_sessions.rs:26` | `src/server/routes/domains/ops.rs:169` |
 | `PATCH` | `/api/dispatched-sessions/{id}` | `dispatched_sessions::update_dispatched_session` | `src/server/routes/dispatched_sessions.rs:80` | `src/server/routes/domains/ops.rs:165` |
 | `GET` | `/api/dispatches` | `dispatches::list_dispatches` | `src/server/routes/dispatches/crud.rs:52` | `src/server/routes/domains/ops.rs:17` |
-| `POST` | `/api/dispatches` | `dispatches::create_dispatch` | `src/server/routes/dispatches/crud.rs:158` | `src/server/routes/domains/ops.rs:17` |
+| `POST` | `/api/dispatches` | `dispatches::create_dispatch` | `src/server/routes/dispatches/crud.rs:160` | `src/server/routes/domains/ops.rs:17` |
 | `POST` | `/api/dispatches/cancel-all` | `queue_api::cancel_all_dispatches` | `src/server/routes/queue_api.rs:126` | `src/server/routes/domains/ops.rs:308` |
 | `GET` | `/api/dispatches/delivery-events/reconcile-stats` | `dispatches::get_dispatch_delivery_reconcile_stats` | `src/server/routes/dispatches/crud.rs:131` | `src/server/routes/domains/ops.rs:97` |
 | `GET` | `/api/dispatches/pending` | `queue_api::list_pending_dispatches` | `src/server/routes/queue_api.rs:65` | `src/server/routes/domains/ops.rs:303` |
 | `GET` | `/api/dispatches/{id}` | `dispatches::get_dispatch` | `src/server/routes/dispatches/crud.rs:79` | `src/server/routes/domains/ops.rs:101` |
-| `PATCH` | `/api/dispatches/{id}` | `dispatches::update_dispatch` | `src/server/routes/dispatches/crud.rs:232` | `src/server/routes/domains/ops.rs:101` |
+| `PATCH` | `/api/dispatches/{id}` | `dispatches::update_dispatch` | `src/server/routes/dispatches/crud.rs:234` | `src/server/routes/domains/ops.rs:101` |
 | `POST` | `/api/dispatches/{id}/cancel` | `queue_api::cancel_dispatch` | `src/server/routes/queue_api.rs:103` | `src/server/routes/domains/ops.rs:307` |
 | `GET` | `/api/dispatches/{id}/events` | `dispatches::get_dispatch_delivery_events` | `src/server/routes/dispatches/crud.rs:101` | `src/server/routes/domains/ops.rs:105` |
 | `POST` | `/api/dm-reply/register` | `dm_reply::register_handler` | `src/server/routes/dm_reply.rs:22` | `src/server/routes/domains/integrations.rs:40` |
