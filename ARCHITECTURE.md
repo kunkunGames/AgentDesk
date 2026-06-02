@@ -60,6 +60,7 @@ src/
 │   │   ├── phase_gates.rs
 │   │   ├── queries.rs
 │   │   ├── runs.rs
+│   │   ├── slot_predicate.rs
 │   │   ├── slots.rs
 │   │   ├── test_support.rs
 │   │   └── tests.rs
@@ -570,6 +571,7 @@ src/
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
 │   │   ├── tui_prompt_relay.rs
+│   │   ├── turn_finalizer.rs
 │   │   ├── voice_background_driver.rs
 │   │   ├── voice_barge_in.rs
 │   │   └── voice_routing.rs

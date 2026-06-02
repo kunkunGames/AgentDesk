@@ -793,13 +793,227 @@ async fn send_reaction_control_reply(
         .await;
 }
 
+/// #3009: when a follow-up message is *merged* into the previous queue head
+/// (`MailboxEnqueueOutcome::merged == true`), the head intervention's
+/// `message_id` is rewritten to this follow-up's id while the older ids are
+/// retained as `source_message_ids` (see `turn_orchestrator::enqueue_intervention`).
+/// The previous queue head already owns a `📬 메시지 대기 중` placeholder card
+/// keyed under one of those older `source_message_ids`. Re-render and re-key
+/// that single card under the new head id instead of POSTing a brand-new card,
+/// so a burst of follow-ups collapses to ONE visible waiting placeholder.
+///
+/// Returns `true` when an existing merged-group placeholder was successfully
+/// reused (no new card needed). Returns `false` when there was no existing
+/// placeholder to reuse (e.g. the head's earlier POST failed), in which case
+/// the caller falls back to creating a fresh card.
+/// Pure decision helper for #3009 merged-placeholder reuse. Given the merged
+/// head's `source_message_ids` and a lookup into the live `queued_placeholders`
+/// map, return the `(prior_source_id, placeholder_msg_id)` of the existing
+/// waiting card that should be re-keyed under the new head id. Returns `None`
+/// when no earlier source id of the group owns a card yet (caller POSTs a fresh
+/// one). The follow-up's own id is excluded because it has no card yet.
+fn pick_reusable_merged_placeholder<F>(
+    source_message_ids: &[serenity::MessageId],
+    user_msg_id: serenity::MessageId,
+    mut lookup: F,
+) -> Option<(serenity::MessageId, serenity::MessageId)>
+where
+    F: FnMut(serenity::MessageId) -> Option<serenity::MessageId>,
+{
+    source_message_ids
+        .iter()
+        .copied()
+        .filter(|id| *id != user_msg_id)
+        .find_map(|id| lookup(id).map(|placeholder| (id, placeholder)))
+}
+
+/// Outcome of the #3009 merged-placeholder reuse attempt. Distinguishes the
+/// "reuse handled it" cases (caller must NOT post a fresh card) from the
+/// genuine "no reusable card, post a fresh one" case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergedPlaceholderReuse {
+    /// Reused / no-op success: a single waiting card already represents this
+    /// merged backlog (either re-keyed here, or this follow-up is a stale
+    /// non-head source whose content is already folded into the head's card).
+    /// The caller must skip the fresh-card POST.
+    Handled,
+    /// No reusable card exists for the head and the head's own card render is
+    /// still required — the caller should POST a fresh placeholder.
+    PostFresh,
+}
+
+async fn reuse_merged_queued_placeholder(
+    ctx: &serenity::Context,
+    data: &Data,
+    channel_id: serenity::ChannelId,
+    user_msg_id: serenity::MessageId,
+) -> MergedPlaceholderReuse {
+    // Serialize the whole reuse (snapshot read → re-key → re-render) against
+    // every other `queued_placeholders` mutation / queue-exit drain on this
+    // channel. Without the lock a concurrent dispatch/queue-exit drain could
+    // remove the source mapping between our snapshot read and our re-key,
+    // leaking the card or resurrecting a stale mapping (#3009 TOCTOU guard).
+    let persist_lock = data.shared.queued_placeholders_persist_lock(channel_id);
+    let persist_guard = persist_lock.lock_owned().await;
+
+    let snapshot = mailbox_snapshot(&data.shared, channel_id).await;
+    // Locate the merged head whose source ids include this follow-up. The
+    // enqueue path rewrote its `message_id` to `user_msg_id`, so match on the
+    // source-id membership to stay robust even if the head id moved again.
+    let Some(merged_head) = snapshot
+        .intervention_queue
+        .iter()
+        .find(|intervention| intervention.source_message_ids.contains(&user_msg_id))
+    else {
+        // No longer queued (already dispatched / exited). The merge outcome
+        // told us this id folded into a prior head, so its content is not
+        // standalone — do NOT post a fresh card for it.
+        return MergedPlaceholderReuse::Handled;
+    };
+    let already_started = snapshot.active_user_message_id == Some(user_msg_id);
+    if already_started {
+        // The merged head is being dispatched; its card transition is owned by
+        // the dispatch hand-off. No fresh card needed.
+        return MergedPlaceholderReuse::Handled;
+    }
+
+    // codex round-1 P2 (identity race) + round-2 P2 (stale-source duplicate):
+    // only re-key the card when `user_msg_id` is STILL the merged head. Under
+    // bursty concurrent merges a newer follow-up can have already advanced the
+    // head past this id (rewriting `message_id`), leaving `user_msg_id` as a
+    // non-head source. Re-keying to a non-head id would let the dispatch drain
+    // delete the only queued card. AND posting a fresh card for this stale
+    // non-head source would recreate the very duplicate this path prevents —
+    // its content is already folded into the head's card. So treat a stale
+    // non-head merged source as Handled (no new card); the head's own reuse
+    // pass owns the single visible card.
+    if merged_head.message_id != user_msg_id {
+        return MergedPlaceholderReuse::Handled;
+    }
+
+    // codex round-3 P3: `enqueue_intervention` already appended this follow-up's
+    // text to the head's accumulated `text` (e.g. "A\nB"). Render the FULL
+    // merged request on the single reused card so the placeholder represents the
+    // whole pending backlog, not just the latest line (`text` is only this
+    // Discord message). Capture it before any further borrows of `snapshot`.
+    let merged_request_text = merged_head.text.clone();
+
+    // Find the existing placeholder card owned by any earlier source id of the
+    // merged group (excluding this follow-up, which has no card yet).
+    let existing =
+        pick_reusable_merged_placeholder(&merged_head.source_message_ids, user_msg_id, |id| {
+            data.shared
+                .queued_placeholders
+                .get(&(channel_id, id))
+                .map(|entry| *entry.value())
+        });
+    let Some((prior_source_id, placeholder_msg_id)) = existing else {
+        // We are the current head but no earlier source owns a card yet (e.g.
+        // the prior head's POST failed). A fresh card IS warranted here.
+        return MergedPlaceholderReuse::PostFresh;
+    };
+
+    // Re-key the mapping so the head id (== `user_msg_id`) owns the card the
+    // dispatch hand-off consumes, and the old source-id mapping is dropped so
+    // a later merged-drain cannot delete this still-live card. The
+    // placeholder_controller entry is keyed by the *placeholder* Discord
+    // message id, which is unchanged, so no controller re-keying is needed.
+    data.shared
+        .remove_queued_placeholder_locked(channel_id, prior_source_id);
+    data.shared
+        .insert_queued_placeholder_locked(channel_id, user_msg_id, placeholder_msg_id);
+
+    // Refresh the card body with the merged request text. `ensure_queued` is
+    // idempotent: an unchanged render coalesces, a changed one edits.
+    let gateway = super::super::gateway::DiscordGateway::new(
+        ctx.http.clone(),
+        data.shared.clone(),
+        data.provider.clone(),
+        None,
+    );
+    let key = super::super::placeholder_controller::PlaceholderKey {
+        provider: data.provider.clone(),
+        channel_id,
+        message_id: placeholder_msg_id,
+    };
+    let queued_input = super::super::placeholder_controller::PlaceholderActiveInput {
+        reason: super::super::formatting::MonitorHandoffReason::Queued,
+        started_at_unix: chrono::Utc::now().timestamp(),
+        tool_summary: None,
+        command_summary: None,
+        reason_detail: None,
+        context_line: None,
+        request_line: Some(merged_request_text),
+        progress_line: None,
+    };
+    let outcome = data
+        .shared
+        .placeholder_controller
+        .ensure_queued(&gateway, key, queued_input)
+        .await;
+
+    // codex round-1 P2 (edit-failure rollback): only commit the re-key when the
+    // card actually renders (`Edited`/`Coalesced`). On `EditFailed`/`Rejected`
+    // the card on Discord may be gone or invalid, so restore the mapping to the
+    // prior source id and report failure — the caller then falls back to the
+    // fresh-card POST path, mirroring how `render_visible_queued_ack` treats a
+    // failed `ensure_queued`. The persistence lock is held across the rollback
+    // so no concurrent drain observes the half-applied re-key.
+    if !matches!(
+        outcome,
+        super::super::placeholder_controller::PlaceholderControllerOutcome::Edited
+            | super::super::placeholder_controller::PlaceholderControllerOutcome::Coalesced
+    ) {
+        data.shared
+            .remove_queued_placeholder_locked(channel_id, user_msg_id);
+        data.shared.insert_queued_placeholder_locked(
+            channel_id,
+            prior_source_id,
+            placeholder_msg_id,
+        );
+        drop(persist_guard);
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⚠ QUEUE-ACK: merged reuse of placeholder {} for message {} in channel {} failed to render ({:?}); kept prior mapping, falling back to fresh card",
+            placeholder_msg_id,
+            user_msg_id,
+            channel_id,
+            outcome,
+        );
+        return MergedPlaceholderReuse::PostFresh;
+    }
+    drop(persist_guard);
+
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] ➕ QUEUE-ACK: merged queued message {} into existing placeholder {} in channel {} (no new card)",
+        user_msg_id,
+        placeholder_msg_id,
+        channel_id
+    );
+    MergedPlaceholderReuse::Handled
+}
+
 async fn render_visible_queued_ack(
     ctx: &serenity::Context,
     data: &Data,
     channel_id: serenity::ChannelId,
     user_msg_id: serenity::MessageId,
     text: &str,
+    merged: bool,
 ) -> bool {
+    // #3009: a merged follow-up reuses the existing waiting placeholder instead
+    // of stacking a duplicate card. Only fall through to a fresh POST when this
+    // message is the current merged head AND no prior card exists to reuse
+    // (e.g. the head's earlier POST failed). A stale non-head merged source is
+    // already represented by the head's single card, so it is `Handled` (no new
+    // card) — posting one would recreate the duplicate this path prevents.
+    if merged {
+        match reuse_merged_queued_placeholder(ctx, data, channel_id, user_msg_id).await {
+            MergedPlaceholderReuse::Handled => return true,
+            MergedPlaceholderReuse::PostFresh => {}
+        }
+    }
     let post_result = super::super::gateway::send_intake_placeholder(
         ctx.http.clone(),
         data.shared.clone(),
@@ -852,9 +1066,21 @@ async fn render_visible_queued_ack(
     let persist_lock = data.shared.queued_placeholders_persist_lock(channel_id);
     let persist_guard = persist_lock.lock_owned().await;
     let snapshot = mailbox_snapshot(&data.shared, channel_id).await;
+    // codex round-3 P2: for a merged fallback (reuse returned `PostFresh`),
+    // require this id to STILL be the queued head before committing a fresh
+    // card. Re-snapshotting under the persist lock closes the burst race where
+    // a newer follow-up merged (advancing the head past `user_msg_id`) while
+    // our `send_intake_placeholder` POST was in flight — without this, a stale
+    // non-head source could keep its own card and recreate the #3009 duplicate.
+    // Non-merged (standalone) messages keep the original source-id membership
+    // check: they are their own head, so the two conditions coincide.
     let still_queued = snapshot.intervention_queue.iter().any(|intervention| {
-        intervention.message_id == user_msg_id
-            || intervention.source_message_ids.contains(&user_msg_id)
+        if merged {
+            intervention.message_id == user_msg_id
+        } else {
+            intervention.message_id == user_msg_id
+                || intervention.source_message_ids.contains(&user_msg_id)
+        }
     });
     let already_started = snapshot.active_user_message_id == Some(user_msg_id);
     if already_started || !still_queued {
@@ -1086,11 +1312,17 @@ async fn handle_reaction_remove(
             let (active_message_id, expected_token) = match snapshot.active_user_message_id {
                 Some(active_id) => (Some(active_id), snapshot.cancel_token.clone()),
                 None => {
+                    // user_msg_id == 0 (e.g. a TUI-direct turn) anchors no
+                    // Discord message that could carry a reaction, so it yields
+                    // None (never matches `removed_reaction.message_id`);
+                    // `MessageId::new(0)` would panic.
                     let inflight_id = super::super::inflight::load_inflight_state(
                         &data.provider,
                         channel_id.get(),
                     )
-                    .map(|state| serenity::MessageId::new(state.user_msg_id));
+                    .and_then(|state| {
+                        super::super::inflight::optional_message_id(state.user_msg_id)
+                    });
                     (inflight_id, None)
                 }
             };
@@ -2060,7 +2292,15 @@ pub(in crate::services::discord) async fn handle_event(
                 }
 
                 if !is_allowed_bot {
-                    render_visible_queued_ack(ctx, data, channel_id, new_message.id, text).await;
+                    render_visible_queued_ack(
+                        ctx,
+                        data,
+                        channel_id,
+                        new_message.id,
+                        text,
+                        outcome.merged,
+                    )
+                    .await;
                 }
 
                 // React 📬 (standalone queue head) or ➕ (merged into previous head).
@@ -2799,6 +3039,73 @@ mod thread_guard_stale_pure_tests {
             super::classify_stale_active_turn_proof(&inflight, &snapshot, now_unix),
             super::StaleActiveTurnProofClassification::ExplicitBackgroundStatus
         );
+    }
+}
+
+/// #3009 — pure-logic tests for merged-placeholder reuse. These exercise the
+/// `pick_reusable_merged_placeholder` decision (which card a merged follow-up
+/// re-keys) without needing a live serenity ctx.
+#[cfg(test)]
+mod merged_placeholder_reuse_pure_tests {
+    use super::*;
+    use poise::serenity_prelude::MessageId;
+    use std::collections::HashMap;
+
+    #[test]
+    fn merged_followup_reuses_prior_head_card() {
+        // Queue head started as msg A (owns card CA); follow-up B merged in,
+        // so the head's source ids are [A, B] and the head message_id == B.
+        let a = MessageId::new(800_000_000_000_001);
+        let b = MessageId::new(800_000_000_000_002);
+        let card_a = MessageId::new(700_000_000_000_001);
+        let map: HashMap<MessageId, MessageId> = [(a, card_a)].into_iter().collect();
+
+        let picked = pick_reusable_merged_placeholder(&[a, b], b, |id| map.get(&id).copied());
+
+        // The follow-up B must reuse A's existing card (no new card).
+        assert_eq!(picked, Some((a, card_a)));
+    }
+
+    #[test]
+    fn second_merged_followup_reuses_rekeyed_card() {
+        // After B merged and re-keyed CA under B, a third follow-up C merges:
+        // source ids [A, B, C], only B currently owns the card.
+        let a = MessageId::new(800_000_000_000_001);
+        let b = MessageId::new(800_000_000_000_002);
+        let c = MessageId::new(800_000_000_000_003);
+        let card = MessageId::new(700_000_000_000_001);
+        let map: HashMap<MessageId, MessageId> = [(b, card)].into_iter().collect();
+
+        let picked = pick_reusable_merged_placeholder(&[a, b, c], c, |id| map.get(&id).copied());
+
+        assert_eq!(picked, Some((b, card)));
+    }
+
+    #[test]
+    fn no_prior_card_falls_back_to_fresh_post() {
+        // The head's earlier POST failed, so no source id owns a card yet.
+        let a = MessageId::new(800_000_000_000_001);
+        let b = MessageId::new(800_000_000_000_002);
+        let map: HashMap<MessageId, MessageId> = HashMap::new();
+
+        let picked = pick_reusable_merged_placeholder(&[a, b], b, |id| map.get(&id).copied());
+
+        assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn own_id_card_is_never_reused() {
+        // Defensive: even if the follow-up id somehow already mapped to a card,
+        // it must be excluded so we never "reuse" the card we are about to
+        // create / treat the new head as its own prior.
+        let a = MessageId::new(800_000_000_000_001);
+        let b = MessageId::new(800_000_000_000_002);
+        let card_b = MessageId::new(700_000_000_000_002);
+        let map: HashMap<MessageId, MessageId> = [(b, card_b)].into_iter().collect();
+
+        let picked = pick_reusable_merged_placeholder(&[a, b], b, |id| map.get(&id).copied());
+
+        assert_eq!(picked, None);
     }
 }
 
