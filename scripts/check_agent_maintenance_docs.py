@@ -45,12 +45,22 @@ LAST_REFRESHED_RE = re.compile(
     r")"
     r"\)\.?\s*$"
 )
+# Module inventory row: | `module` | `path` | <total> | <prod> | <test> | flags |
 MODULE_INVENTORY_ROW_RE = re.compile(
-    r"^\|\s*`[^`]+`\s*\|\s*`(?P<path>[^`]+\.rs)`\s*\|\s*(?P<lines>\d+)\s*\|"
+    r"^\|\s*`[^`]+`\s*\|\s*`(?P<path>[^`]+\.rs)`\s*\|"
+    r"\s*(?P<lines>\d+)\s*\|\s*(?P<prod>\d+)\s*\|\s*(?P<test>\d+)\s*\|"
 )
+# `` `path` (1234 lines …) `` or `` `path` (~1234 lines …) `` — explicit form.
 CHANGE_SURFACE_LINE_RE = re.compile(
-    r"`(?P<path>src/[^`]+\.rs)`\s*\((?P<lines>\d+)\s+lines\b"
+    r"`(?P<path>src/[^`]+\.rs)`\s*\(~?(?P<lines>\d+)\s+lines\b"
 )
+# `` `path` (1234) `` or `` `path` (~1234) `` — bare line-count shorthand used in
+# the services_misc_giants list. The parenthetical must be a number only (no
+# trailing prose), so `(line 1971, …)` or `(directory, refactored)` are ignored.
+CHANGE_SURFACE_SHORTHAND_RE = re.compile(
+    r"`(?P<path>src/[^`]+\.rs)`\s*\(~?(?P<lines>\d+)\)"
+)
+GIANT_FILE_THRESHOLD = 1000
 
 
 @dataclass(frozen=True)
@@ -308,6 +318,14 @@ def check_doc_touch_rules(changed_files: set[str]) -> list[Finding]:
 
 
 def parse_module_inventory(path: Path) -> dict[str, int]:
+    """Map each production module path to its *production* LoC.
+
+    change-surfaces.md freezes modules by their review surface, which is the
+    production line count (excluding `#[cfg(test)] mod` blocks). The inventory's
+    ``Prod`` column is the authority, so the freshness gate compares against it
+    rather than the raw total (#3036).
+    """
+
     inventory: dict[str, int] = {}
     if not path.is_file():
         return inventory
@@ -315,7 +333,7 @@ def parse_module_inventory(path: Path) -> dict[str, int]:
         match = MODULE_INVENTORY_ROW_RE.match(line)
         if match is None:
             continue
-        inventory[match.group("path")] = int(match.group("lines"))
+        inventory[match.group("path")] = int(match.group("prod"))
     return inventory
 
 
@@ -340,29 +358,102 @@ def check_change_surface_line_counts(repo_root: Path) -> list[Finding]:
         ]
 
     findings: list[Finding] = []
+    rel_doc = rel_posix(change_surfaces, repo_root)
     for line_no, line in enumerate(change_surfaces.read_text(encoding="utf-8").splitlines(), start=1):
+        # Collect (path, documented_lines) pairs from both the explicit
+        # "(N lines)" form and the bare "(N)"/"(~N)" shorthand, de-duplicating
+        # overlaps where the shorthand regex also matches inside a longer span.
+        matched: dict[tuple[int, str], int] = {}
         for match in CHANGE_SURFACE_LINE_RE.finditer(line):
-            path = match.group("path")
-            documented = int(match.group("lines"))
+            matched[(match.start(), match.group("path"))] = int(match.group("lines"))
+        explicit_spans = [
+            match.span() for match in CHANGE_SURFACE_LINE_RE.finditer(line)
+        ]
+        for match in CHANGE_SURFACE_SHORTHAND_RE.finditer(line):
+            if any(start <= match.start() < end for start, end in explicit_spans):
+                continue
+            matched[(match.start(), match.group("path"))] = int(match.group("lines"))
+
+        for (_pos, path), documented in sorted(matched.items()):
             actual = inventory.get(path)
             if actual is None:
+                # The module-inventory only lists *production* modules, so a
+                # dedicated `*_tests.rs` file is legitimately absent — warn so the
+                # freeze entry can be reworded, but do not gate. A path that is
+                # also missing from disk, however, is a deleted/renamed frozen
+                # entry (a ghost the gate must catch, #3036).
+                on_disk = (repo_root / path).is_file()
+                is_test_path = path.endswith("_tests.rs") or path.rsplit("/", 1)[-1] in {
+                    "tests.rs",
+                    "integration_tests.rs",
+                }
+                if on_disk and is_test_path:
+                    findings.append(
+                        Finding(
+                            "warning",
+                            rel_doc,
+                            (
+                                f"{path} is a test file (excluded from the "
+                                "production module inventory); reword the freeze "
+                                "entry to drop its line count."
+                            ),
+                            line_no,
+                        )
+                    )
+                else:
+                    findings.append(
+                        Finding(
+                            "error",
+                            rel_doc,
+                            (
+                                f"{path} is frozen with a line count but is "
+                                + (
+                                    "not a production module in "
+                                    "docs/generated/module-inventory.md"
+                                    if on_disk
+                                    else "missing from disk (deleted or renamed)"
+                                )
+                                + "; remove the ghost freeze entry."
+                            ),
+                            line_no,
+                        )
+                    )
+                continue
+            # Ghost registration: a freeze entry whose production surface has
+            # fallen below the giant threshold (decomposition complete). Stale
+            # ghosts kept the page frozen against modules that no longer need
+            # it (#3036), so this is a hard error — remove the entry.
+            if actual < GIANT_FILE_THRESHOLD:
                 findings.append(
                     Finding(
-                        "warning",
-                        rel_posix(change_surfaces, repo_root),
-                        f"{path} is not present in docs/generated/module-inventory.md.",
+                        "error",
+                        rel_doc,
+                        (
+                            f"{path} now has {actual} production lines "
+                            f"(< {GIANT_FILE_THRESHOLD}); it is no longer a giant "
+                            "file. Remove the ghost freeze entry from "
+                            "change-surfaces.md."
+                        ),
                         line_no,
                     )
                 )
                 continue
             if documented != actual:
+                # Stale numbers are an error so the page cannot silently rot, and
+                # an increase specifically signals a decomposition regression
+                # (the frozen surface grew instead of shrinking).
+                regression = " (production surface grew — decomposition regression)" \
+                    if actual > documented else ""
                 findings.append(
                     Finding(
-                        "warning",
-                        rel_posix(change_surfaces, repo_root),
+                        "error",
+                        rel_doc,
                         (
-                            f"{path} line count is {documented} in change-surfaces.md "
-                            f"but {actual} in module-inventory.md."
+                            f"{path} production line count is {documented} in "
+                            f"change-surfaces.md but {actual} in "
+                            f"module-inventory.md{regression}. Re-run "
+                            "`python3 scripts/generate_inventory_docs.py` and sync "
+                            "the freeze entry."
                         ),
                         line_no,
                     )
@@ -441,7 +532,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="emit findings as warnings and exit 0; intended for the initial CI rollout",
     )
+    parser.add_argument(
+        "--line-count-gate",
+        action="store_true",
+        help=(
+            "hard-fail on change-surfaces.md production-LoC drift, ghost freeze "
+            "entries, and decomposition regressions even under --warning-only "
+            "(#3036 measurement integrity gate)"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+# Path/severity of findings produced by check_change_surface_line_counts.
+CHANGE_SURFACE_DOC = "docs/agent-maintenance/change-surfaces.md"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -450,7 +554,8 @@ def main(argv: list[str] | None = None) -> int:
 
     findings: list[Finding] = []
     findings.extend(check_doc_headers(repo_root, args.today, args.freshness_days))
-    findings.extend(check_change_surface_line_counts(repo_root))
+    line_count_findings = check_change_surface_line_counts(repo_root)
+    findings.extend(line_count_findings)
 
     if args.changed_file:
         changed_files = {path.strip() for path in args.changed_file if path.strip()}
@@ -464,6 +569,13 @@ def main(argv: list[str] | None = None) -> int:
     emit_findings(findings, args.warning_only)
     has_errors = any(finding.severity == "error" for finding in findings)
     if has_errors and not args.warning_only:
+        return 1
+    # Even in the #1432 warning-only rollout, production-LoC integrity is a hard
+    # gate when requested: stale numbers, ghost entries, and decomposition
+    # regressions must not slip through (#3036).
+    if args.line_count_gate and any(
+        finding.severity == "error" for finding in line_count_findings
+    ):
         return 1
     return 0
 
