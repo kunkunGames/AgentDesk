@@ -121,8 +121,7 @@ fn configured_repo_dir(repo_id: &str) -> Option<String> {
         return None;
     }
 
-    let path = crate::runtime_layout::expand_user_path(raw)
-        .unwrap_or_else(|| PathBuf::from(raw));
+    let path = crate::runtime_layout::expand_user_path(raw).unwrap_or_else(|| PathBuf::from(raw));
     let resolved = if path.is_relative() {
         base_dir.join(path)
     } else {
