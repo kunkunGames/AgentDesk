@@ -1669,14 +1669,19 @@ async fn cleanup_orphan_external_input_status_panel(
         );
     }
     *status_panel_msg_id = None;
-    if let Some(mut state) =
-        crate::services::discord::inflight::load_inflight_state(provider, channel_id.get())
-        && state.tmux_session_name.as_deref() == Some(tmux_session_name)
-        && state.status_message_id == Some(panel_msg_id.get())
-    {
-        state.status_message_id = None;
-        let _ = crate::services::discord::inflight::save_inflight_state(&state);
-    }
+    // #3077: compare-and-clear under the inflight flock so a newer turn that
+    // rebound this panel between our load and our clear is never wiped. The
+    // tmux-session guard preserves the prior precondition (only clear our own
+    // TUI-direct turn's row).
+    let _ = crate::services::discord::inflight::clear_status_panel_if_current(
+        provider,
+        channel_id.get(),
+        panel_msg_id.get(),
+        &crate::services::discord::inflight::StatusPanelClearGuard {
+            require_tmux_session_name: Some(tmux_session_name.to_string()),
+            ..Default::default()
+        },
+    );
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
         "  [{ts}] 🧹 watcher: cleaned orphan status-panel-v2 for TUI-direct turn (channel {}, tmux={}, panel_msg={})",
@@ -4613,14 +4618,25 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     });
                                     if identity_matches
                                         && !fresh_panel_already_set
-                                        && let Some(mut inflight) = fresh_inflight
+                                        && fresh_inflight.is_some()
                                     {
+                                        // #3077: bind through the typed op so the
+                                        // identity guard + "don't clobber an already-set
+                                        // panel" check are re-validated atomically under
+                                        // the inflight flock — closing the window where an
+                                        // overlapping watcher rebinds between our snapshot
+                                        // load and this write (#3003).
                                         status_panel_msg_id = Some(panel_msg.id);
-                                        inflight.status_message_id = Some(panel_msg.id.get());
-                                        let _ =
-                                            crate::services::discord::inflight::save_inflight_state(
-                                                &inflight,
-                                            );
+                                        let _ = crate::services::discord::inflight::bind_status_panel(
+                                            &watcher_provider,
+                                            channel_id.get(),
+                                            panel_msg.id.get(),
+                                            &crate::services::discord::inflight::StatusPanelBindGuard {
+                                                require_identity: pre_send_identity.clone(),
+                                                skip_if_panel_already_set: true,
+                                                ..Default::default()
+                                            },
+                                        );
                                         let ts = chrono::Local::now().format("%H:%M:%S");
                                         tracing::info!(
                                             "  [{ts}] 🪧 watcher: created status-panel-v2 for TUI-direct turn (channel {}, tmux={}, panel_msg={})",

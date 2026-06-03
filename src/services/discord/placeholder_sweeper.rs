@@ -849,17 +849,27 @@ async fn sweep_orphan_status_panel(
             let _ = delete_inflight_state_file(provider, state.channel_id);
         }
     } else if placeholder_sweep_leaves_row_unevicted(state)
-        && let Some(mut current) = super::inflight::load_inflight_state(provider, state.channel_id)
-        && current.user_msg_id == state.user_msg_id
-        && current.current_msg_id == state.current_msg_id
-        && current.status_message_id == state.status_message_id
+        && let Some(panel_msg_id) = state.status_message_id
     {
         // Partial-response rows (real placeholder + streamed output) are owned by
         // the placeholder sweeper's deferred follow-up; do not evict them here.
         // Only clear our panel reference so we stop re-detecting it (codex P2 r12).
         // On a transient failure the durable store owns the retry, so this is safe.
-        current.status_message_id = None;
-        let _ = super::inflight::save_inflight_state(&current);
+        //
+        // #3077: compare-and-clear under the inflight flock. The user_msg_id +
+        // current_msg_id + msg-id guards reproduce the prior "same turn, same
+        // panel" precondition atomically, so a newer turn that rebound the panel
+        // between our snapshot load and this clear is never wiped.
+        let _ = super::inflight::clear_status_panel_if_current(
+            provider,
+            state.channel_id,
+            panel_msg_id,
+            &super::inflight::StatusPanelClearGuard {
+                require_user_msg_id: Some(state.user_msg_id),
+                require_current_msg_id: Some(state.current_msg_id),
+                ..Default::default()
+            },
+        );
     }
     if !committed {
         return;
