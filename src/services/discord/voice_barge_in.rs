@@ -4796,6 +4796,8 @@ mod tests {
             recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
             global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             turn_finalizer: super::super::turn_finalizer::TurnFinalizer::spawn(),
+            status_panel_controller:
+                super::super::status_panel_controller::StatusPanelController::spawn(false),
             global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),

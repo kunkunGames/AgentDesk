@@ -71,6 +71,7 @@ pub(in crate::services::discord) mod task_supervisor;
 mod tmux;
 #[cfg(unix)]
 pub(crate) use tmux::write_spawn_nonce;
+mod status_panel_controller;
 #[cfg(unix)]
 mod tmux_error_detect;
 #[cfg(unix)]
@@ -1769,6 +1770,14 @@ pub(crate) struct SharedData {
     /// side-effects) as an atomic, exactly-once unit. Bridge/watcher terminals
     /// submit terminal events here instead of finalizing inline.
     pub(in crate::services::discord) turn_finalizer: Arc<turn_finalizer::TurnFinalizer>,
+    /// EPIC #3078 — single-authority status panel controller (PR-1, DORMANT).
+    /// Peer of `turn_finalizer`: owns the user-visible panel message lifecycle
+    /// (create → stream → finalize → reclaim) with one authority. Spawned next
+    /// to the finalizer but NOT yet routed through by any call site, so it is
+    /// inert until later #3078 routing PRs wire `ensure_created`/`stream_update`/
+    /// `finalize`/`reclaim`. The actor task is gated on `status_panel_v2_enabled`.
+    pub(in crate::services::discord) status_panel_controller:
+        Arc<status_panel_controller::StatusPanelController>,
     /// Process-global finalizing turn counter shared across all providers.
     pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of providers still needing to complete shutdown.
@@ -2250,6 +2259,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
         global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         turn_finalizer: turn_finalizer::TurnFinalizer::spawn(),
+        status_panel_controller: status_panel_controller::StatusPanelController::spawn(false),
         global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         shutdown_counted: std::sync::atomic::AtomicBool::new(false),
