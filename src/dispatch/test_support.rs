@@ -1,7 +1,3 @@
-use std::sync::MutexGuard;
-#[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
-use std::sync::{Mutex, OnceLock};
-
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use crate::db::Db;
 
@@ -117,65 +113,6 @@ pub(crate) async fn seed_pg_dispatch(pool: &sqlx::PgPool, dispatch_id: &str, tit
     .execute(pool)
     .await
     .unwrap_or_else(|err| panic!("seed postgres dispatch {dispatch_id}: {err}"));
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-fn lock_dispatch_test_env() -> MutexGuard<'static, ()> {
-    crate::services::discord::runtime_store::lock_test_env()
-}
-
-#[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
-fn lock_dispatch_test_env() -> MutexGuard<'static, ()> {
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("dispatch test env lock poisoned")
-}
-
-pub(crate) struct DispatchEnvOverride {
-    _lock: MutexGuard<'static, ()>,
-    previous_repo_dir: Option<String>,
-    previous_config: Option<String>,
-}
-
-impl DispatchEnvOverride {
-    pub(crate) fn new(repo_dir: Option<&str>, config_path: Option<&str>) -> Self {
-        let lock = lock_dispatch_test_env();
-        let previous_repo_dir = std::env::var("AGENTDESK_REPO_DIR").ok();
-        let previous_config = std::env::var("AGENTDESK_CONFIG").ok();
-
-        match repo_dir {
-            Some(path) => unsafe { std::env::set_var("AGENTDESK_REPO_DIR", path) },
-            None => unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") },
-        }
-        match config_path {
-            Some(path) => unsafe { std::env::set_var("AGENTDESK_CONFIG", path) },
-            None => unsafe { std::env::remove_var("AGENTDESK_CONFIG") },
-        }
-
-        Self {
-            _lock: lock,
-            previous_repo_dir,
-            previous_config,
-        }
-    }
-}
-
-impl Drop for DispatchEnvOverride {
-    fn drop(&mut self) {
-        if let Some(value) = self.previous_repo_dir.as_deref() {
-            unsafe { std::env::set_var("AGENTDESK_REPO_DIR", value) };
-        } else {
-            unsafe { std::env::remove_var("AGENTDESK_REPO_DIR") };
-        }
-
-        if let Some(value) = self.previous_config.as_deref() {
-            unsafe { std::env::set_var("AGENTDESK_CONFIG", value) };
-        } else {
-            unsafe { std::env::remove_var("AGENTDESK_CONFIG") };
-        }
-    }
 }
 
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
