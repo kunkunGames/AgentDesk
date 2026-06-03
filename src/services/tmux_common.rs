@@ -161,13 +161,28 @@ pub(crate) fn tmux_capture_indicates_claude_tui_actively_streaming(capture: &str
     tmux_capture_indicates_claude_tui_busy(capture)
 }
 
-/// #3107 codex re-review (P2#1): a POSITIVE "Claude TUI is mid-response right
-/// now" signal. Reuses the same busy keywords / active-work markers that the
-/// ready-for-input detector keys off (`esc to interrupt`, spinner verbs,
-/// `⏺ Running/Searching/Reading/Editing …`, etc.) over the recent capture
-/// window. Unlike the absence-of-idle heuristic this cannot be satisfied by a
-/// scrolled / error / non-Claude / generic-prompt pane, so an ambiguous pane is
-/// never misclassified as streaming.
+/// #3107 codex re-review (P2#1, F2): a POSITIVE "Claude TUI is mid-response
+/// right now" signal that requires Claude-TUI-SPECIFIC CHROME, not generic
+/// words. The previous implementation accepted any recent line containing the
+/// bare substrings `processing` / `thinking` / `running`. Those words routinely
+/// appear in ASSISTANT BODY TEXT (e.g. the model writing "the test is
+/// running…") and in non-Claude program output, so a finished or even
+/// non-Claude pane could read as "actively streaming" → wrongly un-suppress /
+/// re-acquire / block reclaim.
+///
+/// The reliable in-progress markers the Claude TUI actually RENDERS are:
+///   1. the `esc to interrupt` footer — the strongest, unambiguous signal; it
+///      only renders while a turn is in flight; and
+///   2. the spinner progress line — a leading spinner glyph (`· ✢ ✻ ✽ ✶ ✳ ✦`)
+///      immediately followed by a work verb (`Actioning…`, `Musing…`,
+///      `Thinking…`, `Processing…`, `Running…`, …). This is the footer the TUI
+///      draws while streaming, NOT free-text in the response body.
+/// Plus the explicit `⏺ Running command / Searching for / Reading / Editing …`
+/// active-work markers via `tmux_recent_lines_show_claude_tui_active_work`.
+///
+/// Bare `processing`/`thinking`/`running` NOT anchored to the spinner glyph or
+/// the `esc to interrupt` footer are DROPPED. Anything that is not a
+/// recognizable Claude-TUI in-progress frame biases to FALSE.
 pub(crate) fn tmux_capture_indicates_claude_tui_busy(capture: &str) -> bool {
     let non_empty = capture
         .lines()
@@ -178,18 +193,53 @@ pub(crate) fn tmux_capture_indicates_claude_tui_busy(capture: &str) -> bool {
     }
     let start = non_empty.len().saturating_sub(CLAUDE_TUI_ACTIVE_SCAN_LINES);
     let recent = &non_empty[start..];
-    // The spinner-verb / "esc to interrupt" / "processing"/"thinking"/"running"
-    // keywords (the same set `..._show_idle_suggestion_chrome` treats as the
-    // "busy → not idle" override) plus the explicit active-work markers
-    // (`Actioning`, `Musing`, `⏺ Running/Searching/Reading/Editing …`).
     recent.iter().any(|line| {
         let trimmed = trim_prompt_line(line);
-        let lower = trimmed.to_ascii_lowercase();
-        lower.contains("esc to interrupt")
-            || lower.contains("processing")
-            || lower.contains("thinking")
-            || lower.contains("running")
+        // (1) the `esc to interrupt` footer — strongest in-flight marker.
+        if trimmed.to_ascii_lowercase().contains("esc to interrupt") {
+            return true;
+        }
+        // (2) the spinner progress line: a leading spinner glyph adjacent to a
+        // work verb, as the Claude TUI renders the streaming footer. The
+        // verb-word match is ANCHORED to the spinner glyph so the same word in
+        // assistant body text does NOT trip it.
+        tmux_line_is_claude_tui_spinner_progress(trimmed)
     }) || tmux_recent_lines_show_claude_tui_active_work(recent)
+}
+
+/// `true` when `line` is a Claude TUI spinner progress footer: a leading spinner
+/// glyph (the rotating set the TUI cycles through) directly followed by a work
+/// verb. Anchoring the verb to the spinner glyph is what distinguishes the TUI
+/// chrome from the same verb appearing in assistant body text.
+fn tmux_line_is_claude_tui_spinner_progress(line: &str) -> bool {
+    const SPINNER_GLYPHS: [char; 8] = ['·', '✢', '✳', '✶', '✻', '✽', '✦', '∗'];
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !SPINNER_GLYPHS.contains(&first) {
+        return false;
+    }
+    // The remainder after the glyph (and its following space) must lead with a
+    // work verb the TUI uses for the streaming footer. Completed-work summaries
+    // (`✻ Churned for 4m 56s`, `✻ Worked for 2s`) use a past-tense "<verb> for
+    // <duration>" shape and must NOT count as in-progress.
+    let rest = chars.as_str().trim_start();
+    let lower = rest.to_ascii_lowercase();
+    if lower.contains(" for ") && !lower.contains("esc to interrupt") {
+        return false;
+    }
+    const WORK_VERBS: [&str; 7] = [
+        "actioning",
+        "musing",
+        "thinking",
+        "processing",
+        "running",
+        "crunching",
+        "churning",
+    ];
+    WORK_VERBS.iter().any(|verb| lower.starts_with(verb))
 }
 
 pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
@@ -1219,6 +1269,40 @@ Press any key to continue . . .
         let capture = "\
 ⏺ Reading src/main.rs
 · Musing… (12s · ↓ 2.1k tokens)";
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    // #3107 codex re-review (P2, F2): the busy classifier previously accepted any
+    // recent line containing the bare substrings `running`/`processing`/`thinking`.
+    // Those words appear in normal ASSISTANT BODY text, so a pane that has
+    // finished but still shows such prose was mis-read as streaming. The marker
+    // must be Claude-TUI chrome (spinner glyph / `esc to interrupt`), not a word.
+    #[test]
+    fn actively_streaming_rejects_assistant_body_with_busy_words_but_no_chrome() {
+        // Assistant body text mentions "running" / "processing" / "thinking" but
+        // there is NO `esc to interrupt` footer and NO spinner progress line.
+        let capture = "\
+⏺ I checked the build: the test suite is running in CI and the worker is
+  still processing the queue while thinking through the edge cases.
+some more scrolled-back assistant prose
+another line of prior output";
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    // #3107 F2: a real Claude TUI in-progress frame keyed only on the strongest
+    // marker (`esc to interrupt`) — no spinner verb, no `⏺` active-work line —
+    // must still read as streaming.
+    #[test]
+    fn actively_streaming_accepts_esc_to_interrupt_footer_only() {
+        let capture = "\
+some earlier assistant prose still on screen
+(13s · ↓ 1.2k tokens · esc to interrupt)";
+        assert!(tmux_capture_indicates_claude_tui_busy(capture));
         assert!(tmux_capture_indicates_claude_tui_actively_streaming(
             capture
         ));

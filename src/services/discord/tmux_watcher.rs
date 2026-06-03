@@ -295,7 +295,15 @@ fn watcher_output_progressed_recently(output_path: &str) -> bool {
     modified
         .elapsed()
         .map(|age| age <= LIVE_TURN_PROGRESS_WINDOW)
-        .unwrap_or(false)
+        // #3107 codex re-review (P2, F4): `elapsed()` returns Err when the file
+        // mtime is in the FUTURE (clock drift / NTP jump / an external write with
+        // a skewed clock). Bias the ambiguous case toward "in progress" (true):
+        // the SAFE direction here is to PRESERVE a live turn's panel, not to
+        // reclaim it. A false "not in progress" would delete a genuinely live
+        // turn's panel; a false "in progress" merely defers reclaim by one sweep.
+        // (Distinct from the mtime-MISSING case above, which returns false for the
+        // abandonment path — that's a different, stale-file signal.)
+        .unwrap_or(true)
 }
 
 /// #3107 self-heal (CHANGE 2): when the pane is actively streaming but the
@@ -2995,6 +3003,18 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     // already exists), so this only bounds the log, not the heal.
     let mut active_stream_inflight_reacquire_logged = false;
     let mut restored_turn = restored_turn;
+    // #3107 codex re-review (P2#3, F3): the #3099 hourglass anchor
+    // (`injected_prompt_message_id`) pinned by the restored turn, captured ONCE
+    // up front before `restored_turn` is consumed by the streaming path's
+    // `restored_turn.take()`. The streaming-interval re-acquire site fires later
+    // in the same dispatch, by which point `restored_turn` is already gone — so
+    // we stash the anchor here and thread it through. This keeps a
+    // hourglass-anchored turn that loses its inflight MID-STREAM re-acquiring an
+    // inflight that still carries the pinned message id, so the `⏳ → ✅`
+    // completion cleanup can find its own message instead of orphaning it.
+    let restored_injected_prompt_message_id = restored_turn
+        .as_ref()
+        .and_then(|turn| turn.injected_prompt_message_id);
     // Guard against duplicate relay: track the offset from which the last relay was sent.
     // If the outer loop circles back and current_offset hasn't advanced past this point,
     // the relay is suppressed.
@@ -3445,9 +3465,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let restored_placeholder = restored_turn
                 .as_ref()
                 .and_then(|turn| (turn.current_msg_id.get() != 0).then_some(turn.current_msg_id));
-            let restored_injected_prompt_message_id = restored_turn
-                .as_ref()
-                .and_then(|turn| turn.injected_prompt_message_id);
             let reacquired = reacquire_watcher_inflight_for_active_stream(
                 &watcher_provider,
                 channel_id,
@@ -4377,14 +4394,17 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             data_start_offset,
                             status_panel_msg_id,
                             placeholder_msg_id,
-                            // #3107 codex re-review (P2#3): no recoverable source
-                            // for the #3099 hourglass anchor in the streaming-interval
-                            // block — the inflight was already cleared and the restored
-                            // seed (if any) was consumed at turn-restore time. The
-                            // re-acquired row is `user_msg_id == 0`, which per #3099/#3100
-                            // the watcher path never ⏳-anchors to a real user message, so
-                            // leaving this None is safe for this owner kind.
-                            None,
+                            // #3107 codex re-review (P2#3, F3): thread the #3099
+                            // hourglass anchor captured up front from the restored
+                            // turn (before `restored_turn` was consumed by the
+                            // streaming path's `.take()`). Previously this was
+                            // hardcoded `None`, so a hourglass-anchored turn that
+                            // lost its inflight MID-STREAM was re-acquired WITHOUT the
+                            // pinned message id — orphaning the `⏳` because the
+                            // `⏳ → ✅` cleanup could no longer find its own anchor.
+                            // Preserving it keeps the re-acquired streaming inflight
+                            // pointing at the hourglass message.
+                            restored_injected_prompt_message_id,
                         );
                         if reacquired && !active_stream_inflight_reacquire_logged {
                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -8323,6 +8343,20 @@ mod tests {
         assert!(
             !watcher_output_progressed_recently(tmp.path().join("missing.jsonl").to_str().unwrap()),
             "a missing output file must read as no progress"
+        );
+
+        // #3107 codex re-review (P2, F4): a FUTURE mtime (clock drift / NTP jump /
+        // an external write with a skewed clock) makes `elapsed()` return Err. The
+        // safe direction is to PRESERVE a live turn's panel, so an unresolvable
+        // elapsed must read as "in progress" — NOT as reclaimable.
+        let future = tmp.path().join("future.jsonl");
+        let future_file = std::fs::File::create(&future).expect("create future output");
+        future_file
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3_600))
+            .expect("post-date future output mtime");
+        assert!(
+            watcher_output_progressed_recently(future.to_str().unwrap()),
+            "a future mtime (clock skew) must bias to in-progress so a live turn's panel is preserved"
         );
     }
 
