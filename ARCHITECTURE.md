@@ -512,6 +512,7 @@ src/
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
 │   │   ├── settings.rs
+│   │   ├── shadow_parity_warn.rs
 │   │   ├── shared_memory.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs

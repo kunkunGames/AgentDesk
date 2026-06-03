@@ -222,6 +222,14 @@ fn delete_error_is_permanent(err: &serenity::Error) -> bool {
 /// builds emit a bounded `warn!` (no `panic!`) so a never-before-seen orphan shape
 /// can never crash a production drain over the legacy gate, which continues to
 /// decide the defer regardless.
+/// One-shot bound for the PR-3 orphan-gate parity-mismatch `warn!`: the drain
+/// runs every sweep, so a persistently-diverging `(channel, panel)` must not
+/// log-flood. Logs each distinct `(channel, panel, controller_owns, legacy_owns)`
+/// shape at most once.
+static ORPHAN_GATE_PARITY_WARNED: super::shadow_parity_warn::ParityWarnOnce<
+    super::shadow_parity_warn::OrphanGateShape,
+> = super::shadow_parity_warn::ParityWarnOnce::new();
+
 fn assert_orphan_gate_parity(
     controller_owns: bool,
     legacy_owns: bool,
@@ -235,12 +243,20 @@ fn assert_orphan_gate_parity(
         controller_owns, legacy_owns,
         "#3078 PR-3 orphan-store drain turn-aware-defer parity mismatch (channel {channel_id}, panel {panel_msg_id}): controller owns={controller_owns}, legacy owns={legacy_owns}"
     );
+    if !ORPHAN_GATE_PARITY_WARNED.should_warn((
+        channel_id,
+        panel_msg_id,
+        controller_owns,
+        legacy_owns,
+    )) {
+        return;
+    }
     tracing::warn!(
         channel = channel_id,
         panel = panel_msg_id,
         controller_owns,
         legacy_owns,
-        "#3078 PR-3 orphan-store drain turn-aware-defer parity mismatch — StatusPanelController disagreed with the legacy inflight-row gate on panel ownership; legacy gate decided the defer (no behaviour change), divergence logged for the later controller-executes cutover"
+        "#3078 PR-3 orphan-store drain turn-aware-defer parity mismatch — StatusPanelController disagreed with the legacy inflight-row gate on panel ownership; legacy gate decided the defer (no behaviour change), divergence logged once for the later controller-executes cutover"
     );
 }
 
@@ -432,6 +448,53 @@ mod tests {
         assert_eq!(controller_c, legacy_c);
         assert!(!legacy_c);
         assert_orphan_gate_parity(controller_c, legacy_c, 902, candidate.get());
+
+        // Case D (regression): the controller ledger already holds a STALE
+        // different id for this channel, but the inflight row has since rebound to
+        // THIS exact candidate. The gate must reflect the row's CURRENT id, not the
+        // stale ledger seed → both defer (true), matching legacy.
+        let ctl_d = StatusPanelController::spawn(true);
+        let key_d = TurnKey::new(serenity::ChannelId::new(903), 0, 0);
+        ctl_d.adopt_recovered(
+            key_d,
+            ProviderKind::Claude,
+            crate::services::discord::status_panel_controller::PanelOwnerKind::Standby,
+            Some(serenity::MessageId::new(9999)),
+        );
+        let inflight_d = Some(candidate.get());
+        let legacy_d = inflight_d == Some(candidate.get());
+        let controller_d = ctl_d
+            .orphan_gate_owns_panel(
+                key_d,
+                ProviderKind::Claude,
+                inflight_d.map(serenity::MessageId::new),
+                candidate,
+            )
+            .await;
+        assert_eq!(
+            controller_d, legacy_d,
+            "stale ledger id must not diverge the gate from legacy"
+        );
+        assert!(legacy_d);
+        assert_orphan_gate_parity(controller_d, legacy_d, 903, candidate.get());
+    }
+
+    /// The mismatch `warn!` is bounded: the same `(channel, panel, controller,
+    /// legacy)` shape is logged at most once, so a per-sweep persistent divergence
+    /// cannot flood. `assert_orphan_gate_parity` is `debug_assert`+warn (would
+    /// panic in test), so we exercise the bound on the underlying guard.
+    #[test]
+    fn orphan_gate_parity_warn_is_bounded_once_per_shape() {
+        // First sighting of a shape logs (true); repeats are suppressed (false).
+        assert!(ORPHAN_GATE_PARITY_WARNED.should_warn((5000, 6000, true, false)));
+        assert!(!ORPHAN_GATE_PARITY_WARNED.should_warn((5000, 6000, true, false)));
+        assert!(!ORPHAN_GATE_PARITY_WARNED.should_warn((5000, 6000, true, false)));
+        // A DISTINCT shape (different decision / panel / channel) logs once more.
+        assert!(ORPHAN_GATE_PARITY_WARNED.should_warn((5000, 6000, false, true)));
+        assert!(ORPHAN_GATE_PARITY_WARNED.should_warn((5000, 6001, true, false)));
+        assert!(ORPHAN_GATE_PARITY_WARNED.should_warn((5001, 6000, true, false)));
+        // Re-asserting the original shape stays suppressed.
+        assert!(!ORPHAN_GATE_PARITY_WARNED.should_warn((5000, 6000, true, false)));
     }
 
     #[test]

@@ -790,32 +790,6 @@ fn placeholder_sweep_leaves_row_unevicted(state: &InflightTurnState) -> bool {
             && (!state.full_response.is_empty() || state.response_sent_offset > 0))
 }
 
-/// EPIC #3078 PR-3 — parity gate between the legacy sweeper reclaim target
-/// (`panel_reclaim_target` + `clear_status_panel_if_current`) and the id the
-/// `StatusPanelController` chooses for the same row; they must agree or routing
-/// the IO through it later would change behaviour. `debug_assert` (test/dev fail
-/// loud) + bounded `warn!` in release (never `panic!`, so an unseen orphan shape
-/// cannot crash a prod sweep over the still-executing legacy path).
-fn assert_sweeper_reclaim_parity(
-    controller_target: Option<serenity::MessageId>,
-    legacy_target: Option<serenity::MessageId>,
-    channel_id: u64,
-) {
-    if controller_target == legacy_target {
-        return;
-    }
-    debug_assert_eq!(
-        controller_target, legacy_target,
-        "#3078 PR-3 sweeper status-panel reclaim parity mismatch (channel {channel_id}): controller chose {controller_target:?}, legacy chose {legacy_target:?}"
-    );
-    tracing::warn!(
-        channel = channel_id,
-        controller_target = ?controller_target,
-        legacy_target = ?legacy_target,
-        "#3078 PR-3 sweeper status-panel reclaim parity mismatch — StatusPanelController chose a different reclaim target than the legacy sweeper; legacy path executed (no behaviour change), divergence logged for the later controller-executes cutover"
-    );
-}
-
 async fn sweep_orphan_status_panel(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -854,7 +828,11 @@ async fn sweep_orphan_status_panel(
                 Some(panel_msg),
             )
             .await;
-        assert_sweeper_reclaim_parity(controller_target, Some(panel_msg), state.channel_id);
+        super::shadow_parity_warn::assert_sweeper_reclaim_parity(
+            controller_target.map(|m| m.get()),
+            Some(panel_msg.get()),
+            state.channel_id,
+        );
     }
     let channel = serenity::ChannelId::new(state.channel_id);
     let committed = match channel.delete_message(http, panel_msg).await {
@@ -1208,11 +1186,25 @@ mod sweeper_reclaim_parity_tests {
     //! equals the legacy `panel_reclaim_target` result for representative orphan
     //! rows, so `assert_sweeper_reclaim_parity` never fires and the legacy
     //! delete/clear keeps executing with no behaviour change.
-    use super::assert_sweeper_reclaim_parity;
+    use crate::services::discord::shadow_parity_warn::{
+        assert_sweeper_reclaim_parity, sweeper_parity_should_warn,
+    };
     use crate::services::discord::status_panel_controller::StatusPanelController;
     use crate::services::discord::turn_finalizer::TurnKey;
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude as serenity;
+
+    fn assert_parity(
+        controller: Option<serenity::MessageId>,
+        legacy: Option<serenity::MessageId>,
+        channel: u64,
+    ) {
+        assert_sweeper_reclaim_parity(
+            controller.map(|m| m.get()),
+            legacy.map(|m| m.get()),
+            channel,
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn controller_chosen_reclaim_target_matches_legacy_for_representative_inputs() {
@@ -1225,7 +1217,7 @@ mod sweeper_reclaim_parity_tests {
             .sweeper_reclaim_parity_id(key, ProviderKind::Claude, legacy)
             .await;
         assert_eq!(controller, legacy);
-        assert_sweeper_reclaim_parity(controller, legacy, 500);
+        assert_parity(controller, legacy, 500);
 
         // Case B: channel-only (`user_msg_id == 0`) orphan row — the controller
         // collapses onto the single adopted live entry, choosing the same id.
@@ -1236,7 +1228,7 @@ mod sweeper_reclaim_parity_tests {
             .sweeper_reclaim_parity_id(key0, ProviderKind::Claude, legacy0)
             .await;
         assert_eq!(controller0, legacy0);
-        assert_sweeper_reclaim_parity(controller0, legacy0, 501);
+        assert_parity(controller0, legacy0, 501);
 
         // Case C: no panel id (the row is not panel-bearing) — both agree on None.
         let legacy_none: Option<serenity::MessageId> = None;
@@ -1246,7 +1238,48 @@ mod sweeper_reclaim_parity_tests {
             .sweeper_reclaim_parity_id(key_none, ProviderKind::Claude, legacy_none)
             .await;
         assert_eq!(controller_none, legacy_none);
-        assert_sweeper_reclaim_parity(controller_none, legacy_none, 502);
+        assert_parity(controller_none, legacy_none, 502);
+
+        // Case D (regression): a STALE id already adopted into the controller
+        // ledger must NOT leak into the reclaim target — the row's CURRENT id is
+        // what legacy reclaims. Seed a stale id, then query with a different
+        // current id; the controller must choose the current id, agreeing with
+        // legacy (and the read-only query leaves the stale ledger id untouched).
+        let ctl_d = StatusPanelController::spawn(true);
+        let key_d = TurnKey::new(serenity::ChannelId::new(503), 5003, 0);
+        ctl_d.adopt_recovered(
+            key_d,
+            ProviderKind::Claude,
+            crate::services::discord::status_panel_controller::PanelOwnerKind::Standby,
+            Some(serenity::MessageId::new(4400)),
+        );
+        let legacy_d = Some(serenity::MessageId::new(4401));
+        let controller_d = ctl_d
+            .sweeper_reclaim_parity_id(key_d, ProviderKind::Claude, legacy_d)
+            .await;
+        assert_eq!(
+            controller_d, legacy_d,
+            "stale ledger id must not diverge the reclaim target from legacy"
+        );
+        assert_parity(controller_d, legacy_d, 503);
+    }
+
+    /// The mismatch `warn!` is bounded: the same `(channel, controller, legacy)`
+    /// shape logs at most once so a per-sweep persistent divergence cannot flood.
+    /// `assert_sweeper_reclaim_parity` is `debug_assert`+warn (would panic in
+    /// test), so we exercise the bound on the underlying guard directly.
+    #[test]
+    fn sweeper_parity_warn_is_bounded_once_per_shape() {
+        // First sighting logs (true); repeats are suppressed (false).
+        assert!(sweeper_parity_should_warn((7000, Some(11), Some(22))));
+        assert!(!sweeper_parity_should_warn((7000, Some(11), Some(22))));
+        assert!(!sweeper_parity_should_warn((7000, Some(11), Some(22))));
+        // Distinct shapes (different ids / channel) log once more.
+        assert!(sweeper_parity_should_warn((7000, Some(22), Some(11))));
+        assert!(sweeper_parity_should_warn((7000, Some(11), None)));
+        assert!(sweeper_parity_should_warn((7001, Some(11), Some(22))));
+        // The original shape stays suppressed.
+        assert!(!sweeper_parity_should_warn((7000, Some(11), Some(22))));
     }
 }
 
