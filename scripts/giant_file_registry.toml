@@ -238,3 +238,9 @@ file = "src/services/discord/voice_barge_in.rs"
 owner = "voice-runtime"
 deadline = "2026-08-31"
 decompose_issue = "#3036"
+
+[[entry]]
+file = "src/server/worker_registry.rs"
+owner = "server-runtime"
+deadline = "2026-08-31"
+decompose_issue = "#3036"
