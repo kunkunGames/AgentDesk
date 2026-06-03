@@ -440,6 +440,114 @@ fn status_panel_renders_session_resumed_line_from_lifecycle_details() {
     assert!(rendered.contains("tmux kept"));
 }
 
+/// #3087 — when a new provider session begins (a provider_session_id delta),
+/// the status panel must drop the previous session's accumulated subagents and
+/// task-tool slots while preserving the context/token usage snapshot. Then,
+/// re-firing the SAME provider_session_id must NOT wipe same-session
+/// accumulation (no spurious reset on unrelated field churn).
+#[test]
+fn status_panel_resets_subagents_and_tasks_on_new_provider_session() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3087);
+
+    // Session A: establish a provider session, then accumulate content + context.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        "session_resumed",
+        &json!({ "provider_session_id": "session-A", "tmux_reused": true }),
+    ));
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Inspect bridge"}).to_string(),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use(
+            "TaskCreate",
+            &json!({"taskId": "task-A", "subject": "session A task"}).to_string(),
+        ),
+    );
+    assert!(events.set_context_panel_usage(channel_id, None, 4000, 80, 10, 1000, 60));
+
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(guard.subagents.len(), 1);
+        assert_eq!(guard.tasks.len(), 1);
+        assert!(guard.context.is_some());
+    }
+
+    // Session B: a NEW provider session id. Content slots must be cleared, but
+    // the context/token snapshot must survive.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        "session_fresh",
+        &json!({ "provider_session_id": "session-B", "tmux_reused": false }),
+    ));
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.subagents.is_empty(),
+            "subagents must reset on a new provider session"
+        );
+        assert!(
+            guard.tasks.is_empty(),
+            "tasks must reset on a new provider session"
+        );
+        assert!(
+            guard.context.is_some(),
+            "context/token usage must be preserved across the boundary"
+        );
+    }
+
+    // Re-accumulate within session B, then re-fire the SAME id (only unrelated
+    // field churn: tmux/recovery). The same-session slots must be retained.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Session B work"}).to_string(),
+        ),
+    );
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        "session_fresh",
+        &json!({ "provider_session_id": "session-B", "tmux_reused": true }),
+    ));
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.subagents.len(),
+            1,
+            "same provider session must NOT reset accumulated subagents"
+        );
+        assert_eq!(
+            guard.subagents.first().map(|slot| slot.desc.as_str()),
+            Some("Session B work")
+        );
+    }
+}
+
 #[test]
 fn status_panel_renders_session_fresh_and_fallback_distinctly() {
     let events = PlaceholderLiveEvents::default();

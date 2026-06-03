@@ -78,6 +78,17 @@ impl SessionPanelSnapshot {
             recovery_message_count,
         })
     }
+
+    /// The provider-issued session id carried by this snapshot, normalized to
+    /// `None` when absent or blank. Used to detect a true session boundary
+    /// (provider session delta) so the status panel can reset its accumulated
+    /// subagents/tasks without reacting to unrelated field churn.
+    pub(super) fn provider_session_id(&self) -> Option<&str> {
+        self.provider_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
 }
 
 pub(super) fn render_session_panel_line(

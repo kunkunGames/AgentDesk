@@ -178,6 +178,27 @@ impl PlaceholderLiveEvents {
         if guard.session == snapshot {
             return false;
         }
+
+        // #3087: detect a TRUE session boundary by comparing the OLD vs NEW
+        // provider session id. Only a real provider-session delta (a new/different
+        // non-empty id) resets the accumulated subagents/tasks/todos/workflows;
+        // unrelated field churn (tmux/recovery_count) within the same provider
+        // session must preserve same-session accumulation, and a missing→missing
+        // id must not trigger a spurious reset.
+        let old_provider_session_id = guard
+            .session
+            .as_ref()
+            .and_then(|session| session.provider_session_id())
+            .map(str::to_owned);
+        let new_provider_session_id = snapshot
+            .as_ref()
+            .and_then(|session| session.provider_session_id());
+        if let Some(new_id) = new_provider_session_id {
+            if old_provider_session_id.as_deref() != Some(new_id) {
+                guard.reset_session_content();
+            }
+        }
+
         guard.session = snapshot;
         true
     }
