@@ -405,12 +405,61 @@ pub(super) async fn drain_merged_queued_placeholders(
     to_delete
 }
 
+/// #3082 part B (codex P2-3): the answer-flush wait gate for intake
+/// placeholders, factored out so the queued-only gating is unit-testable
+/// without a live Discord HTTP client.
+///
+/// Only the queued-turn "📬" notice path waits behind an in-flight multi-chunk
+/// answer flush — so the notice lands as a single TRAILING card after the last
+/// chunk, never interleaved between answer chunks. Active-turn placeholders (a
+/// turn starting NOW, or a TUI idle-response card) pass `is_queued_notice =
+/// false` and return immediately, never delayed behind a flush.
+///
+/// The wait is bounded (progress-aware inactivity grace + absolute hard
+/// ceiling) and the barrier guard is RAII-cleared, so a stuck/errored flush can
+/// never permanently suppress the queued card — we proceed regardless once it
+/// elapses (logged, no deadlock).
+async fn await_answer_flush_if_queued_notice(
+    barrier: &Arc<super::answer_flush_barrier::AnswerFlushBarrier>,
+    channel_id: ChannelId,
+    is_queued_notice: bool,
+) {
+    if !is_queued_notice {
+        return;
+    }
+    if !barrier
+        .wait_for_flush(
+            channel_id,
+            super::answer_flush_barrier::ANSWER_FLUSH_WAIT_TIMEOUT,
+            super::answer_flush_barrier::ANSWER_FLUSH_WAIT_HARD_CEILING,
+        )
+        .await
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⏱ INTAKE: answer-flush barrier timed out for channel {}; posting queued card anyway (no deadlock)",
+            channel_id
+        );
+    }
+}
+
 pub(super) async fn send_intake_placeholder(
     http: Arc<serenity::Http>,
     shared: Arc<SharedData>,
     channel_id: ChannelId,
     reference: Option<(ChannelId, MessageId)>,
+    // #3082 part B (codex P2-3): only the queued-turn notice path must wait on
+    // the answer-flush barrier. Active-turn placeholders (a turn starting NOW,
+    // or a TUI idle-response card) are NOT a trailing "📬 queued" notice and
+    // must NOT be delayed behind a multi-chunk answer flush — set this `false`
+    // for those callers.
+    is_queued_notice: bool,
 ) -> Result<MessageId, String> {
+    // codex P2-3: gate the answer-flush wait to the queued-notice path only;
+    // unrelated active-turn placeholders skip the barrier entirely.
+    await_answer_flush_if_queued_notice(&shared.answer_flush_barrier, channel_id, is_queued_notice)
+        .await;
+
     let client = SerenityTurnOutboundClient { http, shared };
     let mut msg = gateway_outbound_message(channel_id, "...");
     if let Some((reference_channel, reference_message)) = reference {
@@ -1020,5 +1069,78 @@ mod tests {
                 assert_eq!(shared.queued_placeholders.len(), 1);
             });
         });
+    }
+}
+
+/// #3082 part B (codex P2-3): gate-behavior tests for the answer-flush wait.
+/// These do not need a live Discord HTTP client (they exercise only the
+/// `await_answer_flush_if_queued_notice` seam against a real barrier), so they
+/// are compiled unconditionally rather than behind `legacy-sqlite-tests`.
+#[cfg(test)]
+mod answer_flush_gate_tests {
+    use super::await_answer_flush_if_queued_notice;
+    use crate::services::discord::answer_flush_barrier::AnswerFlushBarrier;
+    use poise::serenity_prelude::ChannelId;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// P2-3: a non-queued active-turn placeholder must NOT wait on the barrier,
+    /// even while a multi-chunk answer flush is in flight on the same channel.
+    #[tokio::test]
+    async fn active_turn_placeholder_does_not_wait_on_barrier() {
+        let barrier = Arc::new(AnswerFlushBarrier::default());
+        let channel = ChannelId::new(101);
+        // A multi-chunk answer flush is in flight (guard held) for this channel.
+        let _flush_guard = barrier.begin_flush(channel);
+
+        // An ACTIVE-turn placeholder (is_queued_notice = false) must return
+        // immediately, never blocking behind the in-flight flush.
+        let start = Instant::now();
+        await_answer_flush_if_queued_notice(&barrier, channel, false).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "an active-turn placeholder must NOT wait on the answer-flush barrier"
+        );
+    }
+
+    /// P2-3 (counterpart): the queued-notice path DOES wait behind an in-flight
+    /// flush and only proceeds once the flush ends — proving the gate routes the
+    /// two callers differently.
+    #[tokio::test]
+    async fn queued_notice_placeholder_waits_for_flush() {
+        let barrier = Arc::new(AnswerFlushBarrier::default());
+        let channel = ChannelId::new(102);
+        let flush_guard = barrier.begin_flush(channel);
+
+        let barrier_for_card = barrier.clone();
+        let card = tokio::spawn(async move {
+            // is_queued_notice = true — must block behind the flush.
+            await_answer_flush_if_queued_notice(&barrier_for_card, channel, true).await;
+        });
+
+        // Hold the flush briefly; the queued notice must still be waiting.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !card.is_finished(),
+            "the queued-notice placeholder must wait while the flush is in flight"
+        );
+
+        // Flush ends — the queued notice proceeds.
+        drop(flush_guard);
+        card.await.expect("queued-notice wait task must complete");
+    }
+
+    /// P2-3: with no flush in flight, even the queued-notice path returns
+    /// immediately (the wait is only paid when there is something to wait for).
+    #[tokio::test]
+    async fn queued_notice_returns_immediately_when_no_flush() {
+        let barrier = Arc::new(AnswerFlushBarrier::default());
+        let channel = ChannelId::new(103);
+        let start = Instant::now();
+        await_answer_flush_if_queued_notice(&barrier, channel, true).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "with no flush in flight the queued-notice path must not block"
+        );
     }
 }

@@ -8,7 +8,8 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-06-02 (against #3036 production-LoC remeasure).
+> Last refreshed: 2026-06-03 (against #3082 codex follow-up: edit/replace
+> answer-flush coverage + progress-aware flush wait + queued-only gate).
 
 ## Read This First
 
@@ -126,9 +127,10 @@
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset; split loop helpers
     further before adding behavior).
-  - `src/services/discord/tui_prompt_relay.rs` (3237 lines; SSH-direct TUI
+  - `src/services/discord/tui_prompt_relay.rs` (3241 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
-    outside an extraction plan).
+    outside an extraction plan; +4 from #3082 queued-only answer-flush gate
+    (`is_queued_notice = false` for the TUI idle-response placeholder)).
   - `src/services/codex_tmux_wrapper.rs` (1223 lines; Codex tmux wrapper JSON
     event parser and relay bridge for native Codex session events — bugfix only
     outside an extraction plan).
@@ -136,13 +138,17 @@
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
     outside an extraction plan).
   - `src/services/discord/recovery_engine.rs` (3944 lines).
-  - `src/services/discord/health.rs` (2817 lines after #1879 snapshot/mailbox
-    extraction).
+  - `src/services/discord/health.rs` (2820 lines after #1879 snapshot/mailbox
+    extraction; +3 from #3082 answer-flush-barrier field in the test SharedData
+    constructor).
   - `src/services/discord/health/recovery.rs` (2425 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3611 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3620 lines;
     Discord message intake turn orchestration split from the router message
-    handler; bugfix only outside a further extraction plan).
+    handler; bugfix only outside a further extraction plan; +9 from #3082
+    queued-only answer-flush gate (`is_queued_notice` on the two
+    `send_intake_placeholder` call sites: `true` for the race-lost queued card,
+    `false` for the active-turn placeholder)).
   - `src/services/discord/router/message_handler/headless_turn.rs` (1316 lines;
     headless Discord turn launch/terminal-response path split from the router
     message handler; bugfix only outside a further extraction plan).
@@ -152,11 +158,19 @@
     split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1909 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1243 lines).
-  - `src/services/discord/formatting.rs` (2720 lines).
+  - `src/services/discord/formatting.rs` (2766 lines; +46 from #3082
+    answer-flush-barrier guards (+11 around the plain multi-chunk send loops;
+    +24 from the #3082 codex follow-up that also guards the edit/replace path
+    `replace_long_message_raw_with_outcome` and bumps `note_progress` after each
+    delivered chunk for the progress-aware flush wait; +11 from the codex P1-2
+    residual that bumps `note_progress` after the FIRST edited chunk too, on the
+    multi-chunk path only, so the queued-card waiter's inactivity grace cannot
+    expire between the first edit and the first continuation)).
   - `src/services/discord/settings.rs` (2479 lines).
   - `src/services/discord/prompt_builder/` (directory, refactored).
-  - `src/services/discord/runtime_bootstrap.rs` (2564 lines after #2558
-    thread-session GC loopback shim cleanup).
+  - `src/services/discord/runtime_bootstrap.rs` (2567 lines after #2558
+    thread-session GC loopback shim cleanup; +3 from #3082 answer-flush-barrier
+    field in the SharedData constructor).
   - `src/services/discord/session_runtime.rs` (1418 lines).
   - `src/services/discord/voice_barge_in.rs` (4653 lines; voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
@@ -381,10 +395,11 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
 - `src/services/platform/binary_resolver.rs` (1936).
-- `src/services/discord/mod.rs` (5871; +34 from #3019 added the
+- `src/services/discord/mod.rs` (5883; +34 from #3019 added the
   single-authority `increment_global_active` helper + doc mirroring the
   existing decrement helper — offset by removing 6 inline raw `fetch_add`
-  blocks across the relay turn-start sites that now route through it),
+  blocks across the relay turn-start sites that now route through it; +12 from
+  #3082 answer-flush-barrier field/init/doc),
   `src/services/discord_config_audit.rs` (1318).
 - `src/services/turn_orchestrator.rs` (2932).
 
