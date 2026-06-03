@@ -1745,6 +1745,431 @@ fn status_panel_parallel_subagents_close_correct_slots_in_reverse_order() {
     );
 }
 
+// #3086: a finished subagent whose `tool_result` record carries `toolUseResult`
+// accounting renders the TUI-parity `Done (N tools · M tokens · Xs)` summary on
+// the correct slot, paired by tool_use_id.
+#[test]
+fn status_panel_renders_subagent_done_summary_from_tool_use_result() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(386);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Investigate #3086"}).to_string(),
+            Some("toolu_done"),
+        ),
+    );
+    // The user record closes the Task with its toolUseResult accounting. The
+    // toolUseResult agentId names a rollout file that does NOT exist here, so
+    // the summary must come entirely from the in-stream totals (no IO).
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_done",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "agentId": "amissingrollout000",
+                "totalToolUseCount": 81,
+                "totalTokens": 28824,
+                "totalDurationMs": 1_140_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("explorer Investigate #3086"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    // 81 tools, 28824 → 28.8k tokens, 1_140_000ms → 19m.
+    assert!(
+        line.contains("Done (81 tools · 28.8k tokens · 19m)"),
+        "expected TUI-parity Done summary, got: {line}"
+    );
+    assert!(line.contains('✓'), "finished subagent must show ✓: {line}");
+}
+
+// #3086: a single-tool subagent renders the singular "1 tool" noun and small
+// counts render verbatim (no k suffix), seconds under a minute stay `Xs`.
+#[test]
+fn status_panel_subagent_done_summary_handles_singular_and_small_values() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(387);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "tiny", "description": "Quick probe"}).to_string(),
+            Some("toolu_tiny"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_tiny",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "agentId": "atinyrollout000000",
+                "totalToolUseCount": 1,
+                "totalTokens": 940,
+                "totalDurationMs": 45_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("tiny Quick probe"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    assert!(
+        line.contains("Done (1 tool · 940 tokens · 45s)"),
+        "expected singular/small-value summary, got: {line}"
+    );
+}
+
+// #3086: a malformed/partial `toolUseResult` (string body, no accounting) must
+// not panic and must not synthesize a Done summary — it falls back to the plain
+// finished marker, preserving #3084 pairing behavior.
+#[test]
+fn status_panel_subagent_without_accounting_has_no_done_summary() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(388);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "plain", "description": "No accounting"}).to_string(),
+            Some("toolu_plain"),
+        ),
+    );
+    // toolUseResult is a bare string → not a subagent summary; the legacy Task
+    // tool_result path closes the slot without a Done line.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_plain")),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("plain No accounting"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    assert!(line.contains('✓'), "slot must still close as done: {line}");
+    assert!(
+        !line.contains("Done ("),
+        "no accounting → no Done summary, got: {line}"
+    );
+}
+
+// #3086 P1 #1: a `user` record carrying the subagent `toolUseResult` aggregate
+// PLUS multiple `tool_result` blocks (the finished subagent's Task result + an
+// unrelated foreground tool result) while ANOTHER subagent is still running must
+// attribute the Done summary ONLY to the matching subagent slot. The unrelated
+// block must NOT emit a Done/summary, and the aggregate must NOT mis-route to
+// the still-running slot via the last-unfinished fallback.
+#[test]
+fn status_panel_subagent_summary_attaches_only_to_matching_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(389);
+
+    // Two subagents start in parallel: "done" (will finish) and "running"
+    // (stays running). A foreground Bash also runs concurrently.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "finisher", "description": "Finishing work"}).to_string(),
+            Some("toolu_done"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "worker", "description": "Still running"}).to_string(),
+            Some("toolu_running"),
+        ),
+    );
+
+    // One `user` record carries the subagent aggregate (for toolu_done) AND a
+    // second, unrelated foreground tool_result in the same batch.
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_done",
+                        "is_error": false
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bash_unrelated",
+                        "is_error": false
+                    }
+                ]
+            },
+            "toolUseResult": {
+                "agentId": "afinisher00000000",
+                "totalToolUseCount": 12,
+                "totalTokens": 5000,
+                "totalDurationMs": 30_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let finisher_line = rendered
+        .lines()
+        .find(|line| line.contains("finisher Finishing work"))
+        .unwrap_or_else(|| panic!("finisher slot missing in: {rendered}"));
+    let worker_line = rendered
+        .lines()
+        .find(|line| line.contains("worker Still running"))
+        .unwrap_or_else(|| panic!("worker slot missing in: {rendered}"));
+
+    // The matching subagent gets the Done summary and is marked done.
+    assert!(
+        finisher_line.contains("Done (12 tools · 5k tokens · 30s)"),
+        "matching subagent must carry the Done summary, got: {finisher_line}"
+    );
+    assert!(
+        finisher_line.contains('✓'),
+        "matching subagent must be marked done, got: {finisher_line}"
+    );
+
+    // The still-running subagent must NOT be touched: no Done summary, no
+    // done/fail marker. The unrelated block + the aggregate must never mis-route
+    // here via the last-unfinished fallback.
+    assert!(
+        !worker_line.contains("Done ("),
+        "running subagent must not get a stray Done summary, got: {worker_line}"
+    );
+    assert!(
+        !worker_line.contains('✓') && !worker_line.contains('✗'),
+        "running subagent must stay running (no marker), got: {worker_line}"
+    );
+}
+
+// #3086 P1: a single `user` record may BATCH multiple finished subagents, each
+// `tool_result` block carrying its OWN `toolUseResult` aggregate. Each Done
+// summary must land on ITS OWN slot (keyed by that block's tool_use_id), not all
+// on the first id-bearing block. Subagent A (tuA, summaryA) and subagent B (tuB,
+// summaryB) both finish in one batched record: A's summary → slot tuA, B's → tuB.
+#[test]
+fn status_panel_batched_multi_subagent_summaries_land_on_own_slots() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(392);
+
+    // Two subagents start in parallel.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "alpha", "description": "Task A"}).to_string(),
+            Some("toolu_a"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "beta", "description": "Task B"}).to_string(),
+            Some("toolu_b"),
+        ),
+    );
+
+    // ONE `user` record batches BOTH finished subagents. Each `tool_result`
+    // block carries its OWN `toolUseResult` aggregate (its own agentId/total*).
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_a",
+                        "is_error": false,
+                        "toolUseResult": {
+                            "agentId": "aalpha00000000000",
+                            "totalToolUseCount": 12,
+                            "totalTokens": 5000,
+                            "totalDurationMs": 30_000
+                        }
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_b",
+                        "is_error": false,
+                        "toolUseResult": {
+                            "agentId": "abeta000000000000",
+                            "totalToolUseCount": 81,
+                            "totalTokens": 28824,
+                            "totalDurationMs": 1_140_000
+                        }
+                    }
+                ]
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let alpha_line = rendered
+        .lines()
+        .find(|line| line.contains("alpha Task A"))
+        .unwrap_or_else(|| panic!("alpha slot missing in: {rendered}"));
+    let beta_line = rendered
+        .lines()
+        .find(|line| line.contains("beta Task B"))
+        .unwrap_or_else(|| panic!("beta slot missing in: {rendered}"));
+
+    // A's aggregate lands on A's slot (tuA), B's on B's slot (tuB) — NOT both on
+    // the first block.
+    assert!(
+        alpha_line.contains("Done (12 tools · 5k tokens · 30s)"),
+        "alpha must carry its OWN summary, got: {alpha_line}"
+    );
+    assert!(
+        alpha_line.contains('✓'),
+        "alpha must be marked done, got: {alpha_line}"
+    );
+    assert!(
+        beta_line.contains("Done (81 tools · 28.8k tokens · 19m)"),
+        "beta must carry its OWN summary, got: {beta_line}"
+    );
+    assert!(
+        beta_line.contains('✓'),
+        "beta must be marked done, got: {beta_line}"
+    );
+}
+
+// #3086 P1 #1: a summary-bearing `SubagentEnd` whose `tool_use_id` matches NO
+// tracked slot must be dropped, not mis-routed to the last unfinished slot.
+#[test]
+fn status_panel_unmatched_summary_end_is_dropped_not_misrouted() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(390);
+
+    // A single running subagent with a known id.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "worker", "description": "Long task"}).to_string(),
+            Some("toolu_real"),
+        ),
+    );
+
+    // A summary-bearing end arrives with an id that does NOT match the slot.
+    events.push_status_events(
+        channel_id,
+        vec![StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_ghost".to_string()),
+            summary: Some(crate::services::agent_protocol::SubagentSummary {
+                tool_count: Some(99),
+                tokens: Some(99_999),
+                duration_secs: Some(99),
+            }),
+        }],
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let worker_line = rendered
+        .lines()
+        .find(|line| line.contains("worker Long task"))
+        .unwrap_or_else(|| panic!("worker slot missing in: {rendered}"));
+    assert!(
+        !worker_line.contains("Done ("),
+        "unmatched summary must not land on the running slot, got: {worker_line}"
+    );
+    assert!(
+        !worker_line.contains('✓') && !worker_line.contains('✗'),
+        "unmatched summary-bearing end must not close the slot, got: {worker_line}"
+    );
+}
+
+// #3086 P1 #2: the hot-path summary extraction (`subagent_summary_from_user_record`
+// via `status_events_from_json`) must rely ONLY on the in-stream `toolUseResult`
+// aggregate — no synchronous rollout file read. With `cwd`/`sessionId`/`agentId`
+// present but accounting fields missing, the previous code would have read a
+// rollout file off disk; now it must return a partial summary from in-stream
+// fields alone (no IO), omitting the missing parts.
+#[test]
+fn status_panel_subagent_summary_no_rollout_io_on_hot_path() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(391);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "partial", "description": "Partial accounting"}).to_string(),
+            Some("toolu_partial"),
+        ),
+    );
+
+    // Aggregate has agentId + cwd + sessionId (the old fallback trigger) and
+    // ONLY tool_count — tokens/duration are absent. No rollout file is read, so
+    // the missing fields are simply omitted from the Done line.
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "cwd": "/tmp/some/project",
+            "sessionId": "f525f356-9cf1-4c45-b992-4e1210ee68be",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_partial",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "agentId": "apartialrollout00",
+                "totalToolUseCount": 7
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("partial Partial accounting"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    // Only the in-stream tool_count survives; tokens/duration are omitted (no IO
+    // fallback computed them).
+    assert!(
+        line.contains("Done (7 tools)"),
+        "partial in-stream summary expected, got: {line}"
+    );
+    assert!(
+        !line.contains("tokens") && !line.contains('·'),
+        "no rollout-derived fields should appear (no IO), got: {line}"
+    );
+    assert!(line.contains('✓'), "slot must still close as done: {line}");
+}
+
 #[test]
 fn status_events_from_json_captures_workflow_progress_array() {
     let events = status_events_from_json(&json!({
@@ -2273,7 +2698,8 @@ fn status_tool_result_closes_subagent_only_for_task_tools() {
             StatusEvent::ToolEnd { success: false },
             StatusEvent::SubagentEnd {
                 success: false,
-                tool_use_id: None
+                tool_use_id: None,
+                summary: None
             }
         ]
     );

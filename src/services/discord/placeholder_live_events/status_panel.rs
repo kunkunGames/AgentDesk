@@ -1,4 +1,4 @@
-use crate::services::agent_protocol::{StatusEvent, StatusTodoItem};
+use crate::services::agent_protocol::{StatusEvent, StatusTodoItem, SubagentSummary};
 use crate::services::provider::ProviderKind;
 
 use super::common::{
@@ -29,6 +29,10 @@ pub(super) struct SubagentSlot {
     /// exact slot it belongs to (#3084) instead of the first unfinished one,
     /// which mis-attributes completion across parallel subagents.
     tool_use_id: Option<String>,
+    /// TUI-parity accounting (tool count / tokens / duration) populated from the
+    /// finishing `SubagentEnd` (#3086). Drives the `Done (N tools · M tokens ·
+    /// Xs)` summary on the slot's render line.
+    summary: Option<SubagentSummary>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DerivedStatus {
@@ -132,6 +136,7 @@ impl StatusPanelState {
                     recent: None,
                     finished: None,
                     tool_use_id,
+                    summary: None,
                 });
                 self.status = DerivedStatus::SubagentRunning { desc };
                 trim_subagents(&mut self.subagents);
@@ -152,6 +157,7 @@ impl StatusPanelState {
             StatusEvent::SubagentEnd {
                 success,
                 tool_use_id,
+                summary,
             } => {
                 // #3084: prefer closing the slot whose Task tool-use id matches
                 // the result. This pairs a long-running subagent to its own
@@ -160,21 +166,38 @@ impl StatusPanelState {
                 // parallel subagents. Fall back to the first unfinished slot
                 // only when no id is available or no slot matches (e.g.
                 // backends that cannot surface a tool-use id).
-                let matched = tool_use_id.as_deref().and_then(|id| {
-                    self.subagents.iter_mut().rev().find(|slot| {
+                let id = tool_use_id.as_deref();
+                let matched = id.and_then(|id| {
+                    self.subagents.iter().rposition(|slot| {
                         slot.finished.is_none() && slot.tool_use_id.as_deref() == Some(id)
                     })
                 });
-                let slot = match matched {
-                    Some(slot) => Some(slot),
+                // #3086 P1: a summary-bearing end carries accounting for ONE
+                // specific subagent (identified by its `tool_use_id`). If that
+                // id does not match a tracked slot, the end MUST NOT fall back
+                // to the last-unfinished slot — doing so would mark an unrelated
+                // running subagent Done with the wrong summary. Drop the unmatched
+                // summary-bearing end entirely. A plain (no-summary) end keeps the
+                // legacy fallback so #3084 id-less backends still close a slot.
+                let has_summary = summary.as_ref().is_some_and(|s| !s.is_empty());
+                let target = match matched {
+                    Some(index) => Some(index),
+                    None if has_summary && id.is_some() => None,
                     None => self
                         .subagents
-                        .iter_mut()
-                        .rev()
-                        .find(|slot| slot.finished.is_none()),
+                        .iter()
+                        .rposition(|slot| slot.finished.is_none()),
                 };
+                let slot = target.map(|index| &mut self.subagents[index]);
                 if let Some(slot) = slot {
                     slot.finished = Some(success);
+                    // #3086: attach the TUI-parity Done summary to the closing
+                    // slot. Only overwrite when the event actually carries
+                    // accounting, so an id-less terminal notification does not
+                    // wipe a richer summary already present on the slot.
+                    if let Some(summary) = summary.filter(|summary| !summary.is_empty()) {
+                        slot.summary = Some(summary);
+                    }
                 }
                 self.status = DerivedStatus::Running;
             }
@@ -555,11 +578,88 @@ fn render_subagent_slot(slot: &SubagentSlot) -> String {
         line.push_str(" — ");
         line.push_str(&escape_status_panel_markdown(&normalize_summary(recent)));
     }
+    // #3086: append the TUI-parity Done summary on finished slots that carry
+    // accounting (`Done (N tools · M tokens · Xs)`).
+    if let Some(summary) = slot
+        .summary
+        .as_ref()
+        .filter(|_| matches!(slot.finished, Some(true)))
+        .filter(|summary| !summary.is_empty())
+    {
+        if let Some(done) = render_subagent_done_summary(summary) {
+            line.push_str(" — ");
+            line.push_str(&done);
+        }
+    }
     if !marker.is_empty() {
         line.push(' ');
         line.push_str(marker);
     }
     truncate_chars(&line, EVENT_LINE_MAX_CHARS)
+}
+
+/// Formats the TUI-parity `Done (N tools · M tokens · Xs)` summary. Each part is
+/// included only when present, so a partial summary still renders what it has.
+/// Returns `None` when no part is available.
+fn render_subagent_done_summary(summary: &SubagentSummary) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(count) = summary.tool_count {
+        let noun = if count == 1 { "tool" } else { "tools" };
+        parts.push(format!("{count} {noun}"));
+    }
+    if let Some(tokens) = summary.tokens {
+        parts.push(format!("{} tokens", format_compact_count(tokens)));
+    }
+    if let Some(secs) = summary.duration_secs {
+        parts.push(format_duration_secs(secs));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("Done ({})", parts.join(" · ")))
+}
+
+/// Compact count formatting mirroring the TUI (`28824` → `28.8k`, `1_500_000`
+/// → `1.5m`). Values under 1000 render verbatim.
+fn format_compact_count(value: u64) -> String {
+    if value < 1_000 {
+        return value.to_string();
+    }
+    if value < 1_000_000 {
+        let scaled = value as f64 / 1_000.0;
+        return format!("{}k", trim_one_decimal(scaled));
+    }
+    let scaled = value as f64 / 1_000_000.0;
+    format!("{}m", trim_one_decimal(scaled))
+}
+
+/// Renders a one-decimal number without a trailing `.0` (`28.8` stays,
+/// `19.0` → `19`).
+fn trim_one_decimal(value: f64) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if (rounded.fract()).abs() < f64::EPSILON {
+        format!("{}", rounded as u64)
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+/// Humanizes a duration in seconds the way the TUI does: `45s`, `19m`, `1h2m`.
+fn format_duration_secs(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let rem_minutes = minutes % 60;
+    if rem_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h{rem_minutes}m")
+    }
 }
 
 fn sanitize_label(raw: &str) -> String {
