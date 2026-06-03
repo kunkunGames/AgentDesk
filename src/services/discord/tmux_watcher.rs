@@ -142,19 +142,28 @@ fn watcher_should_create_external_input_status_panel(
 ///
 /// * `Bound` / `AlreadyBound` → the row now owns this exact panel; adopt it and
 ///   do NOT delete (deleting would remove a legitimately-bound panel).
-/// * any other outcome (`SkippedPanelAlreadySet` → the row owns a *different*
-///   panel; `GuardMismatch` / `Missing` / `IoError` → the bind never happened)
-///   → the row does NOT reference our panel, so the watcher must not claim
-///   ownership of it. Delete the just-sent duplicate and adopt the row's panel
-///   only when it is the SAME turn we sent for (`identity_matches`); a
-///   replacement turn's panel belongs to that turn and must not be tracked here.
+/// * `SkippedPanelAlreadySet(owned)` → the row owns a *different* panel id,
+///   observed under the bind's flock. Delete the just-sent duplicate and adopt
+///   the row's CURRENT owned panel id (`owned`) — never the pre-bind snapshot,
+///   which can be stale when a concurrent writer set the panel between the
+///   watcher's snapshot load and this atomic bind (#3077 codex P2 #2). The
+///   adoption is still gated on `identity_matches` at the call site, so a
+///   replacement turn's panel is not tracked here.
+/// * `GuardMismatch` / `Missing` / `IoError` → the bind never happened → the
+///   row does NOT reference our panel, so the watcher must not claim ownership
+///   of it. Delete the just-sent duplicate and adopt nothing here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TuiStatusPanelBindDecision {
     /// Delete (or enqueue-delete) the just-sent panel message.
     delete_sent_panel: bool,
     /// When `true`, adopt the just-sent `panel_msg.id`; when `false`, adopt the
-    /// row's persisted handle (only if this is the same turn).
+    /// row's owned handle (`owned_panel_id`, only if this is the same turn).
     adopt_sent_panel: bool,
+    /// On `SkippedPanelAlreadySet`, the row's CURRENT owned (real) panel id as
+    /// observed by the bind under its flock. The caller adopts this — gated on
+    /// `identity_matches` — instead of re-reading the (possibly stale) pre-bind
+    /// snapshot. `None` for every other outcome.
+    owned_panel_id: Option<u64>,
 }
 
 fn resolve_tui_status_panel_bind_decision(
@@ -165,14 +174,20 @@ fn resolve_tui_status_panel_bind_decision(
         Outcome::Bound | Outcome::AlreadyBound => TuiStatusPanelBindDecision {
             delete_sent_panel: false,
             adopt_sent_panel: true,
+            owned_panel_id: None,
         },
-        Outcome::SkippedPanelAlreadySet
-        | Outcome::GuardMismatch
-        | Outcome::Missing
-        | Outcome::IoError => TuiStatusPanelBindDecision {
+        Outcome::SkippedPanelAlreadySet(owned) => TuiStatusPanelBindDecision {
             delete_sent_panel: true,
             adopt_sent_panel: false,
+            owned_panel_id: Some(owned),
         },
+        Outcome::GuardMismatch | Outcome::Missing | Outcome::IoError => {
+            TuiStatusPanelBindDecision {
+                delete_sent_panel: true,
+                adopt_sent_panel: false,
+                owned_panel_id: None,
+            }
+        }
     }
 }
 
@@ -1181,14 +1196,20 @@ mod pane_dead_identity_tests {
     }
 
     #[test]
-    fn tui_status_panel_bind_skipped_panel_already_set_deletes_and_disowns() {
-        // The inflight row already carries a DIFFERENT panel id: our just-sent
-        // panel is a duplicate and must be deleted, never adopted as our handle.
+    fn tui_status_panel_bind_skipped_panel_already_set_deletes_and_adopts_owned() {
+        // #3077 codex P2 #2: the inflight row already carries a DIFFERENT panel id
+        // (observed under the bind's flock). Our just-sent panel is a duplicate and
+        // must be deleted, never adopted as our handle. The decision must surface
+        // the row's CURRENT owned id so the caller adopts the real panel instead of
+        // the (possibly stale) pre-bind snapshot.
         let decision = resolve_tui_status_panel_bind_decision(
-            crate::services::discord::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet,
+            crate::services::discord::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet(
+                4242,
+            ),
         );
         assert!(decision.delete_sent_panel);
         assert!(!decision.adopt_sent_panel);
+        assert_eq!(decision.owned_panel_id, Some(4242));
     }
 
     #[test]
@@ -1198,6 +1219,8 @@ mod pane_dead_identity_tests {
         );
         assert!(decision.delete_sent_panel);
         assert!(!decision.adopt_sent_panel);
+        // No owned id to adopt → handle left unset (safe).
+        assert_eq!(decision.owned_panel_id, None);
     }
 
     #[test]
@@ -1207,6 +1230,7 @@ mod pane_dead_identity_tests {
         );
         assert!(decision.delete_sent_panel);
         assert!(!decision.adopt_sent_panel);
+        assert_eq!(decision.owned_panel_id, None);
     }
 
     #[test]
@@ -1218,6 +1242,7 @@ mod pane_dead_identity_tests {
         );
         assert!(decision.delete_sent_panel);
         assert!(!decision.adopt_sent_panel);
+        assert_eq!(decision.owned_panel_id, None);
     }
 
     #[test]
@@ -4795,16 +4820,23 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                                     panel_msg.id.get(),
                                                 );
                                             }
-                                            // Resolve the handle from the inflight row, never from
-                                            // the just-sent duplicate: only adopt the row's panel
-                                            // when it is the SAME turn we sent for
-                                            // (`identity_matches`); a replacement turn's panel
-                                            // belongs to that turn and must not be tracked here.
+                                            // Resolve the handle from the row's CURRENT owned panel
+                                            // id as observed by the bind (decision.owned_panel_id),
+                                            // never from the just-sent duplicate and never from the
+                                            // pre-bind `fresh_inflight` snapshot (#3077 codex P2 #2).
+                                            // The snapshot can be stale: when a concurrent writer set
+                                            // the panel between our snapshot load and this atomic
+                                            // bind, the bind returns SkippedPanelAlreadySet carrying
+                                            // the freshly-set id while the snapshot still shows none.
+                                            // `owned_panel_id` is `None` for GuardMismatch / Missing /
+                                            // IoError (the bind observed no panel we may claim), which
+                                            // correctly leaves the handle unset (safe). Adopt only for
+                                            // the SAME turn we sent for (`identity_matches`); a
+                                            // replacement turn's panel belongs to that turn.
                                             let resolved_handle = if identity_matches {
-                                                watcher_persisted_status_panel_msg_id(
-                                                    fresh_inflight.as_ref(),
-                                                    &tmux_session_name,
-                                                )
+                                                decision
+                                                    .owned_panel_id
+                                                    .map(serenity::MessageId::new)
                                             } else {
                                                 None
                                             };

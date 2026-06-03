@@ -120,7 +120,7 @@
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7347 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (7369 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable

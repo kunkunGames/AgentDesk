@@ -1260,9 +1260,12 @@ pub(in crate::services::discord) enum StatusPanelBindOutcome {
     Bound,
     /// The row already carried `msg_id`; nothing was written.
     AlreadyBound,
-    /// The row exists but a real panel id is already set and
-    /// `skip_if_panel_already_set` was requested — left untouched.
-    SkippedPanelAlreadySet,
+    /// The row exists but a DIFFERENT real panel id is already set and
+    /// `skip_if_panel_already_set` was requested — left untouched. Carries the
+    /// row's currently-owned (real) panel id as observed under the same flock,
+    /// so the caller can adopt the row's actual panel without a second
+    /// (racy) re-read of the inflight row.
+    SkippedPanelAlreadySet(u64),
     /// No inflight row exists for `(provider, channel_id)`.
     Missing,
     /// The on-disk row did not satisfy `require_user_msg_id` /
@@ -1318,11 +1321,23 @@ fn bind_status_panel_in_root(
     {
         return StatusPanelBindOutcome::GuardMismatch;
     }
-    if guard.skip_if_panel_already_set && status_panel_id_is_real(state.status_message_id) {
-        return StatusPanelBindOutcome::SkippedPanelAlreadySet;
-    }
+    // Same-id re-bind is idempotent and must classify as `AlreadyBound`
+    // REGARDLESS of `skip_if_panel_already_set` — an idempotent re-bind of the
+    // panel this row already owns is a no-op, not a "duplicate skip". Checking
+    // the skip flag first (#3077 codex P2 #1) misclassified a same-id re-bind as
+    // `SkippedPanelAlreadySet`, which the TUI-direct caller then routed to a
+    // DELETE of the row's own already-bound panel. Order: same-id → AlreadyBound;
+    // else a DIFFERENT real id already set + skip flag → SkippedPanelAlreadySet.
     if state.status_message_id == Some(msg_id) {
         return StatusPanelBindOutcome::AlreadyBound;
+    }
+    if guard.skip_if_panel_already_set && status_panel_id_is_real(state.status_message_id) {
+        // Safe: `status_panel_id_is_real` only returns true for `Some(real)`,
+        // and we already handled `Some(msg_id)` above, so this is a DIFFERENT
+        // real panel id. Carry it so the caller adopts the row's owned panel.
+        return StatusPanelBindOutcome::SkippedPanelAlreadySet(
+            state.status_message_id.unwrap_or_default(),
+        );
     }
     state.status_message_id = Some(msg_id);
     match persist_under_lock(
@@ -2690,9 +2705,76 @@ mod stall_recovery_tests {
             },
         );
 
-        assert_eq!(outcome, StatusPanelBindOutcome::SkippedPanelAlreadySet);
+        // Carries the row's owned (DIFFERENT) panel id so the caller can adopt it.
+        assert_eq!(
+            outcome,
+            StatusPanelBindOutcome::SkippedPanelAlreadySet(4242)
+        );
         // Canonical panel preserved — not overwritten by the duplicate.
         assert_eq!(loaded_status_message_id(temp.path(), 7004), Some(4242));
+    }
+
+    #[test]
+    fn bind_status_panel_same_id_is_already_bound_even_with_skip_flag() {
+        // #3077 (codex P2 #1): an idempotent re-bind of the SAME panel id the row
+        // already owns must classify as `AlreadyBound`, NOT
+        // `SkippedPanelAlreadySet`, even when `skip_if_panel_already_set` is set.
+        // Misclassifying it routed the TUI-direct caller to DELETE its own panel.
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7007,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7007,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::AlreadyBound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7007), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_different_id_skips_and_reports_owned_id() {
+        // A DIFFERENT real panel id already set + skip flag → SkippedPanelAlreadySet
+        // carrying the row's owned id (so the caller adopts the real panel).
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7008,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(4242),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7008,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            StatusPanelBindOutcome::SkippedPanelAlreadySet(4242)
+        );
+        assert_eq!(loaded_status_message_id(temp.path(), 7008), Some(4242));
     }
 
     #[test]
