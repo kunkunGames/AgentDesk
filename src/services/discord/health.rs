@@ -54,7 +54,7 @@ use recovery::{
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use session_enrichment::WATCHER_STATE_DESYNC_STALE_MS;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-use snapshot::normalize_global_active_counter;
+use snapshot::assert_global_active_invariant;
 #[allow(unused_imports)]
 pub use snapshot::{
     DiscordHealthSnapshot, HealthStatus, WatcherStateSnapshot, active_request_owner_for_channel,
@@ -4859,27 +4859,115 @@ agents:
     }
 
     #[test]
-    fn normalize_global_active_counter_preserves_ordinary_snapshot_races() {
-        let (global_active, reason) = normalize_global_active_counter(3, 2, 0);
+    fn global_active_invariant_holds_for_balanced_counter() {
+        // global_active == provider_active_turns: the 1:1 increment/decrement
+        // invariant is satisfied, so no assertion/degraded reason fires and the
+        // real atomic value is reported unchanged.
+        let (global_active, reason) = assert_global_active_invariant(2, 2, 0);
 
-        assert_eq!(global_active, 3);
+        assert_eq!(global_active, 2);
         assert_eq!(reason, None);
     }
 
     #[test]
-    fn normalize_global_active_counter_bounds_wrapped_values_only() {
-        let (global_active, reason) = normalize_global_active_counter(usize::MAX, 2, 1);
+    fn global_active_invariant_tolerates_single_snapshot_race() {
+        // A one-turn skew between reading the provider snapshots and the atomic
+        // is a benign race, not drift: report the real value, stay quiet.
+        let (active_higher, reason_higher) = assert_global_active_invariant(3, 2, 0);
+        assert_eq!(active_higher, 3);
+        assert_eq!(reason_higher, None);
+
+        let (active_lower, reason_lower) = assert_global_active_invariant(1, 2, 0);
+        assert_eq!(active_lower, 1);
+        assert_eq!(reason_lower, None);
+    }
+
+    #[test]
+    fn global_active_invariant_fires_loudly_on_real_drift() {
+        // Drift beyond the snapshot-race tolerance means the +1/-1 gating broke:
+        // surface a loud degraded reason but still report the REAL atomic value
+        // (never a silently fabricated/substituted count).
+        let (global_active, reason) = assert_global_active_invariant(5, 2, 0);
+
+        assert_eq!(global_active, 5);
+        assert!(reason.is_some_and(|reason| {
+            reason.starts_with("global_active_drift:")
+                && reason.contains("global_active=5")
+                && reason.contains("provider_active_turns=2")
+                && reason.contains("global_finalizing=0")
+        }));
+    }
+
+    #[test]
+    fn global_active_invariant_clamps_only_wrapped_values_loudly() {
+        // The saturating decrement floor should make this unreachable, but a
+        // pathological wrapped reading clamps the DISPLAY to the observed count
+        // (loudly), never silently.
+        let (global_active, reason) = assert_global_active_invariant(usize::MAX, 2, 1);
 
         assert_eq!(global_active, 2);
         assert!(reason.is_some_and(|reason| {
-            reason.contains("raw=")
+            reason.starts_with("global_active_counter_out_of_bounds:raw=")
                 && reason.contains("provider_active_turns=2")
                 && reason.contains("global_finalizing=1")
         }));
     }
 
     #[tokio::test]
-    async fn health_snapshot_bounds_wrapped_global_active_counter() {
+    async fn health_snapshot_global_active_invariant_quiet_when_balanced() {
+        // Balanced state: two seeded active turns, global_active == 2. The
+        // single-authority +1/-1 invariant holds, so the snapshot must NOT be
+        // degraded by the counter and must report the real value with no
+        // global_active_* degraded reason and no debug_assert panic.
+        let harness = TestHealthHarness::new().await;
+        harness
+            .seed_active_turn(713_000_000_000_000_010, 42, 9_001)
+            .await;
+        harness
+            .seed_active_turn(713_000_000_000_000_011, 43, 9_002)
+            .await;
+
+        let snapshot = build_health_snapshot(&harness.registry()).await;
+        let json = serde_json::to_value(&snapshot).unwrap();
+
+        assert_eq!(json["global_active"], 2);
+        assert_eq!(json["providers"][0]["active_turns"], 2);
+        assert!(
+            !json["degraded_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|reason| reason
+                    .as_str()
+                    .is_some_and(|reason| reason.starts_with("global_active_"))),
+            "balanced counter must not emit a global_active degraded reason"
+        );
+    }
+
+    // Artificial drift must fire the LOUD debug_assert at the snapshot callsite
+    // in debug/CI builds (this is the fail-fast that replaces the silent
+    // band-aid). Real builds keep going via the degraded reason + metric, which
+    // is covered by the pure-detector unit tests above.
+    #[tokio::test]
+    #[should_panic(expected = "global_active invariant violation")]
+    async fn health_snapshot_global_active_drift_panics_in_debug() {
+        let harness = TestHealthHarness::new().await;
+        harness
+            .seed_active_turn(713_000_000_000_000_010, 42, 9_001)
+            .await;
+        harness
+            .seed_active_turn(713_000_000_000_000_011, 43, 9_002)
+            .await;
+        // Inject drift well beyond the snapshot-race tolerance: global_active=5
+        // while only 2 mailbox slots are active.
+        harness.shared.global_active.store(5, Ordering::Relaxed);
+
+        let _ = build_health_snapshot(&harness.registry()).await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "global_active invariant violation")]
+    async fn health_snapshot_wrapped_global_active_counter_panics_in_debug() {
         let harness = TestHealthHarness::new().await;
         harness
             .seed_active_turn(713_000_000_000_000_010, 42, 9_001)
@@ -4892,22 +4980,7 @@ agents:
             .global_active
             .store(usize::MAX, Ordering::Relaxed);
 
-        let snapshot = build_health_snapshot(&harness.registry()).await;
-        let json = serde_json::to_value(&snapshot).unwrap();
-
-        assert_eq!(snapshot.status(), HealthStatus::Degraded);
-        assert_eq!(json["global_active"], 2);
-        assert_eq!(json["global_finalizing"], 0);
-        assert_eq!(json["providers"][0]["active_turns"], 2);
-        assert!(
-            json["degraded_reasons"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|reason| reason.as_str().is_some_and(
-                    |reason| reason.starts_with("global_active_counter_out_of_bounds:raw=")
-                ))
-        );
+        let _ = build_health_snapshot(&harness.registry()).await;
     }
 
     #[tokio::test]
