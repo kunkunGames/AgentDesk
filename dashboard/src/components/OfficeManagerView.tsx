@@ -375,13 +375,36 @@ export default function OfficeManagerView({
                     <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("아이콘", "Icon")}
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      {OFFICE_ICONS.map((icon) => (
+                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={tr("아이콘", "Icon")}>
+                      {OFFICE_ICONS.map((icon, idx) => (
                         <button
                           key={icon}
                           type="button"
+                          role="radio"
                           aria-label={tr(`아이콘 ${icon}`, `Icon ${icon}`)}
-                          aria-pressed={draft.icon === icon}
+                          aria-checked={draft.icon === icon}
+                          tabIndex={draft.icon === icon || (!OFFICE_ICONS.includes(draft.icon) && idx === 0) ? 0 : -1}
+                          onKeyDown={(e) => {
+                            let nextIdx = idx;
+                            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                              e.preventDefault();
+                              nextIdx = (idx + 1) % OFFICE_ICONS.length;
+                            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                              e.preventDefault();
+                              nextIdx = (idx - 1 + OFFICE_ICONS.length) % OFFICE_ICONS.length;
+                            } else if (e.key === "Home") {
+                              e.preventDefault();
+                              nextIdx = 0;
+                            } else if (e.key === "End") {
+                              e.preventDefault();
+                              nextIdx = OFFICE_ICONS.length - 1;
+                            }
+                            if (nextIdx !== idx) {
+                              setDraft((prev) => ({ ...prev, icon: OFFICE_ICONS[nextIdx] }));
+                              const nextButton = e.currentTarget.parentElement?.children[nextIdx] as HTMLButtonElement | undefined;
+                              nextButton?.focus();
+                            }
+                          }}
                           onClick={() => setDraft((prev) => ({ ...prev, icon }))}
                           className="flex h-10 w-10 items-center justify-center rounded-xl text-lg transition-colors"
                           style={{
@@ -403,13 +426,36 @@ export default function OfficeManagerView({
                     <div className="mb-1 text-xs font-medium" style={{ color: "var(--th-text-muted)" }}>
                       {tr("대표 색상", "Accent Color")}
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      {OFFICE_COLORS.map((color) => (
+                    <div className="flex flex-wrap gap-2" role="radiogroup" aria-label={tr("대표 색상", "Accent Color")}>
+                      {OFFICE_COLORS.map((color, idx) => (
                         <button
                           key={color}
                           type="button"
+                          role="radio"
                           aria-label={tr(`색상 ${color}`, `Color ${color}`)}
-                          aria-pressed={draft.color === color}
+                          aria-checked={draft.color === color}
+                          tabIndex={draft.color === color || (!OFFICE_COLORS.includes(draft.color) && idx === 0) ? 0 : -1}
+                          onKeyDown={(e) => {
+                            let nextIdx = idx;
+                            if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+                              e.preventDefault();
+                              nextIdx = (idx + 1) % OFFICE_COLORS.length;
+                            } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+                              e.preventDefault();
+                              nextIdx = (idx - 1 + OFFICE_COLORS.length) % OFFICE_COLORS.length;
+                            } else if (e.key === "Home") {
+                              e.preventDefault();
+                              nextIdx = 0;
+                            } else if (e.key === "End") {
+                              e.preventDefault();
+                              nextIdx = OFFICE_COLORS.length - 1;
+                            }
+                            if (nextIdx !== idx) {
+                              setDraft((prev) => ({ ...prev, color: OFFICE_COLORS[nextIdx] }));
+                              const nextButton = e.currentTarget.parentElement?.children[nextIdx] as HTMLButtonElement | undefined;
+                              nextButton?.focus();
+                            }
+                          }}
                           onClick={() => setDraft((prev) => ({ ...prev, color }))}
                           className="h-9 w-9 rounded-full border-2 transition-transform hover:scale-105"
                           style={{
