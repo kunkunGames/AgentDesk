@@ -116,12 +116,12 @@
   parsing), `src/services/discord/inflight.rs` (state file contract).
 - legacy_modules: none — relay routes are being consolidated, not replaced.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/services/discord/watchers/lifecycle.rs` (2315 lines — canonical
+  - `src/services/discord/watchers/lifecycle.rs` (2313 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
-  - `src/services/discord/tmux.rs` (2207 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2206 lines after #2558 dead-code sweep;
     failover guard; still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (6725 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (6056 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires; split loop helpers
     further before adding behavior).
@@ -139,7 +139,7 @@
     extraction).
   - `src/services/discord/health/recovery.rs` (2382 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3651 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3613 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan).
   - `src/services/discord/router/message_handler/headless_turn.rs` (1318 lines;
@@ -151,7 +151,7 @@
     split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1909 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1132 lines).
-  - `src/services/discord/formatting.rs` (2713 lines).
+  - `src/services/discord/formatting.rs` (2708 lines).
   - `src/services/discord/settings.rs` (2479 lines).
   - `src/services/discord/prompt_builder/` (directory, refactored).
   - `src/services/discord/runtime_bootstrap.rs` (2564 lines after #2558
@@ -194,7 +194,7 @@
   its query/command/view/FSM behavior lives under
   `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
   smaller route-delegation slices.
-  `src/services/auto_queue/activate_command.rs` (1224 lines, post-#1444
+  `src/services/auto_queue/activate_command.rs` (1221 lines, post-#1444
   idempotency-guard expansion) is the canonical activate/dispatch-next
   command surface; it is intentionally above the giant-file threshold and
   tracked here. Further growth requires a split issue.
@@ -233,7 +233,7 @@
 - do_not_edit_without_migration_plan (giant-file):
   - `src/cli/migrate.rs` is the retired postgres-cutover facade (now below the
     giant-file threshold; bugfix only).
-  - `src/cli/doctor/orchestrator.rs` (4428 lines).
+  - `src/cli/doctor/orchestrator.rs` (4430 lines).
   - `src/cli/migrate/apply.rs` (3146 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
@@ -262,7 +262,7 @@
   - `src/server/mod.rs` (2484 lines).
   - `src/receipt.rs` (1843 lines).
   - `src/github/sync.rs` (1488 lines).
-  - `src/reconcile.rs` (1883 lines; periodic reconcile loop covering stale
+  - `src/reconcile.rs` (1886 lines; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
   - `src/server/maintenance.rs` (1108 lines; periodic maintenance loops —
@@ -326,13 +326,13 @@ Line counts are *production* LoC (the `Prod` column in `module-inventory.md`,
 which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync.
 
 - `src/services/auto_queue.rs` (1626) and
-  `src/services/auto_queue/activate_command.rs` (1224); auto-queue route
+  `src/services/auto_queue/activate_command.rs` (1221); auto-queue route
   behavior is split across `src/services/auto_queue/*` slices, with
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
 - `src/services/onboarding/mod.rs` (4955),
-  `src/services/dispatched_sessions.rs` (3393), and
+  `src/services/dispatched_sessions.rs` (3347), and
   `src/services/settings.rs` (1089) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`
   and `src/services/api_friction.rs` have been removed/decomposed.)
@@ -341,7 +341,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   behavior.
 - `src/services/claude.rs` (3765), `src/services/gemini.rs` (1406),
   `src/services/qwen.rs` (2182), `src/services/codex.rs` (2893),
-  `src/services/opencode.rs` (1867), `src/services/provider.rs` (1739) —
+  `src/services/opencode.rs` (1862), `src/services/provider.rs` (1739) —
   provider adapters.
 - `src/services/codex_tui/rollout_tail.rs` (1726) — Codex TUI rollout tail
   parsing and resume identity surface; split before adding non-bugfix behavior
@@ -356,7 +356,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   readiness/cancel contract.
 - `src/services/memory/memento.rs` (3062).
 - `src/services/observability/pg_io.rs` (1047).
-- `src/services/dispatched_sessions.rs` (3393) — dispatched session domain
+- `src/services/dispatched_sessions.rs` (3347) — dispatched session domain
   service. This is the post-#1515 SRP extraction target for route/database
   callsites, but the module itself is now giant-file territory; split focused
   helpers before adding non-bugfix behavior.
@@ -369,9 +369,9 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
 - `src/services/platform/binary_resolver.rs` (1936).
-- `src/services/discord/mod.rs` (5837),
+- `src/services/discord/mod.rs` (5835),
   `src/services/discord_config_audit.rs` (1318).
-- `src/services/turn_orchestrator.rs` (2867).
+- `src/services/turn_orchestrator.rs` (2866).
 
 Decomposed below the giant-file threshold (no longer frozen; bugfix-scoped but
 normal test growth is allowed): `src/services/analytics.rs`,
