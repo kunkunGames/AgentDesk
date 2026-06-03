@@ -134,6 +134,48 @@ fn watcher_should_create_external_input_status_panel(
 /// `tmux_session_name`, mirroring the restore-path session guard. Synthetic
 /// headless ids are filtered via `normalize_status_panel_message_id` (codex P2
 /// r3) so the adoption path never edits a nonexistent Discord message.
+/// #3077 (codex P1): decision for the TUI-direct status-panel publish site
+/// once the atomic [`bind_status_panel`] has returned. The bind — not the
+/// pre-send `identity_matches` snapshot — is the source of truth for whether the
+/// just-sent panel was recorded on the inflight row, so the watcher's local
+/// handle MUST be chosen from its outcome:
+///
+/// * `Bound` / `AlreadyBound` → the row now owns this exact panel; adopt it and
+///   do NOT delete (deleting would remove a legitimately-bound panel).
+/// * any other outcome (`SkippedPanelAlreadySet` → the row owns a *different*
+///   panel; `GuardMismatch` / `Missing` / `IoError` → the bind never happened)
+///   → the row does NOT reference our panel, so the watcher must not claim
+///   ownership of it. Delete the just-sent duplicate and adopt the row's panel
+///   only when it is the SAME turn we sent for (`identity_matches`); a
+///   replacement turn's panel belongs to that turn and must not be tracked here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiStatusPanelBindDecision {
+    /// Delete (or enqueue-delete) the just-sent panel message.
+    delete_sent_panel: bool,
+    /// When `true`, adopt the just-sent `panel_msg.id`; when `false`, adopt the
+    /// row's persisted handle (only if this is the same turn).
+    adopt_sent_panel: bool,
+}
+
+fn resolve_tui_status_panel_bind_decision(
+    outcome: crate::services::discord::inflight::StatusPanelBindOutcome,
+) -> TuiStatusPanelBindDecision {
+    use crate::services::discord::inflight::StatusPanelBindOutcome as Outcome;
+    match outcome {
+        Outcome::Bound | Outcome::AlreadyBound => TuiStatusPanelBindDecision {
+            delete_sent_panel: false,
+            adopt_sent_panel: true,
+        },
+        Outcome::SkippedPanelAlreadySet
+        | Outcome::GuardMismatch
+        | Outcome::Missing
+        | Outcome::IoError => TuiStatusPanelBindDecision {
+            delete_sent_panel: true,
+            adopt_sent_panel: false,
+        },
+    }
+}
+
 fn watcher_persisted_status_panel_msg_id(
     inflight: Option<&InflightTurnState>,
     tmux_session_name: &str,
@@ -1112,6 +1154,70 @@ mod pane_dead_identity_tests {
             watcher_persisted_status_panel_msg_id(None, "AgentDesk-codex-adk-cdx"),
             None
         );
+    }
+
+    // #3077 (codex P1): the TUI-direct publish site must adopt the just-sent
+    // panel ONLY when the atomic bind recorded it on the inflight row. A
+    // successful bind (or one where the row already owns this exact id) adopts
+    // the handle and never deletes; any other outcome means the row does not
+    // reference our panel, so we delete the just-sent duplicate (not leak it)
+    // and never adopt it as the watcher's owned handle.
+    #[test]
+    fn tui_status_panel_bind_bound_adopts_without_delete() {
+        let decision = resolve_tui_status_panel_bind_decision(
+            crate::services::discord::inflight::StatusPanelBindOutcome::Bound,
+        );
+        assert!(decision.adopt_sent_panel);
+        assert!(!decision.delete_sent_panel);
+    }
+
+    #[test]
+    fn tui_status_panel_bind_already_bound_adopts_without_delete() {
+        let decision = resolve_tui_status_panel_bind_decision(
+            crate::services::discord::inflight::StatusPanelBindOutcome::AlreadyBound,
+        );
+        assert!(decision.adopt_sent_panel);
+        assert!(!decision.delete_sent_panel);
+    }
+
+    #[test]
+    fn tui_status_panel_bind_skipped_panel_already_set_deletes_and_disowns() {
+        // The inflight row already carries a DIFFERENT panel id: our just-sent
+        // panel is a duplicate and must be deleted, never adopted as our handle.
+        let decision = resolve_tui_status_panel_bind_decision(
+            crate::services::discord::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet,
+        );
+        assert!(decision.delete_sent_panel);
+        assert!(!decision.adopt_sent_panel);
+    }
+
+    #[test]
+    fn tui_status_panel_bind_guard_mismatch_deletes_and_disowns() {
+        let decision = resolve_tui_status_panel_bind_decision(
+            crate::services::discord::inflight::StatusPanelBindOutcome::GuardMismatch,
+        );
+        assert!(decision.delete_sent_panel);
+        assert!(!decision.adopt_sent_panel);
+    }
+
+    #[test]
+    fn tui_status_panel_bind_missing_deletes_and_disowns() {
+        let decision = resolve_tui_status_panel_bind_decision(
+            crate::services::discord::inflight::StatusPanelBindOutcome::Missing,
+        );
+        assert!(decision.delete_sent_panel);
+        assert!(!decision.adopt_sent_panel);
+    }
+
+    #[test]
+    fn tui_status_panel_bind_io_error_deletes_and_disowns() {
+        // A persist/IO failure means the bind did not happen; do not keep a
+        // local handle that claims ownership of an unrecorded panel.
+        let decision = resolve_tui_status_panel_bind_decision(
+            crate::services::discord::inflight::StatusPanelBindOutcome::IoError,
+        );
+        assert!(decision.delete_sent_panel);
+        assert!(!decision.adopt_sent_panel);
     }
 
     #[test]
@@ -4626,8 +4732,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         // the inflight flock — closing the window where an
                                         // overlapping watcher rebinds between our snapshot
                                         // load and this write (#3003).
-                                        status_panel_msg_id = Some(panel_msg.id);
-                                        let _ = crate::services::discord::inflight::bind_status_panel(
+                                        let bind_outcome = crate::services::discord::inflight::bind_status_panel(
                                             &watcher_provider,
                                             channel_id.get(),
                                             panel_msg.id.get(),
@@ -4637,13 +4742,96 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                                 ..Default::default()
                                             },
                                         );
-                                        let ts = chrono::Local::now().format("%H:%M:%S");
-                                        tracing::info!(
-                                            "  [{ts}] 🪧 watcher: created status-panel-v2 for TUI-direct turn (channel {}, tmux={}, panel_msg={})",
-                                            channel_id.get(),
-                                            tmux_session_name,
-                                            panel_msg.id.get()
-                                        );
+                                        // #3077 (codex P1): the pre-send snapshot/`identity_matches`
+                                        // check narrows the race window but does NOT close it — an
+                                        // overlapping watcher can rebind/replace the inflight row
+                                        // between our `load_inflight_state` and this atomic bind.
+                                        // The bind is the single source of truth for whether THIS
+                                        // panel is now recorded on the inflight row, so the handle
+                                        // we adopt MUST be decided by its return. Adopting
+                                        // `panel_msg.id` unconditionally would leave a sent-but-
+                                        // unrecorded panel that the watcher then treats as its own
+                                        // → duplicate-panel leak / wrong-panel lifecycle.
+                                        let decision =
+                                            resolve_tui_status_panel_bind_decision(bind_outcome);
+                                        if decision.delete_sent_panel {
+                                            // The inflight row did NOT record our panel:
+                                            //  - SkippedPanelAlreadySet → the row already carries a
+                                            //    DIFFERENT (real) panel id; ours is a duplicate.
+                                            //  - GuardMismatch / Missing / IoError → the bind never
+                                            //    happened (the row changed/disappeared or a guard
+                                            //    failed); we must not claim ownership of a panel the
+                                            //    row doesn't know about.
+                                            // Delete the just-sent duplicate so it never leaks. This
+                                            // reuses the same delete path the "inflight changed
+                                            // during send" branch below uses
+                                            // (delete_nonterminal_placeholder → tmux.rs:803). It
+                                            // never double-deletes a legitimately-bound panel: we
+                                            // only reach here when our bind did NOT record
+                                            // `panel_msg.id`, so the row's owned panel (if any) is a
+                                            // *different* id we never delete.
+                                            let discard_outcome = delete_nonterminal_placeholder(
+                                                &http,
+                                                channel_id,
+                                                &shared,
+                                                &watcher_provider,
+                                                &tmux_session_name,
+                                                panel_msg.id,
+                                                "watcher_external_input_status_panel_bind_unowned",
+                                            )
+                                            .await;
+                                            if !discard_outcome.is_committed()
+                                                && !discard_outcome.is_permanent_failure()
+                                            {
+                                                // Transient delete failure: the duplicate panel
+                                                // still exists and this path does not persist it to
+                                                // inflight, so record it in the durable store for
+                                                // the sweeper drain to reclaim independent of turn
+                                                // lifecycle (#3003 codex P2 r14 pattern).
+                                                crate::services::discord::status_panel_orphan_store::enqueue(
+                                                    &watcher_provider,
+                                                    &shared.token_hash,
+                                                    channel_id.get(),
+                                                    panel_msg.id.get(),
+                                                );
+                                            }
+                                            // Resolve the handle from the inflight row, never from
+                                            // the just-sent duplicate: only adopt the row's panel
+                                            // when it is the SAME turn we sent for
+                                            // (`identity_matches`); a replacement turn's panel
+                                            // belongs to that turn and must not be tracked here.
+                                            let resolved_handle = if identity_matches {
+                                                watcher_persisted_status_panel_msg_id(
+                                                    fresh_inflight.as_ref(),
+                                                    &tmux_session_name,
+                                                )
+                                            } else {
+                                                None
+                                            };
+                                            status_panel_msg_id = resolved_handle;
+                                            let ts = chrono::Local::now().format("%H:%M:%S");
+                                            // Single bounded incident log per unowned-bind event.
+                                            tracing::warn!(
+                                                "  [{ts}] ⚠ watcher: status-panel-v2 bind did not record our panel for TUI-direct turn in channel {} (outcome={:?}, panel_msg={}, delete_committed={}, adopted_handle={:?}); discarded duplicate instead of leaking it",
+                                                channel_id.get(),
+                                                bind_outcome,
+                                                panel_msg.id.get(),
+                                                discard_outcome.is_committed(),
+                                                resolved_handle.map(serenity::MessageId::get)
+                                            );
+                                        } else {
+                                            // Bound / AlreadyBound: the row now owns this exact
+                                            // panel id — adopt the just-sent panel as today.
+                                            debug_assert!(decision.adopt_sent_panel);
+                                            status_panel_msg_id = Some(panel_msg.id);
+                                            let ts = chrono::Local::now().format("%H:%M:%S");
+                                            tracing::info!(
+                                                "  [{ts}] 🪧 watcher: created status-panel-v2 for TUI-direct turn (channel {}, tmux={}, panel_msg={})",
+                                                channel_id.get(),
+                                                tmux_session_name,
+                                                panel_msg.id.get()
+                                            );
+                                        }
                                     } else {
                                         // The turn vanished/changed during the send await,
                                         // or an overlapping watcher already owns the panel;

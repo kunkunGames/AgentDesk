@@ -120,7 +120,7 @@
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7223 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (7347 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -132,6 +132,9 @@
     preserves the panel under an active turn; +16 from #3077 routing the
     TUI-direct status-panel publish + orphan-cleanup writes through the typed
     `inflight::bind_status_panel` / `clear_status_panel_if_current` ownership ops;
+    +124 from #3077 codex P1 honoring the `bind_status_panel` return at the
+    TUI-direct publish site (delete the just-sent panel + disown the handle when
+    the bind did not record it, instead of leaking a duplicate);
     split loop helpers further before adding behavior).
   - `src/services/discord/tui_prompt_relay.rs` (3849 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
