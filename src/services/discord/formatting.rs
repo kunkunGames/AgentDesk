@@ -2693,6 +2693,10 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference(
                 .await;
         match send_result {
             Ok(_) => {
+                // #3082 P1-2: chunk landed — keep the answer-flush barrier's
+                // inactivity window fresh so a long answer never trips the
+                // queued-card wait while it is still making progress.
+                shared.answer_flush_barrier.note_progress(channel_id);
                 if is_last {
                     tracing::debug!(
                         target: "discord::chunker",
@@ -2828,6 +2832,10 @@ pub(super) async fn send_long_message_raw_with_rollback(
         rate_limit_wait(shared, channel_id).await;
         match super::http::send_channel_message(http, channel_id, chunk).await {
             Ok(message) => {
+                // #3082 P1-2: chunk landed — refresh the answer-flush barrier's
+                // inactivity window so a long rollback-tracked answer never
+                // trips the queued-card wait while still progressing.
+                shared.answer_flush_barrier.note_progress(channel_id);
                 sent_message_ids.push(message.id.get());
                 if let Err(error) =
                     record_replace_continuation_rollback(rollback_key, sent_message_ids.clone())
@@ -3086,6 +3094,18 @@ pub(super) async fn replace_long_message_raw_with_outcome(
         }
     }
 
+    // #3082 part B (codex P1-1): the edit/replace path is ALSO a multi-chunk
+    // send (chunk 0 edited, continuations sent). Hold the same per-channel
+    // answer-flush barrier across the whole edit+continuation send so a
+    // queued-turn "📬" notice POST cannot interleave between this answer's
+    // chunks. Acquired BEFORE the first edit await and held (RAII) across every
+    // continuation send and every cleanup/error return below — the guard clears
+    // the gate on every exit path (Ok, early `return`, `?`, panic-unwind). The
+    // fallback `send_long_message_raw_with_rollback` acquires its own guard, so
+    // we intentionally do NOT also hold one there (no double-count needed).
+    let _answer_flush_guard =
+        (total > 1).then(|| shared.answer_flush_barrier.begin_flush(channel_id));
+
     tracing::debug!(
         target: "discord::chunker",
         path = "replace_long_message_raw",
@@ -3158,6 +3178,10 @@ pub(super) async fn replace_long_message_raw_with_outcome(
         rate_limit_wait(shared, channel_id).await;
         match super::http::send_channel_message(http, channel_id, chunk).await {
             Ok(message) => {
+                // #3082 P1-2: this chunk landed — reset the answer-flush
+                // barrier's inactivity window so a long edit/replace answer
+                // that keeps making progress never trips the queued-card wait.
+                shared.answer_flush_barrier.note_progress(channel_id);
                 sent_continuation_message_ids.push(message.id.get());
                 if let Err(error) = record_replace_continuation_rollback(
                     rollback_key,

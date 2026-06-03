@@ -1201,6 +1201,10 @@ async fn render_visible_queued_ack(
         data.shared.clone(),
         channel_id,
         None,
+        // #3082 P2-3: this IS the queued-turn "📬" notice — wait behind any
+        // in-flight multi-chunk answer flush so the card lands as a trailing
+        // notice, never interleaved between answer chunks.
+        true,
     )
     .await;
     let placeholder_msg_id = match post_result {

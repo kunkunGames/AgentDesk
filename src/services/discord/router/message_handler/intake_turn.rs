@@ -1793,6 +1793,10 @@ pub(in crate::services::discord) async fn handle_text_message(
                 } else {
                     None
                 },
+                // #3082 P2-3: this message lost the start-turn race and is now
+                // QUEUED — its "📬" card is a trailing notice that must wait
+                // behind any in-flight multi-chunk answer flush.
+                true,
             )
             .await;
 
@@ -2269,6 +2273,11 @@ pub(in crate::services::discord) async fn handle_text_message(
             } else {
                 None
             },
+            // #3082 P2-3: the active turn started cleanly and we are POSTing its
+            // OWN fresh placeholder (not a queued "📬" notice). It must NOT wait
+            // behind a multi-chunk answer flush — this is the turn doing the
+            // answering, gating it would self-deadlock the active turn's card.
+            false,
         )
         .await
         {

@@ -2870,6 +2870,10 @@ async fn relay_tui_idle_response_through_bridge(
         shared.clone(),
         channel_id,
         reference,
+        // #3082 P2-3: a TUI idle-response placeholder is an ACTIVE-turn card,
+        // not a queued "📬" notice — it must not wait on the answer-flush
+        // barrier.
+        false,
     )
     .await?;
     let user_msg_id = anchor
