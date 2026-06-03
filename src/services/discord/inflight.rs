@@ -1213,6 +1213,252 @@ fn save_inflight_state_if_absent_in_root(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// #3077: typed status-panel ownership writes.
+//
+// `status_message_id` is the de-facto "this turn owns status panel M" pointer,
+// and several independent actors (turn-bridge completion fallback, tmux watcher
+// TUI-direct publish/orphan-cleanup, placeholder sweeper) used to mutate it via
+// a non-atomic `load_inflight_state(...)` → `state.status_message_id = …` →
+// `save_inflight_state(...)` triple. Because the read and the write were not
+// serialized against each other, a newer turn that rebound the panel between a
+// stale actor's load and its blind `= None` could have its panel silently
+// orphaned (the #3099/#3100/#3105/#3107 panel-lifecycle race family).
+//
+// These helpers centralize that read-modify-write behind intentful operations
+// that hold the same `lock_inflight_state_path` sidecar flock across the whole
+// compare-and-set, exactly like `save_inflight_state_if_absent`. Callers no
+// longer touch the field directly; they declare *what* they own and *under
+// which precondition*, and the store enforces it atomically.
+
+/// Per-turn precondition for `bind_status_panel`. Lets each caller carry its
+/// own ownership invariant into the lock-held read-modify-write so the guard
+/// check and the write cannot be split by a concurrent writer (TOCTOU).
+#[derive(Debug, Clone, Default)]
+pub(in crate::services::discord) struct StatusPanelBindGuard {
+    /// Bind only when the on-disk row still belongs to this `user_msg_id`.
+    /// `None` means "do not guard on user_msg_id" (used by callers that have
+    /// already established identity another way). Mirrors the turn-bridge
+    /// status-panel-v2 completion fallback guard.
+    pub require_user_msg_id: Option<u64>,
+    /// Bind only when the on-disk row still matches this full turn identity
+    /// (user_msg_id + started_at + tmux_session_name). Mirrors the tmux
+    /// watcher TUI-direct publish guard that defeats turn handoff during the
+    /// Discord send await.
+    pub require_identity: Option<InflightTurnIdentity>,
+    /// When true, do not overwrite a real (non-synthetic) panel id already on
+    /// the row — an overlapping actor already published the canonical panel
+    /// and our send is a duplicate (#3003 reclaim path). Synthetic-headless
+    /// ids do not count as "already set".
+    pub skip_if_panel_already_set: bool,
+}
+
+/// Outcome of a `bind_status_panel` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum StatusPanelBindOutcome {
+    /// The row was found, passed the guard, and now carries `msg_id`.
+    Bound,
+    /// The row already carried `msg_id`; nothing was written.
+    AlreadyBound,
+    /// The row exists but a DIFFERENT real panel id is already set and
+    /// `skip_if_panel_already_set` was requested — left untouched. Carries the
+    /// row's currently-owned (real) panel id as observed under the same flock,
+    /// so the caller can adopt the row's actual panel without a second
+    /// (racy) re-read of the inflight row.
+    SkippedPanelAlreadySet(u64),
+    /// No inflight row exists for `(provider, channel_id)`.
+    Missing,
+    /// The on-disk row did not satisfy `require_user_msg_id` /
+    /// `require_identity` — left untouched (a different turn now owns the row).
+    GuardMismatch,
+    /// Filesystem / serialization failure while persisting the bind.
+    IoError,
+}
+
+/// Intentful "this turn now owns status panel `msg_id`" write. Performs the
+/// guard check and the field set atomically under the inflight sidecar flock,
+/// so it is consistent with `save_inflight_state` / `save_inflight_state_if_absent`.
+pub(in crate::services::discord) fn bind_status_panel(
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelBindGuard,
+) -> StatusPanelBindOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return StatusPanelBindOutcome::IoError;
+    };
+    bind_status_panel_in_root(&root, provider, channel_id, msg_id, guard)
+}
+
+fn bind_status_panel_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelBindGuard,
+) -> StatusPanelBindOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return StatusPanelBindOutcome::IoError;
+    }
+    // Hold the sidecar flock across load → guard → set so a concurrent
+    // writer cannot land between the guard check and the write.
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return StatusPanelBindOutcome::IoError;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return StatusPanelBindOutcome::Missing;
+    };
+    if let Some(expected) = guard.require_user_msg_id
+        && state.user_msg_id != expected
+    {
+        return StatusPanelBindOutcome::GuardMismatch;
+    }
+    if let Some(expected) = guard.require_identity.as_ref()
+        && !expected.matches_state(&state)
+    {
+        return StatusPanelBindOutcome::GuardMismatch;
+    }
+    // Same-id re-bind is idempotent and must classify as `AlreadyBound`
+    // REGARDLESS of `skip_if_panel_already_set` — an idempotent re-bind of the
+    // panel this row already owns is a no-op, not a "duplicate skip". Checking
+    // the skip flag first (#3077 codex P2 #1) misclassified a same-id re-bind as
+    // `SkippedPanelAlreadySet`, which the TUI-direct caller then routed to a
+    // DELETE of the row's own already-bound panel. Order: same-id → AlreadyBound;
+    // else a DIFFERENT real id already set + skip flag → SkippedPanelAlreadySet.
+    if state.status_message_id == Some(msg_id) {
+        return StatusPanelBindOutcome::AlreadyBound;
+    }
+    if guard.skip_if_panel_already_set && status_panel_id_is_real(state.status_message_id) {
+        // Safe: `status_panel_id_is_real` only returns true for `Some(real)`,
+        // and we already handled `Some(msg_id)` above, so this is a DIFFERENT
+        // real panel id. Carry it so the caller adopts the row's owned panel.
+        return StatusPanelBindOutcome::SkippedPanelAlreadySet(
+            state.status_message_id.unwrap_or_default(),
+        );
+    }
+    state.status_message_id = Some(msg_id);
+    match persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:bind_status_panel_in_root",
+    ) {
+        Ok(()) => StatusPanelBindOutcome::Bound,
+        Err(_) => StatusPanelBindOutcome::IoError,
+    }
+}
+
+/// Per-turn precondition for `clear_status_panel_if_current`. The msg-id
+/// compare-and-clear is unconditional; these add the caller's extra ownership
+/// guards (so a sweeper/cleanup that loaded a stale snapshot does not clear a
+/// row a newer turn already advanced).
+#[derive(Debug, Clone, Default)]
+pub(in crate::services::discord) struct StatusPanelClearGuard {
+    /// Clear only when the on-disk row still belongs to this `user_msg_id`.
+    pub require_user_msg_id: Option<u64>,
+    /// Clear only when the on-disk row still carries this `current_msg_id`
+    /// (placeholder sweeper convergence guard).
+    pub require_current_msg_id: Option<u64>,
+    /// Clear only when the on-disk row's tmux session still matches (watcher
+    /// orphan-cleanup guard).
+    pub require_tmux_session_name: Option<String>,
+}
+
+/// Compare-and-clear: clears `status_message_id` ONLY when it currently equals
+/// `msg_id` (and every guard precondition holds). Returns `true` iff it
+/// cleared. This is the #3077 hardening — a blind `= None` becomes a
+/// compare-and-clear so a panel a *newer* turn rebound is never wiped by a
+/// stale actor that loaded an older snapshot.
+pub(in crate::services::discord) fn clear_status_panel_if_current(
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelClearGuard,
+) -> bool {
+    let Some(root) = inflight_runtime_root() else {
+        return false;
+    };
+    clear_status_panel_if_current_in_root(&root, provider, channel_id, msg_id, guard)
+}
+
+fn clear_status_panel_if_current_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelClearGuard,
+) -> bool {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return false;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return false;
+    };
+    if state.status_message_id != Some(msg_id) {
+        return false;
+    }
+    if let Some(expected) = guard.require_user_msg_id
+        && state.user_msg_id != expected
+    {
+        return false;
+    }
+    if let Some(expected) = guard.require_current_msg_id
+        && state.current_msg_id != expected
+    {
+        return false;
+    }
+    if let Some(expected) = guard.require_tmux_session_name.as_deref()
+        && state.tmux_session_name.as_deref() != Some(expected)
+    {
+        return false;
+    }
+    state.status_message_id = None;
+    persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:clear_status_panel_if_current_in_root",
+    )
+    .is_ok()
+}
+
+/// `true` when `id` is a real Discord panel id (present and not a synthetic
+/// headless placeholder). Mirrors `turn_bridge::normalize_status_panel_message_id`
+/// without pulling in the serenity `MessageId` newtype.
+fn status_panel_id_is_real(id: Option<u64>) -> bool {
+    match id {
+        Some(value) => !super::is_synthetic_headless_message_id_raw(value),
+        None => false,
+    }
+}
+
+/// Reads + deserializes the inflight row at `path` while the caller holds the
+/// sidecar flock. Returns `None` on a missing/malformed file (same lenient
+/// posture as `load_inflight_state`).
+fn load_inflight_state_unlocked(path: &Path) -> Option<InflightTurnState> {
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Shared lock-held persist tail: validate, stamp `updated_at`, atomic-write.
+/// Caller must already hold `lock_inflight_state_path`.
+fn persist_under_lock(
+    root: &Path,
+    path: &Path,
+    state: &InflightTurnState,
+    caller: &'static str,
+) -> Result<(), String> {
+    validate_inflight_state_for_save(root, path, state, caller);
+    let mut updated = state.clone();
+    updated.updated_at = now_string();
+    let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
+    atomic_write(path, &json)
+}
+
 pub(crate) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) -> bool {
     let Some(root) = inflight_runtime_root() else {
         return false;
@@ -2197,18 +2443,21 @@ pub(in crate::services::discord) enum InflightSignal {
 mod stall_recovery_tests {
     use super::{
         GuardedClearOutcome, INFLIGHT_STALENESS_THRESHOLD_SECS, InflightRestartMode,
-        InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
+        InflightTurnIdentity, InflightTurnState, RelayOwnerKind, StatusPanelBindGuard,
+        StatusPanelBindOutcome, StatusPanelClearGuard, bind_status_panel_in_root,
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
-        inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
-        load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
+        clear_status_panel_if_current_in_root, inflight_state_allows_idle_tmux_repair_state,
+        inflight_state_is_stale, inflight_state_path, load_inflight_states_from_root,
+        lock_inflight_state_path, normalize_response_sent_offset,
         refresh_inflight_last_offset_if_matches_identity_in_root, save_inflight_state_in_root,
         validate_inflight_state_for_save,
     };
     use crate::services::agent_protocol::RuntimeHandoffKind;
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+    use std::path::Path;
     use tempfile::TempDir;
 
     /// `inflight_state_is_stale` must flip to true once `updated_at` is
@@ -2325,6 +2574,410 @@ mod stall_recovery_tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].status_message_id, Some(123_456));
         assert_eq!(loaded[0].current_msg_id, 99);
+    }
+
+    // ---- #3077: typed status-panel ownership write tests ----
+
+    /// Seeds a single inflight row in `root` and returns it. `user_msg_id` /
+    /// `current_msg_id` / `status_message_id` are caller-controlled so the
+    /// guard semantics can be exercised.
+    fn seed_status_panel_state(
+        root: &Path,
+        channel_id: u64,
+        user_msg_id: u64,
+        current_msg_id: u64,
+        tmux_session_name: Option<&str>,
+        status_message_id: Option<u64>,
+    ) -> InflightTurnState {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            channel_id,
+            Some("adk-claude".to_string()),
+            user_msg_id,
+            user_msg_id,
+            current_msg_id,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            tmux_session_name.map(str::to_string),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        // `new()` takes (.., request_owner_user_id, user_msg_id, current_msg_id, ..);
+        // pin the guard-relevant fields explicitly so the test intent is exact.
+        state.user_msg_id = user_msg_id;
+        state.current_msg_id = current_msg_id;
+        state.status_message_id = status_message_id;
+        save_inflight_state_in_root(root, &state).expect("seed inflight state");
+        state
+    }
+
+    fn loaded_status_message_id(root: &Path, channel_id: u64) -> Option<u64> {
+        load_inflight_states_from_root(root, &ProviderKind::Claude)
+            .into_iter()
+            .find(|s| s.channel_id == channel_id)
+            .and_then(|s| s.status_message_id)
+    }
+
+    #[test]
+    fn bind_status_panel_sets_id_when_unguarded() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(temp.path(), 7001, 10, 11, Some("AgentDesk-claude-a"), None);
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7001,
+            5555,
+            &StatusPanelBindGuard::default(),
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::Bound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7001), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_is_idempotent_when_already_bound() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7002,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7002,
+            5555,
+            &StatusPanelBindGuard::default(),
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::AlreadyBound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7002), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_respects_user_msg_id_guard() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(temp.path(), 7003, 10, 11, Some("AgentDesk-claude-a"), None);
+
+        // Guard expects a different user_msg_id (a newer turn now owns the row).
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7003,
+            5555,
+            &StatusPanelBindGuard {
+                require_user_msg_id: Some(99),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::GuardMismatch);
+        assert_eq!(loaded_status_message_id(temp.path(), 7003), None);
+    }
+
+    #[test]
+    fn bind_status_panel_skips_when_real_panel_already_set() {
+        let temp = TempDir::new().unwrap();
+        // A real (non-synthetic) panel id already on the row.
+        seed_status_panel_state(
+            temp.path(),
+            7004,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(4242),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7004,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        // Carries the row's owned (DIFFERENT) panel id so the caller can adopt it.
+        assert_eq!(
+            outcome,
+            StatusPanelBindOutcome::SkippedPanelAlreadySet(4242)
+        );
+        // Canonical panel preserved — not overwritten by the duplicate.
+        assert_eq!(loaded_status_message_id(temp.path(), 7004), Some(4242));
+    }
+
+    #[test]
+    fn bind_status_panel_same_id_is_already_bound_even_with_skip_flag() {
+        // #3077 (codex P2 #1): an idempotent re-bind of the SAME panel id the row
+        // already owns must classify as `AlreadyBound`, NOT
+        // `SkippedPanelAlreadySet`, even when `skip_if_panel_already_set` is set.
+        // Misclassifying it routed the TUI-direct caller to DELETE its own panel.
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7007,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7007,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::AlreadyBound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7007), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_different_id_skips_and_reports_owned_id() {
+        // A DIFFERENT real panel id already set + skip flag → SkippedPanelAlreadySet
+        // carrying the row's owned id (so the caller adopts the real panel).
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7008,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(4242),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7008,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            StatusPanelBindOutcome::SkippedPanelAlreadySet(4242)
+        );
+        assert_eq!(loaded_status_message_id(temp.path(), 7008), Some(4242));
+    }
+
+    #[test]
+    fn bind_status_panel_overwrites_synthetic_even_with_skip_flag() {
+        let temp = TempDir::new().unwrap();
+        // A synthetic-headless id does NOT count as "already set".
+        seed_status_panel_state(
+            temp.path(),
+            7005,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(crate::services::discord::SYNTHETIC_HEADLESS_MESSAGE_ID_FLOOR + 1),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7005,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::Bound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7005), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_missing_row_reports_missing() {
+        let temp = TempDir::new().unwrap();
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7006,
+            5555,
+            &StatusPanelBindGuard::default(),
+        );
+        assert_eq!(outcome, StatusPanelBindOutcome::Missing);
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_clears_on_match() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7101,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7101,
+            5555,
+            &StatusPanelClearGuard::default(),
+        );
+
+        assert!(cleared);
+        assert_eq!(loaded_status_message_id(temp.path(), 7101), None);
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_preserves_newer_turns_panel_on_mismatch() {
+        let temp = TempDir::new().unwrap();
+        // A newer turn already rebound the panel to 9999; a stale actor still
+        // believes it owns 5555 and asks to clear it. The compare-and-clear
+        // must NOT wipe the newer turn's panel.
+        seed_status_panel_state(
+            temp.path(),
+            7102,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(9999),
+        );
+
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7102,
+            5555,
+            &StatusPanelClearGuard::default(),
+        );
+
+        assert!(!cleared);
+        assert_eq!(loaded_status_message_id(temp.path(), 7102), Some(9999));
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_respects_extra_guards() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7103,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        // msg-id matches, but user_msg_id/current_msg_id/tmux guards point at a
+        // different turn → must NOT clear.
+        let user_mismatch = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_user_msg_id: Some(99),
+                ..Default::default()
+            },
+        );
+        assert!(!user_mismatch);
+
+        let current_mismatch = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_current_msg_id: Some(99),
+                ..Default::default()
+            },
+        );
+        assert!(!current_mismatch);
+
+        let tmux_mismatch = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_tmux_session_name: Some("AgentDesk-claude-other".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!tmux_mismatch);
+
+        assert_eq!(loaded_status_message_id(temp.path(), 7103), Some(5555));
+
+        // All guards satisfied → clears.
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_user_msg_id: Some(10),
+                require_current_msg_id: Some(11),
+                require_tmux_session_name: Some("AgentDesk-claude-a".to_string()),
+            },
+        );
+        assert!(cleared);
+        assert_eq!(loaded_status_message_id(temp.path(), 7103), None);
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_noops_on_missing_row() {
+        let temp = TempDir::new().unwrap();
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7104,
+            5555,
+            &StatusPanelClearGuard::default(),
+        );
+        assert!(!cleared);
+    }
+
+    #[test]
+    fn bind_then_clear_if_current_round_trips_atomically() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(temp.path(), 7200, 10, 11, Some("AgentDesk-claude-a"), None);
+
+        // bind then clear-if-current with the same id returns the row to None,
+        // mirroring the watcher publish → orphan-cleanup lifecycle through the
+        // single locked store path.
+        assert_eq!(
+            bind_status_panel_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                7200,
+                5555,
+                &StatusPanelBindGuard::default(),
+            ),
+            StatusPanelBindOutcome::Bound
+        );
+        assert_eq!(loaded_status_message_id(temp.path(), 7200), Some(5555));
+
+        assert!(clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7200,
+            5555,
+            &StatusPanelClearGuard::default(),
+        ));
+        assert_eq!(loaded_status_message_id(temp.path(), 7200), None);
     }
 
     #[test]

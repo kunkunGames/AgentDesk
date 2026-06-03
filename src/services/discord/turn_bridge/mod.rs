@@ -2120,33 +2120,36 @@ fn persist_status_panel_completion_fallback_message_id(
     let Some(expected_user_msg_id) = expected_user_msg_id else {
         return;
     };
-    let Some(mut inflight_state) = super::inflight::load_inflight_state(provider, channel_id.get())
-    else {
-        return;
+    // #3077: route the load-modify-save through the typed bind op so the
+    // user_msg_id guard and the field set are serialized under the inflight
+    // flock (no TOCTOU with a concurrent turn rebinding the row). Behavior is
+    // preserved: bind only when the on-disk row still belongs to this turn.
+    let guard = super::inflight::StatusPanelBindGuard {
+        require_user_msg_id: Some(expected_user_msg_id),
+        ..Default::default()
     };
-    if inflight_state.user_msg_id != expected_user_msg_id {
-        tracing::debug!(
-            "[turn_bridge] skipped persisting status-panel-v2 fallback id {} in channel {} from {}: inflight user_msg_id {} != expected {}",
-            message_id,
-            channel_id,
-            source,
-            inflight_state.user_msg_id,
-            expected_user_msg_id
-        );
-        return;
-    }
-    if inflight_state.status_message_id == Some(message_id.get()) {
-        return;
-    }
-    inflight_state.status_message_id = Some(message_id.get());
-    if let Err(error) = super::inflight::save_inflight_state(&inflight_state) {
-        tracing::warn!(
-            "[turn_bridge] failed to persist fallback status-panel-v2 message {} in channel {} from {}: {}",
-            message_id,
-            channel_id,
-            source,
-            error
-        );
+    match super::inflight::bind_status_panel(provider, channel_id.get(), message_id.get(), &guard) {
+        super::inflight::StatusPanelBindOutcome::Bound
+        | super::inflight::StatusPanelBindOutcome::AlreadyBound
+        | super::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet(_) => {}
+        super::inflight::StatusPanelBindOutcome::Missing => {}
+        super::inflight::StatusPanelBindOutcome::GuardMismatch => {
+            tracing::debug!(
+                "[turn_bridge] skipped persisting status-panel-v2 fallback id {} in channel {} from {}: inflight user_msg_id != expected {}",
+                message_id,
+                channel_id,
+                source,
+                expected_user_msg_id
+            );
+        }
+        super::inflight::StatusPanelBindOutcome::IoError => {
+            tracing::warn!(
+                "[turn_bridge] failed to persist fallback status-panel-v2 message {} in channel {} from {}",
+                message_id,
+                channel_id,
+                source
+            );
+        }
     }
 }
 
@@ -2194,7 +2197,7 @@ enum HeadlessPlaceholderCleanupAction {
 }
 
 fn is_synthetic_headless_message_id(message_id: MessageId) -> bool {
-    message_id.get() >= 8_000_000_000_000_000_000
+    super::is_synthetic_headless_message_id_raw(message_id.get())
 }
 
 /// Synthetic placeholder id used when a recovery turn has no anchored Discord
