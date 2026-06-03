@@ -48,8 +48,7 @@ jobs:
           fi
 
           if [ -z "${MACOS_RUNNER_GROUP:-}" ]; then
-            echo "::error::MACOS_RUNNER is set, but MACOS_RUNNER_GROUP is empty. Configure the org runner group first, restrict it to this repo, then set MACOS_RUNNER_GROUP to the exact group name."
-            exit 1
+            echo "MACOS_RUNNER_GROUP is empty; using repo-level self-hosted runner (label-based routing, no runner group). Runner groups require an organization; personal-account repos register repo-level runners and select them purely by label."
           fi
 
           labels="$(
@@ -148,9 +147,11 @@ jobs:
     name: Trusted macOS check (self-hosted)
     needs: resolve_macos_runner
     if: needs.resolve_macos_runner.outputs.mode == 'self-hosted'
-    runs-on:
-      group: ${{ needs.resolve_macos_runner.outputs.group }}
-      labels: ${{ fromJSON(needs.resolve_macos_runner.outputs.labels) }}
+    # Repo-level self-hosted runners (personal-account repos) select purely by
+    # label — runner groups are an organization-only feature. If this repo is
+    # ever moved under an org, switch back to the `group:`+`labels:` form and
+    # set MACOS_RUNNER_GROUP.
+    runs-on: ${{ fromJSON(needs.resolve_macos_runner.outputs.labels) }}
     steps:
       - name: Trusted event / runner sanity check
         shell: bash
