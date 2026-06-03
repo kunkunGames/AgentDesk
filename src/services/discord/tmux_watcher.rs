@@ -1858,16 +1858,12 @@ async fn complete_watcher_status_panel_v2(
     if !shared.status_panel_v2_enabled {
         return true;
     }
-    // EPIC #3078 PR-4 — SHADOW parity: the controller's chosen completion id must
-    // equal `status_panel_msg_id`; legacy completes the real Discord IO below.
-    crate::services::discord::watcher_panel_parity::assert_watcher_completion_parity(
-        shared,
-        channel_id,
-        expected_user_msg_id.unwrap_or(0),
-        provider,
-        status_panel_msg_id,
-    )
-    .await;
+    // EPIC #3078: completion parity is DEFERRED to the controller execute-cutover
+    // PR. A faithful check must replicate the SendFallback path (legacy completes
+    // with a concrete id when `status_panel_msg_id` is None, turn_bridge/mod.rs),
+    // which requires the controller to independently compute the completion id
+    // from raw inputs — not the resolved output. PR-4 ships only the faithful
+    // RECLAIM shadow-parity (see cleanup_orphan_external_input_status_panel).
     crate::services::discord::turn_bridge::complete_status_panel_v2_with_http(
         shared,
         http,
@@ -4769,10 +4765,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         && !fresh_panel_already_set
                                         && fresh_inflight.is_some()
                                     {
-                                        // #3077: bind through the typed op so the identity guard +
-                                        // "don't clobber an already-set panel" check re-validate
-                                        // atomically under the inflight flock, closing the rebind
-                                        // window between our snapshot load and this write (#3003).
+                                        // #3077: bind through the typed op so the
+                                        // identity guard + "don't clobber an already-set
+                                        // panel" check are re-validated atomically under
+                                        // the inflight flock — closing the window where an
+                                        // overlapping watcher rebinds between our snapshot
+                                        // load and this write (#3003).
                                         let bind_outcome = crate::services::discord::inflight::bind_status_panel(
                                             &watcher_provider,
                                             channel_id.get(),
@@ -4793,14 +4791,21 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         let decision =
                                             resolve_tui_status_panel_bind_decision(bind_outcome);
                                         if decision.delete_sent_panel {
-                                            // Bind did NOT record our panel (SkippedPanelAlreadySet:
-                                            // row owns a DIFFERENT real id, ours is a duplicate; or
-                                            // GuardMismatch/Missing/IoError: bind never happened, so
-                                            // we must not claim a panel the row doesn't know about).
-                                            // Delete the just-sent duplicate via the same path the
-                                            // "inflight changed during send" branch below uses; it
-                                            // never double-deletes a bound panel (we only reach here
-                                            // when our bind did NOT record `panel_msg.id`).
+                                            // The inflight row did NOT record our panel:
+                                            //  - SkippedPanelAlreadySet → the row already carries a
+                                            //    DIFFERENT (real) panel id; ours is a duplicate.
+                                            //  - GuardMismatch / Missing / IoError → the bind never
+                                            //    happened (the row changed/disappeared or a guard
+                                            //    failed); we must not claim ownership of a panel the
+                                            //    row doesn't know about.
+                                            // Delete the just-sent duplicate so it never leaks. This
+                                            // reuses the same delete path the "inflight changed
+                                            // during send" branch below uses
+                                            // (delete_nonterminal_placeholder → tmux.rs:803). It
+                                            // never double-deletes a legitimately-bound panel: we
+                                            // only reach here when our bind did NOT record
+                                            // `panel_msg.id`, so the row's owned panel (if any) is a
+                                            // *different* id we never delete.
                                             let discard_outcome = delete_nonterminal_placeholder(
                                                 &http,
                                                 channel_id,
@@ -4926,16 +4931,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             }
                         }
                     }
-                    // EPIC #3078 PR-4 — SHADOW parity: the controller's chosen create/adopt id
-                    // must equal the watcher's resolved `status_panel_msg_id` (TUI-direct uid 0).
-                    crate::services::discord::watcher_panel_parity::assert_watcher_create_parity(
-                        &shared,
-                        channel_id,
-                        0,
-                        &watcher_provider,
-                        status_panel_msg_id,
-                    )
-                    .await;
+                    // EPIC #3078: create/adopt parity is DEFERRED to the controller
+                    // execute-cutover PR. A faithful check must replicate
+                    // watcher_should_create_external_input_status_panel from raw
+                    // inputs (comparing the resolved id to itself is tautological).
+                    // PR-4 ships only the faithful RECLAIM shadow-parity below.
 
                     loop {
                         let current_portion =

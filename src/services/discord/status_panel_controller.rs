@@ -448,36 +448,12 @@ impl StatusPanelController {
         self.orphan_parity_target(key, panel_msg_id).await
     }
 
-    /// EPIC #3078 PR-4 — the panel id the controller WOULD own for the watcher's
-    /// TUI-direct create/adopt site, asserted equal to the local
-    /// `status_panel_msg_id` the legacy watcher resolved to (a freshly-created /
-    /// adopted / persisted-restore id, or `None`). Shadow-only and read-only:
-    /// faithful to the inflight row's CURRENT id (collapsing to `None` only on a
-    /// terminal ledger entry), NO ledger mutation, NO durable write, NO Discord
-    /// IO — the watcher keeps executing the real publish/bind/adopt unchanged.
-    pub(in crate::services::discord) async fn watcher_create_parity_id(
-        &self,
-        key: TurnKey,
-        _provider: ProviderKind,
-        resolved_panel_id: Option<MessageId>,
-    ) -> Option<MessageId> {
-        self.orphan_parity_target(key, resolved_panel_id).await
-    }
-
-    /// EPIC #3078 PR-4 — the panel id the controller WOULD finalize for the
-    /// watcher's completion site, asserted equal to the legacy
-    /// `complete_watcher_status_panel_v2` `status_panel_msg_id`. Same read-only
-    /// posture as [`Self::watcher_create_parity_id`]: the legacy completion edit
-    /// keeps executing the real Discord IO; only the controller decision is
-    /// observed for the later controller-executes cutover.
-    pub(in crate::services::discord) async fn watcher_completion_parity_id(
-        &self,
-        key: TurnKey,
-        _provider: ProviderKind,
-        completion_panel_id: Option<MessageId>,
-    ) -> Option<MessageId> {
-        self.orphan_parity_target(key, completion_panel_id).await
-    }
+    // EPIC #3078: watcher CREATE/ADOPT and COMPLETION parity query methods were
+    // deferred to the controller execute-cutover PR. A faithful check must
+    // replicate `watcher_should_create_external_input_status_panel` and the
+    // SendFallback-aware completion id from RAW inputs (not the resolved output,
+    // which `orphan_parity_target` would echo back tautologically). PR-4 ships
+    // only the faithful RECLAIM parity via `sweeper_reclaim_parity_id`.
 
     /// EPIC #3078 PR-3 — the controller's view of "does the live turn still own
     /// THIS EXACT panel?", the gate the orphan-store drain uses to defer a delete
