@@ -1174,6 +1174,56 @@ impl SensitivityState {
     }
 }
 
+/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: monotonic ID allocators
+/// (#3038 god-object split, id-sequence slice).
+///
+/// Bundles the three independent `AtomicU64` counters that previously lived
+/// directly on `VoiceBargeInRuntime`. Each `next_*` accessor preserves the
+/// original `fetch_add` semantics — including the exact memory `Ordering` and
+/// the per-counter seed value — so issued IDs are byte-for-byte identical to
+/// the pre-extraction layout:
+/// - spoken-result playbacks seed at `1` (`SeqCst`),
+/// - progress playbacks seed at `PROGRESS_PLAYBACK_OWNER_START` (`SeqCst`),
+/// - internal voice messages seed at `INTERNAL_VOICE_MESSAGE_ID_START`
+///   (`Relaxed`).
+struct VoiceIdSequences {
+    next_spoken_result_playback_id: AtomicU64,
+    // F4 (#2046): progress/ack 재생 owner id 발급용. 30s 만료 타이머가 owner 일치
+    // 시에만 playback entry 를 정리하도록 한다.
+    next_progress_playback_id: AtomicU64,
+    next_internal_message_id: AtomicU64,
+}
+
+impl VoiceIdSequences {
+    fn new() -> Self {
+        Self {
+            next_spoken_result_playback_id: AtomicU64::new(1),
+            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
+            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
+        }
+    }
+
+    /// Allocate the next spoken-result playback id (`SeqCst`, seeded at `1`).
+    fn next_spoken_result_playback_id(&self) -> u64 {
+        self.next_spoken_result_playback_id
+            .fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Allocate the next progress/ack playback owner id (`SeqCst`, seeded at
+    /// `PROGRESS_PLAYBACK_OWNER_START`).
+    fn next_progress_playback_id(&self) -> u64 {
+        self.next_progress_playback_id
+            .fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Allocate the next internal voice message id (`Relaxed`, seeded at
+    /// `INTERNAL_VOICE_MESSAGE_ID_START`).
+    fn next_internal_message_id(&self) -> u64 {
+        self.next_internal_message_id
+            .fetch_add(1, Ordering::Relaxed)
+    }
+}
+
 pub(in crate::services::discord) struct VoiceBargeInRuntime {
     enabled: bool,
     barge_in_enabled: bool,
@@ -1198,11 +1248,10 @@ pub(in crate::services::discord) struct VoiceBargeInRuntime {
     voice_guilds: dashmap::DashMap<u64, GuildId>,
     active_voice_routes: dashmap::DashMap<u64, ActiveVoiceRoute>,
     deferred_buffers: dashmap::DashMap<u64, Arc<Mutex<DeferredBargeInBuffer>>>,
-    next_spoken_result_playback_id: AtomicU64,
-    // F4 (#2046): progress/ack 재생 owner id 발급용. 30s 만료 타이머가 owner 일치
-    // 시에만 playback entry 를 정리하도록 한다.
-    next_progress_playback_id: AtomicU64,
-    next_internal_message_id: AtomicU64,
+    // #3038: monotonic ID 발급 관심사를 sub-struct 로 격리. 세 카운터(spoken
+    // result / progress playback / internal message)의 seed 값과 memory
+    // Ordering 을 그대로 보존한다.
+    id_sequences: VoiceIdSequences,
     // F6 (#2046): `resolve_voice_turn_target` 가 매 utterance 마다 YAML 을
     // 재파싱하지 않도록 한 `Config` snapshot 핫캐시.
     config_cache: std::sync::Mutex<Option<(Instant, Arc<crate::config::Config>)>>,
@@ -1258,9 +1307,7 @@ impl VoiceBargeInRuntime {
             voice_guilds: dashmap::DashMap::new(),
             active_voice_routes: dashmap::DashMap::new(),
             deferred_buffers: dashmap::DashMap::new(),
-            next_spoken_result_playback_id: AtomicU64::new(1),
-            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
-            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
+            id_sequences: VoiceIdSequences::new(),
             config_cache: std::sync::Mutex::new(None),
             alias_collision_signature: std::sync::Mutex::new(None),
             inflight_foreground_cancels: dashmap::DashMap::new(),
@@ -1292,9 +1339,7 @@ impl VoiceBargeInRuntime {
             voice_guilds: dashmap::DashMap::new(),
             active_voice_routes: dashmap::DashMap::new(),
             deferred_buffers: dashmap::DashMap::new(),
-            next_spoken_result_playback_id: AtomicU64::new(1),
-            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
-            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
+            id_sequences: VoiceIdSequences::new(),
             config_cache: std::sync::Mutex::new(None),
             alias_collision_signature: std::sync::Mutex::new(None),
             inflight_foreground_cancels: dashmap::DashMap::new(),
@@ -2233,9 +2278,7 @@ impl VoiceBargeInRuntime {
     }
 
     fn start_spoken_result_playback(&self, channel_id: ChannelId) -> (u64, CancellationToken) {
-        let id = self
-            .next_spoken_result_playback_id
-            .fetch_add(1, Ordering::SeqCst);
+        let id = self.id_sequences.next_spoken_result_playback_id();
         let cancellation = CancellationToken::new();
         if let Some(previous) = self.spoken_result_playbacks.insert(
             channel_id.get(),
@@ -3984,10 +4027,7 @@ impl VoiceBargeInRuntime {
             }
         }
 
-        let message_id = MessageId::new(
-            self.next_internal_message_id
-                .fetch_add(1, Ordering::Relaxed),
-        );
+        let message_id = MessageId::new(self.id_sequences.next_internal_message_id());
         super::enqueue_internal_followup(
             shared,
             provider,
@@ -4150,9 +4190,7 @@ impl VoiceBargeInRuntime {
         // 30s 만료 타이머는 `clear_playback_if_owner` 로 동일 owner 일 때만 정리.
         // 후속 progress/spoken_result playback 이 entry 를 덮어쓰면 mismatch 로
         // no-op → 후속 playback 의 barge-in 이 깨지지 않는다.
-        let playback_id = self
-            .next_progress_playback_id
-            .fetch_add(1, Ordering::SeqCst);
+        let playback_id = self.id_sequences.next_progress_playback_id();
         self.reset_after_playback_start_with_owner(
             channel_id,
             Arc::new(track),
