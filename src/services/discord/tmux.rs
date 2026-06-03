@@ -139,6 +139,10 @@ pub(super) struct RestoredWatcherTurn {
     last_edit_text: String,
     task_notification_kind: Option<TaskNotificationKind>,
     finish_mailbox_on_completion: bool,
+    /// #3107 codex re-review (P2#3): the #3099 hourglass anchor from the
+    /// restored inflight, carried so a watcher-owned re-acquire (after the row
+    /// is cleared mid-turn) can re-pin it instead of orphaning the `⏳`.
+    pub(super) injected_prompt_message_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -210,6 +214,7 @@ pub(super) fn restored_watcher_turn_from_inflight(
         last_edit_text: reconstructed_inflight_placeholder_body(state),
         task_notification_kind: state.task_notification_kind,
         finish_mailbox_on_completion,
+        injected_prompt_message_id: state.injected_prompt_message_id,
     })
 }
 
@@ -2464,5 +2469,48 @@ mod watcher_stream_progress_tests {
         assert_eq!(persisted.current_msg_id, 9100000000000000125);
 
         unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
+    }
+}
+
+#[cfg(test)]
+mod restored_turn_injected_anchor_tests {
+    use super::restored_watcher_turn_from_inflight;
+    use crate::services::discord::inflight::InflightTurnState;
+    use crate::services::provider::ProviderKind;
+
+    // #3107 codex re-review (P2, F3): the streaming-interval re-acquire site reads
+    // the #3099 hourglass anchor (`injected_prompt_message_id`) from the restored
+    // turn captured up front (before `restored_turn.take()` consumes it). This test
+    // pins the source of that capture: a hourglass-anchored inflight that the
+    // watcher restores must carry the anchor onto the `RestoredWatcherTurn`, so the
+    // mid-stream re-acquire can re-pin it instead of orphaning the `⏳`.
+    #[test]
+    fn restored_turn_carries_injected_prompt_message_id_for_streaming_reacquire() {
+        let provider = ProviderKind::Claude;
+        let tmux_session_name = "AgentDesk-claude-adk-cc-3107-f3";
+        let mut state = InflightTurnState::new(
+            provider,
+            123_456,
+            Some("adk-cc".to_string()),
+            0, // headless / synthetic user turn (task-notification auto-turn)
+            0,
+            55_555, // current_msg_id must be non-zero for a restorable turn
+            "anchored auto-turn".to_string(),
+            None,
+            Some(tmux_session_name.to_string()),
+            Some("/tmp/agentdesk-3107-f3.jsonl".to_string()),
+            None,
+            0,
+        );
+        state.injected_prompt_message_id = Some(424_242);
+
+        let restored = restored_watcher_turn_from_inflight(&state, tmux_session_name, false)
+            .expect("a non-rebind inflight with a real current_msg_id restores");
+        assert_eq!(
+            restored.injected_prompt_message_id,
+            Some(424_242),
+            "the restored turn must carry the #3099 hourglass anchor so the \
+             streaming-interval re-acquire can re-pin it (F3 regression)"
+        );
     }
 }

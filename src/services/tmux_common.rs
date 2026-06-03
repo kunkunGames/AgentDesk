@@ -121,6 +121,173 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
         })
 }
 
+/// #3107: inflight-INDEPENDENT "the pane is in an active TUI turn" signal.
+///
+/// A multi-step agentic Claude TUI turn can lose its dcserver inflight mid-turn
+/// (a momentary idle observation between tool calls trips the completion gate,
+/// commits, and clears inflight) while the pane keeps producing assistant
+/// output. Once inflight is gone every later batch is treated as ownerless and
+/// suppressed (`should_skip_streaming_placeholder_without_inflight` /
+/// `should_suppress_post_terminal_output_without_inflight`), so the live turn
+/// goes dark even though the watcher is still alive.
+///
+/// This predicate gives the suppression/reclaim paths a way to tell a genuinely
+/// finished turn (returned to ready-for-input, or showing idle-suggestion
+/// chrome — the real post-finish ghost noise we DO want to suppress) apart from
+/// a live turn that merely lost its inflight.
+///
+/// #3107 codex re-review (P2#1): the original definition was
+/// `!ready_for_input && !idle_suggestion`, i.e. it treated the *absence* of
+/// idle markers as "streaming". That false-positived on every pane that is
+/// neither idle-marked nor busy: a scrolled pane, an error screen, a
+/// non-Claude-TUI pane, or a generic prompt-waiting pane all read as
+/// "streaming" → spurious un-suppress + re-acquire + reclaim-block. We now
+/// require a POSITIVE Claude-TUI busy signal, not merely the absence of idle
+/// chrome. `true` means: the pane IS a Claude TUI showing an active/busy
+/// indicator AND is not ready-for-input ⇒ a live turn that lost its inflight.
+/// Anything ambiguous (blank / error / scrolled / non-Claude / generic prompt)
+/// biases to `false` (keep suppressing) — the safe direction.
+pub(crate) fn tmux_capture_indicates_claude_tui_actively_streaming(capture: &str) -> bool {
+    if capture.trim().is_empty() {
+        return false;
+    }
+    if tmux_capture_indicates_claude_tui_ready_for_input(capture) {
+        return false;
+    }
+    if tmux_capture_indicates_claude_tui_idle_suggestion(capture) {
+        return false;
+    }
+    // Positive busy signal required (bias to FALSE/suppress when ambiguous).
+    tmux_capture_indicates_claude_tui_busy(capture)
+}
+
+/// #3107 codex re-review (P2#1, F2): a POSITIVE "Claude TUI is mid-response
+/// right now" signal that requires Claude-TUI-SPECIFIC CHROME, not generic
+/// words. The previous implementation accepted any recent line containing the
+/// bare substrings `processing` / `thinking` / `running`. Those words routinely
+/// appear in ASSISTANT BODY TEXT (e.g. the model writing "the test is
+/// running…") and in non-Claude program output, so a finished or even
+/// non-Claude pane could read as "actively streaming" → wrongly un-suppress /
+/// re-acquire / block reclaim.
+///
+/// The reliable in-progress markers the Claude TUI actually RENDERS are:
+///   1. the `esc to interrupt` footer — the strongest, unambiguous signal; it
+///      only renders while a turn is in flight; and
+///   2. the spinner progress line — a leading spinner glyph (`· ✢ ✻ ✽ ✶ ✳ ✦`)
+///      immediately followed by a work verb (`Actioning…`, `Musing…`,
+///      `Thinking…`, `Processing…`, `Running…`, …). This is the footer the TUI
+///      draws while streaming, NOT free-text in the response body.
+/// Plus the explicit `⏺ Running command / Searching for / Reading / Editing …`
+/// active-work markers via `tmux_recent_lines_show_claude_tui_active_work`.
+///
+/// Bare `processing`/`thinking`/`running` NOT anchored to the spinner glyph or
+/// the `esc to interrupt` footer are DROPPED. Anything that is not a
+/// recognizable Claude-TUI in-progress frame biases to FALSE.
+pub(crate) fn tmux_capture_indicates_claude_tui_busy(capture: &str) -> bool {
+    let non_empty = capture
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>();
+    if non_empty.is_empty() {
+        return false;
+    }
+    let start = non_empty.len().saturating_sub(CLAUDE_TUI_ACTIVE_SCAN_LINES);
+    let recent = &non_empty[start..];
+    recent.iter().any(|line| {
+        let trimmed = trim_prompt_line(line);
+        // (1) the `esc to interrupt` footer — strongest in-flight marker.
+        if trimmed.to_ascii_lowercase().contains("esc to interrupt") {
+            return true;
+        }
+        // (2) the spinner progress line: a leading spinner glyph adjacent to a
+        // work verb, as the Claude TUI renders the streaming footer. The
+        // verb-word match is ANCHORED to the spinner glyph so the same word in
+        // assistant body text does NOT trip it.
+        tmux_line_is_claude_tui_spinner_progress(trimmed)
+    }) || tmux_recent_lines_show_claude_tui_active_work(recent)
+}
+
+/// `true` when `line` is a Claude TUI spinner progress footer: a leading spinner
+/// glyph (the rotating set the TUI cycles through) directly followed by a work
+/// verb. Anchoring the verb to the spinner glyph is what distinguishes the TUI
+/// chrome from the same verb appearing in assistant body text.
+fn tmux_line_is_claude_tui_spinner_progress(line: &str) -> bool {
+    const SPINNER_GLYPHS: [char; 8] = ['·', '✢', '✳', '✶', '✻', '✽', '✦', '∗'];
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !SPINNER_GLYPHS.contains(&first) {
+        return false;
+    }
+    // The remainder after the glyph (and its following space) must lead with a
+    // work verb the TUI uses for the streaming footer. Completed-work summaries
+    // (`✻ Churned for 4m 56s`, `✻ Worked for 2s`) use a past-tense "<verb> for
+    // <duration>" shape and must NOT count as in-progress.
+    let rest = chars.as_str().trim_start();
+    let lower = rest.to_ascii_lowercase();
+    if lower.contains(" for ") && !lower.contains("esc to interrupt") {
+        return false;
+    }
+    const WORK_VERBS: [&str; 7] = [
+        "actioning",
+        "musing",
+        "thinking",
+        "processing",
+        "running",
+        "crunching",
+        "churning",
+    ];
+    if !WORK_VERBS.iter().any(|verb| lower.starts_with(verb)) {
+        return false;
+    }
+    // #3107 codex re-review (F2): the leading glyph + work verb alone is NOT
+    // enough — a plain assistant sentence that happens to begin with a spinner
+    // glyph and a verb (e.g. `· Thinking through the problem and running the
+    // tests`) would otherwise read as the streaming footer. The REAL Claude TUI
+    // spinner line ALWAYS carries a status SUFFIX — it renders like
+    // `✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)`. Require at least
+    // one of those status markers so assistant prose can't trip it:
+    //   - the literal `esc to interrupt`, OR
+    //   - a parenthesized TUI status group containing a duration (`<N>s` /
+    //     `<N>m`), a `tokens` count, and/or the `·` separator the TUI uses.
+    if lower.contains("esc to interrupt") {
+        return true;
+    }
+    line_has_claude_tui_spinner_status_group(line)
+}
+
+/// `true` when `line` contains the parenthesized status group the Claude TUI
+/// spinner footer renders next to the work verb, e.g.
+/// `(12s · ↑ 1.2k tokens · esc to interrupt)`. The group must carry at least one
+/// of: a duration token (`<N>s` / `<N>m`), a `tokens` count, or the interior `·`
+/// separator the TUI draws between status fields. A bare parenthetical in
+/// assistant prose (no such marker) does NOT qualify.
+fn line_has_claude_tui_spinner_status_group(line: &str) -> bool {
+    let Some(open) = line.find('(') else {
+        return false;
+    };
+    let after_open = &line[open + 1..];
+    let Some(close_rel) = after_open.find(')') else {
+        return false;
+    };
+    let group = &after_open[..close_rel];
+    let lower = group.to_ascii_lowercase();
+    if lower.contains("esc to interrupt") || lower.contains("tokens") || group.contains('·') {
+        return true;
+    }
+    // A standalone duration token such as `12s` / `4m` inside the group.
+    group
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| {
+            let bytes = tok.as_bytes();
+            bytes.len() >= 2
+                && matches!(bytes[bytes.len() - 1], b's' | b'm')
+                && bytes[..bytes.len() - 1].iter().all(|b| b.is_ascii_digit())
+        })
+}
+
 pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
     tmux_capture_claude_tui_prompt_draft_backspace_budget(capture).is_some()
 }
@@ -1019,5 +1186,238 @@ assistant output
 
         assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
         assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
+    }
+
+    #[test]
+    fn actively_streaming_detects_busy_pane_with_esc_to_interrupt() {
+        // #3107: a live agentic turn that lost its inflight — the pane still
+        // shows the busy/"esc to interrupt" marker and is producing.
+        let capture = "\
+⏺ Running 1 shell command…
+· Actioning… (4m 7s · esc to interrupt)
+─────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ █░░░░░░░░░ │ 7%";
+
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_ready_for_input_pane() {
+        // A genuinely finished turn returned to ready-for-input: not streaming.
+        let capture = "\
+✻ Churned for 4m 56s
+─────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ █░░░░░░░░░ │ 7%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 17 done
+  ⏵⏵ bypass permissions on";
+
+        assert!(tmux_capture_indicates_claude_tui_ready_for_input(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_idle_suggestion_chrome() {
+        // Idle-suggestion chrome is real post-finish ghost noise, not a live
+        // turn — must not be treated as actively streaming.
+        let capture = "\
+⏺ TUI-E2E marker
+✻ Worked for 2s
+────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}좋아, 잘 동작하네
+────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ ░░░░░░░░░░ │ 4%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
+  ⏵⏵ bypass permissions on";
+
+        assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_empty_capture() {
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(""));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            "   \n  \n"
+        ));
+    }
+
+    // #3107 codex re-review (P2#1): the original `!ready && !idle` definition
+    // false-positived any pane that was merely not-idle as "streaming". The
+    // tightened definition requires a POSITIVE busy signal, so a non-Claude /
+    // error / scrolled / generic-prompt pane biases to FALSE (keep suppressing).
+    #[test]
+    fn actively_streaming_rejects_non_claude_pane() {
+        // A plain shell prompt — not a Claude TUI at all — has no busy marker.
+        let capture = "\
+user@host ~/work %\u{00a0}
+$ ls -la
+total 0
+$ ";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_error_screen() {
+        // An error/backtrace screen left in the pane is finished, not streaming.
+        let capture = "\
+thread 'main' panicked at src/lib.rs:42:9:
+called `Result::unwrap()` on an `Err` value: Broken pipe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: process didn't exit successfully (exit status: 101)";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_scrolled_pane_without_busy_marker() {
+        // A scrolled-back pane showing prior assistant output with no live
+        // busy/spinner marker must not read as streaming.
+        let capture = "\
+⏺ Here is the summary of the changes I made earlier.
+  ⎿  Edited 3 files, ran the test suite, all green.
+some scrolled-back prose line
+another scrolled-back prose line";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_generic_prompt_waiting_pane() {
+        // A generic prompt-waiting pane (no Claude busy chrome) is ambiguous and
+        // must bias to FALSE (suppress), not be relayed as streaming.
+        let capture = "\
+Press any key to continue . . .
+> ";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_accepts_claude_busy_spinner_verb() {
+        // A real Claude TUI mid-response with a spinner verb + active-work marker
+        // (no ready/idle chrome) is the genuine "live turn lost its inflight" case.
+        let capture = "\
+⏺ Reading src/main.rs
+· Musing… (12s · ↓ 2.1k tokens)";
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    // #3107 codex re-review (P2, F2): the busy classifier previously accepted any
+    // recent line containing the bare substrings `running`/`processing`/`thinking`.
+    // Those words appear in normal ASSISTANT BODY text, so a pane that has
+    // finished but still shows such prose was mis-read as streaming. The marker
+    // must be Claude-TUI chrome (spinner glyph / `esc to interrupt`), not a word.
+    #[test]
+    fn actively_streaming_rejects_assistant_body_with_busy_words_but_no_chrome() {
+        // Assistant body text mentions "running" / "processing" / "thinking" but
+        // there is NO `esc to interrupt` footer and NO spinner progress line.
+        let capture = "\
+⏺ I checked the build: the test suite is running in CI and the worker is
+  still processing the queue while thinking through the edge cases.
+some more scrolled-back assistant prose
+another line of prior output";
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    // #3107 F2: a real Claude TUI in-progress frame keyed only on the strongest
+    // marker (`esc to interrupt`) — no spinner verb, no `⏺` active-work line —
+    // must still read as streaming.
+    #[test]
+    fn actively_streaming_accepts_esc_to_interrupt_footer_only() {
+        let capture = "\
+some earlier assistant prose still on screen
+(13s · ↓ 1.2k tokens · esc to interrupt)";
+        assert!(tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    // #3107 codex re-review (F2 PARTIAL close): a spinner-progress line keyed on
+    // ONLY the leading glyph + work verb still false-positived on assistant prose
+    // that happens to begin with a spinner glyph and a verb. The real Claude TUI
+    // spinner footer ALWAYS carries a status SUFFIX (`esc to interrupt`, a
+    // duration, a token count, and/or the `·` separator). The recognizer now
+    // requires that suffix, so bare prose can no longer trip it.
+    #[test]
+    fn actively_streaming_rejects_glyph_verb_prose_without_status_suffix() {
+        // Assistant body line: leading spinner glyph + work verb, but NO Claude
+        // TUI status suffix → NOT a spinner-progress footer → NOT busy.
+        let capture = "\
+· Thinking through the problem and running the tests
+some more scrolled-back assistant prose
+another line of prior output";
+        assert!(!tmux_line_is_claude_tui_spinner_progress(
+            "· Thinking through the problem and running the tests"
+        ));
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_accepts_real_spinner_with_status_suffix() {
+        // The genuine Claude TUI spinner footer: glyph + verb + parenthesized
+        // status group with a duration, token count, and `esc to interrupt`.
+        let line = "✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)";
+        assert!(tmux_line_is_claude_tui_spinner_progress(line));
+        let capture = format!("earlier assistant prose\n{line}");
+        assert!(tmux_capture_indicates_claude_tui_busy(&capture));
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            &capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_accepts_spinner_with_duration_only_status() {
+        // A spinner footer whose status group carries only a bare duration token
+        // (no `esc to interrupt`, no `tokens`) still qualifies.
+        let line = "✻ Thinking… (12s)";
+        assert!(tmux_line_is_claude_tui_spinner_progress(line));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_glyph_verb_with_plain_parenthetical() {
+        // Glyph + verb followed by an ordinary parenthetical with no TUI status
+        // marker (no duration, no `tokens`, no `·`) must NOT qualify.
+        let line = "· Thinking about the design (a fresh idea here)";
+        assert!(!tmux_line_is_claude_tui_spinner_progress(line));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_glyph_verb_past_tense_completion() {
+        // Past-tense `<verb> for <duration>` completion summary stays excluded.
+        let line = "· Running for 3s";
+        assert!(!tmux_line_is_claude_tui_spinner_progress(line));
+        let capture = "\
+· Running for 3s
+some scrolled-back prose line
+another scrolled-back prose line";
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 }
