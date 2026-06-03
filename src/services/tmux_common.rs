@@ -134,10 +134,19 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
 /// This predicate gives the suppression/reclaim paths a way to tell a genuinely
 /// finished turn (returned to ready-for-input, or showing idle-suggestion
 /// chrome — the real post-finish ghost noise we DO want to suppress) apart from
-/// a live turn that merely lost its inflight. `true` means: the pane is neither
-/// ready-for-input NOR showing idle-suggestion chrome ⇒ it is actively
-/// producing ⇒ an active turn (that lost its inflight). `false` means the pane
-/// looks finished/idle, so existing suppression must stand.
+/// a live turn that merely lost its inflight.
+///
+/// #3107 codex re-review (P2#1): the original definition was
+/// `!ready_for_input && !idle_suggestion`, i.e. it treated the *absence* of
+/// idle markers as "streaming". That false-positived on every pane that is
+/// neither idle-marked nor busy: a scrolled pane, an error screen, a
+/// non-Claude-TUI pane, or a generic prompt-waiting pane all read as
+/// "streaming" → spurious un-suppress + re-acquire + reclaim-block. We now
+/// require a POSITIVE Claude-TUI busy signal, not merely the absence of idle
+/// chrome. `true` means: the pane IS a Claude TUI showing an active/busy
+/// indicator AND is not ready-for-input ⇒ a live turn that lost its inflight.
+/// Anything ambiguous (blank / error / scrolled / non-Claude / generic prompt)
+/// biases to `false` (keep suppressing) — the safe direction.
 pub(crate) fn tmux_capture_indicates_claude_tui_actively_streaming(capture: &str) -> bool {
     if capture.trim().is_empty() {
         return false;
@@ -148,7 +157,39 @@ pub(crate) fn tmux_capture_indicates_claude_tui_actively_streaming(capture: &str
     if tmux_capture_indicates_claude_tui_idle_suggestion(capture) {
         return false;
     }
-    true
+    // Positive busy signal required (bias to FALSE/suppress when ambiguous).
+    tmux_capture_indicates_claude_tui_busy(capture)
+}
+
+/// #3107 codex re-review (P2#1): a POSITIVE "Claude TUI is mid-response right
+/// now" signal. Reuses the same busy keywords / active-work markers that the
+/// ready-for-input detector keys off (`esc to interrupt`, spinner verbs,
+/// `⏺ Running/Searching/Reading/Editing …`, etc.) over the recent capture
+/// window. Unlike the absence-of-idle heuristic this cannot be satisfied by a
+/// scrolled / error / non-Claude / generic-prompt pane, so an ambiguous pane is
+/// never misclassified as streaming.
+pub(crate) fn tmux_capture_indicates_claude_tui_busy(capture: &str) -> bool {
+    let non_empty = capture
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>();
+    if non_empty.is_empty() {
+        return false;
+    }
+    let start = non_empty.len().saturating_sub(CLAUDE_TUI_ACTIVE_SCAN_LINES);
+    let recent = &non_empty[start..];
+    // The spinner-verb / "esc to interrupt" / "processing"/"thinking"/"running"
+    // keywords (the same set `..._show_idle_suggestion_chrome` treats as the
+    // "busy → not idle" override) plus the explicit active-work markers
+    // (`Actioning`, `Musing`, `⏺ Running/Searching/Reading/Editing …`).
+    recent.iter().any(|line| {
+        let trimmed = trim_prompt_line(line);
+        let lower = trimmed.to_ascii_lowercase();
+        lower.contains("esc to interrupt")
+            || lower.contains("processing")
+            || lower.contains("thinking")
+            || lower.contains("running")
+    }) || tmux_recent_lines_show_claude_tui_active_work(recent)
 }
 
 pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
@@ -1112,6 +1153,74 @@ assistant output
         assert!(!tmux_capture_indicates_claude_tui_actively_streaming(""));
         assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
             "   \n  \n"
+        ));
+    }
+
+    // #3107 codex re-review (P2#1): the original `!ready && !idle` definition
+    // false-positived any pane that was merely not-idle as "streaming". The
+    // tightened definition requires a POSITIVE busy signal, so a non-Claude /
+    // error / scrolled / generic-prompt pane biases to FALSE (keep suppressing).
+    #[test]
+    fn actively_streaming_rejects_non_claude_pane() {
+        // A plain shell prompt — not a Claude TUI at all — has no busy marker.
+        let capture = "\
+user@host ~/work %\u{00a0}
+$ ls -la
+total 0
+$ ";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_error_screen() {
+        // An error/backtrace screen left in the pane is finished, not streaming.
+        let capture = "\
+thread 'main' panicked at src/lib.rs:42:9:
+called `Result::unwrap()` on an `Err` value: Broken pipe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: process didn't exit successfully (exit status: 101)";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_scrolled_pane_without_busy_marker() {
+        // A scrolled-back pane showing prior assistant output with no live
+        // busy/spinner marker must not read as streaming.
+        let capture = "\
+⏺ Here is the summary of the changes I made earlier.
+  ⎿  Edited 3 files, ran the test suite, all green.
+some scrolled-back prose line
+another scrolled-back prose line";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_rejects_generic_prompt_waiting_pane() {
+        // A generic prompt-waiting pane (no Claude busy chrome) is ambiguous and
+        // must bias to FALSE (suppress), not be relayed as streaming.
+        let capture = "\
+Press any key to continue . . .
+> ";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
+
+    #[test]
+    fn actively_streaming_accepts_claude_busy_spinner_verb() {
+        // A real Claude TUI mid-response with a spinner verb + active-work marker
+        // (no ready/idle chrome) is the genuine "live turn lost its inflight" case.
+        let capture = "\
+⏺ Reading src/main.rs
+· Musing… (12s · ↓ 2.1k tokens)";
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
         ));
     }
 }

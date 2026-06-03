@@ -195,6 +195,7 @@ fn watcher_external_input_turn_abandoned(
     provider: &ProviderKind,
     channel_id: ChannelId,
     tmux_session_name: &str,
+    output_path: &str,
     data_start_offset: u64,
     expected_identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
 ) -> bool {
@@ -205,11 +206,13 @@ fn watcher_external_input_turn_abandoned(
         // status panel here would orphan the live turn (frame_ack MissingTarget).
         // Probe the pane lazily (only on this `None` arm, so the
         // `tmux capture-pane` cost is paid only for an abandonment candidate):
-        // if it is actively streaming the turn is live → NOT abandoned. A
-        // genuinely finished/stopped turn returns to ready-for-input, so real
-        // orphans (inflight gone AND pane idle) are still reclaimed.
-        None => watcher_inflight_absence_is_abandonment(watcher_pane_actively_streaming(
+        // if it is actively streaming AND making progress the turn is live →
+        // NOT abandoned. A genuinely finished/stopped turn returns to
+        // ready-for-input (or its pane freezes), so real orphans (inflight gone
+        // AND pane idle/frozen) are still reclaimed.
+        None => watcher_inflight_absence_is_abandonment(watcher_pane_live_turn_in_progress(
             tmux_session_name,
+            output_path,
         )),
         Some(state) => {
             let replaced = expected_identity.is_some_and(|expected| {
@@ -255,6 +258,46 @@ fn watcher_pane_actively_streaming(tmux_session_name: &str) -> bool {
     crate::services::tmux_common::tmux_capture_indicates_claude_tui_actively_streaming(&pane)
 }
 
+/// #3107 codex re-review (P2#3): abandonment-side progress check. A single
+/// static busy frame (e.g. a frozen spinner left on screen by a turn that has
+/// actually stopped) must NOT pin the status panel forever. So the abandonment
+/// `None` arm requires BOTH a positive busy pane AND *evidence of progress* —
+/// the session JSONL was written within `LIVE_TURN_PROGRESS_WINDOW`. A truly
+/// live turn keeps appending output, so its file mtime stays fresh; a frozen
+/// pane's output file goes stale and the turn is correctly declared abandoned
+/// and reclaimed.
+///
+/// This is intentionally distinct from `watcher_pane_actively_streaming` (used
+/// by the self-heal re-acquire): re-acquiring a live-but-inflight-lost turn is
+/// safe even on a single busy frame, but BLOCKING a reclaim is the dangerous
+/// direction (panel orphan leak), so the reclaim path adds the freshness gate.
+fn watcher_pane_live_turn_in_progress(tmux_session_name: &str, output_path: &str) -> bool {
+    watcher_pane_actively_streaming(tmux_session_name)
+        && watcher_output_progressed_recently(output_path)
+}
+
+/// Maximum age of the session JSONL's last write for the turn to count as
+/// "still making progress". A live agentic Claude turn appends stream-json
+/// frames continuously (token deltas, tool events); even a slow tool keeps the
+/// wrapper writing well inside this window. Generous enough not to false-reclaim
+/// a momentarily-quiet live turn, tight enough that a frozen/stopped pane's
+/// stale file trips abandonment within one sweep.
+const LIVE_TURN_PROGRESS_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
+
+fn watcher_output_progressed_recently(output_path: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(output_path) else {
+        // No readable output file: cannot prove progress → not "in progress".
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    modified
+        .elapsed()
+        .map(|age| age <= LIVE_TURN_PROGRESS_WINDOW)
+        .unwrap_or(false)
+}
+
 /// #3107 self-heal (CHANGE 2): when the pane is actively streaming but the
 /// dcserver has no inflight for this channel, re-establish a minimal
 /// watcher-owned `InflightTurnState` so subsequent streaming edits relay and the
@@ -275,12 +318,17 @@ fn reacquire_watcher_inflight_for_active_stream(
     start_offset: u64,
     status_panel_msg_id: Option<serenity::MessageId>,
     placeholder_msg_id: Option<serenity::MessageId>,
+    // #3107 codex re-review (P2#3): the #3099 hourglass anchor from the
+    // just-cleared inflight, when a source still has it. The watcher-owned
+    // re-acquire mints a `user_msg_id == 0` synthetic row; per #3099/#3100 the
+    // watcher path does NOT add a `⏳` to a real Discord *user* message for
+    // such turns, so leaving this `None` is safe for the common case. But if
+    // the cleared row HAD pinned an injected message id (e.g. a
+    // task-notification auto-turn that lost its inflight mid-flight), preserving
+    // it here keeps the `⏳ → ✅` completion cleanup able to find its own
+    // message instead of orphaning the hourglass.
+    injected_prompt_message_id: Option<u64>,
 ) -> bool {
-    // Idempotent: never clobber a concurrently-created legitimate inflight.
-    if crate::services::discord::inflight::load_inflight_state(provider, channel_id.get()).is_some()
-    {
-        return false;
-    }
     // The streaming-edit target is the placeholder/status-panel message still
     // owned by this watcher; pin it as `current_msg_id` so edits + the terminal
     // ack resolve a target instead of MissingTarget.
@@ -309,7 +357,17 @@ fn reacquire_watcher_inflight_for_active_stream(
     if let Some(panel) = status_panel_msg_id {
         state.status_message_id = Some(panel.get());
     }
-    crate::services::discord::inflight::save_inflight_state(&state).is_ok()
+    state.injected_prompt_message_id = injected_prompt_message_id;
+    // #3107 codex re-review (P1): atomic compare-and-set. The previous
+    // implementation did a non-atomic `load_inflight_state(...).is_some()`
+    // preflight here and then an unconditional `save_inflight_state`, leaving a
+    // window in which the Discord intake path could create a REAL inflight for a
+    // new user turn on this `(provider, channel_id)` that the synthetic save
+    // would then clobber. `save_inflight_state_if_absent` performs the
+    // existence check and the write under one sidecar flock (shared with
+    // intake's `save_inflight_state`), so a concurrent intake inflight always
+    // wins and the re-acquire degrades to a no-op.
+    crate::services::discord::inflight::save_inflight_state_if_absent(&state).unwrap_or(false)
 }
 
 fn discard_restored_response_seed_before_no_inflight_terminal_relay(
@@ -3387,6 +3445,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let restored_placeholder = restored_turn
                 .as_ref()
                 .and_then(|turn| (turn.current_msg_id.get() != 0).then_some(turn.current_msg_id));
+            let restored_injected_prompt_message_id = restored_turn
+                .as_ref()
+                .and_then(|turn| turn.injected_prompt_message_id);
             let reacquired = reacquire_watcher_inflight_for_active_stream(
                 &watcher_provider,
                 channel_id,
@@ -3395,6 +3456,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 data_start_offset,
                 restored_panel,
                 restored_placeholder,
+                restored_injected_prompt_message_id,
             );
             if reacquired && !active_stream_inflight_reacquire_logged {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4152,6 +4214,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             &watcher_provider,
                             channel_id,
                             &tmux_session_name,
+                            &output_path,
                             data_start_offset,
                             turn_identity_for_panel.as_ref(),
                         )
@@ -4314,6 +4377,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             data_start_offset,
                             status_panel_msg_id,
                             placeholder_msg_id,
+                            // #3107 codex re-review (P2#3): no recoverable source
+                            // for the #3099 hourglass anchor in the streaming-interval
+                            // block — the inflight was already cleared and the restored
+                            // seed (if any) was consumed at turn-restore time. The
+                            // re-acquired row is `user_msg_id == 0`, which per #3099/#3100
+                            // the watcher path never ⏳-anchors to a real user message, so
+                            // leaving this None is safe for this owner kind.
+                            None,
                         );
                         if reacquired && !active_stream_inflight_reacquire_logged {
                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -4469,6 +4540,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             &watcher_provider,
                             channel_id,
                             &tmux_session_name,
+                            &output_path,
                             data_start_offset,
                             turn_identity_for_panel.as_ref(),
                         ) {
@@ -5892,6 +5964,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     &watcher_provider,
                     channel_id,
                     &tmux_session_name,
+                    &output_path,
                     data_start_offset,
                     turn_identity_for_panel.as_ref(),
                 )) {
@@ -8046,8 +8119,9 @@ mod tests {
         watcher_direct_terminal_should_commit_session_idle,
         watcher_fallback_edit_failure_can_delete_original_placeholder,
         watcher_inflight_absence_is_abandonment, watcher_inflight_represents_external_input,
-        watcher_jsonl_turn_state_ready_for_input, watcher_should_clear_stale_terminal_message_ids,
-        watcher_should_defer_delegated_fresh_idle, watcher_should_delete_suppressed_placeholder,
+        watcher_jsonl_turn_state_ready_for_input, watcher_output_progressed_recently,
+        watcher_should_clear_stale_terminal_message_ids, watcher_should_defer_delegated_fresh_idle,
+        watcher_should_delete_suppressed_placeholder,
         watcher_should_suppress_streaming_after_bridge_delivery,
         watcher_terminal_commit_side_effects_for_test, watcher_terminal_edit_consumes_placeholder,
         watcher_terminal_token_update_status,
@@ -8219,6 +8293,39 @@ mod tests {
         );
     }
 
+    // #3107 codex re-review (P2#3): the abandonment progress gate. A live turn
+    // whose session JSONL was written recently counts as "progressing"; a
+    // finished/stopped turn whose pane shows a STALE lingering frame (no recent
+    // output) does not — so a frozen spinner can no longer pin the panel.
+    #[test]
+    fn watcher_output_progress_gate_distinguishes_fresh_from_stale_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fresh = tmp.path().join("fresh.jsonl");
+        std::fs::write(&fresh, "{\"type\":\"assistant\"}\n").expect("write fresh output");
+        assert!(
+            watcher_output_progressed_recently(fresh.to_str().unwrap()),
+            "a just-written output file must read as recent progress"
+        );
+
+        // A stale file (mtime well past the window) reads as no progress, so a
+        // finished turn with a lingering busy frame is still declared abandoned.
+        let stale = tmp.path().join("stale.jsonl");
+        let stale_file = std::fs::File::create(&stale).expect("create stale output");
+        stale_file
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .expect("backdate stale output mtime");
+        assert!(
+            !watcher_output_progressed_recently(stale.to_str().unwrap()),
+            "a stale output file (frozen turn) must NOT read as progress -> reclaimable"
+        );
+
+        // A missing output file cannot prove progress.
+        assert!(
+            !watcher_output_progressed_recently(tmp.path().join("missing.jsonl").to_str().unwrap()),
+            "a missing output file must read as no progress"
+        );
+    }
+
     // #3107 (CHANGE 2): when the pane is actively streaming but no inflight
     // exists, the watcher re-establishes a minimal Watcher-owned inflight so
     // subsequent edits relay and the terminal ack has a target. The re-acquire
@@ -8251,6 +8358,8 @@ mod tests {
             128,
             Some(panel_id),
             Some(placeholder_id),
+            // #3107 P2#3: a recoverable hourglass anchor is preserved.
+            Some(7_777),
         ));
 
         let restored =
@@ -8271,6 +8380,8 @@ mod tests {
         // (kills frame_ack MissingTarget); the status panel id is preserved too.
         assert_eq!(restored.current_msg_id, placeholder_id.get());
         assert_eq!(restored.status_message_id, Some(panel_id.get()));
+        // #3107 P2#3: the #3099 hourglass anchor is preserved when recoverable.
+        assert_eq!(restored.injected_prompt_message_id, Some(7_777));
 
         // Idempotent: a second observation must NOT clobber the existing row.
         assert!(
@@ -8282,6 +8393,7 @@ mod tests {
                 256,
                 Some(panel_id),
                 Some(placeholder_id),
+                None,
             ),
             "re-acquire must be a no-op when an inflight already exists"
         );
@@ -8293,6 +8405,68 @@ mod tests {
             Some(128),
             "existing inflight offset must be left intact"
         );
+    }
+
+    // #3107 codex re-review (P1): the re-acquire must NOT clobber a REAL inflight
+    // that the intake path created on the same (provider, channel) between the
+    // (now removed) preflight check and the write. With the atomic
+    // compare-and-set save the concurrent intake inflight always wins and the
+    // re-acquire degrades to a no-op.
+    #[test]
+    fn reacquire_watcher_inflight_does_not_clobber_concurrent_intake_inflight() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(987_31071);
+        let tmux_session_name = "AgentDesk-claude-adk-cc";
+        let output_path = "/tmp/agentdesk-3107-cas-output.jsonl";
+
+        // Simulate the intake path having already created a REAL user-authored
+        // inflight (non-zero user_msg_id) for a brand new turn on this channel.
+        let real = InflightTurnState::new(
+            provider.clone(),
+            channel_id.get(),
+            Some("adk-cc".to_string()),
+            777,    // request_owner_user_id
+            12_345, // user_msg_id — a REAL Discord user turn
+            54_321, // current_msg_id
+            "real turn".to_string(),
+            None,
+            Some(tmux_session_name.to_string()),
+            Some(output_path.to_string()),
+            None,
+            999,
+        );
+        crate::services::discord::inflight::save_inflight_state(&real)
+            .expect("seed real intake inflight");
+
+        // The watcher-owned re-acquire must see the row and no-op (intake wins).
+        assert!(
+            !reacquire_watcher_inflight_for_active_stream(
+                &provider,
+                channel_id,
+                tmux_session_name,
+                output_path,
+                128,
+                Some(MessageId::new(5_555)),
+                Some(MessageId::new(6_666)),
+                None,
+            ),
+            "re-acquire must no-op when a concurrent intake inflight exists"
+        );
+
+        let persisted =
+            crate::services::discord::inflight::load_inflight_state(&provider, channel_id.get())
+                .expect("intake inflight must survive");
+        assert_eq!(
+            persisted.user_msg_id, 12_345,
+            "the legitimate intake turn must NOT be overwritten by the synthetic re-acquire"
+        );
+        assert_eq!(persisted.current_msg_id, 54_321);
     }
 
     #[tokio::test]

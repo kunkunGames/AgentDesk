@@ -139,6 +139,10 @@ pub(super) struct RestoredWatcherTurn {
     last_edit_text: String,
     task_notification_kind: Option<TaskNotificationKind>,
     finish_mailbox_on_completion: bool,
+    /// #3107 codex re-review (P2#3): the #3099 hourglass anchor from the
+    /// restored inflight, carried so a watcher-owned re-acquire (after the row
+    /// is cleared mid-turn) can re-pin it instead of orphaning the `⏳`.
+    pub(super) injected_prompt_message_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -210,6 +214,7 @@ pub(super) fn restored_watcher_turn_from_inflight(
         last_edit_text: reconstructed_inflight_placeholder_body(state),
         task_notification_kind: state.task_notification_kind,
         finish_mailbox_on_completion,
+        injected_prompt_message_id: state.injected_prompt_message_id,
     })
 }
 

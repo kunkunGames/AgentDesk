@@ -1154,6 +1154,65 @@ fn save_inflight_state_in_root(root: &Path, state: &InflightTurnState) -> Result
     atomic_write(&path, &json)
 }
 
+/// #3107 codex re-review (P1): atomic compare-and-set save. Writes `state`
+/// ONLY when no inflight row currently exists for `(provider, channel_id)`,
+/// returning `true` iff it wrote.
+///
+/// The watcher self-heal re-acquire (`reacquire_watcher_inflight_for_active_stream`)
+/// previously did a non-atomic `load_inflight_state(...).is_some()` preflight
+/// followed by an unconditional `save_inflight_state`. Between the check and
+/// the save the Discord intake path could create a REAL inflight for a brand
+/// new user turn on the same `(provider, channel_id)`; the synthetic
+/// `user_msg_id = 0` re-acquire save would then clobber it and the legitimate
+/// turn would be lost.
+///
+/// This helper closes that window by performing the existence check AND the
+/// write while holding the same `lock_inflight_state_path` sidecar flock that
+/// `save_inflight_state_in_root` / `clear_inflight_state*` already serialize
+/// on. A concurrent intake `save_inflight_state` either ran before us (we see
+/// its row → no-op, intake wins) or after us (it overwrites our synthetic row
+/// with the real turn → intake still wins). The synthetic row is therefore
+/// only ever written when there is genuinely no inflight at the moment of the
+/// atomic write.
+pub(super) fn save_inflight_state_if_absent(state: &InflightTurnState) -> Result<bool, String> {
+    let Some(root) = inflight_runtime_root() else {
+        return Err("Home directory not found".to_string());
+    };
+    save_inflight_state_if_absent_in_root(&root, state)
+}
+
+fn save_inflight_state_if_absent_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+) -> Result<bool, String> {
+    let Some(provider) = state.provider_kind() else {
+        return Err(format!("Unknown provider '{}'", state.provider));
+    };
+    let path = inflight_state_path(root, &provider, state.channel_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Hold the sidecar flock across the existence check AND the write so a
+    // concurrent intake `save_inflight_state_in_root` (which takes the same
+    // lock) cannot land a real inflight in the gap. `path.exists()` under the
+    // lock is the compare; `atomic_write` is the set.
+    let _lock = lock_inflight_state_path(&path)?;
+    if path.exists() {
+        return Ok(false);
+    }
+    validate_inflight_state_for_save(
+        root,
+        &path,
+        state,
+        "src/services/discord/inflight.rs:save_inflight_state_if_absent_in_root",
+    );
+    let mut updated = state.clone();
+    updated.updated_at = now_string();
+    let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
+    atomic_write(&path, &json)?;
+    Ok(true)
+}
+
 pub(crate) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) -> bool {
     let Some(root) = inflight_runtime_root() else {
         return false;
