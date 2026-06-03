@@ -99,8 +99,11 @@ impl TurnKey {
         }
     }
 
-    /// The literal full-identity key for this turn.
-    fn exact_key(&self) -> LedgerKey {
+    /// The literal full-identity key for this turn. Shared with the
+    /// `StatusPanelController` (#3078), which keys its panel ledger on the same
+    /// `LedgerKey` so the panel and finalize ledgers collapse channel-only
+    /// (`user_msg_id == 0`) recovery/orphan terminals onto the same live entry.
+    pub(in crate::services::discord) fn exact_key(&self) -> LedgerKey {
         LedgerKey {
             channel_id: self.channel_id,
             generation: self.generation,
@@ -110,12 +113,13 @@ impl TurnKey {
 }
 
 /// The exact ledger match: channel + restart generation + user message id.
-/// Full identity so sequential same-channel turns never collide.
+/// Full identity so sequential same-channel turns never collide. Shared with
+/// the `StatusPanelController` (#3078) so both ledgers key turns identically.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct LedgerKey {
-    channel_id: ChannelId,
-    generation: u64,
-    user_msg_id: u64,
+pub(in crate::services::discord) struct LedgerKey {
+    pub(in crate::services::discord) channel_id: ChannelId,
+    pub(in crate::services::discord) generation: u64,
+    pub(in crate::services::discord) user_msg_id: u64,
 }
 
 /// Resolve a submission to the ledger entry it acts on.
@@ -136,25 +140,41 @@ struct LedgerKey {
 ///   live turn is untouched). With no recent finalize, the single live entry is
 ///   unambiguously the turn this orphan terminal belongs to.
 fn resolve_ledger_key(ledger: &HashMap<LedgerKey, LedgerEntry>, key: TurnKey) -> LedgerKey {
+    resolve_channel_only(
+        key,
+        ledger
+            .iter()
+            .map(|(lk, entry)| (lk, entry.phase == Phase::Finalized)),
+    )
+}
+
+/// Channel-only collapse over an explicit candidate set. The finalizer keeps
+/// its in-line `HashMap` walk above; the `StatusPanelController` (#3078) passes
+/// its own `(LedgerKey, is_terminal)` pairs here so the identical
+/// finalized-guard / single-live-entry semantics apply to the panel ledger
+/// without duplicating the subtle ambiguity rule.
+///
+/// - A real `user_msg_id` uses its exact key.
+/// - A channel-only id collapses onto the single non-terminal entry ONLY when
+///   no terminal entry exists for the same channel/generation (ambiguous
+///   otherwise → route to the literal orphan key, a no-op for the caller).
+pub(in crate::services::discord) fn resolve_channel_only<'a>(
+    key: TurnKey,
+    candidates: impl Iterator<Item = (&'a LedgerKey, bool)> + Clone,
+) -> LedgerKey {
     if key.user_msg_id != 0 {
         return key.exact_key();
     }
-    let channel_has_finalized = ledger.iter().any(|(lk, entry)| {
-        lk.channel_id == key.channel_id
-            && lk.generation == key.generation
-            && entry.phase == Phase::Finalized
+    let channel_has_terminal = candidates.clone().any(|(lk, is_terminal)| {
+        lk.channel_id == key.channel_id && lk.generation == key.generation && is_terminal
     });
-    if channel_has_finalized {
-        // Ambiguous (a turn just finalized) → do NOT grab a possibly-new live
-        // entry. Route to the literal id-0 orphan key.
+    if channel_has_terminal {
         return key.exact_key();
     }
-    ledger
-        .iter()
-        .find(|(lk, entry)| {
-            lk.channel_id == key.channel_id
-                && lk.generation == key.generation
-                && entry.phase != Phase::Finalized
+    candidates
+        .into_iter()
+        .find(|(lk, is_terminal)| {
+            lk.channel_id == key.channel_id && lk.generation == key.generation && !*is_terminal
         })
         .map(|(lk, _)| *lk)
         .unwrap_or_else(|| key.exact_key())

@@ -1067,6 +1067,9 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
         global_active,
         turn_finalizer: super::turn_finalizer::TurnFinalizer::spawn(),
+        status_panel_controller: super::status_panel_controller::StatusPanelController::spawn(
+            status_panel_v2_enabled,
+        ),
         global_finalizing,
         shutdown_remaining: shutdown_remaining.clone(),
         shutdown_counted: std::sync::atomic::AtomicBool::new(false),

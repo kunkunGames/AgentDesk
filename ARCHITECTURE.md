@@ -515,6 +515,7 @@ src/
 │   │   ├── shared_memory.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
+│   │   ├── status_panel_controller.rs
 │   │   ├── status_panel_orphan_store.rs
 │   │   ├── streaming_finalizer.rs
 │   │   ├── task_supervisor.rs

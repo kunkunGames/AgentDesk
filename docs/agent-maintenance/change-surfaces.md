@@ -225,10 +225,12 @@
     multi-chunk path only, so the queued-card waiter's inactivity grace cannot
     expire between the first edit and the first continuation)).
   - `src/services/discord/prompt_builder/` (directory, refactored).
-  - `src/services/discord/runtime_bootstrap.rs` (2565 lines after #2558
+  - `src/services/discord/runtime_bootstrap.rs` (2568 lines after #2558
     thread-session GC loopback shim cleanup; +3 from #3082 answer-flush-barrier
     field in the SharedData constructor; +1 from #3037 cluster backflow path
-    rewrite wrapping a longer `services::cluster::node_registry::*` call).
+    rewrite wrapping a longer `services::cluster::node_registry::*` call; +3 from
+    #3078 PR-1 spawning the dormant `StatusPanelController` next to the finalizer
+    in the SharedData constructor).
   - `src/services/discord/session_runtime.rs` (1396 lines).
   - `src/services/discord/voice_barge_in.rs` (4653 lines; voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
