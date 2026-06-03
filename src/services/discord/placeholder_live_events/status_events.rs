@@ -104,6 +104,7 @@ pub(in crate::services::discord) fn status_events_from_tool_result_with_id(
         events.push(StatusEvent::SubagentEnd {
             success: !is_error,
             tool_use_id: tool_use_id.map(str::to_string),
+            summary: None,
         });
     }
     events
@@ -126,6 +127,7 @@ pub(in crate::services::discord) fn status_events_from_task_notification(
                 events.push(StatusEvent::SubagentEnd {
                     success: !task_notification_is_error(status),
                     tool_use_id: None,
+                    summary: None,
                 });
             }
         }
@@ -371,6 +373,14 @@ fn content_block_start_status_events(value: &Value) -> Vec<StatusEvent> {
 }
 
 fn user_status_events(value: &Value) -> Vec<StatusEvent> {
+    // #3086: a `tool_result` whose record carries a top-level `toolUseResult`
+    // with subagent accounting (`agentId` / `total*`) is a finished subagent.
+    // Surface a TUI-parity `Done (N tools · M tokens · Xs)` summary by pairing
+    // the result to its slot via the content block's `tool_use_id`. The
+    // accounting comes from the in-stream `toolUseResult` first (no IO); when a
+    // field is missing we fall back to the per-subagent rollout file.
+    let subagent_summary = subagent_summary_from_user_record(value);
+
     value
         .get("message")
         .and_then(|message| message.get("content"))
@@ -385,9 +395,58 @@ fn user_status_events(value: &Value) -> Vec<StatusEvent> {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+
+            if let Some(summary) = subagent_summary.clone() {
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return vec![
+                    StatusEvent::ToolEnd { success: !is_error },
+                    StatusEvent::SubagentEnd {
+                        success: !is_error,
+                        tool_use_id,
+                        summary: Some(summary),
+                    },
+                ];
+            }
+
             status_events_from_tool_result(None, is_error)
         })
         .collect()
+}
+
+/// Builds the subagent [`SubagentSummary`](crate::services::agent_protocol::SubagentSummary)
+/// for a `user` transcript record when it represents a finished subagent
+/// (`toolUseResult` carries `agentId`/`total*`). Prefers the in-stream totals;
+/// for any field still missing it consults the per-subagent rollout file
+/// resolved from the record's `cwd` + `sessionId` + `agentId`. Returns `None`
+/// for ordinary (non-subagent) tool results.
+fn subagent_summary_from_user_record(
+    value: &Value,
+) -> Option<crate::services::agent_protocol::SubagentSummary> {
+    let (mut summary, agent_id) = super::subagent_rollout::summary_from_tool_use_result(value)?;
+
+    // Fill any gap from the rollout file when we can resolve it.
+    if summary.tool_count.is_none() || summary.tokens.is_none() || summary.duration_secs.is_none() {
+        if let (Some(agent_id), Some(cwd), Some(session_id)) = (
+            agent_id.as_deref(),
+            value.get("cwd").and_then(Value::as_str),
+            value.get("sessionId").and_then(Value::as_str),
+        ) {
+            let rollout = super::subagent_rollout::summary_from_rollout_for(
+                std::path::Path::new(cwd),
+                session_id,
+                agent_id,
+                None,
+            );
+            summary.tool_count = summary.tool_count.or(rollout.tool_count);
+            summary.tokens = summary.tokens.or(rollout.tokens);
+            summary.duration_secs = summary.duration_secs.or(rollout.duration_secs);
+        }
+    }
+
+    Some(summary)
 }
 
 fn system_status_events(value: &Value) -> Vec<StatusEvent> {

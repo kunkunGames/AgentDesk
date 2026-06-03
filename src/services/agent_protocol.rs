@@ -262,6 +262,30 @@ impl StreamMessage {
     }
 }
 
+/// Final accounting for a finished subagent, mirroring the Claude TUI's
+/// `Done (N tool uses · M tokens · Xs)` summary. Reconstructed from the parent
+/// transcript's Task `toolUseResult` (`totalToolUseCount` / `totalTokens` /
+/// `totalDurationMs`) and/or the per-subagent `subagents/agent-<id>.jsonl`
+/// rollout (#3086). Each field is optional so a partial/older transcript that
+/// surfaces only some of the values still renders what it can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentSummary {
+    /// Number of tool invocations the subagent issued (`totalToolUseCount`).
+    pub tool_count: Option<u64>,
+    /// Total tokens attributed to the subagent (`totalTokens`).
+    pub tokens: Option<u64>,
+    /// Wall-clock duration in seconds (`totalDurationMs` / 1000).
+    pub duration_secs: Option<u64>,
+}
+
+impl SubagentSummary {
+    /// `true` when no field carries a value, so callers can skip emitting an
+    /// empty `Done (...)` summary line.
+    pub fn is_empty(&self) -> bool {
+        self.tool_count.is_none() && self.tokens.is_none() && self.duration_secs.is_none()
+    }
+}
+
 /// Provider-normalized status events consumed by Discord status-panel rendering.
 /// The panel code should not depend on provider-specific JSONL shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,6 +315,10 @@ pub enum StatusEvent {
         /// against [`StatusEvent::SubagentStart::tool_use_id`]; `None` falls
         /// back to closing the first unfinished slot.
         tool_use_id: Option<String>,
+        /// TUI-parity accounting (tool count / tokens / duration) reconstructed
+        /// from the Task `toolUseResult` and/or `subagents/*.jsonl` (#3086).
+        /// `None` when no summary fields were recoverable.
+        summary: Option<SubagentSummary>,
     },
     TaskToolUpdate {
         name: String,

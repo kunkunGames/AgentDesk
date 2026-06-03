@@ -1745,6 +1745,139 @@ fn status_panel_parallel_subagents_close_correct_slots_in_reverse_order() {
     );
 }
 
+// #3086: a finished subagent whose `tool_result` record carries `toolUseResult`
+// accounting renders the TUI-parity `Done (N tools · M tokens · Xs)` summary on
+// the correct slot, paired by tool_use_id.
+#[test]
+fn status_panel_renders_subagent_done_summary_from_tool_use_result() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(386);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Investigate #3086"}).to_string(),
+            Some("toolu_done"),
+        ),
+    );
+    // The user record closes the Task with its toolUseResult accounting. The
+    // toolUseResult agentId names a rollout file that does NOT exist here, so
+    // the summary must come entirely from the in-stream totals (no IO).
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_done",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "agentId": "amissingrollout000",
+                "totalToolUseCount": 81,
+                "totalTokens": 28824,
+                "totalDurationMs": 1_140_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("explorer Investigate #3086"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    // 81 tools, 28824 → 28.8k tokens, 1_140_000ms → 19m.
+    assert!(
+        line.contains("Done (81 tools · 28.8k tokens · 19m)"),
+        "expected TUI-parity Done summary, got: {line}"
+    );
+    assert!(line.contains('✓'), "finished subagent must show ✓: {line}");
+}
+
+// #3086: a single-tool subagent renders the singular "1 tool" noun and small
+// counts render verbatim (no k suffix), seconds under a minute stay `Xs`.
+#[test]
+fn status_panel_subagent_done_summary_handles_singular_and_small_values() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(387);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "tiny", "description": "Quick probe"}).to_string(),
+            Some("toolu_tiny"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_tiny",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "agentId": "atinyrollout000000",
+                "totalToolUseCount": 1,
+                "totalTokens": 940,
+                "totalDurationMs": 45_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("tiny Quick probe"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    assert!(
+        line.contains("Done (1 tool · 940 tokens · 45s)"),
+        "expected singular/small-value summary, got: {line}"
+    );
+}
+
+// #3086: a malformed/partial `toolUseResult` (string body, no accounting) must
+// not panic and must not synthesize a Done summary — it falls back to the plain
+// finished marker, preserving #3084 pairing behavior.
+#[test]
+fn status_panel_subagent_without_accounting_has_no_done_summary() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(388);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "plain", "description": "No accounting"}).to_string(),
+            Some("toolu_plain"),
+        ),
+    );
+    // toolUseResult is a bare string → not a subagent summary; the legacy Task
+    // tool_result path closes the slot without a Done line.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_plain")),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("plain No accounting"))
+        .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+    assert!(line.contains('✓'), "slot must still close as done: {line}");
+    assert!(
+        !line.contains("Done ("),
+        "no accounting → no Done summary, got: {line}"
+    );
+}
+
 #[test]
 fn status_events_from_json_captures_workflow_progress_array() {
     let events = status_events_from_json(&json!({
@@ -2273,7 +2406,8 @@ fn status_tool_result_closes_subagent_only_for_task_tools() {
             StatusEvent::ToolEnd { success: false },
             StatusEvent::SubagentEnd {
                 success: false,
-                tool_use_id: None
+                tool_use_id: None,
+                summary: None
             }
         ]
     );
