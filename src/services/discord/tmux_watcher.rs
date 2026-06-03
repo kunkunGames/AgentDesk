@@ -7444,6 +7444,56 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 "src/services/discord/tmux.rs:tmux_output_watcher_confirmed_end",
             );
         }
+        // #3104: terminal/idle reconciliation. A turn can commit (the channel is
+        // about to return to idle) without ever relaying a body onto the live
+        // streaming placeholder — e.g. a session-bound/subagent-only turn whose
+        // terminal output was delegated elsewhere, so `placeholder_msg_id` keeps
+        // the last streaming edit it received. When that last edit still ends in
+        // the transient `⠏ 계속 처리 중` footer, the message is left advertising
+        // "still processing" forever (the legacy in-body footer counterpart to
+        // the status-panel reclaim below). Strip the footer through the shared
+        // final-output formatter so the visible message matches the idle runtime.
+        //
+        // Self-gated: only on genuine commit (not a TimedOut/lifecycle-paused
+        // pane), and only when the body still ends with a footer — a
+        // genuinely-still-streaming message never reaches this committed-output
+        // block, and an already-finalized body is left untouched.
+        if terminal_output_committed
+            && !lifecycle_stage_paused
+            && let Some(placeholder) = placeholder_msg_id
+            && let Some(finalized) =
+                crate::services::discord::formatting::finalize_stale_streaming_footer(
+                    &last_edit_text,
+                    &watcher_provider,
+                )
+        {
+            match crate::services::discord::http::edit_channel_message(
+                &http,
+                channel_id,
+                placeholder,
+                &finalized,
+            )
+            .await
+            {
+                Ok(_) => {
+                    last_edit_text = finalized;
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::info!(
+                        "  [{ts}] 👁 #3104 reconciled stale '계속 처리 중' streaming footer on channel {} msg {} at idle",
+                        channel_id.get(),
+                        placeholder.get()
+                    );
+                }
+                Err(error) => {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ #3104 failed to reconcile stale streaming footer on channel {} msg {}: {error}",
+                        channel_id.get(),
+                        placeholder.get()
+                    );
+                }
+            }
+        }
         // Release the emission slot regardless of success. If delivery failed
         // the local `last_relayed_offset` also stayed put, so the same watcher
         // (or its replacement) can retry on the next tick without fighting
