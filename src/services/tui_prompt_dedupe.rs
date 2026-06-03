@@ -397,6 +397,32 @@ pub(crate) fn clear_tmux_runtime_binding(tmux_session_name: &str) -> bool {
     state.runtime_by_tmux.remove(tmux_session_name).is_some()
 }
 
+/// #3105 (codex P1 sub-case B): tombstone-evict every mirror mapping for a tmux
+/// session that has been determined dead/orphaned (pane gone AND no live watcher
+/// AND no authoritative owner). This removes BOTH the runtime binding (which the
+/// idle relay loop iterates) AND the best-effort channel mirror (which the
+/// drift-alert resolver reads), so subsequent relay-loop iterations no longer
+/// find a stale mapping and stop re-emitting the per-poll drift/skip WARN.
+///
+/// This is NOT a routing authority change: it only forgets a mirror entry whose
+/// session is genuinely gone. A later legitimate re-registration (launch script
+/// rehydrate or a fresh watcher) re-populates these maps normally, so a session
+/// that comes back relays again.
+///
+/// Returns `true` when at least one mirror entry was removed (so callers can
+/// emit a single bounded incident instead of per-poll spam).
+pub(crate) fn evict_dead_tmux_mirror(tmux_session_name: &str) -> bool {
+    let tmux_session_name = tmux_session_name.trim();
+    if tmux_session_name.is_empty() {
+        return false;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.purge_expired();
+    let removed_runtime = state.runtime_by_tmux.remove(tmux_session_name).is_some();
+    let removed_channel = state.channel_by_tmux.remove(tmux_session_name).is_some();
+    removed_runtime || removed_channel
+}
+
 pub(crate) fn runtime_bindings_for_kind(
     runtime_kind: RuntimeHandoffKind,
 ) -> Vec<(String, TuiRuntimeBinding)> {
@@ -1257,6 +1283,72 @@ mod tests {
         assert!(runtime_binding_for_tmux_session("tmux-runtime").is_none());
         assert!(!clear_tmux_runtime_binding("tmux-runtime"));
         assert!(!clear_tmux_runtime_binding("   "));
+    }
+
+    // #3105 (codex P1 sub-case B): evicting a dead/orphaned mirror must drop BOTH
+    // the runtime binding (which the idle relay loop iterates) AND the channel
+    // mirror (which the drift-alert resolver reads), so a subsequent relay pass
+    // finds no mapping and stops re-emitting the per-poll drift/skip WARN. A
+    // later legitimate re-registration must still repopulate both maps.
+    #[test]
+    fn evict_dead_tmux_mirror_drops_runtime_and_channel_then_allows_reregister() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471";
+        register_tmux_runtime_binding(
+            tmux,
+            TuiRuntimeBinding {
+                runtime_kind: RuntimeHandoffKind::ClaudeTui,
+                output_path: "/tmp/claude-transcript.jsonl".to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: None,
+                last_offset: 12,
+                relay_last_offset: None,
+            },
+        );
+        register_tmux_channel(tmux, 1_504_468_805_772_902_471);
+        assert!(runtime_binding_for_tmux_session(tmux).is_some());
+        assert_eq!(
+            owner_channel_for_tmux_session(tmux),
+            Some(1_504_468_805_772_902_471)
+        );
+
+        // Eviction removes both mirror maps and reports the change once.
+        assert!(evict_dead_tmux_mirror(tmux));
+        assert!(
+            runtime_binding_for_tmux_session(tmux).is_none(),
+            "runtime binding gone → relay loop no longer iterates the dead session"
+        );
+        assert_eq!(
+            owner_channel_for_tmux_session(tmux),
+            None,
+            "channel mirror gone → drift-alert resolver finds no mapping"
+        );
+        // Idempotent: a second eviction reports no change (single bounded incident).
+        assert!(!evict_dead_tmux_mirror(tmux));
+        assert!(!evict_dead_tmux_mirror("   "));
+
+        // A later legitimate re-registration repopulates both maps (session came back).
+        register_tmux_runtime_binding(
+            tmux,
+            TuiRuntimeBinding {
+                runtime_kind: RuntimeHandoffKind::ClaudeTui,
+                output_path: "/tmp/claude-transcript.jsonl".to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: None,
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+        register_tmux_channel(tmux, 1_504_468_805_772_902_471);
+        assert!(runtime_binding_for_tmux_session(tmux).is_some());
+        assert_eq!(
+            owner_channel_for_tmux_session(tmux),
+            Some(1_504_468_805_772_902_471)
+        );
     }
 
     #[test]
