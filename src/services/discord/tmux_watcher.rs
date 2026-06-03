@@ -7012,13 +7012,22 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // real notify-bot message still carries the `⏳`. The
             // `should_complete_tui_direct_anchor_lifecycle` gate above does not
             // fire here because an inflight is still present, so clean the
-            // hourglass off the injected message's OWN id via its recorded prompt
-            // anchor instead of leaving it stale.
-            let _ = crate::services::discord::tui_prompt_relay::complete_tui_direct_prompt_anchor_lifecycle_if_present(
+            // hourglass off the injected message's OWN id.
+            //
+            // #3099 codex re-review (P2): target THIS turn's pinned
+            // `injected_prompt_message_id` rather than re-reading the single shared
+            // prompt-anchor slot — under rapid/parallel injection that slot may
+            // already belong to a later turn, and reading it would `✅` the wrong
+            // (still-running) message.
+            let pinned_injected_message_id = inflight_state
+                .as_ref()
+                .and_then(|state| state.injected_prompt_message_id);
+            let _ = crate::services::discord::tui_prompt_relay::complete_tui_direct_anchor_lifecycle_for_inflight(
                 &http,
                 watcher_provider.as_str(),
                 &tmux_session_name,
                 channel_id,
+                pinned_injected_message_id,
                 "watcher_task_notification_anchor_cleanup_user_msg_zero",
             )
             .await;

@@ -395,19 +395,23 @@ async fn complete_recovery_visible_turn(
         // #3099: a TUI-injected task-notification turn can complete via recovery
         // with `user_msg_id == 0` (no anchored Discord user message), so the
         // `⏳ → ✅` step above is skipped. The hourglass, however, was added to a
-        // real notify-bot message tracked by the prompt anchor, so clean it off
-        // that exact injected message via the anchor lifecycle instead of leaving
-        // it stale next to the `✅` the completion path applies elsewhere.
+        // real notify-bot message, so clean it off that exact injected message
+        // instead of leaving it stale next to the `✅` the completion path applies
+        // elsewhere.
+        //
+        // #3099 codex re-review (P2): target THIS turn's pinned
+        // `injected_prompt_message_id` instead of re-reading the single shared
+        // prompt-anchor slot, which a later injection may already own.
         if let Some(tmux_session_name) = state.tmux_session_name.as_deref() {
-            let _ =
-                super::tui_prompt_relay::complete_tui_direct_prompt_anchor_lifecycle_if_present(
-                    http,
-                    provider.as_str(),
-                    tmux_session_name,
-                    channel_id,
-                    "recovery_task_notification_anchor_cleanup_user_msg_zero",
-                )
-                .await;
+            let _ = super::tui_prompt_relay::complete_tui_direct_anchor_lifecycle_for_inflight(
+                http,
+                provider.as_str(),
+                tmux_session_name,
+                channel_id,
+                state.injected_prompt_message_id,
+                "recovery_task_notification_anchor_cleanup_user_msg_zero",
+            )
+            .await;
         }
     }
 
