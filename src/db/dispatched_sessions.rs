@@ -1148,7 +1148,10 @@ mod selector_cleanup_tests {
             .await
             .unwrap()
             .expect("session row must still exist after tmux-only cleanup");
-        assert_eq!(ids.claude_session_id.as_deref(), Some("claude-selector-1841"));
+        assert_eq!(
+            ids.claude_session_id.as_deref(),
+            Some("claude-selector-1841")
+        );
         assert_eq!(
             ids.raw_provider_session_id.as_deref(),
             Some("raw-selector-1841"),
