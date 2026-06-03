@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use url::Url;
 
 const RELAY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -53,9 +53,6 @@ fn run_cli_with_name(
     };
 
     let effective_session_id = relay_event_session_id(provider, session_id, &payload);
-    // Compute the hook stdout (which may carry a tool_feedback nudge for memento
-    // searches) before `payload` is moved into the relay POST below.
-    let stdout = hook_stdout(provider, event, &payload);
     if let Err(error) = relay_hook_event(endpoint, provider, event, &effective_session_id, payload)
     {
         // Provider TUI hooks must not become turn blockers. The receiver path
@@ -68,7 +65,7 @@ fn run_cli_with_name(
             eprintln!("agentdesk {relay_name} marker warning: {marker_error}");
         }
     }
-    println!("{stdout}");
+    println!("{}", hook_success_stdout(provider));
     Ok(())
 }
 
@@ -110,123 +107,6 @@ fn hook_success_stdout(provider: &str) -> &'static str {
         "codex" => "{}",
         _ => r#"{"suppressOutput":true}"#,
     }
-}
-
-/// Stdout returned to the provider TUI for a relayed hook event.
-///
-/// Defaults to the observational `hook_success_stdout`, but for a Claude
-/// `PostToolUse` event firing on a memento `recall`/`context` call it injects a
-/// `tool_feedback` nudge via `hookSpecificOutput.additionalContext`. The
-/// memory search→feedback ratio was effectively zero because models ignore the
-/// advisory `_meta.hints`; surfacing the ask in the model-visible PostToolUse
-/// context closes that loop without touching the Memento server or the prompt.
-///
-/// Codex keeps the observational `{}` — its hook overrides are disabled by
-/// default and its `additionalContext` injection is unverified on the current
-/// CLI, so the nudge is Claude-only by design.
-fn hook_stdout(provider: &str, event: &str, payload: &Value) -> String {
-    if !provider.trim().eq_ignore_ascii_case("codex")
-        && event.trim().eq_ignore_ascii_case("PostToolUse")
-        && memento_search_tool_name(payload).is_some()
-    {
-        let additional_context = memento_feedback_instruction(extract_search_event_id(payload));
-        return json!({
-            "suppressOutput": true,
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": additional_context,
-            }
-        })
-        .to_string();
-    }
-    hook_success_stdout(provider).to_string()
-}
-
-/// Returns the lowercased tool name when the PostToolUse payload is a memento
-/// search (`recall` or `context` — the two tools that return a
-/// `_meta.searchEventId` eligible for `tool_feedback`). `remember`, `forget`,
-/// and the rest are excluded.
-fn memento_search_tool_name(payload: &Value) -> Option<String> {
-    let tool_name = payload
-        .get("tool_name")
-        .and_then(Value::as_str)
-        .map(|name| name.trim().to_ascii_lowercase())?;
-    if !tool_name.contains("memento") {
-        return None;
-    }
-    // Match the trailing tool segment exactly so both `mcp__memento__recall` and
-    // the dotted `memento.recall` form qualify, while `recall_context_combined`
-    // or a non-memento server's `recall` do not.
-    let leaf = tool_name
-        .rsplit(|c| c == '_' || c == '.')
-        .next()
-        .unwrap_or("");
-    matches!(leaf, "recall" | "context").then_some(tool_name)
-}
-
-/// Best-effort extraction of `searchEventId` from the PostToolUse payload.
-///
-/// memento returns it under `_meta.searchEventId`, but in the hook payload the
-/// recall result may be nested inside a stringified MCP text block, so a
-/// structural lookup is unreliable. Scan the serialized `tool_response` (then
-/// the whole payload) for the first integer following the `searchEventId`
-/// marker. Returns `None` when absent — the nudge still fires, just without an
-/// explicit id (the model has the id in its own recall result).
-fn extract_search_event_id(payload: &Value) -> Option<String> {
-    for hay in [payload.get("tool_response"), Some(payload)]
-        .into_iter()
-        .flatten()
-    {
-        if let Some(id) = scan_search_event_id(&hay.to_string()) {
-            return Some(id);
-        }
-    }
-    None
-}
-
-fn scan_search_event_id(serialized: &str) -> Option<String> {
-    // Anchor on `searchEventId` as a JSON *key*: the marker must be followed by
-    // an (optionally backslash-escaped) closing quote and a `:`, then the value
-    // digits. This rejects longer keys (`searchEventIdHash`), bare-word mentions
-    // inside fragment text, and `null`/empty values — each of which would
-    // otherwise let a greedy digit scan capture an unrelated number. Multiple
-    // occurrences are tried so a non-matching first hit doesn't abort the scan.
-    let marker = "searchEventId";
-    let mut haystack = serialized;
-    loop {
-        let rel = haystack.find(marker)?;
-        let after = &haystack[rel + marker.len()..];
-        let key_tail = after
-            .strip_prefix("\\\"")
-            .or_else(|| after.strip_prefix('"'))
-            .unwrap_or(after)
-            .trim_start();
-        if let Some(value_part) = key_tail.strip_prefix(':') {
-            let value = value_part.trim_start();
-            let value = value
-                .strip_prefix("\\\"")
-                .or_else(|| value.strip_prefix('"'))
-                .unwrap_or(value);
-            let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
-            if !digits.is_empty() {
-                return Some(digits);
-            }
-        }
-        haystack = after;
-    }
-}
-
-fn memento_feedback_instruction(search_event_id: Option<String>) -> String {
-    let target = match search_event_id {
-        Some(id) => format!("search_event_id={id}"),
-        None => "the search_event_id shown under `_meta.searchEventId` in that result".to_string(),
-    };
-    format!(
-        "Action required: you just received a memento search result. Before your next memento \
-recall/context/search call, submit one `mcp__memento__tool_feedback` call for THIS result with \
-{target}, `relevant` = whether any returned fragment was on-topic, and `sufficient` = whether the \
-results were enough to proceed. This is a single quick call — do it now, then continue."
-    )
 }
 
 pub fn relay_hook_event(
@@ -482,108 +362,6 @@ mod tests {
     fn hook_success_stdout_is_provider_scoped() {
         assert_eq!(hook_success_stdout("claude"), r#"{"suppressOutput":true}"#);
         assert_eq!(hook_success_stdout("codex"), "{}");
-    }
-
-    #[test]
-    fn claude_posttooluse_memento_recall_injects_feedback_nudge_with_id() {
-        let payload = serde_json::json!({
-            "tool_name": "mcp__memento__recall",
-            "tool_response": [{
-                "type": "text",
-                "text": "{\"fragments\":[],\"_meta\":{\"searchEventId\":\"22752\"}}"
-            }]
-        });
-        let out = hook_stdout("claude", "PostToolUse", &payload);
-        let value: Value = serde_json::from_str(&out).unwrap();
-        let ctx = value["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap();
-        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PostToolUse");
-        assert!(ctx.contains("search_event_id=22752"));
-        assert!(ctx.contains("mcp__memento__tool_feedback"));
-        assert_eq!(value["suppressOutput"], true);
-    }
-
-    #[test]
-    fn claude_posttooluse_memento_context_injects_even_without_extractable_id() {
-        // tool is a memento search but the payload carries no searchEventId:
-        // still nudge, deferring the id to the model's own recall result.
-        let payload = serde_json::json!({ "tool_name": "mcp__memento__context" });
-        let out = hook_stdout("claude", "PostToolUse", &payload);
-        let value: Value = serde_json::from_str(&out).unwrap();
-        let ctx = value["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap();
-        assert!(ctx.contains("_meta.searchEventId"));
-        assert!(ctx.contains("mcp__memento__tool_feedback"));
-    }
-
-    #[test]
-    fn non_search_and_non_posttooluse_stay_observational() {
-        // Wrong event.
-        let recall = serde_json::json!({ "tool_name": "mcp__memento__recall" });
-        assert_eq!(
-            hook_stdout("claude", "PreToolUse", &recall),
-            r#"{"suppressOutput":true}"#
-        );
-        // Right event, non-search memento tool.
-        let forget = serde_json::json!({ "tool_name": "mcp__memento__forget" });
-        assert_eq!(
-            hook_stdout("claude", "PostToolUse", &forget),
-            r#"{"suppressOutput":true}"#
-        );
-        // Right event + search tool, but Codex stays observational.
-        assert_eq!(hook_stdout("codex", "PostToolUse", &recall), "{}");
-    }
-
-    #[test]
-    fn scan_search_event_id_handles_escaped_and_plain_forms() {
-        assert_eq!(
-            scan_search_event_id(r#"{"_meta":{"searchEventId":"22752"}}"#).as_deref(),
-            Some("22752")
-        );
-        assert_eq!(
-            scan_search_event_id(r#"...\"searchEventId\":\"4310\"..."#).as_deref(),
-            Some("4310")
-        );
-        assert_eq!(
-            scan_search_event_id(r#"{"searchEventId":981}"#).as_deref(),
-            Some("981")
-        );
-        assert_eq!(scan_search_event_id(r#"{"other":"1"}"#), None);
-    }
-
-    #[test]
-    fn scan_search_event_id_rejects_false_positives() {
-        // Longer key that merely starts with the marker.
-        assert_eq!(scan_search_event_id(r#"{"searchEventIdHash":"99"}"#), None);
-        // Bare-word mention inside fragment text (no key colon follows).
-        assert_eq!(
-            scan_search_event_id(r#"{"text":"the searchEventId was 4242 last time"}"#),
-            None
-        );
-        // Null / empty values are not captured.
-        assert_eq!(scan_search_event_id(r#"{"searchEventId":null}"#), None);
-        assert_eq!(scan_search_event_id(r#"{"searchEventId":""}"#), None);
-        // A non-matching first occurrence must not abort the scan: the real key
-        // (with a numeric value) appears after a longer-key decoy.
-        assert_eq!(
-            scan_search_event_id(r#"{"searchEventIdHash":"zz","searchEventId":"77"}"#).as_deref(),
-            Some("77")
-        );
-    }
-
-    #[test]
-    fn memento_search_tool_name_matches_both_forms_and_rejects_lookalikes() {
-        let target =
-            |name: &str| memento_search_tool_name(&serde_json::json!({ "tool_name": name }));
-        assert!(target("mcp__memento__recall").is_some());
-        assert!(target("mcp__memento__context").is_some());
-        assert!(target("memento.recall").is_some());
-        // Lookalikes / other servers must not match.
-        assert!(target("mcp__memento__recall_context_combined").is_none());
-        assert!(target("mcp__memento__forget").is_none());
-        assert!(target("mcp__other__recall").is_none());
     }
 
     #[test]

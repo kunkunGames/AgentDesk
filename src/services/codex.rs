@@ -29,8 +29,7 @@ use crate::services::session_backend::{
 };
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
-    tmux_session_exists, tmux_session_has_live_pane,
+    record_tmux_exit_reason, tmux_session_exists, tmux_session_has_live_pane,
 };
 
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
@@ -276,7 +275,7 @@ fn render_codex_wrapper_tmux_script(
         --input-fifo {input_fifo} \\\n  \
         --prompt-file {prompt} \\\n  \
         --cwd {wd} \\\n  \
-        --input-mode fifo{wrapper_args}\n",
+        --input-mode pipe{wrapper_args}\n",
         env = env_lines,
         exe = shell_escape(exe),
         output = shell_escape(output_path),
@@ -657,73 +656,23 @@ fn should_preserve_live_reused_provider_session(
         && !force_fresh_provider_session
 }
 
-/// Input transport a live Codex tmux wrapper was launched with, inferred from
-/// its launch `.sh` marker. `Unknown` covers a missing/unreadable marker (e.g.
-/// a dcserver restart that lost /tmp), which is distinct from an explicit
-/// legacy `Pipe` marker — the two must be treated differently when deciding
-/// whether to preserve a live pane.
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CodexWrapperInputMode {
-    Fifo,
-    Pipe,
-    Unknown,
+fn codex_wrapper_script_uses_pipe_input(script: &str) -> bool {
+    script
+        .lines()
+        .any(|line| line.trim() == "--input-mode pipe \\" || line.trim() == "--input-mode pipe")
 }
 
 #[cfg(unix)]
-fn codex_wrapper_script_input_mode(script: &str) -> CodexWrapperInputMode {
-    let mentions = |needle: &str| {
-        script
-            .lines()
-            .any(|line| line.trim() == format!("{needle} \\") || line.trim() == needle)
-    };
-    if mentions("--input-mode fifo") {
-        CodexWrapperInputMode::Fifo
-    } else if mentions("--input-mode pipe") {
-        CodexWrapperInputMode::Pipe
-    } else {
-        CodexWrapperInputMode::Unknown
-    }
-}
-
-#[cfg(unix)]
-fn codex_tmux_wrapper_session_input_mode(tmux_session_name: &str) -> CodexWrapperInputMode {
+fn codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name: &str) -> bool {
     let Some(script_path) =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "sh")
     else {
-        return CodexWrapperInputMode::Unknown;
+        return false;
     };
     std::fs::read_to_string(script_path)
-        .map(|script| codex_wrapper_script_input_mode(&script))
-        .unwrap_or(CodexWrapperInputMode::Unknown)
-}
-
-#[cfg(unix)]
-fn codex_fifo_wrapper_session_usable(
-    has_live_pane: bool,
-    has_output_path: bool,
-    input_mode: CodexWrapperInputMode,
-    has_input_fifo_path: bool,
-) -> bool {
-    // A reused FIFO wrapper needs the live pane / output transport, an explicit
-    // FIFO input mode this build can drive, and a resolvable input FIFO, because
-    // the follow-up path now writes the base64 sentinel line directly into that
-    // FIFO (issue #3001). Without the FIFO file there is nothing to write to, so
-    // the session is not reusable.
-    has_live_pane
-        && has_output_path
-        && input_mode == CodexWrapperInputMode::Fifo
-        && has_input_fifo_path
-}
-
-/// Whether a live, resume-eligible Codex pane should be preserved (not killed)
-/// when its I/O files are unavailable. Preserve FIFO-mode panes this build can
-/// drive and Unknown panes (missing marker after restart), but NOT an explicit
-/// legacy pipe-mode pane — that one cannot be driven here and must be recreated
-/// (which resumes the conversation via session id) instead of stranding.
-#[cfg(unix)]
-fn codex_input_mode_allows_live_session_preservation(input_mode: CodexWrapperInputMode) -> bool {
-    !matches!(input_mode, CodexWrapperInputMode::Pipe)
+        .map(|script| codex_wrapper_script_uses_pipe_input(&script))
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1565,6 +1514,7 @@ fn execute_streaming_remote_tmux(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn execute_streaming_local_tui_tmux(
     prompt: &str,
     session_id: Option<&str>,
@@ -2029,13 +1979,10 @@ fn execute_streaming_local_tmux(
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
-    let wrapper_input_mode = codex_tmux_wrapper_session_input_mode(tmux_session_name);
-    let session_usable = codex_fifo_wrapper_session_usable(
-        has_live_pane,
-        resolved_output.is_some(),
-        wrapper_input_mode,
-        resolved_input.is_some(),
-    );
+    let session_usable = has_live_pane
+        && resolved_output.is_some()
+        && resolved_input.is_some()
+        && codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name);
 
     if should_reuse_existing_provider_session(session_usable, force_fresh_provider_session) {
         let output_path = resolved_output
@@ -2072,26 +2019,17 @@ fn execute_streaming_local_tmux(
                 // Fall through to new session creation below
             }
         }
-    } else if codex_input_mode_allows_live_session_preservation(wrapper_input_mode)
-        && should_preserve_live_reused_provider_session(
-            session_id,
-            has_live_pane,
-            force_fresh_provider_session,
-        )
-    {
-        // Refuse cleanup for a live wrapper whose input/output files are merely
-        // temporarily missing (e.g. a dcserver restart lost /tmp): FIFO-mode
-        // panes this build can drive, and Unknown panes whose marker is gone. A
-        // live legacy pipe-mode pane is NOT drivable here, so it must fall
-        // through to the recreate branch — which resumes the conversation via
-        // session id — instead of hard-erroring and stranding the user during a
-        // deploy rollover.
+    } else if should_preserve_live_reused_provider_session(
+        session_id,
+        has_live_pane,
+        force_fresh_provider_session,
+    ) {
         tracing::warn!(
             tmux_session_name,
             session_id = session_id.unwrap_or_default(),
             output_path_present = resolved_output.is_some(),
             input_path_present = resolved_input.is_some(),
-            wrapper_input_mode = ?wrapper_input_mode,
+            pipe_input = codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name),
             "refusing to kill live Codex tmux selected for provider-session reuse"
         );
         return Err(format!(
@@ -2119,23 +2057,7 @@ fn execute_streaming_local_tmux(
         .cleanup_best_effort();
 
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
-
-    // Create the named input FIFO that the wrapper reads followups from. A FIFO
-    // has no terminal line discipline, so the base64 sentinel line we later
-    // write is delivered to the wrapper's BufReader::lines() loop unambiguously
-    // (unlike PTY paste, which stranded reused prompts — see issue #3001).
     let _ = std::fs::remove_file(&input_fifo_path);
-    let mkfifo = Command::new("mkfifo")
-        .arg(&input_fifo_path)
-        .output()
-        .map_err(|e| format!("Failed to create input FIFO: {}", e))?;
-    if !mkfifo.status.success() {
-        let _ = std::fs::remove_file(&output_path);
-        return Err(format!(
-            "mkfifo failed: {}",
-            String::from_utf8_lossy(&mkfifo.stderr)
-        ));
-    }
 
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
@@ -2288,70 +2210,46 @@ fn codex_pipe_prompt_lines(prompt: &str) -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn codex_pipe_prompt_buffer_text(prompt: &str) -> String {
-    let mut encoded = codex_pipe_prompt_lines(prompt).join("\n");
-    encoded.push('\n');
-    encoded
-}
-
-#[cfg(unix)]
-fn send_codex_pipe_prompt_to_fifo(input_fifo_path: &str, prompt: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
-
-    // The reused wrapper runs with `--input-mode fifo` and reads followups from
-    // a named FIFO via BufReader::lines(). A FIFO has no terminal line
-    // discipline, so writing the newline-terminated base64 sentinel line(s)
-    // delivers each line unambiguously to the wrapper's decode loop — unlike the
-    // old PTY paste path, which stranded the prompt at "Ready for input"
-    // because the line discipline never submitted the sentinel (issue #3001).
-    let encoded = codex_pipe_prompt_buffer_text(prompt);
-
-    // Open the write side with O_NONBLOCK. The reuse gate observed the FIFO path,
-    // but the wrapper (and thus the FIFO reader) can exit between that check and
-    // this write while the FIFO file lingers — wrapper error paths preserve
-    // session files. A *blocking* O_WRONLY open on a reader-less FIFO would hang
-    // forever and never reach the stale-session recreation path below. With
-    // O_NONBLOCK the open instead fails fast with ENXIO, which we surface as a
-    // recoverable error so the caller can recreate/resume the session (#3001).
-    let fifo = match std::fs::OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(input_fifo_path)
-    {
-        Ok(fifo) => fifo,
-        Err(e) => {
-            // ENXIO == FIFO has no reader attached (wrapper gone). Normalize the
-            // message so should_recreate_session_after_followup_fifo_error()
-            // classifies it as recoverable on every platform (macOS reports
-            // "Device not configured", Linux "No such device or address").
-            if e.raw_os_error() == Some(libc::ENXIO) {
-                return Err(format!(
-                    "Failed to open input FIFO {input_fifo_path}: No such device (no reader attached: {e})"
-                ));
-            }
-            return Err(format!("Failed to open input FIFO {input_fifo_path}: {e}"));
-        }
-    };
-
-    // A reader is attached. Clear O_NONBLOCK so the subsequent write blocks
-    // normally if the prompt exceeds the kernel pipe buffer (chunked base64 can
-    // exceed 64KiB), instead of returning EAGAIN and dropping bytes.
-    let fd = fifo.as_raw_fd();
-    // SAFETY: fd is a valid, owned descriptor for the lifetime of `fifo`.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-        }
+fn send_codex_pipe_prompt_to_tmux(tmux_session_name: &str, prompt: &str) -> Result<(), String> {
+    let encoded = codex_pipe_prompt_lines(prompt).join("\n");
+    let buffer_name = format!("agentdesk-codex-pipe-input-{}", uuid::Uuid::new_v4());
+    let load_output = crate::services::platform::tmux::load_buffer(&buffer_name, &encoded)?;
+    if !load_output.status.success() {
+        let stderr = String::from_utf8_lossy(&load_output.stderr)
+            .trim()
+            .to_string();
+        let detail = if stderr.is_empty() {
+            load_output.status.to_string()
+        } else {
+            stderr
+        };
+        return Err(format!("tmux load-buffer failed: {detail}"));
     }
-
-    let mut fifo = fifo;
-    fifo.write_all(encoded.as_bytes())
-        .map_err(|e| format!("Failed to write to input FIFO {input_fifo_path}: {e}"))?;
-    fifo.flush()
-        .map_err(|e| format!("Failed to flush input FIFO {input_fifo_path}: {e}"))?;
+    let paste_output =
+        crate::services::platform::tmux::paste_buffer_raw(tmux_session_name, &buffer_name, true)?;
+    if !paste_output.status.success() {
+        let stderr = String::from_utf8_lossy(&paste_output.stderr)
+            .trim()
+            .to_string();
+        let detail = if stderr.is_empty() {
+            paste_output.status.to_string()
+        } else {
+            stderr
+        };
+        return Err(format!("tmux paste-buffer failed: {detail}"));
+    }
+    let enter_output = crate::services::platform::tmux::send_keys(tmux_session_name, &["Enter"])?;
+    if !enter_output.status.success() {
+        let stderr = String::from_utf8_lossy(&enter_output.stderr)
+            .trim()
+            .to_string();
+        let detail = if stderr.is_empty() {
+            enter_output.status.to_string()
+        } else {
+            stderr
+        };
+        return Err(format!("tmux send Enter failed: {detail}"));
+    }
     Ok(())
 }
 
@@ -2366,19 +2264,8 @@ fn send_followup_to_tmux(
 ) -> Result<FollowupResult, String> {
     let start_offset = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
 
-    if let Err(error) = send_codex_pipe_prompt_to_fifo(input_fifo_path, prompt) {
-        // The reuse gate passed, but the FIFO/reader can disappear between that
-        // check and this write (wrapper exited, cleaned up its FIFO, broken
-        // pipe). Treat those infrastructure failures as a stale session and
-        // request recreation (which resumes via session id) instead of surfacing
-        // a hard provider error — mirroring the Claude/Qwen FIFO follow-up path.
-        if should_recreate_session_after_followup_fifo_error(&error) {
-            return Ok(FollowupResult::RecreateSession { error });
-        }
-        return Err(format!(
-            "Failed to send Codex follow-up prompt to input FIFO: {error}"
-        ));
-    }
+    send_codex_pipe_prompt_to_tmux(tmux_session_name, prompt)
+        .map_err(|e| format!("Failed to send Codex pipe prompt to tmux: {e}"))?;
 
     if let Some(ref token) = cancel_token {
         *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -2401,10 +2288,9 @@ fn send_followup_to_tmux(
         Err(failure) => {
             let output_exists = std::fs::metadata(output_path).is_ok();
             let current_file_len = std::fs::metadata(output_path).ok().map(|meta| meta.len());
-            // Codex legacy wrapper runs in tmux fifo mode: follow-ups are
-            // written to a named input FIFO, so the FIFO file is the input
-            // transport and can be stat'd directly.
-            let input_exists = std::fs::metadata(input_fifo_path).is_ok();
+            // Codex legacy wrapper now runs in tmux pipe mode. There is no
+            // FIFO file to stat; the live tmux pane is the input transport.
+            let input_exists = true;
             let session_alive = tmux_session_has_live_pane(tmux_session_name);
             let ready_for_input = session_alive
                 && crate::services::tui_turn_state::jsonl_ready_for_input(
@@ -2920,10 +2806,8 @@ mod tui_hosting_tests {
     };
     #[cfg(unix)]
     use super::{
-        CodexWrapperInputMode, codex_fifo_wrapper_session_usable,
-        codex_input_mode_allows_live_session_preservation,
         codex_tui_existing_session_termination_reason,
-        codex_wrapper_existing_session_termination_reason, codex_wrapper_script_input_mode,
+        codex_wrapper_existing_session_termination_reason, codex_wrapper_script_uses_pipe_input,
     };
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
@@ -3237,65 +3121,19 @@ mod tui_hosting_tests {
         assert!(script.contains("'developer rules'"));
         assert!(script.contains("'--compact-token-limit'"));
         assert!(script.contains("'120000'"));
-        assert!(script.contains("--input-mode fifo"));
-        // The wrapper script no longer self-creates the FIFO; the parent
-        // (execute_streaming_local_tmux) mkfifo's it before launch.
+        assert!(script.contains("--input-mode pipe"));
         assert!(!script.contains("mkfifo"));
         assert!(!script.contains("exec '/opt/bin/codex' "));
     }
 
     #[cfg(unix)]
     #[test]
-    fn codex_wrapper_input_mode_detector_distinguishes_fifo_pipe_and_unknown() {
-        let fifo_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-mode fifo \\\n";
+    fn codex_wrapper_pipe_input_detector_rejects_legacy_scripts() {
         let pipe_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-mode pipe \\\n";
-        let unknown_script = "exec agentdesk codex-tmux-wrapper \\\n  --output-file /tmp/o \\\n";
+        let legacy_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-fifo /tmp/in \\\n";
 
-        assert_eq!(
-            codex_wrapper_script_input_mode(fifo_script),
-            CodexWrapperInputMode::Fifo
-        );
-        assert_eq!(
-            codex_wrapper_script_input_mode(pipe_script),
-            CodexWrapperInputMode::Pipe
-        );
-        assert_eq!(
-            codex_wrapper_script_input_mode(unknown_script),
-            CodexWrapperInputMode::Unknown
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_fifo_wrapper_reuse_requires_live_pane_output_fifo_mode_and_fifo_file() {
-        use CodexWrapperInputMode::{Fifo, Pipe, Unknown};
-        // All four conditions must hold: live pane, output transport, explicit
-        // fifo input mode, and a resolvable input FIFO to write the follow-up
-        // sentinel to.
-        assert!(codex_fifo_wrapper_session_usable(true, true, Fifo, true));
-        assert!(!codex_fifo_wrapper_session_usable(false, true, Fifo, true));
-        assert!(!codex_fifo_wrapper_session_usable(true, false, Fifo, true));
-        assert!(!codex_fifo_wrapper_session_usable(true, true, Pipe, true));
-        assert!(!codex_fifo_wrapper_session_usable(
-            true, true, Unknown, true
-        ));
-        assert!(!codex_fifo_wrapper_session_usable(true, true, Fifo, false));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_live_session_preservation_excludes_only_explicit_pipe_mode() {
-        // FIFO-mode (drivable here) and Unknown (marker lost after restart) are
-        // preserved; explicit legacy pipe-mode is recreated, not stranded.
-        assert!(codex_input_mode_allows_live_session_preservation(
-            CodexWrapperInputMode::Fifo
-        ));
-        assert!(codex_input_mode_allows_live_session_preservation(
-            CodexWrapperInputMode::Unknown
-        ));
-        assert!(!codex_input_mode_allows_live_session_preservation(
-            CodexWrapperInputMode::Pipe
-        ));
+        assert!(codex_wrapper_script_uses_pipe_input(pipe_script));
+        assert!(!codex_wrapper_script_uses_pipe_input(legacy_script));
     }
 
     #[test]
@@ -3372,71 +3210,6 @@ mod tui_hosting_tests {
         assert!(!should_preserve_live_reused_provider_session(
             None, true, false
         ));
-    }
-}
-
-#[cfg(test)]
-mod codex_fifo_followup_transport_tests {
-    #[cfg(unix)]
-    #[test]
-    fn reused_fifo_wrapper_buffer_keeps_protocol_line_terminated() {
-        let buffer = super::codex_pipe_prompt_buffer_text("[E2E:E2:TURN-2]\nreply json");
-
-        assert!(buffer.starts_with(super::TMUX_PROMPT_B64_PREFIX));
-        assert!(
-            buffer.ends_with('\n'),
-            "the FIFO protocol line must be newline-terminated so the wrapper's BufReader::lines() loop submits it"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn send_codex_pipe_prompt_writes_sentinel_to_fifo() {
-        use std::io::Read;
-
-        let dir = std::env::temp_dir().join(format!(
-            "agentdesk-codex-fifo-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        let fifo_path = dir.join("input");
-        let fifo_path_str = fifo_path.to_string_lossy().to_string();
-
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo_path)
-            .status()
-            .expect("spawn mkfifo");
-        assert!(status.success(), "mkfifo should succeed");
-
-        let prompt = "[E2E:E2:TURN-2]\nreply json";
-        let expected = super::codex_pipe_prompt_buffer_text(prompt);
-
-        // In production the codex wrapper holds the input FIFO open `O_RDWR`, so
-        // the reused-wrapper write side — which opens `O_NONBLOCK` and fails fast
-        // with ENXIO when no reader is attached (see `send_codex_pipe_prompt_to_fifo`)
-        // — always finds a reader. Mirror that here by holding a reader fd open
-        // BEFORE writing; a separate reader thread races the non-blocking open and
-        // fails ENXIO. `O_RDWR` attaches a reader without blocking and without an
-        // EOF race, so read exactly the bytes we expect.
-        let mut reader = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fifo_path)
-            .expect("open fifo O_RDWR to attach a reader");
-
-        super::send_codex_pipe_prompt_to_fifo(&fifo_path_str, prompt)
-            .expect("write follow-up sentinel to FIFO");
-
-        let mut buf = vec![0u8; expected.len()];
-        reader.read_exact(&mut buf).expect("read fifo");
-        let received = String::from_utf8(buf).expect("fifo bytes are utf-8");
-        assert_eq!(
-            received, expected,
-            "the wrapper must receive the exact newline-terminated base64 sentinel via the FIFO"
-        );
-        assert!(received.ends_with('\n'));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -3881,23 +3654,6 @@ mod tests {
             "bGluZSAxCmxpbmUgMg=="
         );
         assert_eq!(lines, vec![line]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_pipe_prompt_buffer_terminates_sentinel_line_for_tmux_submit() {
-        let buffer = super::codex_pipe_prompt_buffer_text("[E2E:E2:TURN-1]\nreply json");
-
-        assert!(buffer.starts_with(super::TMUX_PROMPT_B64_PREFIX));
-        assert!(
-            buffer.ends_with('\n'),
-            "reused pipe wrapper prompt must be line-terminated before the explicit Enter fallback"
-        );
-        assert_eq!(
-            buffer.lines().count(),
-            1,
-            "small prompts should paste as one sentinel line so read_line can submit it"
-        );
     }
 
     #[cfg(unix)]

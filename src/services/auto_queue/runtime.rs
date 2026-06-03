@@ -3,9 +3,6 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use sqlx::{PgPool, Row as SqlxRow};
 
-use crate::db::auto_queue::slot_predicate::{
-    DispatchSlotPolarity, active_dispatch_on_slot_predicate,
-};
 use crate::services::discord::health::HealthRegistry;
 
 #[derive(Debug, Clone)]
@@ -190,12 +187,12 @@ pub async fn slot_has_active_dispatch_excluding_pg(
 ) -> Result<bool, String> {
     let exclude_id = exclude_dispatch_id.unwrap_or("");
     let exclude_entry_id = exclude_entry_id.unwrap_or("");
-    // #2048 F5 + F8 / #3040: paused/cancelled-run entries no longer block —
-    // their dispatches are being cancelled. review / review-decision /
-    // create-pr dispatches only block when a live session is attached. The
-    // task_dispatches half of this check shares the single SQL builder
-    // (`active_dispatch_on_slot_predicate`) with claim.rs and slots.rs so
-    // slot allocation and slot reset can never disagree.
+    // #2048 F5 + F8: align with claim.rs `active_dispatch_slot_guard_sql`.
+    // (1) Paused/cancelled-run entries no longer block — their dispatches
+    //     are being cancelled. (2) review / review-decision / create-pr
+    //     dispatches only block when a live session is attached. Slot reset
+    //     and slot allocation must agree; before this fix operators could
+    //     not reset slots that allocation already treated as free.
     let auto_queue_active: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::BIGINT
          FROM auto_queue_entries e
@@ -220,22 +217,34 @@ pub async fn slot_has_active_dispatch_excluding_pg(
         return Ok(true);
     }
 
-    let active_dispatch_exists = active_dispatch_on_slot_predicate(
-        "$1",
-        "$2",
-        DispatchSlotPolarity::Exists,
-        Some("d.id != $3"),
-    );
-    let dispatch_query = format!("SELECT {active_dispatch_exists}");
-    sqlx::query_scalar::<_, bool>(&dispatch_query)
-        .bind(agent_id)
-        .bind(slot_index)
-        .bind(exclude_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| {
-            format!("load postgres active dispatches for {agent_id}:{slot_index}: {error}")
-        })
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COUNT(*) > 0
+         FROM task_dispatches
+         WHERE to_agent_id = $1
+           AND status IN ('pending', 'dispatched')
+           AND COALESCE(NULLIF((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'slot_index', '')::BIGINT, -1) = $2
+           AND COALESCE(((COALESCE(NULLIF(context, ''), '{}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+           AND (COALESCE(NULLIF(context, ''), '{}')::jsonb)->'phase_gate' IS NULL
+           AND id != $3
+           AND (
+               COALESCE(dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
+               OR status = 'pending'
+               OR EXISTS (
+                   SELECT 1
+                   FROM sessions s
+                   WHERE s.active_dispatch_id = task_dispatches.id
+                     AND COALESCE(s.status, '') NOT IN ('disconnected', 'completed', 'failed', 'cancelled')
+               )
+           )",
+    )
+    .bind(agent_id)
+    .bind(slot_index)
+    .bind(exclude_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|error| {
+        format!("probe active dispatch excluding {exclude_id} for {agent_id}:{slot_index}: {error}")
+    })
 }
 
 pub async fn reset_slot_thread_bindings_pg(

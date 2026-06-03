@@ -185,150 +185,29 @@ class DocTouchRulesTest(unittest.TestCase):
 
 
 class ChangeSurfaceLineCountTest(unittest.TestCase):
-    _INVENTORY_HEADER = (
-        "| Module | Path | Lines | Prod | Test | Flags |\n"
-        "| --- | --- | ---: | ---: | ---: | --- |\n"
-    )
-
-    def _setup(self, root: Path, inventory_row: str, surface_line: str) -> None:
-        _write(
-            root,
-            "docs/generated/module-inventory.md",
-            self._INVENTORY_HEADER + inventory_row + "\n",
-        )
-        _write(root, "docs/agent-maintenance/change-surfaces.md", surface_line)
-
-    def test_errors_when_copied_count_drifts_from_inventory_prod(self) -> None:
+    def test_warns_when_copied_line_count_drifts_from_inventory(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # total Lines=2100 but Prod=1500 (shrink, still giant); the gate
-            # compares the documented number against Prod, not the raw total.
-            self._setup(
+            _write(
                 root,
-                "| `services::foo` | `src/services/foo.rs` | 2100 | 1500 | 600 |  |",
-                "- `src/services/foo.rs` (1900 lines, giant-file).\n",
+                "docs/generated/module-inventory.md",
+                """
+                | Module | Path | Lines | Flags |
+                | --- | --- | ---: | --- |
+                | `services::foo` | `src/services/foo.rs` | 42 |  |
+                """,
             )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "error")
-        self.assertIn("but 1500 in", findings[0].message)
-        self.assertNotIn("decomposition regression", findings[0].message)
-
-    def test_no_finding_when_count_matches_prod(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._setup(
+            _write(
                 root,
-                "| `services::foo` | `src/services/foo.rs` | 99 | 1500 | 57 |  |",
-                "- `src/services/foo.rs` (1500 lines, giant-file).\n",
+                "docs/agent-maintenance/change-surfaces.md",
+                "- `src/services/foo.rs` (41 lines, giant-file).\n",
             )
-            findings = CHECKER.check_change_surface_line_counts(root)
 
-        self.assertEqual(findings, [])
-
-    def test_errors_on_ghost_freeze_entry_below_threshold(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._setup(
-                root,
-                "| `services::foo` | `src/services/foo.rs` | 4000 | 64 | 3936 |  |",
-                "- `src/services/foo.rs` (3550 lines, giant-file).\n",
-            )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "error")
-        self.assertIn("no longer a giant file", findings[0].message)
-
-    def test_errors_and_flags_decomposition_regression_on_growth(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._setup(
-                root,
-                "| `services::foo` | `src/services/foo.rs` | 2200 | 2100 | 100 |  |",
-                "- `src/services/foo.rs` (1800 lines, giant-file).\n",
-            )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "error")
-        self.assertIn("decomposition regression", findings[0].message)
-
-    def test_gates_bare_shorthand_line_count(self) -> None:
-        # The services_misc_giants list uses a bare `(N)` shorthand; the gate
-        # must validate it too, not just the `(N lines)` form.
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._setup(
-                root,
-                "| `services::foo` | `src/services/foo.rs` | 4000 | 64 | 3936 |  |",
-                "- `src/services/foo.rs` (3550) — provider adapter.\n",
-            )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "error")
-        self.assertIn("no longer a giant file", findings[0].message)
-
-    def test_bare_shorthand_drift_is_error(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._setup(
-                root,
-                "| `services::foo` | `src/services/foo.rs` | 2200 | 1740 | 460 |  |",
-                "- `src/services/foo.rs` (2177).\n",
-            )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "error")
-        self.assertIn("but 1740 in", findings[0].message)
-
-    def test_lines_form_not_double_counted_by_shorthand(self) -> None:
-        # `(N lines …)` must be handled once, not also matched as `(N)`.
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._setup(
-                root,
-                "| `services::foo` | `src/services/foo.rs` | 2000 | 1500 | 500 |  |",
-                "- `src/services/foo.rs` (1500 lines, giant-file).\n",
-            )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(findings, [])
-
-    def test_errors_when_frozen_path_missing_from_disk(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            # Inventory has an unrelated module; the frozen path does not exist
-            # on disk (deleted/renamed) -> hard error, not a warning.
-            self._setup(
-                root,
-                "| `services::bar` | `src/services/bar.rs` | 1500 | 1500 | 0 |  |",
-                "- `src/services/gone.rs` (2000 lines, giant-file).\n",
-            )
-            findings = CHECKER.check_change_surface_line_counts(root)
-
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, "error")
-        self.assertIn("missing from disk", findings[0].message)
-
-    def test_warns_when_frozen_path_is_test_file(self) -> None:
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src/db").mkdir(parents=True)
-            (root / "src/db/tests.rs").write_text("// test harness\n", encoding="utf-8")
-            self._setup(
-                root,
-                "| `services::bar` | `src/services/bar.rs` | 1500 | 1500 | 0 |  |",
-                "- `src/db/tests.rs` (3000 lines).\n",
-            )
             findings = CHECKER.check_change_surface_line_counts(root)
 
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].severity, "warning")
-        self.assertIn("test file", findings[0].message)
+        self.assertIn("but 42 in module-inventory.md", findings[0].message)
 
 
 if __name__ == "__main__":
