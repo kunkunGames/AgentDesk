@@ -438,7 +438,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
-- `src/services/onboarding/mod.rs` (2966),
+- `src/services/onboarding/mod.rs` (2936),
   `src/services/dispatched_sessions.rs` (1326), and
   `src/services/settings.rs` (1007) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`

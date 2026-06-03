@@ -2536,7 +2536,10 @@ fn persist_complete_filesystem_artifacts(
             ctx,
             root,
             completion_state,
-            format!("failed to create config dir {}: {error}", config_dir.display()),
+            format!(
+                "failed to create config dir {}: {error}",
+                config_dir.display()
+            ),
         ));
     }
 
@@ -2859,12 +2862,7 @@ async fn complete_with_options(
 
     if let Some(pool) = state.pg_pool_ref() {
         if let Err(error) = persist_onboarding_pg(pool, body, provider, &resolved_channels).await {
-            return fail_and_persist_completion_state(
-                &ctx,
-                &root,
-                &mut completion_state,
-                error,
-            );
+            return fail_and_persist_completion_state(&ctx, &root, &mut completion_state, error);
         }
     } else {
         return fail_and_persist_completion_state(
