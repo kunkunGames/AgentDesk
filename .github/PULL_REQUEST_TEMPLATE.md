@@ -7,7 +7,7 @@
 <!-- Bulleted checklist: how to verify the change. -->
 
 ## Queue Hygiene & Merge-Readiness checklist
-- [ ] **Duplicate PR guard:** I have checked for overlapping open PRs before creating this PR. For generated inventory refreshes, I have verified no other open Scribe, Redline, Cartographer-Lite, or Steward refresh PRs cover this drift across namespaces.
+- [ ] **Duplicate PR guard:** I have checked for overlapping open PRs (via `gh pr list` or `git branch -r`) before creating this PR. For generated inventory refreshes, I have verified no other open Scribe, Redline, Cartographer-Lite, or Steward refresh PRs cover this drift across namespaces.
 - [ ] **Verification Honesty:** I have not claimed PostgreSQL, Discord, tmux, provider runtime, browser, or CI verification in the PR body unless I actually executed it locally.
 - [ ] **No-change verification:** If this PR claims no change, I have verified it modifies zero files using `gh pr view --json files`. (If an unavoidable no-change PR is opened, its body lists the exact overlapping PR numbers and branches).
 - [ ] **Stale branch cleanup:** I am not salvaging a stale broad branch in-place. Instead, I am closing stale branches and recreating clean branches from main.
