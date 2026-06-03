@@ -3554,6 +3554,18 @@ fn execute_streaming_local_tmux(
     let current_gen = crate::services::discord::runtime_store::load_generation();
     let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
 
+    // #3087: stamp a per-spawn nonce in a SEPARATE marker. The status-panel
+    // session-instance key reads this nonce (unique per spawn) instead of the
+    // `.generation` mtime, so a missing/duplicate mtime can never collapse two
+    // distinct spawns into one instance key. Write errors are logged (not
+    // silently swallowed) since a missing nonce degrades the panel-reset
+    // boundary to best-effort.
+    if let Err(e) = crate::services::discord::write_spawn_nonce(tmux_session_name) {
+        debug_log(&format!(
+            "failed to write spawn nonce for {tmux_session_name}: {e}"
+        ));
+    }
+
     debug_log("tmux session created, storing in cancel token...");
 
     // Store tmux session name in cancel token

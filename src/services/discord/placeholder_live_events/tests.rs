@@ -875,6 +875,182 @@ fn status_panel_resets_on_each_of_two_distinct_none_id_fresh_sessions() {
     }
 }
 
+/// #3087 (codex Edge 5 — false RESET on key AVAILABILITY transition) — the
+/// `session_instance_key` can become available mid-session (`None`→`Some`)
+/// purely because `tmux_session_name` resolved or the `.spawn_nonce` marker
+/// became readable. That is NOT a session change. The boundary must be gated on
+/// the OLD key being `Some` too (mirroring the provider-id gate), so a
+/// `None`→`Some` key transition PRESERVES the same-session accumulation.
+#[test]
+fn status_panel_preserves_accumulation_on_none_to_some_instance_key_availability() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(30875);
+
+    // First tick: no instance key yet (e.g. tmux name / nonce marker not yet
+    // resolved). Establishes a session with a `None` key, same provider id.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        None,
+        "session_resumed",
+        &json!({ "provider_session_id": "stable-id", "tmux_reused": true }),
+    ));
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Pre-key work"}).to_string(),
+        ),
+    );
+
+    // Second tick of the SAME session: the instance key is now AVAILABLE
+    // (`None`→`Some`), same provider id. This is an availability transition,
+    // not a new session — there must be NO reset.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        Some("AgentDesk-claude-ch30875#nonce-aaaa"),
+        "session_resumed",
+        &json!({ "provider_session_id": "stable-id", "tmux_reused": true }),
+    ));
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.subagents.len(),
+            1,
+            "None→Some instance-key availability transition must NOT reset accumulation"
+        );
+        assert_eq!(
+            guard.subagents.first().map(|slot| slot.desc.as_str()),
+            Some("Pre-key work")
+        );
+    }
+
+    // A subsequent genuinely-new spawn (key Some(a)→Some(b)) still resets.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        Some("AgentDesk-claude-ch30875#nonce-bbbb"),
+        "session_fresh",
+        &json!({ "reason": "clear", "tmux_reused": false }),
+    ));
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.subagents.is_empty(),
+            "a Some(a)→Some(b) instance-key change (new spawn) must reset"
+        );
+    }
+}
+
+/// #3087 (codex Edge 3 — missing-nonce same-name respawn must NOT suppress a
+/// real reset) — the prior mtime design folded a missing marker into a
+/// `{name}#0` key, so two back-to-back respawns reusing the same tmux session
+/// name both produced `{name}#0` → identical key → NO reset (the bug
+/// persisted). The nonce design yields `None` when the marker is unavailable,
+/// so a respawn whose nonce is missing never collides with a stored key; the
+/// provider-session delta then remains the reset boundary instead of a
+/// suppressed reset. This test models a same-name respawn where the FIRST
+/// session had a real nonce and the respawn's nonce is unavailable (key `None`)
+/// but the provider session genuinely changed — the panel MUST still reset.
+#[test]
+fn status_panel_resets_on_same_name_respawn_with_missing_nonce_via_provider_delta() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(30876);
+
+    // Session #1: real nonce key + provider id A → accumulate.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        Some("AgentDesk-claude-ch30876#nonce-1111"),
+        "session_resumed",
+        &json!({ "provider_session_id": "session-A", "tmux_reused": true }),
+    ));
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Session A work"}).to_string(),
+        ),
+    );
+
+    // Respawn reusing the SAME tmux name, but the `.spawn_nonce` marker is
+    // unavailable this tick → instance key is `None`. The provider session
+    // genuinely changed (A→B). Under the OLD mtime design both would key to
+    // `{name}#0` and NOT reset; here the `None` key does not collide, and the
+    // Some(a)→Some(b) provider delta drives the reset.
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        None,
+        "session_fresh",
+        &json!({ "provider_session_id": "session-B", "tmux_reused": false }),
+    ));
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.subagents.is_empty(),
+            "same-name respawn with a missing nonce must STILL reset via the provider-session delta (no #0 collision)"
+        );
+    }
+}
+
+/// #3087 — two distinct spawns with distinct NONCES each reset (the positive
+/// path: a respawn that DOES have a readable nonce changes the instance key, so
+/// the reset fires even when there is no provider-session signal at all).
+#[test]
+fn status_panel_resets_on_two_distinct_nonces_without_provider_id() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(30877);
+
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        Some("AgentDesk-claude-ch30877#nonce-aaaa"),
+        "session_fresh",
+        &json!({ "reason": "first_turn", "tmux_reused": false }),
+    ));
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use(
+            "Task",
+            &json!({"subagent_type": "explorer", "description": "Spawn 1 work"}).to_string(),
+        ),
+    );
+
+    assert!(events.set_session_panel_lifecycle_event(
+        channel_id,
+        Some("AgentDesk-claude-ch30877#nonce-bbbb"),
+        "session_fresh",
+        &json!({ "reason": "clear", "tmux_reused": false }),
+    ));
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            guard.subagents.is_empty(),
+            "a distinct per-spawn nonce must reset even with no provider session id"
+        );
+    }
+}
+
 #[test]
 fn status_panel_renders_session_fresh_and_fallback_distinctly() {
     let events = PlaceholderLiveEvents::default();

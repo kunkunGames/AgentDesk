@@ -46,21 +46,21 @@ pub(super) struct SessionPanelSnapshot {
     tmux: Option<TmuxPanelState>,
     recovery_message_count: Option<usize>,
     /// Stable session-INSTANCE marker for this snapshot, derived from the tmux
-    /// runtime's `.generation` spawn marker: `"{tmux_session_name}#{mtime_ns}"`.
+    /// runtime's `.spawn_nonce` spawn marker: `"{tmux_session_name}#{nonce}"`.
     ///
-    /// `.generation` is written exactly once per spawn by `claude.rs` right
-    /// after `tmux::create_session` and is never touched by the live wrapper
-    /// (the adoption path even preserves its mtime on purpose — see
-    /// `tmux_session_files::preserve_mtime_after_write`). Its mtime therefore
-    /// uniquely identifies one wrapper INSTANCE and is invariant across:
+    /// `.spawn_nonce` is written exactly once per spawn (a per-spawn v4 UUID) by
+    /// the provider spawn sites right after `tmux::create_session` and is never
+    /// touched by the live wrapper. Its content therefore uniquely identifies
+    /// one wrapper INSTANCE — guaranteed unique per spawn regardless of
+    /// filesystem mtime resolution — and is invariant across:
     ///   * every status tick and every TURN of the same session (the marker is
     ///     not rewritten per turn), and
     ///   * the `None`→`Some` provider-session-id assignment that lands mid-turn
     ///     on `StreamMessage::Init` (the provider id is orthogonal to the
     ///     spawn marker).
     /// A genuinely new session is a new tmux spawn (`/clear`, idle-timeout,
-    /// turn-cap, cancel→respawn, …), which rewrites `.generation` with a fresh
-    /// mtime — so the instance key changes exactly once, on the real boundary.
+    /// turn-cap, cancel→respawn, …), which mints a fresh nonce — so the instance
+    /// key changes exactly once, on the real boundary.
     ///
     /// Keying the reset on THIS (instead of the per-turn `turn_id`) is what
     /// fixes #3087's two false-reset P1s: a no-provider-id session running many
@@ -123,8 +123,8 @@ impl SessionPanelSnapshot {
             .filter(|value| !value.is_empty())
     }
 
-    /// The stable session-INSTANCE marker (`"{tmux_session_name}#{mtime_ns}"`,
-    /// derived from the `.generation` spawn marker) used to detect a genuine
+    /// The stable session-INSTANCE marker (`"{tmux_session_name}#{nonce}"`,
+    /// derived from the `.spawn_nonce` spawn marker) used to detect a genuine
     /// new-session boundary even when `provider_session_id` is `None`, WITHOUT
     /// re-resetting on every status tick / turn of an ongoing session or on the
     /// `None`→`Some` provider-id assignment (#3087). Normalized to `None` when

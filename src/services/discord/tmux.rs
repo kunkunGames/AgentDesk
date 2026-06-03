@@ -64,6 +64,7 @@ pub(super) use self::tmux_session_files::read_generation_file_mtime_ns;
 pub(super) use self::tmux_session_files::session_panel_instance_key;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use self::tmux_session_files::watermark_after_output_regression;
+pub(crate) use self::tmux_session_files::write_spawn_nonce;
 use self::tmux_session_files::{
     preserve_mtime_after_write, reset_stale_local_relay_offset_if_output_regressed,
     reset_stale_relay_watermark_if_output_regressed, sweep_orphan_session_files,
@@ -3672,6 +3673,74 @@ mod tests {
         );
         let content = std::fs::read_to_string(&path).expect("read");
         assert_eq!(content, "7");
+    }
+
+    // ─── #3087: per-spawn nonce drives the status-panel instance key ──────
+    #[test]
+    fn spawn_nonce_is_read_from_content_and_differs_per_spawn() {
+        // The status-panel session-instance key reads the `.spawn_nonce`
+        // marker CONTENT, which must be unique per spawn (a v4 UUID) — NOT the
+        // `.generation` mtime, which a missing/duplicate mtime could collapse.
+        let _lock = match test_env_lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", tmp.path()) };
+
+        let tmux_name = format!(
+            "AgentDesk-claude-adk-issue-3087-nonce-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let nonce_path = crate::services::tmux_common::session_temp_path(&tmux_name, "spawn_nonce");
+        if let Some(parent) = std::path::Path::new(&nonce_path).parent() {
+            std::fs::create_dir_all(parent).expect("runtime dir");
+        }
+
+        // Before any spawn: no marker → key is None (NOT a `{name}#0` key).
+        assert!(
+            super::session_panel_instance_key(&tmux_name).is_none(),
+            "missing nonce must yield a None key, never a colliding {{name}}#0 key"
+        );
+
+        // First spawn mints a nonce; the key reads it from CONTENT.
+        let nonce1 = super::write_spawn_nonce(&tmux_name).expect("write nonce 1");
+        let key1 = super::session_panel_instance_key(&tmux_name).expect("key after spawn 1");
+        assert_eq!(
+            key1,
+            format!("{tmux_name}#{nonce1}"),
+            "key must be {{name}}#{{nonce-content}}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&nonce_path)
+                .expect("read nonce file")
+                .trim(),
+            nonce1,
+            "the nonce on disk must be the file CONTENT (not derived from mtime)"
+        );
+
+        // A second spawn reusing the SAME tmux name mints a DISTINCT nonce →
+        // distinct key, regardless of filesystem mtime resolution. This is the
+        // exact Edge-3/Edge-4 collision the mtime design could not prevent.
+        let nonce2 = super::write_spawn_nonce(&tmux_name).expect("write nonce 2");
+        assert_ne!(nonce1, nonce2, "each spawn must mint a unique nonce");
+        let key2 = super::session_panel_instance_key(&tmux_name).expect("key after spawn 2");
+        assert_ne!(
+            key1, key2,
+            "two distinct spawns of the same tmux name must produce distinct instance keys"
+        );
+
+        // An empty/blank marker is treated as unavailable (None), not `{name}#`.
+        std::fs::write(&nonce_path, b"   ").expect("blank nonce");
+        assert!(
+            super::session_panel_instance_key(&tmux_name).is_none(),
+            "a blank nonce marker must yield a None key, never a same-name collision"
+        );
+
+        unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
     }
 
     // ─── #1275 P2 #2: resume_offset path snapshots `.generation` mtime ────
