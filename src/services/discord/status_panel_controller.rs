@@ -198,6 +198,24 @@ enum PanelMsg {
         key: TurnKey,
         ack: oneshot::Sender<Option<MessageId>>,
     },
+    /// EPIC #3078 PR-3 — READ-ONLY shadow parity query: "which panel id does the
+    /// live turn own, per the inflight row?" The legacy sweeper/orphan gates read
+    /// the id from the inflight row directly (`inflight.status_message_id`), so
+    /// the faithful parity value is that `inflight_panel_id` — NOT whatever
+    /// (possibly stale) id the in-memory ledger happens to hold. This query
+    /// therefore returns `inflight_panel_id` unchanged, EXCEPT it collapses to
+    /// `None` when the resolved ledger entry is already terminal
+    /// (Completed/Reclaimed): a panel the controller has finalized/reclaimed is
+    /// no longer owned by a live turn. It NEVER mutates the ledger (no seed, no
+    /// resurrection of a terminal entry) and NEVER writes the durable mirror, so
+    /// it is byte-for-byte inert next to the still-executing legacy path. The key
+    /// is resolved with the same `resolve_channel_only` collapse the live ledger
+    /// uses, so the #3003 channel-only (`user_msg_id == 0`) defer is honored.
+    OrphanParityTarget {
+        key: TurnKey,
+        inflight_panel_id: Option<MessageId>,
+        ack: oneshot::Sender<Option<MessageId>>,
+    },
     /// Adopt an ALREADY-EXISTING panel message into the ledger as the live panel
     /// for this turn (the post-restart recovery/orphan case: the panel was sent
     /// by a previous process, so there is nothing to create — the controller
@@ -407,6 +425,83 @@ impl StatusPanelController {
         self.adopt_recovered(key, provider, PanelOwnerKind::Recovery, recovered_msg_id);
         self.current_panel(key).await
     }
+
+    /// EPIC #3078 PR-3 — the panel id the controller WOULD reclaim for an orphaned
+    /// status-panel row the placeholder sweeper is converging, asserted equal to the
+    /// legacy `panel_reclaim_target` / `clear_status_panel_if_current` target. The
+    /// legacy reclaim target IS the persisted panel id on the inflight row, so the
+    /// faithful parity value is that `panel_msg_id` argument itself — read back
+    /// through a READ-ONLY query that ONLY collapses to `None` when the controller
+    /// has already finalized/reclaimed this turn's panel (a terminal ledger entry).
+    /// Crucially this does NOT seed the ledger from the row's id (the prior
+    /// `adopt_recovered` seed read back a STALE in-memory id when one was already
+    /// present, diverging from legacy); it reflects the row's CURRENT id. Shadow-
+    /// only: NO finalize/reclaim, NO ledger mutation, NO durable-mirror write, NO
+    /// Discord IO, so the legacy sweeper keeps executing the actual delete/clear
+    /// unchanged.
+    pub(in crate::services::discord) async fn sweeper_reclaim_parity_id(
+        &self,
+        key: TurnKey,
+        _provider: ProviderKind,
+        panel_msg_id: Option<MessageId>,
+    ) -> Option<MessageId> {
+        self.orphan_parity_target(key, panel_msg_id).await
+    }
+
+    /// EPIC #3078 PR-3 — the controller's view of "does the live turn still own
+    /// THIS EXACT panel?", the gate the orphan-store drain uses to defer a delete
+    /// while the live turn's completion path may be finalizing the panel. Must
+    /// agree with the legacy inflight-row gate `inflight.status_message_id ==
+    /// Some(candidate)`, INCLUDING the channel-only (`user_msg_id == 0`) collapse
+    /// for the #3003 turn-aware defer. Computed from the inflight row's CURRENT
+    /// panel id (`inflight_panel_id`, the value the legacy gate reads) via a
+    /// READ-ONLY query — NOT from whatever (possibly stale) id the in-memory ledger
+    /// holds, the divergence the prior `adopt_recovered` seed introduced. Shadow-
+    /// only: NO ledger mutation, NO durable write, NO Discord IO — the legacy drain
+    /// executes the real defer/delete unchanged.
+    pub(in crate::services::discord) async fn orphan_gate_owns_panel(
+        &self,
+        key: TurnKey,
+        _provider: ProviderKind,
+        inflight_panel_id: Option<MessageId>,
+        candidate: MessageId,
+    ) -> bool {
+        // Faithful to `inflight_panel_id == Some(candidate)`: read the row's
+        // CURRENT panel id back through the read-only query. A row that owns no
+        // panel (state file gone → `None`) resolves to `None`, agreeing the live
+        // turn does NOT own the orphan — exactly the legacy `None == Some(candidate)`
+        // → false outcome — and a terminal controller entry likewise collapses to
+        // `None` (the panel was already released, never resurrected here).
+        self.orphan_parity_target(key, inflight_panel_id).await == Some(candidate)
+    }
+
+    /// READ-ONLY shared helper for the two PR-3 parity gates: the panel id the
+    /// live turn owns per the inflight row (`inflight_panel_id`), collapsed to
+    /// `None` only when the controller has already finalized/reclaimed this turn's
+    /// panel. Never seeds/mutates the ledger and never writes the durable mirror —
+    /// the value reflects the inflight row's CURRENT id, faithfully matching the
+    /// legacy gates, instead of a possibly-stale in-memory ledger id.
+    async fn orphan_parity_target(
+        &self,
+        key: TurnKey,
+        inflight_panel_id: Option<MessageId>,
+    ) -> Option<MessageId> {
+        let (ack, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(PanelMsg::OrphanParityTarget {
+                key,
+                inflight_panel_id,
+                ack,
+            })
+            .is_err()
+        {
+            // Actor not spawned (v2 off) / shut down: fall back to the raw row id,
+            // the legacy value, so a v2-off path still computes faithful parity.
+            return inflight_panel_id;
+        }
+        rx.await.unwrap_or(inflight_panel_id)
+    }
 }
 
 /// Resolve a submission to the ledger entry it acts on, reusing the finalizer's
@@ -501,6 +596,25 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<PanelMsg>) {
                 let lk = resolve_key(&ledger, key);
                 let id = ledger.get(&lk).and_then(|e| e.msg_id);
                 let _ = ack.send(id);
+            }
+            PanelMsg::OrphanParityTarget {
+                key,
+                inflight_panel_id,
+                ack,
+            } => {
+                // READ-ONLY: faithful to the legacy gate, which reads the panel id
+                // straight from the inflight row. Return that `inflight_panel_id`
+                // verbatim so the parity reflects the row's CURRENT id, never a
+                // stale ledger seed. The ONLY override is terminal-safety: if the
+                // resolved entry is already Completed/Reclaimed, the controller has
+                // released this panel, so the live turn no longer owns it → `None`.
+                // No ledger mutation, no durable write, no resurrection.
+                let lk = resolve_key(&ledger, key);
+                let target = match ledger.get(&lk) {
+                    Some(e) if e.phase.is_terminal() => None,
+                    _ => inflight_panel_id,
+                };
+                let _ = ack.send(target);
             }
             PanelMsg::AdoptRecovered {
                 key,
@@ -920,6 +1034,189 @@ mod tests {
             .recovery_completion_parity_id(key2, ProviderKind::Claude, None)
             .await;
         assert_eq!(none, None);
+    }
+
+    /// EPIC #3078 PR-3: the sweeper-reclaim shadow helper adopts the persisted
+    /// orphan panel id and reports it back as the controller's chosen reclaim
+    /// target (parity with the legacy `panel_reclaim_target`), and reports `None`
+    /// for a row that carries no panel id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sweeper_reclaim_parity_id_reports_adopted_id() {
+        let ctl = StatusPanelController::spawn(true);
+
+        // A row carrying a real persisted panel id → that id is the reclaim target.
+        let key = TurnKey::new(ChannelId::new(11), 110, 0);
+        let chosen = ctl
+            .sweeper_reclaim_parity_id(key, ProviderKind::Claude, Some(MessageId::new(1100)))
+            .await;
+        assert_eq!(chosen, Some(MessageId::new(1100)));
+
+        // A row with no persisted panel id → no reclaim target.
+        let key2 = TurnKey::new(ChannelId::new(11), 111, 0);
+        let none = ctl
+            .sweeper_reclaim_parity_id(key2, ProviderKind::Claude, None)
+            .await;
+        assert_eq!(none, None);
+    }
+
+    /// EPIC #3078 PR-3: the orphan-store drain gate helper agrees with the legacy
+    /// inflight-row gate — it returns `true` only when the live turn still owns the
+    /// EXACT orphan panel, including the channel-only (`user_msg_id == 0`) collapse
+    /// for the #3003 turn-aware defer, and `false` when the row owns a different
+    /// panel or no panel at all (state file gone).
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_gate_owns_panel_agrees_with_inflight_row() {
+        // Live turn owns THIS exact panel → defer (true), matching
+        // `inflight.status_message_id == Some(candidate)`.
+        let ctl = StatusPanelController::spawn(true);
+        let key = TurnKey::new(ChannelId::new(12), 120, 0);
+        let owns = ctl
+            .orphan_gate_owns_panel(
+                key,
+                ProviderKind::Claude,
+                Some(MessageId::new(1200)),
+                MessageId::new(1200),
+            )
+            .await;
+        assert!(owns);
+
+        // Live turn owns a DIFFERENT panel → do not defer (false), matching
+        // `Some(other) == Some(candidate)` → false.
+        let ctl2 = StatusPanelController::spawn(true);
+        let key2 = TurnKey::new(ChannelId::new(12), 121, 0);
+        let owns2 = ctl2
+            .orphan_gate_owns_panel(
+                key2,
+                ProviderKind::Claude,
+                Some(MessageId::new(9999)),
+                MessageId::new(1200),
+            )
+            .await;
+        assert!(!owns2);
+
+        // No live row / state file gone (`None`) → do not defer (false), matching
+        // `None == Some(candidate)` → false. The orphan store is the only reclaim
+        // path here, so the drain must NOT defer forever.
+        let ctl3 = StatusPanelController::spawn(true);
+        let key3 = TurnKey::new(ChannelId::new(12), 122, 0);
+        let owns3 = ctl3
+            .orphan_gate_owns_panel(key3, ProviderKind::Claude, None, MessageId::new(1200))
+            .await;
+        assert!(!owns3);
+
+        // Channel-only (`user_msg_id == 0`) recovery/orphan key collapses onto the
+        // adopted live entry → still recognizes ownership of the exact panel.
+        let ctl4 = StatusPanelController::spawn(true);
+        let key4 = TurnKey::new(ChannelId::new(13), 0, 0);
+        let owns4 = ctl4
+            .orphan_gate_owns_panel(
+                key4,
+                ProviderKind::Claude,
+                Some(MessageId::new(1300)),
+                MessageId::new(1300),
+            )
+            .await;
+        assert!(owns4);
+    }
+
+    /// EPIC #3078 PR-3 regression: a STALE different id already in the controller
+    /// ledger for the key must NOT leak into the parity decision. The legacy gate
+    /// compares the inflight row's CURRENT id; the prior `adopt_recovered` seed read
+    /// the stale ledger id back instead and diverged. Both PR-3 parity helpers must
+    /// now compute from the passed-in inflight-row id, agreeing with legacy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parity_uses_inflight_row_id_not_stale_ledger() {
+        let ctl = StatusPanelController::spawn(true);
+        let key = TurnKey::new(ChannelId::new(20), 200, 0);
+
+        // Plant a STALE id in the ledger (a prior turn's panel the controller still
+        // holds in memory). `adopt_recovered` is the only public seed path.
+        ctl.adopt_recovered(
+            key,
+            ProviderKind::Claude,
+            PanelOwnerKind::Standby,
+            Some(MessageId::new(7777)),
+        );
+        assert_eq!(ctl.current_panel(key).await, Some(MessageId::new(7777)));
+
+        // The inflight row now owns a DIFFERENT (current) panel id 8888. Legacy:
+        // `Some(8888) == Some(8888)` → true; `Some(8888) == Some(7777)` → false.
+        // The fix must reflect the row id 8888, NOT the stale 7777.
+        let owns_current = ctl
+            .orphan_gate_owns_panel(
+                key,
+                ProviderKind::Claude,
+                Some(MessageId::new(8888)),
+                MessageId::new(8888),
+            )
+            .await;
+        assert!(owns_current, "gate must own the inflight row's CURRENT id");
+
+        let owns_stale = ctl
+            .orphan_gate_owns_panel(
+                key,
+                ProviderKind::Claude,
+                Some(MessageId::new(8888)),
+                MessageId::new(7777),
+            )
+            .await;
+        assert!(
+            !owns_stale,
+            "gate must NOT own the stale ledger id once the row moved on"
+        );
+
+        // Sweeper reclaim target is the row's CURRENT id, not the stale ledger id.
+        let reclaim = ctl
+            .sweeper_reclaim_parity_id(key, ProviderKind::Claude, Some(MessageId::new(8888)))
+            .await;
+        assert_eq!(reclaim, Some(MessageId::new(8888)));
+
+        // The query is READ-ONLY: the stale ledger id is untouched (no seed/clobber).
+        assert_eq!(ctl.current_panel(key).await, Some(MessageId::new(7777)));
+    }
+
+    /// EPIC #3078 PR-3: a Completed/Reclaimed terminal entry is NOT resurrected by
+    /// the parity query; instead the live turn is reported as no longer owning the
+    /// panel (`None`), and the terminal phase is left intact.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parity_query_never_resurrects_terminal_entry() {
+        let ctl = StatusPanelController::spawn(true);
+        let key = TurnKey::new(ChannelId::new(21), 210, 0);
+        let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
+
+        // Adopt a live panel, then finalize it (terminal Completed).
+        ctl.adopt_recovered(
+            key,
+            ProviderKind::Claude,
+            PanelOwnerKind::Standby,
+            Some(MessageId::new(9100)),
+        );
+        let outcome = ctl.finalize(key, None, shared).await;
+        assert!(matches!(outcome, PanelCommitOutcome::Committed { .. }));
+
+        // The inflight row may still carry 9100, but the controller already
+        // finalized it → the parity query collapses to None (released), and the
+        // gate does not defer.
+        let target = ctl
+            .sweeper_reclaim_parity_id(key, ProviderKind::Claude, Some(MessageId::new(9100)))
+            .await;
+        assert_eq!(target, None, "terminal entry → no live reclaim target");
+
+        let owns = ctl
+            .orphan_gate_owns_panel(
+                key,
+                ProviderKind::Claude,
+                Some(MessageId::new(9100)),
+                MessageId::new(9100),
+            )
+            .await;
+        assert!(!owns, "terminal entry must not be reported as live-owned");
+
+        // A follow-up finalize is still AlreadyTerminal — the query never reopened
+        // the entry.
+        let shared2 = super::super::make_shared_data_for_tests_with_storage(None, None);
+        let again = ctl.finalize(key, None, shared2).await;
+        assert_eq!(again, PanelCommitOutcome::AlreadyTerminal);
     }
 
     /// A channel-only (`user_msg_id == 0`) finalize collapses onto the single

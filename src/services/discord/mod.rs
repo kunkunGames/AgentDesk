@@ -62,6 +62,7 @@ pub mod runtime_store;
 pub(crate) mod session_identity;
 mod session_runtime;
 pub(crate) mod settings;
+mod shadow_parity_warn;
 pub(crate) mod shared_memory;
 mod stall_recovery;
 mod status_panel_orphan_store;
