@@ -1348,6 +1348,14 @@ impl TmuxWatcherRegistry {
             .remove(tmux_session_name);
     }
 
+    /// #3105 (codex P1 sub-case B): true when a LIVE watcher handle currently
+    /// owns this tmux session. Used to distinguish a genuinely dead/orphaned
+    /// session (no live watcher) from a live session whose authoritative owner
+    /// map entry was transiently evicted (which must self-heal, not be tombstoned).
+    pub(super) fn has_live_watcher_handle(&self, tmux_session_name: &str) -> bool {
+        self.by_tmux_session.contains_key(tmux_session_name)
+    }
+
     pub(super) fn tmux_session_is_stale(&self, tmux_session_name: &str) -> Option<bool> {
         self.by_tmux_session.get(tmux_session_name).map(|entry| {
             entry.cancel.load(std::sync::atomic::Ordering::Relaxed) || entry.heartbeat_stale()

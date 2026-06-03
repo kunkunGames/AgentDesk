@@ -1515,8 +1515,75 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
     )));
 }
 
+/// #3105 (codex P1 sub-case B): a tmux session whose dedupe mirror still holds a
+/// stale ClaudeTui binding but which is genuinely dead/orphaned — its pane is
+/// gone AND no LIVE watcher handle owns it. This is the precise gate under which
+/// it is safe to drop any leftover restored-owner binding and tombstone the
+/// mirror; it deliberately EXCLUDES a live session whose authoritative registry
+/// entry was transiently evicted (sub-case A — pane is still live there, so this
+/// returns false and that path self-heals via
+/// `restore_owner_channel_for_tmux_session`).
+///
+/// The pane-liveness check is what distinguishes "pane dead/gone" (evict) from
+/// "pane alive but registry missing" (self-heal). A `restored_owner_by_tmux_session`
+/// entry is NOT treated as proof of life here, because that map is precisely the
+/// stale residue we must reclaim for a session that has since died; it is
+/// cleared as part of the eviction.
+#[cfg(unix)]
+fn claude_tui_session_is_dead_orphaned(shared: &Arc<SharedData>, tmux_session_name: &str) -> bool {
+    !crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
+        && !shared
+            .tmux_watchers
+            .has_live_watcher_handle(tmux_session_name)
+}
+
+/// #3105 (codex P1 sub-case B): evict the stale dedupe mirror for every Claude
+/// TUI runtime binding whose session is dead/orphaned, BEFORE the idle relay
+/// loop iterates the mirror. The relay loop's `for` is driven by
+/// `runtime_bindings_for_kind(ClaudeTui)`; without this pass a dead/orphaned
+/// session (e.g. a thread-suffixed session whose pane no longer exists on this
+/// host) is yielded every iteration, fails authoritative owner resolution, and
+/// re-emits the drift + skip WARN every ~0.5s indefinitely. Tombstoning the
+/// mirror here removes the binding from that iteration set, so the spam stops
+/// after a single bounded incident line. A later legitimate re-registration
+/// (launch-script rehydrate or a fresh watcher) re-populates the mirror, so a
+/// session that comes back relays again.
+///
+/// This pass is independent of `list_session_names()` (which never contains a
+/// session that is gone from this host), which is exactly why the previous
+/// in-`list` dead-pane branch could not reach it.
+#[cfg(unix)]
+fn evict_dead_orphaned_claude_tui_mirrors(shared: &Arc<SharedData>) {
+    for (tmux_session_name, _binding) in
+        crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(RuntimeHandoffKind::ClaudeTui)
+    {
+        if !claude_tui_session_is_dead_orphaned(shared, &tmux_session_name) {
+            continue;
+        }
+        // Drop any leftover restored-owner binding (a dead session must never
+        // resolve an authoritative owner), then tombstone the dedupe mirror.
+        shared
+            .tmux_watchers
+            .clear_restored_owner_for_tmux_session(&tmux_session_name);
+        if crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(&tmux_session_name) {
+            tracing::warn!(
+                tmux_session_name = %tmux_session_name,
+                provider = "claude",
+                "evicted stale dedupe mirror for dead/orphaned Claude TUI session \
+                 (pane gone, no live watcher); idle relay will no longer re-emit \
+                 per-poll drift/skip warnings for it"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 fn rehydrate_existing_claude_tui_bindings(shared: &Arc<SharedData>) {
+    // #3105 (codex P1 sub-case B): tombstone stale mirrors for dead/orphaned
+    // sessions BEFORE anything else, so the per-poll drift/skip WARN spam stops
+    // even when the session is not present in `list_session_names()` at all.
+    evict_dead_orphaned_claude_tui_mirrors(shared);
+
     let sessions = match crate::services::platform::tmux::list_session_names() {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -1550,6 +1617,23 @@ fn rehydrate_existing_claude_tui_bindings(shared: &Arc<SharedData>) {
             shared
                 .tmux_watchers
                 .clear_restored_owner_for_tmux_session(&tmux_session_name);
+            // #3105 (codex P1 sub-case B): a listed-but-dead pane with no live
+            // watcher is orphaned — also tombstone its stale dedupe mirror so the
+            // idle relay loop stops re-emitting the per-poll drift/skip WARN for
+            // it (the dead-pane branch previously only cleared the restored owner
+            // and left the mirror to spam). `clear_restored_owner_*` above already
+            // ran, so the dead-orphaned predicate cannot be masked by a stale
+            // restored owner here.
+            if claude_tui_session_is_dead_orphaned(shared, &tmux_session_name)
+                && crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(&tmux_session_name)
+            {
+                tracing::warn!(
+                    tmux_session_name = %tmux_session_name,
+                    provider = "claude",
+                    "evicted stale dedupe mirror for dead/orphaned Claude TUI session \
+                     (listed pane dead, no live watcher)"
+                );
+            }
             continue;
         }
         // #3105: self-heal the authoritative tmux-session→channel registry for a
@@ -3696,6 +3780,128 @@ mod tests {
             owner_channel_for_tmux_session(&shared, tmux),
             Some(owner),
             "after authoritative re-registration the live session must route again"
+        );
+
+        // Cleanup shared global dedupe state for cross-test isolation.
+        crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(tmux);
+    }
+
+    // #3105 (codex P1 sub-case B): a DEAD/orphaned tmux session (pane gone, not
+    // present on this host) whose dedupe mirror still holds a stale ClaudeTui
+    // runtime binding + channel mapping must NOT spam the per-poll drift/skip
+    // WARN forever. After the rehydrate pass evicts the mirror, the next idle
+    // relay iteration finds NO runtime binding to iterate and NO channel mapping
+    // to drift on — proving the 0.5s spam is stopped. A unique, never-created
+    // session name guarantees `tmux_session_has_live_pane` is false.
+    #[cfg(unix)]
+    #[test]
+    fn dead_orphaned_session_mirror_is_evicted_and_stops_drift_spam() {
+        let _guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let shared = super::super::make_shared_data_for_tests();
+        // A session that does not exist on this host (pane gone / orphaned).
+        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471-DEAD-ORPHAN-fix3105";
+        let owner = 1_504_468_805_772_902_471u64;
+
+        // Seed the stale dedupe mirror exactly as a dead/orphaned session leaves it:
+        // a ClaudeTui runtime binding (what the relay loop iterates) and a
+        // last-seen channel mapping (what the drift-alert resolver reads).
+        crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
+            tmux,
+            crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+                runtime_kind: RuntimeHandoffKind::ClaudeTui,
+                output_path: "/tmp/claude-transcript-dead-orphan.jsonl".to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: None,
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux, owner);
+
+        // Preconditions: the relay loop WOULD iterate this binding and drift.
+        assert!(
+            crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(
+                RuntimeHandoffKind::ClaudeTui
+            )
+            .iter()
+            .any(|(name, _)| name == tmux),
+            "precondition: dead session's binding is in the relay loop's iteration set"
+        );
+        assert_eq!(
+            owner_channel_for_tmux_session(&shared, tmux),
+            None,
+            "precondition: registry misses + mirror hit == the drift the relay loop hits"
+        );
+        // The session is genuinely dead/orphaned (no live pane, no live watcher).
+        assert!(
+            claude_tui_session_is_dead_orphaned(&shared, tmux),
+            "precondition: a never-created session is dead/orphaned"
+        );
+
+        // The rehydrate pass runs the eviction. (rehydrate_existing_claude_tui_bindings
+        // calls evict_dead_orphaned_claude_tui_mirrors first; we call it directly
+        // so the assertion does not depend on a live tmux binary for list-sessions.)
+        evict_dead_orphaned_claude_tui_mirrors(&shared);
+
+        // After eviction: the relay loop iterates an EMPTY set for this session,
+        // and the drift-alert resolver finds NO mapping → no drift/skip WARN.
+        assert!(
+            !crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(
+                RuntimeHandoffKind::ClaudeTui
+            )
+            .iter()
+            .any(|(name, _)| name == tmux),
+            "the stale runtime binding must be evicted so the relay loop no longer iterates it"
+        );
+        assert_eq!(
+            crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(tmux),
+            None,
+            "the stale channel mirror must be evicted so no drift WARN can fire"
+        );
+
+        // Idempotent on the next pass (the ~0.5s repeat): no binding, no work,
+        // no second incident — proving the spam is bounded to one line.
+        evict_dead_orphaned_claude_tui_mirrors(&shared);
+        assert!(
+            !crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(
+                RuntimeHandoffKind::ClaudeTui
+            )
+            .iter()
+            .any(|(name, _)| name == tmux),
+            "subsequent iterations stay clean (0.5s spam stopped)"
+        );
+    }
+
+    // #3105 (codex P1 sub-case A guard): a LIVE thread-suffixed session whose
+    // authoritative registry entry was evicted must NOT be treated as
+    // dead/orphaned — its mirror must survive so the live self-heal path can
+    // re-register the authoritative owner. We assert the dead-orphaned predicate
+    // is gated on pane-liveness: with a live watcher handle present the predicate
+    // is false even though the registry owner map is otherwise empty.
+    #[cfg(unix)]
+    #[test]
+    fn live_session_with_watcher_handle_is_not_dead_orphaned() {
+        let shared = super::super::make_shared_data_for_tests();
+        let tmux = "AgentDesk-claude-adk-cc-LIVE-fix3105";
+        let owner = ChannelId::new(1_504_468_805_772_902_471);
+
+        // A live watcher handle owns the session → it is NOT dead/orphaned even
+        // though the host has no real tmux pane for this synthetic name.
+        let dir = std::env::temp_dir();
+        let output_path = dir.join("claude-live-fix3105.jsonl");
+        shared
+            .tmux_watchers
+            .insert(owner, test_watcher_handle(tmux, &output_path));
+        assert!(
+            shared.tmux_watchers.has_live_watcher_handle(tmux),
+            "precondition: a live watcher handle owns the session"
+        );
+        assert!(
+            !claude_tui_session_is_dead_orphaned(&shared, tmux),
+            "a session with a live watcher handle must never be tombstoned as dead/orphaned"
         );
     }
 
