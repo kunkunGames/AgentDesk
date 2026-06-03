@@ -91,8 +91,8 @@
 - canonical_modules: `src/dispatch/{mod,dispatch_context,dispatch_create,dispatch_status}.rs`.
 - legacy_modules: none.
 - do_not_edit_without_migration_plan (giant-file, awaiting split issue):
-  - `src/dispatch/dispatch_context.rs` (5254 lines).
-  - `src/dispatch/dispatch_create.rs` (3635 lines).
+  - `src/dispatch/dispatch_context.rs` (3884 lines).
+  - `src/dispatch/dispatch_create.rs` (2092 lines).
   - `src/dispatch/dispatch_status.rs` (2125 lines).
   - `src/services/dispatches/outbox_route.rs` (1118 lines; route extraction
     orchestration surface from #1722, split before adding non-bugfix behavior).
@@ -342,7 +342,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
-- `src/services/onboarding/mod.rs` (4955),
+- `src/services/onboarding/mod.rs` (3699),
   `src/services/dispatched_sessions.rs` (3475), and
   `src/services/settings.rs` (1089) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`

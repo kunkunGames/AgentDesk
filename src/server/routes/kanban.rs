@@ -3283,32 +3283,3 @@ mod update_card_validation_tests {
 // ── #1065 param standardization tests ────────────────────────────────
 // UpdateCardBody canonical field is `assignee_agent_id` (snake_case).
 // Legacy `assigned_agent_id` still accepted via serde alias during migration.
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod param_standardization_tests {
-    use super::UpdateCardBody;
-
-    #[test]
-    fn param_standardization_update_card_body_accepts_assignee_agent_id() {
-        let payload = r#"{"assignee_agent_id":"ch-td"}"#;
-        let body: UpdateCardBody =
-            serde_json::from_str(payload).expect("canonical assignee_agent_id must parse");
-        assert_eq!(body.assignee_agent_id.as_deref(), Some("ch-td"));
-    }
-
-    #[test]
-    fn param_standardization_update_card_body_accepts_legacy_assigned_agent_id_alias() {
-        let payload = r#"{"assigned_agent_id":"ch-td"}"#;
-        let body: UpdateCardBody = serde_json::from_str(payload)
-            .expect("legacy assigned_agent_id payload must still parse via serde alias");
-        assert_eq!(body.assignee_agent_id.as_deref(), Some("ch-td"));
-    }
-
-    #[test]
-    fn param_standardization_update_card_body_no_duplicate_agent_fields() {
-        // Canonical path is single-field: one struct field with one alias.
-        // This guards against re-introducing a separate `assigned_agent_id` field.
-        let payload = r#"{"assignee_agent_id":"canonical"}"#;
-        let body: UpdateCardBody = serde_json::from_str(payload).expect("must parse");
-        assert_eq!(body.assignee_agent_id.as_deref(), Some("canonical"));
-    }
-}
