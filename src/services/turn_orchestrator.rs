@@ -2898,6 +2898,10 @@ mod actor_hydrate_regression_tests {
         assert!(other.exists());
     }
 
+    // SAFETY (await_holding_lock): the test-env Mutex is held across awaits to
+    // serialize tests that mutate the process-global `AGENTDESK_ROOT_DIR` env;
+    // releasing before the awaits would race concurrent tests. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn hydrate_from_disk_does_not_reinsert_after_actor_dequeue_removed_file() {
         let _lock = lock_test_env();
@@ -3501,6 +3505,10 @@ mod persistence_tests {
         }
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits to prevent concurrent env clobbering.
+    // Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn enqueue_rolls_back_when_pending_queue_persistence_fails() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3656,6 +3664,9 @@ mod persistence_tests {
         );
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn actor_hydrate_from_disk_preserves_voice_announcement_payload() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3700,6 +3711,9 @@ mod persistence_tests {
         );
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn restart_drain_persists_voice_announcement_payload() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3734,6 +3748,9 @@ mod persistence_tests {
         assert_eq!(saved[0].voice_announcement.as_ref(), Some(&announcement));
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn restart_drain_all_reports_pending_queue_persistence_errors() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3958,6 +3975,9 @@ mod finish_cancelled_turn_tests {
         }
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn finish_cancelled_turn_clears_cancelled_active_without_rehydrating_queue() {
         let _lock = match TEST_ENV_LOCK.lock() {
