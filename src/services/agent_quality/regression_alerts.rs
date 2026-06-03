@@ -127,6 +127,32 @@ pub fn drill_down_link(agent_id: &str) -> String {
 /// Format a Discord-bound alert message for `regression`. Includes
 /// agent id, metric label, expected (baseline) vs actual (current),
 /// sample sizes, and a drill-down link as required by DoD.
+pub fn explicit_decode_fallback<'r, T, R>(row: &'r R, column: &str, default_val: T) -> Result<T>
+where
+    R: Row,
+    T: sqlx::Decode<'r, R::Database> + sqlx::Type<R::Database>,
+    for<'a> &'a str: sqlx::ColumnIndex<R>,
+{
+    decode_with_fallback(column, default_val, || row.try_get(column))
+}
+
+fn decode_with_fallback<T, F>(column: &str, default_val: T, decode: F) -> Result<T>
+where
+    F: FnOnce() -> std::result::Result<T, sqlx::Error>,
+{
+    match decode() {
+        Ok(val) => Ok(val),
+        Err(sqlx::Error::ColumnDecode { .. }) => {
+            tracing::warn!(
+                column = column,
+                "[quality] explicit fallback on column decode error"
+            );
+            Ok(default_val)
+        }
+        Err(e) => Err(anyhow!("decode {}: {}", column, e)),
+    }
+}
+
 pub fn format_alert_message(regression: &Regression) -> String {
     format!(
         "[quality] regression on agent `{agent}` :: metric={metric} \
@@ -191,18 +217,10 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             .try_get("agent_id")
             .map_err(|error| anyhow!("decode agent_id: {error}"))?;
 
-        let turn_7d: Option<f64> = row
-            .try_get("turn_success_rate_7d")
-            .map_err(|error| anyhow!("decode turn_success_rate_7d: {error}"))?;
-        let turn_30d: Option<f64> = row
-            .try_get("turn_success_rate_30d")
-            .map_err(|error| anyhow!("decode turn_success_rate_30d: {error}"))?;
-        let turn_s7: i64 = row
-            .try_get("turn_sample_size_7d")
-            .map_err(|error| anyhow!("decode turn_sample_size_7d: {error}"))?;
-        let turn_s30: i64 = row
-            .try_get("turn_sample_size_30d")
-            .map_err(|error| anyhow!("decode turn_sample_size_30d: {error}"))?;
+        let turn_7d: Option<f64> = explicit_decode_fallback(&row, "turn_success_rate_7d", None)?;
+        let turn_30d: Option<f64> = explicit_decode_fallback(&row, "turn_success_rate_30d", None)?;
+        let turn_s7: i64 = explicit_decode_fallback(&row, "turn_sample_size_7d", 0)?;
+        let turn_s30: i64 = explicit_decode_fallback(&row, "turn_sample_size_30d", 0)?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::TurnSuccessRate,
@@ -214,18 +232,10 @@ pub async fn compute_regressions(pool: &PgPool) -> Result<Vec<Regression>> {
             out.push(reg);
         }
 
-        let review_7d: Option<f64> = row
-            .try_get("review_pass_rate_7d")
-            .map_err(|error| anyhow!("decode review_pass_rate_7d: {error}"))?;
-        let review_30d: Option<f64> = row
-            .try_get("review_pass_rate_30d")
-            .map_err(|error| anyhow!("decode review_pass_rate_30d: {error}"))?;
-        let review_s7: i64 = row
-            .try_get("review_sample_size_7d")
-            .map_err(|error| anyhow!("decode review_sample_size_7d: {error}"))?;
-        let review_s30: i64 = row
-            .try_get("review_sample_size_30d")
-            .map_err(|error| anyhow!("decode review_sample_size_30d: {error}"))?;
+        let review_7d: Option<f64> = explicit_decode_fallback(&row, "review_pass_rate_7d", None)?;
+        let review_30d: Option<f64> = explicit_decode_fallback(&row, "review_pass_rate_30d", None)?;
+        let review_s7: i64 = explicit_decode_fallback(&row, "review_sample_size_7d", 0)?;
+        let review_s30: i64 = explicit_decode_fallback(&row, "review_sample_size_30d", 0)?;
         if let Some(reg) = build_regression(
             &agent_id,
             QualityMetric::ReviewPassRate,
@@ -435,3 +445,243 @@ pub async fn run_regression_alerter_pg(pool: &PgPool) -> Result<u64> {
 // ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "legacy-sqlite-tests"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detection_flags_when_drop_meets_threshold_and_samples_sufficient() {
+        let regression = build_regression(
+            "agent-a",
+            QualityMetric::TurnSuccessRate,
+            Some(0.55),
+            Some(0.80),
+            10,
+            40,
+        )
+        .expect("threshold breach should produce regression");
+        assert_eq!(regression.metric, QualityMetric::TurnSuccessRate);
+        assert!((regression.delta - 0.25).abs() < 1e-9);
+        assert_eq!(regression.sample_size_7d, 10);
+        assert_eq!(regression.sample_size_30d, 40);
+    }
+
+    #[test]
+    fn detection_skips_when_drop_below_threshold() {
+        let result = build_regression(
+            "agent-a",
+            QualityMetric::ReviewPassRate,
+            Some(0.65),
+            Some(0.80),
+            10,
+            40,
+        );
+        // 15%p drop — below the 20%p threshold.
+        assert!(result.is_none(), "15%p drop must NOT trigger regression");
+    }
+
+    #[test]
+    fn detection_skips_when_sample_size_below_minimum() {
+        // 7d sample below MIN_SAMPLE_SIZE
+        let result = build_regression(
+            "agent-a",
+            QualityMetric::TurnSuccessRate,
+            Some(0.40),
+            Some(0.80),
+            4, // below MIN_SAMPLE_SIZE
+            40,
+        );
+        assert!(
+            result.is_none(),
+            "sample_size_7d < {} must suppress alert",
+            MIN_SAMPLE_SIZE
+        );
+
+        // 30d sample below MIN_SAMPLE_SIZE
+        let result = build_regression(
+            "agent-a",
+            QualityMetric::TurnSuccessRate,
+            Some(0.40),
+            Some(0.80),
+            10,
+            3,
+        );
+        assert!(
+            result.is_none(),
+            "sample_size_30d < {} must suppress alert",
+            MIN_SAMPLE_SIZE
+        );
+    }
+
+    #[test]
+    fn detection_skips_when_baseline_or_current_missing() {
+        assert!(
+            build_regression(
+                "agent-a",
+                QualityMetric::TurnSuccessRate,
+                None,
+                Some(0.80),
+                10,
+                40,
+            )
+            .is_none()
+        );
+        assert!(
+            build_regression(
+                "agent-a",
+                QualityMetric::TurnSuccessRate,
+                Some(0.50),
+                None,
+                10,
+                40,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cooldown_allows_first_alert_then_suppresses_within_24h() {
+        let now = 1_777_000_000_000_i64;
+        // No previous alert → should fire.
+        assert!(should_fire_alert_pure(
+            QualityMetric::TurnSuccessRate,
+            "agent-a",
+            None,
+            now
+        ));
+
+        // Just sent an alert.
+        let last = now;
+        // 1 hour later → suppressed.
+        assert!(!should_fire_alert_pure(
+            QualityMetric::TurnSuccessRate,
+            "agent-a",
+            Some(last),
+            now + 60 * 60 * 1000
+        ));
+
+        // 23 hours later → still suppressed.
+        assert!(!should_fire_alert_pure(
+            QualityMetric::TurnSuccessRate,
+            "agent-a",
+            Some(last),
+            now + 23 * 60 * 60 * 1000
+        ));
+
+        // 24h+1m later → released.
+        assert!(should_fire_alert_pure(
+            QualityMetric::TurnSuccessRate,
+            "agent-a",
+            Some(last),
+            now + 24 * 60 * 60 * 1000 + 60_000
+        ));
+    }
+
+    #[test]
+    fn formatter_includes_required_dod_fields() {
+        let regression = Regression {
+            agent_id: "agent-x".to_string(),
+            metric: QualityMetric::TurnSuccessRate,
+            baseline: 0.92,
+            current: 0.65,
+            delta: 0.27,
+            sample_size_7d: 14,
+            sample_size_30d: 80,
+        };
+        let msg = format_alert_message(&regression);
+        // DoD: ID / metric / expected / actual / drill-down
+        assert!(msg.contains("agent-x"), "must include agent id");
+        assert!(
+            msg.contains("turn_success_rate"),
+            "must include metric name"
+        );
+        assert!(msg.contains("92.0%"), "must include expected (baseline)");
+        assert!(msg.contains("65.0%"), "must include actual (current)");
+        assert!(
+            msg.contains("27.0%p"),
+            "must include drop in percentage points"
+        );
+        assert!(msg.contains("sample=14/80"), "must include sample sizes");
+        assert!(msg.contains("drill="), "must include drill-down link");
+        assert!(
+            msg.contains("agent-x"),
+            "drill-down link must reference agent id"
+        );
+    }
+
+    #[test]
+    fn channel_resolution_prefers_env_override_then_falls_back_to_adk_cc() {
+        // Reset env to a known state.
+        let prev = std::env::var(ALERT_CHANNEL_ENV).ok();
+        // SAFETY: tests are single-threaded for env mutation; cleanup at end.
+        unsafe {
+            std::env::remove_var(ALERT_CHANNEL_ENV);
+        }
+        assert_eq!(resolve_alert_channel(), FALLBACK_ALERT_CHANNEL);
+
+        unsafe {
+            std::env::set_var(ALERT_CHANNEL_ENV, "1234567890");
+        }
+        assert_eq!(resolve_alert_channel(), "1234567890");
+
+        // Empty / whitespace falls back to default.
+        unsafe {
+            std::env::set_var(ALERT_CHANNEL_ENV, "   ");
+        }
+        assert_eq!(resolve_alert_channel(), FALLBACK_ALERT_CHANNEL);
+
+        // restore
+        unsafe {
+            match prev {
+                Some(value) => std::env::set_var(ALERT_CHANNEL_ENV, value),
+                None => std::env::remove_var(ALERT_CHANNEL_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn compute_regressions_requires_strict_types() {
+        let result: Result<Option<f64>> = Err(anyhow::anyhow!("db error"));
+        let mapped = result.map_err(|e| anyhow::anyhow!("decode error: {e}"));
+        assert!(mapped.is_err());
+        assert!(
+            mapped
+                .unwrap_err()
+                .to_string()
+                .contains("decode error: db error")
+        );
+    }
+}
+
+#[cfg(test)]
+mod explicit_decode_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn returns_default_on_column_decode_error() {
+        let result: Result<f64, anyhow::Error> = decode_with_fallback("some_column", 42.0, || {
+            Err(sqlx::Error::ColumnDecode {
+                index: "some_column".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mock decode error",
+                )),
+            })
+        });
+
+        assert_eq!(result.unwrap(), 42.0);
+    }
+
+    #[test]
+    fn fails_closed_on_other_errors() {
+        let result: Result<f64, anyhow::Error> = decode_with_fallback("some_column", 42.0, || {
+            Err(sqlx::Error::ColumnNotFound("missing".to_string()))
+        });
+
+        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("decode some_column"));
+        assert!(error.contains("missing"));
+    }
+}

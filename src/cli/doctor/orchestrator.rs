@@ -1677,12 +1677,8 @@ fn check_voice_cli_present(
         .with_severity(Severity::Error);
     }
     let resolved = if trimmed.contains('/') || trimmed.starts_with('~') {
-        let expanded = if trimmed.starts_with("~/") || trimmed == "~" {
-            crate::runtime_layout::expand_user_path(trimmed)
-                .unwrap_or_else(|| std::path::PathBuf::from(trimmed))
-        } else {
-            std::path::PathBuf::from(trimmed)
-        };
+        let expanded = crate::runtime_layout::expand_user_path(trimmed)
+            .unwrap_or_else(|| std::path::PathBuf::from(trimmed));
         if expanded.is_file() {
             Some(expanded)
         } else {
@@ -3041,7 +3037,7 @@ fn check_degraded_reasons(snapshot: &HealthSnapshot) -> Check {
                 .error
                 .clone()
                 .unwrap_or_else(|| "health endpoint unavailable".to_string()),
-            "health endpoint에 접근할 수 없어 degraded reason을 분류하지 못했습니다.",
+            "could not classify degraded reasons because the health endpoint is unavailable.",
         )
         .with_subsystem("health")
         .with_security_exposure(SecurityExposure::OperationalMetadata)
@@ -3086,14 +3082,14 @@ fn check_degraded_reasons(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Health Reasons",
             detail.clone(),
-            "health degraded reason을 subsystem별로 확인하세요.",
+            "check health degraded reasons by subsystem.",
         ),
         CheckStatus::Fail => Check::fail(
             "health_degraded_reasons",
             CheckGroup::Core,
             "Health Reasons",
             detail.clone(),
-            "error/critical degraded reason을 먼저 해결하세요.",
+            "resolve error/critical degraded reasons first.",
         ),
     };
     check = check
