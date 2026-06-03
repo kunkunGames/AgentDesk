@@ -935,6 +935,47 @@ mod status_panel_v2_formatter_tests {
     }
 
     #[test]
+    fn finalize_stale_streaming_footer_strips_completed_body() {
+        // #3104: a turn that streamed then returned idle leaves the last edit
+        // text ending in `⠏ 계속 처리 중`; finalize must strip it.
+        let last_edit = "E2E answer\n- did the work\n\n⠏ 계속 처리 중";
+        let finalized = super::finalize_stale_streaming_footer(last_edit, &ProviderKind::Claude);
+        assert_eq!(finalized.as_deref(), Some("E2E answer\n- did the work"));
+    }
+
+    #[test]
+    fn finalize_stale_streaming_footer_leaves_streaming_body_untouched() {
+        // A genuinely-still-streaming body (no trailing footer) is left as-is so
+        // the reconciliation pass never clears a live footer prematurely.
+        let still_streaming = "Partial answer so far";
+        assert_eq!(
+            super::finalize_stale_streaming_footer(still_streaming, &ProviderKind::Claude),
+            None
+        );
+    }
+
+    #[test]
+    fn finalize_stale_streaming_footer_skips_footer_only_body() {
+        // Footer-only placeholder (no real content) must NOT be edited to blank;
+        // the caller's delete/replace path owns that case.
+        let footer_only = "⠏ 계속 처리 중";
+        assert_eq!(
+            super::finalize_stale_streaming_footer(footer_only, &ProviderKind::Claude),
+            None
+        );
+    }
+
+    #[test]
+    fn text_ends_with_streaming_footer_detects_korean_footer() {
+        assert!(super::text_ends_with_streaming_footer(
+            "Answer\n\n⠏ 계속 처리 중"
+        ));
+        assert!(!super::text_ends_with_streaming_footer(
+            "Answer\n\nmore text"
+        ));
+    }
+
+    #[test]
     fn format_for_discord_removes_leading_tui_no_response_chrome() {
         let input = "No response requested.\n\nFinal answer";
         let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
@@ -1031,6 +1072,43 @@ fn strip_trailing_streaming_status_footer(lines: &mut Vec<&str>) {
         }
         lines.truncate(last_nonblank);
     }
+}
+
+/// True when `text`'s last non-blank line is a transient streaming footer
+/// (e.g. `⠏ 계속 처리 중`). Used by the terminal/idle reconciliation pass to
+/// detect a message that still advertises "still processing" after the turn
+/// has actually finished, without re-running the full formatter.
+pub(super) fn text_ends_with_streaming_footer(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| is_streaming_placeholder_status_line(line.trim()))
+}
+
+/// #3104: terminal/idle reconciliation. Given the last text the bridge/watcher
+/// edited onto the visible response message, return the footer-stripped final
+/// body that should replace it — but ONLY when the message still ends with a
+/// transient `계속 처리 중` (still processing) streaming footer.
+///
+/// Returns `None` when the message does not end with a streaming footer (so a
+/// genuinely-still-streaming or already-finalized body is left untouched), or
+/// when stripping the footer would leave no visible content (the caller should
+/// then delete/replace via its own empty-body path rather than edit to blank).
+pub(super) fn finalize_stale_streaming_footer(
+    last_edit_text: &str,
+    provider: &crate::services::provider::ProviderKind,
+) -> Option<String> {
+    if !text_ends_with_streaming_footer(last_edit_text) {
+        return None;
+    }
+    let cleaned = format_for_discord_with_provider(last_edit_text, provider);
+    if cleaned.trim().is_empty() {
+        return None;
+    }
+    if cleaned == last_edit_text {
+        return None;
+    }
+    Some(cleaned)
 }
 
 pub(super) fn is_streaming_placeholder_status_line(line: &str) -> bool {

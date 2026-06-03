@@ -120,7 +120,7 @@
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7369 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (7419 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -135,6 +135,8 @@
     +124 from #3077 codex P1 honoring the `bind_status_panel` return at the
     TUI-direct publish site (delete the just-sent panel + disown the handle when
     the bind did not record it, instead of leaking a duplicate);
+    +50 from #3104 terminal/idle reconciliation pass that strips a lingering
+    `계속 처리 중` streaming footer off the committed-but-unrelayed placeholder;
     split loop helpers further before adding behavior).
   - `src/services/discord/tui_prompt_relay.rs` (3849 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
@@ -216,14 +218,16 @@
     split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1849 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1242 lines).
-  - `src/services/discord/formatting.rs` (2765 lines; +46 from #3082
+  - `src/services/discord/formatting.rs` (2802 lines; +46 from #3082
     answer-flush-barrier guards (+11 around the plain multi-chunk send loops;
     +24 from the #3082 codex follow-up that also guards the edit/replace path
     `replace_long_message_raw_with_outcome` and bumps `note_progress` after each
     delivered chunk for the progress-aware flush wait; +11 from the codex P1-2
     residual that bumps `note_progress` after the FIRST edited chunk too, on the
     multi-chunk path only, so the queued-card waiter's inactivity grace cannot
-    expire between the first edit and the first continuation)).
+    expire between the first edit and the first continuation); +37 from #3104
+    `finalize_stale_streaming_footer` / `text_ends_with_streaming_footer` shared
+    terminal-idle reconciliation helpers + their unit tests).
   - `src/services/discord/prompt_builder/` (directory, refactored).
   - `src/services/discord/runtime_bootstrap.rs` (2568 lines after #2558
     thread-session GC loopback shim cleanup; +3 from #3082 answer-flush-barrier
