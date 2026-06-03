@@ -45,21 +45,35 @@ pub(super) struct SessionPanelSnapshot {
     provider_session_id: Option<String>,
     tmux: Option<TmuxPanelState>,
     recovery_message_count: Option<usize>,
-    /// Per-session instance marker: the turn id (`discord:<channel>:<user_msg_id>`)
-    /// whose lifecycle row produced this snapshot. Two DIFFERENT fresh sessions
-    /// arrive on DIFFERENT turns (a new `user_msg_id`), so their turn ids differ;
-    /// every status tick of the SAME fresh session re-loads the SAME turn's
-    /// lifecycle row, so the turn id is stable across ticks. This lets a
-    /// fresh-session boundary be detected even when `provider_session_id` is
-    /// `None` (the common `/clear`, idle-timeout, turn-cap, goal-fresh,
-    /// no-cached-provider-session paths) WITHOUT re-resetting on every tick of an
-    /// ongoing fresh session (#3087).
-    turn_id: Option<String>,
+    /// Stable session-INSTANCE marker for this snapshot, derived from the tmux
+    /// runtime's `.generation` spawn marker: `"{tmux_session_name}#{mtime_ns}"`.
+    ///
+    /// `.generation` is written exactly once per spawn by `claude.rs` right
+    /// after `tmux::create_session` and is never touched by the live wrapper
+    /// (the adoption path even preserves its mtime on purpose — see
+    /// `tmux_session_files::preserve_mtime_after_write`). Its mtime therefore
+    /// uniquely identifies one wrapper INSTANCE and is invariant across:
+    ///   * every status tick and every TURN of the same session (the marker is
+    ///     not rewritten per turn), and
+    ///   * the `None`→`Some` provider-session-id assignment that lands mid-turn
+    ///     on `StreamMessage::Init` (the provider id is orthogonal to the
+    ///     spawn marker).
+    /// A genuinely new session is a new tmux spawn (`/clear`, idle-timeout,
+    /// turn-cap, cancel→respawn, …), which rewrites `.generation` with a fresh
+    /// mtime — so the instance key changes exactly once, on the real boundary.
+    ///
+    /// Keying the reset on THIS (instead of the per-turn `turn_id`) is what
+    /// fixes #3087's two false-reset P1s: a no-provider-id session running many
+    /// turns keeps one instance key (no per-turn reset), and the `None`→`Some`
+    /// provider-id assignment does not change it (no mid-session reset).
+    /// `None` when the tmux session/marker is unavailable (e.g. headless /
+    /// pre-spawn); the reset then falls back to the provider-session delta.
+    session_instance_key: Option<String>,
 }
 
 impl SessionPanelSnapshot {
     pub(super) fn from_lifecycle_event(
-        turn_id: Option<&str>,
+        session_instance_key: Option<&str>,
         kind: &str,
         details: &Value,
     ) -> Option<Self> {
@@ -84,7 +98,7 @@ impl SessionPanelSnapshot {
         .map(str::to_string);
         let tmux = parse_tmux_panel_state(details);
         let recovery_message_count = parse_recovery_message_count(details);
-        let turn_id = turn_id
+        let session_instance_key = session_instance_key
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
@@ -94,7 +108,7 @@ impl SessionPanelSnapshot {
             provider_session_id,
             tmux,
             recovery_message_count,
-            turn_id,
+            session_instance_key,
         })
     }
 
@@ -109,19 +123,15 @@ impl SessionPanelSnapshot {
             .filter(|value| !value.is_empty())
     }
 
-    /// Whether this snapshot describes a freshly-started session
-    /// (`🆕 새 세션 시작`). A genuinely fresh session legitimately carries
-    /// `provider_session_id == None`, so the fresh-boundary reset must key off
-    /// the per-instance `turn_id` rather than the (absent) provider id.
-    pub(super) const fn is_fresh(&self) -> bool {
-        matches!(self.kind, SessionPanelKind::Fresh)
-    }
-
-    /// The per-session instance marker (turn id) used to distinguish two
-    /// DIFFERENT fresh sessions that both lack a provider session id. Normalized
-    /// to `None` when absent or blank.
-    pub(super) fn turn_id(&self) -> Option<&str> {
-        self.turn_id
+    /// The stable session-INSTANCE marker (`"{tmux_session_name}#{mtime_ns}"`,
+    /// derived from the `.generation` spawn marker) used to detect a genuine
+    /// new-session boundary even when `provider_session_id` is `None`, WITHOUT
+    /// re-resetting on every status tick / turn of an ongoing session or on the
+    /// `None`→`Some` provider-id assignment (#3087). Normalized to `None` when
+    /// absent or blank (no live tmux marker — the reset then relies on the
+    /// provider-session delta alone).
+    pub(super) fn session_instance_key(&self) -> Option<&str> {
+        self.session_instance_key
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())

@@ -1632,10 +1632,15 @@ async fn refresh_session_panel_line_from_lifecycle(
     shared: &SharedData,
     channel_id: ChannelId,
     turn_id: &str,
+    tmux_session_name: Option<&str>,
 ) -> bool {
     let Some(pg_pool) = shared.pg_pool.as_ref() else {
         return false;
     };
+    let session_instance_key = tmux_session_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .and_then(super::tmux::session_panel_instance_key);
     let channel_id_text = channel_id.get().to_string();
     match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
         pg_pool,
@@ -1648,7 +1653,7 @@ async fn refresh_session_panel_line_from_lifecycle(
             .placeholder_live_events
             .set_session_panel_lifecycle_event(
                 channel_id,
-                turn_id,
+                session_instance_key.as_deref(),
                 &event.kind,
                 &event.details_json,
             ),
@@ -6097,6 +6102,7 @@ pub(super) fn spawn_turn_bridge(
                     shared_owned.as_ref(),
                     channel_id,
                     turn_id.as_str(),
+                    inflight_state.tmux_session_name.as_deref(),
                 )
                 .await;
             }

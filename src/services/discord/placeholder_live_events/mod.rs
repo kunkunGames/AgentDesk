@@ -152,11 +152,12 @@ impl PlaceholderLiveEvents {
     pub(in crate::services::discord) fn set_session_panel_lifecycle_event(
         &self,
         channel_id: ChannelId,
-        turn_id: &str,
+        session_instance_key: Option<&str>,
         kind: &str,
         details: &Value,
     ) -> bool {
-        let snapshot = SessionPanelSnapshot::from_lifecycle_event(Some(turn_id), kind, details);
+        let snapshot =
+            SessionPanelSnapshot::from_lifecycle_event(session_instance_key, kind, details);
         self.set_session_panel_snapshot(channel_id, snapshot)
     }
 
@@ -182,55 +183,63 @@ impl PlaceholderLiveEvents {
 
         // #3087: detect a TRUE session boundary and reset the accumulated
         // subagents/tasks/todos/workflows exactly once, on the transition INTO a
-        // new session instance.
+        // new session INSTANCE.
         //
-        // There are two kinds of boundary:
-        //   (a) provider-session delta — the new snapshot carries a non-empty
-        //       provider_session_id that differs from the stored one (resume /
-        //       reconnect to a different provider session).
-        //   (b) fresh-session boundary — a genuinely fresh session legitimately
-        //       arrives with provider_session_id == None (the common /clear,
-        //       idle-timeout, turn-cap, goal-fresh, no_cached_provider_session
-        //       paths all normalize to None). For these we cannot key off the
-        //       provider id, so we key off the per-instance `turn_id`: a NEW
-        //       fresh session arrives on a NEW turn, while every status tick of
-        //       the SAME fresh session re-loads the SAME turn's lifecycle row.
+        // The boundary is keyed on the snapshot's `session_instance_key` — a
+        // STABLE per-INSTANCE marker derived from the tmux `.generation` spawn
+        // file (`"{tmux_session_name}#{mtime_ns}"`). That marker is written once
+        // per spawn and never rewritten by the live wrapper, so it is invariant
+        // across every status tick and every TURN of one session, and invariant
+        // across the `None`→`Some` provider-session-id assignment that lands
+        // mid-turn on `StreamMessage::Init`. A genuinely new session is a new
+        // tmux spawn (`/clear`, idle-timeout, turn-cap, cancel→respawn, …) which
+        // rewrites `.generation` with a fresh mtime, so the instance key changes
+        // exactly once on the real boundary.
         //
-        // The `turn_id` marker is what prevents the every-tick / mid-session
-        // false-reset: because the Fresh kind PERSISTS across ticks of one fresh
-        // session, a naive "reset whenever kind == Fresh" would wipe live
-        // subagents/tasks on every tick. Gating on a CHANGE of the fresh turn id
-        // resets only on the first tick of each new fresh session and preserves
-        // mid-session accumulation thereafter.
+        // This replaces the earlier per-turn `turn_id` keying, which reset on
+        // EVERY turn of a no-provider-id session (each turn carries a new
+        // turn_id) and was therefore BLOCKED. Resetting on a CHANGE of the
+        // stable instance key fixes both false-reset P1s:
+        //   * multi-turn same session (turn_id changes each turn, instance key
+        //     unchanged) — NO reset, and
+        //   * `None`→`Some` provider-id within one session (instance key
+        //     unchanged) — NO reset.
         //
-        // Unrelated field churn (tmux/recovery_count) within the same session —
-        // same provider id, or same fresh turn id — must NOT reset, and a
-        // missing→missing id with an unchanged fresh turn id must not trigger a
-        // spurious reset.
+        // The provider-session delta is retained as a secondary trigger so a
+        // `Some(a)`→`Some(b)` change to a genuinely different provider session
+        // still resets even on the rare path where the instance key is
+        // unavailable (`None`, e.g. headless / no live tmux marker). Unrelated
+        // field churn (tmux/recovery_count) within the same instance must NOT
+        // reset.
+        let old_instance_key = guard
+            .session
+            .as_ref()
+            .and_then(|session| session.session_instance_key())
+            .map(str::to_owned);
         let old_provider_session_id = guard
             .session
             .as_ref()
             .and_then(|session| session.provider_session_id())
             .map(str::to_owned);
-        let old_fresh_turn_id = guard
-            .session
-            .as_ref()
-            .filter(|session| session.is_fresh())
-            .and_then(|session| session.turn_id())
-            .map(str::to_owned);
 
-        let provider_session_boundary = snapshot
+        let instance_boundary = snapshot
             .as_ref()
-            .and_then(|session| session.provider_session_id())
-            .is_some_and(|new_id| old_provider_session_id.as_deref() != Some(new_id));
+            .and_then(|session| session.session_instance_key())
+            .is_some_and(|new_key| old_instance_key.as_deref() != Some(new_key));
 
-        let fresh_boundary = snapshot
-            .as_ref()
-            .filter(|session| session.is_fresh() && session.provider_session_id().is_none())
-            .and_then(|session| session.turn_id())
-            .is_some_and(|new_turn_id| old_fresh_turn_id.as_deref() != Some(new_turn_id));
+        // Secondary trigger: a `Some(a)`→`Some(b)` change to a DIFFERENT
+        // provider session, used only when the instance key cannot decide (e.g.
+        // headless / no live tmux marker on either side). This is deliberately
+        // gated on the OLD id being `Some` too, so a `None`→`Some` assignment
+        // within one instance (the mid-turn `StreamMessage::Init`) never resets
+        // (#3087 P1-B).
+        let provider_session_boundary = old_provider_session_id.is_some()
+            && snapshot
+                .as_ref()
+                .and_then(|session| session.provider_session_id())
+                .is_some_and(|new_id| old_provider_session_id.as_deref() != Some(new_id));
 
-        if provider_session_boundary || fresh_boundary {
+        if instance_boundary || provider_session_boundary {
             guard.reset_session_content();
         }
 

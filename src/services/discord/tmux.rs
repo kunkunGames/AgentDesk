@@ -61,6 +61,7 @@ mod watcher_lifecycle;
 
 use self::tmux_reattach_offsets::matching_recent_watcher_reattach_offset;
 pub(super) use self::tmux_session_files::read_generation_file_mtime_ns;
+pub(super) use self::tmux_session_files::session_panel_instance_key;
 #[cfg(all(test, feature = "legacy-sqlite-tests"))]
 use self::tmux_session_files::watermark_after_output_regression;
 use self::tmux_session_files::{

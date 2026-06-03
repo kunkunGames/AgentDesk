@@ -32,6 +32,29 @@ pub(in crate::services::discord) fn read_generation_file_mtime_ns(tmux_session_n
         .unwrap_or(0)
 }
 
+/// Build the stable session-INSTANCE key the status panel uses to detect a
+/// genuine new-session boundary (#3087): `"{tmux_session_name}#{mtime_ns}"`,
+/// where `mtime_ns` is the `.generation` spawn marker's mtime. The marker is
+/// written once per spawn and never touched by the live wrapper (adoption even
+/// preserves its mtime), so this key is invariant across every status tick and
+/// every TURN of one session, and across the `None`→`Some` provider-session-id
+/// assignment — yet it changes on a real respawn (`/clear`, idle-timeout,
+/// cancel→respawn, …).
+///
+/// Returns `None` when `tmux_session_name` is blank or no `.generation` marker
+/// exists yet (e.g. headless / pre-spawn). A `0` mtime (marker missing) is
+/// still folded into the key so a session with no marker collapses to one
+/// stable instance rather than thrashing every tick.
+pub(in crate::services::discord) fn session_panel_instance_key(
+    tmux_session_name: &str,
+) -> Option<String> {
+    let name = tmux_session_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("{name}#{}", read_generation_file_mtime_ns(name)))
+}
+
 /// Rewrite a file's contents while preserving its prior modified time. Used
 /// by the adoption path to refresh the `.generation` marker payload (so the
 /// generation number on disk matches the current dcserver runtime) without
