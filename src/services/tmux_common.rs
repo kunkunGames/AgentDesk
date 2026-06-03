@@ -68,7 +68,16 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
     });
     let idle_footer = lines.iter().any(|line| {
         let line = trim_prompt_line(line);
-        line.contains("Tools: 0 done") || line.contains("bypass permissions")
+        // `Tools: 0 done` means a turn has just started (no tools run yet) — a
+        // running, not idle, signal — so it must NOT count as idle chrome (it
+        // previously let a freshly-submitted running prompt read as ready, #3051).
+        // A completed-work footer (`Tools: N>0 done`) or the permission-mode
+        // banner are the genuine idle markers; mirrors the `!Tools: 0 done` guard
+        // in `..._show_completed_history`.
+        line.contains("bypass permissions")
+            || (line.contains("Tools:")
+                && line.contains(" done")
+                && !line.contains("Tools: 0 done"))
     });
     separator && idle_footer
 }
@@ -109,6 +118,173 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
             let after_prompt = &recent_forward[index + 1..];
             tmux_lines_after_claude_prompt_show_completed_history(after_prompt)
                 || tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(after_prompt)
+        })
+}
+
+/// #3107: inflight-INDEPENDENT "the pane is in an active TUI turn" signal.
+///
+/// A multi-step agentic Claude TUI turn can lose its dcserver inflight mid-turn
+/// (a momentary idle observation between tool calls trips the completion gate,
+/// commits, and clears inflight) while the pane keeps producing assistant
+/// output. Once inflight is gone every later batch is treated as ownerless and
+/// suppressed (`should_skip_streaming_placeholder_without_inflight` /
+/// `should_suppress_post_terminal_output_without_inflight`), so the live turn
+/// goes dark even though the watcher is still alive.
+///
+/// This predicate gives the suppression/reclaim paths a way to tell a genuinely
+/// finished turn (returned to ready-for-input, or showing idle-suggestion
+/// chrome — the real post-finish ghost noise we DO want to suppress) apart from
+/// a live turn that merely lost its inflight.
+///
+/// #3107 codex re-review (P2#1): the original definition was
+/// `!ready_for_input && !idle_suggestion`, i.e. it treated the *absence* of
+/// idle markers as "streaming". That false-positived on every pane that is
+/// neither idle-marked nor busy: a scrolled pane, an error screen, a
+/// non-Claude-TUI pane, or a generic prompt-waiting pane all read as
+/// "streaming" → spurious un-suppress + re-acquire + reclaim-block. We now
+/// require a POSITIVE Claude-TUI busy signal, not merely the absence of idle
+/// chrome. `true` means: the pane IS a Claude TUI showing an active/busy
+/// indicator AND is not ready-for-input ⇒ a live turn that lost its inflight.
+/// Anything ambiguous (blank / error / scrolled / non-Claude / generic prompt)
+/// biases to `false` (keep suppressing) — the safe direction.
+pub(crate) fn tmux_capture_indicates_claude_tui_actively_streaming(capture: &str) -> bool {
+    if capture.trim().is_empty() {
+        return false;
+    }
+    if tmux_capture_indicates_claude_tui_ready_for_input(capture) {
+        return false;
+    }
+    if tmux_capture_indicates_claude_tui_idle_suggestion(capture) {
+        return false;
+    }
+    // Positive busy signal required (bias to FALSE/suppress when ambiguous).
+    tmux_capture_indicates_claude_tui_busy(capture)
+}
+
+/// #3107 codex re-review (P2#1, F2): a POSITIVE "Claude TUI is mid-response
+/// right now" signal that requires Claude-TUI-SPECIFIC CHROME, not generic
+/// words. The previous implementation accepted any recent line containing the
+/// bare substrings `processing` / `thinking` / `running`. Those words routinely
+/// appear in ASSISTANT BODY TEXT (e.g. the model writing "the test is
+/// running…") and in non-Claude program output, so a finished or even
+/// non-Claude pane could read as "actively streaming" → wrongly un-suppress /
+/// re-acquire / block reclaim.
+///
+/// The reliable in-progress markers the Claude TUI actually RENDERS are:
+///   1. the `esc to interrupt` footer — the strongest, unambiguous signal; it
+///      only renders while a turn is in flight; and
+///   2. the spinner progress line — a leading spinner glyph (`· ✢ ✻ ✽ ✶ ✳ ✦`)
+///      immediately followed by a work verb (`Actioning…`, `Musing…`,
+///      `Thinking…`, `Processing…`, `Running…`, …). This is the footer the TUI
+///      draws while streaming, NOT free-text in the response body.
+/// Plus the explicit `⏺ Running command / Searching for / Reading / Editing …`
+/// active-work markers via `tmux_recent_lines_show_claude_tui_active_work`.
+///
+/// Bare `processing`/`thinking`/`running` NOT anchored to the spinner glyph or
+/// the `esc to interrupt` footer are DROPPED. Anything that is not a
+/// recognizable Claude-TUI in-progress frame biases to FALSE.
+pub(crate) fn tmux_capture_indicates_claude_tui_busy(capture: &str) -> bool {
+    let non_empty = capture
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>();
+    if non_empty.is_empty() {
+        return false;
+    }
+    let start = non_empty.len().saturating_sub(CLAUDE_TUI_ACTIVE_SCAN_LINES);
+    let recent = &non_empty[start..];
+    recent.iter().any(|line| {
+        let trimmed = trim_prompt_line(line);
+        // (1) the `esc to interrupt` footer — strongest in-flight marker.
+        if trimmed.to_ascii_lowercase().contains("esc to interrupt") {
+            return true;
+        }
+        // (2) the spinner progress line: a leading spinner glyph adjacent to a
+        // work verb, as the Claude TUI renders the streaming footer. The
+        // verb-word match is ANCHORED to the spinner glyph so the same word in
+        // assistant body text does NOT trip it.
+        tmux_line_is_claude_tui_spinner_progress(trimmed)
+    }) || tmux_recent_lines_show_claude_tui_active_work(recent)
+}
+
+/// `true` when `line` is a Claude TUI spinner progress footer: a leading spinner
+/// glyph (the rotating set the TUI cycles through) directly followed by a work
+/// verb. Anchoring the verb to the spinner glyph is what distinguishes the TUI
+/// chrome from the same verb appearing in assistant body text.
+fn tmux_line_is_claude_tui_spinner_progress(line: &str) -> bool {
+    const SPINNER_GLYPHS: [char; 8] = ['·', '✢', '✳', '✶', '✻', '✽', '✦', '∗'];
+    let line = line.trim_start();
+    let mut chars = line.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !SPINNER_GLYPHS.contains(&first) {
+        return false;
+    }
+    // The remainder after the glyph (and its following space) must lead with a
+    // work verb the TUI uses for the streaming footer. Completed-work summaries
+    // (`✻ Churned for 4m 56s`, `✻ Worked for 2s`) use a past-tense "<verb> for
+    // <duration>" shape and must NOT count as in-progress.
+    let rest = chars.as_str().trim_start();
+    let lower = rest.to_ascii_lowercase();
+    if lower.contains(" for ") && !lower.contains("esc to interrupt") {
+        return false;
+    }
+    const WORK_VERBS: [&str; 7] = [
+        "actioning",
+        "musing",
+        "thinking",
+        "processing",
+        "running",
+        "crunching",
+        "churning",
+    ];
+    if !WORK_VERBS.iter().any(|verb| lower.starts_with(verb)) {
+        return false;
+    }
+    // #3107 codex re-review (F2): the leading glyph + work verb alone is NOT
+    // enough — a plain assistant sentence that happens to begin with a spinner
+    // glyph and a verb (e.g. `· Thinking through the problem and running the
+    // tests`) would otherwise read as the streaming footer. The REAL Claude TUI
+    // spinner line ALWAYS carries a status SUFFIX — it renders like
+    // `✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)`. Require at least
+    // one of those status markers so assistant prose can't trip it:
+    //   - the literal `esc to interrupt`, OR
+    //   - a parenthesized TUI status group containing a duration (`<N>s` /
+    //     `<N>m`), a `tokens` count, and/or the `·` separator the TUI uses.
+    if lower.contains("esc to interrupt") {
+        return true;
+    }
+    line_has_claude_tui_spinner_status_group(line)
+}
+
+/// `true` when `line` contains the parenthesized status group the Claude TUI
+/// spinner footer renders next to the work verb, e.g.
+/// `(12s · ↑ 1.2k tokens · esc to interrupt)`. The group must carry at least one
+/// of: a duration token (`<N>s` / `<N>m`), a `tokens` count, or the interior `·`
+/// separator the TUI draws between status fields. A bare parenthetical in
+/// assistant prose (no such marker) does NOT qualify.
+fn line_has_claude_tui_spinner_status_group(line: &str) -> bool {
+    let Some(open) = line.find('(') else {
+        return false;
+    };
+    let after_open = &line[open + 1..];
+    let Some(close_rel) = after_open.find(')') else {
+        return false;
+    };
+    let group = &after_open[..close_rel];
+    let lower = group.to_ascii_lowercase();
+    if lower.contains("esc to interrupt") || lower.contains("tokens") || group.contains('·') {
+        return true;
+    }
+    // A standalone duration token such as `12s` / `4m` inside the group.
+    group
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| {
+            let bytes = tok.as_bytes();
+            bytes.len() >= 2
+                && matches!(bytes[bytes.len() - 1], b's' | b'm')
+                && bytes[..bytes.len() - 1].iter().all(|b| b.is_ascii_digit())
         })
 }
 
@@ -153,6 +329,14 @@ fn tmux_recent_lines_show_claude_tui_active_work(lines: &[&str]) -> bool {
             || line.contains("Musing")
             || lower.contains("esc to interrupt")
             || lower.contains("current work")
+            // NOTE: neither the footer context-usage bar (`🤖 Model │ ██░░ │ NN%`)
+            // nor the completed-thinking summary line (`✻ Churned for 4m 56s`) is a
+            // running signal — both render in IDLE/ready states too. #3051 keyed
+            // active-work on the `██` run, which flipped a ready prompt with >20%
+            // context usage to not-ready; the running vs. idle distinction is
+            // instead carried by the footer (`Tools: 0 done` = freshly-started, no
+            // tools yet) handled in `..._show_idle_suggestion_chrome`, plus the
+            // explicit `esc to interrupt`/spinner-verb keywords above.
             || (line.starts_with('⏺')
                 && ((line.contains("Running ") && line.contains("command"))
                     || line.contains("Searching for ")
@@ -213,6 +397,56 @@ pub(crate) fn tmux_capture_indicates_generic_ready_banner(capture: &str) -> bool
         .filter(|l| !l.trim().is_empty())
         .take(CLAUDE_TUI_READY_SCAN_LINES)
         .any(|l| l.contains(CLAUDE_TUI_READY_BANNER))
+}
+
+/// Detect whether the interactive Claude TUI `/effort` slider overlay is still
+/// open in the captured pane.
+///
+/// Claude Code 2.1.x renders `/effort` as a *horizontal slider*, not a
+/// box-drawing radio list: the open overlay carries BOTH an `Effort` heading
+/// and a `←/→ to adjust` (left/right arrow) instructional footer. When the
+/// overlay is dismissed (Enter confirms the selection) both disappear and the
+/// pane returns to the normal composer chrome.
+///
+/// We require BOTH signals to co-occur in the recent capture so that stale
+/// scrollback — e.g. a prior conversation or code snippet that merely mentions
+/// `←/→ to adjust` or the word "effort" — cannot be mistaken for a live
+/// overlay. Requiring the pair is the load-bearing guard against false
+/// "selector still open" failures.
+///
+/// This is the post-submit validation for `/effort` passthrough: if this
+/// returns true after we drive the slider, the selection did NOT confirm and
+/// the pane is stranded on the overlay.
+pub(crate) fn tmux_capture_indicates_claude_tui_selector_open(capture: &str) -> bool {
+    let non_empty = capture
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>();
+    let start = non_empty.len().saturating_sub(CLAUDE_TUI_DRAFT_SCAN_LINES);
+    let recent = &non_empty[start..];
+
+    let has_footer = recent.iter().any(|line| line_is_slider_adjust_footer(line));
+    let has_heading = recent
+        .iter()
+        .any(|line| line_is_effort_slider_heading(line));
+    has_footer && has_heading
+}
+
+/// True for the slider's instructional footer, e.g. `←/→ to adjust` or
+/// `← / → to adjust` (Claude renders the arrow glyphs `←`/`→` paired with the
+/// word "adjust"). We accept either arrow glyph plus the "adjust" keyword so a
+/// minor copy/spacing change does not silently disable the detector.
+fn line_is_slider_adjust_footer(line: &str) -> bool {
+    let lower = trim_prompt_line(line).to_lowercase();
+    (lower.contains('←') || lower.contains('→')) && lower.contains("adjust")
+}
+
+/// True for the `/effort` slider heading line — the overlay labels the control
+/// with the word "effort". Required alongside the adjust footer so a stray
+/// scrollback line containing only one of the two signals is not read as a
+/// live overlay.
+fn line_is_effort_slider_heading(line: &str) -> bool {
+    trim_prompt_line(line).to_lowercase().contains("effort")
 }
 
 /// Format a tmux session name as an exact-match target.
@@ -378,6 +612,13 @@ pub fn cleanup_session_temp_files(session_name: &str) {
         "owner",
         "sh",
         "generation",
+        // #3087: the per-spawn status-panel instance nonce. Must be swept on
+        // teardown like the other session temp files — otherwise a respawn whose
+        // fresh nonce write fails (logged, non-fatal) would leave the PRIOR
+        // spawn's nonce readable, yielding the same instance key as the old
+        // spawn and suppressing the panel reset on a genuinely new session.
+        // (Mirrors `SPAWN_NONCE_SUFFIX` in discord::tmux_session_files.)
+        "spawn_nonce",
         "exit_reason",
         TMUX_RUNTIME_KIND_TEMP_EXT,
         TMUX_DEAD_MARKER_TEMP_EXT,
@@ -461,17 +702,6 @@ impl RotatingJsonlWriter {
             self.file = open_jsonl_append_file(&self.path)?;
         }
         Ok(())
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-impl RotatingJsonlWriter {
-    #[cfg(unix)]
-    fn bound_file_id(&self) -> std::io::Result<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-
-        let meta = self.file.metadata()?;
-        Ok((meta.dev(), meta.ino()))
     }
 }
 
@@ -635,6 +865,87 @@ pub fn truncate_jsonl_head_safe(
     }
     std::fs::rename(&tmp_path, path)?;
     Ok(Some(new_size))
+}
+
+#[cfg(test)]
+mod selector_overlay_tests {
+    use super::*;
+
+    #[test]
+    fn selector_open_detected_for_effort_slider_footer() {
+        // Claude Code 2.1.x `/effort` is a horizontal slider with a
+        // `←/→ to adjust` footer while the overlay is open.
+        let pane = "\
+Claude Code v2.1.141
+
+  Effort   low ─ medium ─ [high] ─ xhigh ─ max
+
+  ←/→ to adjust · Enter to confirm · Esc to cancel";
+
+        assert!(tmux_capture_indicates_claude_tui_selector_open(pane));
+    }
+
+    #[test]
+    fn selector_open_detected_with_spaced_arrow_footer() {
+        let pane = "\
+  Effort
+  ← / → to adjust   Enter to confirm";
+
+        assert!(tmux_capture_indicates_claude_tui_selector_open(pane));
+    }
+
+    #[test]
+    fn selector_open_false_when_only_footer_present_in_scrollback() {
+        // A stale scrollback line that mentions the adjust footer but has no
+        // accompanying Effort heading must not read as a live overlay.
+        let pane = "\
+Claude Code v2.1.141
+
+  README: press ←/→ to adjust the carousel
+❯
+  ⏵⏵ bypass permissions on";
+
+        assert!(!tmux_capture_indicates_claude_tui_selector_open(pane));
+    }
+
+    #[test]
+    fn selector_open_false_when_only_effort_word_present() {
+        // A line that merely mentions "effort" without the adjust footer is
+        // not a live slider overlay either.
+        let pane = "\
+Claude Code v2.1.141
+
+⏺ I adjusted the effort estimate in the doc.
+❯
+  ⏵⏵ bypass permissions on";
+
+        assert!(!tmux_capture_indicates_claude_tui_selector_open(pane));
+    }
+
+    #[test]
+    fn selector_open_false_for_plain_ready_prompt() {
+        let pane = "\
+Claude Code v2.1.141
+
+❯
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
+  ⏵⏵ bypass permissions on";
+
+        assert!(!tmux_capture_indicates_claude_tui_selector_open(pane));
+    }
+
+    #[test]
+    fn selector_open_false_for_composer_draft_mentioning_adjust() {
+        // A draft that merely contains the word "adjust" without the slider
+        // arrow footer must not be mistaken for an open slider overlay.
+        let pane = "\
+Claude Code v2.1.141
+
+❯ adjust the layout margins
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done";
+
+        assert!(!tmux_capture_indicates_claude_tui_selector_open(pane));
+    }
 }
 
 #[cfg(test)]
@@ -876,453 +1187,237 @@ assistant output
         assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
         assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
     }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::*;
 
     #[test]
-    fn session_temp_path_is_namespaced_by_runtime_root() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        let previous_host = std::env::var_os("HOSTNAME");
+    fn actively_streaming_detects_busy_pane_with_esc_to_interrupt() {
+        // #3107: a live agentic turn that lost its inflight — the pane still
+        // shows the busy/"esc to interrupt" marker and is producing.
+        let capture = "\
+⏺ Running 1 shell command…
+· Actioning… (4m 7s · esc to interrupt)
+─────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ █░░░░░░░░░ │ 7%";
 
-        unsafe {
-            std::env::set_var("HOSTNAME", "test-host");
-            std::env::set_var("AGENTDESK_ROOT_DIR", "/tmp/adk-runtime-a");
-        }
-        let path_a = session_temp_path("tmux-a", "jsonl");
-
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", "/tmp/adk-runtime-b") };
-        let path_b = session_temp_path("tmux-a", "jsonl");
-
-        match previous_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        match previous_host {
-            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
-
-        assert_ne!(path_a, path_b);
-        assert!(path_a.contains("tmux-a"));
-        assert!(path_b.contains("tmux-a"));
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn session_temp_path_uses_persistent_runtime_dir_when_root_is_set() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+    fn actively_streaming_rejects_ready_for_input_pane() {
+        // A genuinely finished turn returned to ready-for-input: not streaming.
+        let capture = "\
+✻ Churned for 4m 56s
+─────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ █░░░░░░░░░ │ 7%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 17 done
+  ⏵⏵ bypass permissions on";
 
-        // tmpdir we own for the test
-        let tdir =
-            std::env::temp_dir().join(format!("adk-issue-892-persistent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tdir);
-
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
-        }
-
-        let path = session_temp_path("tmux-persistent-test", "jsonl");
-        let expected_prefix = tdir.join("runtime").join("sessions");
-        assert!(
-            path.starts_with(&expected_prefix.display().to_string()),
-            "expected {} to start with {}",
-            path,
-            expected_prefix.display()
-        );
-
-        // agentdesk_temp_dir() should have created the directory as a side
-        // effect — verify it's there and accessible.
-        assert!(
-            expected_prefix.exists(),
-            "persistent sessions dir not created"
-        );
-
-        // Restore env and clean up.
-        match previous_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        let _ = std::fs::remove_dir_all(&tdir);
+        assert!(tmux_capture_indicates_claude_tui_ready_for_input(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn agentdesk_temp_dir_uses_persistent_sessions_subpath() {
-        // Verify that when runtime_root() is Some(root), agentdesk_temp_dir()
-        // returns a path ending in `runtime/sessions`. We don't clear HOME in
-        // this test because other concurrent tests rely on env stability —
-        // instead we assert the structural property.
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
+    fn actively_streaming_rejects_idle_suggestion_chrome() {
+        // Idle-suggestion chrome is real post-finish ghost noise, not a live
+        // turn — must not be treated as actively streaming.
+        let capture = "\
+⏺ TUI-E2E marker
+✻ Worked for 2s
+────────────────────────────────────────────────────────────────────────────
+❯\u{00a0}좋아, 잘 동작하네
+────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ ░░░░░░░░░░ │ 4%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
+  ⏵⏵ bypass permissions on";
 
-        let tdir =
-            std::env::temp_dir().join(format!("adk-issue-892-subpath-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tdir);
-
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
-        }
-
-        let dir = agentdesk_temp_dir();
-        let expected = tdir.join("runtime").join("sessions");
-        assert_eq!(dir, expected.display().to_string());
-
-        // Fallback branch: when persistent_sessions_dir() is None
-        // (no runtime_root available) we must return std::env::temp_dir().
-        // We can't easily force runtime_root()→None without clobbering HOME
-        // for concurrent tests, so we test the inner decision explicitly
-        // by asserting persistent_sessions_dir is Some(expected) — its
-        // presence exercises the Some arm; the None arm is trivially
-        // `std::env::temp_dir().display().to_string()`.
-        assert_eq!(persistent_sessions_dir(), Some(expected));
-
-        match previous_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        let _ = std::fs::remove_dir_all(&tdir);
+        assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn resolve_session_temp_path_prefers_new_over_legacy() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        let previous_host = std::env::var_os("HOSTNAME");
+    fn actively_streaming_rejects_empty_capture() {
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(""));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            "   \n  \n"
+        ));
+    }
 
-        let tdir =
-            std::env::temp_dir().join(format!("adk-issue-892-resolve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tdir);
-
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
-            std::env::set_var("HOSTNAME", "resolve-host");
-        }
-
-        let session = format!("issue-892-resolve-sess-{}", std::process::id());
-
-        // No files anywhere → None.
-        assert!(
-            resolve_session_temp_path(&session, "jsonl").is_none(),
-            "expected None when neither location has the file"
-        );
-
-        // Create the legacy file only.
-        let legacy = legacy_tmp_session_path(&session, "jsonl");
-        std::fs::write(&legacy, b"legacy").unwrap();
-        assert_eq!(
-            resolve_session_temp_path(&session, "jsonl"),
-            Some(legacy.clone()),
-            "expected legacy path when only legacy exists"
-        );
-
-        // Create the new persistent file — should win.
-        let new_path = session_temp_path(&session, "jsonl");
-        std::fs::create_dir_all(std::path::Path::new(&new_path).parent().unwrap()).unwrap();
-        std::fs::write(&new_path, b"new").unwrap();
-        assert_eq!(
-            resolve_session_temp_path(&session, "jsonl"),
-            Some(new_path.clone()),
-            "expected new path to be preferred over legacy"
-        );
-
-        // Cleanup.
-        let _ = std::fs::remove_file(&legacy);
-        let _ = std::fs::remove_file(&new_path);
-        let _ = std::fs::remove_dir_all(&tdir);
-
-        match previous_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        match previous_host {
-            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
+    // #3107 codex re-review (P2#1): the original `!ready && !idle` definition
+    // false-positived any pane that was merely not-idle as "streaming". The
+    // tightened definition requires a POSITIVE busy signal, so a non-Claude /
+    // error / scrolled / generic-prompt pane biases to FALSE (keep suppressing).
+    #[test]
+    fn actively_streaming_rejects_non_claude_pane() {
+        // A plain shell prompt — not a Claude TUI at all — has no busy marker.
+        let capture = "\
+user@host ~/work %\u{00a0}
+$ ls -la
+total 0
+$ ";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn truncate_jsonl_head_safe_drops_partial_leading_line() {
-        let tdir = std::env::temp_dir().join(format!("adk-issue-892-trunc-{}", std::process::id()));
-        std::fs::create_dir_all(&tdir).unwrap();
-        let path = tdir.join("session.jsonl");
-
-        // Build a file: several known-length lines, each ending in \n.
-        // Each line: "line-NN:<pad>\n" — 100 bytes total so it's easy to reason about.
-        let line_size = 100usize;
-        let lines: Vec<String> = (0..200)
-            .map(|i| {
-                let prefix = format!("line-{:03}:", i);
-                let pad = line_size - prefix.len() - 1; // -1 for \n
-                format!("{}{}\n", prefix, "x".repeat(pad))
-            })
-            .collect();
-        let content: String = lines.concat();
-        std::fs::write(&path, &content).unwrap();
-
-        // Cap at 5 KB, keep ~3.5 KB → must preserve a whole number of lines
-        // ending with the last line of input.
-        let cap = 5_000u64;
-        let keep = 3_500u64;
-        let result =
-            truncate_jsonl_head_safe(path.to_str().unwrap(), cap, keep).expect("truncate ok");
-        assert!(result.is_some(), "file should have been truncated");
-
-        let after = std::fs::read_to_string(&path).unwrap();
-
-        // 1. Every kept line must be complete (file ends with \n).
-        assert!(
-            after.ends_with('\n'),
-            "truncated file must end with newline"
-        );
-
-        // 2. Last line of output equals last line of input.
-        let last_out = after.lines().last().unwrap();
-        let last_in = lines.last().unwrap().trim_end_matches('\n');
-        assert_eq!(
-            last_out, last_in,
-            "last kept line should be last input line"
-        );
-
-        // 3. No partial first line. Every output line must match a whole input line.
-        for out_line in after.lines() {
-            assert!(
-                lines.iter().any(|l| l.trim_end_matches('\n') == out_line),
-                "unexpected partial line in output: {out_line}"
-            );
-        }
-
-        // 4. Size is within the keep target (give or take one whole line).
-        let new_size = after.len() as u64;
-        assert!(
-            new_size <= keep,
-            "new size {} should be <= target keep {}",
-            new_size,
-            keep
-        );
-
-        // Cleanup.
-        let _ = std::fs::remove_dir_all(&tdir);
+    fn actively_streaming_rejects_error_screen() {
+        // An error/backtrace screen left in the pane is finished, not streaming.
+        let capture = "\
+thread 'main' panicked at src/lib.rs:42:9:
+called `Result::unwrap()` on an `Err` value: Broken pipe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+error: process didn't exit successfully (exit status: 101)";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn truncate_jsonl_head_safe_no_op_under_cap() {
-        let tdir =
-            std::env::temp_dir().join(format!("adk-issue-892-trunc-noop-{}", std::process::id()));
-        std::fs::create_dir_all(&tdir).unwrap();
-        let path = tdir.join("small.jsonl");
-        std::fs::write(&path, b"line1\nline2\n").unwrap();
-        let result = truncate_jsonl_head_safe(path.to_str().unwrap(), 1_000_000, 500_000)
-            .expect("truncate ok");
-        assert!(result.is_none(), "small file should not be truncated");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line1\nline2\n");
-        let _ = std::fs::remove_dir_all(&tdir);
+    fn actively_streaming_rejects_scrolled_pane_without_busy_marker() {
+        // A scrolled-back pane showing prior assistant output with no live
+        // busy/spinner marker must not read as streaming.
+        let capture = "\
+⏺ Here is the summary of the changes I made earlier.
+  ⎿  Edited 3 files, ran the test suite, all green.
+some scrolled-back prose line
+another scrolled-back prose line";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn truncate_jsonl_head_safe_missing_file_returns_none() {
-        let result =
-            truncate_jsonl_head_safe("/tmp/issue-892-does-not-exist-xyz.jsonl", 1_000, 500)
-                .expect("missing file should be ok");
-        assert!(result.is_none());
+    fn actively_streaming_rejects_generic_prompt_waiting_pane() {
+        // A generic prompt-waiting pane (no Claude busy chrome) is ambiguous and
+        // must bias to FALSE (suppress), not be relayed as streaming.
+        let capture = "\
+Press any key to continue . . .
+> ";
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn rotating_jsonl_writer_reopens_after_path_replacement() {
-        let tdir = tempfile::tempdir().unwrap();
-        let path = tdir.path().join("session.jsonl");
-        let mut writer = RotatingJsonlWriter::open(&path).expect("open writer");
-
-        writer
-            .write_line(r#"{"type":"assistant","message":"before"}"#)
-            .unwrap();
-
-        let replacement = path.with_extension("jsonl.truncate.tmp");
-        std::fs::write(
-            &replacement,
-            "{\"type\":\"assistant\",\"message\":\"kept\"}\n",
-        )
-        .unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
-
-        writer
-            .write_line(r#"{"type":"assistant","message":"after"}"#)
-            .unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains(r#"{"type":"assistant","message":"kept"}"#),
-            "replacement content must survive rotation: {content}"
-        );
-        assert!(
-            content.contains(r#"{"type":"assistant","message":"after"}"#),
-            "writer must reopen and append to the replacement path: {content}"
-        );
-        assert!(
-            !content.contains(r#"{"type":"assistant","message":"before"}"#),
-            "replaced path should not retain pre-rotation content in this fixture: {content}"
-        );
+    fn actively_streaming_accepts_claude_busy_spinner_verb() {
+        // A real Claude TUI mid-response with a spinner verb + active-work marker
+        // (no ready/idle chrome) is the genuine "live turn lost its inflight" case.
+        let capture = "\
+⏺ Reading src/main.rs
+· Musing… (12s · ↓ 2.1k tokens)";
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
-    #[cfg(unix)]
+    // #3107 codex re-review (P2, F2): the busy classifier previously accepted any
+    // recent line containing the bare substrings `running`/`processing`/`thinking`.
+    // Those words appear in normal ASSISTANT BODY text, so a pane that has
+    // finished but still shows such prose was mis-read as streaming. The marker
+    // must be Claude-TUI chrome (spinner glyph / `esc to interrupt`), not a word.
     #[test]
-    fn rotating_jsonl_writer_syncs_old_fd_before_reopening_after_rotation() {
-        let tdir = tempfile::tempdir().unwrap();
-        let path = tdir.path().join("session.jsonl");
-        let stale = tdir.path().join("session.stale.jsonl");
-        let mut writer = RotatingJsonlWriter::open(&path).expect("open writer");
-
-        writer
-            .write_line(r#"{"type":"assistant","message":"before"}"#)
-            .expect("write before");
-        let old_id = writer.bound_file_id().expect("old file id");
-
-        std::fs::rename(&path, &stale).expect("move old file aside");
-        std::fs::write(&path, "{\"type\":\"assistant\",\"message\":\"kept\"}\n")
-            .expect("write replacement");
-
-        writer.sync_all().expect("sync old fd");
-        assert_eq!(
-            writer.bound_file_id().expect("bound file id after sync"),
-            old_id,
-            "sync_all must fsync the original fd before any later reopen"
-        );
-
-        writer
-            .write_line(r#"{"type":"assistant","message":"after"}"#)
-            .expect("write after");
-
-        let replacement = std::fs::read_to_string(&path).expect("read replacement");
-        assert!(replacement.contains(r#"{"type":"assistant","message":"kept"}"#));
-        assert!(replacement.contains(r#"{"type":"assistant","message":"after"}"#));
-
-        let stale_content = std::fs::read_to_string(&stale).expect("read stale");
-        assert!(stale_content.contains(r#"{"type":"assistant","message":"before"}"#));
+    fn actively_streaming_rejects_assistant_body_with_busy_words_but_no_chrome() {
+        // Assistant body text mentions "running" / "processing" / "thinking" but
+        // there is NO `esc to interrupt` footer and NO spinner progress line.
+        let capture = "\
+⏺ I checked the build: the test suite is running in CI and the worker is
+  still processing the queue while thinking through the edge cases.
+some more scrolled-back assistant prose
+another line of prior output";
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
-    // #1261 (Fix B): the watcher cleanup writes a `death_pane_log` snapshot
-    // before killing the dead-pane session so the wrapper-level stderr that
-    // never reached the structured jsonl is still recoverable post-mortem.
-    // `cleanup_session_temp_files` MUST NOT delete this snapshot — otherwise
-    // it would be erased microseconds after being written.
-    //
-    // The deletable EXTS list is the cleanup contract; pin its shape here so
-    // a future "let's also nuke death_pane_log" tweak fails this test instead
-    // of silently re-breaking post-mortem.
+    // #3107 F2: a real Claude TUI in-progress frame keyed only on the strongest
+    // marker (`esc to interrupt`) — no spinner verb, no `⏺` active-work line —
+    // must still read as streaming.
     #[test]
-    fn cleanup_session_temp_files_preserves_death_pane_log_snapshot() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        let previous_host = std::env::var_os("HOSTNAME");
+    fn actively_streaming_accepts_esc_to_interrupt_footer_only() {
+        let capture = "\
+some earlier assistant prose still on screen
+(13s · ↓ 1.2k tokens · esc to interrupt)";
+        assert!(tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
+    }
 
-        let tdir =
-            std::env::temp_dir().join(format!("adk-issue-1261-cleanup-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tdir);
-
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
-            std::env::set_var("HOSTNAME", "issue-1261-host");
-        }
-
-        let session = format!("issue-1261-cleanup-sess-{}", std::process::id());
-
-        // Seed every cleanup-eligible extension *plus* the death_pane_log
-        // snapshot Fix B writes.
-        let cleaned_exts = [
-            "jsonl",
-            "input",
-            "prompt",
-            "owner",
-            "sh",
-            "generation",
-            "exit_reason",
-            TMUX_RUNTIME_KIND_TEMP_EXT,
-            TMUX_DEAD_MARKER_TEMP_EXT,
-            CLAUDE_TUI_HOOK_SETTINGS_TEMP_EXT,
-            CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
-        ];
-        let mut cleaned_paths = Vec::new();
-        for ext in &cleaned_exts {
-            let path = session_temp_path(&session, ext);
-            if let Some(parent) = std::path::Path::new(&path).parent() {
-                std::fs::create_dir_all(parent).unwrap();
-            }
-            std::fs::write(&path, format!("seed-{ext}")).unwrap();
-            cleaned_paths.push(path);
-        }
-        let death_log_path = session_temp_path(&session, "death_pane_log");
-        std::fs::write(&death_log_path, "post-mortem capture").unwrap();
-
-        cleanup_session_temp_files(&session);
-
-        for path in &cleaned_paths {
-            assert!(
-                !std::path::Path::new(path).exists(),
-                "cleanup_session_temp_files must remove cleanup-eligible files: {path}"
-            );
-        }
-        assert!(
-            std::path::Path::new(&death_log_path).exists(),
-            "cleanup_session_temp_files must NOT remove the death_pane_log snapshot: {death_log_path}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&death_log_path).unwrap(),
-            "post-mortem capture",
-            "death_pane_log content must be preserved verbatim"
-        );
-
-        let _ = std::fs::remove_file(&death_log_path);
-        let _ = std::fs::remove_dir_all(&tdir);
-        match previous_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        match previous_host {
-            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
+    // #3107 codex re-review (F2 PARTIAL close): a spinner-progress line keyed on
+    // ONLY the leading glyph + work verb still false-positived on assistant prose
+    // that happens to begin with a spinner glyph and a verb. The real Claude TUI
+    // spinner footer ALWAYS carries a status SUFFIX (`esc to interrupt`, a
+    // duration, a token count, and/or the `·` separator). The recognizer now
+    // requires that suffix, so bare prose can no longer trip it.
+    #[test]
+    fn actively_streaming_rejects_glyph_verb_prose_without_status_suffix() {
+        // Assistant body line: leading spinner glyph + work verb, but NO Claude
+        // TUI status suffix → NOT a spinner-progress footer → NOT busy.
+        let capture = "\
+· Thinking through the problem and running the tests
+some more scrolled-back assistant prose
+another line of prior output";
+        assert!(!tmux_line_is_claude_tui_spinner_progress(
+            "· Thinking through the problem and running the tests"
+        ));
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 
     #[test]
-    fn tmux_runtime_kind_marker_round_trips_and_cleanup_removes_it() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        let previous_host = std::env::var_os("HOSTNAME");
+    fn actively_streaming_accepts_real_spinner_with_status_suffix() {
+        // The genuine Claude TUI spinner footer: glyph + verb + parenthesized
+        // status group with a duration, token count, and `esc to interrupt`.
+        let line = "✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)";
+        assert!(tmux_line_is_claude_tui_spinner_progress(line));
+        let capture = format!("earlier assistant prose\n{line}");
+        assert!(tmux_capture_indicates_claude_tui_busy(&capture));
+        assert!(tmux_capture_indicates_claude_tui_actively_streaming(
+            &capture
+        ));
+    }
 
-        let tdir =
-            std::env::temp_dir().join(format!("adk-runtime-kind-marker-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tdir);
+    #[test]
+    fn actively_streaming_accepts_spinner_with_duration_only_status() {
+        // A spinner footer whose status group carries only a bare duration token
+        // (no `esc to interrupt`, no `tokens`) still qualifies.
+        let line = "✻ Thinking… (12s)";
+        assert!(tmux_line_is_claude_tui_spinner_progress(line));
+    }
 
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &tdir);
-            std::env::set_var("HOSTNAME", "runtime-kind-host");
-        }
+    #[test]
+    fn actively_streaming_rejects_glyph_verb_with_plain_parenthetical() {
+        // Glyph + verb followed by an ordinary parenthetical with no TUI status
+        // marker (no duration, no `tokens`, no `·`) must NOT qualify.
+        let line = "· Thinking about the design (a fresh idea here)";
+        assert!(!tmux_line_is_claude_tui_spinner_progress(line));
+    }
 
-        let session = format!("runtime-kind-sess-{}", std::process::id());
-        write_tmux_runtime_kind_marker(
-            &session,
-            crate::services::agent_protocol::RuntimeHandoffKind::CodexTui,
-        )
-        .expect("write marker");
-
-        assert_eq!(
-            resolve_tmux_runtime_kind_marker(&session),
-            Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui)
-        );
-
-        cleanup_session_temp_files(&session);
-        assert_eq!(resolve_tmux_runtime_kind_marker(&session), None);
-
-        let _ = std::fs::remove_dir_all(&tdir);
-        match previous_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        match previous_host {
-            Some(value) => unsafe { std::env::set_var("HOSTNAME", value) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
+    #[test]
+    fn actively_streaming_rejects_glyph_verb_past_tense_completion() {
+        // Past-tense `<verb> for <duration>` completion summary stays excluded.
+        let line = "· Running for 3s";
+        assert!(!tmux_line_is_claude_tui_spinner_progress(line));
+        let capture = "\
+· Running for 3s
+some scrolled-back prose line
+another scrolled-back prose line";
+        assert!(!tmux_capture_indicates_claude_tui_busy(capture));
+        assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
+            capture
+        ));
     }
 }

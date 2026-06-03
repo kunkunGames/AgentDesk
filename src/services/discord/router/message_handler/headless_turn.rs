@@ -551,9 +551,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         adk_session_key.as_deref(),
     )
     .await;
-    shared
-        .global_active
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::services::discord::increment_global_active(shared, "headless_turn_start");
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
@@ -1286,7 +1284,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             provider,
             gateway: Arc::new(HeadlessGateway),
             channel_id,
-            user_msg_id,
+            user_msg_id: Some(user_msg_id),
             user_text_owned: prompt_owned,
             request_owner_name: request_owner_name.to_string(),
             role_binding,
@@ -1299,7 +1297,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             memory_recall_usage: memory_recall.token_usage,
             context_window_tokens: model_context_window,
             context_compact_percent: compact_percent,
-            current_msg_id: placeholder_msg_id,
+            current_msg_id: Some(placeholder_msg_id),
             response_sent_offset: 0,
             full_response: String::new(),
             tmux_last_offset: Some(inflight_offset),

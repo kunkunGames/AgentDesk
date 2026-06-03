@@ -14,6 +14,14 @@ pub(in crate::services::discord) fn status_events_from_tool_use(
     name: &str,
     input: &str,
 ) -> Vec<StatusEvent> {
+    status_events_from_tool_use_with_id(name, input, None)
+}
+
+pub(in crate::services::discord) fn status_events_from_tool_use_with_id(
+    name: &str,
+    input: &str,
+    tool_use_id: Option<&str>,
+) -> Vec<StatusEvent> {
     let args_summary = format_tool_input(name, input)
         .trim()
         .is_empty()
@@ -55,6 +63,7 @@ pub(in crate::services::discord) fn status_events_from_tool_use(
                 .map(str::to_string)
                 .or_else(|| Some(name.to_string())),
             desc: subagent_description(&value).or(args_summary.clone()),
+            tool_use_id: tool_use_id.map(str::to_string),
         });
     }
     if is_todo_write_tool(name) {
@@ -82,9 +91,21 @@ pub(in crate::services::discord) fn status_events_from_tool_result(
     tool_name: Option<&str>,
     is_error: bool,
 ) -> Vec<StatusEvent> {
+    status_events_from_tool_result_with_id(tool_name, is_error, None)
+}
+
+pub(in crate::services::discord) fn status_events_from_tool_result_with_id(
+    tool_name: Option<&str>,
+    is_error: bool,
+    tool_use_id: Option<&str>,
+) -> Vec<StatusEvent> {
     let mut events = vec![StatusEvent::ToolEnd { success: !is_error }];
     if tool_name.is_some_and(tool_result_completes_subagent) {
-        events.push(StatusEvent::SubagentEnd { success: !is_error });
+        events.push(StatusEvent::SubagentEnd {
+            success: !is_error,
+            tool_use_id: tool_use_id.map(str::to_string),
+            summary: None,
+        });
     }
     events
 }
@@ -105,6 +126,8 @@ pub(in crate::services::discord) fn status_events_from_task_notification(
             if task_notification_is_terminal(status) {
                 events.push(StatusEvent::SubagentEnd {
                     success: !task_notification_is_error(status),
+                    tool_use_id: None,
+                    summary: None,
                 });
             }
         }
@@ -350,13 +373,72 @@ fn content_block_start_status_events(value: &Value) -> Vec<StatusEvent> {
 }
 
 fn user_status_events(value: &Value) -> Vec<StatusEvent> {
-    value
+    // #3086: a finished subagent's `tool_result` carries a `toolUseResult`
+    // aggregate with subagent accounting (`agentId` / `total*`). Surface a
+    // TUI-parity `Done (N tools · M tokens · Xs)` summary by pairing the result
+    // to its slot via the content block's own `tool_use_id`. The accounting
+    // comes from the in-stream `toolUseResult` (no IO).
+    //
+    // #3086 P1: a single `user` record may BATCH several finished subagents'
+    // `tool_result` blocks, and each Task subagent result carries its OWN
+    // `toolUseResult` aggregate (its own `agentId`/`total*`). The aggregate for
+    // subagent A lives in A's own block; B's lives in B's. We therefore compute
+    // each block's summary FROM THAT SAME BLOCK and key it by THAT block's
+    // `tool_use_id` — the slot key the panel pairs on (#3084). We must NOT
+    // attach a single record-level aggregate to "the first id-bearing block":
+    // with multiple aggregate-bearing blocks that would put subagent A's Done
+    // summary on subagent B's slot.
+    //
+    // Legacy single-subagent records put the aggregate at the RECORD top level
+    // (one `tool_result` block, top-level `toolUseResult`). When no block
+    // carries its own aggregate, we fall back to attaching that record-level
+    // aggregate to the first id-bearing `tool_result` block (there is exactly
+    // one finished subagent in that shape, so a single owner is correct).
+    //
+    // We cannot read slot state here (it lives in the panel), so each
+    // summary-bearing `SubagentEnd` is keyed by the block's `tool_use_id`; the
+    // panel (status_panel.rs) requires that id to match a tracked subagent slot
+    // before applying it — a summary-bearing end with an unmatched id is dropped
+    // rather than mis-routed to the last unfinished slot.
+    let blocks = value
         .get("message")
         .and_then(|message| message.get("content"))
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|block| {
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    // Per-block aggregates take precedence: when ANY `tool_result` block carries
+    // its own `toolUseResult` aggregate, attribute each summary to its own block
+    // and never fall back to the record-level aggregate (which, in the batched
+    // shape, would be absent or ambiguous).
+    let any_block_aggregate = blocks.iter().any(|block| {
+        block.get("type").and_then(Value::as_str) == Some("tool_result")
+            && super::subagent_rollout::summary_from_tool_use_result(block).is_some()
+    });
+
+    // Legacy single-subagent fallback: the aggregate sits at the record top
+    // level. Attribute it to the first id-bearing `tool_result` block (only one
+    // finished subagent exists in that shape). Disabled when blocks carry their
+    // own aggregates, to avoid double-counting / mis-attribution.
+    let record_summary = if any_block_aggregate {
+        None
+    } else {
+        subagent_summary_from_record(value)
+    };
+    let record_summary_owner_idx = record_summary.as_ref().and_then(|_| {
+        blocks.iter().position(|block| {
+            block.get("type").and_then(Value::as_str) == Some("tool_result")
+                && block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty())
+        })
+    });
+
+    blocks
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, block)| {
             if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                 return Vec::new();
             }
@@ -364,9 +446,64 @@ fn user_status_events(value: &Value) -> Vec<StatusEvent> {
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+
+            // This block's OWN aggregate (batched multi-subagent case): attach
+            // the per-subagent summary here, keyed by THIS block's tool_use_id.
+            let block_summary = subagent_summary_from_record(block);
+            // Or, for the legacy single-subagent shape, the record-level
+            // aggregate owned by the first id-bearing block.
+            let summary = block_summary.or_else(|| {
+                if Some(idx) == record_summary_owner_idx {
+                    record_summary.clone()
+                } else {
+                    None
+                }
+            });
+
+            if let Some(summary) = summary {
+                // Pair by this block's own tool_use_id. The panel refuses to
+                // apply the summary unless the id matches a real, tracked slot,
+                // so a stray summary can never land on an unrelated running slot.
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                return vec![
+                    StatusEvent::ToolEnd { success: !is_error },
+                    StatusEvent::SubagentEnd {
+                        success: !is_error,
+                        tool_use_id,
+                        summary: Some(summary),
+                    },
+                ];
+            }
+
             status_events_from_tool_result(None, is_error)
         })
         .collect()
+}
+
+/// Builds the subagent [`SubagentSummary`](crate::services::agent_protocol::SubagentSummary)
+/// from a JSON object's `toolUseResult` aggregate. The object may be either an
+/// individual `tool_result` content block (batched multi-subagent case, where
+/// each Task result carries its own `toolUseResult`) or the whole `user` record
+/// (legacy single-subagent case, where the aggregate sits at the record top
+/// level). Returns `None` for ordinary (non-subagent) tool results.
+///
+/// #3086 P1: this runs on the live relay/status hot path, so it uses ONLY the
+/// in-stream `toolUseResult` aggregate — no disk IO. The aggregate is the exact
+/// accounting the TUI renders and is normally complete; any field it omits is
+/// simply left empty, and the render layer degrades to a partial `Done (...)`
+/// line. The previous synchronous per-subagent rollout fallback
+/// (`std::fs::read_to_string` of a potentially large `agent-<id>.jsonl`) was an
+/// unbounded blocking read on the async relay loop and is removed from this
+/// path. The IO-free rollout parser (`summary_from_rollout_str`) remains
+/// available for any off-hot-path / offline use.
+fn subagent_summary_from_record(
+    value: &Value,
+) -> Option<crate::services::agent_protocol::SubagentSummary> {
+    let (summary, _agent_id) = super::subagent_rollout::summary_from_tool_use_result(value)?;
+    Some(summary)
 }
 
 fn system_status_events(value: &Value) -> Vec<StatusEvent> {

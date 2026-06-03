@@ -125,6 +125,9 @@ impl LiveBargeInMonitor {
         }
     }
 
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn sensitivity(&self) -> BargeInSensitivity {
         self.sensitivity
     }
@@ -257,6 +260,9 @@ impl DeferredBargeInBuffer {
         }
     }
 
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn push_transcript(&mut self, transcript: &str) -> bool {
         let cleaned = cleaned_transcript_for_prompt(transcript);
         if cleaned.is_empty() || is_repeated_noise_transcript(&cleaned) {
@@ -280,6 +286,9 @@ impl DeferredBargeInBuffer {
         }
     }
 
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.turn_count
     }
@@ -334,6 +343,9 @@ pub(crate) async fn run_sensitivity_ttl_reset(
     }
 }
 
+// reason: voice runtime is wired only when voice config is enabled; no compile
+// target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) fn pcm16_stereo_levels(buf: &[u8]) -> (f32, f32) {
     let levels = pcm16_stereo_levels_struct(buf);
     (levels.mean_db, levels.max_db)

@@ -4782,6 +4782,9 @@ mod tests {
             queued_placeholders: dashmap::DashMap::new(),
             queue_exit_placeholder_clears: dashmap::DashMap::new(),
             queued_placeholders_persist_locks: dashmap::DashMap::new(),
+            answer_flush_barrier: std::sync::Arc::new(
+                super::super::answer_flush_barrier::AnswerFlushBarrier::default(),
+            ),
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -4792,6 +4795,9 @@ mod tests {
             recovery_started_at: std::time::Instant::now(),
             recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
             global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            turn_finalizer: super::super::turn_finalizer::TurnFinalizer::spawn(),
+            status_panel_controller:
+                super::super::status_panel_controller::StatusPanelController::spawn(false),
             global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),
@@ -4821,8 +4827,6 @@ mod tests {
             token_hash: "voice-handoff-test-token-hash".to_string(),
             provider: ProviderKind::Claude,
             api_port: 9,
-            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-            sqlite: None,
             pg_pool,
             engine: None,
             health_registry: std::sync::Weak::new(),

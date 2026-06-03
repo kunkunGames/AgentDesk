@@ -18,6 +18,7 @@ data.db
 out/e2e/
 report.*.json
 docs/generated/module-inventory.md
+docs/generated/giant-file-registry.md
 docs/generated/route-inventory.md
 docs/generated/worker-inventory.md
 .playwright-cli/
@@ -46,3 +47,6 @@ __pycache__/
 
 # Transient ops playbooks (campaign prompts, incident runbooks)
 /docs/ops/
+
+# Per-user routine scripts — individual user config space (#3081 follow-up; keeps already-tracked shared routines, ignores new local ones)
+routines/

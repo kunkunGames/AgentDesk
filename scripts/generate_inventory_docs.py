@@ -20,7 +20,88 @@ ARCHITECTURE_TOP_LEVEL_MAP_START = "<!-- BEGIN GENERATED: TOP LEVEL MODULE MAP -
 ARCHITECTURE_TOP_LEVEL_MAP_END = "<!-- END GENERATED: TOP LEVEL MODULE MAP -->"
 GIANT_FILE_THRESHOLD = 1000
 HTTP_METHODS = ("delete", "get", "head", "options", "patch", "post", "put")
+<<<<<<< ours
 TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs", "high_risk_recovery.rs"}
+=======
+TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs"}
+GIANT_FILE_REGISTRY = REPO_ROOT / "scripts" / "giant_file_registry.toml"
+GIANT_FILE_REGISTRY_DOC = GENERATED_DOCS_DIR / "giant-file-registry.md"
+
+# Only whole test *modules* count as test LoC — inline `#[cfg(test)]` guards on
+# production struct fields, conditional logic, or test-only helper fns left in
+# the module body remain production code because they shape the compiled-out
+# test seams of the production surface.
+#
+# A module's `#[cfg(...)]` attribute gates it to test-only builds when the
+# predicate *requires* the `test` flag. `cfg_requires_test` evaluates this
+# structurally (with balanced-paren awareness) so it handles nested forms such
+# as `all(test, not(feature = "legacy-sqlite-tests"))`. Predicates that do not
+# remove the module from production builds — `not(test)` (production-only) and
+# `any(test, …)` (compiles when the other option is set) — are rejected.
+
+# `#[cfg(...)]` attribute immediately before a (optionally attributed, optionally
+# `pub`) `mod <name> {` declaration. The cfg body is captured for structural
+# evaluation; the `mod` open brace anchors the test-module body.
+# The predicate stays inside a single attribute (`[^]]`), and only further
+# attributes or whitespace may sit between the cfg and the `mod` keyword — so an
+# inline `#[cfg(test)]` guarding a function does not spuriously bind to a later
+# `mod`.
+_CFG_MOD_RE = re.compile(
+    r"#\[cfg\((?P<predicate>[^]]*?)\)\]"
+    r"\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?"
+    r"mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{",
+)
+
+
+def _split_top_level_cfg_args(body: str) -> list[str]:
+    args: list[str] = []
+    depth = 0
+    start = 0
+    in_string = False
+    for index, ch in enumerate(body):
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append(body[start:index])
+            start = index + 1
+    args.append(body[start:])
+    return [arg.strip() for arg in args if arg.strip()]
+
+
+def cfg_requires_test(predicate: str) -> bool:
+    """Return True when a `#[cfg(<predicate>)]` compiles only under `test`.
+
+    * ``test`` -> True.
+    * ``all(a, b, …)`` -> True when any argument requires test (conjunction).
+    * ``any(a, b, …)`` -> True only when *every* argument requires test (the
+      module would otherwise also build without test).
+    * ``not(…)`` -> never test-gating for our purposes (``not(test)`` is
+      production-only; ``not(other)`` does not require test).
+    * anything else (e.g. ``feature = "x"``) -> False.
+    """
+
+    predicate = predicate.strip()
+    if predicate == "test":
+        return True
+    for keyword, combine in (("all", any), ("any", all)):
+        prefix = keyword + "("
+        if predicate.startswith(prefix) and predicate.endswith(")"):
+            inner = predicate[len(prefix):-1]
+            args = _split_top_level_cfg_args(inner)
+            if not args:
+                return False
+            return combine(cfg_requires_test(arg) for arg in args)
+    if predicate.startswith("not(") and predicate.endswith(")"):
+        return False
+    return False
+>>>>>>> theirs
 
 TOP_LEVEL_MODULE_PURPOSES = {
     "bootstrap.rs": "Builds config, database, policy engine, and shared app state before launch.",
@@ -34,8 +115,6 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "error.rs": "Shared HTTP and policy error type with typed codes and JSON response helpers.",
     "github/": "GitHub sync, issue triage, and Definition-of-Done mirroring.",
     "high_risk_recovery.rs": "PG-only high-risk recovery tests for boot reconciliation and review refire paths.",
-    "integration_tests/": "Scenario-specific integration test modules that supplement `src/integration_tests.rs`.",
-    "integration_tests.rs": "End-to-end pipeline, dispatch, review, and recovery integration test harness.",
     "kanban/": "High-level kanban orchestration, state machine facade, and shared test support.",
     "launch.rs": "Starts the Tokio runtime and hands off to server boot.",
     "lib.rs": "Library crate boundary that exposes the server/CLI modules for the slim binary entry point and tests.",
@@ -66,7 +145,18 @@ class ModuleEntry:
     module_path: str
     file_path: str
     line_count: int
+    prod_line_count: int
+    test_line_count: int
     flags: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GiantFileRegistration:
+    file_path: str
+    owner: str
+    deadline: str
+    decompose_issue: str
+    prod_line_count: int
 
 
 @dataclass(frozen=True)
@@ -98,6 +188,39 @@ def read_text(path: Path) -> str:
 
 def line_count(text: str) -> int:
     return len(text.splitlines())
+
+
+def test_line_count(text: str) -> int:
+    """Count lines that live inside ``#[cfg(test)] mod`` blocks.
+
+    Whole ``*_tests.rs`` files are already excluded from the production set by
+    :func:`is_test_file`; this splits the remaining files so the giant-file
+    signal tracks the *production* review surface rather than inline test
+    fixtures (#3036).
+    """
+
+    total = line_count(text)
+    test_lines: set[int] = set()
+    for match in _CFG_MOD_RE.finditer(text):
+        if not cfg_requires_test(match.group("predicate")):
+            continue
+        brace = text.rindex("{", match.start(), match.end())
+        try:
+            _body, end = scan_balanced(text, brace, "{", "}")
+        except ParseError:
+            continue
+        start_line = offset_to_line(text, match.start())
+        end_line = offset_to_line(text, end)
+        for line in range(start_line, end_line + 1):
+            if 1 <= line <= total:
+                test_lines.add(line)
+    return len(test_lines)
+
+
+def split_prod_test_lines(text: str) -> tuple[int, int]:
+    total = line_count(text)
+    test = test_line_count(text)
+    return total - test, test
 
 
 def rel_posix(path: Path) -> str:
@@ -469,23 +592,354 @@ def resolve_function_source(
     return None
 
 
-def collect_modules() -> list[ModuleEntry]:
-    modules: list[ModuleEntry] = []
+# `mod <name>;` file-module declaration, capturing any preceding `#[cfg(...)]`.
+_MOD_DECL_RE = re.compile(
+    r"(?:#\[cfg\((?P<predicate>[^]]*?)\)\]\s*)?"
+    r"(?:pub(?:\([^)]*\))?\s+)?mod\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+
+
+def _declared_child_paths(parent: Path, name: str) -> list[Path]:
+    """Resolve the file(s) a `mod <name>;` declaration in ``parent`` points to."""
+
+    base = parent.parent
+    return [base / f"{name}.rs", base / name / "mod.rs"]
+
+
+def test_only_module_files() -> set[Path]:
+    """Files whose module is declared *only* under a test-requiring cfg.
+
+    A file like ``src/server/routes/routes_tests/common.rs`` carries no
+    ``#[cfg(test)]`` of its own but is compiled solely because its parent
+    ``mod routes_tests;`` is gated behind ``#[cfg(all(test, …))]``. Such whole
+    subtrees are test fixtures and must be excluded from the production
+    giant-file surface (#3036). A module declared in *both* a production and a
+    test context (e.g. ``src/db/schema.rs``) stays production.
+    """
+
+    test_targets: set[Path] = set()
+    prod_targets: set[Path] = set()
     for path in production_rust_files():
         text = read_text(path)
+        for match in _MOD_DECL_RE.finditer(text):
+            predicate = match.group("predicate")
+            requires_test = predicate is not None and cfg_requires_test(predicate)
+            for child in _declared_child_paths(path, match.group("name")):
+                (test_targets if requires_test else prod_targets).add(child.resolve())
+
+    test_only_dirs: list[Path] = []
+    test_only_files: set[Path] = set()
+    for target in test_targets - prod_targets:
+        if target.name == "mod.rs":
+            test_only_dirs.append(target.parent)
+        test_only_files.add(target)
+
+    result: set[Path] = set()
+    for path in production_rust_files():
+        resolved = path.resolve()
+        if resolved in test_only_files:
+            result.add(path)
+            continue
+        if any(directory in resolved.parents for directory in test_only_dirs):
+            result.add(path)
+    return result
+
+
+def collect_modules() -> list[ModuleEntry]:
+    modules: list[ModuleEntry] = []
+    test_only = test_only_module_files()
+    for path in production_rust_files():
+        text = read_text(path)
+        total = line_count(text)
+        if path in test_only:
+            # Whole file is reached only through a test-gated parent `mod`; count
+            # every line as test so the production surface is not frozen (#3036).
+            prod_lines, test_lines = 0, total
+        else:
+            prod_lines, test_lines = split_prod_test_lines(text)
         flags: list[str] = []
-        if line_count(text) >= GIANT_FILE_THRESHOLD:
+        # Giant-file freezing keys off *production* LoC so that a module which
+        # is only large because of inline test fixtures is not frozen against
+        # legitimate prod-side bugfixes or further test growth (#3036).
+        if prod_lines >= GIANT_FILE_THRESHOLD:
             flags.append("giant-file")
         modules.append(
             ModuleEntry(
                 module_path=module_path_for_file(path),
                 file_path=rel_posix(path),
-                line_count=line_count(text),
+                line_count=total,
+                prod_line_count=prod_lines,
+                test_line_count=test_lines,
                 flags=tuple(flags),
             )
         )
     modules.sort(key=lambda item: item.module_path)
     return modules
+
+
+_REGISTRY_SECTION_RE = re.compile(r"^\[(?P<name>\[?[A-Za-z0-9_.-]+\]?)\]$")
+_REGISTRY_LIST_KV_RE = re.compile(r'^"(?P<value>[^"]+)"\s*,?\s*$')
+_REGISTRY_KV_RE = re.compile(r'^(?P<key>[A-Za-z0-9_]+)\s*=\s*"(?P<value>[^"]*)"$')
+_REGISTRY_ARRAY_RE = re.compile(r"^(?P<name>[A-Za-z0-9_]+)\s*=\s*\[\s*(?P<rest>.*)$")
+_DEADLINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_REGISTRY_ENTRY_FIELDS = ("file", "owner", "deadline", "decompose_issue")
+_REGISTRY_ARRAY_NAMES = ("grandfathered", "grandfathered_baseline_paths")
+
+
+def _strip_toml_comment(line: str) -> str:
+    in_string = False
+    for index, ch in enumerate(line):
+        if ch == '"':
+            in_string = not in_string
+        elif ch == "#" and not in_string:
+            return line[:index].rstrip()
+    return line.rstrip()
+
+
+def load_giant_file_registry() -> tuple[list[str], list[dict[str, str]], list[str] | None]:
+    """Parse the tiny TOML subset used by the giant-file registry.
+
+    Supports the ``grandfathered`` and ``grandfathered_baseline_paths`` string
+    arrays (each possibly spread over multiple lines) and any number of
+    ``[[entry]]`` tables with quoted string values. Avoids a hard dependency on
+    ``tomllib`` so the check runs on the same interpreters as the existing audit
+    scripts. Returns ``(grandfathered, entries, baseline_paths)`` where
+    ``baseline_paths`` is ``None`` if the array is absent.
+    """
+
+    if not GIANT_FILE_REGISTRY.is_file():
+        raise ParseError(f"giant-file registry metadata missing: {rel_posix(GIANT_FILE_REGISTRY)}")
+
+    arrays: dict[str, list[str]] = {}
+    seen_arrays: set[str] = set()
+    entries: list[dict[str, str]] = []
+    current_entry: dict[str, str] | None = None
+    active_array: str | None = None
+
+    def consume_array_tokens(target: list[str], text: str) -> bool:
+        """Append quoted paths from ``text``; return True when the array closes."""
+        closed = False
+        if "]" in text:
+            text, _after = text.split("]", 1)
+            closed = True
+        for token in text.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            match = _REGISTRY_LIST_KV_RE.fullmatch(token + ",")
+            if match is None:
+                raise ParseError(f"unparsable registry array entry: {token!r}")
+            target.append(match.group("value"))
+        return closed
+
+    for raw_line in read_text(GIANT_FILE_REGISTRY).splitlines():
+        line = _strip_toml_comment(raw_line).strip()
+        if not line:
+            continue
+
+        if active_array is not None:
+            if consume_array_tokens(arrays[active_array], line):
+                active_array = None
+            continue
+
+        section = _REGISTRY_SECTION_RE.fullmatch(line)
+        if section:
+            name = section.group("name")
+            if name == "[entry]":
+                current_entry = {}
+                entries.append(current_entry)
+            else:
+                current_entry = None
+            continue
+
+        array_open = _REGISTRY_ARRAY_RE.fullmatch(line)
+        if array_open and array_open.group("name") in _REGISTRY_ARRAY_NAMES:
+            name = array_open.group("name")
+            if name in seen_arrays:
+                raise ParseError(f"duplicate registry array: {name!r}")
+            seen_arrays.add(name)
+            arrays[name] = []
+            current_entry = None
+            if not consume_array_tokens(arrays[name], array_open.group("rest")):
+                active_array = name
+            continue
+
+        if current_entry is not None:
+            kv = _REGISTRY_KV_RE.fullmatch(line)
+            if kv is None:
+                raise ParseError(f"unparsable registry entry line: {line!r}")
+            current_entry[kv.group("key")] = kv.group("value")
+
+    baseline_paths = arrays.get("grandfathered_baseline_paths")
+    return arrays.get("grandfathered", []), entries, baseline_paths
+
+
+def build_giant_registrations(modules: list[ModuleEntry]) -> list[GiantFileRegistration]:
+    """Validate the registry against measured prod-giants and build rows.
+
+    Raises ``ParseError`` (failing generation, and therefore CI) when the
+    registry drifts from reality (#3036):
+
+      * a current prod-giant is registered nowhere (new giant without an
+        owner/deadline/decompose issue);
+      * a registered path is no longer a prod-giant (ghost registration left
+        behind after decomposition);
+      * an ``[[entry]]`` is missing a required field or has a malformed
+        deadline;
+      * a grandfathered path is absent from the frozen
+        ``grandfathered_baseline_paths`` baseline, which would let a new giant
+        skip the owner/deadline/decompose requirement.
+    """
+
+    grandfathered, entries, baseline_paths = load_giant_file_registry()
+    prod_giants = {
+        entry.file_path: entry.prod_line_count
+        for entry in modules
+        if "giant-file" in entry.flags
+    }
+
+    problems: list[str] = []
+    seen: set[str] = set()
+
+    # Closed baseline: `grandfathered` must be a subset of the frozen
+    # `grandfathered_baseline_paths` snapshot. Removing a path (decomposed or
+    # promoted to an [[entry]]) is fine; introducing a brand-new path is not —
+    # this blocks swapping in a new prod-giant to dodge the owner/deadline gate.
+    if baseline_paths is None:
+        problems.append(
+            "missing `grandfathered_baseline_paths` array in "
+            f"{rel_posix(GIANT_FILE_REGISTRY)}"
+        )
+    else:
+        baseline_set = set(baseline_paths)
+        for path in sorted(set(grandfathered) - baseline_set):
+            problems.append(
+                f"grandfathered path {path!r} is not in the frozen "
+                "`grandfathered_baseline_paths` baseline; new giants must be "
+                "registered as an [[entry]] with owner/deadline/decompose_issue "
+                "instead of grandfathered"
+            )
+
+    registrations: list[GiantFileRegistration] = []
+    for entry in entries:
+        missing = [field for field in _REGISTRY_ENTRY_FIELDS if not entry.get(field)]
+        if missing:
+            problems.append(
+                f"[[entry]] {entry.get('file', '<no file>')!r} missing required "
+                f"field(s): {', '.join(missing)}"
+            )
+            continue
+        path = entry["file"]
+        if not _DEADLINE_RE.fullmatch(entry["deadline"]):
+            problems.append(
+                f"[[entry]] {path!r} deadline {entry['deadline']!r} is not YYYY-MM-DD"
+            )
+        if path in seen:
+            problems.append(f"duplicate registry path: {path!r}")
+        seen.add(path)
+        prod = prod_giants.get(path)
+        if prod is None:
+            problems.append(
+                f"ghost registration: [[entry]] {path!r} is no longer a prod-giant "
+                f"(>= {GIANT_FILE_THRESHOLD} prod lines); remove it once decomposed"
+            )
+            continue
+        registrations.append(
+            GiantFileRegistration(
+                file_path=path,
+                owner=entry["owner"],
+                deadline=entry["deadline"],
+                decompose_issue=entry["decompose_issue"],
+                prod_line_count=prod,
+            )
+        )
+
+    for path in grandfathered:
+        if path in seen:
+            problems.append(f"duplicate registry path: {path!r}")
+            continue
+        seen.add(path)
+        prod = prod_giants.get(path)
+        if prod is None:
+            problems.append(
+                f"ghost registration: grandfathered {path!r} is no longer a "
+                f"prod-giant (>= {GIANT_FILE_THRESHOLD} prod lines); remove it"
+            )
+            continue
+        registrations.append(
+            GiantFileRegistration(
+                file_path=path,
+                owner="",
+                deadline="",
+                decompose_issue="",
+                prod_line_count=prod,
+            )
+        )
+
+    unregistered = sorted(set(prod_giants) - seen)
+    for path in unregistered:
+        problems.append(
+            f"unregistered giant: {path!r} has {prod_giants[path]} prod lines "
+            f"(>= {GIANT_FILE_THRESHOLD}) but is missing from "
+            f"{rel_posix(GIANT_FILE_REGISTRY)}; add an [[entry]] with owner, "
+            "deadline, and decompose_issue"
+        )
+
+    if problems:
+        raise ParseError(
+            "giant-file registry drift:\n  - " + "\n  - ".join(sorted(problems))
+        )
+
+    registrations.sort(key=lambda item: item.file_path)
+    return registrations
+
+
+def render_giant_file_registry(registrations: list[GiantFileRegistration]) -> str:
+    tracked = [reg for reg in registrations if reg.deadline]
+    grandfathered = [reg for reg in registrations if not reg.deadline]
+    lines = [
+        "# Giant-file Registry",
+        "",
+        "> Generated by `python3 scripts/generate_inventory_docs.py` from "
+        "`scripts/giant_file_registry.toml`. Do not edit manually.",
+        "",
+        f"- Giant-file threshold: `>= {GIANT_FILE_THRESHOLD}` production lines "
+        "(excludes `#[cfg(test)] mod` blocks).",
+        f"- Registered giant files: `{len(registrations)}`",
+        f"- Tracked (owner + deadline + decompose issue): `{len(tracked)}`",
+        f"- Grandfathered (awaiting owner/deadline backfill or decomposition): "
+        f"`{len(grandfathered)}`",
+        "",
+        "## Tracked Decompositions",
+        "",
+        "| Path | Prod | Owner | Deadline | Decompose Issue |",
+        "| --- | ---: | --- | --- | --- |",
+    ]
+    if tracked:
+        for reg in tracked:
+            lines.append(
+                f"| `{reg.file_path}` | {reg.prod_line_count} | {reg.owner} | "
+                f"{reg.deadline} | {reg.decompose_issue} |"
+            )
+    else:
+        lines.append("| _none_ | | | | |")
+    lines.extend(
+        [
+            "",
+            "## Grandfathered",
+            "",
+            "> Predate the deadline mandate (#3036). Each must be decomposed "
+            "(drops off this list) or promoted to a tracked decomposition with "
+            "an owner and deadline.",
+            "",
+            "| Path | Prod |",
+            "| --- | ---: |",
+        ]
+    )
+    for reg in grandfathered:
+        lines.append(f"| `{reg.file_path}` | {reg.prod_line_count} |")
+    lines.append("")
+    return "\n".join(lines)
 
 
 def extract_call_args(text: str, match: re.Match[str]) -> tuple[str, int]:
@@ -782,8 +1236,12 @@ def render_module_inventory(entries: list[ModuleEntry]) -> str:
         "> Drift policy: see [docs/generated/README.md](README.md#generated-docs-drift-policy).",
         "",
         f"- Production Rust modules: `{len(entries)}`",
-        f"- Giant-file threshold: `>= {GIANT_FILE_THRESHOLD}` lines",
+        f"- Giant-file threshold: `>= {GIANT_FILE_THRESHOLD}` production lines",
         f"- Giant files: `{giant_count}`",
+        "",
+        "> `Prod` excludes lines inside `#[cfg(test)] mod` blocks; the",
+        "> giant-file flag tracks `Prod` so inline test fixtures do not freeze a",
+        "> module (#3036). `Lines` is the raw total for reference.",
         "",
         "## Namespace Summary",
         "",
@@ -797,14 +1255,15 @@ def render_module_inventory(entries: list[ModuleEntry]) -> str:
             "",
             "## Detailed Inventory",
             "",
-            "| Module | Path | Lines | Flags |",
-            "| --- | --- | ---: | --- |",
+            "| Module | Path | Lines | Prod | Test | Flags |",
+            "| --- | --- | ---: | ---: | ---: | --- |",
         ]
     )
     for entry in entries:
         flags = ", ".join(entry.flags) if entry.flags else ""
         lines.append(
-            f"| `{entry.module_path}` | `{entry.file_path}` | {entry.line_count} | {flags} |"
+            f"| `{entry.module_path}` | `{entry.file_path}` | {entry.line_count} | "
+            f"{entry.prod_line_count} | {entry.test_line_count} | {flags} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -865,6 +1324,7 @@ def generated_documents() -> dict[Path, str]:
     by_file, by_name = build_function_index(function_paths)
 
     module_entries = collect_modules()
+    giant_registrations = build_giant_registrations(module_entries)
     route_entries: list[RouteEntry] = []
     for route_path in route_paths:
         route_entries.extend(parse_route_file(route_path, "/api", by_file, by_name))
@@ -887,6 +1347,7 @@ def generated_documents() -> dict[Path, str]:
     return {
         ARCHITECTURE_DOC: render_architecture_doc(),
         GENERATED_DOCS_DIR / "module-inventory.md": render_module_inventory(module_entries),
+        GIANT_FILE_REGISTRY_DOC: render_giant_file_registry(giant_registrations),
         GENERATED_DOCS_DIR / "route-inventory.md": render_route_inventory(route_entries),
         GENERATED_DOCS_DIR / "worker-inventory.md": render_worker_inventory(worker_entries),
     }

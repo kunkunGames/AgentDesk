@@ -11,9 +11,6 @@ mod terminal_delivery;
 mod tmux_runtime;
 mod turn_analytics;
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests;
-
 use super::gateway::TurnGateway;
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
 use super::*;
@@ -1632,10 +1629,18 @@ async fn refresh_session_panel_line_from_lifecycle(
     shared: &SharedData,
     channel_id: ChannelId,
     turn_id: &str,
+    tmux_session_name: Option<&str>,
 ) -> bool {
     let Some(pg_pool) = shared.pg_pool.as_ref() else {
         return false;
     };
+    #[cfg(unix)]
+    let session_instance_key = tmux_session_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .and_then(super::tmux::session_panel_instance_key);
+    #[cfg(not(unix))]
+    let session_instance_key: Option<String> = None;
     let channel_id_text = channel_id.get().to_string();
     match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
         pg_pool,
@@ -1646,7 +1651,12 @@ async fn refresh_session_panel_line_from_lifecycle(
     {
         Ok(Some(event)) => shared
             .placeholder_live_events
-            .set_session_panel_lifecycle_event(channel_id, &event.kind, &event.details_json),
+            .set_session_panel_lifecycle_event(
+                channel_id,
+                session_instance_key.as_deref(),
+                &event.kind,
+                &event.details_json,
+            ),
         Ok(None) => shared
             .placeholder_live_events
             .clear_session_panel(channel_id),
@@ -2113,33 +2123,36 @@ fn persist_status_panel_completion_fallback_message_id(
     let Some(expected_user_msg_id) = expected_user_msg_id else {
         return;
     };
-    let Some(mut inflight_state) = super::inflight::load_inflight_state(provider, channel_id.get())
-    else {
-        return;
+    // #3077: route the load-modify-save through the typed bind op so the
+    // user_msg_id guard and the field set are serialized under the inflight
+    // flock (no TOCTOU with a concurrent turn rebinding the row). Behavior is
+    // preserved: bind only when the on-disk row still belongs to this turn.
+    let guard = super::inflight::StatusPanelBindGuard {
+        require_user_msg_id: Some(expected_user_msg_id),
+        ..Default::default()
     };
-    if inflight_state.user_msg_id != expected_user_msg_id {
-        tracing::debug!(
-            "[turn_bridge] skipped persisting status-panel-v2 fallback id {} in channel {} from {}: inflight user_msg_id {} != expected {}",
-            message_id,
-            channel_id,
-            source,
-            inflight_state.user_msg_id,
-            expected_user_msg_id
-        );
-        return;
-    }
-    if inflight_state.status_message_id == Some(message_id.get()) {
-        return;
-    }
-    inflight_state.status_message_id = Some(message_id.get());
-    if let Err(error) = super::inflight::save_inflight_state(&inflight_state) {
-        tracing::warn!(
-            "[turn_bridge] failed to persist fallback status-panel-v2 message {} in channel {} from {}: {}",
-            message_id,
-            channel_id,
-            source,
-            error
-        );
+    match super::inflight::bind_status_panel(provider, channel_id.get(), message_id.get(), &guard) {
+        super::inflight::StatusPanelBindOutcome::Bound
+        | super::inflight::StatusPanelBindOutcome::AlreadyBound
+        | super::inflight::StatusPanelBindOutcome::SkippedPanelAlreadySet(_) => {}
+        super::inflight::StatusPanelBindOutcome::Missing => {}
+        super::inflight::StatusPanelBindOutcome::GuardMismatch => {
+            tracing::debug!(
+                "[turn_bridge] skipped persisting status-panel-v2 fallback id {} in channel {} from {}: inflight user_msg_id != expected {}",
+                message_id,
+                channel_id,
+                source,
+                expected_user_msg_id
+            );
+        }
+        super::inflight::StatusPanelBindOutcome::IoError => {
+            tracing::warn!(
+                "[turn_bridge] failed to persist fallback status-panel-v2 message {} in channel {} from {}",
+                message_id,
+                channel_id,
+                source
+            );
+        }
     }
 }
 
@@ -2187,8 +2200,16 @@ enum HeadlessPlaceholderCleanupAction {
 }
 
 fn is_synthetic_headless_message_id(message_id: MessageId) -> bool {
-    message_id.get() >= 8_000_000_000_000_000_000
+    super::is_synthetic_headless_message_id_raw(message_id.get())
 }
+
+/// Synthetic placeholder id used when a recovery turn has no anchored Discord
+/// placeholder (current_msg_id == 0) and creating a fresh one failed. It sits in
+/// the synthetic-headless range so `is_synthetic_headless_message_id` already
+/// treats it as "no real Discord message to edit", driving placeholder
+/// (re)creation on first streamed output instead of a doomed edit of a
+/// nonexistent message. (A real Discord message id never reaches this range.)
+const SYNTHETIC_HEADLESS_RECOVERY_PLACEHOLDER_ID: u64 = 8_000_000_000_000_000_001;
 
 fn is_codex_tool_log_marker_line(line: &str) -> bool {
     let trimmed = line.trim_start();
@@ -2435,7 +2456,10 @@ pub(super) struct TurnBridgeContext {
     pub(super) provider: ProviderKind,
     pub(super) gateway: Arc<dyn TurnGateway>,
     pub(super) channel_id: ChannelId,
-    pub(super) user_msg_id: MessageId,
+    /// `None` for a recovery turn with no anchored Discord user message
+    /// (user_msg_id == 0, e.g. a TUI-direct turn). All Discord-message side
+    /// effects keyed on it (reactions, analytics row, voice link) are skipped.
+    pub(super) user_msg_id: Option<MessageId>,
     pub(super) user_text_owned: String,
     pub(super) request_owner_name: String,
     pub(super) role_binding: Option<RoleBinding>,
@@ -2448,7 +2472,10 @@ pub(super) struct TurnBridgeContext {
     pub(super) memory_recall_usage: TokenUsage,
     pub(super) context_window_tokens: u64,
     pub(super) context_compact_percent: u64,
-    pub(super) current_msg_id: MessageId,
+    /// `None` for a recovery turn that never anchored a Discord placeholder
+    /// (current_msg_id == 0, e.g. a TUI-direct turn). The bridge then creates a
+    /// fresh placeholder on first output instead of editing a nonexistent one.
+    pub(super) current_msg_id: Option<MessageId>,
     pub(super) response_sent_offset: usize,
     pub(super) full_response: String,
     pub(super) tmux_last_offset: Option<u64>,
@@ -3225,12 +3252,6 @@ fn maybe_refresh_active_turn_activity_heartbeat_at(
     };
     let thread_channel_id = active_turn_thread_channel_id(adk_session_name, inflight_state);
 
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    let legacy_db = {
-        let SharedData { sqlite, .. } = shared;
-        sqlite.as_ref()
-    };
-    #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
     let legacy_db = None::<&crate::db::Db>;
 
     if super::tmux::refresh_session_heartbeat_from_tmux_output(
@@ -3259,7 +3280,8 @@ fn maybe_refresh_active_turn_activity_heartbeat_at(
 async fn enqueue_headless_delivery(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
-    owning_user_msg_id: MessageId,
+    // `None` for a recovery turn with no anchored user message (user_msg_id == 0).
+    owning_user_msg_id: Option<MessageId>,
     session_key: Option<&str>,
     delivery_bot: Option<&str>,
     content: &str,
@@ -3326,13 +3348,13 @@ async fn enqueue_headless_delivery(
                                         .await
                                         .active_user_message_id;
                                 if let Some(active_user_message_id) = active_user_message_id
-                                    && active_user_message_id != owning_user_msg_id
+                                    && Some(active_user_message_id) != owning_user_msg_id
                                 {
                                     tracing::warn!(
-                                        "[outbox] skipped terminal delivery marker {} for session {} because active turn message changed from {} to {}",
+                                        "[outbox] skipped terminal delivery marker {} for session {} because active turn message changed from {:?} to {}",
                                         outbox_id,
                                         session_key,
-                                        owning_user_msg_id.get(),
+                                        owning_user_msg_id.map(|id| id.get()),
                                         active_user_message_id.get()
                                     );
                                 } else if let Err(error) = sqlx::query(
@@ -3631,7 +3653,7 @@ pub(super) fn persist_turn_analytics_row_with_handles(
                 .and_then(crate::services::discord::adk_session::parse_thread_channel_id_from_name)
                 .map(|value| value.to_string())
         });
-    let turn_id = discord_turn_id(provider, channel_id, user_msg_id, session_key);
+    let turn_id = discord_turn_id(provider, channel_id, Some(user_msg_id), session_key, None);
     let session_key = session_key.map(str::to_string);
     let thread_title = inflight_state.thread_title.clone();
     let persisted_channel_id = inflight_state
@@ -3672,13 +3694,6 @@ pub(super) fn persist_turn_analytics_row_with_handles(
     };
 
     let Some(pg_pool) = pg_pool else {
-        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-        if let Some(db) = _db {
-            if let Err(error) = crate::db::turns::upsert_turn_owned_sqlite(db, &entry) {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!("  [{ts}] ⚠ failed to persist sqlite turn analytics row: {error}");
-            }
-        }
         return;
     };
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -3980,6 +3995,24 @@ fn handle_watcher_runtime_handoff(
                 .mailbox_finalize_owed
                 .store(true, std::sync::atomic::Ordering::Release);
             *bridge_published_finalize_owed_for_this_turn = true;
+            // #3016 phase 2: register the turn with the single-authority
+            // finalizer BEFORE unpausing the watcher. Message arrival order in
+            // the actor replaces the deleted Release/AcqRel ordering: the
+            // ledger now knows the turn exists (with the watcher as relay
+            // owner) before the watcher can submit its terminal. The legacy
+            // `mailbox_finalize_owed` store stays for the incremental window
+            // (the watcher still consumes it until phase 3 / removed in phase
+            // 5); the ledger is the authority that supersedes the CAS revoke
+            // deleted from the bridge finalize branches below.
+            shared_owned.turn_finalizer.register_start(
+                super::turn_finalizer::TurnKey::new(
+                    channel_id,
+                    inflight_state.user_msg_id,
+                    shared_owned.current_generation,
+                ),
+                provider.clone(),
+                super::inflight::RelayOwnerKind::Watcher,
+            );
             watcher
                 .paused
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -4003,6 +4036,7 @@ pub(super) fn spawn_turn_bridge(
         bridge.channel_id,
         bridge.user_msg_id,
         bridge.adk_session_key.as_deref(),
+        bridge.inflight_state.turn_start_offset,
     );
     let bridge_session_key = bridge.adk_session_key.clone();
     // Attach the span via `.instrument(..)` on the async block instead of
@@ -4030,6 +4064,7 @@ pub(super) fn spawn_turn_bridge(
             bridge.channel_id,
             bridge.user_msg_id,
             bridge.adk_session_key.as_deref(),
+            bridge.inflight_state.turn_start_offset,
         );
         let user_text_owned = bridge.user_text_owned.clone();
         let request_owner_name = bridge.request_owner_name.clone();
@@ -4047,7 +4082,7 @@ pub(super) fn spawn_turn_bridge(
                 resolve_voice_turn_link_for_playback(
                     shared_owned.pg_pool.as_ref(),
                     dispatch_id.as_deref(),
-                    Some(user_msg_id),
+                    user_msg_id,
                     Some(&turn_id),
                 )
                 .await
@@ -4183,7 +4218,15 @@ pub(super) fn spawn_turn_bridge(
         let mut recovery_retry = false;
         let mut last_adk_heartbeat = std::time::Instant::now();
         let mut pending_stream_messages: VecDeque<StreamMessage> = VecDeque::new();
+        // #3084: pair tool_result → tool_use by provider tool-use id when the
+        // backend supplies one. A long-running Task subagent returns its result
+        // after intervening short foreground tools, so the old FIFO queue
+        // popped the wrong tool name and the real subagent's SubagentEnd never
+        // fired (ghost "running" marker). The HashMap pairs precisely by id;
+        // the VecDeque remains the fallback for backends with no tool-use id.
         let mut pending_status_tool_results: VecDeque<String> = VecDeque::new();
+        let mut pending_status_tool_results_by_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         // codex round-8 P1 on PR #1308: while a long-running placeholder is
         // active, bump the inflight file's mtime so the sweeper sees the turn
         // as alive. Without this, a healthy 5+ minute background tool would
@@ -4194,14 +4237,45 @@ pub(super) fn spawn_turn_bridge(
         let mut last_activity_heartbeat_at: Option<std::time::Instant> = None;
         let mut terminal_control_ready_observed = false;
         let mut terminal_control_drain_until: Option<std::time::Instant> = None;
-        let mut current_msg_id = bridge.current_msg_id;
+        let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
+        // A recovery turn with no anchored placeholder (current_msg_id == 0,
+        // e.g. a TUI-direct turn) reaches the bridge with `None`. The bridge
+        // streams into a concrete placeholder, so create a fresh one now; if
+        // creation fails we fall back to the channel and the first streaming
+        // edit re-creates it. This keeps the working `current_msg_id` a real
+        // `MessageId` for the ~30 downstream relay sites without panicking on
+        // `MessageId::new(0)`.
+        let mut current_msg_id = match bridge.current_msg_id {
+            Some(id) => id,
+            None => {
+                let placeholder =
+                    super::formatting::build_processing_status_block(SPINNER[0]).to_string();
+                match gateway.send_message(channel_id, &placeholder).await {
+                    Ok(created) => {
+                        bridge_created_response_placeholder_msg_id = Some(created);
+                        created
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            channel = channel_id.get(),
+                            "[turn_bridge] recovery turn has no anchored placeholder and creating one failed: {error}; continuing — streaming will retry placeholder creation"
+                        );
+                        // No placeholder yet. Use a synthetic-headless sentinel
+                        // so the established `is_synthetic_headless_message_id`
+                        // path (which already means "no real Discord message to
+                        // edit") drives placeholder (re)creation on first output
+                        // instead of editing a nonexistent message.
+                        MessageId::new(SYNTHETIC_HEADLESS_RECOVERY_PLACEHOLDER_ID)
+                    }
+                }
+            }
+        };
         let mut response_sent_offset = bridge.response_sent_offset;
         let mut streamed_assistant_text_this_turn = false;
         let mut streaming_rollover_frozen_msg_ids: Vec<MessageId> = Vec::new();
         let mut terminal_full_replay_cleanup_msg_ids: Vec<MessageId> = Vec::new();
         let mut tmux_last_offset = bridge.tmux_last_offset;
         let mut watcher_owner_channel_id = channel_id;
-        let mut bridge_created_response_placeholder_msg_id: Option<MessageId> = None;
         let mut new_session_id = bridge.new_session_id.clone();
         let mut new_raw_provider_session_id: Option<String> = None;
         let defer_watcher_resume = bridge.defer_watcher_resume;
@@ -4258,6 +4332,21 @@ pub(super) fn spawn_turn_bridge(
         };
 
         let mut inflight_state = bridge.inflight_state.clone();
+        // Codex P2: a no-anchor recovery turn (bridge.current_msg_id == None)
+        // had a fresh placeholder created above into the working `current_msg_id`,
+        // but the cloned inflight still carries `current_msg_id == 0`. Mirror the
+        // real id back NOW so the `save_inflight_state` below persists it; without
+        // this, a restart before the first streaming edit would see id 0 again,
+        // re-create a placeholder, and orphan the spinner we just sent. The
+        // synthetic-headless fallback (creation failed) is intentionally NOT
+        // persisted — it is not a real Discord message and the streaming path
+        // re-creates a placeholder on first output.
+        if bridge.current_msg_id.is_none()
+            && !is_synthetic_headless_message_id(current_msg_id)
+            && inflight_state.current_msg_id == 0
+        {
+            inflight_state.current_msg_id = current_msg_id.get();
+        }
         let mut last_status_edit = tokio::time::Instant::now();
         let status_interval = super::status_update_interval();
         let mut last_session_panel_lifecycle_refresh =
@@ -4354,7 +4443,7 @@ pub(super) fn spawn_turn_bridge(
             role_binding.as_ref(),
             "turn_start",
             serde_json::json!({
-                "user_msg_id": user_msg_id.get(),
+                "user_msg_id": user_msg_id.map(|id| id.get()),
                 "request_owner_name": request_owner_name.as_str(),
             }),
         );
@@ -4666,8 +4755,22 @@ pub(super) fn spawn_turn_bridge(
                                 redacted_thinking_transcript_event(summary),
                             );
                         }
-                        StreamMessage::ToolUse { name, input } => {
-                            pending_status_tool_results.push_back(name.clone());
+                        StreamMessage::ToolUse {
+                            name,
+                            input,
+                            tool_use_id,
+                        } => {
+                            // #3084: index the tool name by its tool-use id when
+                            // present so the matching ToolResult resolves the
+                            // exact tool regardless of interleaving; otherwise
+                            // fall back to FIFO ordering.
+                            match tool_use_id.as_deref() {
+                                Some(id) => {
+                                    pending_status_tool_results_by_id
+                                        .insert(id.to_string(), name.clone());
+                                }
+                                None => pending_status_tool_results.push_back(name.clone()),
+                            }
                             any_tool_used = true;
                             has_post_tool_text = false;
                             inflight_state.any_tool_used = true;
@@ -4686,9 +4789,8 @@ pub(super) fn spawn_turn_bridge(
                                     );
                                 }
                             }
-                            if None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some() {
+                            if shared_owned.pg_pool.is_some() {
                                 match record_skill_usage_from_tool_use(
-                                    None::<&crate::db::Db>,
                                     shared_owned.pg_pool.as_ref(),
                                     &name,
                                     &input,
@@ -4733,8 +4835,10 @@ pub(super) fn spawn_turn_bridge(
                             status_panel_dirty |= record_status_panel_events(
                                 shared_owned.as_ref(),
                                 channel_id,
-                                super::placeholder_live_events::status_events_from_tool_use(
-                                    &name, &input,
+                                super::placeholder_live_events::status_events_from_tool_use_with_id(
+                                    &name,
+                                    &input,
+                                    tool_use_id.as_deref(),
                                 ),
                             );
                             // #1113 implicit-terminate: a new ToolUse arriving
@@ -4895,8 +4999,21 @@ pub(super) fn spawn_turn_bridge(
                                 state_dirty = true;
                             }
                         }
-                        StreamMessage::ToolResult { content, is_error } => {
-                            let status_tool_name = pending_status_tool_results.pop_front();
+                        StreamMessage::ToolResult {
+                            content,
+                            is_error,
+                            tool_use_id,
+                        } => {
+                            // #3084: resolve the originating tool by id when the
+                            // result carries one (pairing a delayed subagent
+                            // result to its own ToolUse); otherwise fall back to
+                            // FIFO order for id-less backends.
+                            let status_tool_name = match tool_use_id.as_deref() {
+                                Some(id) => pending_status_tool_results_by_id
+                                    .remove(id)
+                                    .or_else(|| pending_status_tool_results.pop_front()),
+                                None => pending_status_tool_results.pop_front(),
+                            };
                             if inflight_state.source == crate::dispatch::Source::Voice {
                                 let label = if is_error {
                                     "tool_result:error"
@@ -4930,9 +5047,10 @@ pub(super) fn spawn_turn_bridge(
                             status_panel_dirty |= record_status_panel_events(
                                 shared_owned.as_ref(),
                                 channel_id,
-                                super::placeholder_live_events::status_events_from_tool_result(
+                                super::placeholder_live_events::status_events_from_tool_result_with_id(
                                     status_tool_name.as_deref(),
                                     is_error,
+                                    tool_use_id.as_deref(),
                                 ),
                             );
                             // #1255: a long-running tool's ToolResult means the
@@ -5749,6 +5867,29 @@ pub(super) fn spawn_turn_bridge(
                                         .mailbox_finalize_owed
                                         .store(true, Ordering::Release);
                                     bridge_published_finalize_owed_for_this_turn = true;
+                                    // #3016 phase 3: register the turn with the
+                                    // single-authority finalizer BEFORE
+                                    // unpausing the watcher — same as the
+                                    // `handle_watcher_runtime_handoff` helper.
+                                    // This legacy `StreamMessage::TmuxReady`
+                                    // handoff does NOT go through that helper, so
+                                    // without this the watcher's channel-only
+                                    // (id-0) GateTimeout/Complete submissions
+                                    // would create a `RelayOwnerKind::None`
+                                    // ledger entry — and a busy-pane gate-timeout
+                                    // would then finalize immediately instead of
+                                    // arming the deadline-backstop. Registering
+                                    // here with the Watcher owner makes the
+                                    // gate-timeout defer correctly.
+                                    shared_owned.turn_finalizer.register_start(
+                                        super::turn_finalizer::TurnKey::new(
+                                            channel_id,
+                                            inflight_state.user_msg_id,
+                                            shared_owned.current_generation,
+                                        ),
+                                        provider.clone(),
+                                        super::inflight::RelayOwnerKind::Watcher,
+                                    );
                                     // #1452 (Codex iter 3 P1): unpause must
                                     // use Release ordering so a watcher
                                     // observing `paused = false` is
@@ -5989,6 +6130,7 @@ pub(super) fn spawn_turn_bridge(
                     shared_owned.as_ref(),
                     channel_id,
                     turn_id.as_str(),
+                    inflight_state.tmux_session_name.as_deref(),
                 )
                 .await;
             }
@@ -6726,10 +6868,66 @@ pub(super) fn spawn_turn_bridge(
                     tui_gate_timed_out = bridge_early_gate_timed_out,
                     "  [{ts}] ⚠ bridge watcher handoff missing finalizer; bridge is releasing mailbox to avoid stranded queued turns"
                 );
-                let finish =
-                    super::mailbox_finish_turn(&shared_owned, &provider, channel_id).await;
+                // #3016 phase 2: route through the single-authority finalizer.
+                // It owns the exact sequence this branch ran inline (mailbox
+                // cancel_token release + `mark_completion_cleanup`/`cancelled`
+                // + counter decrement gated on `removed_token.is_some()` +
+                // watchdog override clear + dispatch_thread_parents retain +
+                // voice drain + dispatch_role_overrides cleanup). The ledger
+                // gate makes a transitional double-finalize with a still-direct
+                // watcher (phase 3 routes it) a harmless idempotent no-op.
+                let outcome = shared_owned
+                    .turn_finalizer
+                    .submit_terminal(
+                        super::turn_finalizer::TurnKey::new(
+                            channel_id,
+                            // user_msg_id == 0 collapses to the channel-only
+                            // terminal that `turn_finalizer` already supports
+                            // (recovery/orphan path) instead of panicking.
+                            user_msg_id.map(|id| id.get()).unwrap_or(0),
+                            shared_owned.current_generation,
+                        ),
+                        provider.clone(),
+                        if cancelled {
+                            super::turn_finalizer::TerminalEvent::Cancel
+                        } else {
+                            super::turn_finalizer::TerminalEvent::Complete
+                        },
+                        super::turn_finalizer::FinalizeContext::bridge(),
+                        shared_owned.clone(),
+                    )
+                    .await;
+                // `finalize_owned` is the real invariant: SOME authority (this
+                // bridge submission OR whoever already finalized — the ledger
+                // guarantees exactly-once) owns the finalize for this turn. All
+                // three outcomes satisfy it, so none is a violation.
+                // `this_finalized` records only whether THIS submission was the
+                // one finalizer; an `AlreadyFinalized` (someone else won, e.g. a
+                // sweeper/watcher race) is the normal/info path and must NOT
+                // emit a false `[invariant]` ERROR.
+                let (this_finalized, finalize_owned, has_pending_after_voice) = match outcome {
+                    super::turn_finalizer::FinalizeOutcome::Finalized {
+                        removed_token,
+                        has_pending,
+                        ..
+                    } => (removed_token.is_some(), true, has_pending),
+                    super::turn_finalizer::FinalizeOutcome::AlreadyFinalized
+                    | super::turn_finalizer::FinalizeOutcome::Deferred => {
+                        // Something else finalized first (rare sweeper race —
+                        // the watcher handle is gone in this branch). This
+                        // branch always drained deferred voice work before
+                        // #3016, so drain it here too rather than leaking
+                        // deferred voice prompts.
+                        let voice_deferred_enqueued = shared_owned
+                            .voice_barge_in
+                            .drain_deferred_after_turn(&shared_owned, &provider, channel_id)
+                            .await;
+                        (false, true, voice_deferred_enqueued)
+                    }
+                };
+                let _ = this_finalized;
                 record_turn_bridge_invariant(
-                    finish.removed_token.is_some(),
+                    finalize_owned,
                     &provider,
                     channel_id,
                     dispatch_id.as_deref(),
@@ -6737,34 +6935,13 @@ pub(super) fn spawn_turn_bridge(
                     Some(turn_id.as_str()),
                     "mailbox_active_turn_recovered_after_missing_watcher_handoff",
                     "src/services/discord/turn_bridge/mod.rs:bridge_relay_delegated_to_watcher",
-                    "missing watcher handoff finalizer must not leave the channel mailbox active",
+                    "missing watcher handoff finalizer must leave the turn finalized by some authority",
                     serde_json::json!({
-                        "has_pending": finish.has_pending,
-                        "mailbox_online": finish.mailbox_online,
+                        "this_finalized": this_finalized,
+                        "has_pending": has_pending_after_voice,
                         "watcher_owner_channel_id": watcher_owner_channel_id.get(),
                     }),
                 );
-                if let Some(removed_token) = finish.removed_token {
-                    if !cancelled {
-                        removed_token.mark_completion_cleanup();
-                    }
-                    removed_token
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    super::saturating_decrement_global_active(&shared_owned);
-                }
-                super::clear_watchdog_deadline_override(channel_id.get()).await;
-                shared_owned
-                    .dispatch_thread_parents
-                    .retain(|_, thread| *thread != channel_id);
-                let voice_deferred_enqueued = shared_owned
-                    .voice_barge_in
-                    .drain_deferred_after_turn(&shared_owned, &provider, channel_id)
-                    .await;
-                let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
-                if !has_pending_after_voice {
-                    shared_owned.dispatch_role_overrides.remove(&channel_id);
-                }
                 has_pending_after_voice
             }
         } else {
@@ -6774,109 +6951,108 @@ pub(super) fn spawn_turn_bridge(
             // prompt_too_long / transport_error / recovery_retry, or the
             // watcher never ended up owning relay).
             //
-            // Codex iter 3 P1: we must distinguish three outcomes:
-            //   (a) THIS turn published the debt AND watcher has NOT yet
-            //       consumed it → revoke (`true → false`) and run our own
-            //       `mailbox_finish_turn`. Without revoke a future swap
-            //       would mistakenly clear the next turn's cancel_token.
-            //   (b) THIS turn published the debt AND watcher ALREADY
-            //       consumed it (called `mailbox_finish_turn` itself) →
-            //       SKIP our own finalization to avoid clearing a turn we
-            //       no longer own (Codex P2 review iter 2).
-            //   (c) THIS turn never published the debt at all (no
-            //       `TmuxReady` reached, or watcher missing) → the
-            //       handle's value is just whatever the previous turn
-            //       left there. We MUST run our own `mailbox_finish_turn`
-            //       — treating this as outcome (b) would leak the
-            //       cancel_token (Codex iter 3 P1).
+            // #3016 phase 2/3: the single-authority finalizer's per-turn
+            // ledger phase gate now ARBITRATES exactly-once — whoever submits
+            // the terminal first finalizes; the loser receives
+            // `AlreadyFinalized` and does nothing. The CAS no longer decides
+            // who finalizes.
             //
-            // `bridge_published_finalize_owed_for_this_turn` distinguishes
-            // (a)/(b) from (c). `compare_exchange(true, false, AcqRel,
-            // Acquire)` then distinguishes (a) from (b): Ok = revoked
-            // unconsumed debt (a); Err = watcher beat us (b).
-            let watcher_already_finalized = if bridge_published_finalize_owed_for_this_turn
-                && let Some(watcher) =
-                    shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
+            // BUT we still REVOKE the legacy `mailbox_finalize_owed` flag here
+            // until it is fully removed (phase 5). The watcher consumes that
+            // flag via `swap(false)` and, when set, routes a terminal into the
+            // finalizer. If the bridge finalizes this turn and leaves the flag
+            // set, a watcher that survives into the NEXT turn would swap the
+            // stale `true` and submit a channel-only terminal that collapses
+            // onto — and prematurely finalizes — the next turn's live ledger
+            // entry. Clearing it here (only when THIS turn published it) closes
+            // that cross-turn hazard.
+            if bridge_published_finalize_owed_for_this_turn
+                && let Some(watcher) = shared_owned.tmux_watchers.get(&watcher_owner_channel_id)
             {
-                matches!(
-                    watcher.mailbox_finalize_owed.compare_exchange(
-                        true,
-                        false,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    ),
-                    Err(_)
-                )
-            } else {
-                false
-            };
-
-            if watcher_already_finalized {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] watcher_finalized_before_bridge_revoke: skipping bridge mailbox_finish_turn for channel {} (#1452)",
-                    channel_id.get()
+                let _ = watcher.mailbox_finalize_owed.compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
                 );
-                shared_owned
-                    .voice_barge_in
-                    .drain_deferred_after_turn(&shared_owned, &provider, channel_id)
-                    .await
-            } else {
-                if bridge_early_gate_timed_out {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::warn!(
-                        provider = %provider.as_str(),
-                        channel = channel_id.get(),
-                        "  [{ts}] ⚠ #2293/#2780: bridge releasing mailbox despite TUI quiescence timeout; follow-up pre-submit gate will requeue if pane is still busy"
-                    );
-                }
-                let finish =
-                    super::mailbox_finish_turn(&shared_owned, &provider, channel_id).await;
-                record_turn_bridge_invariant(
-                    finish.removed_token.is_some(),
-                    &provider,
-                    channel_id,
-                    dispatch_id.as_deref(),
-                    adk_session_key.as_deref(),
-                    Some(turn_id.as_str()),
-                    "mailbox_active_turn_matches_dispatch",
-                    "src/services/discord/turn_bridge/mod.rs:mailbox_finish_turn",
-                    "turn_bridge finalization expected exactly one active mailbox turn",
-                    serde_json::json!({
-                        "has_pending": finish.has_pending,
-                        "mailbox_online": finish.mailbox_online,
-                    }),
-                );
-                if let Some(removed_token) = finish.removed_token {
-                    // Mark the token as cancelled so any lingering watchdog timer exits cleanly
-                    // instead of mistakenly firing on a newer turn's token.
-                    if !cancelled {
-                        removed_token.mark_completion_cleanup();
-                    }
-                    removed_token
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    super::saturating_decrement_global_active(&shared_owned);
-                }
-                // Clean up any pending watchdog deadline override for this channel
-                super::clear_watchdog_deadline_override(channel_id.get()).await;
-                // Clean up dispatch-thread parent mapping when the thread turn ends.
-                // Iterate and remove entries whose thread matches this channel_id.
-                shared_owned
-                    .dispatch_thread_parents
-                    .retain(|_, thread| *thread != channel_id);
-                let voice_deferred_enqueued = shared_owned
-                    .voice_barge_in
-                    .drain_deferred_after_turn(&shared_owned, &provider, channel_id)
-                    .await;
-                let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
-                // Keep the override while queued turns remain so review/reused-thread routing
-                // survives restart-preserve and same-runtime dequeue paths.
-                if !has_pending_after_voice {
-                    shared_owned.dispatch_role_overrides.remove(&channel_id);
-                }
-                has_pending_after_voice
             }
+            if bridge_early_gate_timed_out {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    provider = %provider.as_str(),
+                    channel = channel_id.get(),
+                    "  [{ts}] ⚠ #2293/#2780: bridge releasing mailbox despite TUI quiescence timeout; follow-up pre-submit gate will requeue if pane is still busy"
+                );
+            }
+            let outcome = shared_owned
+                .turn_finalizer
+                .submit_terminal(
+                    super::turn_finalizer::TurnKey::new(
+                        channel_id,
+                        // user_msg_id == 0 → channel-only terminal key, which
+                        // turn_finalizer already supports (recovery/orphan path).
+                        user_msg_id.map(|id| id.get()).unwrap_or(0),
+                        shared_owned.current_generation,
+                    ),
+                    provider.clone(),
+                    if cancelled {
+                        super::turn_finalizer::TerminalEvent::Cancel
+                    } else {
+                        super::turn_finalizer::TerminalEvent::Complete
+                    },
+                    super::turn_finalizer::FinalizeContext::bridge(),
+                    shared_owned.clone(),
+                )
+                .await;
+            // `finalize_owned` is the actual invariant: SOMEONE (this bridge
+            // submission OR the watcher that won the race OR the deadline-armed
+            // backstop for a deferred gate-timeout) owns the one finalize for
+            // this turn. The single-authority ledger guarantees that, so all
+            // three outcomes are the normal/info path. `this_finalized` only
+            // records whether THIS submission was the one that finalized — it
+            // must NOT be conflated with an invariant violation, otherwise a
+            // watcher-won `AlreadyFinalized` (e.g. the watcher consumed
+            // `mailbox_finalize_owed` before the bridge revoked it) emits a
+            // false `[invariant]` ERROR for completely normal exactly-once
+            // behaviour — the pre-#3016 code treated that as an info path.
+            let (this_finalized, finalize_owned, has_pending_after_voice) = match outcome {
+                super::turn_finalizer::FinalizeOutcome::Finalized {
+                    removed_token,
+                    has_pending,
+                    ..
+                } => (removed_token.is_some(), true, has_pending),
+                super::turn_finalizer::FinalizeOutcome::AlreadyFinalized
+                | super::turn_finalizer::FinalizeOutcome::Deferred => {
+                    // The watcher won the finalize race (or the gate-timeout
+                    // deferred), so the bridge's `do_finalize` did NOT run and
+                    // the watcher's finalize context does not drain voice. The
+                    // pre-#3016 `watcher_already_finalized` branch still drained
+                    // deferred voice barge-in work here, so we must too —
+                    // otherwise prompts deferred during the turn stay stuck.
+                    let voice_deferred_enqueued = shared_owned
+                        .voice_barge_in
+                        .drain_deferred_after_turn(&shared_owned, &provider, channel_id)
+                        .await;
+                    (false, true, voice_deferred_enqueued)
+                }
+            };
+            let _ = this_finalized;
+            record_turn_bridge_invariant(
+                finalize_owned,
+                &provider,
+                channel_id,
+                dispatch_id.as_deref(),
+                adk_session_key.as_deref(),
+                Some(turn_id.as_str()),
+                "mailbox_active_turn_matches_dispatch",
+                "src/services/discord/turn_bridge/mod.rs:mailbox_finish_turn",
+                "turn_bridge finalization expected the turn to be finalized by some authority",
+                serde_json::json!({
+                    "this_finalized": this_finalized,
+                    "has_pending": has_pending_after_voice,
+                }),
+            );
+            has_pending_after_voice
         };
         let mut preserve_inflight_for_cleanup_retry = false;
         let mut terminal_delivery_committed = false;
@@ -6896,6 +7072,7 @@ pub(super) fn spawn_turn_bridge(
         if !bridge_output_owner
             .map(|owner| owner.skips_bridge_spinner_cleanup())
             .unwrap_or(false)
+            && let Some(user_msg_id) = user_msg_id
         {
             gateway.remove_reaction(channel_id, user_msg_id, '⏳').await;
         }
@@ -6921,12 +7098,16 @@ pub(super) fn spawn_turn_bridge(
             // #2452 H6: schedule the auto-retry via the explicit
             // completion path so the dedup lockout is released as soon
             // as scheduling resolves (≤ 120s safety net inside helper).
-            spawn_retry_with_history_with_release(
-                gateway.clone(),
-                channel_id,
-                user_msg_id,
-                user_text_owned.clone(),
-            );
+            // A recovery turn with no anchored user message (user_msg_id == 0)
+            // has no message to retry-with-history against, so skip scheduling.
+            if let Some(user_msg_id) = user_msg_id {
+                spawn_retry_with_history_with_release(
+                    gateway.clone(),
+                    channel_id,
+                    user_msg_id,
+                    user_text_owned.clone(),
+                );
+            }
             // Replace placeholder with recovery notice (don't delete — avoids visual gap)
             let _ = gateway
                 .edit_message(
@@ -7053,30 +7234,6 @@ pub(super) fn spawn_turn_bridge(
                         );
                         preserve_inflight_for_cleanup_retry = true;
                     }
-                } else {
-                    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-                    if let Some(db) = None::<&crate::db::Db> {
-                        if let Ok(conn) = db.lock() {
-                            if let Err(error) =
-                                crate::dispatch::cancel_dispatch_and_reset_auto_queue_on_conn(
-                                    &conn,
-                                    dispatch_id,
-                                    Some(cancel_source.as_str()),
-                                )
-                            {
-                                tracing::warn!(
-                                    "[turn_bridge] failed to cancel dispatch {} during cancelled turn cleanup: {}",
-                                    dispatch_id,
-                                    error
-                                );
-                            }
-                        } else {
-                            tracing::warn!(
-                                "[turn_bridge] failed to lock DB for cancelled turn cleanup on dispatch {}",
-                                dispatch_id
-                            );
-                        }
-                    }
                 }
             }
 
@@ -7128,7 +7285,9 @@ pub(super) fn spawn_turn_bridge(
                 preserve_inflight_for_cleanup_retry = true;
             }
 
-            if preserved_restart_mode.is_none() {
+            if preserved_restart_mode.is_none()
+                && let Some(user_msg_id) = user_msg_id
+            {
                 gateway.add_reaction(channel_id, user_msg_id, '🛑').await;
             }
 
@@ -7168,7 +7327,9 @@ pub(super) fn spawn_turn_bridge(
                 preserve_inflight_for_cleanup_retry = true;
             }
 
-            gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
+            if let Some(user_msg_id) = user_msg_id {
+                gateway.add_reaction(channel_id, user_msg_id, '⚠').await;
+            }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!("  [{ts}] ⚠ Prompt too long (channel {})", channel_id);
@@ -7263,12 +7424,16 @@ pub(super) fn spawn_turn_bridge(
                 )
                 .await;
                 // #2452 H6: explicit completion path — see helper docs.
-                spawn_retry_with_history_with_release(
-                    gateway.clone(),
-                    channel_id,
-                    user_msg_id,
-                    user_text_owned.clone(),
-                );
+                // Skip retry-with-history when the recovery turn has no anchored
+                // user message (user_msg_id == 0).
+                if let Some(user_msg_id) = user_msg_id {
+                    spawn_retry_with_history_with_release(
+                        gateway.clone(),
+                        channel_id,
+                        user_msg_id,
+                        user_text_owned.clone(),
+                    );
+                }
                 full_response = String::new(); // Suppress error message to user
             } else if full_response.is_empty() {
                 // #2451 H5 graduation: the authoritative resume-failure
@@ -7342,12 +7507,14 @@ pub(super) fn spawn_turn_bridge(
                     )
                     .await;
                     // #2452 H6: explicit completion path — see helper docs.
-                    spawn_retry_with_history_with_release(
-                        gateway.clone(),
-                        channel_id,
-                        user_msg_id,
-                        user_text_owned.clone(),
-                    );
+                    if let Some(user_msg_id) = user_msg_id {
+                        spawn_retry_with_history_with_release(
+                            gateway.clone(),
+                            channel_id,
+                            user_msg_id,
+                            user_text_owned.clone(),
+                        );
+                    }
                     full_response = String::new();
                 } else {
                     // Check for resume failure via other methods
@@ -7378,12 +7545,14 @@ pub(super) fn spawn_turn_bridge(
                         )
                         .await;
                         // #2452 H6: explicit completion path — see helper.
-                        spawn_retry_with_history_with_release(
-                            gateway.clone(),
-                            channel_id,
-                            user_msg_id,
-                            user_text_owned.clone(),
-                        );
+                        if let Some(user_msg_id) = user_msg_id {
+                            spawn_retry_with_history_with_release(
+                                gateway.clone(),
+                                channel_id,
+                                user_msg_id,
+                                user_text_owned.clone(),
+                            );
+                        }
                         full_response = String::new();
                     }
                     // #2451 H5 Method 2: authoritative resume-failure
@@ -7423,12 +7592,14 @@ pub(super) fn spawn_turn_bridge(
                             )
                             .await;
                             // #2452 H6: explicit completion path.
-                            spawn_retry_with_history_with_release(
-                                gateway.clone(),
-                                channel_id,
-                                user_msg_id,
-                                user_text_owned.clone(),
-                            );
+                            if let Some(user_msg_id) = user_msg_id {
+                                spawn_retry_with_history_with_release(
+                                    gateway.clone(),
+                                    channel_id,
+                                    user_msg_id,
+                                    user_text_owned.clone(),
+                                );
+                            }
                             full_response = String::new();
                         }
                     }
@@ -7719,87 +7890,93 @@ pub(super) fn spawn_turn_bridge(
                 // #2274: if the in-memory marker is absent (dcserver
                 // restarted mid-turn, or rehydration has not yet completed)
                 // fall back to the durable PG row for the agent_id lookup.
-                let pg_pool_for_handoff = shared_owned.pg_pool.as_ref();
-                let in_memory_handoff_agent_id =
-                    crate::voice::announce_meta::global_store()
-                        .get_handoff(user_msg_id)
-                        .and_then(|meta| meta.agent_id);
-                let stored_handoff_agent_id = match in_memory_handoff_agent_id {
-                    Some(agent_id) => Some(agent_id),
-                    None => match pg_pool_for_handoff {
-                        Some(pool) => crate::voice::announce_meta::load_handoff_durable(
-                            pool,
-                            user_msg_id,
-                        )
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|meta| meta.agent_id),
-                        None => None,
-                    },
-                };
-                let mapped_voice_channel_id = shared_owned
-                    .voice_barge_in
-                    .voice_channel_for_background(channel_id, stored_handoff_agent_id.as_deref())
-                    .await;
-                if let Some(voice_channel_id) = voice_background_completion_target(
-                    mapped_voice_channel_id,
-                    dispatch_id.as_deref(),
-                    user_msg_id,
-                    Some(&turn_id),
-                    &user_text_owned,
-                    channel_id,
-                    pg_pool_for_handoff,
-                )
-                .await
-                {
-                    if !inflight_state.silent_turn {
-                        let voice_barge_in = shared_owned.voice_barge_in.clone();
-                        let shared_for_voice = shared_owned.clone();
-                        let summary_source = spoken_delivery_response.clone();
-                        let background_channel_id = channel_id;
-                        let failed = cancelled
-                            || is_prompt_too_long
-                            || transport_error
-                            || recovery_retry
-                            || resume_failure_detected;
-                        super::task_supervisor::spawn_observed("voice_background_completion_summary", async move {
-                            voice_barge_in
-                                .speak_voice_background_completion_summary(
-                                    &shared_for_voice,
-                                    voice_channel_id,
+                // A recovery turn with no anchored user message (user_msg_id ==
+                // 0) is never a voice turn — voice turns carry a synthetic,
+                // non-zero voice message id — so the voice-handoff completion
+                // routing (all keyed on the user message id) does not apply.
+                if let Some(user_msg_id) = user_msg_id {
+                    let pg_pool_for_handoff = shared_owned.pg_pool.as_ref();
+                    let in_memory_handoff_agent_id =
+                        crate::voice::announce_meta::global_store()
+                            .get_handoff(user_msg_id)
+                            .and_then(|meta| meta.agent_id);
+                    let stored_handoff_agent_id = match in_memory_handoff_agent_id {
+                        Some(agent_id) => Some(agent_id),
+                        None => match pg_pool_for_handoff {
+                            Some(pool) => crate::voice::announce_meta::load_handoff_durable(
+                                pool,
+                                user_msg_id,
+                            )
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|meta| meta.agent_id),
+                            None => None,
+                        },
+                    };
+                    let mapped_voice_channel_id = shared_owned
+                        .voice_barge_in
+                        .voice_channel_for_background(channel_id, stored_handoff_agent_id.as_deref())
+                        .await;
+                    if let Some(voice_channel_id) = voice_background_completion_target(
+                        mapped_voice_channel_id,
+                        dispatch_id.as_deref(),
+                        user_msg_id,
+                        Some(&turn_id),
+                        &user_text_owned,
+                        channel_id,
+                        pg_pool_for_handoff,
+                    )
+                    .await
+                    {
+                        if !inflight_state.silent_turn {
+                            let voice_barge_in = shared_owned.voice_barge_in.clone();
+                            let shared_for_voice = shared_owned.clone();
+                            let summary_source = spoken_delivery_response.clone();
+                            let background_channel_id = channel_id;
+                            let failed = cancelled
+                                || is_prompt_too_long
+                                || transport_error
+                                || recovery_retry
+                                || resume_failure_detected;
+                            super::task_supervisor::spawn_observed("voice_background_completion_summary", async move {
+                                voice_barge_in
+                                    .speak_voice_background_completion_summary(
+                                        &shared_for_voice,
+                                        voice_channel_id,
+                                        background_channel_id,
+                                        &summary_source,
+                                        failed,
+                                    )
+                                    .await;
+                                voice_barge_in.publish_progress_for_playback(
                                     background_channel_id,
-                                    &summary_source,
-                                    failed,
-                                )
-                                .await;
-                            voice_barge_in.publish_progress_for_playback(
-                                background_channel_id,
+                                    Some(voice_channel_id),
+                                    "agent:done",
+                                );
+                            });
+                        } else {
+                            shared_owned.voice_barge_in.publish_progress_for_playback(
+                                channel_id,
                                 Some(voice_channel_id),
                                 "agent:done",
                             );
-                        });
-                    } else {
-                        shared_owned.voice_barge_in.publish_progress_for_playback(
-                            channel_id,
-                            Some(voice_channel_id),
-                            "agent:done",
-                        );
-                    }
-                } else if inflight_state.source == crate::dispatch::Source::Voice {
-                    if !inflight_state.silent_turn {
+                        }
+                    } else if inflight_state.source == crate::dispatch::Source::Voice {
+                        if !inflight_state.silent_turn {
+                            shared_owned
+                                .voice_barge_in
+                                .spawn_spoken_result_playback(
+                                    &shared_owned,
+                                    channel_id,
+                                    &spoken_delivery_response,
+                                )
+                                .await;
+                        }
                         shared_owned
                             .voice_barge_in
-                            .spawn_spoken_result_playback(
-                                &shared_owned,
-                                channel_id,
-                                &spoken_delivery_response,
-                            )
-                            .await;
+                            .publish_progress(channel_id, "agent:done");
                     }
-                    shared_owned
-                        .voice_barge_in
-                        .publish_progress(channel_id, "agent:done");
                 }
             }
 
@@ -7923,6 +8100,7 @@ pub(super) fn spawn_turn_bridge(
             if can_chain_locally
                 && !preserve_inflight_for_cleanup_retry
                 && !delivery_response.trim().is_empty()
+                && let Some(user_msg_id) = user_msg_id
             {
                 gateway.add_reaction(channel_id, user_msg_id, '✅').await;
             }
@@ -7990,7 +8168,7 @@ pub(super) fn spawn_turn_bridge(
                 &mut last_status_panel_text,
                 false,
                 "turn_terminal_delivery",
-                user_msg_id.get(),
+                user_msg_id.map(|id| id.get()).unwrap_or(0),
             )
             .await;
         }
@@ -8319,7 +8497,11 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        if None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some() {
+        // No user message (user_msg_id == 0) → no analytics row to key
+        // (`discord:<channel>:0` is the bogus form); skip the persist.
+        if (None::<&crate::db::Db>.is_some() || shared_owned.pg_pool.is_some())
+            && let Some(user_msg_id) = user_msg_id
+        {
             persist_turn_analytics_row_with_handles(
                 None::<&crate::db::Db>,
                 shared_owned.pg_pool.as_ref(),

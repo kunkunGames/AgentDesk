@@ -1793,6 +1793,10 @@ pub(in crate::services::discord) async fn handle_text_message(
                 } else {
                     None
                 },
+                // #3082 P2-3: this message lost the start-turn race and is now
+                // QUEUED — its "📬" card is a trailing notice that must wait
+                // behind any in-flight multi-chunk answer flush.
+                true,
             )
             .await;
 
@@ -2269,6 +2273,11 @@ pub(in crate::services::discord) async fn handle_text_message(
             } else {
                 None
             },
+            // #3082 P2-3: the active turn started cleanly and we are POSTing its
+            // OWN fresh placeholder (not a queued "📬" notice). It must NOT wait
+            // behind a multi-chunk answer flush — this is the turn doing the
+            // answering, gating it would self-deadlock the active turn's card.
+            false,
         )
         .await
         {
@@ -2308,9 +2317,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             }
         }
     };
-    shared
-        .global_active
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::services::discord::increment_global_active(shared, "intake_after_mailbox_slot");
     shared
         .turn_start_times
         .insert(channel_id, std::time::Instant::now());
@@ -3573,7 +3580,7 @@ pub(in crate::services::discord) async fn handle_text_message(
                 }),
             )),
             channel_id,
-            user_msg_id,
+            user_msg_id: Some(user_msg_id),
             user_text_owned: user_text.to_string(),
             request_owner_name: request_owner_name.to_string(),
             role_binding: role_binding.clone(),
@@ -3592,7 +3599,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             memory_recall_usage: memory_recall.token_usage,
             context_window_tokens: model_context_window,
             context_compact_percent: compact_percent,
-            current_msg_id: placeholder_msg_id,
+            current_msg_id: Some(placeholder_msg_id),
             response_sent_offset: 0,
             full_response: String::new(),
             tmux_last_offset: Some(inflight_offset),

@@ -31,6 +31,18 @@ def _relay_msg(msg_id: int, content: str, ts: str | None = None) -> dict:
     return message
 
 
+def _reply_msg(msg_id: int, content: str, ts: str | None = None) -> dict:
+    message = _relay_msg(msg_id, content, ts=ts)
+    message["type"] = 19
+    return message
+
+
+def _system_msg(msg_id: int, content: str) -> dict:
+    message = _relay_msg(msg_id, content)
+    message["type"] = 7
+    return message
+
+
 def _raw_bot_msg(msg_id: int, content: str, ts: str | None = None) -> dict:
     message = {
         "id": str(msg_id),
@@ -164,6 +176,36 @@ class RelayLatency(unittest.TestCase):
 
 
 class RawChromeAndEditAssertions(unittest.TestCase):
+    def test_direct_input_reply_body_counts_as_relay_response(self):
+        window = _window(
+            _reply_msg(1, "[E2E:E21:HEAD]\nDIRECT_E21_OK\n[E2E:E21:TAIL]")
+        )
+
+        self.assertEqual(len(window.raw_messages), 1)
+        self.assertEqual(len(window.messages), 1)
+        assertions.text_present(window, needle="[E2E:E21:HEAD]")
+        assertions.text_present(window, needle="DIRECT_E21_OK")
+        assertions.text_present(window, needle="[E2E:E21:TAIL]")
+        assertions.ordered_text_present(
+            window,
+            needles=["[E2E:E21:HEAD]", "DIRECT_E21_OK", "[E2E:E21:TAIL]"],
+        )
+        assertions.body_complete(
+            window, head="[E2E:E21:HEAD]", tail="[E2E:E21:TAIL]"
+        )
+
+    def test_status_reply_and_non_reply_system_messages_stay_out_of_relay_surface(self):
+        window = _window(
+            _reply_msg(1, "✅ 응답 완료 [E2E:E21:TAIL]"),
+            _system_msg(2, "[E2E:E21:TAIL]"),
+        )
+
+        self.assertEqual(len(window.raw_messages), 2)
+        self.assertEqual(window.messages, [])
+        assertions.raw_text_present(window, needle="[E2E:E21:TAIL]")
+        with self.assertRaises(assertions.AssertionError):
+            assertions.text_present(window, needle="[E2E:E21:TAIL]")
+
     def test_window_updates_same_message_id_to_final_body(self):
         window = _window(_raw_bot_msg(1, "Processing..."))
         window.add(_relay_msg(1, "final [E2E:EDIT]", ts="2026-05-29T00:00:00Z"))
@@ -339,6 +381,71 @@ class RunAssertionDispatch(unittest.TestCase):
         with self.assertRaises(assertions.AssertionError):
             self.run_assertion(
                 {"provider_hold_marker_seen": "[E2E:E18:OTHER]"},
+                window=window,
+                record=record,
+            )
+
+    def test_fixture_assertion_dispatch_uses_record_state(self):
+        window = _window(_relay_msg(1, "[E2E:E25:FINAL]"))
+        record = {
+            "fixture_state": {
+                "task_notification_kind": "Background",
+                "task_notification_source": "CronCreate",
+                "task_notification_status": "completed",
+                "task_complete_seen": True,
+                "task_complete_turn_id": "turn-1",
+                "result_text_source": "task_complete.last_agent_message",
+                "finalized": True,
+                "active_turn": "none",
+                "followup_ready": True,
+                "followup_probe_accepted": True,
+                "queue_depth": 0,
+                "pending_discord_callback": False,
+            },
+            "fixture_health": {
+                "status": "healthy",
+                "degraded_reasons": [],
+                "active_turn": "none",
+                "queue_depth": 0,
+                "pending_discord_callback": False,
+                "stale_thread_proof": False,
+                "relay_stall_state": "healthy",
+            },
+        }
+
+        self.run_assertion(
+            {
+                "fixture_task_notification": {
+                    "kind": "Background",
+                    "source": "CronCreate",
+                    "status": "completed",
+                }
+            },
+            window=window,
+            record=record,
+        )
+        self.run_assertion({"fixture_finalized": {"active_turn": "none"}}, window=window, record=record)
+        self.run_assertion({"fixture_followup_ready": True}, window=window, record=record)
+        self.run_assertion({"fixture_no_health_degradation": True}, window=window, record=record)
+        self.run_assertion(
+            {
+                "fixture_task_complete_finalized": {
+                    "turn_id": "turn-1",
+                    "result_text_source": "task_complete.last_agent_message",
+                }
+            },
+            window=window,
+            record=record,
+        )
+        self.run_assertion(
+            {"fixture_state": {"followup_probe_accepted": True}},
+            window=window,
+            record=record,
+        )
+
+        with self.assertRaises(assertions.AssertionError):
+            self.run_assertion(
+                {"fixture_task_complete_finalized": {"turn_id": "other"}},
                 window=window,
                 record=record,
             )

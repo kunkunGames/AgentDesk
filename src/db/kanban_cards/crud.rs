@@ -331,22 +331,6 @@ pub async fn card_id_by_issue_number_pg(
         .map_err(|error| format!("postgres lookup failed: {error}"))
 }
 
-pub async fn card_ids_by_issue_number_pg(
-    pool: &PgPool,
-    issue_number: i64,
-) -> Result<Vec<String>, String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT id
-         FROM kanban_cards
-         WHERE github_issue_number = $1
-         ORDER BY id ASC",
-    )
-    .bind(issue_number)
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("{error}"))
-}
-
 pub async fn load_card_pipeline_context_pg(
     pool: &PgPool,
     card_id: &str,
@@ -399,24 +383,6 @@ pub async fn update_card_review_status_pg(
     Ok(())
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub fn resolve_agent_id_from_channel_id_on_conn(
-    conn: &sqlite_test::Connection,
-    channel_id: &str,
-) -> Option<String> {
-    conn.query_row(
-        "SELECT id FROM agents
-         WHERE discord_channel_id = ?1
-            OR discord_channel_alt = ?1
-            OR discord_channel_cc = ?1
-            OR discord_channel_cdx = ?1
-         LIMIT 1",
-        [channel_id],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
 pub async fn resolve_agent_id_from_channel_id_with_pg(
     pool: &PgPool,
     channel_id: &str,
@@ -435,19 +401,6 @@ pub async fn resolve_agent_id_from_channel_id_with_pg(
     .ok()
     .flatten()
     .and_then(|row| row.try_get::<String, _>("id").ok())
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub fn resolve_existing_agent_id_on_conn(
-    conn: &sqlite_test::Connection,
-    agent_id: &str,
-) -> Option<String> {
-    conn.query_row(
-        "SELECT id FROM agents WHERE id = ?1 LIMIT 1",
-        [agent_id],
-        |row| row.get(0),
-    )
-    .ok()
 }
 
 pub async fn resolve_existing_agent_id_with_pg(pool: &PgPool, agent_id: &str) -> Option<String> {

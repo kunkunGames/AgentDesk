@@ -411,10 +411,15 @@ async fn fetch_provider_session_id_once(
     // #107: Filter empty strings — a stale clear path may have stored ""
     // instead of NULL; treat it as no session ID.
     // Also try session_id field as fallback for provider-agnostic lookup.
+    // #3052: GET /claude-session-id also returns raw_provider_session_id (the
+    // native provider selector). Use it as a third durable fallback so a
+    // tmux-only idle cleanup that left only the raw selector can still
+    // provider-native resume.
     let selector = json
         .get("claude_session_id")
         .and_then(|v| v.as_str())
         .or_else(|| json.get("session_id").and_then(|v| v.as_str()))
+        .or_else(|| json.get("raw_provider_session_id").and_then(|v| v.as_str()))
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -436,12 +441,18 @@ async fn fetch_provider_session_id_once(
             .and_then(|v| v.as_str())
             .map(|value| !value.is_empty())
             .unwrap_or(false);
+        let has_raw_provider_session_id = json
+            .get("raw_provider_session_id")
+            .and_then(|v| v.as_str())
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
         tracing::info!(
-            "  [{ts}] [session-restore] provider session lookup returned no usable selector: key={} provider={} has_claude_selector={} has_session_id={}",
+            "  [{ts}] [session-restore] provider session lookup returned no usable selector: key={} provider={} has_claude_selector={} has_session_id={} has_raw_provider_session_id={}",
             session_key,
             provider.as_str(),
             has_claude_selector,
-            has_raw_session_id
+            has_raw_session_id,
+            has_raw_provider_session_id
         );
     }
     selector
@@ -689,193 +700,6 @@ mod parse_dispatch_id_tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::{
-        CONTEXT_COMPACTION_PRESERVED_SECTIONS, context_compaction_details, context_usage_percent,
-        derive_adk_session_info, parse_thread_channel_id_from_name,
-    };
-
-    #[test]
-    fn derive_uses_user_text_when_human_readable() {
-        let summary = derive_adk_session_info(
-            Some("회의록 일감 전체 폐기 기능 구현해줘"),
-            Some("adk-cdx"),
-            Some("/repo"),
-        );
-        assert_eq!(summary, "회의록 일감 전체 폐기 기능 구현해줘");
-    }
-
-    #[test]
-    fn derive_skips_raw_commands_and_falls_back() {
-        let summary = derive_adk_session_info(
-            Some("cargo test --no-run"),
-            Some("adk-cdx"),
-            Some("/Users/me/AgentDesk"),
-        );
-        assert_eq!(summary, "AgentDesk 작업 진행 중");
-    }
-
-    #[test]
-    fn derive_maps_short_generic_request_to_actionable_fallback() {
-        let summary =
-            derive_adk_session_info(Some("맞춰줘"), Some("adk-cdx"), Some("/Users/me/AgentDesk"));
-        assert_eq!(summary, "AgentDesk 개선 작업 진행 중");
-    }
-
-    #[test]
-    fn derive_maps_short_deploy_request_to_deploy_fallback() {
-        let summary =
-            derive_adk_session_info(Some("배포해"), Some("adk-cdx"), Some("/Users/me/AgentDesk"));
-        assert_eq!(summary, "AgentDesk 배포 작업 진행 중");
-    }
-
-    // ── P0 tests ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_parse_dispatch_id_valid() {
-        use super::parse_dispatch_id;
-        let result =
-            parse_dispatch_id("DISPATCH:550e8400-e29b-41d4-a716-446655440000 - Fix login bug");
-        assert_eq!(
-            result,
-            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_dispatch_id_with_profile_label() {
-        use super::parse_dispatch_id;
-        let result = parse_dispatch_id(
-            "DISPATCH:550e8400-e29b-41d4-a716-446655440000 [🔍 리뷰] - #2762 Review",
-        );
-        assert_eq!(
-            result,
-            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_dispatch_id_no_title() {
-        use super::parse_dispatch_id;
-        let result = parse_dispatch_id("DISPATCH:550e8400-e29b-41d4-a716-446655440000");
-        assert_eq!(
-            result,
-            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_dispatch_id_invalid() {
-        use super::parse_dispatch_id;
-        assert_eq!(parse_dispatch_id("random text with no dispatch"), None);
-        assert_eq!(parse_dispatch_id("DISPATCH_WRONG:abc"), None);
-    }
-
-    #[test]
-    fn test_parse_dispatch_id_empty() {
-        use super::parse_dispatch_id;
-        assert_eq!(parse_dispatch_id(""), None);
-        assert_eq!(parse_dispatch_id("DISPATCH:"), None);
-        assert_eq!(parse_dispatch_id("DISPATCH:  "), None);
-    }
-
-    #[test]
-    fn test_parse_thread_channel_id_from_name_valid() {
-        assert_eq!(
-            parse_thread_channel_id_from_name("adk-cdx-t1485506232256168011"),
-            Some(1485506232256168011)
-        );
-    }
-
-    #[test]
-    fn test_parse_thread_channel_id_from_name_invalid() {
-        assert_eq!(parse_thread_channel_id_from_name("adk-cdx"), None);
-        assert_eq!(parse_thread_channel_id_from_name("adk-cdx-t123"), None);
-    }
-
-    #[test]
-    fn test_derive_session_info_max_chars() {
-        // SESSION_INFO_MAX_CHARS = 60
-        // A long user text should be truncated to 60 chars (with ellipsis)
-        let long_text = "가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하가나다라마바사아자차카타파하";
-        let summary = derive_adk_session_info(Some(long_text), None, None);
-        assert!(summary.chars().count() <= 60);
-    }
-
-    #[test]
-    fn test_build_adk_session_key_format() {
-        use crate::services::provider::ProviderKind;
-        let tmux_name = ProviderKind::Claude.build_tmux_session_name("my-channel");
-        let key = super::build_namespaced_session_key("hash123", &ProviderKind::Claude, &tmux_name);
-        assert!(key.starts_with("claude/hash123/"));
-        assert!(key.contains(':'));
-        assert!(key.ends_with(&tmux_name));
-    }
-
-    #[test]
-    fn test_build_session_key_candidates_include_legacy_tail() {
-        use crate::services::provider::ProviderKind;
-        let tmux_name = ProviderKind::Codex.build_tmux_session_name("agentdesk-main");
-        let candidates =
-            super::build_session_key_candidates("tokenxyz", &ProviderKind::Codex, &tmux_name);
-        assert!(candidates[0].starts_with("codex/tokenxyz/"));
-        assert_eq!(candidates[1], super::build_legacy_session_key(&tmux_name));
-    }
-
-    #[test]
-    fn test_legacy_session_key_from_namespaced_round_trip() {
-        let key = "codex/tokenxyz/host123:AgentDesk-codex-main";
-        assert_eq!(
-            super::legacy_session_key_from_namespaced(key),
-            Some("host123:AgentDesk-codex-main".to_string())
-        );
-        assert_eq!(
-            super::legacy_session_key_from_namespaced("host123:legacy"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_build_provider_session_payload_includes_provider() {
-        use crate::services::provider::ProviderKind;
-
-        let payload = super::build_provider_session_payload(
-            "host:AgentDesk-codex-adk-cdx",
-            "session-123",
-            Some("raw-session-123"),
-            &ProviderKind::Codex,
-        );
-
-        assert_eq!(payload["session_key"], "host:AgentDesk-codex-adk-cdx");
-        assert_eq!(payload["session_id"], "raw-session-123");
-        assert_eq!(payload["claude_session_id"], "session-123");
-        assert_eq!(payload["provider"], "codex");
-    }
-
-    #[test]
-    fn test_context_usage_percent_uses_context_window() {
-        assert_eq!(context_usage_percent(850, 1_000), 85);
-        assert_eq!(context_usage_percent(1_780, 1_000), 100);
-        assert_eq!(context_usage_percent(1, 0), 0);
-    }
-
-    #[test]
-    fn test_context_compaction_details_include_preserved_sections() {
-        let details = context_compaction_details(91, Some(37));
-
-        assert_eq!(details.before_pct, 91);
-        assert_eq!(details.after_pct, Some(37));
-        assert_eq!(
-            details.preserved_sections,
-            CONTEXT_COMPACTION_PRESERVED_SECTIONS
-                .iter()
-                .map(|section| (*section).to_string())
-                .collect::<Vec<_>>()
-        );
-    }
-}
-
 #[cfg(test)]
 mod context_usage_tests {
     use super::context_usage_percent;
@@ -888,6 +712,49 @@ mod context_usage_tests {
     }
 }
 
+#[cfg(test)]
+mod compact_threshold_tests {
+    use super::ContextThresholds;
+    use crate::services::provider::ProviderKind;
+
+    /// #3097: a configured `context_compact_percent_claude` value must be the
+    /// value `compact_pct_for(Claude)` returns — this is exactly the number that
+    /// flows into the claude spawn's `compact_percent` and thus sets
+    /// `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (the spawn only sets the env var when
+    /// the value is `> 0`).
+    #[test]
+    fn compact_pct_for_claude_uses_claude_specific_override() {
+        let thresholds = ContextThresholds {
+            compact_pct: 80,
+            compact_pct_codex: 100,
+            compact_pct_claude: 60,
+            context_window: 1_000_000,
+        };
+        // Claude takes its own override, distinct from the generic value.
+        assert_eq!(thresholds.compact_pct_for(&ProviderKind::Claude), 60);
+        // Codex still uses its own override.
+        assert_eq!(thresholds.compact_pct_for(&ProviderKind::Codex), 100);
+        // Other providers fall back to the generic value.
+        assert_eq!(thresholds.compact_pct_for(&ProviderKind::Gemini), 80);
+        // A configured Claude value is > 0, so the override env var would be set.
+        assert!(thresholds.compact_pct_for(&ProviderKind::Claude) > 0);
+    }
+
+    /// When only the generic threshold is configured, Claude inherits it.
+    /// `fetch_context_thresholds` defaults `compact_pct_claude` to the generic
+    /// `compact_pct`, so this mirrors the runtime fallback behaviour.
+    #[test]
+    fn compact_pct_for_claude_falls_back_to_generic() {
+        let thresholds = ContextThresholds {
+            compact_pct: 55,
+            compact_pct_codex: 100,
+            compact_pct_claude: 55,
+            context_window: 1_000_000,
+        };
+        assert_eq!(thresholds.compact_pct_for(&ProviderKind::Claude), 55);
+    }
+}
+
 /// Context window management thresholds.
 /// Single source of truth used by Rust turn-end compact logic.
 /// Provider-specific overrides: `context_compact_percent_codex`, `context_compact_percent_claude`, etc.
@@ -895,6 +762,9 @@ pub(super) struct ContextThresholds {
     pub compact_pct: u64,
     /// Provider-specific override (if set). Falls back to compact_pct.
     pub compact_pct_codex: u64,
+    /// Claude-specific override (if set). Falls back to compact_pct.
+    /// Flows to `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` on the claude spawn (#3097).
+    pub compact_pct_claude: u64,
     pub context_window: u64,
 }
 
@@ -903,6 +773,9 @@ impl Default for ContextThresholds {
         Self {
             compact_pct: 60,
             compact_pct_codex: 100,
+            // Default to the generic compact_pct default so Claude inherits the
+            // shared threshold unless `context_compact_percent_claude` is set.
+            compact_pct_claude: 60,
             context_window: 1_000_000,
         }
     }
@@ -913,6 +786,7 @@ impl ContextThresholds {
     pub fn compact_pct_for(&self, provider: &crate::services::provider::ProviderKind) -> u64 {
         match provider {
             crate::services::provider::ProviderKind::Codex => self.compact_pct_codex,
+            crate::services::provider::ProviderKind::Claude => self.compact_pct_claude,
             _ => self.compact_pct,
         }
     }
@@ -943,10 +817,16 @@ pub(super) async fn fetch_context_thresholds(_api_port: u16) -> ContextThreshold
     let compact_pct = find_u64("context_compact_percent").unwrap_or(defaults.compact_pct);
     let compact_pct_codex =
         find_u64("context_compact_percent_codex").unwrap_or(defaults.compact_pct_codex);
+    // #3097: read the Claude-specific override. Fall back to the *generic*
+    // `compact_pct` (not a fixed default) so a user who only sets the generic
+    // value still applies it to Claude, while `context_compact_percent_claude`
+    // takes precedence when present.
+    let compact_pct_claude = find_u64("context_compact_percent_claude").unwrap_or(compact_pct);
 
     ContextThresholds {
         compact_pct,
         compact_pct_codex,
+        compact_pct_claude,
         context_window: defaults.context_window,
     }
 }

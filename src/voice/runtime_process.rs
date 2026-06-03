@@ -33,6 +33,9 @@ impl Default for VoiceRuntimeProcessConfig {
 }
 
 impl VoiceRuntimeProcessConfig {
+    // reason: out-of-process voice runtime launch is wired only when the voice
+    // runtime process is enabled; no compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn launch_spec(&self) -> Option<VoiceRuntimeLaunchSpec> {
         if !self.enabled {
             return None;
@@ -48,6 +51,9 @@ impl VoiceRuntimeProcessConfig {
     }
 }
 
+// reason: out-of-process voice runtime surface; wired only when the voice
+// runtime process is enabled, which no compile target exercises. See #3034.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VoiceRuntimeLaunchSpec {
     pub executable: PathBuf,
@@ -56,11 +62,17 @@ pub(crate) struct VoiceRuntimeLaunchSpec {
     pub protocol_version: u16,
 }
 
+// reason: out-of-process voice runtime surface; wired only when the voice
+// runtime process is enabled, which no compile target exercises. See #3034.
+#[allow(dead_code)]
 #[async_trait]
 pub(crate) trait VoiceRuntimeProcessSupervisor: Send + Sync {
     async fn start(&self, spec: VoiceRuntimeLaunchSpec) -> Result<Box<dyn VoiceRuntimeProcess>>;
 }
 
+// reason: out-of-process voice runtime surface; wired only when the voice
+// runtime process is enabled, which no compile target exercises. See #3034.
+#[allow(dead_code)]
 #[async_trait]
 pub(crate) trait VoiceRuntimeProcess: Send + Sync {
     fn protocol_version(&self) -> u16;
@@ -68,6 +80,9 @@ pub(crate) trait VoiceRuntimeProcess: Send + Sync {
     async fn stop(&self) -> Result<()>;
 }
 
+// reason: out-of-process voice runtime surface; wired only when the voice
+// runtime process is enabled, which no compile target exercises. See #3034.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct DisabledVoiceRuntimeProcessSupervisor;
 
@@ -80,6 +95,9 @@ impl VoiceRuntimeProcessSupervisor for DisabledVoiceRuntimeProcessSupervisor {
     }
 }
 
+// reason: out-of-process voice runtime surface; wired only when the voice
+// runtime process is enabled, which no compile target exercises. See #3034.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(crate) struct TokioVoiceRuntimeProcessSupervisor;
 
@@ -108,6 +126,9 @@ impl VoiceRuntimeProcessSupervisor for TokioVoiceRuntimeProcessSupervisor {
     }
 }
 
+// reason: out-of-process voice runtime surface; wired only when the voice
+// runtime process is enabled, which no compile target exercises. See #3034.
+#[allow(dead_code)]
 struct TokioVoiceRuntimeProcess {
     protocol_version: u16,
     child: Mutex<Child>,

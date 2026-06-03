@@ -66,6 +66,7 @@ async fn schedule_post_cancel_queue_drain(
 /// any persisted queue file for this channel across the provider's token
 /// namespaces.
 async fn force_purge_channel_mailbox(
+    health_registry: Option<&Arc<HealthRegistry>>,
     target: &TurnLifecycleTarget,
     session_key: Option<&str>,
 ) -> Option<usize> {
@@ -95,15 +96,38 @@ async fn force_purge_channel_mailbox(
         &token_hash,
         None,
     );
-    let purged = handle.purge_queue(persistence).await;
+    // #3029(D): force purge must also release the active-turn anchor so the
+    // next dispatch is not blocked by a stale `cancel_token` /
+    // `active_user_message_id`. The handler only clears an anchor whose token
+    // is already `cancelled` (the force-kill above flipped it), so a fresh
+    // turn that raced in after the kill keeps its anchor (#2706).
+    let purge = handle.purge_queue(persistence, true).await;
+    let purged = purge.drained;
     tracing::info!(
         provider = provider.as_str(),
         channel_id = channel_id.get(),
         purged,
         disk_files_removed,
+        cleared_active_anchor = purge.cleared_active_anchor,
         session_key,
         "force purged channel mailbox queue"
     );
+    let finish = crate::services::discord::health::finish_cancelled_provider_channel_mailbox(
+        health_registry.map(Arc::as_ref),
+        Some(provider.as_str()),
+        Some(channel_id.get()),
+        "queue_api_force_cancel_post_purge",
+    )
+    .await;
+    if finish.cleared_active_turn {
+        tracing::info!(
+            provider = provider.as_str(),
+            channel_id = channel_id.get(),
+            global_active_decremented = finish.global_active_decremented,
+            runtime_session_cleared = finish.runtime_session_cleared,
+            "force purge finalized cancelled active mailbox turn"
+        );
+    }
     Some(purged)
 }
 
@@ -611,7 +635,7 @@ impl QueueService {
         // default preserve branch re-hydrates the disk queue back into the
         // mailbox; force is the opposite operation.
         let queue_purged_count = if force {
-            force_purge_channel_mailbox(&target, session_key.as_deref()).await
+            force_purge_channel_mailbox(health_registry, &target, session_key.as_deref()).await
         } else {
             None
         };
@@ -900,7 +924,7 @@ mod tests {
             tmux_name: String::new(),
         };
 
-        let purged = force_purge_channel_mailbox(&target, None).await;
+        let purged = force_purge_channel_mailbox(None, &target, None).await;
 
         assert_eq!(purged, Some(1));
         assert!(handle.snapshot().await.intervention_queue.is_empty());

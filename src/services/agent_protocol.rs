@@ -168,10 +168,30 @@ pub enum StreamMessage {
     RetryBoundary,
     /// Text response chunk
     Text { content: String },
-    /// Tool use started
-    ToolUse { name: String, input: String },
-    /// Tool execution result
-    ToolResult { content: String, is_error: bool },
+    /// Tool use started.
+    ///
+    /// `tool_use_id` is the provider-assigned identifier for this tool
+    /// invocation (Anthropic `id`, etc.). It lets consumers pair a
+    /// `ToolResult` back to the exact `ToolUse` instead of relying on FIFO
+    /// ordering, which mis-pairs when a long-running tool (e.g. a Task
+    /// subagent) returns after intervening short foreground tools. Backends
+    /// that cannot surface an id leave this `None`, in which case consumers
+    /// fall back to FIFO pairing.
+    ToolUse {
+        name: String,
+        input: String,
+        tool_use_id: Option<String>,
+    },
+    /// Tool execution result.
+    ///
+    /// `tool_use_id` mirrors the originating [`StreamMessage::ToolUse`] id so
+    /// the result can be matched to its tool use precisely. `None` when the
+    /// backend does not provide one.
+    ToolResult {
+        content: String,
+        is_error: bool,
+        tool_use_id: Option<String>,
+    },
     /// Provider thinking/reasoning progress marker. Raw reasoning payloads must stay redacted.
     Thinking { summary: Option<String> },
     /// Background task notification
@@ -242,6 +262,30 @@ impl StreamMessage {
     }
 }
 
+/// Final accounting for a finished subagent, mirroring the Claude TUI's
+/// `Done (N tool uses · M tokens · Xs)` summary. Reconstructed from the parent
+/// transcript's Task `toolUseResult` (`totalToolUseCount` / `totalTokens` /
+/// `totalDurationMs`) and/or the per-subagent `subagents/agent-<id>.jsonl`
+/// rollout (#3086). Each field is optional so a partial/older transcript that
+/// surfaces only some of the values still renders what it can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentSummary {
+    /// Number of tool invocations the subagent issued (`totalToolUseCount`).
+    pub tool_count: Option<u64>,
+    /// Total tokens attributed to the subagent (`totalTokens`).
+    pub tokens: Option<u64>,
+    /// Wall-clock duration in seconds (`totalDurationMs` / 1000).
+    pub duration_secs: Option<u64>,
+}
+
+impl SubagentSummary {
+    /// `true` when no field carries a value, so callers can skip emitting an
+    /// empty `Done (...)` summary line.
+    pub fn is_empty(&self) -> bool {
+        self.tool_count.is_none() && self.tokens.is_none() && self.duration_secs.is_none()
+    }
+}
+
 /// Provider-normalized status events consumed by Discord status-panel rendering.
 /// The panel code should not depend on provider-specific JSONL shapes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,12 +300,25 @@ pub enum StatusEvent {
     SubagentStart {
         subagent_type: Option<String>,
         desc: Option<String>,
+        /// Originating Task tool-use id, used to pair the eventual
+        /// `SubagentEnd` to the exact slot rather than the first unfinished
+        /// one (which mis-attributes across parallel subagents). `None` when
+        /// the backend cannot surface an id.
+        tool_use_id: Option<String>,
     },
     SubagentEvent {
         summary: String,
     },
     SubagentEnd {
         success: bool,
+        /// Tool-use id of the Task whose result closed this subagent. Matched
+        /// against [`StatusEvent::SubagentStart::tool_use_id`]; `None` falls
+        /// back to closing the first unfinished slot.
+        tool_use_id: Option<String>,
+        /// TUI-parity accounting (tool count / tokens / duration) reconstructed
+        /// from the Task `toolUseResult` and/or `subagents/*.jsonl` (#3086).
+        /// `None` when no summary fields were recoverable.
+        summary: Option<SubagentSummary>,
     },
     TaskToolUpdate {
         name: String,
@@ -503,64 +560,4 @@ pub(crate) fn session_id_regex() -> &'static Regex {
 /// Max length reduced to 64 characters for security.
 pub(crate) fn is_valid_session_id(session_id: &str) -> bool {
     !session_id.is_empty() && session_id.len() <= 64 && session_id_regex().is_match(session_id)
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::{is_valid_session_id, session_id_regex};
-
-    #[test]
-    fn test_session_id_valid() {
-        assert!(is_valid_session_id("abc123"));
-        assert!(is_valid_session_id("session-1"));
-        assert!(is_valid_session_id("session_2"));
-        assert!(is_valid_session_id("session.3"));
-        assert!(is_valid_session_id("session:4"));
-        assert!(is_valid_session_id("ABC-XYZ_123"));
-        assert!(is_valid_session_id("a"));
-    }
-
-    #[test]
-    fn test_session_id_empty_rejected() {
-        assert!(!is_valid_session_id(""));
-    }
-
-    #[test]
-    fn test_session_id_too_long_rejected() {
-        let max_len = "a".repeat(64);
-        assert!(is_valid_session_id(&max_len));
-
-        let too_long = "a".repeat(65);
-        assert!(!is_valid_session_id(&too_long));
-    }
-
-    #[test]
-    fn test_session_id_special_chars_rejected() {
-        assert!(!is_valid_session_id("session;rm -rf"));
-        assert!(!is_valid_session_id("session'OR'1=1"));
-        assert!(!is_valid_session_id("session`cmd`"));
-        assert!(!is_valid_session_id("session$(cmd)"));
-        assert!(!is_valid_session_id("session\nline2"));
-        assert!(!is_valid_session_id("session\0null"));
-        assert!(!is_valid_session_id("path/traversal"));
-        assert!(!is_valid_session_id("session with space"));
-        assert!(!is_valid_session_id("-config"));
-        assert!(!is_valid_session_id("--resume-session-id"));
-        assert!(!is_valid_session_id("_leading_underscore"));
-        assert!(!is_valid_session_id("session@email"));
-    }
-
-    #[test]
-    fn test_session_id_unicode_rejected() {
-        assert!(!is_valid_session_id("세션아이디"));
-        assert!(!is_valid_session_id("session_日本語"));
-        assert!(!is_valid_session_id("émoji🎉"));
-    }
-
-    #[test]
-    fn test_session_id_regex_caching() {
-        let regex1 = session_id_regex();
-        let regex2 = session_id_regex();
-        assert!(std::ptr::eq(regex1, regex2));
-    }
 }

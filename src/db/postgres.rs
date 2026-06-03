@@ -358,6 +358,9 @@ pub async fn applied_migration_checksum_mismatch_details(
     Ok(mismatches)
 }
 
+// reason: public migration-diagnostics wrapper surfaced by maintenance paths,
+// not by every compile target. See #3034.
+#[allow(dead_code)]
 pub async fn applied_migration_checksum_mismatches(pool: &PgPool) -> Result<Vec<i64>, String> {
     Ok(applied_migration_checksum_mismatch_details(pool)
         .await?

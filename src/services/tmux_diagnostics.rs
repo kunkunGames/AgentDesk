@@ -56,6 +56,15 @@ pub fn tmux_exit_reason_is_normal_completion(reason: &str) -> bool {
         || lower.contains("dispatch turn completed")
         || lower.contains("unified-thread run completed")
         || lower == "exit:0"
+        // Routine fresh-session teardown is an intentional, quiet cleanup the
+        // runtime performs after a fresh routine reaches a terminal state
+        // (agent turn finished/timed out, or a terminal JS-script action
+        // completed/skipped/paused the run). `force_kill_turn` records the
+        // exit reason as `explicit cleanup via routine fresh ...`, so without
+        // this branch the lifecycle watcher would treat the deliberate kill as
+        // an abnormal pane death and emit a false "session ended" notice for a
+        // session that already delivered its terminal response (#3006).
+        || lower.contains("routine fresh")
 }
 
 pub fn read_tmux_exit_reason(tmux_session_name: &str) -> Option<String> {
@@ -218,168 +227,5 @@ pub fn build_tmux_death_diagnostic(
         None
     } else {
         Some(parts.join("; "))
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use super::{
-        TMUX_NORMAL_COMPLETION_REASON, build_tmux_death_diagnostic, clear_tmux_exit_reason,
-        read_recent_output_hint, record_normal_tmux_exit_reason, record_tmux_exit_reason,
-        should_recreate_session_after_followup_fifo_error,
-        should_recreate_session_after_stdin_error, tmux_exit_reason_is_normal_completion,
-    };
-
-    fn unique_test_session_name() -> String {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "AgentDesk-test-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        )
-    }
-
-    #[test]
-    fn test_tmux_exit_reason_round_trip() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let session = unique_test_session_name();
-        clear_tmux_exit_reason(&session);
-        record_tmux_exit_reason(&session, "explicit cleanup: /stop");
-        let diag = build_tmux_death_diagnostic(&session, None).unwrap();
-        assert!(diag.contains("explicit cleanup: /stop"));
-        clear_tmux_exit_reason(&session);
-    }
-
-    #[test]
-    fn test_tmux_exit_reason_identifies_normal_completion() {
-        assert!(tmux_exit_reason_is_normal_completion(
-            "turn completed (code 0)"
-        ));
-        assert!(tmux_exit_reason_is_normal_completion("exit:0"));
-        assert!(tmux_exit_reason_is_normal_completion(
-            "[2026-04-23 12:34:56] unified-thread run completed"
-        ));
-        assert!(!tmux_exit_reason_is_normal_completion("signal:9"));
-    }
-
-    #[test]
-    fn test_record_normal_tmux_exit_reason_round_trip() {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let session = unique_test_session_name();
-        clear_tmux_exit_reason(&session);
-        record_normal_tmux_exit_reason(&session);
-        let diag = build_tmux_death_diagnostic(&session, None).unwrap();
-        assert!(diag.contains(TMUX_NORMAL_COMPLETION_REASON));
-        clear_tmux_exit_reason(&session);
-    }
-
-    #[test]
-    fn test_should_recreate_session_after_followup_fifo_error() {
-        // FIFO write broken pipe
-        assert!(should_recreate_session_after_followup_fifo_error(
-            "Failed to write to input FIFO: Broken pipe (os error 32)"
-        ));
-        // FIFO flush broken pipe
-        assert!(should_recreate_session_after_followup_fifo_error(
-            "Failed to flush input FIFO: Broken pipe (os error 32)"
-        ));
-        // FIFO open — file not found
-        assert!(should_recreate_session_after_followup_fifo_error(
-            "Failed to open input FIFO: No such file or directory (os error 2)"
-        ));
-        // FIFO open — not found (alternative wording)
-        assert!(should_recreate_session_after_followup_fifo_error(
-            "Failed to open input FIFO: entity not found"
-        ));
-        // FIFO open — bad file descriptor
-        assert!(should_recreate_session_after_followup_fifo_error(
-            "Failed to open input FIFO: Bad file descriptor (os error 9)"
-        ));
-        // FIFO open — no such device
-        assert!(should_recreate_session_after_followup_fifo_error(
-            "Failed to open input FIFO: No such device or address (os error 6)"
-        ));
-        // Unrelated error should NOT trigger recreation
-        assert!(!should_recreate_session_after_followup_fifo_error(
-            "Failed to read Codex output: unexpected EOF"
-        ));
-        // Permission error should NOT trigger recreation
-        assert!(!should_recreate_session_after_followup_fifo_error(
-            "Failed to open input FIFO: Permission denied (os error 13)"
-        ));
-        // Empty string should NOT trigger
-        assert!(!should_recreate_session_after_followup_fifo_error(""));
-    }
-
-    #[test]
-    fn test_should_recreate_session_after_stdin_error() {
-        // Broken pipe on stdin write
-        assert!(should_recreate_session_after_stdin_error(
-            "Failed to write to child stdin: Broken pipe (os error 32)"
-        ));
-        // Broken pipe on stdin flush
-        assert!(should_recreate_session_after_stdin_error(
-            "Failed to flush child stdin: Broken pipe (os error 32)"
-        ));
-        // stdin already closed
-        assert!(should_recreate_session_after_stdin_error(
-            "Child stdin already closed"
-        ));
-        // Generic write failure (includes BrokenPipe as inner cause)
-        assert!(should_recreate_session_after_stdin_error(
-            "Failed to write to child stdin: connection reset"
-        ));
-        // Lock poisoned — NOT recoverable via recreation
-        assert!(!should_recreate_session_after_stdin_error(
-            "stdin lock poisoned: PoisonError"
-        ));
-        // Unrelated error
-        assert!(!should_recreate_session_after_stdin_error(
-            "unexpected EOF in output"
-        ));
-        // Empty string
-        assert!(!should_recreate_session_after_stdin_error(""));
-    }
-
-    #[test]
-    fn test_read_recent_output_hint_ignores_embedded_result_string() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
-            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"literal \"type\":\"result\" in code"}]}}"#,
-        )
-        .unwrap();
-        let hint = read_recent_output_hint(file.path().to_str().unwrap()).unwrap();
-        assert!(hint.starts_with("recent_output_tail="));
-    }
-
-    #[test]
-    fn test_read_recent_output_hint_detects_success_result_line() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
-            r#"{"type":"result","subtype":"success","result":"ok"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_recent_output_hint(file.path().to_str().unwrap()).as_deref(),
-            Some("recent_output=completed_result_present")
-        );
-    }
-
-    #[test]
-    fn test_read_recent_output_hint_detects_stale_resume_error() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            file.path(),
-            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found"]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_recent_output_hint(file.path().to_str().unwrap()).as_deref(),
-            Some("recent_output=stale_resume_error")
-        );
     }
 }

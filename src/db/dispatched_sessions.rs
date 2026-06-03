@@ -20,22 +20,6 @@ pub(crate) async fn load_dispatch_thread_id_pg(pool: &PgPool, dispatch_id: &str)
     normalize_thread_channel_id(thread_id.as_deref())
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) fn load_dispatch_thread_id_sqlite(
-    conn: &sqlite_test::Connection,
-    dispatch_id: &str,
-) -> Option<String> {
-    let thread_id: Option<String> = conn
-        .query_row(
-            "SELECT thread_id FROM task_dispatches WHERE id = ?1",
-            [dispatch_id],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
-    normalize_thread_channel_id(thread_id.as_deref())
-}
-
 #[derive(Debug)]
 pub(crate) struct RetryDispatchMeta {
     pub(crate) card_id: String,
@@ -867,10 +851,20 @@ mod dispatch_surface_tests {
 
     #[test]
     fn delivery_state_uppercase_status_is_normalized() {
-        // Defensive: callers occasionally write status values uppercase.
+        // Defensive: callers occasionally write status values uppercase, so
+        // classify_delivery_state lowercases before matching.
+        // NOTE: per #2036, sent_at dominates session_is_working — so a
+        // DISPATCHED turn only reads "codex_active" once sent_at is set
+        // (the bridge handed the prompt to codex); with sent_at unset it is
+        // still "queued". This test pins the case-normalization, not the
+        // sent_at gating, so it passes sent_at_is_set=true for the active case.
+        assert_eq!(
+            classify_delivery_state(Some("DISPATCHED"), true, true),
+            "codex_active"
+        );
         assert_eq!(
             classify_delivery_state(Some("DISPATCHED"), true, false),
-            "codex_active"
+            "queued"
         );
         assert_eq!(
             classify_delivery_state(Some("Completed"), false, false),
@@ -883,7 +877,8 @@ mod dispatch_surface_tests {
 mod selector_cleanup_tests {
     use super::{
         disconnect_session_and_prepare_retry_pg, disconnect_stale_fixed_session_by_key_pg,
-        gc_stale_fixed_working_sessions_db_pg, reconcile_orphaned_tmuxless_session_pg,
+        gc_stale_fixed_working_sessions_db_pg, load_provider_session_ids_pg,
+        reconcile_orphaned_tmuxless_session_pg,
     };
 
     struct TestPostgresDb {
@@ -1118,6 +1113,44 @@ mod selector_cleanup_tests {
         let (status, active_dispatch_id, _, _) = session_state(&pool, session_key).await;
         assert_eq!(status, "idle");
         assert_eq!(active_dispatch_id.as_deref(), Some("dispatch-2861"));
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    /// #3052: a tmux-only idle cleanup (the reconcile path `/kill-tmux` runs
+    /// when tmux is already gone) must leave BOTH provider resume selector
+    /// columns intact, and the resume lookup (`load_provider_session_ids_pg`)
+    /// must still surface them so provider-native resume can succeed.
+    #[tokio::test]
+    async fn tmux_only_kill_preserves_resume_selectors() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        let session_key = "host:tmux-only-resume-selector";
+
+        seed_session_with_selectors(&pool, session_key, "idle", None).await;
+
+        // Simulate the tmux-only idle cleanup reconcile.
+        assert!(reconcile_orphaned_tmuxless_session_pg(&pool, session_key).await);
+
+        // Both selector columns must survive the cleanup.
+        assert_cleanup_preserved_selectors(&pool, session_key).await;
+
+        // The resume lookup used by kill-tmux's resumable check and by the
+        // session-restore fallback must still return both selectors.
+        let ids = load_provider_session_ids_pg(&pool, session_key, Some("claude"))
+            .await
+            .unwrap()
+            .expect("session row must still exist after tmux-only cleanup");
+        assert_eq!(
+            ids.claude_session_id.as_deref(),
+            Some("claude-selector-1841")
+        );
+        assert_eq!(
+            ids.raw_provider_session_id.as_deref(),
+            Some("raw-selector-1841"),
+            "raw provider selector must survive so native resume can fall back to it"
+        );
 
         pool.close().await;
         pg_db.drop().await;
@@ -1521,6 +1554,48 @@ pub(crate) async fn reconcile_orphaned_tmuxless_session_pg(
     }
 }
 
+/// Return the effective "last seen" instant idle-kill selects on for a session
+/// (`COALESCE(last_heartbeat, created_at)`), as a unix-epoch nanosecond count.
+/// Used by the kill-time live-activity guard (#3053) to compare against runtime
+/// file mtimes (relay output / generation marker / provider transcript).
+/// `None` when the row is absent or the timestamp cannot be decoded.
+pub(crate) async fn session_last_seen_unix_nanos_pg(
+    pool: &PgPool,
+    session_key: &str,
+) -> Option<i64> {
+    let last_seen: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT COALESCE(last_heartbeat, created_at) FROM sessions WHERE session_key = $1",
+    )
+    .bind(session_key)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    last_seen.map(|value| value.timestamp_nanos_opt().unwrap_or(0))
+}
+
+/// Refresh `sessions.last_heartbeat = NOW()` by exact `session_key`. Used by the
+/// kill-time live-activity guard (#3053) when runtime activity is newer than the
+/// stored heartbeat, so a subsequent idle-kill tick no longer selects the row.
+/// Returns true when a row was touched.
+pub(crate) async fn refresh_session_heartbeat_by_key_pg(pool: &PgPool, session_key: &str) -> bool {
+    match sqlx::query("UPDATE sessions SET last_heartbeat = NOW() WHERE session_key = $1")
+        .bind(session_key)
+        .execute(pool)
+        .await
+    {
+        Ok(result) => result.rows_affected() > 0,
+        Err(error) => {
+            tracing::warn!(
+                "[dispatched-sessions] refresh_session_heartbeat_by_key_pg: failed for {}: {}",
+                session_key,
+                error
+            );
+            false
+        }
+    }
+}
+
 /// Mark stale fixed-channel working sessions as disconnected without clearing
 /// provider selectors needed for resume after runtime cleanup.
 pub async fn gc_stale_fixed_working_sessions_db_pg(pool: &PgPool) -> usize {
@@ -1747,15 +1822,6 @@ pub(crate) struct UpdateSessionParams<'a> {
     pub(crate) session_info: Option<&'a str>,
 }
 
-pub(crate) async fn session_exists_pg(pool: &PgPool, session_key: &str) -> Result<bool, String> {
-    sqlx::query("SELECT 1 FROM sessions WHERE session_key = $1 LIMIT 1")
-        .bind(session_key)
-        .fetch_optional(pool)
-        .await
-        .map(|row| row.is_some())
-        .map_err(|error| format!("load postgres session existence for {session_key}: {error}"))
-}
-
 /// Upsert a hook session row.
 ///
 /// #2045 Finding 7 (P2): the helper now returns whether the row was inserted
@@ -1838,66 +1904,6 @@ pub(crate) async fn upsert_hook_session_pg(
             params.session_key
         )
     })
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) fn upsert_hook_session_sqlite_for_tests(
-    conn: &sqlite_test::Connection,
-    params: HookSessionUpsert<'_>,
-) -> Result<(), String> {
-    conn.execute(
-        "INSERT INTO sessions (
-            session_key,
-            instance_id,
-            agent_id,
-            provider,
-            status,
-            session_info,
-            model,
-            tokens,
-            cwd,
-            active_dispatch_id,
-            thread_channel_id,
-            claude_session_id,
-            raw_provider_session_id,
-            last_heartbeat
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, datetime('now'))
-         ON CONFLICT(session_key) DO UPDATE SET
-            status = excluded.status,
-            instance_id = COALESCE(NULLIF(TRIM(excluded.instance_id), ''), sessions.instance_id),
-            provider = excluded.provider,
-            session_info = COALESCE(excluded.session_info, sessions.session_info),
-            model = COALESCE(excluded.model, sessions.model),
-            tokens = excluded.tokens,
-            cwd = COALESCE(excluded.cwd, sessions.cwd),
-            active_dispatch_id = CASE
-              WHEN lower(excluded.status) IN ('disconnected', 'aborted') THEN NULL
-              WHEN excluded.active_dispatch_id IS NOT NULL THEN excluded.active_dispatch_id
-              ELSE sessions.active_dispatch_id
-            END,
-            agent_id = COALESCE(NULLIF(TRIM(excluded.agent_id), ''), NULLIF(TRIM(sessions.agent_id), '')),
-            thread_channel_id = COALESCE(excluded.thread_channel_id, sessions.thread_channel_id),
-            claude_session_id = COALESCE(excluded.claude_session_id, sessions.claude_session_id),
-            raw_provider_session_id = COALESCE(excluded.raw_provider_session_id, sessions.raw_provider_session_id),
-            last_heartbeat = datetime('now')",
-        sqlite_test::params![
-            params.session_key,
-            params.instance_id,
-            params.agent_id,
-            params.provider,
-            params.status,
-            params.session_info,
-            params.model,
-            params.tokens,
-            params.cwd,
-            params.active_dispatch_id,
-            params.thread_channel_id,
-            params.claude_session_id,
-            params.raw_provider_session_id,
-        ],
-    )
-    .map(|_| ())
-    .map_err(|error| format!("{error}"))
 }
 
 pub(crate) async fn cleanup_disconnected_sessions_pg(pool: &PgPool) -> Result<u64, String> {

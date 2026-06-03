@@ -60,6 +60,26 @@ const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
 /// slightly delayed recovery (issue #1446).
 pub(super) const INFLIGHT_STALENESS_THRESHOLD_SECS: u64 = 300;
 
+/// Build an optional `serenity::MessageId` from a possibly-zero raw inflight id.
+///
+/// `current_msg_id == 0` is a LEGITIMATE state: a TUI-direct / recovery turn
+/// (`runtime_kind = claude_tui`, `status_message_id = None`) that never anchored
+/// a Discord placeholder message. `serenity::MessageId::new(0)` PANICS
+/// ("Attempted to call MessageId::new with invalid (0) value"), so every
+/// recovery/relay path that derives a placeholder id from a possibly-zero
+/// inflight field must funnel through this helper and treat `None` as
+/// "no anchored placeholder" — skipping the placeholder-specific step while
+/// still performing watcher/session recovery — rather than panicking.
+pub(in crate::services::discord) fn optional_message_id(
+    raw: u64,
+) -> Option<poise::serenity_prelude::MessageId> {
+    if raw == 0 {
+        None
+    } else {
+        Some(poise::serenity_prelude::MessageId::new(raw))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InflightTurnState {
     pub version: u32,
@@ -228,6 +248,19 @@ pub(super) struct InflightTurnState {
     /// `Managed` for legacy rows that pre-date this field.
     #[serde(default)]
     pub turn_source: TurnSource,
+    /// #3099 codex re-review (P2): the Discord notify-bot message id that carries
+    /// this turn's `⏳` reaction, when the turn was injected with a
+    /// `user_msg_id == 0` (no anchored Discord *user* message — e.g. a
+    /// `<task-notification>` auto-turn). The `⏳ → ✅` completion cleanup for such
+    /// turns previously read whatever was in the single shared prompt-anchor slot
+    /// (`prompt_anchor_by_tmux`), so a *later* injection that overwrote that slot
+    /// would steal the cleanup: turn A's completion would `⏳→✅` turn B's message
+    /// while B was still running, and A's `⏳` would never clear. Pinning the
+    /// injected message id on the inflight row makes each turn clean up its OWN
+    /// message regardless of how the shared slot has since been overwritten.
+    /// `None` for turns with a real `user_msg_id` or legacy rows.
+    #[serde(default)]
+    pub injected_prompt_message_id: Option<u64>,
 }
 
 /// Origin of a turn whose state is captured in [`InflightTurnState`]. Pure
@@ -556,6 +589,7 @@ impl InflightTurnState {
             watcher_owns_live_relay: false,
             relay_owner_kind: RelayOwnerKind::None,
             turn_source: TurnSource::Managed,
+            injected_prompt_message_id: None,
         }
     }
 
@@ -958,6 +992,33 @@ fn validate_inflight_state_for_save(
         "inflight response_sent_offset must not move backwards"
     );
 
+    // I6 (last_offset_monotonic) — OBSERVE-ONLY on the bridge/watcher save
+    // path. A legit fresh-turn reset (different user_msg_id or
+    // turn_start_offset) lowers last_offset on purpose, so the check is gated
+    // by SAME turn identity; only a backward move within the same turn is a
+    // violation. We do not skip the write here (that would drop a legit fresh
+    // turn); the enforcing variant lives in the standby/refresh path.
+    let same_turn_identity = existing.user_msg_id == state.user_msg_id
+        && existing.turn_start_offset == state.turn_start_offset;
+    let last_offset_monotonic = !same_turn_identity || state.last_offset >= existing.last_offset;
+    record_inflight_invariant(
+        last_offset_monotonic,
+        state,
+        "last_offset_monotonic",
+        code_location,
+        "inflight last_offset must not move backwards for the same turn identity",
+        serde_json::json!({
+            "previous": existing.last_offset,
+            "next": state.last_offset,
+            "same_turn_identity": same_turn_identity,
+            "path": path.display().to_string(),
+        }),
+    );
+    debug_assert!(
+        last_offset_monotonic,
+        "inflight last_offset must not move backwards for the same turn identity"
+    );
+
     let same_tmux_owner = existing.tmux_session_name.is_none()
         || state.tmux_session_name.is_none()
         || existing.tmux_session_name == state.tmux_session_name;
@@ -1093,6 +1154,311 @@ fn save_inflight_state_in_root(root: &Path, state: &InflightTurnState) -> Result
     atomic_write(&path, &json)
 }
 
+/// #3107 codex re-review (P1): atomic compare-and-set save. Writes `state`
+/// ONLY when no inflight row currently exists for `(provider, channel_id)`,
+/// returning `true` iff it wrote.
+///
+/// The watcher self-heal re-acquire (`reacquire_watcher_inflight_for_active_stream`)
+/// previously did a non-atomic `load_inflight_state(...).is_some()` preflight
+/// followed by an unconditional `save_inflight_state`. Between the check and
+/// the save the Discord intake path could create a REAL inflight for a brand
+/// new user turn on the same `(provider, channel_id)`; the synthetic
+/// `user_msg_id = 0` re-acquire save would then clobber it and the legitimate
+/// turn would be lost.
+///
+/// This helper closes that window by performing the existence check AND the
+/// write while holding the same `lock_inflight_state_path` sidecar flock that
+/// `save_inflight_state_in_root` / `clear_inflight_state*` already serialize
+/// on. A concurrent intake `save_inflight_state` either ran before us (we see
+/// its row → no-op, intake wins) or after us (it overwrites our synthetic row
+/// with the real turn → intake still wins). The synthetic row is therefore
+/// only ever written when there is genuinely no inflight at the moment of the
+/// atomic write.
+pub(super) fn save_inflight_state_if_absent(state: &InflightTurnState) -> Result<bool, String> {
+    let Some(root) = inflight_runtime_root() else {
+        return Err("Home directory not found".to_string());
+    };
+    save_inflight_state_if_absent_in_root(&root, state)
+}
+
+fn save_inflight_state_if_absent_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+) -> Result<bool, String> {
+    let Some(provider) = state.provider_kind() else {
+        return Err(format!("Unknown provider '{}'", state.provider));
+    };
+    let path = inflight_state_path(root, &provider, state.channel_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    // Hold the sidecar flock across the existence check AND the write so a
+    // concurrent intake `save_inflight_state_in_root` (which takes the same
+    // lock) cannot land a real inflight in the gap. `path.exists()` under the
+    // lock is the compare; `atomic_write` is the set.
+    let _lock = lock_inflight_state_path(&path)?;
+    if path.exists() {
+        return Ok(false);
+    }
+    validate_inflight_state_for_save(
+        root,
+        &path,
+        state,
+        "src/services/discord/inflight.rs:save_inflight_state_if_absent_in_root",
+    );
+    let mut updated = state.clone();
+    updated.updated_at = now_string();
+    let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
+    atomic_write(&path, &json)?;
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// #3077: typed status-panel ownership writes.
+//
+// `status_message_id` is the de-facto "this turn owns status panel M" pointer,
+// and several independent actors (turn-bridge completion fallback, tmux watcher
+// TUI-direct publish/orphan-cleanup, placeholder sweeper) used to mutate it via
+// a non-atomic `load_inflight_state(...)` → `state.status_message_id = …` →
+// `save_inflight_state(...)` triple. Because the read and the write were not
+// serialized against each other, a newer turn that rebound the panel between a
+// stale actor's load and its blind `= None` could have its panel silently
+// orphaned (the #3099/#3100/#3105/#3107 panel-lifecycle race family).
+//
+// These helpers centralize that read-modify-write behind intentful operations
+// that hold the same `lock_inflight_state_path` sidecar flock across the whole
+// compare-and-set, exactly like `save_inflight_state_if_absent`. Callers no
+// longer touch the field directly; they declare *what* they own and *under
+// which precondition*, and the store enforces it atomically.
+
+/// Per-turn precondition for `bind_status_panel`. Lets each caller carry its
+/// own ownership invariant into the lock-held read-modify-write so the guard
+/// check and the write cannot be split by a concurrent writer (TOCTOU).
+#[derive(Debug, Clone, Default)]
+pub(in crate::services::discord) struct StatusPanelBindGuard {
+    /// Bind only when the on-disk row still belongs to this `user_msg_id`.
+    /// `None` means "do not guard on user_msg_id" (used by callers that have
+    /// already established identity another way). Mirrors the turn-bridge
+    /// status-panel-v2 completion fallback guard.
+    pub require_user_msg_id: Option<u64>,
+    /// Bind only when the on-disk row still matches this full turn identity
+    /// (user_msg_id + started_at + tmux_session_name). Mirrors the tmux
+    /// watcher TUI-direct publish guard that defeats turn handoff during the
+    /// Discord send await.
+    pub require_identity: Option<InflightTurnIdentity>,
+    /// When true, do not overwrite a real (non-synthetic) panel id already on
+    /// the row — an overlapping actor already published the canonical panel
+    /// and our send is a duplicate (#3003 reclaim path). Synthetic-headless
+    /// ids do not count as "already set".
+    pub skip_if_panel_already_set: bool,
+}
+
+/// Outcome of a `bind_status_panel` attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum StatusPanelBindOutcome {
+    /// The row was found, passed the guard, and now carries `msg_id`.
+    Bound,
+    /// The row already carried `msg_id`; nothing was written.
+    AlreadyBound,
+    /// The row exists but a DIFFERENT real panel id is already set and
+    /// `skip_if_panel_already_set` was requested — left untouched. Carries the
+    /// row's currently-owned (real) panel id as observed under the same flock,
+    /// so the caller can adopt the row's actual panel without a second
+    /// (racy) re-read of the inflight row.
+    SkippedPanelAlreadySet(u64),
+    /// No inflight row exists for `(provider, channel_id)`.
+    Missing,
+    /// The on-disk row did not satisfy `require_user_msg_id` /
+    /// `require_identity` — left untouched (a different turn now owns the row).
+    GuardMismatch,
+    /// Filesystem / serialization failure while persisting the bind.
+    IoError,
+}
+
+/// Intentful "this turn now owns status panel `msg_id`" write. Performs the
+/// guard check and the field set atomically under the inflight sidecar flock,
+/// so it is consistent with `save_inflight_state` / `save_inflight_state_if_absent`.
+pub(in crate::services::discord) fn bind_status_panel(
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelBindGuard,
+) -> StatusPanelBindOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return StatusPanelBindOutcome::IoError;
+    };
+    bind_status_panel_in_root(&root, provider, channel_id, msg_id, guard)
+}
+
+fn bind_status_panel_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelBindGuard,
+) -> StatusPanelBindOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return StatusPanelBindOutcome::IoError;
+    }
+    // Hold the sidecar flock across load → guard → set so a concurrent
+    // writer cannot land between the guard check and the write.
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return StatusPanelBindOutcome::IoError;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return StatusPanelBindOutcome::Missing;
+    };
+    if let Some(expected) = guard.require_user_msg_id
+        && state.user_msg_id != expected
+    {
+        return StatusPanelBindOutcome::GuardMismatch;
+    }
+    if let Some(expected) = guard.require_identity.as_ref()
+        && !expected.matches_state(&state)
+    {
+        return StatusPanelBindOutcome::GuardMismatch;
+    }
+    // Same-id re-bind is idempotent and must classify as `AlreadyBound`
+    // REGARDLESS of `skip_if_panel_already_set` — an idempotent re-bind of the
+    // panel this row already owns is a no-op, not a "duplicate skip". Checking
+    // the skip flag first (#3077 codex P2 #1) misclassified a same-id re-bind as
+    // `SkippedPanelAlreadySet`, which the TUI-direct caller then routed to a
+    // DELETE of the row's own already-bound panel. Order: same-id → AlreadyBound;
+    // else a DIFFERENT real id already set + skip flag → SkippedPanelAlreadySet.
+    if state.status_message_id == Some(msg_id) {
+        return StatusPanelBindOutcome::AlreadyBound;
+    }
+    if guard.skip_if_panel_already_set && status_panel_id_is_real(state.status_message_id) {
+        // Safe: `status_panel_id_is_real` only returns true for `Some(real)`,
+        // and we already handled `Some(msg_id)` above, so this is a DIFFERENT
+        // real panel id. Carry it so the caller adopts the row's owned panel.
+        return StatusPanelBindOutcome::SkippedPanelAlreadySet(
+            state.status_message_id.unwrap_or_default(),
+        );
+    }
+    state.status_message_id = Some(msg_id);
+    match persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:bind_status_panel_in_root",
+    ) {
+        Ok(()) => StatusPanelBindOutcome::Bound,
+        Err(_) => StatusPanelBindOutcome::IoError,
+    }
+}
+
+/// Per-turn precondition for `clear_status_panel_if_current`. The msg-id
+/// compare-and-clear is unconditional; these add the caller's extra ownership
+/// guards (so a sweeper/cleanup that loaded a stale snapshot does not clear a
+/// row a newer turn already advanced).
+#[derive(Debug, Clone, Default)]
+pub(in crate::services::discord) struct StatusPanelClearGuard {
+    /// Clear only when the on-disk row still belongs to this `user_msg_id`.
+    pub require_user_msg_id: Option<u64>,
+    /// Clear only when the on-disk row still carries this `current_msg_id`
+    /// (placeholder sweeper convergence guard).
+    pub require_current_msg_id: Option<u64>,
+    /// Clear only when the on-disk row's tmux session still matches (watcher
+    /// orphan-cleanup guard).
+    pub require_tmux_session_name: Option<String>,
+}
+
+/// Compare-and-clear: clears `status_message_id` ONLY when it currently equals
+/// `msg_id` (and every guard precondition holds). Returns `true` iff it
+/// cleared. This is the #3077 hardening — a blind `= None` becomes a
+/// compare-and-clear so a panel a *newer* turn rebound is never wiped by a
+/// stale actor that loaded an older snapshot.
+pub(in crate::services::discord) fn clear_status_panel_if_current(
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelClearGuard,
+) -> bool {
+    let Some(root) = inflight_runtime_root() else {
+        return false;
+    };
+    clear_status_panel_if_current_in_root(&root, provider, channel_id, msg_id, guard)
+}
+
+fn clear_status_panel_if_current_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    msg_id: u64,
+    guard: &StatusPanelClearGuard,
+) -> bool {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return false;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return false;
+    };
+    if state.status_message_id != Some(msg_id) {
+        return false;
+    }
+    if let Some(expected) = guard.require_user_msg_id
+        && state.user_msg_id != expected
+    {
+        return false;
+    }
+    if let Some(expected) = guard.require_current_msg_id
+        && state.current_msg_id != expected
+    {
+        return false;
+    }
+    if let Some(expected) = guard.require_tmux_session_name.as_deref()
+        && state.tmux_session_name.as_deref() != Some(expected)
+    {
+        return false;
+    }
+    state.status_message_id = None;
+    persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:clear_status_panel_if_current_in_root",
+    )
+    .is_ok()
+}
+
+/// `true` when `id` is a real Discord panel id (present and not a synthetic
+/// headless placeholder). Mirrors `turn_bridge::normalize_status_panel_message_id`
+/// without pulling in the serenity `MessageId` newtype.
+fn status_panel_id_is_real(id: Option<u64>) -> bool {
+    match id {
+        Some(value) => !super::is_synthetic_headless_message_id_raw(value),
+        None => false,
+    }
+}
+
+/// Reads + deserializes the inflight row at `path` while the caller holds the
+/// sidecar flock. Returns `None` on a missing/malformed file (same lenient
+/// posture as `load_inflight_state`).
+fn load_inflight_state_unlocked(path: &Path) -> Option<InflightTurnState> {
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Shared lock-held persist tail: validate, stamp `updated_at`, atomic-write.
+/// Caller must already hold `lock_inflight_state_path`.
+fn persist_under_lock(
+    root: &Path,
+    path: &Path,
+    state: &InflightTurnState,
+    caller: &'static str,
+) -> Result<(), String> {
+    validate_inflight_state_for_save(root, path, state, caller);
+    let mut updated = state.clone();
+    updated.updated_at = now_string();
+    let json = serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?;
+    atomic_write(path, &json)
+}
+
 pub(crate) fn clear_inflight_state(provider: &ProviderKind, channel_id: u64) -> bool {
     let Some(root) = inflight_runtime_root() else {
         return false;
@@ -1212,6 +1578,7 @@ pub(in crate::services::discord) fn clear_inflight_state_if_matches_tmux_respons
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_identity(
     provider: &ProviderKind,
     channel_id: u64,
@@ -1220,6 +1587,7 @@ pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_iden
     output_path: &str,
     expected_current_msg_id: Option<u64>,
     last_offset: u64,
+    caller_owner: RelayOwnerKind,
 ) -> bool {
     let Some(root) = inflight_runtime_root() else {
         return false;
@@ -1233,6 +1601,7 @@ pub(in crate::services::discord) fn refresh_inflight_last_offset_if_matches_iden
         output_path,
         expected_current_msg_id,
         last_offset,
+        caller_owner,
     )
 }
 
@@ -1489,6 +1858,7 @@ fn clear_inflight_state_if_matches_tmux_response_in_root(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refresh_inflight_last_offset_if_matches_identity_in_root(
     root: &std::path::Path,
     provider: &ProviderKind,
@@ -1498,6 +1868,7 @@ fn refresh_inflight_last_offset_if_matches_identity_in_root(
     output_path: &str,
     expected_current_msg_id: Option<u64>,
     last_offset: u64,
+    caller_owner: RelayOwnerKind,
 ) -> bool {
     let path = inflight_state_path(root, provider, channel_id);
     let Ok(_lock) = lock_inflight_state_path(&path) else {
@@ -1527,6 +1898,52 @@ fn refresh_inflight_last_offset_if_matches_identity_in_root(
         if state.turn_start_offset != Some(expected_offset) {
             return false;
         }
+    }
+
+    // I6 (last_offset_owner_gated): the persisted watermark is advanced only
+    // by the current relay owner. A non-owner caller (standby/idle) follows
+    // the authoritative offset read-only and must yield to a live owner. The
+    // identity guards above already proved this is the SAME turn, so a live
+    // owner that differs from the caller is an authority conflict, not a
+    // fresh-turn reset.
+    let persisted_owner = state.effective_relay_owner_kind();
+    let owner_is_live = !matches!(persisted_owner, RelayOwnerKind::None);
+    if owner_is_live && persisted_owner != caller_owner {
+        record_inflight_invariant(
+            false,
+            &state,
+            "last_offset_owner_gated",
+            "src/services/discord/inflight.rs:refresh_inflight_last_offset_if_matches_identity_in_root",
+            "inflight last_offset must only be advanced by the current relay owner",
+            serde_json::json!({
+                "persisted_owner": persisted_owner.as_str(),
+                "caller_owner": caller_owner.as_str(),
+                "previous": state.last_offset,
+                "next": last_offset,
+                "path": path.display().to_string(),
+            }),
+        );
+        return false;
+    }
+
+    // I6 (last_offset_monotonic): same identity, so a backward watermark write
+    // would clobber the authoritative offset and replay a stale transcript
+    // tail. Reject and record. A fresh-turn reset is already excluded by the
+    // identity guards above.
+    if last_offset < state.last_offset {
+        record_inflight_invariant(
+            false,
+            &state,
+            "last_offset_monotonic",
+            "src/services/discord/inflight.rs:refresh_inflight_last_offset_if_matches_identity_in_root",
+            "inflight last_offset must not move backwards for the same turn identity",
+            serde_json::json!({
+                "previous": state.last_offset,
+                "next": last_offset,
+                "path": path.display().to_string(),
+            }),
+        );
+        return false;
     }
 
     state.last_offset = last_offset;
@@ -2026,17 +2443,21 @@ pub(in crate::services::discord) enum InflightSignal {
 mod stall_recovery_tests {
     use super::{
         GuardedClearOutcome, INFLIGHT_STALENESS_THRESHOLD_SECS, InflightRestartMode,
-        InflightTurnIdentity, InflightTurnState,
+        InflightTurnIdentity, InflightTurnState, RelayOwnerKind, StatusPanelBindGuard,
+        StatusPanelBindOutcome, StatusPanelClearGuard, bind_status_panel_in_root,
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
-        inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
-        load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
+        clear_status_panel_if_current_in_root, inflight_state_allows_idle_tmux_repair_state,
+        inflight_state_is_stale, inflight_state_path, load_inflight_states_from_root,
+        lock_inflight_state_path, normalize_response_sent_offset,
         refresh_inflight_last_offset_if_matches_identity_in_root, save_inflight_state_in_root,
+        validate_inflight_state_for_save,
     };
     use crate::services::agent_protocol::RuntimeHandoffKind;
     use crate::services::provider::ProviderKind;
     use chrono::TimeZone;
+    use std::path::Path;
     use tempfile::TempDir;
 
     /// `inflight_state_is_stale` must flip to true once `updated_at` is
@@ -2153,6 +2574,410 @@ mod stall_recovery_tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].status_message_id, Some(123_456));
         assert_eq!(loaded[0].current_msg_id, 99);
+    }
+
+    // ---- #3077: typed status-panel ownership write tests ----
+
+    /// Seeds a single inflight row in `root` and returns it. `user_msg_id` /
+    /// `current_msg_id` / `status_message_id` are caller-controlled so the
+    /// guard semantics can be exercised.
+    fn seed_status_panel_state(
+        root: &Path,
+        channel_id: u64,
+        user_msg_id: u64,
+        current_msg_id: u64,
+        tmux_session_name: Option<&str>,
+        status_message_id: Option<u64>,
+    ) -> InflightTurnState {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            channel_id,
+            Some("adk-claude".to_string()),
+            user_msg_id,
+            user_msg_id,
+            current_msg_id,
+            "hello".to_string(),
+            Some("session-1".to_string()),
+            tmux_session_name.map(str::to_string),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        );
+        // `new()` takes (.., request_owner_user_id, user_msg_id, current_msg_id, ..);
+        // pin the guard-relevant fields explicitly so the test intent is exact.
+        state.user_msg_id = user_msg_id;
+        state.current_msg_id = current_msg_id;
+        state.status_message_id = status_message_id;
+        save_inflight_state_in_root(root, &state).expect("seed inflight state");
+        state
+    }
+
+    fn loaded_status_message_id(root: &Path, channel_id: u64) -> Option<u64> {
+        load_inflight_states_from_root(root, &ProviderKind::Claude)
+            .into_iter()
+            .find(|s| s.channel_id == channel_id)
+            .and_then(|s| s.status_message_id)
+    }
+
+    #[test]
+    fn bind_status_panel_sets_id_when_unguarded() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(temp.path(), 7001, 10, 11, Some("AgentDesk-claude-a"), None);
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7001,
+            5555,
+            &StatusPanelBindGuard::default(),
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::Bound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7001), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_is_idempotent_when_already_bound() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7002,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7002,
+            5555,
+            &StatusPanelBindGuard::default(),
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::AlreadyBound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7002), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_respects_user_msg_id_guard() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(temp.path(), 7003, 10, 11, Some("AgentDesk-claude-a"), None);
+
+        // Guard expects a different user_msg_id (a newer turn now owns the row).
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7003,
+            5555,
+            &StatusPanelBindGuard {
+                require_user_msg_id: Some(99),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::GuardMismatch);
+        assert_eq!(loaded_status_message_id(temp.path(), 7003), None);
+    }
+
+    #[test]
+    fn bind_status_panel_skips_when_real_panel_already_set() {
+        let temp = TempDir::new().unwrap();
+        // A real (non-synthetic) panel id already on the row.
+        seed_status_panel_state(
+            temp.path(),
+            7004,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(4242),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7004,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        // Carries the row's owned (DIFFERENT) panel id so the caller can adopt it.
+        assert_eq!(
+            outcome,
+            StatusPanelBindOutcome::SkippedPanelAlreadySet(4242)
+        );
+        // Canonical panel preserved — not overwritten by the duplicate.
+        assert_eq!(loaded_status_message_id(temp.path(), 7004), Some(4242));
+    }
+
+    #[test]
+    fn bind_status_panel_same_id_is_already_bound_even_with_skip_flag() {
+        // #3077 (codex P2 #1): an idempotent re-bind of the SAME panel id the row
+        // already owns must classify as `AlreadyBound`, NOT
+        // `SkippedPanelAlreadySet`, even when `skip_if_panel_already_set` is set.
+        // Misclassifying it routed the TUI-direct caller to DELETE its own panel.
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7007,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7007,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::AlreadyBound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7007), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_different_id_skips_and_reports_owned_id() {
+        // A DIFFERENT real panel id already set + skip flag → SkippedPanelAlreadySet
+        // carrying the row's owned id (so the caller adopts the real panel).
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7008,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(4242),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7008,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            StatusPanelBindOutcome::SkippedPanelAlreadySet(4242)
+        );
+        assert_eq!(loaded_status_message_id(temp.path(), 7008), Some(4242));
+    }
+
+    #[test]
+    fn bind_status_panel_overwrites_synthetic_even_with_skip_flag() {
+        let temp = TempDir::new().unwrap();
+        // A synthetic-headless id does NOT count as "already set".
+        seed_status_panel_state(
+            temp.path(),
+            7005,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(crate::services::discord::SYNTHETIC_HEADLESS_MESSAGE_ID_FLOOR + 1),
+        );
+
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7005,
+            5555,
+            &StatusPanelBindGuard {
+                skip_if_panel_already_set: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(outcome, StatusPanelBindOutcome::Bound);
+        assert_eq!(loaded_status_message_id(temp.path(), 7005), Some(5555));
+    }
+
+    #[test]
+    fn bind_status_panel_missing_row_reports_missing() {
+        let temp = TempDir::new().unwrap();
+        let outcome = bind_status_panel_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7006,
+            5555,
+            &StatusPanelBindGuard::default(),
+        );
+        assert_eq!(outcome, StatusPanelBindOutcome::Missing);
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_clears_on_match() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7101,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7101,
+            5555,
+            &StatusPanelClearGuard::default(),
+        );
+
+        assert!(cleared);
+        assert_eq!(loaded_status_message_id(temp.path(), 7101), None);
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_preserves_newer_turns_panel_on_mismatch() {
+        let temp = TempDir::new().unwrap();
+        // A newer turn already rebound the panel to 9999; a stale actor still
+        // believes it owns 5555 and asks to clear it. The compare-and-clear
+        // must NOT wipe the newer turn's panel.
+        seed_status_panel_state(
+            temp.path(),
+            7102,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(9999),
+        );
+
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7102,
+            5555,
+            &StatusPanelClearGuard::default(),
+        );
+
+        assert!(!cleared);
+        assert_eq!(loaded_status_message_id(temp.path(), 7102), Some(9999));
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_respects_extra_guards() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(
+            temp.path(),
+            7103,
+            10,
+            11,
+            Some("AgentDesk-claude-a"),
+            Some(5555),
+        );
+
+        // msg-id matches, but user_msg_id/current_msg_id/tmux guards point at a
+        // different turn → must NOT clear.
+        let user_mismatch = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_user_msg_id: Some(99),
+                ..Default::default()
+            },
+        );
+        assert!(!user_mismatch);
+
+        let current_mismatch = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_current_msg_id: Some(99),
+                ..Default::default()
+            },
+        );
+        assert!(!current_mismatch);
+
+        let tmux_mismatch = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_tmux_session_name: Some("AgentDesk-claude-other".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!tmux_mismatch);
+
+        assert_eq!(loaded_status_message_id(temp.path(), 7103), Some(5555));
+
+        // All guards satisfied → clears.
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7103,
+            5555,
+            &StatusPanelClearGuard {
+                require_user_msg_id: Some(10),
+                require_current_msg_id: Some(11),
+                require_tmux_session_name: Some("AgentDesk-claude-a".to_string()),
+            },
+        );
+        assert!(cleared);
+        assert_eq!(loaded_status_message_id(temp.path(), 7103), None);
+    }
+
+    #[test]
+    fn clear_status_panel_if_current_noops_on_missing_row() {
+        let temp = TempDir::new().unwrap();
+        let cleared = clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7104,
+            5555,
+            &StatusPanelClearGuard::default(),
+        );
+        assert!(!cleared);
+    }
+
+    #[test]
+    fn bind_then_clear_if_current_round_trips_atomically() {
+        let temp = TempDir::new().unwrap();
+        seed_status_panel_state(temp.path(), 7200, 10, 11, Some("AgentDesk-claude-a"), None);
+
+        // bind then clear-if-current with the same id returns the row to None,
+        // mirroring the watcher publish → orphan-cleanup lifecycle through the
+        // single locked store path.
+        assert_eq!(
+            bind_status_panel_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                7200,
+                5555,
+                &StatusPanelBindGuard::default(),
+            ),
+            StatusPanelBindOutcome::Bound
+        );
+        assert_eq!(loaded_status_message_id(temp.path(), 7200), Some(5555));
+
+        assert!(clear_status_panel_if_current_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            7200,
+            5555,
+            &StatusPanelClearGuard::default(),
+        ));
+        assert_eq!(loaded_status_message_id(temp.path(), 7200), None);
     }
 
     #[test]
@@ -2634,6 +3459,7 @@ mod stall_recovery_tests {
             &output_path,
             Some(state.current_msg_id),
             123,
+            RelayOwnerKind::StandbyRelay,
         );
 
         assert!(refreshed);
@@ -2669,6 +3495,7 @@ mod stall_recovery_tests {
             &output_path,
             None,
             123,
+            RelayOwnerKind::StandbyRelay,
         );
 
         assert!(!refreshed);
@@ -2677,6 +3504,201 @@ mod stall_recovery_tests {
         assert_eq!(loaded[0].user_msg_id, 101);
         assert_eq!(loaded[0].started_at, "2026-05-17 10:00:05");
         assert_eq!(loaded[0].last_offset, 20);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_rejects_backward_offset_same_identity() {
+        // #3017 I6 (last_offset_monotonic): a backward watermark write for the
+        // SAME turn identity is rejected so a stale transcript tail cannot be
+        // replayed; the on-disk offset is left untouched.
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.last_offset = 200;
+        let identity = InflightTurnIdentity::from_state(&state);
+        let output_path = state.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &identity,
+            state.turn_start_offset,
+            &output_path,
+            Some(state.current_msg_id),
+            150,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(!refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_offset, 200);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_advances_forward_offset_same_identity() {
+        // #3017 I6: a forward watermark write for the same identity advances.
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.last_offset = 200;
+        let identity = InflightTurnIdentity::from_state(&state);
+        let output_path = state.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &identity,
+            state.turn_start_offset,
+            &output_path,
+            Some(state.current_msg_id),
+            250,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_offset, 250);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_standby_yields_to_watcher_owner() {
+        // #3017 I6 (last_offset_owner_gated): a StandbyRelay caller must not
+        // advance the watermark while the persisted owner is the live Watcher.
+        let temp = TempDir::new().unwrap();
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        state.last_offset = 100;
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        let identity = InflightTurnIdentity::from_state(&state);
+        let output_path = state.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &identity,
+            state.turn_start_offset,
+            &output_path,
+            Some(state.current_msg_id),
+            250,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(!refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].last_offset, 100);
+    }
+
+    #[test]
+    fn identity_heartbeat_refresh_allows_fresh_turn_reset() {
+        // #3017 I6 fresh-turn exemption: a NEW turn identity legitimately
+        // resets the watermark to a smaller offset; the identity guards reject
+        // the refresh BEFORE the monotonic clamp ever runs, so the standby
+        // caller simply does not clobber the new turn.
+        let temp = TempDir::new().unwrap();
+        let mut old_turn = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        old_turn.current_msg_id = 0;
+        old_turn.user_msg_id = 100;
+        old_turn.started_at = "2026-05-17 10:00:00".to_string();
+        old_turn.last_offset = 500;
+        old_turn.turn_start_offset = Some(0);
+        let old_identity = InflightTurnIdentity::from_state(&old_turn);
+        let output_path = old_turn.output_path.clone().expect("test output path");
+        save_inflight_state_in_root(temp.path(), &old_turn).unwrap();
+
+        // A fresh turn: new user_msg_id AND a new turn_start_offset that
+        // legitimately resets the watermark to a smaller value.
+        let mut fresh_turn = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 101);
+        fresh_turn.current_msg_id = 0;
+        fresh_turn.user_msg_id = 101;
+        fresh_turn.started_at = "2026-05-17 10:00:05".to_string();
+        fresh_turn.output_path = Some(output_path.clone());
+        fresh_turn.last_offset = 10;
+        fresh_turn.turn_start_offset = Some(10);
+        save_inflight_state_in_root(temp.path(), &fresh_turn).unwrap();
+
+        // The standby caller still believes it is the OLD turn; the identity
+        // guards reject it, leaving the fresh turn's small offset intact.
+        let refreshed = refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            321,
+            &old_identity,
+            old_turn.turn_start_offset,
+            &output_path,
+            None,
+            123,
+            RelayOwnerKind::StandbyRelay,
+        );
+
+        assert!(!refreshed);
+        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].user_msg_id, 101);
+        assert_eq!(loaded[0].last_offset, 10);
+    }
+
+    #[test]
+    fn validate_save_records_backward_last_offset_violation_same_identity() {
+        // #3017 I6 OBSERVE-ONLY on the save path: a backward last_offset for
+        // the same turn identity records a `last_offset_monotonic` violation
+        // (and trips the debug_assert) but does NOT skip the write — a legit
+        // fresh-turn reset must still be able to persist.
+        let temp = TempDir::new().unwrap();
+        let mut existing = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        existing.last_offset = 300;
+        save_inflight_state_in_root(temp.path(), &existing).unwrap();
+
+        let provider = ProviderKind::Claude;
+        let path = inflight_state_path(temp.path(), &provider, 321);
+
+        // Same identity (user_msg_id + turn_start_offset) but a backward
+        // last_offset → records a violation. Run with the debug_assert
+        // disabled by catching the panic so we can assert observability fired.
+        let mut backward = existing.clone();
+        backward.last_offset = 100;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_inflight_state_for_save(
+                temp.path(),
+                &path,
+                &backward,
+                "src/services/discord/inflight.rs:test",
+            );
+        }));
+        // In debug builds the debug_assert fires; in release it returns.
+        // Either way the invariant record was emitted before the assert.
+        assert!(result.is_err() || cfg!(not(debug_assertions)));
+    }
+
+    #[test]
+    fn validate_save_allows_backward_last_offset_for_fresh_turn() {
+        // #3017 I6: a DIFFERENT turn identity lowering last_offset is exempt —
+        // the save path must not flag a legit fresh-turn reset.
+        let temp = TempDir::new().unwrap();
+        let mut existing = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        existing.last_offset = 300;
+        save_inflight_state_in_root(temp.path(), &existing).unwrap();
+
+        let provider = ProviderKind::Claude;
+        let path = inflight_state_path(temp.path(), &provider, 321);
+
+        let mut fresh = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 101);
+        fresh.user_msg_id = 101;
+        fresh.last_offset = 10;
+
+        // No panic — different identity is exempt from the monotonic clamp.
+        validate_inflight_state_for_save(
+            temp.path(),
+            &path,
+            &fresh,
+            "src/services/discord/inflight.rs:test",
+        );
     }
 
     #[test]
@@ -3062,13 +4084,29 @@ mod wave_a_cleanup_tests {
         // run with a different "current_generation" — the helper must
         // still skip the row because `restart_mode.is_some()`, NOT
         // because the generations happen to match.
+        // `load_generation()` reads the PROCESS-WIDE `AGENTDESK_ROOT_DIR`, so
+        // serialize on the shared env lock and point the root at our own temp
+        // dir for the whole test. Otherwise a concurrent root-mutating test can
+        // flip the env between this read and the load-path read below, making
+        // `current_runtime_gen` inconsistent and tripping the assertions.
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let temp = TempDir::new().unwrap();
+        struct EnvReset(Option<std::ffi::OsString>);
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+                }
+            }
+        }
+        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
 
-        // Sync the row's restart_generation to whatever the process-
-        // wide `load_generation()` happens to return in this test
-        // environment (env var pointing at a sibling test's temp dir,
-        // missing file → 0, etc.). With them aligned, the load path's
-        // `stale_removal_reason` planned-restart branch hits its
+        // With the root isolated to `temp` (no generation file → 0), the load
+        // path's `stale_removal_reason` planned-restart branch hits its
         // generation-match arm and does not auto-evict.
         let current_runtime_gen = super::super::runtime_store::load_generation();
 
@@ -3193,369 +4231,5 @@ mod wave_a_cleanup_tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].restart_generation, Some(2));
         assert_eq!(after[0].user_msg_id, 78);
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::{
-        CreateNewInflightError, InflightTurnState, latest_request_owner_user_id_for_channel,
-        load_inflight_states, load_inflight_states_from_root,
-        mark_all_inflight_states_restart_mode, save_inflight_state_create_new_in_root,
-        save_inflight_state_in_root, stale_removal_reason,
-    };
-    use crate::services::discord::InflightRestartMode;
-    use crate::services::provider::ProviderKind;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_save_and_load_inflight_state() {
-        let temp = TempDir::new().unwrap();
-
-        let state = InflightTurnState::new(
-            ProviderKind::Codex,
-            123,
-            Some("adk-cdx".to_string()),
-            456,
-            789,
-            999,
-            "hello".to_string(),
-            Some("session-1".to_string()),
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            42,
-        );
-        save_inflight_state_in_root(temp.path(), &state).unwrap();
-
-        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].channel_id, 123);
-        assert_eq!(loaded[0].current_msg_id, 999);
-        assert_eq!(loaded[0].last_offset, 42);
-        assert_eq!(loaded[0].turn_start_offset, Some(42));
-    }
-
-    #[test]
-    fn test_save_and_load_inflight_state_preserves_worktree_metadata() {
-        let temp = TempDir::new().unwrap();
-
-        let mut state = InflightTurnState::new(
-            ProviderKind::Codex,
-            123,
-            Some("adk-cdx".to_string()),
-            456,
-            789,
-            999,
-            "hello".to_string(),
-            Some("session-1".to_string()),
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            42,
-        );
-        state.set_worktree_context(
-            Some("/tmp/worktree".to_string()),
-            Some("agentdesk/codex/adk-cdx".to_string()),
-            Some("abc123".to_string()),
-        );
-        save_inflight_state_in_root(temp.path(), &state).unwrap();
-
-        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].worktree_path.as_deref(), Some("/tmp/worktree"));
-        assert_eq!(
-            loaded[0].worktree_branch.as_deref(),
-            Some("agentdesk/codex/adk-cdx")
-        );
-        assert_eq!(loaded[0].base_commit.as_deref(), Some("abc123"));
-    }
-
-    #[test]
-    fn planned_restart_state_uses_generation_aware_retention() {
-        let mut state = InflightTurnState::new(
-            ProviderKind::Codex,
-            123,
-            Some("adk-cdx".to_string()),
-            456,
-            789,
-            999,
-            "hello".to_string(),
-            Some("session-1".to_string()),
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            42,
-        );
-        state.restart_mode = Some(InflightRestartMode::DrainRestart);
-        state.restart_generation = Some(7);
-
-        assert!(
-            stale_removal_reason(&state, 600, 7).is_none(),
-            "current-generation planned restart should survive the normal 300s cleanup window"
-        );
-        assert!(
-            stale_removal_reason(&state, 10, 8)
-                .expect("old generation planned restart should be removed")
-                .contains("old generation")
-        );
-    }
-
-    #[test]
-    fn latest_request_owner_user_id_prefers_most_recent_state_across_providers() {
-        let temp = TempDir::new().unwrap();
-        let inflight_root = temp.path().join("runtime").join("discord_inflight");
-
-        let mut claude_state = InflightTurnState::new(
-            ProviderKind::Claude,
-            123,
-            Some("adk-cc".to_string()),
-            111,
-            789,
-            999,
-            "hello".to_string(),
-            None,
-            None,
-            None,
-            None,
-            0,
-        );
-        claude_state.updated_at = "2026-04-11 00:00:00".to_string();
-        save_inflight_state_in_root(&inflight_root, &claude_state).unwrap();
-
-        let mut codex_state = InflightTurnState::new(
-            ProviderKind::Codex,
-            123,
-            Some("adk-cdx".to_string()),
-            222,
-            790,
-            1000,
-            "world".to_string(),
-            None,
-            None,
-            None,
-            None,
-            0,
-        );
-        codex_state.updated_at = "2026-04-11 00:00:05".to_string();
-        save_inflight_state_in_root(&inflight_root, &codex_state).unwrap();
-
-        let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
-        let owner = latest_request_owner_user_id_for_channel(123);
-        match previous {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-
-        assert_eq!(owner, Some(222));
-    }
-
-    #[test]
-    fn mark_all_inflight_states_restart_mode_marks_saved_states() {
-        let _lock = super::super::runtime_store::lock_test_env();
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("agentdesk-root");
-        std::fs::create_dir_all(root.join("runtime")).unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &root) };
-        struct EnvReset;
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") };
-            }
-        }
-        let _reset = EnvReset;
-
-        let inflight_root = root.join("runtime").join("discord_inflight");
-        let state = InflightTurnState::new(
-            ProviderKind::Codex,
-            123,
-            Some("adk-cdx".to_string()),
-            456,
-            789,
-            999,
-            "hello".to_string(),
-            Some("session-1".to_string()),
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            42,
-        );
-        save_inflight_state_in_root(&inflight_root, &state).unwrap();
-
-        assert_eq!(
-            mark_all_inflight_states_restart_mode(
-                &ProviderKind::Codex,
-                InflightRestartMode::DrainRestart,
-            ),
-            1
-        );
-
-        let states = load_inflight_states(&ProviderKind::Codex);
-        assert_eq!(states.len(), 1);
-        assert_eq!(
-            states[0].restart_mode,
-            Some(InflightRestartMode::DrainRestart)
-        );
-        assert_eq!(
-            states[0].restart_generation,
-            Some(super::super::runtime_store::load_generation())
-        );
-    }
-
-    /// #897 P2 #1: `save_inflight_state_create_new_in_root` must succeed on
-    /// a vacant path (atomic create) and reject a second call at the same
-    /// path with `AlreadyExists` — this is the guarantee that prevents a
-    /// `/api/inflight/rebind` call from overwriting a concurrent live
-    /// turn's canonical inflight state.
-    #[test]
-    fn save_inflight_state_create_new_rejects_existing_path() {
-        let temp = TempDir::new().unwrap();
-        let state = InflightTurnState::new(
-            ProviderKind::Codex,
-            1_234_567,
-            Some("adk-cdx".to_string()),
-            0,
-            0,
-            0,
-            "/api/inflight/rebind".to_string(),
-            None,
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
-        );
-
-        save_inflight_state_create_new_in_root(temp.path(), &state)
-            .expect("first atomic create must succeed on a vacant path");
-
-        match save_inflight_state_create_new_in_root(temp.path(), &state) {
-            Err(CreateNewInflightError::AlreadyExists) => {}
-            other => panic!(
-                "second atomic create must report AlreadyExists, got {:?}",
-                other
-            ),
-        }
-    }
-
-    /// #897 P2 #1: a previously-saved `save_inflight_state_in_root` write
-    /// must be observed by `save_inflight_state_create_new_in_root` as
-    /// `AlreadyExists`. This is the actual race we need to guard against —
-    /// a legitimate turn writes its state via `save_inflight_state`, then a
-    /// concurrent rebind call must NOT overwrite it.
-    #[test]
-    fn save_inflight_state_create_new_rejects_path_written_by_normal_save() {
-        let temp = TempDir::new().unwrap();
-        let live_turn_state = InflightTurnState::new(
-            ProviderKind::Codex,
-            9_876_543,
-            Some("adk-cdx".to_string()),
-            123, // live user
-            456, // real user_msg_id
-            789, // real current_msg_id
-            "real user input".to_string(),
-            Some("session-live".to_string()),
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            128,
-        );
-        save_inflight_state_in_root(temp.path(), &live_turn_state)
-            .expect("legitimate turn write must succeed");
-
-        let rebind_state = InflightTurnState::new(
-            ProviderKind::Codex,
-            9_876_543,
-            Some("adk-cdx".to_string()),
-            0,
-            0,
-            0,
-            "/api/inflight/rebind".to_string(),
-            None,
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
-        );
-        match save_inflight_state_create_new_in_root(temp.path(), &rebind_state) {
-            Err(CreateNewInflightError::AlreadyExists) => {}
-            other => panic!("rebind must not overwrite live turn state; got {:?}", other),
-        }
-
-        // Canonical live-turn data must survive.
-        let states = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
-        assert_eq!(states.len(), 1);
-        assert_eq!(states[0].request_owner_user_id, 123);
-        assert_eq!(states[0].user_msg_id, 456);
-        assert_eq!(states[0].user_text, "real user input");
-    }
-
-    /// Relay state contract — invariant **I1**
-    /// (`docs/relay-state-contract.md`, `response_sent_offset_in_bounds` +
-    /// `response_sent_offset_monotonic`).
-    ///
-    /// A normal forward-moving save must succeed without tripping either
-    /// the bounds or the monotonicity check.
-    #[test]
-    fn relay_state_contract_i1_response_sent_offset_advances_monotonically() {
-        let temp = TempDir::new().unwrap();
-
-        let mut state = InflightTurnState::new(
-            ProviderKind::Codex,
-            555,
-            Some("adk-cdx".to_string()),
-            1,
-            2,
-            3,
-            "user prompt".to_string(),
-            None,
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
-        );
-        state.full_response = "hello world".to_string();
-        state.response_sent_offset = 5;
-        save_inflight_state_in_root(temp.path(), &state).expect("first save");
-
-        state.response_sent_offset = 11; // == full_response.len()
-        save_inflight_state_in_root(temp.path(), &state).expect("forward save");
-
-        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].response_sent_offset, 11);
-        assert_eq!(loaded[0].full_response, "hello world");
-    }
-
-    /// Relay state contract — invariant **I3**
-    /// (`docs/relay-state-contract.md`, `watcher_relay_idempotent`).
-    ///
-    /// `last_watcher_relayed_offset` must round-trip across save/load so
-    /// a replacement watcher (post restart, post replace) initialises its
-    /// duplicate-relay guard from the persisted high-water mark.
-    #[test]
-    fn relay_state_contract_i3_last_watcher_relayed_offset_persists() {
-        let temp = TempDir::new().unwrap();
-
-        let mut state = InflightTurnState::new(
-            ProviderKind::Codex,
-            777,
-            Some("adk-cdx".to_string()),
-            1,
-            2,
-            3,
-            "user prompt".to_string(),
-            None,
-            Some("AgentDesk-codex-adk-cdx".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
-        );
-        state.last_watcher_relayed_offset = Some(4_096);
-        save_inflight_state_in_root(temp.path(), &state).expect("save with watcher offset");
-
-        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].last_watcher_relayed_offset, Some(4_096));
     }
 }

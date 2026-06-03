@@ -141,6 +141,7 @@ fn ensure_one_card_row_affected(
 #[cfg(test)]
 mod verdict_tests;
 
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn insert_iteration_pg(
     pool: &PgPool,
     params: InsertIterationParams,
@@ -315,6 +316,7 @@ pub async fn list_iterations_for_card_pg(
 }
 
 /// Load `title` and `metadata` JSON for a card — used by the discard path to seed child cards.
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn load_card_header_pg(
     pool: &PgPool,
     card_id: &str,
@@ -648,6 +650,7 @@ async fn lock_candidate_dedupe_key_in_tx(
     Ok(())
 }
 
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn iteration_count_for_card_pg(pool: &PgPool, card_id: &str) -> Result<i64, String> {
     sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM automation_candidate_iterations WHERE card_id = $1",
@@ -820,6 +823,7 @@ fn program_iteration_budget(program: &serde_json::Value) -> i32 {
 }
 
 /// Transition the card to a new status.
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn transition_card_status_pg(
     pool: &PgPool,
     card_id: &str,
@@ -844,6 +848,7 @@ pub async fn transition_card_status_pg(
 }
 
 /// Persist the last completed automation iteration on the card's program metadata.
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn update_card_program_current_iteration_pg(
     pool: &PgPool,
     card_id: &str,
@@ -880,6 +885,7 @@ pub async fn update_card_program_current_iteration_pg(
 }
 
 /// Create a child card for the next iteration of an automation candidate.
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn create_child_candidate_card_pg(
     pool: &PgPool,
     parent_card_id: &str,
@@ -933,6 +939,7 @@ pub async fn create_child_candidate_card_pg(
 /// Read `metadata->'program'->>'repo_dir'` for the card.
 ///
 /// Returns `None` if the card doesn't exist or the field isn't set.
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn load_card_repo_dir_pg(pool: &PgPool, card_id: &str) -> Result<Option<String>, String> {
     let value: Option<String> = sqlx::query_scalar(
         r#"
@@ -955,6 +962,7 @@ pub async fn load_card_repo_dir_pg(pool: &PgPool, card_id: &str) -> Result<Optio
 ///
 /// Returns `None` if the card doesn't exist or the field isn't set.
 /// Expected values: `"manual_review"` (default) | `"auto_apply_after_green"`.
+#[allow(dead_code)] // staged-rollout automation-candidate repo helper; not on every target. See #3034
 pub async fn load_card_final_gate_pg(
     pool: &PgPool,
     card_id: &str,

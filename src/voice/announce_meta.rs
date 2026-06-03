@@ -129,6 +129,7 @@ impl VoiceAnnouncementMetaStore {
         }
     }
 
+    #[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
     pub(crate) fn take(&self, message_id: MessageId) -> Option<VoiceTranscriptAnnouncement> {
         self.take_with_acceptance(message_id)
             .map(|(announcement, _)| announcement)
@@ -155,6 +156,7 @@ impl VoiceAnnouncementMetaStore {
             .map(|stored| (stored.announcement, stored.accepted_replay))
     }
 
+    #[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
     pub(crate) fn contains(&self, message_id: MessageId) -> bool {
         let mut entries = match self.entries.write() {
             Ok(entries) => entries,
@@ -165,6 +167,7 @@ impl VoiceAnnouncementMetaStore {
         entries.contains_key(&message_id.get())
     }
 
+    #[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
     pub(crate) fn insert_handoff(&self, message_id: MessageId, meta: VoiceBackgroundHandoffMeta) {
         self.insert_handoff_with_remaining_ttl(message_id, meta, HANDOFF_META_TTL);
     }
@@ -507,6 +510,7 @@ pub(crate) async fn bind_pending_voice_announcement_by_key_durable(
 
 /// Atomic consume variant for workers that receive a forwarded readable
 /// announcement before the posting process successfully binds `message_id`.
+#[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
 pub(crate) async fn take_pending_voice_announcement_by_key_durable(
     pool: &PgPool,
     pending_key: &str,
@@ -586,6 +590,7 @@ pub(crate) async fn load_consumed_voice_announcement_durable(
     value.map(decode_voice_announcement_value).transpose()
 }
 
+#[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
 pub(crate) async fn take_voice_announcement_durable(
     pool: &PgPool,
     message_id: MessageId,
@@ -654,6 +659,7 @@ fn is_durable_pending_message_id(message_id: &str) -> bool {
 /// `ON CONFLICT … DO UPDATE` deliberately refuses to update rows that were
 /// already consumed. A late publish/persist retry must not resurrect a
 /// handoff after terminal delivery has claimed it (#2392).
+#[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
 pub(crate) async fn persist_handoff_durable(
     pool: &PgPool,
     message_id: MessageId,

@@ -729,32 +729,6 @@ pub(super) fn load_restored_session_cwd(
         .flatten();
     }
 
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    if let Some(db) = db {
-        use sqlite_test::OptionalExtension;
-
-        let Ok(conn) = db.lock() else {
-            return None;
-        };
-        for session_key in session_keys {
-            let path = conn
-                .query_row(
-                    "SELECT cwd FROM sessions WHERE session_key = ?1 LIMIT 1",
-                    sqlite_test::params![session_key],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .flatten();
-            if let Some(path) =
-                path.filter(|path| !path.is_empty() && std::path::Path::new(path).is_dir())
-            {
-                return Some(path);
-            }
-        }
-    }
-
     let _ = (db, session_keys);
     None
 }
@@ -852,29 +826,6 @@ pub(super) fn load_restored_provider_session_id(
         .flatten();
     }
 
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    if let Some(db) = db {
-        use sqlite_test::OptionalExtension;
-
-        let Ok(conn) = db.lock() else {
-            return None;
-        };
-        return conn
-            .query_row(
-                "SELECT claude_session_id
-                 FROM sessions
-                 WHERE session_key = ?1 AND provider = ?2
-                 LIMIT 1",
-                sqlite_test::params![session_keys[0], provider.as_str()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .flatten()
-            .filter(|session_id| !session_id.is_empty());
-    }
-
     let _ = (db, session_keys);
     None
 }
@@ -889,12 +840,6 @@ pub(in crate::services::discord) fn sqlite_runtime_db(
     if shared.pg_pool.is_some() {
         None
     } else {
-        #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-        {
-            let SharedData { sqlite, .. } = shared;
-            return sqlite.as_ref();
-        }
-        #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
         None::<&crate::db::Db>
     }
 }
@@ -1076,21 +1021,6 @@ pub(super) fn load_human_alert_target(shared: &SharedData) -> Option<String> {
         .and_then(|channel| normalize_human_alert_target(&channel));
     }
 
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    if let Some(db) = sqlite_runtime_db(shared) {
-        let Ok(conn) = db.lock() else {
-            return None;
-        };
-        return conn
-            .query_row(
-                "SELECT value FROM kv_meta WHERE key = 'kanban_human_alert_channel_id'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|channel| normalize_human_alert_target(&channel));
-    }
-
     let _ = shared;
     None
 }
@@ -1156,41 +1086,6 @@ pub(super) async fn update_card_ready_failure_marker_pg(
     Ok(updated > 0)
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(super) fn update_card_ready_failure_marker_sqlite(
-    db: &crate::db::Db,
-    card_id: &str,
-    reason: &str,
-) -> Result<bool, String> {
-    use sqlite_test::OptionalExtension;
-
-    let conn = db
-        .lock()
-        .map_err(|error| format!("lock sqlite db for ready marker: {error}"))?;
-    let existing_metadata = conn
-        .query_row(
-            "SELECT metadata FROM kanban_cards WHERE id = ?1",
-            sqlite_test::params![card_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|error| format!("load sqlite card metadata for {card_id}: {error}"))?
-        .flatten();
-    let metadata_json =
-        merge_card_label_metadata(existing_metadata.as_deref(), READY_FOR_INPUT_STUCK_LABEL);
-    let updated = conn
-        .execute(
-            "UPDATE kanban_cards
-             SET metadata = ?1,
-                 blocked_reason = ?2,
-                 updated_at = datetime('now')
-             WHERE id = ?3",
-            sqlite_test::params![metadata_json, reason, card_id],
-        )
-        .map_err(|error| format!("update sqlite ready marker for {card_id}: {error}"))?;
-    Ok(updated > 0)
-}
-
 pub(super) fn load_dispatch_card_id(shared: &SharedData, dispatch_id: &str) -> Option<String> {
     if let Some(pool) = shared.pg_pool.as_ref() {
         let dispatch_id = dispatch_id.to_string();
@@ -1209,20 +1104,6 @@ pub(super) fn load_dispatch_card_id(shared: &SharedData, dispatch_id: &str) -> O
         )
         .ok()
         .flatten();
-    }
-
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    if let Some(db) = sqlite_runtime_db(shared) {
-        let Ok(conn) = db.lock() else {
-            return None;
-        };
-        return conn
-            .query_row(
-                "SELECT kanban_card_id FROM task_dispatches WHERE id = ?1",
-                sqlite_test::params![dispatch_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
     }
 
     let _ = (shared, dispatch_id);
@@ -1266,15 +1147,6 @@ pub(in crate::services::discord) async fn fail_dispatch_for_ready_for_input_stal
             update_card_ready_failure_marker_pg(pool, card_id_ref, READY_FOR_INPUT_STUCK_REASON)
                 .await?
         } else if let Some(db) = sqlite_runtime_db(shared.as_ref()) {
-            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-            {
-                update_card_ready_failure_marker_sqlite(
-                    db,
-                    card_id_ref,
-                    READY_FOR_INPUT_STUCK_REASON,
-                )?
-            }
-            #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
             {
                 let _ = db;
                 false
@@ -1431,6 +1303,31 @@ pub(in crate::services::discord) async fn clear_recovery_handled_channels(shared
     let _ = shared;
 }
 
+/// Outcome of a single `last_heartbeat` refresh attempt, used for auditable
+/// logging at the `touch_session_activity` boundary (#3053). Distinguishes
+/// which candidate key path matched so silent no-ops (the original failure
+/// mode where TUI/watcher activity refreshed a non-matching row) are visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum HeartbeatRefreshMatch {
+    /// One of the namespaced/legacy `session_key` candidates matched.
+    SessionKey,
+    /// Fell back to `provider + thread_channel_id` and matched.
+    ThreadChannelFallback,
+    /// No row matched any candidate — activity went unobserved by idle-kill.
+    NoMatch,
+}
+
+pub(in crate::services::discord) struct HeartbeatRefreshOutcome {
+    pub matched: HeartbeatRefreshMatch,
+    pub rows_affected: u64,
+}
+
+impl HeartbeatRefreshOutcome {
+    pub fn refreshed(&self) -> bool {
+        self.rows_affected > 0
+    }
+}
+
 // Tmux watcher output is activity, but reusing hook_session here would also
 // overwrite status/tokens defaults. Touch only last_heartbeat instead.
 pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output(
@@ -1441,6 +1338,28 @@ pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output(
     tmux_session_name: &str,
     thread_channel_id: Option<u64>,
 ) -> bool {
+    refresh_session_heartbeat_from_tmux_output_detailed(
+        db,
+        pg_pool,
+        token_hash,
+        provider,
+        tmux_session_name,
+        thread_channel_id,
+    )
+    .refreshed()
+}
+
+/// Same as `refresh_session_heartbeat_from_tmux_output` but reports which
+/// candidate key matched and how many rows were touched, so callers can emit
+/// auditable activity logs (#3053).
+pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output_detailed(
+    db: Option<&crate::db::Db>,
+    pg_pool: Option<&sqlx::PgPool>,
+    token_hash: &str,
+    provider: &ProviderKind,
+    tmux_session_name: &str,
+    thread_channel_id: Option<u64>,
+) -> HeartbeatRefreshOutcome {
     let session_keys = super::super::adk_session::build_session_key_candidates(
         token_hash,
         provider,
@@ -1465,11 +1384,17 @@ pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output(
                 .map_err(|error| format!("refresh pg watcher heartbeat by session key: {error}"))?
                 .rows_affected();
                 if updated > 0 {
-                    return Ok(true);
+                    return Ok(HeartbeatRefreshOutcome {
+                        matched: HeartbeatRefreshMatch::SessionKey,
+                        rows_affected: updated,
+                    });
                 }
 
                 let Some(thread_channel_id) = thread_channel_id else {
-                    return Ok(false);
+                    return Ok(HeartbeatRefreshOutcome {
+                        matched: HeartbeatRefreshMatch::NoMatch,
+                        rows_affected: 0,
+                    });
                 };
                 let updated = sqlx::query(
                     "UPDATE sessions
@@ -1486,31 +1411,95 @@ pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output(
                     format!("refresh pg watcher heartbeat by thread channel: {error}")
                 })?
                 .rows_affected();
-                Ok(updated > 0)
+                Ok(HeartbeatRefreshOutcome {
+                    matched: if updated > 0 {
+                        HeartbeatRefreshMatch::ThreadChannelFallback
+                    } else {
+                        HeartbeatRefreshMatch::NoMatch
+                    },
+                    rows_affected: updated,
+                })
             },
             |message| message,
         )
-        .unwrap_or(false);
-    }
-
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    if let Some(db) = db {
-        let Ok(conn) = db.lock() else {
-            return false;
-        };
-        return conn
-            .execute(
-                "UPDATE sessions
-                 SET last_heartbeat = datetime('now')
-                 WHERE session_key = ?1 AND provider = ?2",
-                sqlite_test::params![session_keys[0], provider.as_str()],
-            )
-            .map(|updated| updated > 0)
-            .unwrap_or(false);
+        .unwrap_or(HeartbeatRefreshOutcome {
+            matched: HeartbeatRefreshMatch::NoMatch,
+            rows_affected: 0,
+        });
     }
 
     let _ = (db, provider, thread_channel_id, session_keys);
-    false
+    HeartbeatRefreshOutcome {
+        matched: HeartbeatRefreshMatch::NoMatch,
+        rows_affected: 0,
+    }
+}
+
+/// Single auditable entry point for runtime-observed session activity (#3053).
+///
+/// Refreshes `sessions.last_heartbeat = NOW()` for the row idle-kill selects
+/// on (`COALESCE(last_heartbeat, created_at)`) and logs the resolved
+/// `session_key`, BOTH candidate keys (namespaced + legacy `host:tmux`),
+/// rows-affected, the caller-supplied `reason`/`source`, and whether the
+/// `thread_channel_id` fallback was used. The original failure mode (#3053)
+/// was a silent no-op: TUI/watcher activity refreshed a non-matching row or
+/// no row at all, and idle-kill later killed the live session. The structured
+/// log makes that branch observable.
+///
+/// Returns true when at least one row was touched.
+pub(in crate::services::discord) fn touch_session_activity(
+    db: Option<&crate::db::Db>,
+    pg_pool: Option<&sqlx::PgPool>,
+    token_hash: &str,
+    provider: &ProviderKind,
+    tmux_session_name: &str,
+    thread_channel_id: Option<u64>,
+    reason: &str,
+    source: &str,
+) -> bool {
+    let session_keys = super::super::adk_session::build_session_key_candidates(
+        token_hash,
+        provider,
+        tmux_session_name,
+    );
+    let outcome = refresh_session_heartbeat_from_tmux_output_detailed(
+        db,
+        pg_pool,
+        token_hash,
+        provider,
+        tmux_session_name,
+        thread_channel_id,
+    );
+
+    let used_thread_fallback = outcome.matched == HeartbeatRefreshMatch::ThreadChannelFallback;
+    if outcome.refreshed() {
+        tracing::debug!(
+            source,
+            reason,
+            tmux_session = %tmux_session_name,
+            namespaced_key = %session_keys[0],
+            legacy_key = %session_keys[1],
+            rows_affected = outcome.rows_affected,
+            used_thread_fallback,
+            thread_channel_id = ?thread_channel_id,
+            "touch_session_activity: refreshed idle-kill heartbeat (#3053)"
+        );
+    } else {
+        // No row matched — idle-kill will not observe this activity. This is the
+        // exact #3053 failure mode, so warn (not debug) to make it actionable.
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            source,
+            reason,
+            tmux_session = %tmux_session_name,
+            namespaced_key = %session_keys[0],
+            legacy_key = %session_keys[1],
+            rows_affected = outcome.rows_affected,
+            thread_channel_id = ?thread_channel_id,
+            "  [{ts}] ⚠ touch_session_activity: NO session row matched runtime activity — idle-kill heartbeat NOT refreshed (#3053)",
+        );
+    }
+    outcome.refreshed()
 }
 
 pub(super) fn maybe_refresh_watcher_activity_heartbeat(
@@ -1591,11 +1580,7 @@ pub(super) async fn resolve_watcher_dispatch_id(
             .await,
         )
         .or_else(|| {
-            resolve_dispatched_thread_dispatch_from_db(
-                None::<&crate::db::Db>,
-                shared.pg_pool.as_ref(),
-                channel_id.get(),
-            )
+            resolve_dispatched_thread_dispatch_from_db(shared.pg_pool.as_ref(), channel_id.get())
         })
 }
 
@@ -1619,8 +1604,18 @@ pub(super) fn should_suppress_streaming_placeholder_after_recent_stop(
     has_assistant_response && inflight_missing && recent_turn_stop
 }
 
-pub(super) fn should_skip_streaming_placeholder_without_inflight(inflight_missing: bool) -> bool {
-    inflight_missing
+pub(super) fn should_skip_streaming_placeholder_without_inflight(
+    inflight_missing: bool,
+    pane_actively_streaming: bool,
+) -> bool {
+    // #3107: a live agentic TUI turn can lose its inflight mid-turn (a momentary
+    // idle observation between tool calls commits and clears it). When the pane
+    // is still actively producing assistant output, the missing inflight is a
+    // self-heal opportunity, NOT a signal to suppress — dropping the edit here
+    // is exactly the relay-degradation bug. Only suppress when inflight is
+    // missing AND the pane looks finished/idle (genuine post-finish ghost noise
+    // like provider-selector chrome).
+    inflight_missing && !pane_actively_streaming
 }
 
 pub(super) fn should_suppress_post_terminal_output_without_inflight(
@@ -1629,6 +1624,7 @@ pub(super) fn should_suppress_post_terminal_output_without_inflight(
     ssh_direct_prompt_pending: bool,
     external_input_lease_present: bool,
     assistant_continuation_present: bool,
+    pane_actively_streaming: bool,
 ) -> bool {
     // SSH-direct prompts never create an inflight (they bypass the Discord
     // message path), so the (terminal + no-inflight) shape alone is not enough
@@ -1637,11 +1633,15 @@ pub(super) fn should_suppress_post_terminal_output_without_inflight(
     // we must still relay even when notification/anchor creation failed.
     // Likewise, another assistant event after an early terminal relay means
     // the provider turn continued with tool calls or final text; do not drop it.
+    // #3107: and if the pane is still actively producing assistant output, the
+    // turn is live and merely lost its inflight — relay (and re-acquire) rather
+    // than suppress.
     terminal_success_seen
         && inflight_missing
         && !ssh_direct_prompt_pending
         && !external_input_lease_present
         && !assistant_continuation_present
+        && !pane_actively_streaming
 }
 
 #[cfg(test)]
@@ -1654,30 +1654,36 @@ mod post_terminal_output_tests {
     #[test]
     fn post_terminal_output_without_inflight_is_suppressed() {
         assert!(should_suppress_post_terminal_output_without_inflight(
-            true, true, false, false, false
+            true, true, false, false, false, false
         ));
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                false, true, false, false, false
+                false, true, false, false, false, false
             ),
             "pre-terminal output still belongs to the active watcher turn"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, false, false, false, false
+                true, false, false, false, false, false
             ),
             "a newly active inflight owns subsequent output"
         );
         assert!(
-            !should_suppress_post_terminal_output_without_inflight(true, true, true, false, false),
+            !should_suppress_post_terminal_output_without_inflight(
+                true, true, true, false, false, false
+            ),
             "SSH-direct prompt anchor present: output is a real direct-input response"
         );
         assert!(
-            !should_suppress_post_terminal_output_without_inflight(true, true, false, true, false),
+            !should_suppress_post_terminal_output_without_inflight(
+                true, true, false, true, false, false
+            ),
             "ExternalInput lease present: notification failure must not suppress response output"
         );
         assert!(
-            !should_suppress_post_terminal_output_without_inflight(true, true, false, false, true),
+            !should_suppress_post_terminal_output_without_inflight(
+                true, true, false, false, true, false
+            ),
             "assistant continuation after early terminal relay still belongs to the provider turn"
         );
     }
@@ -1685,27 +1691,71 @@ mod post_terminal_output_tests {
     #[test]
     fn post_terminal_hard_result_after_committed_turn_requires_direct_input_evidence() {
         assert!(
-            should_suppress_post_terminal_output_without_inflight(true, true, false, false, false),
+            should_suppress_post_terminal_output_without_inflight(
+                true, true, false, false, false, false
+            ),
             "a late hard_result envelope after a committed Discord turn must not relay again"
         );
         assert!(
-            !should_suppress_post_terminal_output_without_inflight(true, true, true, false, false),
+            !should_suppress_post_terminal_output_without_inflight(
+                true, true, true, false, false, false
+            ),
             "a pending SSH-direct prompt is explicit evidence of a fresh direct-input turn"
         );
         assert!(
-            !should_suppress_post_terminal_output_without_inflight(true, true, false, true, false),
+            !should_suppress_post_terminal_output_without_inflight(
+                true, true, false, true, false, false
+            ),
             "an ExternalInput lease is explicit evidence of a fresh direct-input turn"
         );
         assert!(
-            should_suppress_post_terminal_output_without_inflight(true, true, false, false, false),
+            should_suppress_post_terminal_output_without_inflight(
+                true, true, false, false, false, false
+            ),
             "a result-only duplicate without assistant continuation stays suppressed"
         );
     }
 
     #[test]
+    fn post_terminal_output_with_actively_streaming_pane_is_not_suppressed() {
+        // #3107: the (terminal + no-inflight) shape that would otherwise be
+        // suppressed must still relay when the pane is actively producing —
+        // the turn is live and merely lost its inflight.
+        assert!(
+            !should_suppress_post_terminal_output_without_inflight(
+                true, true, false, false, false, true
+            ),
+            "an actively-streaming pane means the turn is live: relay, do not suppress"
+        );
+        // Asymmetry: with a finished/idle pane the same shape is still genuine
+        // post-finish ghost noise and stays suppressed.
+        assert!(
+            should_suppress_post_terminal_output_without_inflight(
+                true, true, false, false, false, false
+            ),
+            "a finished pane with missing inflight is real ghost noise: still suppressed"
+        );
+    }
+
+    #[test]
     fn streaming_placeholder_without_inflight_is_skipped() {
-        assert!(should_skip_streaming_placeholder_without_inflight(true));
-        assert!(!should_skip_streaming_placeholder_without_inflight(false));
+        // Genuine ghost noise: inflight missing AND pane idle/finished.
+        assert!(should_skip_streaming_placeholder_without_inflight(
+            true, false
+        ));
+        assert!(!should_skip_streaming_placeholder_without_inflight(
+            false, false
+        ));
+        // #3107 asymmetry: inflight missing but pane actively streaming → the
+        // live turn lost its inflight; do NOT skip the streaming edit.
+        assert!(
+            !should_skip_streaming_placeholder_without_inflight(true, true),
+            "an actively-streaming pane with missing inflight is a live turn: relay"
+        );
+        // A present inflight is never skipped regardless of pane state.
+        assert!(!should_skip_streaming_placeholder_without_inflight(
+            false, true
+        ));
     }
 }
 
@@ -1729,11 +1779,6 @@ impl WatcherClaimOutcome {
             action,
             owner_channel_id,
         }
-    }
-
-    #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-    pub(crate) fn action(self) -> WatcherClaimAction {
-        self.action
     }
 
     pub(crate) fn owner_channel_id(self) -> ChannelId {
@@ -2479,26 +2524,19 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
     // and message handlers find an active session with current_path
     if !owned_sessions.is_empty() {
         let mut data = shared.core.lock().await;
-        let sqlite_settings_db = if shared.pg_pool.is_some() {
-            None
-        } else {
-            None::<&crate::db::Db>
-        };
         for (channel_id, channel_name) in &owned_sessions {
             let persisted_path = load_last_session_path(
-                sqlite_settings_db,
                 shared.pg_pool.as_ref(),
                 &shared.token_hash,
                 channel_id.get(),
             );
             let remote_profile = load_last_remote_profile(
-                sqlite_settings_db,
                 shared.pg_pool.as_ref(),
                 &shared.token_hash,
                 channel_id.get(),
             );
             let persisted_session_id = load_restored_provider_session_id(
-                sqlite_settings_db,
+                None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 &shared.token_hash,
                 &provider,

@@ -25,6 +25,9 @@ use tracing::warn;
 
 pub(crate) const DEFAULT_TTS_CHUNK_MAX_CHARS: usize = 220;
 
+// reason: streaming TTS playback is wired only when voice config is enabled; no
+// compile target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) const DEFAULT_STREAMING_TTS_QUEUE_CAPACITY: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,12 +45,18 @@ struct SynthesizedChunk {
     synthesis_elapsed: Duration,
 }
 
+// reason: streaming TTS playback is wired only when voice config is enabled; no
+// compile target exercises it. See #3034.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct StreamingTtsChunkSender {
     queue: IncrementalTtsChunkQueue,
     tx: mpsc::Sender<String>,
 }
 
+// reason: streaming TTS playback is wired only when voice config is enabled; no
+// compile target exercises it. See #3034.
+#[allow(dead_code)]
 impl StreamingTtsChunkSender {
     pub(crate) async fn push_text(&mut self, text: &str) -> Result<()> {
         self.queue.push_text(text);
@@ -70,12 +79,18 @@ impl StreamingTtsChunkSender {
     }
 }
 
+// reason: streaming TTS playback is wired only when voice config is enabled; no
+// compile target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) fn streaming_tts_chunk_channel(
     max_chars: usize,
 ) -> (StreamingTtsChunkSender, mpsc::Receiver<String>) {
     streaming_tts_chunk_channel_with_capacity(max_chars, DEFAULT_STREAMING_TTS_QUEUE_CAPACITY)
 }
 
+// reason: streaming TTS playback is wired only when voice config is enabled; no
+// compile target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) fn streaming_tts_chunk_channel_with_capacity(
     max_chars: usize,
     capacity: usize,
@@ -123,6 +138,9 @@ where
     .await
 }
 
+// reason: streaming TTS playback is wired only when voice config is enabled; no
+// compile target exercises it. See #3034.
+#[allow(dead_code)]
 pub(crate) async fn play_streaming_chunks_with_prefetch<F>(
     call_lock: Arc<Mutex<songbird::Call>>,
     tts: TtsRuntime,

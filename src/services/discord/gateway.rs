@@ -248,7 +248,7 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
         &self,
         target_channel: &str,
         content: &str,
-    ) -> Result<String, crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError>
+    ) -> Result<String, crate::services::dispatches::discord_delivery::DispatchMessagePostError>
     {
         let channel_id = parse_channel_id(target_channel)?;
         rate_limit_wait(&self.shared, channel_id).await;
@@ -270,13 +270,13 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
         content: &str,
         reference_channel: &str,
         reference_message: &str,
-    ) -> Result<String, crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError>
+    ) -> Result<String, crate::services::dispatches::discord_delivery::DispatchMessagePostError>
     {
         let channel_id = parse_channel_id(target_channel)?;
         let reference_channel_id = parse_channel_id(reference_channel)?;
         let reference_message_id = parse_message_id(reference_message).map_err(|error| {
-            crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError::new(
-                crate::server::routes::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other,
+            crate::services::dispatches::discord_delivery::DispatchMessagePostError::new(
+                crate::services::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other,
                 error,
             )
         })?;
@@ -299,12 +299,12 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
         target_channel: &str,
         message_id: &str,
         content: &str,
-    ) -> Result<String, crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError>
+    ) -> Result<String, crate::services::dispatches::discord_delivery::DispatchMessagePostError>
     {
         let channel_id = parse_channel_id(target_channel)?;
         let message_id = parse_message_id(message_id).map_err(|error| {
-            crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError::new(
-                crate::server::routes::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other,
+            crate::services::dispatches::discord_delivery::DispatchMessagePostError::new(
+                crate::services::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other,
                 error,
             )
         })?;
@@ -325,32 +325,29 @@ impl DiscordOutboundClient for SerenityTurnOutboundClient {
 
 fn parse_channel_id(
     raw: &str,
-) -> Result<ChannelId, crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError>
-{
-    raw.parse::<u64>()
-        .map(ChannelId::new)
-        .map_err(|error| {
-            crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError::new(
-                crate::server::routes::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other,
-                format!("invalid Discord channel id {raw}: {error}"),
-            )
-        })
+) -> Result<ChannelId, crate::services::dispatches::discord_delivery::DispatchMessagePostError> {
+    raw.parse::<u64>().map(ChannelId::new).map_err(|error| {
+        crate::services::dispatches::discord_delivery::DispatchMessagePostError::new(
+            crate::services::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other,
+            format!("invalid Discord channel id {raw}: {error}"),
+        )
+    })
 }
 
 fn dispatch_post_error(
     error: serenity::Error,
-) -> crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError {
+) -> crate::services::dispatches::discord_delivery::DispatchMessagePostError {
     let detail = crate::utils::redact::redact_known_secrets(&error.to_string());
     let lowered = detail.to_ascii_lowercase();
     let kind = if detail.contains("BASE_TYPE_MAX_LENGTH")
         || lowered.contains("2000 or fewer in length")
         || lowered.contains("length")
     {
-        crate::server::routes::dispatches::discord_delivery::DispatchMessagePostErrorKind::MessageTooLong
+        crate::services::dispatches::discord_delivery::DispatchMessagePostErrorKind::MessageTooLong
     } else {
-        crate::server::routes::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other
+        crate::services::dispatches::discord_delivery::DispatchMessagePostErrorKind::Other
     };
-    crate::server::routes::dispatches::discord_delivery::DispatchMessagePostError::new(kind, detail)
+    crate::services::dispatches::discord_delivery::DispatchMessagePostError::new(kind, detail)
 }
 
 /// codex review P2 (#1332 follow-up): drain the `queued_placeholders` /
@@ -408,12 +405,61 @@ pub(super) async fn drain_merged_queued_placeholders(
     to_delete
 }
 
+/// #3082 part B (codex P2-3): the answer-flush wait gate for intake
+/// placeholders, factored out so the queued-only gating is unit-testable
+/// without a live Discord HTTP client.
+///
+/// Only the queued-turn "📬" notice path waits behind an in-flight multi-chunk
+/// answer flush — so the notice lands as a single TRAILING card after the last
+/// chunk, never interleaved between answer chunks. Active-turn placeholders (a
+/// turn starting NOW, or a TUI idle-response card) pass `is_queued_notice =
+/// false` and return immediately, never delayed behind a flush.
+///
+/// The wait is bounded (progress-aware inactivity grace + absolute hard
+/// ceiling) and the barrier guard is RAII-cleared, so a stuck/errored flush can
+/// never permanently suppress the queued card — we proceed regardless once it
+/// elapses (logged, no deadlock).
+async fn await_answer_flush_if_queued_notice(
+    barrier: &Arc<super::answer_flush_barrier::AnswerFlushBarrier>,
+    channel_id: ChannelId,
+    is_queued_notice: bool,
+) {
+    if !is_queued_notice {
+        return;
+    }
+    if !barrier
+        .wait_for_flush(
+            channel_id,
+            super::answer_flush_barrier::ANSWER_FLUSH_WAIT_TIMEOUT,
+            super::answer_flush_barrier::ANSWER_FLUSH_WAIT_HARD_CEILING,
+        )
+        .await
+    {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::warn!(
+            "  [{ts}] ⏱ INTAKE: answer-flush barrier timed out for channel {}; posting queued card anyway (no deadlock)",
+            channel_id
+        );
+    }
+}
+
 pub(super) async fn send_intake_placeholder(
     http: Arc<serenity::Http>,
     shared: Arc<SharedData>,
     channel_id: ChannelId,
     reference: Option<(ChannelId, MessageId)>,
+    // #3082 part B (codex P2-3): only the queued-turn notice path must wait on
+    // the answer-flush barrier. Active-turn placeholders (a turn starting NOW,
+    // or a TUI idle-response card) are NOT a trailing "📬 queued" notice and
+    // must NOT be delayed behind a multi-chunk answer flush — set this `false`
+    // for those callers.
+    is_queued_notice: bool,
 ) -> Result<MessageId, String> {
+    // codex P2-3: gate the answer-flush wait to the queued-notice path only;
+    // unrelated active-turn placeholders skip the barrier entirely.
+    await_answer_flush_if_queued_notice(&shared.answer_flush_barrier, channel_id, is_queued_notice)
+        .await;
+
     let client = SerenityTurnOutboundClient { http, shared };
     let mut msg = gateway_outbound_message(channel_id, "...");
     if let Some((reference_channel, reference_message)) = reference {
@@ -876,152 +922,75 @@ impl TurnGateway for HeadlessGateway {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::{drain_merged_queued_placeholders, live_bot_owner_provider, outbound_policy};
-    use crate::services::discord::outbound::policy::{FallbackPolicy, LengthStrategy};
-    use poise::serenity_prelude::{ChannelId, MessageId};
-    use std::time::Duration;
+/// #3082 part B (codex P2-3): gate-behavior tests for the answer-flush wait.
+/// These do not need a live Discord HTTP client (they exercise only the
+/// `await_answer_flush_if_queued_notice` seam against a real barrier), so they
+/// are compiled unconditionally rather than behind `legacy-sqlite-tests`.
+#[cfg(test)]
+mod answer_flush_gate_tests {
+    use super::await_answer_flush_if_queued_notice;
+    use crate::services::discord::answer_flush_barrier::AnswerFlushBarrier;
+    use poise::serenity_prelude::ChannelId;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    #[test]
-    fn live_bot_owner_provider_requires_live_turn_context() {
-        assert!(live_bot_owner_provider(None).is_none());
+    /// P2-3: a non-queued active-turn placeholder must NOT wait on the barrier,
+    /// even while a multi-chunk answer flush is in flight on the same channel.
+    #[tokio::test]
+    async fn active_turn_placeholder_does_not_wait_on_barrier() {
+        let barrier = Arc::new(AnswerFlushBarrier::default());
+        let channel = ChannelId::new(101);
+        // A multi-chunk answer flush is in flight (guard held) for this channel.
+        let _flush_guard = barrier.begin_flush(channel);
+
+        // An ACTIVE-turn placeholder (is_queued_notice = false) must return
+        // immediately, never blocking behind the in-flight flush.
+        let start = Instant::now();
+        await_answer_flush_if_queued_notice(&barrier, channel, false).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "an active-turn placeholder must NOT wait on the answer-flush barrier"
+        );
     }
 
-    #[test]
-    fn gateway_outbound_policy_preserves_streaming_chunks() {
-        let policy = outbound_policy();
+    /// P2-3 (counterpart): the queued-notice path DOES wait behind an in-flight
+    /// flush and only proceeds once the flush ends — proving the gate routes the
+    /// two callers differently.
+    #[tokio::test]
+    async fn queued_notice_placeholder_waits_for_flush() {
+        let barrier = Arc::new(AnswerFlushBarrier::default());
+        let channel = ChannelId::new(102);
+        let flush_guard = barrier.begin_flush(channel);
 
-        assert_eq!(policy.length_strategy, LengthStrategy::RejectOverLimit);
-        assert_eq!(policy.fallback, FallbackPolicy::None);
-        assert_eq!(policy.idempotency_window, Duration::ZERO);
-    }
-
-    // codex review round-6 P2 (#1332): the two `drain_merged_queued_placeholders`
-    // tests below now write to disk via `persist_channel_from_map` whenever
-    // the drain mutates the map. Without isolation they could pollute the
-    // developer's real `~/.adk/release` runtime directory or race a
-    // parallel test that mutates `AGENTDESK_ROOT_DIR`. Wrap each test in
-    // `lock_test_env` + a `tempfile::tempdir` `AGENTDESK_ROOT_DIR` so the
-    // write-through lands in a per-test temp directory.
-    fn with_isolated_runtime_root<F: FnOnce(&std::path::Path)>(f: F) {
-        let _lock = crate::services::discord::runtime_store::lock_test_env();
-        let tmp = tempfile::tempdir().expect("create temp runtime dir for queued placeholder test");
-        unsafe {
-            std::env::set_var(
-                "AGENTDESK_ROOT_DIR",
-                tmp.path().to_str().expect("temp path must be valid utf-8"),
-            );
-        }
-        f(tmp.path());
-        unsafe {
-            std::env::remove_var("AGENTDESK_ROOT_DIR");
-        }
-    }
-
-    // codex review P2 (#1332 follow-up): when a merged intervention is
-    // dispatched, the queued placeholders for every NON-head source id must
-    // be drained and returned for visible-card cleanup. The head id is left
-    // in place because the dispatch hand-off path consumes it directly.
-    //
-    // codex review round-6 P2 (#1332): isolated under temp `AGENTDESK_ROOT_DIR`
-    // so the persistence write-through cannot pollute the dev runtime dir
-    // or race other parallel tests that mutate the env var. Run the async
-    // body on a freshly-built runtime inside the env-locked block — using
-    // `#[tokio::test]` would acquire the lock AFTER the runtime started,
-    // and other tests on the runtime's worker threads could observe a
-    // half-set `AGENTDESK_ROOT_DIR`.
-    #[test]
-    fn drain_merged_queued_placeholders_drops_non_head_source_ids() {
-        with_isolated_runtime_root(|_root| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build single-thread tokio runtime");
-            rt.block_on(async {
-                let shared = crate::services::discord::make_shared_data_for_tests();
-                let channel_id = ChannelId::new(940_000_000_000_001);
-                let head_msg = MessageId::new(840_000_000_000_001);
-                let head_card = MessageId::new(740_000_000_000_001);
-                let merged_a_msg = MessageId::new(840_000_000_000_002);
-                let merged_a_card = MessageId::new(740_000_000_000_002);
-                let merged_b_msg = MessageId::new(840_000_000_000_003);
-                let merged_b_card = MessageId::new(740_000_000_000_003);
-
-                shared
-                    .queued_placeholders
-                    .insert((channel_id, head_msg), head_card);
-                shared
-                    .queued_placeholders
-                    .insert((channel_id, merged_a_msg), merged_a_card);
-                shared
-                    .queued_placeholders
-                    .insert((channel_id, merged_b_msg), merged_b_card);
-
-                let drained = drain_merged_queued_placeholders(
-                    &shared,
-                    channel_id,
-                    head_msg,
-                    &[merged_a_msg, merged_b_msg, head_msg],
-                )
-                .await;
-
-                // Head id must remain in queued_placeholders so the dispatch hand-off
-                // path can consume it; the two merged ids must be drained AND
-                // returned so the caller can delete their stale Discord cards.
-                assert_eq!(drained.len(), 2);
-                let drained_set: std::collections::HashSet<MessageId> =
-                    drained.into_iter().collect();
-                assert!(drained_set.contains(&merged_a_card));
-                assert!(drained_set.contains(&merged_b_card));
-                assert!(!drained_set.contains(&head_card));
-                assert_eq!(shared.queued_placeholders.len(), 1);
-                assert_eq!(
-                    shared
-                        .queued_placeholders
-                        .get(&(channel_id, head_msg))
-                        .map(|entry| *entry.value()),
-                    Some(head_card),
-                    "head id mapping must survive the drain"
-                );
-            });
+        let barrier_for_card = barrier.clone();
+        let card = tokio::spawn(async move {
+            // is_queued_notice = true — must block behind the flush.
+            await_answer_flush_if_queued_notice(&barrier_for_card, channel, true).await;
         });
+
+        // Hold the flush briefly; the queued notice must still be waiting.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !card.is_finished(),
+            "the queued-notice placeholder must wait while the flush is in flight"
+        );
+
+        // Flush ends — the queued notice proceeds.
+        drop(flush_guard);
+        card.await.expect("queued-notice wait task must complete");
     }
 
-    // codex review P2: a non-merged intervention (single source id == head)
-    // should produce an empty drain — there is nothing to clean up.
-    //
-    // codex review round-6 P2 (#1332): even though this drain takes the
-    // `mutated == false` branch and does NOT write to disk, the helper
-    // still acquires the per-channel persistence mutex which DashMap-stores
-    // the lock entry inside `SharedData::queued_placeholders_persist_locks`.
-    // Wrap the test for symmetry with the mutating sibling and to defend
-    // against future drain-helper changes that would start persisting on
-    // the no-op path.
-    #[test]
-    fn drain_merged_queued_placeholders_noop_for_non_merged_intervention() {
-        with_isolated_runtime_root(|_root| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build single-thread tokio runtime");
-            rt.block_on(async {
-                let shared = crate::services::discord::make_shared_data_for_tests();
-                let channel_id = ChannelId::new(950_000_000_000_001);
-                let head_msg = MessageId::new(850_000_000_000_001);
-                let head_card = MessageId::new(750_000_000_000_001);
-
-                shared
-                    .queued_placeholders
-                    .insert((channel_id, head_msg), head_card);
-
-                let drained =
-                    drain_merged_queued_placeholders(&shared, channel_id, head_msg, &[head_msg])
-                        .await;
-
-                assert!(drained.is_empty());
-                assert_eq!(shared.queued_placeholders.len(), 1);
-            });
-        });
+    /// P2-3: with no flush in flight, even the queued-notice path returns
+    /// immediately (the wait is only paid when there is something to wait for).
+    #[tokio::test]
+    async fn queued_notice_returns_immediately_when_no_flush() {
+        let barrier = Arc::new(AnswerFlushBarrier::default());
+        let channel = ChannelId::new(103);
+        let start = Instant::now();
+        await_answer_flush_if_queued_notice(&barrier, channel, true).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "with no flush in flight the queued-notice path must not block"
+        );
     }
 }

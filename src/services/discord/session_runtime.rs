@@ -684,11 +684,6 @@ pub(super) async fn auto_restore_session_force(
     let (last_path, saved_remote, provider) = {
         let settings = shared.settings.read().await;
         let provider = settings.provider.clone();
-        let sqlite_settings_db = if shared.pg_pool.is_some() {
-            None
-        } else {
-            None::<&crate::db::Db>
-        };
         let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref())
             .or_else(|| {
                 if is_dm {
@@ -699,7 +694,6 @@ pub(super) async fn auto_restore_session_force(
                 }
             });
         let saved_remote = load_last_remote_profile(
-            sqlite_settings_db,
             shared.pg_pool.as_ref(),
             &shared.token_hash,
             channel_id.get(),
@@ -740,31 +734,9 @@ pub(super) async fn auto_restore_session_force(
                 .flatten();
             }
 
-            #[cfg(all(test, feature = "legacy-sqlite-tests"))]
-            {
-                None::<&crate::db::Db>.and_then(|db| {
-                    db.lock().ok().and_then(|conn| {
-                        session_keys.iter().find_map(|session_key| {
-                            conn.query_row(
-                                "SELECT cwd FROM sessions WHERE session_key = ?1",
-                                [session_key],
-                                |row| row.get::<_, String>(0),
-                            )
-                            .ok()
-                            .filter(|p| {
-                                !p.is_empty() && session_path_is_usable(p, saved_remote.as_deref())
-                            })
-                        })
-                    })
-                })
-            }
-            #[cfg(not(all(test, feature = "legacy-sqlite-tests")))]
-            {
-                None
-            }
+            None
         });
         let persisted_path = load_last_session_path(
-            sqlite_settings_db,
             shared.pg_pool.as_ref(),
             &shared.token_hash,
             channel_id.get(),
@@ -802,6 +774,20 @@ pub(super) async fn auto_restore_session_force(
             session.remote_profile_name = saved_remote.clone();
         }
         if session.current_path.is_some() || last_path.is_none() {
+            // A pre-existing session (e.g. inserted by restart watcher
+            // registration with `current_path` from `sessions.cwd` but
+            // `worktree: None`) hits this early return before the insertion
+            // block below. Reconstruct the managed-worktree metadata here too so
+            // restarted thread sessions regain `WorktreeInfo` / inflight worktree
+            // context and a correct cleanup root (#3011).
+            if let Some(current_path) = session.current_path.clone() {
+                reconstruct_managed_worktree_metadata(
+                    session,
+                    &provider,
+                    channel_id,
+                    &current_path,
+                );
+            }
             return;
         }
     }
@@ -839,6 +825,7 @@ pub(super) async fn auto_restore_session_force(
             session.remote_profile_name = saved_remote.clone();
         }
         session.current_path = Some(last_path.clone());
+        reconstruct_managed_worktree_metadata(session, &provider, channel_id, &last_path);
         drop(data);
 
         // Rescan skills with project path
@@ -851,6 +838,221 @@ pub(super) async fn auto_restore_session_force(
             .unwrap_or_default();
         tracing::info!("  [{ts}] ↻ Auto-restored session: {last_path}{remote_info}");
     }
+}
+
+/// Look up the persisted worktree path for a thread session from the `sessions`
+/// DB table, mirroring the restore lookup in [`auto_restore_session_force`].
+///
+/// After a dcserver restart the in-memory `sessions` map is empty, so without
+/// this lookup a new thread message would create a brand-new worktree and drop
+/// the provider session fingerprint / recovery context tied to the previous
+/// worktree path (#3011). The returned path is only honored when it still names
+/// a usable git worktree on disk; otherwise we fall back to creating a fresh one.
+fn restore_thread_worktree_path_from_db(
+    pg_pool: Option<&sqlx::PgPool>,
+    token_hash: &str,
+    provider: &ProviderKind,
+    channel_name: &str,
+) -> Option<String> {
+    let tmux_name = provider.build_tmux_session_name(channel_name);
+    let session_keys = build_session_key_candidates(token_hash, provider, &tmux_name);
+    let pg_pool = pg_pool?;
+    crate::utils::async_bridge::block_on_pg_result(
+        pg_pool,
+        move |pool| async move {
+            for session_key in session_keys {
+                // `sessions.cwd` is nullable: decode as Option so a NULL /
+                // metadata-only row for an earlier session-key candidate does
+                // not fail the decode and abort the loop before the legacy
+                // fallback key is tried.
+                let path = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT cwd FROM sessions WHERE session_key = $1 LIMIT 1",
+                )
+                .bind(&session_key)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| format!("load thread session cwd {session_key}: {error}"))?
+                .flatten();
+                if let Some(path) = path.filter(|p| !p.is_empty()) {
+                    return Ok(Some(path));
+                }
+            }
+            Ok(None)
+        },
+        |message| message,
+    )
+    .ok()
+    .flatten()
+}
+
+/// True when `worktree_path` exists, is a git worktree, and shares the same
+/// repository (git common dir) as `parent_path`. The shared-repo match is
+/// essential: a thread can be reused by a later dispatch that targets a
+/// *different* repo, in which case the stored cwd must NOT be restored — we must
+/// fall through to create a worktree off the requested `parent_path` so the
+/// dispatch runs against its real target (#3011 codex review: avoid treating a
+/// restored cwd as the dispatch target).
+///
+/// Both paths are compared by their `--git-common-dir` so the check holds even
+/// when `parent_path` is itself a linked worktree (e.g. a dispatch worktree),
+/// where comparing against the main checkout would otherwise reject a valid
+/// restored thread worktree.
+fn restored_worktree_belongs_to_parent(parent_path: &str, worktree_path: &str) -> bool {
+    if !std::path::Path::new(worktree_path).is_dir() {
+        return false;
+    }
+    // Only accept a *distinct linked* worktree. If a previous
+    // `create_git_worktree` failure persisted the fallback `parent_path` (the
+    // shared parent checkout) as this thread's cwd, restoring it would record
+    // the main checkout as `session.worktree`, defeating isolation and exposing
+    // it to worktree idle-cleanup. A linked worktree's per-worktree git dir
+    // differs from its shared common dir; the main checkout's do not.
+    if !is_linked_worktree(worktree_path) {
+        return false;
+    }
+    let worktree_repo = match git_common_dir(worktree_path) {
+        Some(dir) => dir,
+        None => return false,
+    };
+    let parent_repo = match git_common_dir(parent_path) {
+        Some(dir) => dir,
+        None => return false,
+    };
+    paths_equal(&worktree_repo, &parent_repo)
+}
+
+/// True when `path` lives under the AgentDesk-managed worktrees root, i.e. it is
+/// a worktree this process created via [`create_git_worktree`] and therefore owns
+/// for cleanup. A user's *configured workspace* that happens to be a linked git
+/// worktree lives elsewhere and must NOT be treated as a disposable
+/// AgentDesk-owned worktree — otherwise idle session cleanup could remove the
+/// user's checkout and delete its branch (#3011 codex review P1).
+fn is_managed_worktree_path(path: &str) -> bool {
+    let Some(root) = worktrees_root() else {
+        return false;
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    let candidate = std::path::PathBuf::from(path);
+    let candidate = candidate.canonicalize().unwrap_or(candidate);
+    candidate.starts_with(&root)
+}
+
+/// True when `path` is a *linked* git worktree rather than the repository's main
+/// checkout. A linked worktree's per-worktree git dir
+/// (`<repo>/.git/worktrees/<name>`) differs from the shared common dir
+/// (`<repo>/.git`), whereas they are identical for the main checkout.
+fn is_linked_worktree(path: &str) -> bool {
+    let git_dir = git_command_stdout(path, &["rev-parse", "--path-format=absolute", "--git-dir"])
+        .ok()
+        .filter(|dir| !dir.is_empty());
+    let common_dir = git_common_dir(path);
+    match (git_dir, common_dir) {
+        (Some(git_dir), Some(common_dir)) => {
+            let git_dir = std::path::PathBuf::from(git_dir);
+            let git_dir = git_dir.canonicalize().unwrap_or(git_dir);
+            !paths_equal(&git_dir, &common_dir)
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the absolute git common dir (the shared repository `.git` directory)
+/// for `path`, canonicalizing so the same repo compares equal regardless of how
+/// it was reached (main checkout vs. linked worktree, symlinks, relative input).
+fn git_common_dir(path: &str) -> Option<std::path::PathBuf> {
+    let common_dir = git_command_stdout(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .filter(|dir| !dir.is_empty())?;
+    let common_dir = std::path::PathBuf::from(common_dir);
+    Some(common_dir.canonicalize().unwrap_or(common_dir))
+}
+
+/// Compare two filesystem paths, tolerating symlinked/relative differences by
+/// canonicalizing when possible and falling back to a lexical comparison.
+fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
+/// Reconstruct the [`WorktreeInfo`] for a restored thread worktree path. The
+/// branch is read back from the worktree's HEAD so unmerged-commit / local-change
+/// detection keeps working across restarts.
+///
+/// Returns `None` when the worktree's branch cannot be recovered (detached HEAD
+/// or a failed lookup). Attaching `WorktreeInfo` with an empty branch is unsafe:
+/// idle cleanup builds an `origin/main..<branch>` range from it and, with an
+/// empty branch, inspects the wrong checkout's HEAD — so a clean detached
+/// worktree carrying unmerged work could be wrongly removed (#3011 codex P1).
+fn restored_worktree_info(parent_path: &str, worktree_path: &str) -> Option<WorktreeInfo> {
+    let branch_name = git_command_stdout(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .ok()
+        .filter(|b| !b.is_empty() && b != "HEAD")?;
+    Some(WorktreeInfo {
+        // `original_path` is the cleanup root: idle cleanup runs
+        // `git -C original_path worktree remove <worktree_path>` then
+        // `git -C original_path branch -D <branch>`. It must therefore be a
+        // stable checkout that survives removing this worktree — never the
+        // restored worktree itself (which `parent_path` can equal when the
+        // dispatch parent is itself a linked worktree). Resolve the main
+        // checkout from the worktree's common dir so branch deletion still
+        // works post-removal.
+        original_path: main_checkout_for_worktree(worktree_path)
+            .unwrap_or_else(|| parent_path.to_string()),
+        worktree_path: worktree_path.to_string(),
+        branch_name,
+    })
+}
+
+/// Reconstruct and attach [`WorktreeInfo`] to a restored session when its
+/// `path` is an AgentDesk-managed linked git worktree and the session does not
+/// already carry worktree metadata. No-op otherwise (already populated, a
+/// user-configured workspace outside the managed worktrees root, or the main
+/// checkout). Used by the auto-restore paths so a thread session that resumes
+/// after a dcserver restart regains its worktree metadata, inflight worktree
+/// context, and a stable cleanup root instead of silently dropping them (#3011).
+fn reconstruct_managed_worktree_metadata(
+    session: &mut DiscordSession,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    path: &str,
+) {
+    if session.worktree.is_some() || !is_managed_worktree_path(path) || !is_linked_worktree(path) {
+        return;
+    }
+    // Skip reconstruction when no branch can be recovered (detached HEAD); see
+    // `restored_worktree_info` — attaching an empty branch would mislead cleanup.
+    let Some(wt_info) = restored_worktree_info(path, path) else {
+        return;
+    };
+    let base_commit = crate::services::platform::git_head_commit(&wt_info.original_path);
+    sync_inflight_worktree_context(
+        provider,
+        channel_id.get(),
+        Some(wt_info.worktree_path.clone()),
+        Some(wt_info.branch_name.clone()),
+        base_commit,
+    );
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    tracing::info!(
+        "  [{ts}] ↻ Restored worktree metadata: {} (branch: {})",
+        wt_info.worktree_path,
+        wt_info.branch_name
+    );
+    session.worktree = Some(wt_info);
+}
+
+/// Resolve the repository's main checkout directory for a linked `worktree_path`.
+/// The common dir resolves to `<main_checkout>/.git`, so its parent is the main
+/// checkout. Returns `None` when the path is not under a resolvable git repo.
+fn main_checkout_for_worktree(worktree_path: &str) -> Option<String> {
+    let common_dir = git_common_dir(worktree_path)?;
+    let main_checkout = common_dir.parent()?;
+    Some(main_checkout.to_string_lossy().to_string())
 }
 
 /// Create a lightweight session for a thread, bootstrapped from the parent channel's path.
@@ -900,11 +1102,57 @@ pub(super) async fn bootstrap_thread_session(
             born_generation: runtime_store::load_generation(),
             assistant_turns: 0,
         });
+    // Prefer restoring the worktree persisted for this thread session across a
+    // dcserver restart. The in-memory `sessions` map is cleared on restart, so
+    // without this lookup a new thread message would create a brand-new worktree
+    // and drop the provider session fingerprint / recovery context tied to the
+    // previous worktree path (#3011). Mirror the DB cwd lookup used by
+    // `auto_restore_session_force`, and only create a fresh worktree when the
+    // stored path is absent or no longer a usable git worktree on disk.
+    let ch = session
+        .channel_name
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let restored_worktree = restore_thread_worktree_path_from_db(
+        shared.pg_pool.as_ref(),
+        &shared.token_hash,
+        &provider_kind,
+        &ch,
+    )
+    .filter(|path| is_managed_worktree_path(path))
+    .filter(|path| restored_worktree_belongs_to_parent(parent_path, path));
+    // Only honor the restore when a branch is recoverable. A detached / unknown
+    // branch would yield an empty `branch_name` that misleads idle cleanup, so
+    // in that case fall through to create a fresh, well-formed worktree instead.
+    if let Some(restored_path) = restored_worktree
+        && let Some(wt_info) = restored_worktree_info(parent_path, &restored_path)
+    {
+        let base_commit = crate::services::platform::git_head_commit(&wt_info.original_path);
+        let restored_path = wt_info.worktree_path.clone();
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!(
+            "  [{ts}] ↻ Restored thread worktree: {} (branch: {})",
+            wt_info.worktree_path,
+            wt_info.branch_name
+        );
+        sync_inflight_worktree_context(
+            &provider_kind,
+            thread_channel_id.get(),
+            Some(wt_info.worktree_path.clone()),
+            Some(wt_info.branch_name.clone()),
+            base_commit,
+        );
+        session.worktree = Some(wt_info);
+        session.current_path = Some(restored_path.clone());
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!("  [{ts}] ↻ Bootstrapped thread session: {restored_path}");
+        return true;
+    }
+
     // Always create a worktree for thread sessions to isolate concurrent work.
     let effective_path = {
-        let ch = session.channel_name.as_deref().unwrap_or("unknown");
         let provider_str = shared.settings.read().await.provider.as_str().to_string();
-        match create_git_worktree(parent_path, ch, &provider_str) {
+        match create_git_worktree(parent_path, &ch, &provider_str) {
             Ok((wt_path, branch)) => {
                 let base_commit = crate::services::platform::git_head_commit(parent_path);
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1144,698 +1392,5 @@ pub(super) async fn resolve_thread_parent(
             Some((parent_id, parent_name))
         }
         _ => None,
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    fn run_git(repo_dir: &Path, args: &[&str]) -> String {
-        let output = GitCommand::new()
-            .args(args)
-            .repo(repo_dir)
-            .run_output()
-            .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {}", args, e));
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
-    fn branch_exists(repo_dir: &Path, branch: &str) -> bool {
-        GitCommand::new()
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ])
-            .repo(repo_dir)
-            .run_output()
-            .is_ok()
-    }
-
-    fn setup_git_repo_with_origin() -> (tempfile::TempDir, tempfile::TempDir) {
-        let origin = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
-
-        run_git(origin.path(), &["init", "--bare"]);
-        run_git(repo.path(), &["init", "-b", "main"]);
-        run_git(repo.path(), &["config", "user.email", "test@test.com"]);
-        run_git(repo.path(), &["config", "user.name", "Test"]);
-        run_git(
-            repo.path(),
-            &["remote", "add", "origin", origin.path().to_str().unwrap()],
-        );
-        run_git(repo.path(), &["commit", "--allow-empty", "-m", "initial"]);
-        run_git(repo.path(), &["push", "-u", "origin", "main"]);
-
-        (repo, origin)
-    }
-
-    #[test]
-    fn synthetic_thread_channel_name_round_trips() {
-        let channel_id = ChannelId::new(12345);
-        let synthetic = synthetic_thread_channel_name("agentdesk-codex", channel_id);
-
-        assert_eq!(synthetic, "agentdesk-codex-t12345");
-        assert!(is_synthetic_thread_channel_name(&synthetic, channel_id));
-        assert!(!is_synthetic_thread_channel_name(
-            "agentdesk-codex",
-            channel_id
-        ));
-    }
-
-    #[test]
-    fn choose_restore_channel_name_prefers_existing_synthetic_thread_name() {
-        let channel_id = ChannelId::new(12345);
-        let chosen = choose_restore_channel_name(
-            Some("agentdesk-codex-t12345"),
-            Some("새 스레드 제목"),
-            Some((ChannelId::new(777), Some("agentdesk-codex".to_string()))),
-            channel_id,
-        );
-
-        assert_eq!(chosen.as_deref(), Some("agentdesk-codex-t12345"));
-    }
-
-    #[test]
-    fn resolve_is_dm_channel_prefers_gateway_hint() {
-        assert!(resolve_is_dm_channel(Some(true), false));
-        assert!(!resolve_is_dm_channel(Some(false), true));
-    }
-
-    #[test]
-    fn resolve_is_dm_channel_uses_lookup_when_hint_missing() {
-        assert!(resolve_is_dm_channel(None, true));
-        assert!(!resolve_is_dm_channel(None, false));
-    }
-
-    #[test]
-    fn assistant_turn_count_only_counts_assistant_messages() {
-        let session = DiscordSession {
-            session_id: None,
-            memento_context_loaded: false,
-            memento_reflected: false,
-            current_path: None,
-            history: vec![
-                HistoryItem {
-                    item_type: HistoryType::User,
-                    content: "user".to_string(),
-                },
-                HistoryItem {
-                    item_type: HistoryType::Assistant,
-                    content: "assistant-1".to_string(),
-                },
-                HistoryItem {
-                    item_type: HistoryType::ToolUse,
-                    content: "tool".to_string(),
-                },
-                HistoryItem {
-                    item_type: HistoryType::Assistant,
-                    content: "assistant-2".to_string(),
-                },
-            ],
-            pending_uploads: Vec::new(),
-            cleared: false,
-            remote_profile_name: None,
-            channel_id: None,
-            channel_name: None,
-            category_name: None,
-            last_active: tokio::time::Instant::now(),
-            worktree: None,
-            born_generation: 0,
-            assistant_turns: 0,
-        };
-
-        assert_eq!(session.assistant_turn_count(), 2);
-    }
-
-    #[test]
-    fn recent_history_context_returns_latest_user_and_assistant_messages() {
-        let session = DiscordSession {
-            session_id: None,
-            memento_context_loaded: false,
-            memento_reflected: false,
-            current_path: None,
-            history: vec![
-                HistoryItem {
-                    item_type: HistoryType::User,
-                    content: "첫 질문".to_string(),
-                },
-                HistoryItem {
-                    item_type: HistoryType::Assistant,
-                    content: "첫 답변".to_string(),
-                },
-                HistoryItem {
-                    item_type: HistoryType::User,
-                    content: "둘째 질문".to_string(),
-                },
-                HistoryItem {
-                    item_type: HistoryType::Assistant,
-                    content: "둘째 답변".to_string(),
-                },
-            ],
-            pending_uploads: Vec::new(),
-            cleared: false,
-            remote_profile_name: None,
-            channel_id: None,
-            channel_name: None,
-            category_name: None,
-            last_active: tokio::time::Instant::now(),
-            worktree: None,
-            born_generation: 0,
-            assistant_turns: 0,
-        };
-
-        assert_eq!(
-            session.recent_history_context(3).as_deref(),
-            Some("Assistant: 첫 답변\nUser: 둘째 질문\nAssistant: 둘째 답변")
-        );
-    }
-
-    #[test]
-    fn choose_restore_channel_name_builds_synthetic_name_for_threads() {
-        let channel_id = ChannelId::new(12345);
-        let chosen = choose_restore_channel_name(
-            None,
-            Some("새 스레드 제목"),
-            Some((ChannelId::new(777), Some("agentdesk-codex".to_string()))),
-            channel_id,
-        );
-
-        assert_eq!(chosen.as_deref(), Some("agentdesk-codex-t12345"));
-    }
-
-    #[test]
-    fn choose_restore_channel_name_keeps_existing_name_when_live_metadata_missing() {
-        let channel_id = ChannelId::new(12345);
-        let chosen = choose_restore_channel_name(Some("agentdesk-codex"), None, None, channel_id);
-
-        assert_eq!(chosen.as_deref(), Some("agentdesk-codex"));
-    }
-
-    #[test]
-    fn allows_nonlocal_session_path_requires_remote_profile_name() {
-        assert!(allows_nonlocal_session_path(Some("mac-mini")));
-        assert!(!allows_nonlocal_session_path(Some("")));
-        assert!(!allows_nonlocal_session_path(None));
-    }
-
-    #[test]
-    fn session_path_is_usable_for_remote_nonlocal_path() {
-        assert!(session_path_is_usable("~/repo", Some("mac-mini")));
-    }
-
-    #[test]
-    fn select_restored_session_path_prefers_configured_workspace() {
-        let selected = select_restored_session_path(
-            Some("/new/workspace".to_string()),
-            Some("/old/workspace".to_string()),
-            Some("/yaml/workspace".to_string()),
-            Some("remote"),
-        );
-
-        assert_eq!(selected.as_deref(), Some("/new/workspace"));
-    }
-
-    #[test]
-    fn select_restored_session_path_falls_back_when_configured_missing() {
-        let selected = select_restored_session_path(
-            None,
-            Some("/db/workspace".to_string()),
-            Some("/yaml/workspace".to_string()),
-            Some("remote"),
-        );
-
-        assert_eq!(selected.as_deref(), Some("/db/workspace"));
-    }
-
-    #[test]
-    fn cleanup_git_worktree_preserves_branch_until_origin_main_contains_commit() {
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-        let worktree_dir = repo_dir.join("wt-543");
-        let branch = "wt/fix-543";
-
-        run_git(
-            repo_dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_dir.to_str().unwrap(),
-            ],
-        );
-        run_git(
-            &worktree_dir,
-            &[
-                "commit",
-                "--allow-empty",
-                "-m",
-                "fix: preserve worktree (#543)",
-            ],
-        );
-
-        // Simulate local main advancing before auto-merge pushes to origin.
-        run_git(repo_dir, &["merge", "--ff-only", branch]);
-
-        cleanup_git_worktree(
-            None,
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir.to_string_lossy().to_string(),
-                worktree_path: worktree_dir.to_string_lossy().to_string(),
-                branch_name: branch.to_string(),
-            },
-        );
-
-        assert!(worktree_dir.exists(), "worktree should be preserved");
-        assert!(
-            branch_exists(repo_dir, branch),
-            "branch should stay until origin/main contains it"
-        );
-    }
-
-    #[test]
-    fn create_git_worktree_starts_from_origin_main_even_when_local_main_is_ahead() {
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-
-        let origin_head_before = run_git(repo_dir, &["rev-parse", "origin/main"]);
-        run_git(
-            repo_dir,
-            &["commit", "--allow-empty", "-m", "local-only commit"],
-        );
-        let local_head_after = run_git(repo_dir, &["rev-parse", "HEAD"]);
-        assert_ne!(
-            origin_head_before, local_head_after,
-            "test setup requires local main to be ahead of origin/main"
-        );
-
-        let (worktree_path, branch_name) =
-            create_git_worktree(repo_dir.to_str().unwrap(), "slot-reset", "claude").unwrap();
-        let worktree_head = run_git(Path::new(&worktree_path), &["rev-parse", "HEAD"]);
-        let worktree_branch = run_git(Path::new(&worktree_path), &["branch", "--show-current"]);
-
-        assert_eq!(
-            worktree_head, origin_head_before,
-            "fresh worktree must start from origin/main rather than local main HEAD"
-        );
-        assert_eq!(worktree_branch, branch_name);
-
-        cleanup_git_worktree(
-            None,
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir.to_string_lossy().to_string(),
-                worktree_path,
-                branch_name,
-            },
-        );
-    }
-
-    #[test]
-    fn cleanup_git_worktree_removes_branch_once_origin_main_contains_commit() {
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-        let worktree_dir = repo_dir.join("wt-merged");
-        let branch = "wt/fix-merged";
-
-        run_git(
-            repo_dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_dir.to_str().unwrap(),
-            ],
-        );
-        run_git(
-            &worktree_dir,
-            &[
-                "commit",
-                "--allow-empty",
-                "-m",
-                "fix: merged worktree (#543)",
-            ],
-        );
-        run_git(repo_dir, &["merge", "--ff-only", branch]);
-        run_git(repo_dir, &["push", "origin", "main"]);
-
-        cleanup_git_worktree(
-            None,
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir.to_string_lossy().to_string(),
-                worktree_path: worktree_dir.to_string_lossy().to_string(),
-                branch_name: branch.to_string(),
-            },
-        );
-
-        assert!(
-            !worktree_dir.exists(),
-            "merged worktree should be cleaned up"
-        );
-        assert!(
-            !branch_exists(repo_dir, branch),
-            "merged branch should be deleted after cleanup"
-        );
-    }
-
-    #[test]
-    fn cleanup_git_worktree_removes_squash_merged_branch() {
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-        let worktree_dir = repo_dir.join("wt-squash-merged");
-        let branch = "wt/fix-squash-merged";
-        let notes = worktree_dir.join("notes.txt");
-
-        run_git(
-            repo_dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_dir.to_str().unwrap(),
-            ],
-        );
-        std::fs::write(&notes, "one\n").unwrap();
-        run_git(&worktree_dir, &["add", "notes.txt"]);
-        run_git(&worktree_dir, &["commit", "-m", "feat: add first note"]);
-        std::fs::write(&notes, "one\ntwo\n").unwrap();
-        run_git(&worktree_dir, &["add", "notes.txt"]);
-        run_git(&worktree_dir, &["commit", "-m", "feat: add second note"]);
-
-        run_git(repo_dir, &["merge", "--squash", branch]);
-        run_git(
-            repo_dir,
-            &["commit", "-m", "feat: squash merged worktree (#543)"],
-        );
-        run_git(repo_dir, &["push", "origin", "main"]);
-
-        cleanup_git_worktree(
-            None,
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir.to_string_lossy().to_string(),
-                worktree_path: worktree_dir.to_string_lossy().to_string(),
-                branch_name: branch.to_string(),
-            },
-        );
-
-        assert!(
-            !worktree_dir.exists(),
-            "squash-merged worktree should be cleaned up"
-        );
-        assert!(
-            !branch_exists(repo_dir, branch),
-            "squash-merged branch should be deleted after cleanup"
-        );
-    }
-
-    #[test]
-    fn cleanup_git_worktree_preserves_dirty_worktree() {
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-        let worktree_dir = repo_dir.join("wt-dirty");
-        let branch = "wt/fix-dirty";
-
-        run_git(
-            repo_dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_dir.to_str().unwrap(),
-            ],
-        );
-        std::fs::write(worktree_dir.join("dirty.txt"), "keep me\n").unwrap();
-
-        cleanup_git_worktree(
-            None,
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir.to_string_lossy().to_string(),
-                worktree_path: worktree_dir.to_string_lossy().to_string(),
-                branch_name: branch.to_string(),
-            },
-        );
-
-        assert!(worktree_dir.exists(), "dirty worktree should be preserved");
-        assert!(
-            branch_exists(repo_dir, branch),
-            "dirty branch should be preserved"
-        );
-    }
-
-    #[test]
-    fn cleanup_git_worktree_disconnects_sessions_referencing_removed_path() {
-        let db = crate::db::test_db();
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-        let worktree_dir = repo_dir.join("wt-session-cleanup");
-        let branch = "wt/fix-session-cleanup";
-        let worktree_path = worktree_dir.to_string_lossy().to_string();
-
-        run_git(
-            repo_dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_dir.to_str().unwrap(),
-            ],
-        );
-        run_git(
-            &worktree_dir,
-            &[
-                "commit",
-                "--allow-empty",
-                "-m",
-                "fix: merged worktree for session cleanup (#543)",
-            ],
-        );
-        run_git(repo_dir, &["merge", "--ff-only", branch]);
-        run_git(repo_dir, &["push", "origin", "main"]);
-
-        db.lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO sessions
-                 (session_key, status, cwd, active_dispatch_id, claude_session_id, created_at)
-                 VALUES (?1, 'idle', ?2, 'dispatch-1', 'sid-1', datetime('now'))",
-                ["host:worktree-cleanup-session", worktree_path.as_str()],
-            )
-            .unwrap();
-
-        cleanup_git_worktree(
-            Some(&db),
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir.to_string_lossy().to_string(),
-                worktree_path: worktree_dir.to_string_lossy().to_string(),
-                branch_name: branch.to_string(),
-            },
-        );
-
-        let session_row: (Option<String>, String, Option<String>, Option<String>) = db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT cwd, status, active_dispatch_id, claude_session_id
-                 FROM sessions
-                 WHERE session_key = ?1",
-                ["host:worktree-cleanup-session"],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(session_row.0, None);
-        assert_eq!(session_row.1, "disconnected");
-        assert_eq!(session_row.2, None);
-        assert_eq!(session_row.3, None);
-    }
-
-    #[test]
-    fn cleanup_git_worktree_preserves_when_git_inspection_fails() {
-        let (repo, _origin) = setup_git_repo_with_origin();
-        let repo_dir = repo.path();
-        let worktree_dir = repo_dir.join("wt-inspect-fail");
-        let branch = "wt/fix-inspect-fail";
-
-        run_git(
-            repo_dir,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_dir.to_str().unwrap(),
-            ],
-        );
-
-        cleanup_git_worktree(
-            None,
-            None,
-            &WorktreeInfo {
-                original_path: repo_dir
-                    .join("missing-parent")
-                    .to_string_lossy()
-                    .to_string(),
-                worktree_path: worktree_dir.to_string_lossy().to_string(),
-                branch_name: branch.to_string(),
-            },
-        );
-
-        assert!(
-            worktree_dir.exists(),
-            "worktree should remain when cleanup cannot verify merge state"
-        );
-        assert!(
-            branch_exists(repo_dir, branch),
-            "branch should remain when cleanup cannot verify merge state"
-        );
-    }
-
-    #[test]
-    fn restored_memento_context_loaded_preserves_loaded_state_only_when_already_loaded() {
-        assert!(!super::restored_memento_context_loaded(
-            false,
-            None,
-            Some("session-1")
-        ));
-        assert!(super::restored_memento_context_loaded(
-            true,
-            Some("session-1"),
-            Some("session-1")
-        ));
-        assert!(!super::restored_memento_context_loaded(
-            true,
-            Some("session-1"),
-            Some("session-2")
-        ));
-        assert!(!super::restored_memento_context_loaded(
-            true,
-            Some("session-1"),
-            None
-        ));
-    }
-
-    #[test]
-    fn restore_provider_session_keeps_unloaded_memento_state_until_context_reloads() {
-        let mut session = DiscordSession {
-            session_id: None,
-            memento_context_loaded: false,
-            memento_reflected: true,
-            current_path: None,
-            history: Vec::new(),
-            pending_uploads: Vec::new(),
-            cleared: false,
-            remote_profile_name: None,
-            channel_id: None,
-            channel_name: None,
-            category_name: None,
-            last_active: tokio::time::Instant::now(),
-            worktree: None,
-            born_generation: 0,
-            assistant_turns: 0,
-        };
-
-        session.restore_provider_session(Some("session-1".to_string()));
-
-        assert_eq!(session.session_id.as_deref(), Some("session-1"));
-        assert!(!session.memento_context_loaded);
-        assert!(!session.memento_reflected);
-    }
-
-    #[test]
-    fn restore_provider_session_clears_loaded_state_when_session_id_changes() {
-        let mut session = DiscordSession {
-            session_id: Some("session-1".to_string()),
-            memento_context_loaded: true,
-            memento_reflected: true,
-            current_path: None,
-            history: Vec::new(),
-            pending_uploads: Vec::new(),
-            cleared: false,
-            remote_profile_name: None,
-            channel_id: None,
-            channel_name: None,
-            category_name: None,
-            last_active: tokio::time::Instant::now(),
-            worktree: None,
-            born_generation: 0,
-            assistant_turns: 0,
-        };
-
-        session.restore_provider_session(Some("session-2".to_string()));
-
-        assert_eq!(session.session_id.as_deref(), Some("session-2"));
-        assert!(!session.memento_context_loaded);
-        assert!(!session.memento_reflected);
-    }
-
-    #[test]
-    fn sync_inflight_worktree_context_persists_bootstrap_worktree_metadata() {
-        // Serialize against any other test that also mutates AGENTDESK_ROOT_DIR,
-        // so the env var stays consistent across the save/load round-trip when
-        // cargo test schedules tests on multiple threads in CI.
-        let _guard = super::runtime_store::lock_test_env();
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("agentdesk-root");
-        std::fs::create_dir_all(root.join("runtime").join("state").join("discord")).unwrap();
-
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-
-        let previous_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", &root) };
-        let _reset = EnvReset(previous_root);
-
-        let provider = crate::services::provider::ProviderKind::Codex;
-        let inflight = crate::services::discord::inflight::InflightTurnState::new(
-            provider.clone(),
-            4242,
-            Some("adk-cdx-t4242".to_string()),
-            1,
-            2,
-            3,
-            "resume".to_string(),
-            Some("session-4242".to_string()),
-            Some("AgentDesk-codex-adk-cdx-t4242".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
-        );
-        crate::services::discord::inflight::save_inflight_state(&inflight).unwrap();
-
-        sync_inflight_worktree_context(
-            &provider,
-            4242,
-            Some("/tmp/new-worktree".to_string()),
-            Some("agentdesk/codex/adk-cdx-t4242".to_string()),
-            Some("abc123".to_string()),
-        );
-
-        let saved = crate::services::discord::inflight::load_inflight_state(&provider, 4242)
-            .expect("bootstrap should update existing inflight state");
-        assert_eq!(saved.worktree_path.as_deref(), Some("/tmp/new-worktree"));
-        assert_eq!(
-            saved.worktree_branch.as_deref(),
-            Some("agentdesk/codex/adk-cdx-t4242")
-        );
-        assert_eq!(saved.base_commit.as_deref(), Some("abc123"));
     }
 }

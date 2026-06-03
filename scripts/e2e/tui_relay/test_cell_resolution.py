@@ -82,6 +82,9 @@ class ScenarioFilter(unittest.TestCase):
         self.assertIn("E-8", ids)
         self.assertIn("E-18", ids)
         self.assertIn("E-20", ids)
+        self.assertIn("E-22", ids)
+        self.assertIn("E-23", ids)
+        self.assertIn("E-24", ids)
         self.assertNotIn("E-4", ids)
         self.assertNotIn("E-10", ids)
         self.assertNotIn("E-12", ids)
@@ -97,6 +100,8 @@ class ScenarioFilter(unittest.TestCase):
         self.assertIn("E-19", ids)
         self.assertIn("E-20", ids)
         self.assertIn("E-21", ids)
+        self.assertIn("E-22", ids)
+        self.assertIn("E-23", ids)
         self.assertNotIn("E-13", ids)
         self.assertIn("E-4", ids)
         self.assertIn("E-10", ids)
@@ -111,9 +116,11 @@ class ScenarioFilter(unittest.TestCase):
         ids = {str(s.get("id")) for s in scenarios}
         self.assertIn("E-1", ids)
         self.assertIn("E-20", ids)
+        self.assertIn("E-23", ids)
         self.assertNotIn("E-13", ids)
         self.assertNotIn("E-4", ids)
         self.assertNotIn("E-7", ids)
+        self.assertNotIn("E-22", ids)
         self.assertNotIn("E-18", ids)
 
     def test_codex_pipe_scenarios(self):
@@ -122,6 +129,9 @@ class ScenarioFilter(unittest.TestCase):
         self.assertIn("E-7", ids)
         self.assertIn("E-18", ids)
         self.assertIn("E-20", ids)
+        self.assertIn("E-25", ids)
+        self.assertNotIn("E-22", ids)
+        self.assertNotIn("E-23", ids)
         self.assertNotIn("E-13", ids)
         self.assertNotIn("E-6", ids)
         self.assertNotIn("E-4", ids)
@@ -136,6 +146,9 @@ class ScenarioFilter(unittest.TestCase):
         self.assertIn("E-19", ids)
         self.assertIn("E-20", ids)
         self.assertIn("E-21", ids)
+        self.assertIn("E-25", ids)
+        self.assertNotIn("E-22", ids)
+        self.assertNotIn("E-23", ids)
         e17 = next(s for s in scenarios if s.get("id") == "E-17")
         self.assertIn("skip_reason", e17)
         self.assertIn("acceptance_criteria", e17)
@@ -178,6 +191,74 @@ class ScenarioFilter(unittest.TestCase):
             ]
             self.assertEqual(health_steps[0]["global_active_max"], 0)
             self.assertEqual(health_steps[0]["global_finalizing_max"], 0)
+            assertion_kinds = {
+                next(iter(assertion.keys())) for assertion in e18["assertions"]
+            }
+            self.assertNotIn("relay_latency_within", assertion_kinds)
+            self.assertIn(
+                {"raw_message_count_between_markers": {"min": 0, "max": 36}},
+                e18["assertions"],
+            )
+            self.assertIn(
+                {"provider_hold_marker_seen": "[E2E:E18:OK]"},
+                e18["assertions"],
+            )
+            self.assertIn(
+                {
+                    "marker_absent": {
+                        "marker": "[E2E:E18:LATE]",
+                        "surface": "relay",
+                    }
+                },
+                e18["assertions"],
+            )
+
+    def test_e8_health_assertion_waits_for_restart_finalizing_drain(self):
+        expected_e8_cells = {
+            "claude-pipe",
+            "claude-tui",
+            "claude-e",
+            "codex-pipe",
+            "codex-tui",
+        }
+        for cell in driver.SUPPORTED_CELLS:
+            scenarios = driver.load_scenarios(self.scenarios_dir, cell=cell)
+            ids = {str(s.get("id")) for s in scenarios}
+            if cell not in expected_e8_cells:
+                self.assertNotIn("E-8", ids)
+                continue
+            self.assertIn("E-8", ids)
+            e8 = next(s for s in scenarios if s.get("id") == "E-8")
+            health_steps = [
+                step["assert_health"] for step in e8["steps"] if "assert_health" in step
+            ]
+            self.assertEqual(len(health_steps), 1)
+            self.assertGreaterEqual(health_steps[0]["timeout_s"], 30)
+            self.assertLessEqual(health_steps[0]["poll_interval_s"], 2)
+            self.assertEqual(health_steps[0]["global_active_max"], 0)
+            self.assertEqual(health_steps[0]["global_finalizing_max"], 0)
+
+    def test_e10_health_assertion_waits_for_stranded_draft_finalizing_drain(self):
+        for cell in driver.SUPPORTED_CELLS:
+            scenarios = driver.load_scenarios(self.scenarios_dir, cell=cell)
+            ids = {str(s.get("id")) for s in scenarios}
+            if cell not in {"claude-tui", "codex-tui"}:
+                self.assertNotIn("E-10", ids)
+                continue
+            self.assertIn("E-10", ids)
+            e10 = next(s for s in scenarios if s.get("id") == "E-10")
+            health_steps = [
+                step["assert_health"] for step in e10["steps"] if "assert_health" in step
+            ]
+            self.assertEqual(len(health_steps), 1)
+            self.assertGreaterEqual(health_steps[0]["timeout_s"], 30)
+            self.assertLessEqual(health_steps[0]["poll_interval_s"], 2)
+            self.assertIn(
+                "global_active_counter_out_of_bounds",
+                health_steps[0]["forbid_degraded_reasons"],
+            )
+            self.assertEqual(health_steps[0]["global_active_max"], 0)
+            self.assertEqual(health_steps[0]["global_finalizing_max"], 0)
 
     def test_e19_session_continuity_scope_is_tui_only(self):
         for cell in driver.SUPPORTED_CELLS:
@@ -185,6 +266,27 @@ class ScenarioFilter(unittest.TestCase):
             ids = {str(s.get("id")) for s in scenarios}
             if cell in {"claude-tui", "codex-tui"}:
                 self.assertIn("E-19", ids)
+                e19 = next(s for s in scenarios if s.get("id") == "E-19")
+                prompt_text = "\n".join(
+                    str(step.get("send_prompt", ""))
+                    for step in e19["steps"]
+                    if "send_prompt" in step
+                )
+                self.assertIn("E19_SECRET_ALPHA_5AF3C2", prompt_text)
+                self.assertIn(
+                    {"text_present": "[E2E:E19:POST] E19_SECRET_ALPHA_5AF3C2"},
+                    e19["assertions"],
+                )
+                health_steps = [
+                    step["assert_health"]
+                    for step in e19["steps"]
+                    if "assert_health" in step
+                ]
+                self.assertEqual(len(health_steps), 1)
+                self.assertGreaterEqual(health_steps[0]["timeout_s"], 60)
+                self.assertLessEqual(health_steps[0]["poll_interval_s"], 2)
+                self.assertEqual(health_steps[0]["global_active_max"], 0)
+                self.assertEqual(health_steps[0]["global_finalizing_max"], 0)
             else:
                 self.assertNotIn("E-19", ids)
 
@@ -205,6 +307,98 @@ class ScenarioFilter(unittest.TestCase):
                 self.assertNotIn("skip_reason", e21)
             else:
                 self.assertNotIn("E-21", ids)
+
+    def test_e22_tool_use_text_completeness_scope_is_claude_relay_backed(self):
+        for cell in driver.SUPPORTED_CELLS:
+            scenarios = driver.load_scenarios(self.scenarios_dir, cell=cell)
+            ids = {str(s.get("id")) for s in scenarios}
+            if cell not in {"claude-pipe", "claude-tui"}:
+                self.assertNotIn("E-22", ids)
+                continue
+            e22 = next(s for s in scenarios if s.get("id") == "E-22")
+            self.assertIn("acceptance_criteria", e22)
+            self.assertNotIn("skip_reason", e22)
+            wait_steps = [
+                step["wait_for_provider_hold_state"]
+                for step in e22["steps"]
+                if "wait_for_provider_hold_state" in step
+            ]
+            self.assertEqual(len(wait_steps), 1)
+            self.assertEqual(wait_steps[0]["ok_marker"], "[E2E:E22:PRE]")
+            self.assertEqual(wait_steps[0]["late_marker"], "[E2E:E22:HEAD]")
+            self.assertIn({"provider_hold_marker_seen": "[E2E:E22:PRE]"}, e22["assertions"])
+            self.assertIn(
+                {
+                    "completion_chrome_after_body": {
+                        "body_marker": "[E2E:E22:TAIL]",
+                        "required": True,
+                    }
+                },
+                e22["assertions"],
+            )
+
+    def test_e23_premature_completion_guard_covers_claude_tool_capable_cells(self):
+        for cell in driver.SUPPORTED_CELLS:
+            scenarios = driver.load_scenarios(self.scenarios_dir, cell=cell)
+            ids = {str(s.get("id")) for s in scenarios}
+            if cell not in {"claude-pipe", "claude-tui", "claude-e"}:
+                self.assertNotIn("E-23", ids)
+                continue
+            e23 = next(s for s in scenarios if s.get("id") == "E-23")
+            self.assertIn("acceptance_criteria", e23)
+            self.assertNotIn("skip_reason", e23)
+            self.assertIn(
+                {
+                    "completion_chrome_after_body": {
+                        "body_marker": "[E2E:E23:BODY-END]",
+                        "required": True,
+                    }
+                },
+                e23["assertions"],
+            )
+
+    def test_e24_croncreate_fixture_scope_and_contract(self):
+        for cell in driver.SUPPORTED_CELLS:
+            scenarios = driver.load_scenarios(self.scenarios_dir, cell=cell)
+            ids = {str(s.get("id")) for s in scenarios}
+            if cell == "claude-pipe":
+                self.assertIn("E-24", ids)
+                e24 = next(s for s in scenarios if s.get("id") == "E-24")
+                self.assertEqual(e24.get("execution"), "fixture")
+                self.assertIn(
+                    {
+                        "fixture_task_notification": {
+                            "kind": "Background",
+                            "source": "CronCreate",
+                            "status": "completed",
+                        }
+                    },
+                    e24["assertions"],
+                )
+                self.assertTrue(driver.is_local_fixture_scenario(e24))
+            else:
+                self.assertNotIn("E-24", ids)
+
+    def test_e25_codex_modern_schema_fixture_scope_and_contract(self):
+        for cell in driver.SUPPORTED_CELLS:
+            scenarios = driver.load_scenarios(self.scenarios_dir, cell=cell)
+            ids = {str(s.get("id")) for s in scenarios}
+            if cell in {"codex-pipe", "codex-tui"}:
+                self.assertIn("E-25", ids)
+                e25 = next(s for s in scenarios if s.get("id") == "E-25")
+                self.assertEqual(e25.get("execution"), "fixture")
+                self.assertIn(
+                    {
+                        "fixture_task_complete_finalized": {
+                            "turn_id": "codex-modern-e25-turn",
+                            "result_text_source": "task_complete.last_agent_message",
+                        }
+                    },
+                    e25["assertions"],
+                )
+                self.assertTrue(driver.is_local_fixture_scenario(e25))
+            else:
+                self.assertNotIn("E-25", ids)
 
     def test_e11_excluded_everywhere(self):
         for cell in driver.SUPPORTED_CELLS:

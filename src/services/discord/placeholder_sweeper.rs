@@ -255,36 +255,21 @@ pub(in crate::services::discord) async fn probe_placeholder_state(
 ///     glyphs followed by a space, e.g. `⠋ Processing...` or
 ///     `⠹ ⚙ Bash: cargo build`. Produced by
 ///     [`build_placeholder_status_block`] / [`build_processing_status_block`].
-///   - Monitor handoff card: new cards carry [`PLACEHOLDER_PROBE_MARKER`].
-///     Legacy unmarked cards must match the full generated card skeleton, not
-///     just the first header line. This protects delivered answers whose first
-///     line is exactly one of the Korean handoff headers (#2877).
+///   - Monitor handoff card: the authoritative signal is the structured
+///     [`PLACEHOLDER_PROBE_MARKER`] embedded by `monitor_handoff_header`. Every
+///     card emitted since #2896 carries it, so detection no longer depends on
+///     the card's locale-specific header/footer prose.
+///   - Legacy fallback (#3031C): pre-marker cards still in flight are matched by
+///     the card's *structural* scaffold — the `> **시작**: <t:…:R>` started-at
+///     blockquote plus another `> **…**:` field line — never by exact Korean
+///     header/footer strings. This drops the manual cross-file lockstep with
+///     `monitor_handoff_header` in `formatting.rs` while still protecting the
+///     dwindling set of unmarked legacy cards.
 ///
 /// Anything else (real prose, code blocks, embeds rendered as text) is
 /// treated as a delivered response and protected from sweeper overwrite.
 pub(in crate::services::discord) fn is_message_still_placeholder(content: &str) -> bool {
     const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    // Exact canonical header strings produced by `monitor_handoff_header`
-    // in `src/services/discord/formatting.rs`. Keep in lockstep with that
-    // function; `handoff_card_headers_are_placeholder` and
-    // `delivered_response_with_status_style_prefix_is_not_placeholder`
-    // pin the in/out boundaries.
-    const HANDOFF_HEADERS_EXACT: &[&str] = &[
-        "📬 **메시지 대기 중**",
-        "🔄 **백그라운드 처리 중**",
-        "🔄 **응답 처리 중**",
-        "⚠ **백그라운드 정체**",
-        "⚠ **응답 정체**",
-        "✅ **백그라운드 완료**",
-        "✅ **응답 완료**",
-        "⏱ **백그라운드 타임아웃**",
-        "⏱ **응답 타임아웃**",
-        "⚠ **백그라운드 중단** (모니터 연결 끊김)",
-        "⚠ **응답 중단**",
-    ];
-    // Failed states render as `❌ **{label}**[: {detail}]`. Accept the bare
-    // header plus the header-with-detail-prefix variant.
-    const HANDOFF_FAILED_HEADERS: &[&str] = &["❌ **백그라운드 실패**", "❌ **응답 실패**"];
 
     let trimmed = content.trim_start();
     if trimmed.is_empty() {
@@ -304,50 +289,43 @@ pub(in crate::services::discord) fn is_message_still_placeholder(content: &str) 
         }
     }
 
+    // Authoritative, locale-independent signal: the structured probe marker that
+    // `monitor_handoff_header` embeds in every placeholder card.
     if trimmed.contains(PLACEHOLDER_PROBE_MARKER) {
         return true;
     }
 
-    // Legacy pre-marker handoff cards are still recognized, but only when the
-    // whole generated card skeleton is present. First-line-only matching is
-    // what caused #2877 false StillPlaceholder classifications.
+    // #3031C — minimal legacy fallback for pre-marker cards still in flight.
+    // Matches the card's structural scaffold only (the `> **시작**: <t:…:R>`
+    // started-at blockquote + at least one other `> **…**:` field line), so it
+    // stays correct regardless of header/footer wording and requires no manual
+    // lockstep with `formatting.rs`. First-line header matching is intentionally
+    // gone (it caused #2877 false StillPlaceholder classifications).
     let lines = trimmed.lines().collect::<Vec<_>>();
-    let first_line = lines.first().copied().unwrap_or(trimmed).trim_end();
-    let header_matches = HANDOFF_HEADERS_EXACT.iter().any(|h| first_line == *h)
-        || HANDOFF_FAILED_HEADERS
-            .iter()
-            .any(|h| first_line == *h || first_line.starts_with(&format!("{h}: ")));
-    if header_matches && legacy_handoff_card_shape(&lines) {
+    if legacy_handoff_card_shape(&lines) {
         return true;
     }
 
     false
 }
 
+/// #3031C — locale-independent structural detector for legacy (pre-marker)
+/// handoff cards. Keys off the markdown blockquote scaffold the card always
+/// renders rather than any translatable header/footer prose.
 fn legacy_handoff_card_shape(lines: &[&str]) -> bool {
-    let has_reason_or_tool = lines.iter().skip(1).any(|line| {
-        let line = line.trim();
-        line.starts_with("> **도구**:") || line.starts_with("> **사유**:")
-    });
     let has_started_at = lines
         .iter()
-        .skip(1)
-        .any(|line| line.trim().starts_with("> **시작**: <t:"));
-    let has_known_footer_or_tail = lines.iter().skip(1).any(|line| {
-        let line = line.trim();
-        matches!(
-            line,
-            "현재 진행 중인 턴 완료 후 처리 시작합니다."
-                | "완료 시 이 채널로 결과 이어서 보냅니다."
-                | "완료 시 이 채널로 결과를 이어서 표시합니다."
-                | "스트림 진행이 멈춰 복구 상태를 확인 중입니다."
-                | "결과가 위에 도착했습니다."
-                | "자세한 사유는 다음 응답을 확인해 주세요."
-                | "타임아웃 임계를 넘어 종료되었습니다."
-                | "브릿지 또는 세션이 종료되었습니다."
-        ) || line.starts_with('⠋')
-    });
-    has_reason_or_tool && has_started_at && has_known_footer_or_tail
+        .any(|line| line.trim().starts_with("> **") && line.contains(": <t:"));
+    // A second blockquote field (도구/사유/요약 in any locale) distinguishes the
+    // card scaffold from an arbitrary message that merely quotes a timestamp.
+    let blockquote_field_lines = lines
+        .iter()
+        .filter(|line| {
+            let line = line.trim();
+            line.starts_with("> **") && line.contains("**:")
+        })
+        .count();
+    has_started_at && blockquote_field_lines >= 2
 }
 
 /// Run a single sweep pass for the given provider. Public for testability —
@@ -368,6 +346,23 @@ async fn run_placeholder_sweep_pass(
             // Rebind-origin inflights do not represent a real Discord turn.
             // Skip — there is no placeholder message to edit.
             continue;
+        }
+        // #3003: reclaim an orphaned status-panel-v2 BEFORE the placeholder skips
+        // below — a panel-only row can have `current_msg_id == 0` or a non-empty
+        // `full_response`, both of which the placeholder sweep skips. Planned
+        // restart/hot-swap rows are left for recovery (matching the placeholder
+        // restart_mode guard).
+        if state.restart_mode.is_none() {
+            sweep_orphan_status_panel(
+                http,
+                shared,
+                provider,
+                &shared.token_hash,
+                &state,
+                age_secs,
+                &mut report,
+            )
+            .await;
         }
         if state.current_msg_id == 0 || state.channel_id == 0 {
             continue;
@@ -751,16 +746,184 @@ fn observed_age_still_stale(
     current_age_secs + slack_secs >= snapshot_age_secs
 }
 
+/// #3003 durable safety net: reclaim an orphaned status-panel-v2 message left on
+/// an abandoned inflight row.
+///
+/// A watcher-created TUI-direct panel whose turn never completed — e.g. a
+/// transient Discord delete failure during the turn, or the owning process died
+/// before the in-loop reclaim ran — keeps its `status_message_id` on the
+/// lingering inflight and would otherwise stay stuck at "계속 처리 중". This is
+/// the panel counterpart to the placeholder (`current_msg_id`) sweep below, and
+/// runs even for rows the placeholder sweep skips (`current_msg_id == 0`, or a
+/// non-empty `full_response`).
+///
+/// Mirrors the placeholder abandon semantics: act only at the time-based abandon
+/// threshold, normalise synthetic-headless ids, guard against a replacement
+/// turn, and treat transient Discord errors as retryable (id preserved for a
+/// later pass). A permanent gone status (404/403/410) is treated as success so
+/// the persisted id is cleared. Returns true when a real delete committed.
+/// Gate for [`sweep_orphan_status_panel`]: returns the real Discord panel id to
+/// reclaim, or `None` when this row is not an abandoned panel-bearing row.
+/// Pure (no IO) so the threshold / synthetic-id / channel gating is unit-tested.
+fn panel_reclaim_target(state: &InflightTurnState, age_secs: u64) -> Option<serenity::MessageId> {
+    if !matches!(classify_age(age_secs), SweepDecision::Abandoned) {
+        return None;
+    }
+    if state.channel_id == 0 {
+        return None;
+    }
+    super::turn_bridge::normalize_status_panel_message_id(
+        state.status_message_id.map(serenity::MessageId::new),
+    )
+}
+
+/// True when the placeholder abandoned branch below will NOT evict this row this
+/// pass — either it has no placeholder (`current_msg_id == 0`) or it already
+/// streamed partial output (the partial-response guard at the top of
+/// `run_placeholder_sweep_pass`). For those rows the panel sweep must clear the
+/// persisted `status_message_id` itself to converge; for rows the placeholder
+/// branch WILL evict, clearing here would only refresh the file mtime and defer
+/// that eviction (codex P2 r12).
+fn placeholder_sweep_leaves_row_unevicted(state: &InflightTurnState) -> bool {
+    state.current_msg_id == 0
+        || (!state.long_running_placeholder_active
+            && (!state.full_response.is_empty() || state.response_sent_offset > 0))
+}
+
+async fn sweep_orphan_status_panel(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    token_hash: &str,
+    state: &InflightTurnState,
+    age_secs: u64,
+    report: &mut SweepPassReport,
+) {
+    let Some(panel_msg) = panel_reclaim_target(state, age_secs) else {
+        return;
+    };
+    // Do not delete a panel a replacement turn now owns, or one whose turn has
+    // already completed (state file gone).
+    if !inflight_state_still_same_turn(provider, state, age_secs) {
+        return;
+    }
+    // EPIC #3078 PR-3 — route the panel reclaim + clear through the
+    // `StatusPanelController` behind a SHADOW parity check: the controller adopts
+    // the persisted orphan id and reports the id it WOULD reclaim/clear, asserted
+    // == the legacy `panel_reclaim_target`. The legacy delete + clear below still
+    // execute the real Discord IO + durable clear, so behaviour is unchanged (the
+    // executing cutover needs the async `PanelSink` PR-2 deferred). The actor is
+    // NOT spawned when v2 is off, so this v2 guard short-circuits the awaited
+    // shadow read (whose ack would never be answered), mirroring `recovery_engine`.
+    if shared.status_panel_v2_enabled {
+        let controller_target = shared
+            .status_panel_controller
+            .sweeper_reclaim_parity_id(
+                super::turn_finalizer::TurnKey::new(
+                    serenity::ChannelId::new(state.channel_id),
+                    state.user_msg_id,
+                    state.born_generation,
+                ),
+                provider.clone(),
+                Some(panel_msg),
+            )
+            .await;
+        super::shadow_parity_warn::assert_sweeper_reclaim_parity(
+            controller_target.map(|m| m.get()),
+            Some(panel_msg.get()),
+            state.channel_id,
+        );
+    }
+    let channel = serenity::ChannelId::new(state.channel_id);
+    let committed = match channel.delete_message(http, panel_msg).await {
+        Ok(_) => true,
+        Err(serenity::Error::Http(http_err))
+            if http_err
+                .status_code()
+                .is_some_and(|status| is_permanent_message_gone_status(status.as_u16())) =>
+        {
+            // Permanently gone — count as reclaimed, clear the persisted id.
+            true
+        }
+        Err(err) => {
+            // Transient: hand off to the durable store so the retry survives even
+            // if this inflight row is evicted/cleared before the next sweep (codex
+            // P2 r10/r11/r13). The drain in the sweeper loop owns the retry.
+            super::status_panel_orphan_store::enqueue(
+                provider,
+                token_hash,
+                state.channel_id,
+                panel_msg.get(),
+            );
+            tracing::debug!(
+                "[placeholder_sweeper] orphan status-panel-v2 delete for {}/{} failed transiently \
+                 — enqueued for durable retry: {err}",
+                state.channel_id,
+                panel_msg.get()
+            );
+            false
+        }
+    };
+    // Converge the inflight row so the sweeper stops re-detecting this panel.
+    if state.current_msg_id == 0 {
+        // Panel-only abandoned row: it has no placeholder, so the placeholder
+        // abandoned branch below skips it forever. Once the panel is handled
+        // (deleted, or — on transient failure — enqueued to the durable store) the
+        // row has nothing left, so evict it instead of only clearing the panel id
+        // (codex P2 r23) — otherwise it lingers and keeps the channel busy.
+        if inflight_state_still_same_turn(provider, state, age_secs) {
+            finalize_abandoned_mailbox(shared, provider, state).await;
+            let _ = delete_inflight_state_file(provider, state.channel_id);
+        }
+    } else if placeholder_sweep_leaves_row_unevicted(state)
+        && let Some(panel_msg_id) = state.status_message_id
+    {
+        // Partial-response rows (real placeholder + streamed output) are owned by
+        // the placeholder sweeper's deferred follow-up; do not evict them here.
+        // Only clear our panel reference so we stop re-detecting it (codex P2 r12).
+        // On a transient failure the durable store owns the retry, so this is safe.
+        //
+        // #3077: compare-and-clear under the inflight flock. The user_msg_id +
+        // current_msg_id + msg-id guards reproduce the prior "same turn, same
+        // panel" precondition atomically, so a newer turn that rebound the panel
+        // between our snapshot load and this clear is never wiped.
+        let _ = super::inflight::clear_status_panel_if_current(
+            provider,
+            state.channel_id,
+            panel_msg_id,
+            &super::inflight::StatusPanelClearGuard {
+                require_user_msg_id: Some(state.user_msg_id),
+                require_current_msg_id: Some(state.current_msg_id),
+                ..Default::default()
+            },
+        );
+    }
+    if !committed {
+        return;
+    }
+    report.reclaimed_panels += 1;
+    tracing::warn!(
+        "[sweeper SAFETY-NET] reclaimed orphan status-panel-v2 age={age_secs}s for {}/{} \
+         (panel_msg {})",
+        provider.as_str(),
+        state.channel_id,
+        panel_msg.get()
+    );
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct SweepPassReport {
     pub scanned: usize,
     pub stalled: usize,
     pub abandoned: usize,
+    /// #3003: orphaned status-panel-v2 messages reclaimed this pass.
+    pub reclaimed_panels: usize,
 }
 
 fn should_log_sweep_report(report: SweepPassReport, sweeps_since_heartbeat: u64) -> bool {
     report.stalled > 0
         || report.abandoned > 0
+        || report.reclaimed_panels > 0
         || sweeps_since_heartbeat >= SWEEP_HEARTBEAT_INTERVAL_SWEEPS
 }
 
@@ -779,15 +942,27 @@ pub(super) fn spawn_placeholder_sweeper(
         loop {
             let report =
                 run_placeholder_sweep_pass(&http, &shared, &provider, &mut stalled_tracker).await;
+            // #3003: retry any durably-queued orphan status-panel deletes whose
+            // inline reclaim failed transiently (and whose inflight row is gone, so
+            // there is no per-turn handle left). Independent of inflight lifecycle.
+            let drained = super::status_panel_orphan_store::drain(
+                &http,
+                &shared,
+                &provider,
+                &shared.token_hash,
+            )
+            .await;
             sweeps_since_heartbeat = sweeps_since_heartbeat.saturating_add(1);
-            if should_log_sweep_report(report, sweeps_since_heartbeat) {
+            if should_log_sweep_report(report, sweeps_since_heartbeat) || drained > 0 {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
-                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={}",
+                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_orphans={}",
                     provider.as_str(),
                     report.scanned,
                     report.stalled,
-                    report.abandoned
+                    report.abandoned,
+                    report.reclaimed_panels,
+                    drained
                 );
                 sweeps_since_heartbeat = 0;
             }
@@ -964,6 +1139,148 @@ mod is_message_still_placeholder_tests {
             "\n🔄 **응답 처리 중**\n{PLACEHOLDER_PROBE_MARKER}"
         )));
     }
+
+    #[test]
+    fn marker_is_authoritative_regardless_of_header_wording() {
+        // #3031C: detection keys off the structured marker, not the card's
+        // header/footer prose. A card with a non-Korean (or future-localized)
+        // header is still recognised purely via the marker — proving the brittle
+        // exact-string lockstep with formatting.rs is gone.
+        assert!(is_message_still_placeholder(&format!(
+            "🔄 **Processing response**\n{PLACEHOLDER_PROBE_MARKER}"
+        )));
+        assert!(is_message_still_placeholder(&format!(
+            "🆕 **completely new header text**\n> **whatever**: x\n{PLACEHOLDER_PROBE_MARKER}"
+        )));
+        // The marker alone, with no recognizable header at all.
+        assert!(is_message_still_placeholder(&format!(
+            "arbitrary leading text\n{PLACEHOLDER_PROBE_MARKER}"
+        )));
+    }
+
+    #[test]
+    fn legacy_unmarked_card_matched_by_structural_scaffold_not_header_strings() {
+        // #3031C: pre-marker legacy cards are recognised by the markdown
+        // blockquote scaffold (started-at `<t:…>` line + a second field line),
+        // independent of the exact (translatable) header/footer wording.
+        assert!(is_message_still_placeholder(
+            "ANY HEADER LINE\n> **사유**: 응답 스트리밍 중\n> **시작**: <t:123:R>\nfooter prose in any language"
+        ));
+        // A delivered answer that merely starts with a status-style header but
+        // lacks the blockquote scaffold must NOT be treated as a placeholder.
+        assert!(!is_message_still_placeholder(
+            "✅ **응답 완료**\n실제 답변 본문입니다."
+        ));
+        // A single quoted timestamp without a second blockquote field is not a
+        // card scaffold.
+        assert!(!is_message_still_placeholder(
+            "지난 알림 인용:\n> **시작**: <t:123:R>"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod sweeper_reclaim_parity_tests {
+    //! EPIC #3078 PR-3: the `StatusPanelController`'s chosen reclaim target
+    //! (adopt the persisted orphan panel id → read back through the live actor)
+    //! equals the legacy `panel_reclaim_target` result for representative orphan
+    //! rows, so `assert_sweeper_reclaim_parity` never fires and the legacy
+    //! delete/clear keeps executing with no behaviour change.
+    use crate::services::discord::shadow_parity_warn::{
+        assert_sweeper_reclaim_parity, sweeper_parity_should_warn,
+    };
+    use crate::services::discord::status_panel_controller::StatusPanelController;
+    use crate::services::discord::turn_finalizer::TurnKey;
+    use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude as serenity;
+
+    fn assert_parity(
+        controller: Option<serenity::MessageId>,
+        legacy: Option<serenity::MessageId>,
+        channel: u64,
+    ) {
+        assert_sweeper_reclaim_parity(
+            controller.map(|m| m.get()),
+            legacy.map(|m| m.get()),
+            channel,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_chosen_reclaim_target_matches_legacy_for_representative_inputs() {
+        // Case A: a real persisted orphan panel id is the legacy reclaim target;
+        // the controller adopts it and chooses the same id.
+        let legacy = Some(serenity::MessageId::new(2200));
+        let ctl = StatusPanelController::spawn(true);
+        let key = TurnKey::new(serenity::ChannelId::new(500), 5001, 0);
+        let controller = ctl
+            .sweeper_reclaim_parity_id(key, ProviderKind::Claude, legacy)
+            .await;
+        assert_eq!(controller, legacy);
+        assert_parity(controller, legacy, 500);
+
+        // Case B: channel-only (`user_msg_id == 0`) orphan row — the controller
+        // collapses onto the single adopted live entry, choosing the same id.
+        let legacy0 = Some(serenity::MessageId::new(3300));
+        let ctl0 = StatusPanelController::spawn(true);
+        let key0 = TurnKey::new(serenity::ChannelId::new(501), 0, 0);
+        let controller0 = ctl0
+            .sweeper_reclaim_parity_id(key0, ProviderKind::Claude, legacy0)
+            .await;
+        assert_eq!(controller0, legacy0);
+        assert_parity(controller0, legacy0, 501);
+
+        // Case C: no panel id (the row is not panel-bearing) — both agree on None.
+        let legacy_none: Option<serenity::MessageId> = None;
+        let ctl_none = StatusPanelController::spawn(true);
+        let key_none = TurnKey::new(serenity::ChannelId::new(502), 5002, 0);
+        let controller_none = ctl_none
+            .sweeper_reclaim_parity_id(key_none, ProviderKind::Claude, legacy_none)
+            .await;
+        assert_eq!(controller_none, legacy_none);
+        assert_parity(controller_none, legacy_none, 502);
+
+        // Case D (regression): a STALE id already adopted into the controller
+        // ledger must NOT leak into the reclaim target — the row's CURRENT id is
+        // what legacy reclaims. Seed a stale id, then query with a different
+        // current id; the controller must choose the current id, agreeing with
+        // legacy (and the read-only query leaves the stale ledger id untouched).
+        let ctl_d = StatusPanelController::spawn(true);
+        let key_d = TurnKey::new(serenity::ChannelId::new(503), 5003, 0);
+        ctl_d.adopt_recovered(
+            key_d,
+            ProviderKind::Claude,
+            crate::services::discord::status_panel_controller::PanelOwnerKind::Standby,
+            Some(serenity::MessageId::new(4400)),
+        );
+        let legacy_d = Some(serenity::MessageId::new(4401));
+        let controller_d = ctl_d
+            .sweeper_reclaim_parity_id(key_d, ProviderKind::Claude, legacy_d)
+            .await;
+        assert_eq!(
+            controller_d, legacy_d,
+            "stale ledger id must not diverge the reclaim target from legacy"
+        );
+        assert_parity(controller_d, legacy_d, 503);
+    }
+
+    /// The mismatch `warn!` is bounded: the same `(channel, controller, legacy)`
+    /// shape logs at most once so a per-sweep persistent divergence cannot flood.
+    /// `assert_sweeper_reclaim_parity` is `debug_assert`+warn (would panic in
+    /// test), so we exercise the bound on the underlying guard directly.
+    #[test]
+    fn sweeper_parity_warn_is_bounded_once_per_shape() {
+        // First sighting logs (true); repeats are suppressed (false).
+        assert!(sweeper_parity_should_warn((7000, Some(11), Some(22))));
+        assert!(!sweeper_parity_should_warn((7000, Some(11), Some(22))));
+        assert!(!sweeper_parity_should_warn((7000, Some(11), Some(22))));
+        // Distinct shapes (different ids / channel) log once more.
+        assert!(sweeper_parity_should_warn((7000, Some(22), Some(11))));
+        assert!(sweeper_parity_should_warn((7000, Some(11), None)));
+        assert!(sweeper_parity_should_warn((7001, Some(11), Some(22))));
+        // The original shape stays suppressed.
+        assert!(!sweeper_parity_should_warn((7000, Some(11), Some(22))));
+    }
 }
 
 #[cfg(test)]
@@ -1014,160 +1331,5 @@ mod safety_net_threshold_tests {
         // than one minute. 30s is the current cadence; pin the
         // upper bound.
         assert!(SWEEP_INTERVAL_SECS <= 60);
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_age_below_stall_is_active() {
-        assert_eq!(classify_age(0), SweepDecision::Active);
-        assert_eq!(
-            classify_age(STALL_THRESHOLD_SECS - 1),
-            SweepDecision::Active
-        );
-    }
-
-    #[test]
-    fn classify_age_at_stall_threshold_is_stalled() {
-        assert_eq!(classify_age(STALL_THRESHOLD_SECS), SweepDecision::Stalled);
-        assert_eq!(
-            classify_age(ABANDON_THRESHOLD_SECS - 1),
-            SweepDecision::Stalled
-        );
-    }
-
-    #[test]
-    fn classify_age_at_abandon_threshold_is_abandoned() {
-        assert_eq!(
-            classify_age(ABANDON_THRESHOLD_SECS),
-            SweepDecision::Abandoned
-        );
-        assert_eq!(
-            classify_age(ABANDON_THRESHOLD_SECS + 600),
-            SweepDecision::Abandoned
-        );
-    }
-
-    #[test]
-    fn sweep_report_heartbeat_logs_without_transitions() {
-        assert!(!should_log_sweep_report(
-            SweepPassReport {
-                scanned: 0,
-                stalled: 0,
-                abandoned: 0,
-            },
-            SWEEP_HEARTBEAT_INTERVAL_SWEEPS - 1,
-        ));
-        assert!(should_log_sweep_report(
-            SweepPassReport {
-                scanned: 0,
-                stalled: 0,
-                abandoned: 0,
-            },
-            SWEEP_HEARTBEAT_INTERVAL_SWEEPS,
-        ));
-        assert!(should_log_sweep_report(
-            SweepPassReport {
-                scanned: 1,
-                stalled: 1,
-                abandoned: 0,
-            },
-            0,
-        ));
-    }
-
-    fn make_state(channel_id: u64, current_msg_id: u64) -> InflightTurnState {
-        InflightTurnState::new(
-            ProviderKind::Codex,
-            channel_id,
-            None,
-            42,
-            100,
-            current_msg_id,
-            "test".to_string(),
-            None,
-            None,
-            None,
-            None,
-            0,
-        )
-    }
-
-    #[test]
-    fn build_stalled_placeholder_uses_stable_badge() {
-        let state = make_state(1234, 5678);
-        let text = build_stalled_placeholder(&state);
-        assert!(text.starts_with("⚠ **응답 정체**"));
-        assert!(text.contains("stalled — no stream progress"));
-        assert!(!text.contains("계속 처리 중"));
-        assert!(!text.contains("90s"));
-    }
-
-    #[test]
-    fn stalled_edit_tracker_allows_one_edit_per_state_update() {
-        let provider = ProviderKind::Codex;
-        let mut state = make_state(1234, 5678);
-        state.updated_at = "2026-04-25 12:00:00".to_string();
-        let mut tracker = StalledEditTracker::default();
-
-        assert!(tracker.mark_pending(&provider, &state));
-        assert!(!tracker.mark_pending(&provider, &state));
-        tracker.mark_edited(&provider, &state);
-        assert!(!tracker.mark_pending(&provider, &state));
-
-        state.updated_at = "2026-04-25 12:01:00".to_string();
-        assert!(tracker.mark_pending(&provider, &state));
-    }
-
-    #[test]
-    fn observed_age_slack_only_matches_when_within_slack() {
-        // Current age much smaller than snapshot age means a fresh write —
-        // not stale.
-        assert!(!observed_age_still_stale(120, 100, 5));
-        // Current age within slack of snapshot age — still stale.
-        assert!(observed_age_still_stale(120, 116, 5));
-        // Current age greater than snapshot age (no fresh write) — still
-        // stale.
-        assert!(observed_age_still_stale(120, 130, 5));
-    }
-
-    #[test]
-    fn build_abandoned_placeholder_uses_aborted_status() {
-        let state = make_state(1234, 5678);
-        let text = build_abandoned_placeholder(&state);
-        assert!(text.starts_with("⚠ **응답 중단**"));
-    }
-
-    #[test]
-    fn restart_mode_inflights_are_skipped_in_decision_path() {
-        // Sweeper exits early for restart_mode states regardless of age.
-        // Verify the source state used for the early-skip branch — actually
-        // editing/deleting requires async + filesystem fixtures that the
-        // unit test layer does not stand up.
-        let mut state = make_state(1234, 5678);
-        assert!(state.restart_mode.is_none());
-        state.set_restart_mode(super::super::InflightRestartMode::DrainRestart);
-        assert!(state.restart_mode.is_some());
-    }
-
-    #[test]
-    fn placeholder_only_gating_excludes_partially_streamed_state() {
-        // The sweeper guards `!state.full_response.is_empty() ||
-        // state.response_sent_offset > 0` to avoid overwriting partially
-        // delivered responses. This test pins the data shape that the gate
-        // checks against.
-        let mut state = make_state(1234, 5678);
-        assert!(state.full_response.is_empty());
-        assert_eq!(state.response_sent_offset, 0);
-
-        state.full_response = "partial response so far".to_string();
-        assert!(!state.full_response.is_empty());
-
-        state.full_response.clear();
-        state.response_sent_offset = 64;
-        assert!(state.response_sent_offset > 0);
     }
 }

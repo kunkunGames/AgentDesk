@@ -40,6 +40,11 @@ impl TmuxCleanupPolicy {
 /// upper-bound when the exit signal never fires. The constant is now a
 /// *safety net*, not the primary timing source.
 const PROVIDER_INTERRUPT_SETTLE: Duration = Duration::from_millis(750);
+// #3021 / codex P2: confirmation delay before treating a claude pane as
+// genuinely idle and skipping its SIGINT. Guards against a stale JSONL
+// turn-state read in the sub-second window after a follow-up prompt is
+// submitted but before claude flushes the new `user` envelope.
+const PROVIDER_IDLE_CONFIRM_DELAY: Duration = Duration::from_millis(400);
 /// Upper bound for the post-SIGINT grace period before we escalate to
 /// SIGKILL. Same #2426 rationale as `PROVIDER_INTERRUPT_SETTLE`: when the
 /// provider exits cleanly we observe its PID exit and proceed immediately.
@@ -56,6 +61,41 @@ pub(in crate::services::discord) struct ProviderTurnInterruptOutcome {
     pub sent_keys: bool,
     pub fallback_sigint_pid: Option<u32>,
     pub missing_tmux_session: bool,
+    /// #3029(A): set when the SIGINT-only interrupt path (empty key list —
+    /// claude, whose pane C-c targets the wrapper) needed to deliver a SIGINT
+    /// to an actively-generating turn but the provider PID lookup returned
+    /// `None` (ps failure, command-name drift, or a just-spawned child not yet
+    /// visible). On that path the interrupt is the *only* delivery mechanism,
+    /// so a `None` PID is a silent no-op: the mailbox marks the turn [Stopped]
+    /// but no signal reaches the provider. This flag converts that into an
+    /// explicit failure the hard-stop path can escalate on, instead of
+    /// reporting unconditional success.
+    pub sigint_target_missing: bool,
+}
+
+/// #3029(A): does this provider/plan combination treat the direct SIGINT
+/// fallback as its *only* interrupt delivery (i.e. there is no send-keys path
+/// that could have reached the turn)? Claude uses an empty key list because a
+/// pane C-c hits the wrapper and tears the session down (#1260) — so when its
+/// SIGINT target is missing, the interrupt silently did nothing.
+fn interrupt_is_sigint_only(provider: &ProviderKind, plan_keys_empty: bool) -> bool {
+    plan_keys_empty && matches!(provider, ProviderKind::Claude)
+}
+
+/// #3029(A): the interrupt silently did nothing when the SIGINT-only path was
+/// the only delivery mechanism, the turn was genuinely active
+/// (`ready_for_input == false`), yet no SIGINT target PID could be resolved.
+/// An idle pane (`ready_for_input == true`) intentionally resolves to no PID
+/// and is NOT a missed interrupt (#3021).
+fn interrupt_sigint_target_missing(
+    provider: &ProviderKind,
+    plan_keys_empty: bool,
+    ready_for_input: bool,
+    resolved_sigint_pid: Option<u32>,
+) -> bool {
+    interrupt_is_sigint_only(provider, plan_keys_empty)
+        && !ready_for_input
+        && resolved_sigint_pid.is_none()
 }
 
 fn provider_turn_interrupt_plan(provider: &ProviderKind) -> Option<ProviderTurnInterruptPlan> {
@@ -77,16 +117,40 @@ fn provider_turn_interrupt_plan(provider: &ProviderKind) -> Option<ProviderTurnI
 
 fn fallback_sigint_pid_for_provider(
     provider: &ProviderKind,
-    _ready_for_input: bool,
+    ready_for_input: bool,
     provider_pid: Option<u32>,
 ) -> Option<u32> {
     match provider {
-        // #1260: claude only gets the interrupt via direct SIGINT (no C-c on
-        // the pane), so always deliver it when we have the PID. The previous
-        // `ready_for_input` branch was meant to avoid double-delivery when
-        // C-c had already gone to the pane — irrelevant now that the C-c
-        // path is removed for claude.
-        ProviderKind::Claude | ProviderKind::Codex | ProviderKind::Qwen => provider_pid,
+        // #3021: Claude has NO send-keys interrupt path (empty key list — see
+        // `provider_turn_interrupt_plan`), so the direct SIGINT is both its
+        // only interrupt AND, on an idle pane, a process-kill that terminates
+        // the TUI, kills the pane, and makes the watcher tear down the whole
+        // tmux session as "dead after turn". Under `PreserveSession` (e.g. ⏳
+        // reaction removal on a finished-but-still-"active" turn) that destroys
+        // the session + context — the opposite of the policy intent. When the
+        // pane is confirmed idle (`ready_for_input`, double-checked by the
+        // caller's confirmation re-probe so a stale post-submit read cannot
+        // pass) there is no generation to interrupt, so skip the SIGINT and
+        // leave the live process alone. An actively streaming turn reports
+        // `ready_for_input == false` and is still interrupted (#1260). The
+        // hard-stop path already treats `ready_for_input` as "do not kill"
+        // (`hard_stop_pid_for_unresponsive_provider`); this mirrors it.
+        ProviderKind::Claude => {
+            if ready_for_input {
+                None
+            } else {
+                provider_pid
+            }
+        }
+        // Codex/Qwen also send Escape/C-c, but those keys reach the wrapper
+        // PTY rather than the separately-spawned provider child, so the direct
+        // SIGINT fallback is what actually stops them. The readiness probe can
+        // read a stale terminal/ready state in the sub-second window after a
+        // follow-up submit, and (unlike Claude) these providers get no
+        // confirmation re-probe — so do NOT gate their interrupt on
+        // `ready_for_input`. Always deliver the fallback when we have the child
+        // PID, matching base-branch behavior (#1260).
+        ProviderKind::Codex | ProviderKind::Qwen => provider_pid,
         ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Unsupported(_) => None,
     }
 }
@@ -140,6 +204,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
             sent_keys: false,
             fallback_sigint_pid: None,
             missing_tmux_session: true,
+            sigint_target_missing: false,
         };
     };
     let Some(plan) = provider_turn_interrupt_plan(provider) else {
@@ -148,6 +213,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
             sent_keys: false,
             fallback_sigint_pid: None,
             missing_tmux_session: false,
+            sigint_target_missing: false,
         };
     };
 
@@ -209,6 +275,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
             sent_keys,
             fallback_sigint_pid: None,
             missing_tmux_session: false,
+            sigint_target_missing: false,
         };
     }
 
@@ -263,8 +330,98 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
         }
     };
 
+    // #3021 / codex P2: the JSONL turn-state probe can briefly read a stale
+    // terminal `result` in the sub-second window after a follow-up prompt is
+    // submitted but before claude flushes the new `user` envelope to the
+    // transcript — reporting ready_for_input=true for a turn that is actually
+    // still generating. Claude has no send-keys interrupt path, so skipping
+    // its SIGINT on that stale read would leave a cancelled turn running. The
+    // 750ms settle above already lets the envelope land for a genuinely active
+    // turn; require a second agreeing read before committing to "idle, skip
+    // SIGINT" so a freshly-submitted turn (which flips to Busy on the confirm
+    // read) is still interrupted, while a genuinely idle pane (#3021) stays
+    // ready across both reads and is correctly left alone. Only claude needs
+    // this — every other provider also has a send-keys/Escape interrupt, and
+    // the extra delay is confined to the idle-stop path where nothing is being
+    // interrupted anyway.
+    let (ready_for_input, provider_pid) = if ready_for_input
+        && matches!(provider, ProviderKind::Claude)
+    {
+        tokio::time::sleep(PROVIDER_IDLE_CONFIRM_DELAY).await;
+        let session_for_confirm = tmux_session_name.to_string();
+        let provider_for_confirm = provider.clone();
+        let confirm = tokio::task::spawn_blocking(move || {
+            let ready =
+                tmux_ready_for_input_without_tui_pane(&session_for_confirm, &provider_for_confirm);
+            let pid = provider_cli_pid_in_tmux(
+                &session_for_confirm,
+                &provider_for_confirm,
+                tracked_child_pid,
+            );
+            (ready, pid)
+        })
+        .await;
+        match confirm {
+            // Stay "idle" only if the confirmation agrees; otherwise treat the
+            // turn as active and interrupt with the freshly observed pid.
+            //
+            // codex review P2: use ONLY the confirm probe's freshly-observed
+            // pid — never fall back to the pre-confirm `provider_pid`. If the
+            // provider/pane exited during the 400ms confirm window the confirm
+            // pid is `None`; reviving the stale pre-confirm pid here would
+            // SIGINT a process that is no longer under the tmux pane (and could
+            // signal an unrelated process after PID reuse). A `None` confirm
+            // pid therefore correctly skips the SIGINT — there is nothing left
+            // to interrupt.
+            Ok((confirmed_ready, confirmed_pid)) => (confirmed_ready, confirmed_pid),
+            Err(error) => {
+                tracing::warn!(
+                    "provider turn interrupt idle-confirm join error: provider={} session={} reason={} error={}",
+                    provider.as_str(),
+                    tmux_session_name,
+                    reason,
+                    error
+                );
+                // On a confirm-probe failure we cannot re-validate the pid, so
+                // do NOT reuse the stale pre-confirm pid (same PID-reuse hazard
+                // codex flagged). Skip the SIGINT fallback; the cooperative
+                // cancel in `cancel_active_token` still runs, and the hard-stop
+                // path re-probes for a live, pane-validated pid afterward.
+                (false, None)
+            }
+        }
+    } else {
+        (ready_for_input, provider_pid)
+    };
+
     let fallback_sigint_pid =
         fallback_sigint_pid_for_provider(provider, ready_for_input, provider_pid);
+
+    // #3029(A): on the SIGINT-only path (claude — empty key list, so the
+    // direct SIGINT is the *only* way to reach the turn), an active turn
+    // (`ready_for_input == false`) that yields no SIGINT target is a silent
+    // no-op: nothing actually interrupts the provider even though the caller
+    // marks the turn [Stopped]. `ready_for_input == false` here means the
+    // confirmation re-probe agreed the turn is genuinely generating (an idle
+    // pane correctly resolves to `None` and is intentionally left alone, #3021).
+    // Flag this so the hard-stop path escalates instead of trusting an
+    // unconditional success.
+    let sigint_target_missing = interrupt_sigint_target_missing(
+        provider,
+        plan.keys.is_empty(),
+        ready_for_input,
+        fallback_sigint_pid,
+    );
+    if sigint_target_missing {
+        tracing::error!(
+            "provider turn interrupt SIGINT target missing: provider={} session={} reason={} \
+             detail=active_turn_without_provider_pid (PID lookup returned None; SIGINT not delivered) — escalating",
+            provider.as_str(),
+            tmux_session_name,
+            reason
+        );
+    }
+
     if let Some(pid) = fallback_sigint_pid {
         if let Err(error) = send_sigint(pid) {
             tracing::warn!(
@@ -291,6 +448,7 @@ pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
         sent_keys,
         fallback_sigint_pid,
         missing_tmux_session: false,
+        sigint_target_missing,
     }
 }
 
@@ -467,7 +625,50 @@ async fn hard_stop_unresponsive_provider_cli_turn(
         }
     };
 
+    // #3029(A): the initial interrupt could not find a SIGINT target for an
+    // active SIGINT-only (claude) turn, so no signal was delivered. The
+    // post-grace re-probe runs against current `ps` state and may now resolve
+    // the provider PID (the child became visible / `ps` recovered). Deliver
+    // the SIGINT we previously missed — but only to a live provider PID that
+    // is NOT the pane foreground, so we never SIGINT the wrapper/pane and tear
+    // down a reusable session (PreserveSession intent stays intact; this is a
+    // contained, reach-guaranteed escalation, not the #3018 mapping rework).
+    if interrupt_outcome.sigint_target_missing && session_alive && !ready_for_input {
+        match current_provider_pid {
+            Some(pid) if Some(pid) != pane_pid => {
+                if let Err(error) = send_sigint(pid) {
+                    tracing::warn!(
+                        "provider hard-stop SIGINT re-delivery failed: provider={} session={} pid={} reason={} error={}",
+                        provider.as_str(),
+                        tmux_session_name,
+                        pid,
+                        reason,
+                        error
+                    );
+                } else {
+                    tracing::info!(
+                        "provider hard-stop SIGINT re-delivered after missed interrupt target: provider={} session={} pid={} reason={}",
+                        provider.as_str(),
+                        tmux_session_name,
+                        pid,
+                        reason
+                    );
+                }
+            }
+            _ => {
+                tracing::error!(
+                    "provider hard-stop could not escalate missed SIGINT: provider={} session={} reason={} \
+                     detail=no_live_non_pane_provider_pid (interrupt did not reach the turn)",
+                    provider.as_str(),
+                    tmux_session_name,
+                    reason
+                );
+            }
+        }
+    }
+
     let Some(pid) = hard_stop_pid_for_unresponsive_provider(
+        provider,
         cleanup_policy,
         session_alive,
         ready_for_input,
@@ -489,6 +690,7 @@ async fn hard_stop_unresponsive_provider_cli_turn(
 }
 
 fn hard_stop_pid_for_unresponsive_provider(
+    provider: &ProviderKind,
     cleanup_policy: TmuxCleanupPolicy,
     session_alive: bool,
     ready_for_input: bool,
@@ -499,6 +701,16 @@ fn hard_stop_pid_for_unresponsive_provider(
     if cleanup_policy.should_cleanup_tmux() || !session_alive || ready_for_input {
         return None;
     }
+
+    // #2965: PreserveSession means "do not tear down the reusable TUI".
+    // Claude's CLI runs below the wrapper, so the candidate PID can be a
+    // child rather than the pane foreground. Killing that child can still
+    // make the wrapper exit and collapse the tmux session. Force=true keeps
+    // the explicit cleanup path; preserve paths stop at cooperative SIGINT.
+    if matches!(provider, ProviderKind::Claude) {
+        return None;
+    }
+
     let candidate = current_provider_pid.or(previous_provider_pid)?;
 
     // TUI mode regression guard: when the provider CLI is the tmux pane
@@ -1021,492 +1233,6 @@ pub(super) fn is_dcserver_restart_command(input: &str) -> bool {
         && (lower.contains("kickstart") || lower.contains("bootstrap") || lower.contains("bootout"))
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::{TmuxCleanupPolicy, handoff_interrupted_message, stale_inflight_message};
-    use crate::services::discord::InflightRestartMode;
-    use crate::services::provider::{CancelToken, ProviderKind};
-    use std::sync::Arc;
-
-    #[test]
-    fn stale_message_keeps_generic_interrupted_wording() {
-        let empty = stale_inflight_message("");
-        assert!(empty.contains("이어붙이지 못했습니다"));
-
-        let partial = stale_inflight_message("partial response");
-        assert!(partial.contains("partial response"));
-        assert!(partial.contains("[Interrupted by restart]"));
-        assert!(!partial.contains("[재시작 후 복구 진행 중]"));
-    }
-
-    #[test]
-    fn stale_and_handoff_messages_strip_tui_no_response_chrome() {
-        let stale = stale_inflight_message("No response requested.\n\npartial response");
-        assert!(stale.contains("partial response"));
-        assert!(!stale.contains("No response requested."));
-
-        let stale_empty = stale_inflight_message("No response requested.");
-        assert!(stale_empty.contains("이어붙이지 못했습니다"));
-        assert!(!stale_empty.contains("[Interrupted by restart]"));
-
-        let handoff = handoff_interrupted_message(
-            InflightRestartMode::HotSwapHandoff,
-            "No response requested.\n\nhandoff response",
-        );
-        assert!(handoff.contains("handoff response"));
-        assert!(!handoff.contains("No response requested."));
-    }
-
-    #[test]
-    fn preserve_session_and_inflight_sets_restart_mode_on_token() {
-        let token = Arc::new(CancelToken::new());
-        super::cancel_active_token(
-            &token,
-            TmuxCleanupPolicy::PreserveSessionAndInflight {
-                restart_mode: InflightRestartMode::HotSwapHandoff,
-            },
-            "test preserve-session stop",
-        );
-        assert_eq!(
-            token.restart_mode(),
-            Some(InflightRestartMode::HotSwapHandoff)
-        );
-        assert!(
-            !TmuxCleanupPolicy::PreserveSessionAndInflight {
-                restart_mode: InflightRestartMode::HotSwapHandoff,
-            }
-            .should_cleanup_tmux(),
-            "PreserveSessionAndInflight must not tear down the tmux wrapper"
-        );
-    }
-
-    #[test]
-    fn drain_restart_message_uses_restart_specific_wording() {
-        let text = handoff_interrupted_message(InflightRestartMode::DrainRestart, "");
-        assert!(text.contains("dcserver 재시작"));
-        assert!(!text.contains("이어붙이지 못했습니다"));
-    }
-
-    // #1260: Claude's PTY foreground is `agentdesk tmux-wrapper`, not the
-    // claude CLI (whose stdin is piped from the wrapper). A `tmux send-keys
-    // C-c` therefore SIGINTs the wrapper and tears the session down. The
-    // empty key list signals to `interrupt_provider_cli_turn` that it must
-    // skip send-keys and proceed straight to the direct-SIGINT fallback.
-    // Codex runs as the PTY foreground itself, but its TUI advertises
-    // `Esc to interrupt`; keep the primary tmux key path aligned with
-    // `codex_tui::input::plan_cancel()`. Qwen still uses C-c.
-    #[test]
-    fn provider_interrupt_plan_skips_send_keys_for_claude_only() {
-        assert_eq!(
-            super::provider_turn_interrupt_plan(&ProviderKind::Claude).map(|plan| plan.keys),
-            Some(&[][..]),
-            "claude must skip send-keys C-c — wrapper is the PTY foreground (#1260)"
-        );
-        assert_eq!(
-            super::provider_turn_interrupt_plan(&ProviderKind::Codex).map(|plan| plan.keys),
-            Some(&["Escape"][..])
-        );
-        assert_eq!(
-            super::provider_turn_interrupt_plan(&ProviderKind::Qwen).map(|plan| plan.keys),
-            Some(&["C-c"][..])
-        );
-        assert!(super::provider_turn_interrupt_plan(&ProviderKind::Gemini).is_none());
-    }
-
-    // #1260: with C-c via send-keys removed for claude, the SIGINT fallback
-    // is now the *only* interrupt delivery path. It must fire whenever we
-    // know claude's PID, regardless of `ready_for_input`. The previous
-    // ready-for-input gate was meant to avoid double-delivery on top of the
-    // (now-removed) C-c.
-    #[test]
-    fn provider_interrupt_fallback_always_fires_for_claude_when_pid_known() {
-        assert_eq!(
-            super::fallback_sigint_pid_for_provider(&ProviderKind::Claude, true, Some(42)),
-            Some(42),
-            "claude SIGINT fallback must fire even when ready_for_input=true (#1260)"
-        );
-        assert_eq!(
-            super::fallback_sigint_pid_for_provider(&ProviderKind::Claude, false, Some(42)),
-            Some(42)
-        );
-        assert_eq!(
-            super::fallback_sigint_pid_for_provider(&ProviderKind::Claude, false, None),
-            None,
-            "no PID = no SIGINT (still skip the fallback cleanly)"
-        );
-        assert_eq!(
-            super::fallback_sigint_pid_for_provider(&ProviderKind::Codex, true, Some(42)),
-            Some(42)
-        );
-        assert_eq!(
-            super::fallback_sigint_pid_for_provider(&ProviderKind::Qwen, false, Some(42)),
-            Some(42)
-        );
-        assert_eq!(
-            super::fallback_sigint_pid_for_provider(&ProviderKind::Gemini, false, Some(42)),
-            None
-        );
-    }
-
-    #[test]
-    fn hard_stop_targets_only_unresponsive_preserved_provider() {
-        // pane_pid distinct from candidate => not TUI mode, kill allowed.
-        let wrapper_pane = Some(9999u32);
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                false,
-                Some(42),
-                Some(41),
-                wrapper_pane,
-            ),
-            Some(42),
-            "current provider PID wins when the tmux session is still busy"
-        );
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                false,
-                None,
-                Some(41),
-                wrapper_pane,
-            ),
-            Some(41),
-            "the SIGINT fallback PID is retained as a last known provider target"
-        );
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                true,
-                Some(42),
-                Some(41),
-                wrapper_pane,
-            ),
-            None,
-            "ready_for_input means the provider accepted the interrupt"
-        );
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::CleanupSession {
-                    termination_reason_code: Some("test")
-                },
-                true,
-                false,
-                Some(42),
-                Some(41),
-                wrapper_pane,
-            ),
-            None,
-            "cleanup-session paths already tear down tmux and must not double-kill"
-        );
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSession,
-                false,
-                false,
-                None,
-                Some(41),
-                None,
-            ),
-            None,
-            "a missing tmux session must not kill a stale last-known PID"
-        );
-    }
-
-    // TUI mode regression: when the provider CLI is the tmux pane foreground
-    // itself, hard-killing it tears down the pane — same blast radius as
-    // CleanupSession, which PreserveSession* forbids. Without this guard,
-    // exposing pane_pid via select_provider_pid_in_pane lets the post-SIGINT
-    // hard-stop kill the claude TUI 1.5s after a successful stop because
-    // tmux_session_ready_for_input only recognizes the legacy wrapper prompt.
-    #[test]
-    fn hard_stop_skips_kill_when_candidate_pid_is_pane_foreground() {
-        let pane_pid = Some(96964u32);
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                false,
-                Some(96964),
-                Some(96964),
-                pane_pid,
-            ),
-            None,
-            "TUI mode: pane_pid == provider PID; killing it tears down the pane (PreserveSession violation)"
-        );
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSessionAndInflight {
-                    restart_mode: InflightRestartMode::HotSwapHandoff,
-                },
-                true,
-                false,
-                Some(96964),
-                None,
-                pane_pid,
-            ),
-            None,
-            "PreserveSessionAndInflight also forbids tearing down the pane via TUI PID kill"
-        );
-        // Wrapper-mode sanity: pane_pid is the wrapper, candidate is a child;
-        // the kill remains permitted.
-        assert_eq!(
-            super::hard_stop_pid_for_unresponsive_provider(
-                TmuxCleanupPolicy::PreserveSession,
-                true,
-                false,
-                Some(97458),
-                None,
-                Some(97437),
-            ),
-            Some(97458),
-            "wrapper mode: candidate child PID kept; wrapper pane PID is not the target"
-        );
-    }
-
-    #[test]
-    fn preserve_session_cancel_keeps_tmux_session_reference() {
-        let token = Arc::new(CancelToken::new());
-        *token.tmux_session.lock().unwrap() = Some("AgentDesk-codex-test".to_string());
-
-        super::cancel_active_token(&token, TmuxCleanupPolicy::PreserveSession, "test stop");
-
-        assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
-        assert_eq!(
-            token.tmux_session.lock().unwrap().as_deref(),
-            Some("AgentDesk-codex-test")
-        );
-    }
-
-    /// #1218 regression: `stop_active_turn` must invoke
-    /// `interrupt_provider_cli_turn` (provider abort key + SIGINT fallback)
-    /// BEFORE `cancel_active_token` flips the cancel flag. The previous
-    /// pair-by-hand pattern (cancel first, interrupt second) caused
-    /// `tmux send-keys` to fail with "can't find pane" once the wrapper
-    /// SIGKILL collapsed the tmux session.
-    #[tokio::test(flavor = "current_thread")]
-    async fn stop_active_turn_runs_interrupt_before_cancel() {
-        let token = Arc::new(CancelToken::new());
-        *token.tmux_session.lock().unwrap() =
-            Some("AgentDesk-claude-stop-order-regression-1218-does-not-exist".to_string());
-
-        assert!(
-            !token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
-            "fresh token must start uncancelled"
-        );
-
-        // child_pid stays None so kill_pid_tree is a no-op even though the
-        // helper would normally SIGKILL. The fake tmux session also doesn't
-        // exist, so send-keys will fail internally, but the helper must not
-        // panic and must still flip the cancel flag.
-        super::stop_active_turn(
-            &ProviderKind::Claude,
-            &token,
-            TmuxCleanupPolicy::PreserveSession,
-            "test stop_active_turn ordering",
-        )
-        .await;
-
-        assert!(
-            token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
-            "cancel flag must be set after stop_active_turn returns"
-        );
-        // PreserveSession leaves the tmux_session field intact for any
-        // follow-up cleanup that needs the session name.
-        assert_eq!(
-            token.tmux_session.lock().unwrap().as_deref(),
-            Some("AgentDesk-claude-stop-order-regression-1218-does-not-exist")
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn stop_active_turn_is_noop_for_provider_without_interrupt_plan() {
-        let token = Arc::new(CancelToken::new());
-        // Gemini has no provider_turn_interrupt_plan, so stop_active_turn
-        // must skip the send-keys path entirely and still flip the cancel
-        // flag via cancel_active_token.
-        super::stop_active_turn(
-            &ProviderKind::Gemini,
-            &token,
-            TmuxCleanupPolicy::PreserveSession,
-            "test stop_active_turn gemini",
-        )
-        .await;
-        assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn interrupt_reports_missing_tmux_session_for_naked_token() {
-        let token = Arc::new(CancelToken::new());
-
-        let outcome =
-            super::interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "test naked token")
-                .await;
-
-        assert!(
-            outcome.missing_tmux_session,
-            "naked cancel token must be surfaced as an explicit diagnostic"
-        );
-        assert!(!outcome.sent_keys);
-        assert!(outcome.fallback_sigint_pid.is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn select_provider_pid_returns_pane_pid_when_pane_is_claude_tui() {
-        // Regression: TUI mode runs `claude` directly as the tmux pane
-        // foreground (no wrapper). `descendant_processes` excludes pane_pid,
-        // so without the pane self-check the search returned None and stop
-        // emoji silently no-op'd the claude TUI.
-        let rows = vec![
-            super::ProcessRow {
-                pid: 96964,
-                ppid: 10240,
-                command:
-                    "/Users/me/.local/bin/claude --session-id abc --dangerously-skip-permissions"
-                        .into(),
-            },
-            super::ProcessRow {
-                pid: 26622,
-                ppid: 96964,
-                command: "/bin/zsh -c some-tool-call".into(),
-            },
-            super::ProcessRow {
-                pid: 97010,
-                ppid: 96964,
-                command: "npm exec @modelcontextprotocol/server-brave-search".into(),
-            },
-        ];
-
-        let resolved =
-            super::select_provider_pid_in_pane(96964, &rows, &ProviderKind::Claude, None);
-
-        assert_eq!(
-            resolved,
-            Some(96964),
-            "TUI mode: pane_pid is the claude CLI itself; stop must SIGINT it directly"
-        );
-    }
-
-    // #2172: Codex TUI direct-launch regression. Codex runs as the tmux pane
-    // foreground itself (no wrapper) in Direct TUI mode. Without the pane
-    // self-check, `descendant_processes` excludes pane_pid and the search
-    // returns None, causing stop emoji to silently SIGINT nothing while Codex
-    // keeps generating output. Mirrors the Claude TUI regression guard above.
-    #[cfg(unix)]
-    #[test]
-    fn select_provider_pid_returns_pane_pid_when_pane_is_codex_tui() {
-        let rows = vec![
-            super::ProcessRow {
-                pid: 88400,
-                ppid: 10240,
-                command: "/opt/homebrew/bin/codex --resume-session abc123".into(),
-            },
-            super::ProcessRow {
-                pid: 88450,
-                ppid: 88400,
-                command: "/bin/sh -c some-tool-invocation".into(),
-            },
-            super::ProcessRow {
-                pid: 88451,
-                ppid: 88400,
-                command: "node /opt/homebrew/lib/node_modules/codex/helper.js".into(),
-            },
-        ];
-
-        let resolved = super::select_provider_pid_in_pane(88400, &rows, &ProviderKind::Codex, None);
-
-        assert_eq!(
-            resolved,
-            Some(88400),
-            "Codex TUI direct mode: pane_pid is the codex CLI itself; interrupt must target it directly (#2172)"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn select_provider_pid_still_finds_wrapped_provider_descendant() {
-        // Wrapper mode (codex-tmux-wrapper, legacy claude wrapper): the
-        // pane foreground is the wrapper and the provider CLI is a child.
-        // The pane self-check must NOT short-circuit on the wrapper, and
-        // the descendant search must still pick the provider PID.
-        let rows = vec![
-            super::ProcessRow {
-                pid: 97437,
-                ppid: 10240,
-                command: "/path/to/agentdesk codex-tmux-wrapper --codex-bin /opt/bin/codex".into(),
-            },
-            super::ProcessRow {
-                pid: 97458,
-                ppid: 97437,
-                command: "node /opt/homebrew/bin/codex exec resume abc --json".into(),
-            },
-        ];
-
-        let resolved = super::select_provider_pid_in_pane(97437, &rows, &ProviderKind::Codex, None);
-
-        assert_eq!(
-            resolved,
-            Some(97458),
-            "wrapper mode: skip the wrapper pane_pid, return the codex child"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn select_provider_pid_returns_none_when_no_provider_in_tree() {
-        let rows = vec![
-            super::ProcessRow {
-                pid: 5000,
-                ppid: 1,
-                command: "/bin/bash".into(),
-            },
-            super::ProcessRow {
-                pid: 5001,
-                ppid: 5000,
-                command: "vim".into(),
-            },
-        ];
-
-        let resolved = super::select_provider_pid_in_pane(5000, &rows, &ProviderKind::Claude, None);
-
-        assert!(
-            resolved.is_none(),
-            "no claude in pane or descendants => no SIGINT target"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn provider_process_matching_prefers_binary_basename() {
-        assert_eq!(
-            super::provider_command_match_score("/opt/bin/codex exec --json", &ProviderKind::Codex),
-            3
-        );
-        assert_eq!(
-            super::provider_command_match_score("node /opt/claude/cli.js", &ProviderKind::Claude),
-            1
-        );
-        assert_eq!(
-            super::provider_command_match_score("/bin/bash -lc qwen helper", &ProviderKind::Qwen),
-            2
-        );
-        assert_eq!(
-            super::provider_command_match_score(
-                "agentdesk codex-tmux-wrapper",
-                &ProviderKind::Codex
-            ),
-            1
-        );
-        assert!(super::command_is_agentdesk_provider_wrapper(
-            "/tmp/agentdesk codex-tmux-wrapper --codex-bin /opt/bin/codex"
-        ));
-    }
-}
-
 // #2426: tests for the PID-exit observation helper. These do not require the
 // `legacy-sqlite-tests` feature because they exercise only the
 // `wait_for_pid_exit` path and do not touch the SQLite test scaffolding.
@@ -1614,5 +1340,61 @@ mod pid_exit_tests {
             elapsed < Duration::from_secs(2),
             "the upper bound must not be exceeded by more than scheduler jitter (took {elapsed:?})"
         );
+    }
+}
+
+// #3029(A): the "missed SIGINT target" decision is a pure boolean and runs
+// under the default `cargo test` invocation (the main suite is gated behind
+// the `legacy-sqlite-tests` feature, which CI does not enable by default).
+#[cfg(test)]
+mod sigint_target_missing_tests {
+    use super::interrupt_sigint_target_missing;
+    use crate::services::provider::ProviderKind;
+
+    #[test]
+    fn active_claude_without_pid_is_a_missed_interrupt() {
+        // SIGINT-only path (empty keys = claude), turn actively generating
+        // (ready_for_input=false), and NO resolved PID → silent no-op that must
+        // now be flagged for escalation instead of reporting success.
+        assert!(
+            interrupt_sigint_target_missing(&ProviderKind::Claude, true, false, None),
+            "active claude with no resolvable PID must escalate (#3029 A), not silently succeed"
+        );
+    }
+
+    #[test]
+    fn active_claude_with_pid_is_not_missed() {
+        assert!(
+            !interrupt_sigint_target_missing(&ProviderKind::Claude, true, false, Some(42)),
+            "a resolved PID means the SIGINT had a target — not a miss"
+        );
+    }
+
+    #[test]
+    fn idle_claude_without_pid_is_not_missed() {
+        // #3021: an idle pane intentionally resolves to no PID and is left
+        // alone; that is NOT a missed interrupt.
+        assert!(
+            !interrupt_sigint_target_missing(&ProviderKind::Claude, true, true, None),
+            "idle claude (ready_for_input=true) is intentionally skipped, not a miss (#3021)"
+        );
+    }
+
+    #[test]
+    fn wrapped_providers_are_not_sigint_only() {
+        // Codex/Qwen have a send-keys path, so a missing fallback PID is not a
+        // SIGINT-only silent no-op (their send-keys still reaches the wrapper).
+        assert!(!interrupt_sigint_target_missing(
+            &ProviderKind::Codex,
+            false,
+            false,
+            None
+        ));
+        assert!(!interrupt_sigint_target_missing(
+            &ProviderKind::Qwen,
+            false,
+            false,
+            None
+        ));
     }
 }

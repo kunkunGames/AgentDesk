@@ -665,86 +665,6 @@ fn pending_queue_items_to_interventions(
         .collect()
 }
 
-/// Save all non-empty intervention queues to `{provider}/{token_hash}/`.
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) fn save_pending_queues(
-    provider: &ProviderKind,
-    token_hash: &str,
-    queues: &HashMap<ChannelId, Vec<Intervention>>,
-    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
-) -> Result<(), String> {
-    let Some(root) = pending_queue_root() else {
-        return Err(format!(
-            "pending queue root unavailable for provider={} token_hash={}",
-            provider.as_str(),
-            token_hash
-        ));
-    };
-    let dir = root.join(provider.as_str()).join(token_hash);
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("create pending queue dir {}: {error}", dir.display()))?;
-    let entries = fs::read_dir(&dir)
-        .map_err(|error| format!("read pending queue dir {}: {error}", dir.display()))?;
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        fs::remove_file(&path).map_err(|error| {
-            format!(
-                "remove stale pending queue file {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-    for (channel_id, queue) in queues {
-        if queue.is_empty() {
-            continue;
-        }
-        let override_id = dispatch_role_overrides
-            .get(channel_id)
-            .map(|r| r.value().get());
-        let items: Vec<PendingQueueItem> = queue
-            .iter()
-            .map(|i| PendingQueueItem {
-                author_id: i.author_id.get(),
-                author_is_bot: i.author_is_bot,
-                message_id: i.message_id.get(),
-                source_message_ids: if i.source_message_ids.is_empty() {
-                    vec![i.message_id.get()]
-                } else {
-                    i.source_message_ids.iter().map(|id| id.get()).collect()
-                },
-                text: i.text.clone(),
-                reply_context: i.reply_context.clone(),
-                has_reply_boundary: i.has_reply_boundary,
-                merge_consecutive: i.merge_consecutive,
-                pending_uploads: i.pending_uploads.clone(),
-                channel_id: Some(channel_id.get()),
-                channel_name: None,
-                override_channel_id: override_id,
-                // #2266: persist voice metadata in the restart-drain
-                // bulk-save path too (matches `save_channel_queue` above).
-                voice_announcement: i.voice_announcement.clone(),
-            })
-            .collect();
-        let json = serde_json::to_string_pretty(&items).map_err(|error| {
-            format!(
-                "serialize pending queue provider={} token_hash={} channel_id={}: {error}",
-                provider.as_str(),
-                token_hash,
-                channel_id.get()
-            )
-        })?;
-        let path = dir.join(format!("{}.json", channel_id.get()));
-        let context = crate::services::discord::runtime_store::AtomicWriteContext::new(
-            "discord_pending_queue",
-        )
-        .provider(provider.as_str())
-        .token_hash(token_hash)
-        .channel_id(channel_id.get());
-        crate::services::discord::runtime_store::critical_atomic_write(&path, &json, context)?;
-    }
-    Ok(())
-}
-
 /// Only reads files in this bot's token-namespaced subdirectory.
 /// Returns `(queues, dispatch_role_overrides)` so the caller can restore both.
 pub(crate) fn load_pending_queues(
@@ -848,104 +768,6 @@ pub(crate) fn warn_legacy_pending_queue_files(provider: &ProviderKind) {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) fn take_next_soft_intervention_persisted(
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: ChannelId,
-    intervention_queue: &mut HashMap<ChannelId, Vec<Intervention>>,
-    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
-) -> Option<(Intervention, bool)> {
-    let mut remove_queue = false;
-    let (next, has_more) = if let Some(queue) = intervention_queue.get_mut(&channel_id) {
-        let next = dequeue_next_soft_intervention(queue);
-        let has_more = has_soft_intervention(queue);
-        remove_queue = queue.is_empty();
-        (next.intervention, has_more.has_pending)
-    } else {
-        (None, false)
-    };
-
-    if next.is_none() {
-        if remove_queue {
-            intervention_queue.remove(&channel_id);
-            dispatch_role_overrides.remove(&channel_id);
-            if let Err(error) = save_channel_queue(provider, token_hash, channel_id, &[], None) {
-                tracing::error!(
-                    provider = provider.as_str(),
-                    token_hash,
-                    channel_id = channel_id.get(),
-                    "failed to persist pending queue removal: {error}"
-                );
-            }
-        }
-        return None;
-    }
-
-    let intervention = next.unwrap();
-
-    if remove_queue {
-        intervention_queue.remove(&channel_id);
-        dispatch_role_overrides.remove(&channel_id);
-        if let Err(error) = save_channel_queue(provider, token_hash, channel_id, &[], None) {
-            tracing::error!(
-                provider = provider.as_str(),
-                token_hash,
-                channel_id = channel_id.get(),
-                "failed to persist pending queue removal: {error}"
-            );
-        }
-    } else if let Some(queue) = intervention_queue.get(&channel_id) {
-        if let Err(error) = save_channel_queue(
-            provider,
-            token_hash,
-            channel_id,
-            queue,
-            dispatch_role_overrides
-                .get(&channel_id)
-                .map(|override_id| override_id.value().get()),
-        ) {
-            tracing::error!(
-                provider = provider.as_str(),
-                token_hash,
-                channel_id = channel_id.get(),
-                "failed to persist pending queue after dequeue: {error}"
-            );
-        }
-    }
-
-    Some((intervention, has_more))
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-pub(crate) fn requeue_intervention_front_persisted(
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: ChannelId,
-    intervention_queue: &mut HashMap<ChannelId, Vec<Intervention>>,
-    dispatch_role_overrides: &dashmap::DashMap<ChannelId, ChannelId>,
-    intervention: Intervention,
-) {
-    let queue = intervention_queue.entry(channel_id).or_default();
-    let _ = requeue_intervention_front(queue, intervention);
-    if let Err(error) = save_channel_queue(
-        provider,
-        token_hash,
-        channel_id,
-        queue,
-        dispatch_role_overrides
-            .get(&channel_id)
-            .map(|override_id| override_id.value().get()),
-    ) {
-        tracing::error!(
-            provider = provider.as_str(),
-            token_hash,
-            channel_id = channel_id.get(),
-            "failed to persist pending queue after requeue: {error}"
-        );
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct QueuePersistenceContext {
     pub(crate) provider: ProviderKind,
@@ -1007,6 +829,17 @@ pub(crate) struct ClearChannelResult {
 pub(crate) struct CancelActiveTurnResult {
     pub(crate) token: Option<Arc<CancelToken>>,
     pub(crate) already_stopping: bool,
+}
+
+/// #3029(D): outcome of a `PurgeQueue` request.
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub(crate) struct PurgeQueueResult {
+    /// Number of intervention-queue entries drained.
+    pub(crate) drained: usize,
+    /// Whether the request also released a *cancelled* active-turn anchor
+    /// (only possible when `clear_cancelled_active_anchor` was requested and
+    /// the anchored token was already cancelled).
+    pub(crate) cleared_active_anchor: bool,
 }
 
 pub(crate) struct HasPendingSoftQueueResult {
@@ -1293,7 +1126,10 @@ impl ChannelMailboxHandle {
         &self,
         cancel_token: Arc<CancelToken>,
         request_owner: UserId,
-        user_message_id: MessageId,
+        // `None` for a recovery turn that carries no user message
+        // (user_msg_id == 0, e.g. a TUI-direct turn) — there is then no
+        // `active_user_message_id` to bind. `MessageId::new(0)` would panic.
+        user_message_id: Option<MessageId>,
     ) -> RecoveryKickoffResult {
         self.request(
             |reply| ChannelMailboxMsg::RecoveryKickoff {
@@ -1425,9 +1261,50 @@ impl ChannelMailboxHandle {
         .await
     }
 
+    /// #3016 — identity-guarded finish. Finalizes the active turn ONLY when
+    /// the mailbox's current `active_user_message_id` matches
+    /// `expected_user_message_id`; otherwise it is a no-op that returns
+    /// `removed_token = None` (so the caller's counter decrement is skipped)
+    /// and leaves the possibly-newer live turn untouched.
+    pub(crate) async fn finish_turn_if_matches(
+        &self,
+        expected_user_message_id: MessageId,
+        persistence: QueuePersistenceContext,
+    ) -> FinishTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::FinishTurnIfMatches {
+                expected_user_message_id,
+                persistence,
+                reply,
+            },
+            FinishTurnResult {
+                removed_token: None,
+                has_pending: false,
+                mailbox_online: false,
+                queue_exit_events: Vec::new(),
+                persistence_error: None,
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn hard_stop(&self) -> FinishTurnResult {
         self.request(
             |reply| ChannelMailboxMsg::HardStop { reply },
+            FinishTurnResult {
+                removed_token: None,
+                has_pending: false,
+                mailbox_online: false,
+                queue_exit_events: Vec::new(),
+                persistence_error: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_cancelled_turn(&self) -> FinishTurnResult {
+        self.request(
+            |reply| ChannelMailboxMsg::FinishCancelledTurn { reply },
             FinishTurnResult {
                 removed_token: None,
                 has_pending: false,
@@ -1455,10 +1332,23 @@ impl ChannelMailboxHandle {
     /// touching the active `cancel_token`, so a turn that entered the
     /// mailbox between a sibling force-kill and this call is not
     /// collaterally cancelled.
-    pub(crate) async fn purge_queue(&self, persistence: QueuePersistenceContext) -> usize {
+    ///
+    /// #3029(D): `clear_cancelled_active_anchor=true` additionally releases the
+    /// active-turn anchor when its token is already `cancelled` (force purge),
+    /// so a force cancel does not leave a stale anchor that blocks the next
+    /// dispatch. Pass `false` for a pure queue drain.
+    pub(crate) async fn purge_queue(
+        &self,
+        persistence: QueuePersistenceContext,
+        clear_cancelled_active_anchor: bool,
+    ) -> PurgeQueueResult {
         self.request(
-            |reply| ChannelMailboxMsg::PurgeQueue { persistence, reply },
-            0,
+            |reply| ChannelMailboxMsg::PurgeQueue {
+                persistence,
+                clear_cancelled_active_anchor,
+                reply,
+            },
+            PurgeQueueResult::default(),
         )
         .await
     }
@@ -1880,7 +1770,7 @@ enum ChannelMailboxMsg {
     RecoveryKickoff {
         cancel_token: Arc<CancelToken>,
         request_owner: UserId,
-        user_message_id: MessageId,
+        user_message_id: Option<MessageId>,
         reply: oneshot::Sender<RecoveryKickoffResult>,
     },
     ClearRecoveryMarker {
@@ -1913,7 +1803,22 @@ enum ChannelMailboxMsg {
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<FinishTurnResult>,
     },
+    /// #3016 — identity-guarded finish. Only finalizes the active turn IF the
+    /// mailbox's CURRENT `active_user_message_id` matches
+    /// `expected_user_message_id`. Closes the wrong-turn race: a stale /
+    /// channel-only terminal arriving after a turn finalized but before the
+    /// next turn's `try_start_turn` (or after ledger GC) must NOT release the
+    /// NEWER turn's token or decrement `global_active`. On mismatch this is a
+    /// no-op that returns `removed_token = None`, leaving the live turn intact.
+    FinishTurnIfMatches {
+        expected_user_message_id: MessageId,
+        persistence: QueuePersistenceContext,
+        reply: oneshot::Sender<FinishTurnResult>,
+    },
     HardStop {
+        reply: oneshot::Sender<FinishTurnResult>,
+    },
+    FinishCancelledTurn {
         reply: oneshot::Sender<FinishTurnResult>,
     },
     Clear {
@@ -1924,9 +1829,19 @@ enum ChannelMailboxMsg {
     /// `cancel_token`. Used by `cancel_turn(force=true)` so the in-memory
     /// channel mailbox is emptied even if a fresh turn entered the actor
     /// between `force_kill_turn_without_cancel_event` and this purge.
+    ///
+    /// #3029(D): when `clear_cancelled_active_anchor` is set (force purge),
+    /// also release the active-turn anchor (`cancel_token` /
+    /// `active_request_owner` / `active_user_message_id` / `turn_started_at`)
+    /// — but ONLY if that anchor's token is already `cancelled`. The force
+    /// path cancels the token via `cancel_active_token` before purging, so the
+    /// just-killed turn's anchor is cleared, while a fresh *uncancelled* turn
+    /// that entered the actor between force-kill and purge keeps its anchor
+    /// (preserving the #2706 no-collateral-cancel guarantee).
     PurgeQueue {
         persistence: QueuePersistenceContext,
-        reply: oneshot::Sender<usize>,
+        clear_cancelled_active_anchor: bool,
+        reply: oneshot::Sender<PurgeQueueResult>,
     },
     ReplaceQueue {
         queue: Vec<Intervention>,
@@ -2063,6 +1978,36 @@ fn hydrate_pending_queue_into_state(
         restored_override,
         persistence_error: None,
     }
+}
+
+fn hydrate_pending_queue_from_disk_if_present(
+    state: &mut ChannelMailboxState,
+    channel_id: ChannelId,
+    persistence: &QueuePersistenceContext,
+) -> HydratePendingQueueResult {
+    let (disk_items, restored_override) =
+        load_channel_pending_queue(&persistence.provider, &persistence.token_hash, channel_id);
+    if disk_items.is_empty() {
+        return HydratePendingQueueResult {
+            absorbed: 0,
+            queue_len_after: state.intervention_queue.len(),
+            restored_override,
+            persistence_error: None,
+        };
+    }
+
+    let mut effective_persistence = persistence.clone();
+    if effective_persistence.dispatch_role_override.is_none() {
+        effective_persistence.dispatch_role_override =
+            restored_override.map(|channel| channel.get());
+    }
+    hydrate_pending_queue_into_state(
+        state,
+        channel_id,
+        disk_items,
+        effective_persistence,
+        restored_override,
+    )
 }
 
 fn finalize_turn_state(
@@ -2461,7 +2406,7 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     let activated_turn = state.cancel_token.is_none();
                     state.cancel_token = Some(cancel_token);
                     state.active_request_owner = Some(request_owner);
-                    state.active_user_message_id = Some(user_message_id);
+                    state.active_user_message_id = user_message_id;
                     state.recovery_started_at = Some(Instant::now());
                     if activated_turn || state.turn_started_at.is_none() {
                         state.turn_started_at = Some(Utc::now());
@@ -2479,6 +2424,21 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     reply,
                 } => {
                     state.last_persistence = Some(persistence.clone());
+                    let hydrate_result = hydrate_pending_queue_from_disk_if_present(
+                        &mut state,
+                        channel_id,
+                        &persistence,
+                    );
+                    if let Some(error) = hydrate_result.persistence_error {
+                        let _ = reply.send(EnqueueInterventionResult {
+                            enqueued: false,
+                            merged: false,
+                            refusal_reason: None,
+                            queue_exit_events: Vec::new(),
+                            persistence_error: Some(error),
+                        });
+                        continue;
+                    }
                     let previous_queue = state.intervention_queue.clone();
                     let mut enqueue_result =
                         enqueue_intervention(&mut state.intervention_queue, intervention);
@@ -2626,6 +2586,48 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     ));
                     mark_turn_finished_signal_done(channel_id);
                 }
+                ChannelMailboxMsg::FinishTurnIfMatches {
+                    expected_user_message_id,
+                    persistence,
+                    reply,
+                } => {
+                    // #3016 — identity guard. Finalize ONLY when the active
+                    // turn's user_message_id still matches the terminal's
+                    // identity. A mismatch (or no active turn) means the turn
+                    // this terminal belonged to already finalized and a newer
+                    // turn may now own the mailbox — so we must NOT take its
+                    // token. Return a no-op result (removed_token = None) that
+                    // mirrors `mailbox_finish_turn`'s idempotent second-call
+                    // shape, so the finalizer's `removed_token.is_some()` gate
+                    // skips the counter decrement and trailing release.
+                    let matches = state
+                        .active_user_message_id
+                        .is_some_and(|active| active == expected_user_message_id);
+                    if matches {
+                        state.last_persistence = Some(persistence.clone());
+                        let _ = reply.send(finalize_turn_state(
+                            &mut state,
+                            channel_id,
+                            Some(&persistence),
+                        ));
+                        mark_turn_finished_signal_done(channel_id);
+                    } else {
+                        // No-op: do not touch the active token. Surface the
+                        // current pending state so a caller that schedules a
+                        // queue kickoff still sees an accurate backlog flag,
+                        // but never release the (possibly newer) live turn.
+                        let _ = reply.send(FinishTurnResult {
+                            removed_token: None,
+                            has_pending: state
+                                .intervention_queue
+                                .iter()
+                                .any(|item| item.mode == InterventionMode::Soft),
+                            mailbox_online: true,
+                            queue_exit_events: Vec::new(),
+                            persistence_error: None,
+                        });
+                    }
+                }
                 ChannelMailboxMsg::HardStop { reply } => {
                     let persistence = state.last_persistence.clone();
                     let _ = reply.send(finalize_turn_state(
@@ -2634,6 +2636,31 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                         persistence.as_ref(),
                     ));
                     mark_turn_finished_signal_done(channel_id);
+                }
+                ChannelMailboxMsg::FinishCancelledTurn { reply } => {
+                    let should_finish = state.cancel_token.as_ref().is_some_and(|token| {
+                        token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                    });
+                    if should_finish {
+                        let persistence = state.last_persistence.clone();
+                        let _ = reply.send(finalize_turn_state(
+                            &mut state,
+                            channel_id,
+                            persistence.as_ref(),
+                        ));
+                        mark_turn_finished_signal_done(channel_id);
+                    } else {
+                        let _ = reply.send(FinishTurnResult {
+                            removed_token: None,
+                            has_pending: state
+                                .intervention_queue
+                                .iter()
+                                .any(|item| item.mode == InterventionMode::Soft),
+                            mailbox_online: true,
+                            queue_exit_events: Vec::new(),
+                            persistence_error: None,
+                        });
+                    }
                 }
                 ChannelMailboxMsg::Clear { persistence, reply } => {
                     state.last_persistence = Some(persistence.clone());
@@ -2673,16 +2700,42 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     let _ = reply.send(result);
                     mark_turn_finished_signal_done(channel_id);
                 }
-                ChannelMailboxMsg::PurgeQueue { persistence, reply } => {
+                ChannelMailboxMsg::PurgeQueue {
+                    persistence,
+                    clear_cancelled_active_anchor,
+                    reply,
+                } => {
                     // #2706: queue-only purge. Leaves `cancel_token`,
                     // `active_request_owner`, `active_user_message_id`
                     // untouched so a turn that entered the actor in
                     // between force-kill and purge is not collaterally
                     // cancelled.
+                    //
+                    // #3029(D): a force purge additionally releases the
+                    // active-turn anchor, but ONLY when the anchored token is
+                    // already `cancelled`. The force path flips that flag via
+                    // `cancel_active_token` before purging, so this clears the
+                    // just-killed turn's anchor while still leaving a fresh,
+                    // uncancelled turn (which raced in after the force-kill)
+                    // fully intact — keeping the #2706 guarantee.
+                    let cleared_active_anchor = if clear_cancelled_active_anchor
+                        && state.cancel_token.as_ref().is_some_and(|token| {
+                            token.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                        }) {
+                        state.cancel_token = None;
+                        state.active_request_owner = None;
+                        state.active_user_message_id = None;
+                        state.recovery_started_at = None;
+                        state.turn_started_at = None;
+                        reset_watchdog_extension_state(&mut state);
+                        true
+                    } else {
+                        false
+                    };
                     state.last_persistence = Some(persistence.clone());
                     let previous_queue = state.intervention_queue.clone();
                     let drained = state.intervention_queue.drain(..).count();
-                    let result = if persist_queue_or_restore(
+                    let drained = if persist_queue_or_restore(
                         &mut state,
                         channel_id,
                         &persistence,
@@ -2695,7 +2748,13 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     } else {
                         drained
                     };
-                    let _ = reply.send(result);
+                    if cleared_active_anchor {
+                        mark_turn_finished_signal_done(channel_id);
+                    }
+                    let _ = reply.send(PurgeQueueResult {
+                        drained,
+                        cleared_active_anchor,
+                    });
                 }
                 ChannelMailboxMsg::ReplaceQueue {
                     queue,
@@ -2719,22 +2778,10 @@ fn spawn_channel_mailbox(channel_id: ChannelId) -> ChannelMailboxHandle {
                     // a dequeue that removes the file cannot race with a stale
                     // out-of-actor disk snapshot and reinsert an already
                     // processed item.
-                    let (disk_items, restored_override) = load_channel_pending_queue(
-                        &persistence.provider,
-                        &persistence.token_hash,
-                        channel_id,
-                    );
-                    let mut effective_persistence = persistence;
-                    if effective_persistence.dispatch_role_override.is_none() {
-                        effective_persistence.dispatch_role_override =
-                            restored_override.map(|channel| channel.get());
-                    }
-                    let result = hydrate_pending_queue_into_state(
+                    let result = hydrate_pending_queue_from_disk_if_present(
                         &mut state,
                         channel_id,
-                        disk_items,
-                        effective_persistence,
-                        restored_override,
+                        &persistence,
                     );
                     let _ = reply.send(result);
                 }
@@ -3706,776 +3753,6 @@ mod persistence_tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::*;
-    use crate::services::discord::runtime_store::test_env_lock;
-
-    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
-
-    fn queue_file_path(
-        root: &Path,
-        provider: &ProviderKind,
-        token_hash: &str,
-        channel_id: ChannelId,
-    ) -> PathBuf {
-        root.join("runtime")
-            .join("discord_pending_queue")
-            .join(provider.as_str())
-            .join(token_hash)
-            .join(format!("{}.json", channel_id.get()))
-    }
-
-    fn read_saved_items(
-        root: &Path,
-        provider: &ProviderKind,
-        token_hash: &str,
-        channel_id: ChannelId,
-    ) -> Vec<PendingQueueItem> {
-        let path = queue_file_path(root, provider, token_hash, channel_id);
-        let json = std::fs::read_to_string(path).unwrap();
-        serde_json::from_str(&json).unwrap()
-    }
-
-    fn make_intervention(message_id: u64, text: &str, created_at: Instant) -> Intervention {
-        Intervention {
-            author_id: UserId::new(1),
-            author_is_bot: false,
-            message_id: MessageId::new(message_id),
-            source_message_ids: vec![MessageId::new(message_id)],
-            text: text.to_string(),
-            mode: InterventionMode::Soft,
-            created_at,
-            reply_context: None,
-            has_reply_boundary: false,
-            merge_consecutive: false,
-            pending_uploads: Vec::new(),
-            voice_announcement: None,
-        }
-    }
-
-    fn make_mergeable_intervention(
-        message_id: u64,
-        text: &str,
-        created_at: Instant,
-    ) -> Intervention {
-        let mut intervention = make_intervention(message_id, text, created_at);
-        intervention.merge_consecutive = true;
-        intervention
-    }
-
-    fn make_overflow_queue(now: Instant) -> Vec<Intervention> {
-        std::iter::once(make_intervention(1, "trimmed", now))
-            .chain(
-                (2..=(MAX_INTERVENTIONS_PER_CHANNEL as u64 + 1)).map(|message_id| {
-                    make_intervention(message_id, &format!("queued-{message_id}"), now)
-                }),
-            )
-            .collect()
-    }
-
-    fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
-        test_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    #[tokio::test]
-    async fn has_pending_soft_queue_persists_pruned_queue_state() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-prune-pending";
-        let channel_id = ChannelId::new(41);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
-        let queue = make_overflow_queue(Instant::now());
-
-        handle.replace_queue(queue, persistence.clone()).await;
-
-        assert_eq!(
-            read_saved_items(tmp.path(), &provider, token_hash, channel_id).len(),
-            MAX_INTERVENTIONS_PER_CHANNEL + 1
-        );
-
-        let result = handle.has_pending_soft_queue(persistence).await;
-        assert!(result.has_pending);
-        assert_eq!(result.queue_exit_events.len(), 1);
-        assert_eq!(result.queue_exit_events[0].kind, QueueExitKind::Superseded);
-        assert_eq!(
-            result.queue_exit_events[0].intervention.message_id,
-            MessageId::new(1)
-        );
-        assert_eq!(
-            handle.snapshot().await.intervention_queue.len(),
-            MAX_INTERVENTIONS_PER_CHANNEL
-        );
-
-        let items = read_saved_items(tmp.path(), &provider, token_hash, channel_id);
-        assert_eq!(items.len(), MAX_INTERVENTIONS_PER_CHANNEL);
-        assert!(items.iter().all(|item| item.text != "trimmed"));
-        assert!(items.iter().any(|item| item.text == "queued-2"));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn finish_turn_persists_pruned_queue_state() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-prune-finish";
-        let channel_id = ChannelId::new(42);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
-        let queue = make_overflow_queue(Instant::now());
-
-        handle.replace_queue(queue, persistence.clone()).await;
-        let active_msg_id = MessageId::new(77);
-        handle
-            .restore_active_turn(Arc::new(CancelToken::new()), UserId::new(7), active_msg_id)
-            .await;
-
-        let result = handle.finish_turn(persistence).await;
-        assert!(result.removed_token.is_some());
-        assert!(result.has_pending);
-        assert!(result.mailbox_online);
-        assert_eq!(result.queue_exit_events.len(), 1);
-        assert_eq!(result.queue_exit_events[0].kind, QueueExitKind::Superseded);
-        assert_eq!(
-            result.queue_exit_events[0].intervention.message_id,
-            MessageId::new(1)
-        );
-
-        let snapshot = handle.snapshot().await;
-        assert!(snapshot.cancel_token.is_none());
-        assert_eq!(snapshot.active_user_message_id, None);
-        assert_eq!(
-            snapshot.intervention_queue.len(),
-            MAX_INTERVENTIONS_PER_CHANNEL
-        );
-
-        let items = read_saved_items(tmp.path(), &provider, token_hash, channel_id);
-        assert_eq!(items.len(), MAX_INTERVENTIONS_PER_CHANNEL);
-        assert!(items.iter().all(|item| item.text != "trimmed"));
-        assert!(items.iter().any(|item| item.text == "queued-2"));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn hard_stop_reuses_last_persistence_and_persists_pruned_queue_state() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-prune-hard-stop";
-        let channel_id = ChannelId::new(47);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
-        let queue = make_overflow_queue(Instant::now());
-
-        handle.replace_queue(queue, persistence).await;
-        handle
-            .restore_active_turn(
-                Arc::new(CancelToken::new()),
-                UserId::new(8),
-                MessageId::new(88),
-            )
-            .await;
-
-        let result = handle.hard_stop().await;
-        assert!(result.removed_token.is_some());
-        assert!(result.has_pending);
-        assert!(result.mailbox_online);
-        assert_eq!(result.queue_exit_events.len(), 1);
-        assert_eq!(result.queue_exit_events[0].kind, QueueExitKind::Superseded);
-        assert_eq!(
-            result.queue_exit_events[0].intervention.message_id,
-            MessageId::new(1)
-        );
-
-        let snapshot = handle.snapshot().await;
-        assert!(snapshot.cancel_token.is_none());
-        assert_eq!(snapshot.active_user_message_id, None);
-        assert_eq!(
-            snapshot.intervention_queue.len(),
-            MAX_INTERVENTIONS_PER_CHANNEL
-        );
-
-        let items = read_saved_items(tmp.path(), &provider, token_hash, channel_id);
-        assert_eq!(items.len(), MAX_INTERVENTIONS_PER_CHANNEL);
-        assert!(items.iter().all(|item| item.text != "trimmed"));
-        assert!(items.iter().any(|item| item.text == "queued-2"));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[test]
-    fn has_soft_intervention_at_prunes_expired_entries_without_boot_time_dependency() {
-        let created_at = Instant::now();
-        let mut queue = vec![
-            make_intervention(1, "expired", created_at),
-            make_intervention(2, "fresh", created_at + Duration::from_secs(1)),
-        ];
-
-        assert!(has_soft_intervention_at(
-            &mut queue,
-            created_at + INTERVENTION_TTL + Duration::from_secs(1)
-        ));
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].message_id, MessageId::new(2));
-        assert_eq!(queue[0].text, "fresh");
-    }
-
-    #[tokio::test]
-    async fn restart_drain_all_persists_every_mailbox_queue() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-restart-drain";
-        let channel_a = ChannelId::new(141);
-        let channel_b = ChannelId::new(142);
-        let registry = ChannelMailboxRegistry::default();
-        let now = Instant::now();
-
-        registry
-            .handle(channel_a)
-            .replace_queue(
-                vec![make_intervention(1, "first queued item", now)],
-                QueuePersistenceContext::new(&provider, token_hash, None),
-            )
-            .await;
-        registry
-            .handle(channel_b)
-            .replace_queue(
-                vec![
-                    make_intervention(2, "second queued item", now),
-                    make_intervention(3, "third queued item", now),
-                ],
-                QueuePersistenceContext::new(&provider, token_hash, Some(9_999)),
-            )
-            .await;
-
-        let dispatch_role_overrides = dashmap::DashMap::new();
-        dispatch_role_overrides.insert(channel_b, ChannelId::new(9_999));
-
-        let drain = registry
-            .restart_drain_all(&provider, token_hash, &dispatch_role_overrides)
-            .await;
-
-        assert_eq!(drain.queued_count, 3);
-        assert!(drain.persistence_errors.is_empty());
-
-        let items_a = read_saved_items(tmp.path(), &provider, token_hash, channel_a);
-        assert_eq!(items_a.len(), 1);
-        assert_eq!(items_a[0].text, "first queued item");
-        assert_eq!(items_a[0].override_channel_id, None);
-
-        let items_b = read_saved_items(tmp.path(), &provider, token_hash, channel_b);
-        assert_eq!(items_b.len(), 2);
-        assert_eq!(items_b[0].text, "second queued item");
-        assert_eq!(items_b[1].text, "third queued item");
-        assert_eq!(items_b[0].override_channel_id, Some(9_999));
-        assert_eq!(items_b[1].override_channel_id, Some(9_999));
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn restart_drain_all_reports_pending_queue_persistence_errors() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-restart-drain-failure";
-        let channel_id = ChannelId::new(143);
-        let registry = ChannelMailboxRegistry::default();
-        let now = Instant::now();
-
-        registry
-            .handle(channel_id)
-            .replace_queue(
-                vec![make_intervention(1, "queued item", now)],
-                QueuePersistenceContext::new(&provider, token_hash, None),
-            )
-            .await;
-
-        std::fs::remove_dir_all(tmp.path().join("runtime")).unwrap();
-        std::fs::write(tmp.path().join("runtime"), "not-a-directory").unwrap();
-
-        let drain = registry
-            .restart_drain_all(&provider, token_hash, &dashmap::DashMap::new())
-            .await;
-
-        assert_eq!(drain.queued_count, 0);
-        assert_eq!(drain.persistence_errors.len(), 1);
-        assert_eq!(drain.persistence_errors[0].channel_id, channel_id);
-        assert!(
-            drain.persistence_errors[0].error.contains("create_dir_all")
-                || drain.persistence_errors[0]
-                    .error
-                    .contains("Not a directory")
-        );
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn cancel_active_turn_marks_token_without_clearing_turn_state() {
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(ChannelId::new(44));
-        let token = Arc::new(CancelToken::new());
-
-        handle
-            .try_start_turn(token.clone(), UserId::new(9), MessageId::new(91))
-            .await;
-
-        let first = handle.cancel_active_turn().await;
-        assert!(first.token.is_some());
-        assert!(!first.already_stopping);
-        assert!(token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(handle.snapshot().await.cancel_token.is_some());
-
-        let second = handle.cancel_active_turn().await;
-        assert!(second.already_stopping);
-        assert!(second.token.is_some());
-    }
-
-    #[tokio::test]
-    async fn cancel_queued_message_removes_matching_entry_and_persists() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-cancel-queued";
-        let channel_id = ChannelId::new(43);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
-        let now = Instant::now();
-
-        handle
-            .replace_queue(
-                vec![
-                    make_intervention(10, "first", now),
-                    make_intervention(11, "second", now),
-                ],
-                persistence.clone(),
-            )
-            .await;
-
-        let result = handle
-            .cancel_queued_message(MessageId::new(10), persistence)
-            .await;
-        assert_eq!(
-            result.removed.as_ref().map(|item| item.text.as_str()),
-            Some("first")
-        );
-        assert_eq!(result.queue_exit_events.len(), 1);
-        assert_eq!(result.queue_exit_events[0].kind, QueueExitKind::Cancelled);
-        assert_eq!(
-            result.queue_exit_events[0].intervention.message_id,
-            MessageId::new(10)
-        );
-
-        let snapshot = handle.snapshot().await;
-        assert_eq!(snapshot.intervention_queue.len(), 1);
-        assert_eq!(snapshot.intervention_queue[0].message_id.get(), 11);
-
-        let items = read_saved_items(tmp.path(), &provider, token_hash, channel_id);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].message_id, 11);
-        assert_eq!(items[0].text, "second");
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn enqueue_reports_superseded_overflow_entry() {
-        let provider = ProviderKind::Claude;
-        let registry = ChannelMailboxRegistry::default();
-        let channel_id = ChannelId::new(48);
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, "mailbox-overflow", None);
-        let now = Instant::now();
-
-        handle
-            .replace_queue(
-                (0..MAX_INTERVENTIONS_PER_CHANNEL)
-                    .map(|idx| make_intervention(idx as u64 + 1, "queued", now))
-                    .collect(),
-                persistence.clone(),
-            )
-            .await;
-
-        let result = handle
-            .enqueue(
-                make_intervention(999, "latest", now + Duration::from_secs(1)),
-                persistence,
-            )
-            .await;
-
-        assert!(result.enqueued);
-        assert_eq!(result.queue_exit_events.len(), 1);
-        assert_eq!(result.queue_exit_events[0].kind, QueueExitKind::Superseded);
-        assert_eq!(
-            result.queue_exit_events[0].intervention.message_id,
-            MessageId::new(1)
-        );
-        assert_eq!(
-            handle.snapshot().await.intervention_queue.len(),
-            MAX_INTERVENTIONS_PER_CHANNEL
-        );
-    }
-
-    #[tokio::test]
-    async fn requeue_front_reports_superseded_overflow_entry() {
-        let provider = ProviderKind::Claude;
-        let registry = ChannelMailboxRegistry::default();
-        let channel_id = ChannelId::new(50);
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, "mailbox-requeue-overflow", None);
-        let now = Instant::now();
-
-        handle
-            .replace_queue(
-                (0..MAX_INTERVENTIONS_PER_CHANNEL)
-                    .map(|idx| make_intervention(idx as u64 + 1, "queued", now))
-                    .collect(),
-                persistence.clone(),
-            )
-            .await;
-
-        let result = handle
-            .requeue_front(
-                make_intervention(999, "retry", now + Duration::from_secs(1)),
-                persistence,
-            )
-            .await;
-
-        assert_eq!(result.queue_exit_events.len(), 1);
-        assert_eq!(result.queue_exit_events[0].kind, QueueExitKind::Superseded);
-        assert_eq!(
-            result.queue_exit_events[0].intervention.message_id,
-            MessageId::new(MAX_INTERVENTIONS_PER_CHANNEL as u64)
-        );
-
-        let snapshot = handle.snapshot().await;
-        assert_eq!(
-            snapshot.intervention_queue.len(),
-            MAX_INTERVENTIONS_PER_CHANNEL
-        );
-        assert_eq!(
-            snapshot.intervention_queue[0].message_id,
-            MessageId::new(999)
-        );
-    }
-
-    #[tokio::test]
-    async fn clear_marks_remaining_queue_as_superseded() {
-        let provider = ProviderKind::Claude;
-        let registry = ChannelMailboxRegistry::default();
-        let channel_id = ChannelId::new(49);
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, "mailbox-clear", None);
-        let now = Instant::now();
-
-        handle
-            .replace_queue(
-                vec![
-                    make_intervention(10, "first", now),
-                    make_intervention(11, "second", now),
-                ],
-                persistence.clone(),
-            )
-            .await;
-        handle
-            .restore_active_turn(
-                Arc::new(CancelToken::new()),
-                UserId::new(9),
-                MessageId::new(91),
-            )
-            .await;
-
-        let result = handle.clear(persistence).await;
-
-        assert!(result.removed_token.is_some());
-        assert_eq!(result.queue_exit_events.len(), 2);
-        assert!(
-            result
-                .queue_exit_events
-                .iter()
-                .all(|event| event.kind == QueueExitKind::Superseded)
-        );
-        assert!(handle.snapshot().await.intervention_queue.is_empty());
-    }
-
-    #[tokio::test]
-    async fn enqueue_merges_consecutive_non_reply_messages_and_persists_source_ids() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-merge-consecutive";
-        let channel_id = ChannelId::new(143);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
-        let now = Instant::now();
-
-        let first = handle
-            .enqueue(
-                make_mergeable_intervention(20, "first", now),
-                persistence.clone(),
-            )
-            .await;
-        assert!(first.enqueued);
-        // First message into an empty queue must not be classified as merged
-        // — there is nothing to merge with. The reaction emoji selector relies
-        // on this distinction (📬 for standalone vs ➕ for merged).
-        assert!(!first.merged);
-
-        let second = handle
-            .enqueue(
-                make_mergeable_intervention(21, "second", now + Duration::from_secs(1)),
-                persistence.clone(),
-            )
-            .await;
-        assert!(second.enqueued);
-        // Second mergeable message folds into the first → merged=true so the
-        // caller can pick the ➕ reaction emoji.
-        assert!(second.merged);
-
-        let snapshot = handle.snapshot().await;
-        assert_eq!(snapshot.intervention_queue.len(), 1);
-        assert_eq!(snapshot.intervention_queue[0].message_id.get(), 21);
-        assert_eq!(
-            snapshot.intervention_queue[0]
-                .source_message_ids
-                .iter()
-                .map(|id| id.get())
-                .collect::<Vec<_>>(),
-            vec![20, 21]
-        );
-        assert_eq!(snapshot.intervention_queue[0].text, "first\nsecond");
-
-        let items = read_saved_items(tmp.path(), &provider, token_hash, channel_id);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].message_id, 21);
-        assert_eq!(items[0].source_message_ids, vec![20, 21]);
-        assert_eq!(items[0].text, "first\nsecond");
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn enqueue_reply_boundary_breaks_merge_chain() {
-        let registry = ChannelMailboxRegistry::default();
-        let channel_id = ChannelId::new(144);
-        let handle = registry.handle(channel_id);
-        let persistence =
-            QueuePersistenceContext::new(&ProviderKind::Claude, "reply-boundary", None);
-        let now = Instant::now();
-
-        let mut reply = make_mergeable_intervention(31, "reply", now + Duration::from_secs(1));
-        reply.has_reply_boundary = true;
-        reply.reply_context = Some("[Reply context]".to_string());
-
-        assert!(
-            handle
-                .enqueue(
-                    make_mergeable_intervention(30, "first", now),
-                    persistence.clone(),
-                )
-                .await
-                .enqueued
-        );
-        assert!(handle.enqueue(reply, persistence.clone()).await.enqueued);
-        assert!(
-            handle
-                .enqueue(
-                    make_mergeable_intervention(32, "after", now + Duration::from_secs(2)),
-                    persistence.clone(),
-                )
-                .await
-                .enqueued
-        );
-        assert!(
-            handle
-                .enqueue(
-                    make_mergeable_intervention(33, "tail", now + Duration::from_secs(3)),
-                    persistence,
-                )
-                .await
-                .enqueued
-        );
-
-        let snapshot = handle.snapshot().await;
-        assert_eq!(snapshot.intervention_queue.len(), 3);
-        assert_eq!(snapshot.intervention_queue[0].text, "first");
-        assert_eq!(snapshot.intervention_queue[1].text, "reply");
-        assert_eq!(snapshot.intervention_queue[2].text, "after\ntail");
-        assert_eq!(
-            snapshot.intervention_queue[2]
-                .source_message_ids
-                .iter()
-                .map(|id| id.get())
-                .collect::<Vec<_>>(),
-            vec![32, 33]
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_queued_message_matches_any_merged_source_message_id() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "mailbox-cancel-merged";
-        let channel_id = ChannelId::new(145);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
-        let now = Instant::now();
-
-        assert!(
-            handle
-                .enqueue(
-                    make_mergeable_intervention(40, "first", now),
-                    persistence.clone(),
-                )
-                .await
-                .enqueued
-        );
-        assert!(
-            handle
-                .enqueue(
-                    make_mergeable_intervention(41, "second", now + Duration::from_secs(1)),
-                    persistence.clone(),
-                )
-                .await
-                .enqueued
-        );
-
-        let removed = handle
-            .cancel_queued_message(MessageId::new(40), persistence.clone())
-            .await;
-        assert_eq!(removed.queue_exit_events.len(), 1);
-        assert_eq!(removed.queue_exit_events[0].kind, QueueExitKind::Cancelled);
-        let removed = removed
-            .removed
-            .expect("merged item should be removable by original source id");
-        assert_eq!(removed.message_id.get(), 41);
-        assert_eq!(
-            removed
-                .source_message_ids
-                .iter()
-                .map(|id| id.get())
-                .collect::<Vec<_>>(),
-            vec![40, 41]
-        );
-
-        let snapshot = handle.snapshot().await;
-        assert!(snapshot.intervention_queue.is_empty());
-        let path = queue_file_path(tmp.path(), &provider, token_hash, channel_id);
-        assert!(!path.exists());
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn recovery_kickoff_marks_recovery_until_finish_turn() {
-        let _lock = lock_test_env();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
-
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(45);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let persistence = QueuePersistenceContext::new(&provider, "mailbox-recovery", None);
-
-        let kickoff = handle
-            .recovery_kickoff(
-                Arc::new(CancelToken::new()),
-                UserId::new(5),
-                MessageId::new(55),
-            )
-            .await;
-        assert!(kickoff.activated_turn);
-        assert!(handle.snapshot().await.recovery_started_at.is_some());
-
-        let finished = handle.finish_turn(persistence).await;
-        assert!(finished.removed_token.is_some());
-        assert!(finished.mailbox_online);
-        assert!(handle.snapshot().await.recovery_started_at.is_none());
-
-        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
-    }
-
-    #[tokio::test]
-    async fn timeout_override_round_trip_stays_in_mailbox() {
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(ChannelId::new(46));
-
-        assert_eq!(
-            handle.extend_timeout(30).await,
-            Err(WatchdogDeadlineExtensionError::NoActiveTurn)
-        );
-
-        let token = Arc::new(CancelToken::new());
-        let now_ms = Utc::now().timestamp_millis();
-        token
-            .watchdog_deadline_ms
-            .store(now_ms + 60_000, Ordering::Relaxed);
-        token
-            .watchdog_max_deadline_ms
-            .store(now_ms + 120_000, Ordering::Relaxed);
-        assert!(
-            handle
-                .try_start_turn(token.clone(), UserId::new(7), MessageId::new(11))
-                .await
-        );
-
-        let extended = handle.extend_timeout(30).await.unwrap();
-        assert_eq!(extended.applied_extend_secs, 30);
-        assert_eq!(extended.extension_count_limit, u32::MAX);
-        assert_eq!(extended.extension_total_secs_limit, u64::MAX);
-        assert!(!extended.clamped);
-        assert!(extended.new_deadline_ms >= now_ms + 90_000);
-        assert_eq!(
-            token.watchdog_deadline_ms.load(Ordering::Relaxed),
-            extended.new_deadline_ms
-        );
-        assert_eq!(
-            token.watchdog_max_deadline_ms.load(Ordering::Relaxed),
-            extended.max_deadline_ms
-        );
-        assert!(extended.max_deadline_ms >= extended.new_deadline_ms);
-        assert_eq!(handle.take_timeout_override().await, Some(extended));
-        assert_eq!(handle.take_timeout_override().await, None);
-
-        assert!(handle.extend_timeout(15).await.is_ok());
-        handle.clear_timeout_override().await;
-        assert_eq!(handle.take_timeout_override().await, None);
-    }
-}
-
 // #2706: PurgeQueue regression guards. Kept in a plain `#[cfg(test)]` module so
 // they run under the default `cargo test` invocation — the legacy-sqlite-tests
 // feature is *not* enabled in CI by default, so the regression coverage for
@@ -4538,8 +3815,9 @@ mod purge_queue_tests {
             .restore_active_turn(active_token.clone(), UserId::new(7), MessageId::new(70))
             .await;
 
-        let drained = handle.purge_queue(persistence).await;
-        assert_eq!(drained, 3);
+        let purge = handle.purge_queue(persistence, false).await;
+        assert_eq!(purge.drained, 3);
+        assert!(!purge.cleared_active_anchor);
 
         let snapshot = handle.snapshot().await;
         assert!(snapshot.intervention_queue.is_empty());
@@ -4560,11 +3838,206 @@ mod purge_queue_tests {
         let persistence =
             QueuePersistenceContext::new(&provider, "mailbox-purge-idempotent-2706", None);
 
-        let drained_first = handle.purge_queue(persistence.clone()).await;
-        let drained_second = handle.purge_queue(persistence).await;
-        assert_eq!(drained_first, 0);
-        assert_eq!(drained_second, 0);
+        let drained_first = handle.purge_queue(persistence.clone(), false).await;
+        let drained_second = handle.purge_queue(persistence, false).await;
+        assert_eq!(drained_first.drained, 0);
+        assert_eq!(drained_second.drained, 0);
         assert!(handle.snapshot().await.intervention_queue.is_empty());
+    }
+
+    // #3029(D): a force purge (clear_cancelled_active_anchor=true) against an
+    // already-cancelled active turn releases the anchor so the next dispatch
+    // is not blocked by a stale cancel_token / active_user_message_id.
+    #[tokio::test]
+    async fn force_purge_clears_cancelled_active_anchor() {
+        let provider = ProviderKind::Claude;
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(30290);
+        let handle = registry.handle(channel_id);
+        let persistence = QueuePersistenceContext::new(&provider, "mailbox-force-purge-3029", None);
+
+        let active_token = Arc::new(CancelToken::new());
+        handle
+            .restore_active_turn(active_token.clone(), UserId::new(7), MessageId::new(70))
+            .await;
+        // The force path flips `cancelled` (via cancel_active_token) before
+        // purging; emulate that here.
+        active_token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let purge = handle.purge_queue(persistence, true).await;
+        assert!(
+            purge.cleared_active_anchor,
+            "force purge must release a cancelled active-turn anchor (#3029 D)"
+        );
+        assert!(
+            handle.cancel_token().await.is_none(),
+            "cancelled active anchor must be cleared after force purge"
+        );
+    }
+
+    // #3029(D) / #2706: a force purge must NOT clear the anchor of a fresh,
+    // *uncancelled* turn that raced into the actor after the force-kill —
+    // otherwise force=true would collaterally cancel the new turn.
+    #[tokio::test]
+    async fn force_purge_preserves_uncancelled_active_anchor() {
+        let provider = ProviderKind::Claude;
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(30291);
+        let handle = registry.handle(channel_id);
+        let persistence =
+            QueuePersistenceContext::new(&provider, "mailbox-force-purge-fresh-3029", None);
+
+        let fresh_token = Arc::new(CancelToken::new());
+        handle
+            .restore_active_turn(fresh_token.clone(), UserId::new(7), MessageId::new(71))
+            .await;
+        // Token is NOT cancelled — represents a fresh turn that raced in.
+
+        let purge = handle.purge_queue(persistence, true).await;
+        assert!(
+            !purge.cleared_active_anchor,
+            "uncancelled fresh turn must keep its anchor (#2706 no-collateral-cancel)"
+        );
+        let surviving = handle.cancel_token().await;
+        assert!(surviving.is_some());
+        assert!(Arc::ptr_eq(&surviving.unwrap(), &fresh_token));
+    }
+}
+
+#[cfg(test)]
+mod finish_cancelled_turn_tests {
+    use std::sync::{Arc, LazyLock, Mutex};
+    use std::time::Instant;
+
+    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
+
+    use crate::services::provider::ProviderKind;
+    use crate::services::turn_orchestrator::{
+        CancelToken, ChannelMailboxRegistry, Intervention, InterventionMode,
+        QueuePersistenceContext, save_channel_queue,
+    };
+
+    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
+    static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn make_intervention(message_id: u64, text: &str) -> Intervention {
+        Intervention {
+            author_id: UserId::new(1),
+            author_is_bot: false,
+            message_id: MessageId::new(message_id),
+            source_message_ids: vec![MessageId::new(message_id)],
+            text: text.to_string(),
+            mode: InterventionMode::Soft,
+            created_at: Instant::now(),
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            pending_uploads: Vec::new(),
+            voice_announcement: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_cancelled_turn_clears_cancelled_active_without_rehydrating_queue() {
+        let _lock = match TEST_ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+
+        let provider = ProviderKind::Codex;
+        let token_hash = "finish-cancelled-no-rehydrate";
+        let channel_id = ChannelId::new(2_997_001);
+        let registry = ChannelMailboxRegistry::default();
+        let handle = registry.handle(channel_id);
+        let persistence = QueuePersistenceContext::new(&provider, token_hash, None);
+
+        handle.replace_queue(Vec::new(), persistence).await;
+        save_channel_queue(
+            &provider,
+            token_hash,
+            channel_id,
+            &[make_intervention(30, "disk-only queued prompt")],
+            None,
+        )
+        .expect("seed disk-only pending queue");
+
+        let token = Arc::new(CancelToken::new());
+        token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            handle
+                .try_start_turn(token.clone(), UserId::new(7), MessageId::new(70))
+                .await
+        );
+
+        let finished = handle.finish_cancelled_turn().await;
+
+        assert!(
+            finished
+                .removed_token
+                .as_ref()
+                .is_some_and(|removed| Arc::ptr_eq(removed, &token)),
+            "removed_token tells recovery it may decrement global_active",
+        );
+        assert!(!finished.has_pending);
+        assert!(finished.mailbox_online);
+        let snapshot = handle.snapshot().await;
+        assert!(snapshot.cancel_token.is_none());
+        assert!(snapshot.active_user_message_id.is_none());
+        assert!(
+            snapshot.intervention_queue.is_empty(),
+            "finish_cancelled_turn must not hydrate disk-only pending queues",
+        );
+
+        unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) };
+    }
+
+    #[tokio::test]
+    async fn finish_cancelled_turn_preserves_uncancelled_active_turn() {
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(2_997_002);
+        let handle = registry.handle(channel_id);
+        let token = Arc::new(CancelToken::new());
+
+        assert!(
+            handle
+                .try_start_turn(token.clone(), UserId::new(7), MessageId::new(71))
+                .await
+        );
+
+        let finished = handle.finish_cancelled_turn().await;
+
+        assert!(finished.removed_token.is_none());
+        assert!(finished.mailbox_online);
+        let snapshot = handle.snapshot().await;
+        assert!(
+            snapshot
+                .cancel_token
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &token)),
+            "fresh active turn must survive a stale finish_cancelled_turn call",
+        );
+        assert_eq!(snapshot.active_user_message_id, Some(MessageId::new(71)));
+    }
+
+    #[tokio::test]
+    async fn finish_cancelled_turn_is_noop_when_mailbox_is_idle() {
+        let registry = ChannelMailboxRegistry::default();
+        let channel_id = ChannelId::new(2_997_003);
+        let handle = registry.handle(channel_id);
+
+        let finished = handle.finish_cancelled_turn().await;
+
+        assert!(finished.removed_token.is_none());
+        assert!(finished.mailbox_online);
+        let snapshot = handle.snapshot().await;
+        assert!(snapshot.cancel_token.is_none());
+        assert!(snapshot.active_user_message_id.is_none());
     }
 }
 

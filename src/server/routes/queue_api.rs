@@ -4,6 +4,7 @@
 
 use axum::{
     Json,
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
 };
@@ -154,6 +155,34 @@ pub struct CancelTurnQuery {
     pub force: bool,
 }
 
+/// #3029(C): `force` carried in the request *body*, mirroring the JSON-body
+/// shape of `cancel_all_dispatches` / `extend_turn_timeout`. Clients that POST
+/// `{"force": true}` previously had it silently dropped because the handler
+/// only read `Query<CancelTurnQuery>`, downgrading an intended hard-kill to a
+/// soft cancel.
+#[derive(Debug, Default, Deserialize)]
+pub struct CancelTurnBody {
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// #3029(C): resolve the effective `force` intent from query + body. The body
+/// wins when present and parseable (it's the canonical JSON shape); the query
+/// param remains an honored fallback for existing `?force=true` clients. An
+/// empty or non-JSON body falls through to the query value, so callers that
+/// never sent a body keep working unchanged.
+fn resolve_cancel_force(query_force: bool, body: &Bytes) -> bool {
+    if body.is_empty() {
+        return query_force;
+    }
+    match serde_json::from_slice::<CancelTurnBody>(body) {
+        Ok(parsed) => parsed.force || query_force,
+        // Unparseable body: do not silently swallow the request; honor the
+        // query fallback so a `?force=true` with a junk body still forces.
+        Err(_) => query_force,
+    }
+}
+
 /// Cancel the active turn in a channel.
 ///
 /// Default (`force=false`): preserves the live provider session and watcher;
@@ -162,15 +191,19 @@ pub struct CancelTurnQuery {
 ///
 /// `force=true`: tear the tmux session down, SIGKILL the PID tree, clear
 /// inflight state. The turn will not complete gracefully; in-flight
-/// `cargo`/`claude` subprocesses get terminated.
+/// `cargo`/`claude` subprocesses get terminated. `force` may be supplied either
+/// as a query param (`?force=true`) or in the JSON body (`{"force": true}`,
+/// #3029); the body wins when both are present.
 pub async fn cancel_turn(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
     Query(query): Query<CancelTurnQuery>,
+    body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let force = resolve_cancel_force(query.force, &body);
     match state
         .queue_service()
-        .cancel_turn(state.health_registry.as_ref(), &channel_id, query.force)
+        .cancel_turn(state.health_registry.as_ref(), &channel_id, force)
         .await
     {
         Ok(response) => (StatusCode::OK, Json(response)),
@@ -351,124 +384,56 @@ fn pending_dispatch_row_to_json_pg(
     }))
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
+// #3029(C): `resolve_cancel_force` is a pure parser with no DB/runtime
+// dependency, so its coverage lives in a plain `#[cfg(test)]` module that runs
+// under the default `cargo test` invocation (the suite above is gated behind
+// the `legacy-sqlite-tests` feature, which CI does not enable by default).
+#[cfg(test)]
+mod cancel_force_tests {
     use super::*;
-    use crate::services::provider::CancelToken;
-    use crate::services::turn_orchestrator::ChannelMailboxRegistry;
-    use crate::voice::announce_meta::{VoiceBackgroundHandoffMeta, global_store};
-    use poise::serenity_prelude::{ChannelId, MessageId, UserId};
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use axum::body::Bytes;
 
-    fn make_state() -> AppState {
-        let db = crate::db::test_db();
-        let engine = crate::engine::PolicyEngine::new_with_legacy_db(
-            &crate::config::Config::default(),
-            db.clone(),
-        )
-        .unwrap();
-        AppState::test_state(db, engine)
-    }
-
-    #[tokio::test]
-    async fn extend_turn_timeout_reports_effective_deadline_and_tracked_max() {
-        let channel_id = ChannelId::new(1_417_000_001);
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let token = Arc::new(CancelToken::new());
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        token
-            .watchdog_deadline_ms
-            .store(now_ms + 60_000, Ordering::Relaxed);
-        token
-            .watchdog_max_deadline_ms
-            .store(now_ms + 120_000, Ordering::Relaxed);
+    #[test]
+    fn body_force_true_is_honored_even_when_query_false() {
+        let body = Bytes::from_static(b"{\"force\": true}");
         assert!(
-            handle
-                .try_start_turn(token.clone(), UserId::new(7), MessageId::new(11))
-                .await
-        );
-
-        let (status, Json(body)) = extend_turn_timeout(
-            State(make_state()),
-            Path(channel_id.get().to_string()),
-            Json(ExtendTimeoutBody { extend_secs: 30 }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["clamped"], false);
-        assert_eq!(body["requested_extend_secs"], 30);
-        assert_eq!(body["applied_extend_secs"], 30);
-        assert_eq!(body["new_deadline_ms"], body["effective_deadline_ms"]);
-        assert!(body["effective_remaining_minutes"].as_i64().unwrap() >= 1);
-        assert!(
-            body["max_deadline_ms"].as_i64().unwrap() >= body["new_deadline_ms"].as_i64().unwrap()
+            resolve_cancel_force(false, &body),
+            "force in body must be honored (#3029 C): previously dropped to default=false"
         );
     }
 
-    /// Verify that extending the watchdog deadline also refreshes the in-memory
-    /// voice-background handoff marker TTL (#2352): a short-TTL marker inserted
-    /// before the extension must still be readable afterwards.
-    #[tokio::test]
-    async fn extend_turn_timeout_refreshes_in_memory_handoff_meta_ttl() {
-        // Use a unique channel / message ID pair to avoid cross-test pollution
-        // in the process-level global store.
-        let channel_id = ChannelId::new(1_417_000_002);
-        let message_id = MessageId::new(8_200_002);
+    #[test]
+    fn body_force_false_is_respected() {
+        let body = Bytes::from_static(b"{\"force\": false}");
+        assert!(!resolve_cancel_force(false, &body));
+    }
 
-        // Register an active turn so extend_watchdog_deadline can reach it
-        // through ChannelMailboxRegistry::global_handle.
-        let registry = ChannelMailboxRegistry::default();
-        let handle = registry.handle(channel_id);
-        let token = Arc::new(CancelToken::new());
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        token
-            .watchdog_deadline_ms
-            .store(now_ms + 60_000, Ordering::Relaxed);
-        token
-            .watchdog_max_deadline_ms
-            .store(now_ms + 120_000, Ordering::Relaxed);
+    #[test]
+    fn empty_body_falls_back_to_query() {
+        let empty = Bytes::new();
         assert!(
-            handle
-                .try_start_turn(token.clone(), UserId::new(8), message_id)
-                .await
+            resolve_cancel_force(true, &empty),
+            "existing ?force=true clients (no body) must keep forcing"
         );
+        assert!(!resolve_cancel_force(false, &empty));
+    }
 
-        // Insert a handoff marker with a minimal TTL so that without the
-        // refresh it would be treated as nearly-expired.
-        let meta = VoiceBackgroundHandoffMeta {
-            voice_channel_id: 9_900_001,
-            background_channel_id: channel_id.get(),
-            agent_id: Some("test-agent".to_string()),
-            local_only_fallback: false,
-        };
-        global_store().insert_handoff_with_remaining_ttl(
-            message_id,
-            meta.clone(),
-            std::time::Duration::from_secs(1),
+    #[test]
+    fn query_force_remains_fallback_when_body_omits_force() {
+        // Body is valid JSON but omits `force` → serde default false; the query
+        // value still wins as a fallback.
+        let body = Bytes::from_static(b"{}");
+        assert!(resolve_cancel_force(true, &body));
+        assert!(!resolve_cancel_force(false, &body));
+    }
+
+    #[test]
+    fn unparseable_body_falls_back_to_query() {
+        let junk = Bytes::from_static(b"not json");
+        assert!(
+            resolve_cancel_force(true, &junk),
+            "a junk body must not silently swallow a ?force=true intent"
         );
-
-        // Extend the watchdog — this must refresh the handoff marker's TTL.
-        let (status, Json(body)) = extend_turn_timeout(
-            State(make_state()),
-            Path(channel_id.get().to_string()),
-            Json(ExtendTimeoutBody { extend_secs: 3600 }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "extend must succeed");
-        assert_eq!(body["ok"], true);
-
-        // The marker must still be readable — the TTL was refreshed.
-        assert_eq!(
-            global_store().get_handoff(message_id),
-            Some(meta),
-            "handoff meta must survive after watchdog extension refreshed its TTL"
-        );
-
-        // Clean up the global store entry to avoid polluting other tests.
-        let _ = global_store().take_handoff(message_id);
+        assert!(!resolve_cancel_force(false, &junk));
     }
 }

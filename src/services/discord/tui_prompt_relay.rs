@@ -35,6 +35,9 @@ const CLAUDE_IDLE_INFLIGHT_DRAIN_POLL: Duration = Duration::from_millis(100);
 const CLAUDE_IDLE_FRESH_TRANSCRIPT_LOOKBACK_BYTES: u64 = 65_536;
 const CODEX_IDLE_PROMPT_ANCHOR_WAIT: Duration = Duration::from_secs(2);
 const CODEX_IDLE_PROMPT_ANCHOR_POLL: Duration = Duration::from_millis(100);
+const TUI_DIRECT_SYNTHETIC_CLAIM_WAIT: Duration = Duration::from_secs(2);
+const TUI_DIRECT_SYNTHETIC_CLAIM_POLL: Duration = Duration::from_millis(100);
+const TUI_DIRECT_SYNTHETIC_OWNER_USER_ID: u64 = 1;
 static CODEX_IDLE_ROLLOUT_RELAY_STARTED: AtomicBool = AtomicBool::new(false);
 static CLAUDE_IDLE_TRANSCRIPT_RELAY_STARTED: AtomicBool = AtomicBool::new(false);
 static CLAUDE_IDLE_RESPONSE_TAILS: LazyLock<Mutex<HashSet<String>>> =
@@ -251,14 +254,34 @@ impl TurnGateway for TuiDirectBridgeGateway {
 
     fn dispatch_queued_turn<'a>(
         &'a self,
-        _channel_id: ChannelId,
-        _intervention: &'a super::Intervention,
+        channel_id: ChannelId,
+        intervention: &'a super::Intervention,
         _request_owner_name: &'a str,
-        _has_more_queued_turns: bool,
+        has_more_queued_turns: bool,
     ) -> GatewayFuture<'a, Result<(), String>> {
-        Box::pin(
-            async move { Err("TUI-direct bridge adapter cannot dispatch queued turns".into()) },
-        )
+        Box::pin(async move {
+            super::mailbox_requeue_intervention_front(
+                &self.shared,
+                &self.provider,
+                channel_id,
+                intervention.clone(),
+            )
+            .await;
+            super::schedule_deferred_idle_queue_kickoff(
+                self.shared.clone(),
+                self.provider.clone(),
+                channel_id,
+                "tui_direct_bridge_queued_turn",
+            );
+            tracing::info!(
+                provider = %self.provider.as_str(),
+                channel_id = channel_id.get(),
+                queued_message_id = intervention.message_id.get(),
+                has_more_queued_turns,
+                "TUI-direct bridge adapter deferred queued turn to normal Discord intake without prompt resubmission"
+            );
+            Ok(())
+        })
     }
 
     fn validate_live_routing<'a>(
@@ -277,7 +300,7 @@ impl TurnGateway for TuiDirectBridgeGateway {
     }
 
     fn bot_owner_provider(&self) -> Option<ProviderKind> {
-        Some(self.provider.clone())
+        None
     }
 }
 
@@ -370,19 +393,7 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         );
         return;
     };
-    let lease = record_observed_external_turn_lease(shared, &prompt, channel_id);
-    let mut lease_guard = ProviderKind::from_str(&prompt.provider).and_then(|provider| {
-        (matches!(provider, ProviderKind::Claude)
-            && bridge_adapter_owns_external_turn(lease.relay_owner))
-        .then(|| {
-            TuiDirectExternalInputLeaseGuard::new(
-                provider,
-                &prompt.tmux_session_name,
-                channel_id,
-                &lease,
-            )
-        })
-    });
+    let mut lease = record_observed_external_turn_lease(shared, &prompt, channel_id);
     let Some(registry) = shared.health_registry() else {
         tracing::warn!(
             provider = %prompt.provider,
@@ -412,49 +423,204 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             return;
         }
     };
-    let content = format_ssh_direct_prompt_notification(
-        &prompt.provider,
-        &prompt.tmux_session_name,
-        &prompt.prompt,
+    // #3099 / #3100: classify the injected text before it enters the active-turn
+    // reaction/inflight machinery. A compact/system continuation prologue is NOT
+    // a human request — it must be rendered as a neutral session note with no
+    // `⏳`, no prompt anchor, and no synthetic turn ownership.
+    //
+    // #3099 codex re-review (P1): SystemContinuation must NOT short-circuit the
+    // whole relay. The compact continuation IS fed to the provider and Claude
+    // produces assistant output; that output still has to reach Discord via the
+    // bridge tail. So a SystemContinuation suppresses ONLY the user-turn
+    // lifecycle (the `⏳` reaction, the prompt anchor, and the synthetic
+    // user-turn/inflight ownership) — the assistant-output delivery path (the
+    // Claude bridge tail below) still runs exactly as for any other injection.
+    let injected_class = classify_injected_prompt(&prompt.prompt);
+    // #3099 codex re-review (P1): suppressing the user-turn lifecycle (⏳ + anchor
+    // + synthetic ownership) is decoupled from output delivery. The bridge tail
+    // below runs regardless so the provider's assistant output still reaches
+    // Discord even for a SystemContinuation.
+    let is_system_continuation = injected_class.suppresses_user_turn_lifecycle();
+    debug_assert!(
+        injected_class.still_delivers_assistant_output(),
+        "every injected class must still deliver assistant output via the bridge tail",
     );
-    let anchor_message = match channel_id.say(&*notify_http, content).await {
-        Ok(message) => message,
-        Err(error) => {
-            tracing::warn!(
-                provider = %prompt.provider,
-                channel_id = channel_id.get(),
-                turn_id = lease.turn_id.as_deref().unwrap_or(""),
-                session_key = lease.session_key.as_deref().unwrap_or(""),
-                relay_owner = lease.relay_owner.as_str(),
-                runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
-                error = %error,
-                "failed to send SSH-direct TUI prompt notify"
-            );
-            return;
+    if is_system_continuation {
+        let note = format_system_continuation_note(&prompt.tmux_session_name, &prompt.prompt);
+        match channel_id.say(&*notify_http, note).await {
+            Ok(message) => {
+                tracing::info!(
+                    provider = %prompt.provider,
+                    channel_id = channel_id.get(),
+                    tmux_session_name = %prompt.tmux_session_name,
+                    note_message_id = message.id.get(),
+                    "rendered system/compact continuation injection as neutral session note; no active-turn lifecycle, assistant output still relayed via bridge tail"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    provider = %prompt.provider,
+                    channel_id = channel_id.get(),
+                    tmux_session_name = %prompt.tmux_session_name,
+                    error = %error,
+                    "failed to send system/compact continuation session note"
+                );
+            }
         }
-    };
-    crate::services::tui_prompt_dedupe::record_prompt_anchor(
-        &prompt.provider,
-        &prompt.tmux_session_name,
-        channel_id.get(),
-        anchor_message.id.get(),
-    );
-    super::formatting::add_reaction_raw(&notify_http, channel_id, anchor_message.id, '⏳').await;
-    tracing::info!(
-        provider = %prompt.provider,
-        channel_id = channel_id.get(),
-        tmux_session_name = %prompt.tmux_session_name,
-        turn_id = lease.turn_id.as_deref().unwrap_or(""),
-        session_key = lease.session_key.as_deref().unwrap_or(""),
-        relay_owner = lease.relay_owner.as_str(),
-        runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
-        anchor_message_id = anchor_message.id.get(),
-        "SSH-direct TUI prompt notified; runtime relay will handle output without synthetic inflight"
-    );
+    } else {
+        // #3075: a `<task-notification>` auto-turn is a MACHINE event — render it
+        // as a compact structured card and DEDUPE repeats by task-id (a repeat
+        // edits its live card or drops as a no-op → no new ⏳/turn; the first
+        // sighting returns content to post as the #3099 anchor). HumanTuiDirect
+        // keeps the raw render; SystemContinuation is handled above (#3100).
+        let content = if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
+            match super::tui_task_card::resolve_task_card_content(
+                &notify_http,
+                shared,
+                channel_id,
+                &prompt.prompt,
+            )
+            .await
+            {
+                super::tui_task_card::TaskCardOutcome::Post { content } => content,
+                super::tui_task_card::TaskCardOutcome::Repeat => {
+                    // #3075 codex P1 #2: a repeat edited the live card (or dropped
+                    // as a no-op) and early-returns BEFORE the bridge-tail /
+                    // lease-guard cleanup block below. But `record_observed_external_turn_lease`
+                    // (above) already recorded a fresh external-input turn lease for
+                    // THIS observation, overwriting any prior one. If we returned now
+                    // without clearing it, that dangling non-Unassigned lease would
+                    // make `session_bound_external_lease_blocks_delivery` skip a
+                    // legitimate session-bound / bridge-tail delivery. Clear exactly
+                    // the lease this observation recorded (exact-match, so a newer
+                    // turn that reused this provider/session/channel is preserved).
+                    clear_observed_external_turn_lease_if_current(&prompt, channel_id, &lease);
+                    return;
+                }
+            }
+        } else {
+            format_ssh_direct_prompt_notification(
+                &prompt.provider,
+                &prompt.tmux_session_name,
+                &prompt.prompt,
+            )
+        };
+        let anchor_message = match channel_id.say(&*notify_http, content).await {
+            Ok(message) => message,
+            Err(error) => {
+                // #3075 codex P2: for a TaskNotificationEvent the `Post` outcome
+                // above reserved a placeholder card slot (message_id == 0) BEFORE
+                // this post. If the post fails we early-return without ever calling
+                // `record_posted_card`, so the placeholder would linger and force
+                // every later same-task notification to resolve to `Pending`
+                // (`TaskCardOutcome::Repeat` → no-op), silently suppressing that
+                // task-id until the 1h stale purge. Release the reservation we own
+                // (exact-match: only while message_id is still 0) so the NEXT
+                // same-task notification reserves fresh and reposts. A racing
+                // repeat that legitimately saw `Pending` is still a safe no-op:
+                // its slot read happened against this same placeholder, and clearing
+                // it only changes the *next* reservation's outcome — it never turns
+                // an already-dropped repeat into a double-post.
+                if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
+                    let task_id =
+                        super::tui_task_card::parse_task_notification(&prompt.prompt).task_id;
+                    super::tui_task_card::forget_reserved_card(
+                        channel_id.get(),
+                        task_id.as_deref(),
+                    );
+                }
+                tracing::warn!(
+                    provider = %prompt.provider,
+                    channel_id = channel_id.get(),
+                    turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                    session_key = lease.session_key.as_deref().unwrap_or(""),
+                    relay_owner = lease.relay_owner.as_str(),
+                    runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+                    error = %error,
+                    "failed to send SSH-direct TUI prompt notify"
+                );
+                return;
+            }
+        };
+        if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
+            // #3075: remember this card so a repeat completion edits it.
+            super::tui_task_card::record_posted_card(
+                channel_id.get(),
+                &prompt.prompt,
+                anchor_message.id.get(),
+            );
+        }
+        crate::services::tui_prompt_dedupe::record_prompt_anchor(
+            &prompt.provider,
+            &prompt.tmux_session_name,
+            channel_id.get(),
+            anchor_message.id.get(),
+        );
+        super::formatting::add_reaction_raw(&notify_http, channel_id, anchor_message.id, '⏳')
+            .await;
+        // #3099: a `<task-notification>` auto-turn is still a real provider turn
+        // that earns the same synthetic ownership as human direct input — the
+        // difference is purely that its `⏳` completion cleanup must be anchored on
+        // this injected message's own id (handled in the watcher/recovery
+        // completion paths), so it does NOT short-circuit here. Only
+        // SystemContinuation skips this active-turn block (but still relays output
+        // via the bridge tail below).
+        debug_assert!(
+            injected_class.is_human_active_turn()
+                || matches!(injected_class, InjectedPromptClass::TaskNotificationEvent),
+            "system-continuation injections must not reach active-turn handling",
+        );
+        if let Some(provider) = ProviderKind::from_str(&prompt.provider) {
+            let claim = claim_tui_direct_synthetic_turn(
+                shared,
+                &provider,
+                channel_id,
+                &prompt.tmux_session_name,
+                &prompt.prompt,
+                anchor_message.id,
+                &lease,
+            )
+            .await;
+            if claim.claimed && lease.relay_owner != claim.relay_owner {
+                lease.relay_owner = claim.relay_owner;
+                crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+                    provider.as_str(),
+                    &prompt.tmux_session_name,
+                    lease.clone(),
+                );
+            }
+        }
+        tracing::info!(
+            provider = %prompt.provider,
+            channel_id = channel_id.get(),
+            tmux_session_name = %prompt.tmux_session_name,
+            turn_id = lease.turn_id.as_deref().unwrap_or(""),
+            session_key = lease.session_key.as_deref().unwrap_or(""),
+            relay_owner = lease.relay_owner.as_str(),
+            runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
+            anchor_message_id = anchor_message.id.get(),
+            synthetic_inflight = tui_direct_synthetic_inflight_active_for_prompt(&prompt.provider, channel_id, &prompt.tmux_session_name),
+            "SSH-direct TUI prompt notified; runtime relay attached synthetic ownership when possible"
+        );
+    }
 
     #[cfg(unix)]
     {
-        if maybe_spawn_claude_idle_response_tail(shared.clone(), channel_id, &prompt, &lease).await
+        let mut lease_guard = ProviderKind::from_str(&prompt.provider).and_then(|provider| {
+            (matches!(provider, ProviderKind::Claude)
+                && bridge_adapter_owns_external_turn(lease.relay_owner))
+            .then(|| {
+                TuiDirectExternalInputLeaseGuard::new(
+                    provider,
+                    &prompt.tmux_session_name,
+                    channel_id,
+                    &lease,
+                )
+            })
+        });
+        if bridge_adapter_owns_external_turn(lease.relay_owner)
+            && maybe_spawn_claude_idle_response_tail(shared.clone(), channel_id, &prompt, &lease)
+                .await
             && let Some(guard) = lease_guard.as_mut()
         {
             guard.disarm();
@@ -462,7 +628,7 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     }
     #[cfg(not(unix))]
     {
-        let _ = &mut lease_guard;
+        let _ = &mut lease;
     }
 }
 
@@ -476,26 +642,13 @@ fn record_observed_external_turn_lease(
         &prompt.tmux_session_name,
     );
     let runtime_kind = binding.as_ref().map(|binding| binding.runtime_kind);
-    let relay_output_path = binding.as_ref().map(|binding| {
-        #[cfg(unix)]
-        {
-            if prompt
-                .provider
-                .trim()
-                .eq_ignore_ascii_case(ProviderKind::Claude.as_str())
-                && binding.runtime_kind == RuntimeHandoffKind::ClaudeTui
-                && let Some(transcript_path) = resolved_claude_idle_relay_transcript_path(
-                    shared,
-                    &prompt.tmux_session_name,
-                    channel_id,
-                    binding,
-                )
-            {
-                return transcript_path;
-            }
-        }
-        PathBuf::from(binding.relay_output_path())
-    });
+    let relay_output_path = external_input_relay_output_path(
+        shared,
+        &prompt.provider,
+        &prompt.tmux_session_name,
+        channel_id,
+        binding.as_ref(),
+    );
     let relay_owner = external_input_relay_owner_for_output(
         shared,
         &prompt.tmux_session_name,
@@ -536,6 +689,57 @@ fn record_observed_external_turn_lease(
         "observed TUI-direct input as already-submitted external turn"
     );
     lease
+}
+
+/// Clear the external-input turn lease recorded by
+/// [`record_observed_external_turn_lease`] for THIS observation, if it is still
+/// the current lease (exact match).
+///
+/// Used by the `<task-notification>` edit-repeat path (#3075 codex P1 #2): a
+/// repeat records a fresh lease before card resolution but then early-returns,
+/// skipping the normal bridge-tail / lease-guard cleanup. Without this, that
+/// stale non-`Unassigned` lease would block session-bound / bridge-tail delivery
+/// (`session_relay_sink::session_bound_external_lease_blocks_delivery`). The
+/// exact-match guard means a newer turn that reused the same
+/// provider/session/channel after we recorded ours is left untouched.
+fn clear_observed_external_turn_lease_if_current(
+    prompt: &ObservedTuiPrompt,
+    channel_id: ChannelId,
+    lease: &ExternalInputRelayLease,
+) -> bool {
+    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_matches(
+        &prompt.provider,
+        &prompt.tmux_session_name,
+        channel_id.get(),
+        lease,
+    )
+}
+
+fn external_input_relay_output_path(
+    shared: &Arc<SharedData>,
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: ChannelId,
+    binding: Option<&crate::services::tui_prompt_dedupe::TuiRuntimeBinding>,
+) -> Option<PathBuf> {
+    let binding = binding?;
+    #[cfg(unix)]
+    {
+        if provider
+            .trim()
+            .eq_ignore_ascii_case(ProviderKind::Claude.as_str())
+            && binding.runtime_kind == RuntimeHandoffKind::ClaudeTui
+            && let Some(transcript_path) = resolved_claude_idle_relay_transcript_path(
+                shared,
+                tmux_session_name,
+                channel_id,
+                binding,
+            )
+        {
+            return Some(transcript_path);
+        }
+    }
+    Some(PathBuf::from(binding.relay_output_path()))
 }
 
 fn record_external_turn_lease_for_output(
@@ -648,6 +852,328 @@ fn external_input_relay_owner_for_watchers(
 
 fn bridge_adapter_owns_external_turn(owner: ExternalInputRelayOwner) -> bool {
     matches!(owner, ExternalInputRelayOwner::BridgeAdapter)
+}
+
+#[derive(Debug)]
+struct TuiDirectSyntheticTurnClaim {
+    relay_owner: ExternalInputRelayOwner,
+    claimed: bool,
+}
+
+async fn finish_tui_direct_synthetic_pre_save_failure(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) {
+    // This cleanup runs before the synthetic path increments global_active.
+    let _ = super::mailbox_finish_turn(shared, provider, channel_id).await;
+}
+
+async fn claim_tui_direct_synthetic_turn(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    prompt_text: &str,
+    anchor_message_id: MessageId,
+    lease: &ExternalInputRelayLease,
+) -> TuiDirectSyntheticTurnClaim {
+    let binding =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name);
+    let output_path = external_input_relay_output_path(
+        shared,
+        provider.as_str(),
+        tmux_session_name,
+        channel_id,
+        binding.as_ref(),
+    );
+    let start_offset = binding
+        .as_ref()
+        .map(crate::services::tui_prompt_dedupe::TuiRuntimeBinding::relay_last_offset)
+        .unwrap_or(0);
+    let relay_owner = if tui_direct_watcher_can_own_output(
+        &shared.tmux_watchers,
+        tmux_session_name,
+        output_path.as_deref(),
+    ) {
+        ExternalInputRelayOwner::TmuxWatcher
+    } else {
+        ExternalInputRelayOwner::BridgeAdapter
+    };
+    let relay_owner_kind = match relay_owner {
+        ExternalInputRelayOwner::TmuxWatcher => RelayOwnerKind::Watcher,
+        ExternalInputRelayOwner::SessionBoundRelay => RelayOwnerKind::SessionBoundRelay,
+        _ => RelayOwnerKind::None,
+    };
+
+    let cancel_token = Arc::new(CancelToken::new());
+    super::turn_bridge::bind_cancel_token_tmux_runtime(
+        provider,
+        &cancel_token,
+        tmux_session_name,
+        "tui_direct_synthetic_inflight",
+    );
+    let started = super::mailbox_try_start_turn(
+        shared,
+        channel_id,
+        cancel_token,
+        serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
+        anchor_message_id,
+    )
+    .await;
+    if !started {
+        let snapshot = super::mailbox_snapshot(shared, channel_id).await;
+        if snapshot.active_user_message_id != Some(anchor_message_id) {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id = channel_id.get(),
+                tmux_session_name = %tmux_session_name,
+                active_user_message_id = snapshot
+                    .active_user_message_id
+                    .map(|id| id.get())
+                    .unwrap_or(0),
+                anchor_message_id = anchor_message_id.get(),
+                "skipping TUI-direct synthetic inflight; mailbox already owns a different turn"
+            );
+            return TuiDirectSyntheticTurnClaim {
+                relay_owner,
+                claimed: false,
+            };
+        }
+    }
+
+    if let Some(existing) = super::inflight::load_inflight_state(provider, channel_id.get())
+        && existing.tmux_session_name.as_deref() == Some(tmux_session_name)
+        && existing.turn_source == TurnSource::ExternalInput
+        && existing.user_msg_id == anchor_message_id.get()
+    {
+        let mut existing = existing;
+        existing.set_relay_owner_kind(relay_owner_kind);
+        existing.session_key = lease.session_key.clone();
+        existing.runtime_kind = lease.runtime_kind;
+        // #3099 codex re-review (P2): keep this turn's own injected `⏳` message id
+        // pinned so completion cleanup never reads a later injection's overwrite of
+        // the shared prompt-anchor slot.
+        existing.injected_prompt_message_id = Some(anchor_message_id.get());
+        if let Err(error) = super::inflight::save_inflight_state(&existing) {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel_id = channel_id.get(),
+                tmux_session_name = %tmux_session_name,
+                error = %error,
+                "failed to refresh TUI-direct synthetic inflight ownership"
+            );
+            if started {
+                finish_tui_direct_synthetic_pre_save_failure(shared, provider, channel_id).await;
+            }
+            return TuiDirectSyntheticTurnClaim {
+                relay_owner,
+                claimed: false,
+            };
+        }
+        if started {
+            super::increment_global_active(shared, "tui_direct_synthetic_refresh");
+            shared
+                .turn_start_times
+                .insert(channel_id, std::time::Instant::now());
+        }
+        publish_tui_direct_watcher_finalize_debt(
+            shared,
+            channel_id,
+            tmux_session_name,
+            relay_owner,
+        );
+        return TuiDirectSyntheticTurnClaim {
+            relay_owner,
+            claimed: true,
+        };
+    }
+
+    let inflight_state = build_tui_direct_synthetic_inflight_state(
+        provider.clone(),
+        channel_id,
+        anchor_message_id,
+        None,
+        prompt_text,
+        tmux_session_name,
+        output_path.as_deref(),
+        start_offset,
+        lease,
+        relay_owner_kind,
+    );
+    if let Err(error) = super::inflight::save_inflight_state(&inflight_state) {
+        tracing::warn!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            tmux_session_name = %tmux_session_name,
+            error = %error,
+            "failed to save TUI-direct synthetic inflight"
+        );
+        if started {
+            finish_tui_direct_synthetic_pre_save_failure(shared, provider, channel_id).await;
+        }
+        return TuiDirectSyntheticTurnClaim {
+            relay_owner,
+            claimed: false,
+        };
+    }
+
+    if started {
+        super::increment_global_active(shared, "tui_direct_synthetic_save");
+        shared
+            .turn_start_times
+            .insert(channel_id, std::time::Instant::now());
+    }
+    publish_tui_direct_watcher_finalize_debt(shared, channel_id, tmux_session_name, relay_owner);
+    tracing::info!(
+        provider = %provider.as_str(),
+        channel_id = channel_id.get(),
+        tmux_session_name = %tmux_session_name,
+        anchor_message_id = anchor_message_id.get(),
+        relay_owner = relay_owner.as_str(),
+        mailbox_started = started,
+        "created TUI-direct synthetic inflight for already-submitted provider turn"
+    );
+    TuiDirectSyntheticTurnClaim {
+        relay_owner,
+        claimed: true,
+    }
+}
+
+fn publish_tui_direct_watcher_finalize_debt(
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    relay_owner: ExternalInputRelayOwner,
+) {
+    if !matches!(relay_owner, ExternalInputRelayOwner::TmuxWatcher) {
+        return;
+    }
+    let owner_channel = shared
+        .tmux_watchers
+        .owner_channel_for_tmux_session(tmux_session_name)
+        .unwrap_or(channel_id);
+    let Some(watcher) = shared.tmux_watchers.get(&owner_channel) else {
+        return;
+    };
+    if watcher.tmux_session_name != tmux_session_name {
+        return;
+    }
+    watcher
+        .mailbox_finalize_owed
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn tui_direct_watcher_can_own_output(
+    watchers: &super::TmuxWatcherRegistry,
+    tmux_session_name: &str,
+    output_path: Option<&Path>,
+) -> bool {
+    let watcher_alive = watchers
+        .tmux_session_is_stale(tmux_session_name)
+        .is_some_and(|stale| !stale);
+    if !watcher_alive {
+        return false;
+    }
+    match output_path {
+        Some(output_path) => watchers
+            .watcher_output_path(tmux_session_name)
+            .is_some_and(|watcher_path| Path::new(&watcher_path) == output_path),
+        None => true,
+    }
+}
+
+fn tui_direct_synthetic_inflight_active_for_prompt(
+    provider: &str,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+) -> bool {
+    let Some(provider) = ProviderKind::from_str(provider) else {
+        return false;
+    };
+    tui_direct_synthetic_inflight_matches(
+        super::inflight::load_inflight_state(&provider, channel_id.get()).as_ref(),
+        tmux_session_name,
+    )
+}
+
+fn tui_direct_synthetic_inflight_matches(
+    state: Option<&InflightTurnState>,
+    tmux_session_name: &str,
+) -> bool {
+    state.is_some_and(|state| {
+        state.turn_source == TurnSource::ExternalInput
+            && state.tmux_session_name.as_deref() == Some(tmux_session_name)
+    })
+}
+
+fn tui_direct_watcher_synthetic_inflight_matches(
+    state: Option<&InflightTurnState>,
+    tmux_session_name: &str,
+) -> bool {
+    state.is_some_and(|state| {
+        state.turn_source == TurnSource::ExternalInput
+            && state.tmux_session_name.as_deref() == Some(tmux_session_name)
+            && state.effective_relay_owner_kind() == RelayOwnerKind::Watcher
+    })
+}
+
+#[cfg(unix)]
+async fn wait_for_tui_direct_watcher_synthetic_claim(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + TUI_DIRECT_SYNTHETIC_CLAIM_WAIT;
+    loop {
+        if tui_direct_watcher_synthetic_inflight_matches(
+            super::inflight::load_inflight_state(provider, channel_id.get()).as_ref(),
+            tmux_session_name,
+        ) {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep(TUI_DIRECT_SYNTHETIC_CLAIM_POLL.min(deadline - now)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn finish_tui_direct_synthetic_turn_if_current(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    reason: &'static str,
+) {
+    let Some(state) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
+        return;
+    };
+    if !tui_direct_synthetic_inflight_matches(Some(&state), tmux_session_name) {
+        return;
+    }
+    let snapshot = super::mailbox_snapshot(shared, channel_id).await;
+    // user_msg_id == 0 (a TUI-direct turn with no anchored Discord user
+    // message) maps to `None`, matching the mailbox's `active_user_message_id`
+    // for such turns; `MessageId::new(0)` would panic.
+    if snapshot.active_user_message_id != super::inflight::optional_message_id(state.user_msg_id) {
+        return;
+    }
+    super::inflight::clear_inflight_state(provider, channel_id.get());
+    let finish = super::mailbox_finish_turn(shared, provider, channel_id).await;
+    if finish.removed_token.is_some() {
+        super::saturating_decrement_global_active(shared);
+    }
+    if finish.mailbox_online && finish.has_pending {
+        super::schedule_deferred_idle_queue_kickoff(
+            shared.clone(),
+            provider.clone(),
+            channel_id,
+            reason,
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -886,7 +1412,28 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
         loop {
             let now = tokio::time::Instant::now();
             if now >= next_rehydrate {
-                rehydrate_existing_claude_tui_bindings();
+                // #3105 (codex P2): `rehydrate_existing_claude_tui_bindings` is a
+                // fully BLOCKING pass — it issues synchronous `tmux` subprocess
+                // calls (`list-sessions`, `has-session`, `has-live-pane`) and, via
+                // `pane_is_confirmed_dead_orphaned`, a `std::thread::sleep` between
+                // multi-sample pane probes. Running it inline on this Tokio worker
+                // would stall the executor (and every other async task scheduled on
+                // the same worker) for samples×delay PLUS the tmux subprocess
+                // latency on each pass. Move ALL of that blocking work onto the
+                // blocking pool with `spawn_blocking` so the executor stays free;
+                // the sync core (and its unit-testable multi-sample logic) is
+                // unchanged.
+                let shared_for_rehydrate = shared.clone();
+                let rehydrate_result = tokio::task::spawn_blocking(move || {
+                    rehydrate_existing_claude_tui_bindings(&shared_for_rehydrate);
+                })
+                .await;
+                if let Err(error) = rehydrate_result {
+                    tracing::warn!(
+                        error = %error,
+                        "Claude TUI binding rehydrate task panicked or was cancelled"
+                    );
+                }
                 next_rehydrate = now + CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL;
             }
             for (tmux_session_name, binding) in
@@ -896,6 +1443,15 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
             {
                 let Some(channel_id) = owner_channel_for_tmux_session(&shared, &tmux_session_name)
                 else {
+                    // #3018: registry has no owner channel for this active Claude
+                    // TUI binding — the idle relay cannot route, so it skips. Make
+                    // the skip visible (was a silent continue) so missing mappings
+                    // are diagnosable instead of silently dropping relay output.
+                    tracing::warn!(
+                        tmux_session_name = %tmux_session_name,
+                        provider = "claude",
+                        "Claude idle relay skipped: no authoritative owner channel for tmux session"
+                    );
                     continue;
                 };
                 if super::inflight::load_inflight_state(&ProviderKind::Claude, channel_id.get())
@@ -1008,6 +1564,22 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                             runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
                             "Claude idle transcript relay selected external turn owner"
                         );
+                        if wait_for_tui_direct_watcher_synthetic_claim(
+                            &ProviderKind::Claude,
+                            channel_id,
+                            &tmux_session_name,
+                        )
+                        .await
+                        {
+                            tracing::info!(
+                                tmux_session_name = %tmux_session_name,
+                                channel_id = channel_id.get(),
+                                turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                                session_key = lease.session_key.as_deref().unwrap_or(""),
+                                "Claude idle transcript relay yielded to TUI-direct synthetic watcher inflight"
+                            );
+                            continue;
+                        }
                         if bridge_adapter_owns_external_turn(lease.relay_owner) {
                             let tail_spawned = spawn_claude_idle_response_tail_once(
                                 shared.clone(),
@@ -1049,8 +1621,154 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
     )));
 }
 
+/// #3105 (codex P2): the eviction in `evict_dead_orphaned_claude_tui_mirrors` is
+/// destructive (it tombstones the dedupe mirror and so removes self-heal), so the
+/// liveness check that gates it must be conservative against a TRANSIENT
+/// pane-probe flake. We require the "no live pane" verdict to hold across multiple
+/// samples (with a short delay between them) — a single negative read must never
+/// declare a session dead. `1` would reproduce the original single-sample bug.
 #[cfg(unix)]
-fn rehydrate_existing_claude_tui_bindings() {
+const DEAD_ORPHANED_PANE_PROBE_SAMPLES: usize = 3;
+
+/// Delay between consecutive pane probes. A genuinely-live session that briefly
+/// flaked recovers within one of these windows; a genuinely-gone session stays
+/// dead across all of them. Kept small so the (rare) eviction path adds at most
+/// a few hundred ms to a single rehydrate pass that runs every 5s.
+#[cfg(unix)]
+const DEAD_ORPHANED_PANE_PROBE_DELAY: Duration = Duration::from_millis(75);
+
+/// #3105 (codex P1 sub-case B): a tmux session whose dedupe mirror still holds a
+/// stale ClaudeTui binding but which is genuinely dead/orphaned — its pane is
+/// gone AND no LIVE watcher handle owns it. This is the precise gate under which
+/// it is safe to drop any leftover restored-owner binding and tombstone the
+/// mirror; it deliberately EXCLUDES a live session whose authoritative registry
+/// entry was transiently evicted (sub-case A — pane is still live there, so this
+/// returns false and that path self-heals via
+/// `restore_owner_channel_for_tmux_session`).
+///
+/// The pane-liveness check is what distinguishes "pane dead/gone" (evict) from
+/// "pane alive but registry missing" (self-heal). A `restored_owner_by_tmux_session`
+/// entry is NOT treated as proof of life here, because that map is precisely the
+/// stale residue we must reclaim for a session that has since died; it is
+/// cleared as part of the eviction.
+///
+/// #3105 (codex P2): because eviction is destructive, the dead verdict is made
+/// resistant to a transient pane-probe flake (sub-case A false-positive risk for a
+/// LIVE thread-suffixed session that has not yet been claimed): the pane must read
+/// dead across `DEAD_ORPHANED_PANE_PROBE_SAMPLES` consecutive samples, AND — since
+/// "no watcher handle" is the weakest possible signal — the hard
+/// `tmux_session_exists` (`tmux has-session`) check must confirm the session truly
+/// does not exist on this host. A single soft "no live pane" read can NEVER evict.
+#[cfg(unix)]
+fn claude_tui_session_is_dead_orphaned(shared: &Arc<SharedData>, tmux_session_name: &str) -> bool {
+    // A live watcher handle is conclusive proof of life: never evict, never probe.
+    if shared
+        .tmux_watchers
+        .has_live_watcher_handle(tmux_session_name)
+    {
+        return false;
+    }
+    pane_is_confirmed_dead_orphaned(
+        || crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name),
+        || crate::services::tmux_diagnostics::tmux_session_exists(tmux_session_name),
+        DEAD_ORPHANED_PANE_PROBE_SAMPLES,
+        Some(DEAD_ORPHANED_PANE_PROBE_DELAY),
+    )
+}
+
+/// #3105 (codex P2): pure, testable core of the dead/orphaned pane decision (no
+/// watcher-handle dependency — the caller short-circuits on a live handle first).
+///
+/// Conservative by construction so a LIVE session is NEVER classified dead from a
+/// transient flake:
+///   1. `has_live_pane` is sampled up to `samples` times; the moment ANY sample
+///      reports a live pane the session is declared NOT dead (self-heal preserved).
+///      Only if ALL `samples` agree the pane is dead do we proceed.
+///   2. Even then, the hard `session_exists` (`tmux has-session`) check must
+///      confirm the session is truly gone from this host. "No watcher handle" is
+///      the weakest signal, so a soft "no live pane" alone never evicts; the
+///      session must be confirmed absent.
+///
+/// Sub-case B (the production `AgentDesk-claude-adk-cc-t1504468805772902471` case)
+/// still evicts: a genuinely-gone session reports no live pane on every sample AND
+/// `session_exists` is false, so this returns true and the WARN spam stops.
+#[cfg(unix)]
+fn pane_is_confirmed_dead_orphaned(
+    mut has_live_pane: impl FnMut() -> bool,
+    session_exists: impl FnOnce() -> bool,
+    samples: usize,
+    inter_probe_delay: Option<Duration>,
+) -> bool {
+    let samples = samples.max(1);
+    for sample in 0..samples {
+        if has_live_pane() {
+            // Any live observation across the window means the session is alive
+            // (or recovered from a flake): never evict.
+            return false;
+        }
+        if sample + 1 < samples {
+            if let Some(delay) = inter_probe_delay {
+                // Blocking sleep is intentional here: this sync core (and the
+                // sync `tmux` subprocess probes it drives) only ever runs off
+                // the Tokio executor — the sole async caller dispatches the
+                // whole rehydrate pass via `spawn_blocking` (#3105 codex P2), so
+                // this never stalls an executor worker.
+                std::thread::sleep(delay);
+            }
+        }
+    }
+    // Every soft probe agreed the pane is dead. Require the hard has-session check
+    // to confirm the session truly does not exist before declaring it orphaned.
+    !session_exists()
+}
+
+/// #3105 (codex P1 sub-case B): evict the stale dedupe mirror for every Claude
+/// TUI runtime binding whose session is dead/orphaned, BEFORE the idle relay
+/// loop iterates the mirror. The relay loop's `for` is driven by
+/// `runtime_bindings_for_kind(ClaudeTui)`; without this pass a dead/orphaned
+/// session (e.g. a thread-suffixed session whose pane no longer exists on this
+/// host) is yielded every iteration, fails authoritative owner resolution, and
+/// re-emits the drift + skip WARN every ~0.5s indefinitely. Tombstoning the
+/// mirror here removes the binding from that iteration set, so the spam stops
+/// after a single bounded incident line. A later legitimate re-registration
+/// (launch-script rehydrate or a fresh watcher) re-populates the mirror, so a
+/// session that comes back relays again.
+///
+/// This pass is independent of `list_session_names()` (which never contains a
+/// session that is gone from this host), which is exactly why the previous
+/// in-`list` dead-pane branch could not reach it.
+#[cfg(unix)]
+fn evict_dead_orphaned_claude_tui_mirrors(shared: &Arc<SharedData>) {
+    for (tmux_session_name, _binding) in
+        crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(RuntimeHandoffKind::ClaudeTui)
+    {
+        if !claude_tui_session_is_dead_orphaned(shared, &tmux_session_name) {
+            continue;
+        }
+        // Drop any leftover restored-owner binding (a dead session must never
+        // resolve an authoritative owner), then tombstone the dedupe mirror.
+        shared
+            .tmux_watchers
+            .clear_restored_owner_for_tmux_session(&tmux_session_name);
+        if crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(&tmux_session_name) {
+            tracing::warn!(
+                tmux_session_name = %tmux_session_name,
+                provider = "claude",
+                "evicted stale dedupe mirror for dead/orphaned Claude TUI session \
+                 (pane gone, no live watcher); idle relay will no longer re-emit \
+                 per-poll drift/skip warnings for it"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn rehydrate_existing_claude_tui_bindings(shared: &Arc<SharedData>) {
+    // #3105 (codex P1 sub-case B): tombstone stale mirrors for dead/orphaned
+    // sessions BEFORE anything else, so the per-poll drift/skip WARN spam stops
+    // even when the session is not present in `list_session_names()` at all.
+    evict_dead_orphaned_claude_tui_mirrors(shared);
+
     let sessions = match crate::services::platform::tmux::list_session_names() {
         Ok(sessions) => sessions,
         Err(error) => {
@@ -1063,17 +1781,69 @@ fn rehydrate_existing_claude_tui_bindings() {
         let existing_binding = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(
             &tmux_session_name,
         );
+        // #3018: dedupe lookup here is a diagnostic/mirror rehydration hint only
+        // (subordinate to the freshly resolved channel below), never a routing
+        // authority — the authoritative resolver is owner_channel_for_tmux_session.
         let existing_channel =
             crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(&tmux_session_name);
         let fresh_binding = rehydrated_claude_tui_binding_for_tmux_session(&tmux_session_name);
-        let channel_id = match resolve_rehydrated_claude_tmux_channel_id(&tmux_session_name)
-            .or(existing_channel)
-        {
+        // #3105: prefer the settings-derived (authoritative) channel; only fall
+        // back to the dedupe mirror's last-seen channel for the dedupe binding
+        // refresh below. The mirror's value must NOT be promoted into the
+        // authoritative registry — see the repair gate below.
+        let authoritative_channel = resolve_rehydrated_claude_tmux_channel_id(&tmux_session_name);
+        let channel_id = match authoritative_channel.or(existing_channel) {
             Some(channel_id) => channel_id,
             None => continue,
         };
         if !crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_session_name) {
+            // #3105: the restored owner binding is only valid for a LIVE session;
+            // drop it once the pane is gone so a dead session can never resolve.
+            shared
+                .tmux_watchers
+                .clear_restored_owner_for_tmux_session(&tmux_session_name);
+            // #3105 (codex P1 sub-case B): a listed-but-dead pane with no live
+            // watcher is orphaned — also tombstone its stale dedupe mirror so the
+            // idle relay loop stops re-emitting the per-poll drift/skip WARN for
+            // it (the dead-pane branch previously only cleared the restored owner
+            // and left the mirror to spam). `clear_restored_owner_*` above already
+            // ran, so the dead-orphaned predicate cannot be masked by a stale
+            // restored owner here.
+            if claude_tui_session_is_dead_orphaned(shared, &tmux_session_name)
+                && crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(&tmux_session_name)
+            {
+                tracing::warn!(
+                    tmux_session_name = %tmux_session_name,
+                    provider = "claude",
+                    "evicted stale dedupe mirror for dead/orphaned Claude TUI session \
+                     (listed pane dead, no live watcher)"
+                );
+            }
             continue;
+        }
+        // #3105: self-heal the authoritative tmux-session→channel registry for a
+        // LIVE Claude TUI session that has no live watcher handle (e.g. the slot
+        // was evicted by a compact/restart/rebind and never re-claimed because
+        // the user is typing directly into the pane). Without this the #3018
+        // "registry is the single authority, never fall back to the mirror" rule
+        // turns a transient registry miss into a PERMANENT relay drop. We promote
+        // ONLY the settings-derived channel (authoritative, resolves both base
+        // and thread-suffixed tmux names) — never the dedupe mirror — and emit a
+        // single bounded incident instead of the per-poll drift warning.
+        if let Some(authoritative_channel) = authoritative_channel {
+            let repaired = shared.tmux_watchers.restore_owner_channel_for_tmux_session(
+                &tmux_session_name,
+                ChannelId::new(authoritative_channel),
+            );
+            if repaired {
+                tracing::warn!(
+                    tmux_session_name = %tmux_session_name,
+                    channel_id = authoritative_channel,
+                    provider = "claude",
+                    "repaired authoritative tmux-session→channel registry for live TUI session \
+                     (no live watcher slot); idle relay can route again"
+                );
+            }
         }
         if let (Some(existing), Some(_)) = (&existing_binding, existing_channel) {
             if existing.runtime_kind == RuntimeHandoffKind::ClaudeTui
@@ -1612,6 +2382,14 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                 }
                 let Some(channel_id) = owner_channel_for_tmux_session(&shared, &tmux_session_name)
                 else {
+                    // #3018: registry has no owner channel for this active Codex
+                    // TUI binding — surface the relay skip (was a silent continue)
+                    // so missing mappings are diagnosable.
+                    tracing::warn!(
+                        tmux_session_name = %tmux_session_name,
+                        provider = "codex",
+                        "Codex idle relay skipped: no authoritative owner channel for tmux session"
+                    );
                     continue;
                 };
                 if super::inflight::load_inflight_state(&ProviderKind::Codex, channel_id.get())
@@ -1689,6 +2467,27 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                             runtime_kind = lease.runtime_kind.map(RuntimeHandoffKind::as_str).unwrap_or("unknown"),
                             "codex idle rollout relay selected external turn owner"
                         );
+                        if wait_for_tui_direct_watcher_synthetic_claim(
+                            &ProviderKind::Codex,
+                            channel_id,
+                            &tmux_session_name,
+                        )
+                        .await
+                        {
+                            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
+                                &tmux_session_name,
+                                &binding.output_path,
+                                line_end_offset,
+                            );
+                            tracing::info!(
+                                tmux_session_name = %tmux_session_name,
+                                channel_id = channel_id.get(),
+                                turn_id = lease.turn_id.as_deref().unwrap_or(""),
+                                session_key = lease.session_key.as_deref().unwrap_or(""),
+                                "codex idle rollout relay yielded to TUI-direct synthetic watcher inflight"
+                            );
+                            continue;
+                        }
                         if !bridge_adapter_owns_external_turn(lease.relay_owner) {
                             crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                                 &tmux_session_name,
@@ -2062,6 +2861,14 @@ async fn run_codex_idle_response_tail(
                 error = %error,
                 "codex idle rollout response tail failed"
             );
+            finish_tui_direct_synthetic_turn_if_current(
+                &shared,
+                &ProviderKind::Codex,
+                channel_id,
+                &tmux_session_name,
+                "codex_tui_direct_tail_failed",
+            )
+            .await;
             return;
         }
         Err(error) => {
@@ -2071,6 +2878,14 @@ async fn run_codex_idle_response_tail(
                 error = %error,
                 "codex idle rollout response tail panicked"
             );
+            finish_tui_direct_synthetic_turn_if_current(
+                &shared,
+                &ProviderKind::Codex,
+                channel_id,
+                &tmux_session_name,
+                "codex_tui_direct_tail_panicked",
+            )
+            .await;
             return;
         }
     };
@@ -2082,6 +2897,14 @@ async fn run_codex_idle_response_tail(
             rollout_path.to_str().unwrap_or_default(),
             final_offset,
         );
+        finish_tui_direct_synthetic_turn_if_current(
+            &shared,
+            &ProviderKind::Codex,
+            channel_id,
+            &tmux_session_name,
+            "codex_tui_direct_empty_response",
+        )
+        .await;
         return;
     }
     let delivery_result = relay_tui_idle_response_through_bridge(
@@ -2096,6 +2919,16 @@ async fn run_codex_idle_response_tail(
         &lease,
     )
     .await;
+    if delivery_result.is_err() {
+        finish_tui_direct_synthetic_turn_if_current(
+            &shared,
+            &ProviderKind::Codex,
+            channel_id,
+            &tmux_session_name,
+            "codex_tui_direct_delivery_failed",
+        )
+        .await;
+    }
     if tui_idle_tail_should_commit_runtime_binding_offset(response, delivery_result.is_ok()) {
         crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
             &tmux_session_name,
@@ -2191,6 +3024,14 @@ async fn run_claude_idle_response_tail(
                 error = %error,
                 "Claude idle transcript response tail failed"
             );
+            finish_tui_direct_synthetic_turn_if_current(
+                &shared,
+                &ProviderKind::Claude,
+                channel_id,
+                &tmux_session_name,
+                "claude_tui_direct_tail_failed",
+            )
+            .await;
             return;
         }
         Err(error) => {
@@ -2200,6 +3041,14 @@ async fn run_claude_idle_response_tail(
                 error = %error,
                 "Claude idle transcript response tail panicked"
             );
+            finish_tui_direct_synthetic_turn_if_current(
+                &shared,
+                &ProviderKind::Claude,
+                channel_id,
+                &tmux_session_name,
+                "claude_tui_direct_tail_panicked",
+            )
+            .await;
             return;
         }
     };
@@ -2211,6 +3060,14 @@ async fn run_claude_idle_response_tail(
             &transcript_path,
             final_offset,
         );
+        finish_tui_direct_synthetic_turn_if_current(
+            &shared,
+            &ProviderKind::Claude,
+            channel_id,
+            &tmux_session_name,
+            "claude_tui_direct_empty_response",
+        )
+        .await;
         return;
     }
     let delivery_result = relay_tui_idle_response_through_bridge(
@@ -2225,6 +3082,16 @@ async fn run_claude_idle_response_tail(
         &lease,
     )
     .await;
+    if delivery_result.is_err() {
+        finish_tui_direct_synthetic_turn_if_current(
+            &shared,
+            &ProviderKind::Claude,
+            channel_id,
+            &tmux_session_name,
+            "claude_tui_direct_delivery_failed",
+        )
+        .await;
+    }
     if tui_idle_tail_should_commit_runtime_binding_offset(response, delivery_result.is_ok()) {
         advance_claude_tmux_runtime_binding_offset(
             &tmux_session_name,
@@ -2350,6 +3217,12 @@ async fn relay_tui_idle_response_through_bridge(
             provider.as_str()
         ));
     };
+    // #3097: resolve the provider-specific compact threshold so the status
+    // panel reflects the configured value (e.g. `context_compact_percent_claude`)
+    // instead of the hardcoded 0 it used previously.
+    let context_compact_percent = super::adk_session::fetch_context_thresholds(shared.api_port)
+        .await
+        .compact_pct_for(&provider);
     let anchor = prompt_anchor_for_response_after_wait(
         provider.as_str(),
         tmux_session_name,
@@ -2367,6 +3240,10 @@ async fn relay_tui_idle_response_through_bridge(
         shared.clone(),
         channel_id,
         reference,
+        // #3082 P2-3: a TUI idle-response placeholder is an ACTIVE-turn card,
+        // not a queued "📬" notice — it must not wait on the answer-flush
+        // barrier.
+        false,
     )
     .await?;
     let user_msg_id = anchor
@@ -2393,7 +3270,7 @@ async fn relay_tui_idle_response_through_bridge(
             provider: provider.clone(),
         }),
         channel_id,
-        user_msg_id,
+        user_msg_id: Some(user_msg_id),
         user_text_owned: prompt_text.to_string(),
         request_owner_name: "TUI direct".to_string(),
         role_binding: None,
@@ -2405,8 +3282,8 @@ async fn relay_tui_idle_response_through_bridge(
         dispatch_kind: None,
         memory_recall_usage: TokenUsage::default(),
         context_window_tokens: 0,
-        context_compact_percent: 0,
-        current_msg_id,
+        context_compact_percent,
+        current_msg_id: Some(current_msg_id),
         response_sent_offset: 0,
         full_response: String::new(),
         tmux_last_offset: Some(start_offset),
@@ -2466,17 +3343,43 @@ fn build_tui_direct_bridge_inflight_state(
     start_offset: u64,
     lease: &ExternalInputRelayLease,
 ) -> InflightTurnState {
+    build_tui_direct_synthetic_inflight_state(
+        provider,
+        channel_id,
+        user_msg_id,
+        Some(current_msg_id),
+        prompt_text,
+        tmux_session_name,
+        Some(output_path),
+        start_offset,
+        lease,
+        RelayOwnerKind::None,
+    )
+}
+
+fn build_tui_direct_synthetic_inflight_state(
+    provider: ProviderKind,
+    channel_id: ChannelId,
+    user_msg_id: MessageId,
+    current_msg_id: Option<MessageId>,
+    prompt_text: &str,
+    tmux_session_name: &str,
+    output_path: Option<&Path>,
+    start_offset: u64,
+    lease: &ExternalInputRelayLease,
+    relay_owner_kind: RelayOwnerKind,
+) -> InflightTurnState {
     let mut state = InflightTurnState::new(
         provider,
         channel_id.get(),
         None,
-        0,
+        TUI_DIRECT_SYNTHETIC_OWNER_USER_ID,
         user_msg_id.get(),
-        current_msg_id.get(),
+        current_msg_id.map(MessageId::get).unwrap_or(0),
         prompt_text.to_string(),
         None,
         Some(tmux_session_name.to_string()),
-        output_path.to_str().map(str::to_string),
+        output_path.and_then(|path| path.to_str().map(str::to_string)),
         None,
         start_offset,
     );
@@ -2484,7 +3387,12 @@ fn build_tui_direct_bridge_inflight_state(
     state.session_key = lease.session_key.clone();
     state.runtime_kind = lease.runtime_kind;
     state.turn_source = TurnSource::ExternalInput;
-    state.set_relay_owner_kind(RelayOwnerKind::None);
+    state.set_relay_owner_kind(relay_owner_kind);
+    // #3099 codex re-review (P2): pin THIS turn's injected `⏳` message id onto
+    // the inflight so the `user_msg_id == 0` completion cleanup can target this
+    // turn's own message instead of whatever later injection has since
+    // overwritten the single shared prompt-anchor slot.
+    state.injected_prompt_message_id = Some(user_msg_id.get());
     state
 }
 
@@ -2597,6 +3505,86 @@ pub(super) async fn complete_tui_direct_prompt_anchor_lifecycle_if_present(
     Some(anchor)
 }
 
+/// #3099 codex re-review (P2): complete the `⏳ → ✅` lifecycle for a turn that
+/// finished with `user_msg_id == 0`, targeting THIS turn's own injected message.
+///
+/// The shared prompt-anchor slot (`prompt_anchor_by_tmux`) holds a single value
+/// per provider/tmux and is overwritten by each new injection. Reading it at
+/// completion time is unsafe under rapid/parallel injection: turn A's completion
+/// would land the `✅` on turn B's still-running message (and A's `⏳` would never
+/// clear). When the inflight row carries its own pinned `injected_prompt_message_id`
+/// (recorded when the synthetic turn claimed `⏳`), we swap the reaction on that
+/// exact message instead, and only clear the shared slot when it still points at
+/// the same message. Falls back to the shared-slot behaviour for legacy inflight
+/// rows that pre-date the pinned id.
+/// Pure selector for which injected message id the `user_msg_id == 0` completion
+/// cleanup should target. Returns `Some(id)` to swap reactions on that exact
+/// pinned message (this turn's own id), or `None` to fall back to the legacy
+/// shared prompt-anchor slot. A zero pinned id is treated as absent.
+pub(super) fn pinned_anchor_cleanup_target(pinned_injected_message_id: Option<u64>) -> Option<u64> {
+    pinned_injected_message_id.filter(|id| *id != 0)
+}
+
+pub(super) async fn complete_tui_direct_anchor_lifecycle_for_inflight(
+    http: &serenity::Http,
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: ChannelId,
+    pinned_injected_message_id: Option<u64>,
+    reason: &str,
+) -> Option<crate::services::tui_prompt_dedupe::TuiPromptAnchor> {
+    let Some(message_id) = pinned_anchor_cleanup_target(pinned_injected_message_id) else {
+        // Legacy row without a pinned id — preserve the prior shared-slot path.
+        return complete_tui_direct_prompt_anchor_lifecycle_if_present(
+            http,
+            provider,
+            tmux_session_name,
+            channel_id,
+            reason,
+        )
+        .await;
+    };
+    let anchor = crate::services::tui_prompt_dedupe::TuiPromptAnchor {
+        channel_id: channel_id.get(),
+        message_id,
+    };
+    let anchor_channel_id = ChannelId::new(anchor.channel_id);
+    let anchor_message_id = MessageId::new(anchor.message_id);
+    super::formatting::remove_reaction_raw(http, anchor_channel_id, anchor_message_id, '⏳').await;
+    let completion_reaction = serenity::ReactionType::Unicode('✅'.to_string());
+    if let Err(error) = anchor_channel_id
+        .create_reaction(http, anchor_message_id, completion_reaction)
+        .await
+    {
+        tracing::warn!(
+            provider = %provider,
+            channel_id = anchor.channel_id,
+            tmux_session_name = %tmux_session_name,
+            anchor_message_id = anchor.message_id,
+            reason,
+            error = %error,
+            "failed to complete pinned TUI-direct injected-message reaction lifecycle; keeping for retry"
+        );
+        return None;
+    }
+    // Only clear the shared slot if it still points at THIS turn's message — a
+    // later injection may already own it and must keep its own `⏳`.
+    crate::services::tui_prompt_dedupe::clear_prompt_anchor_for_response(
+        provider,
+        tmux_session_name,
+        anchor,
+    );
+    tracing::info!(
+        provider = %provider,
+        channel_id = anchor.channel_id,
+        tmux_session_name = %tmux_session_name,
+        anchor_message_id = anchor.message_id,
+        reason,
+        "completed pinned TUI-direct injected-message reaction lifecycle"
+    );
+    Some(anchor)
+}
+
 fn owner_channel_for_prompt(
     shared: &Arc<SharedData>,
     prompt: &ObservedTuiPrompt,
@@ -2604,17 +3592,219 @@ fn owner_channel_for_prompt(
     owner_channel_for_tmux_session(shared, &prompt.tmux_session_name)
 }
 
+/// Resolve the owner channel for a tmux session.
+///
+/// #3018: the authoritative `tmux_watchers` registry (which holds the 1:1
+/// `by_tmux_session`/`tmux_session_by_channel`/`owner_channel_by_tmux_session`
+/// invariant) is the SINGLE source of truth. The `tui_prompt_dedupe` cache is a
+/// best-effort, expiry-based mirror only — it must NEVER act as a reverse
+/// authority for resolution, because when the two disagree it produces
+/// wrong-channel routing or silent relay skips at the call sites.
+///
+/// When the registry misses but the dedupe cache still holds a mapping we have
+/// observable drift: we emit an explicit warn and return `None` so the drift is
+/// surfaced rather than silently papered over by routing to the stale mirror.
 fn owner_channel_for_tmux_session(
     shared: &Arc<SharedData>,
     tmux_session_name: &str,
 ) -> Option<ChannelId> {
-    shared
+    let registry_owner = shared
         .tmux_watchers
-        .owner_channel_for_tmux_session(tmux_session_name)
-        .or_else(|| {
-            crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(tmux_session_name)
-                .map(ChannelId::new)
-        })
+        .owner_channel_for_tmux_session(tmux_session_name);
+    let dedupe_owner =
+        crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(tmux_session_name);
+    resolve_owner_channel_authoritatively(tmux_session_name, registry_owner, dedupe_owner)
+}
+
+/// Pure decision core for [`owner_channel_for_tmux_session`], split out so the
+/// registry-as-single-authority and drift-alert behaviour can be unit tested
+/// without constructing a full `SharedData`.
+fn resolve_owner_channel_authoritatively(
+    tmux_session_name: &str,
+    registry_owner: Option<ChannelId>,
+    dedupe_owner: Option<u64>,
+) -> Option<ChannelId> {
+    match (registry_owner, dedupe_owner) {
+        (Some(registry_channel), _) => Some(registry_channel),
+        (None, Some(dedupe_channel)) => {
+            // #3018: registry miss + dedupe mirror hit == observable drift.
+            // Do NOT fall back to the mirror (it is not a reverse authority);
+            // surface the drift so it is visible instead of routing on stale state.
+            tracing::warn!(
+                tmux_session_name = %tmux_session_name,
+                dedupe_channel_id = dedupe_channel,
+                "tmux-session→channel registry miss while dedupe mirror has a mapping; \
+                 treating registry as single authority and dropping (drift alert)"
+            );
+            None
+        }
+        (None, None) => None,
+    }
+}
+
+/// Classification of TUI-injected prompt text (#3099, #3100).
+///
+/// Injected terminal input arrives through a single observation path
+/// (`relay_observed_prompt`) regardless of origin, but the three origins must
+/// drive different ⏳/turn-lifecycle behaviour:
+///
+/// * [`HumanTuiDirect`](InjectedPromptClass::HumanTuiDirect) — a person typed
+///   into the TUI. This is a real active turn: it earns a `⏳` reaction, claims
+///   queue/inflight ownership, and cleans `⏳ → ✅` on completion.
+/// * [`TaskNotificationEvent`](InjectedPromptClass::TaskNotificationEvent) — a
+///   `<task-notification>` auto-turn (e.g. a background `run_in_background`
+///   completing) that Claude Code / Codex inject into their own session. These
+///   ARE real Discord messages with their own id, so they get a `⏳`, but the
+///   completion of that auto-turn must remove the `⏳` from the injected
+///   message itself (#3099) — not from a synthetic `user_msg_id == 0`.
+/// * [`SystemContinuation`](InjectedPromptClass::SystemContinuation) — a
+///   compact / "this session is being continued from a previous conversation"
+///   system prologue. This is NOT a human request and must not occupy the
+///   user-turn lifecycle: no `⏳`, no queue/inflight ownership, no
+///   cancel-on-hourglass semantics (#3100). It is rendered as a neutral
+///   session note if visible at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InjectedPromptClass {
+    HumanTuiDirect,
+    TaskNotificationEvent,
+    SystemContinuation,
+}
+
+impl InjectedPromptClass {
+    /// Whether this class represents a human-driven active turn that should
+    /// receive a `⏳` reaction and claim queue/inflight ownership.
+    pub(super) fn is_human_active_turn(self) -> bool {
+        matches!(self, InjectedPromptClass::HumanTuiDirect)
+    }
+
+    /// #3099 codex re-review (P1): whether this class must SKIP the user-turn
+    /// lifecycle — the `⏳` reaction, the prompt anchor, and the synthetic
+    /// user-turn/inflight ownership. Only [`SystemContinuation`] does; it is a
+    /// system event, not a human request.
+    pub(super) fn suppresses_user_turn_lifecycle(self) -> bool {
+        matches!(self, InjectedPromptClass::SystemContinuation)
+    }
+
+    /// #3099 codex re-review (P1): whether the provider turn's assistant OUTPUT
+    /// must still be delivered (via the Claude bridge tail / transcript path)
+    /// for this class. This is true for EVERY class — a `SystemContinuation`
+    /// suppresses the user-turn lifecycle but the compact continuation is still
+    /// fed to Claude, which produces assistant output that MUST reach Discord.
+    /// The original early-return regressed this by orphaning that output.
+    pub(super) fn still_delivers_assistant_output(self) -> bool {
+        true
+    }
+}
+
+/// Pure classifier for injected TUI prompt text (#3099, #3100).
+///
+/// Order matters: a compact-continuation prologue can itself embed an
+/// arbitrary summary, so the system-continuation predicate is checked first
+/// (it is the most specific "not a human turn" signal), then the
+/// task-notification tag, otherwise it is treated as human direct input.
+pub(super) fn classify_injected_prompt(prompt: &str) -> InjectedPromptClass {
+    if is_system_continuation_prompt(prompt) {
+        InjectedPromptClass::SystemContinuation
+    } else if is_task_notification_prompt(prompt) {
+        InjectedPromptClass::TaskNotificationEvent
+    } else {
+        InjectedPromptClass::HumanTuiDirect
+    }
+}
+
+/// Detects the `<task-notification>` auto-turn tag injected by Claude Code /
+/// Codex when a background task reaches a terminal state.
+fn is_task_notification_prompt(prompt: &str) -> bool {
+    let trimmed = prompt.trim_start();
+    // Skip a leading terminal-control prefix some injectors prepend before the
+    // tag (strip_terminal_controls is applied for display, not classification).
+    let normalized = strip_terminal_controls(trimmed);
+    let normalized = normalized.trim_start();
+    normalized.contains("<task-notification>") || normalized.contains("<task-notification ")
+}
+
+/// Detects compact / system-injected continuation prologues that resume a
+/// session from a previous conversation. These are system events, never human
+/// requests, so they must not occupy the user-turn lifecycle (#3100).
+///
+/// #3100 codex re-review (P2): the compact continuation banner is *machine
+/// injected* — Claude Code emits it as the ENTIRE prompt body when a session
+/// resumes after a context compaction, and it always BEGINS with the canonical
+/// opening sentence. The previous implementation used unanchored case-sensitive
+/// `contains()` on three free-text fragments, which:
+///   * false-positives on a human message that merely *quotes* the banner mid
+///     sentence (the human then silently loses its `⏳`/turn), and
+///   * false-negatives on a banner with slightly different trailing summary text
+///     or newline layout.
+/// We instead anchor on provenance: a real continuation banner is the whole
+/// injected text and STARTS with the canonical opening. A human quoting the
+/// banner inside a normal request will not have it at the very start, so it can
+/// never trip the classifier. The opening sentence is the stable machine
+/// envelope; everything after it (the summary body) is free-form and is NOT
+/// matched, so trailing/newline variation cannot cause a false negative.
+fn is_system_continuation_prompt(prompt: &str) -> bool {
+    let normalized = strip_terminal_controls(prompt);
+    let normalized = normalized.trim_start();
+    // #3100 codex P2: a real continuation banner can arrive WRAPPED with the
+    // SSH-direct injection envelope (`format_ssh_direct_prompt_notification`),
+    // e.g. when a previously-rendered notification round-trips back into the
+    // terminal and is re-observed. The observed text then begins with
+    // `터미널에 직접 주입된 입력 (tmux : <session>):` followed by a newline (and a
+    // ```text fence) before the actual continuation body. `strip_terminal_controls`
+    // does NOT remove that wrapper, so the canonical `starts_with` below would
+    // fail and the banner would be mis-classified as `HumanTuiDirect` (gaining a
+    // spurious ⏳/anchor/synthetic turn). Strip a LEADING wrapper line — and the
+    // immediately following ```text fence line, if present — so the check runs
+    // against the real banner body. This is anchored to the start: a human merely
+    // quoting the wrapper mid-message keeps its wrapper text deeper in the body
+    // and is not affected.
+    let normalized = strip_leading_injection_wrapper(normalized);
+    let normalized = normalized.trim_start();
+    // Canonical opening sentences of the system-injected continuation banner.
+    // These are anchored to start-of-prompt (the injection envelope), never
+    // matched as an embedded substring.
+    const SYSTEM_CONTINUATION_OPENINGS: &[&str] = &[
+        "This session is being continued from a previous conversation",
+        "Please continue the conversation from where we left it off",
+    ];
+    SYSTEM_CONTINUATION_OPENINGS
+        .iter()
+        .any(|opening| normalized.starts_with(opening))
+}
+
+/// #3100 codex P2: removes a LEADING SSH-direct injection wrapper line so the
+/// continuation classifier can inspect the real banner body.
+///
+/// The wrapper is produced by [`format_ssh_direct_prompt_notification`] and
+/// looks like `터미널에 직접 주입된 입력 (tmux : `<session>`):\n```text\n<body>...`.
+/// Only a wrapper at the very START of `text` is stripped (anchored), so a human
+/// message that merely quotes the marker mid-body is never unwrapped. When the
+/// first line is the wrapper, that line (up to and including its newline) is
+/// dropped; if the next line opens a ```text / ``` code fence it is dropped too,
+/// exposing the banner body that follows. Returns the original slice unchanged
+/// when there is no leading wrapper.
+fn strip_leading_injection_wrapper(text: &str) -> &str {
+    const WRAPPER_MARKER: &str = "터미널에 직접 주입된 입력";
+    if !text.starts_with(WRAPPER_MARKER) {
+        return text;
+    }
+    // Drop the wrapper line (through its newline). Without a newline the wrapper
+    // is the whole text and there is no banner body to expose.
+    let Some(after_wrapper_line) = text.find('\n').map(|idx| &text[idx + 1..]) else {
+        return text;
+    };
+    // The wrapper renders the body inside a ```text fence; skip a leading fence
+    // line so the canonical opening (the fence's first content line) is exposed.
+    let trimmed = after_wrapper_line.trim_start_matches(['\r', '\n']);
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        // Drop the rest of the fence-opening line (e.g. ```text) through its
+        // newline; if the fence opener has no newline there is no body to check.
+        if let Some(idx) = rest.find('\n') {
+            return &rest[idx + 1..];
+        }
+        return after_wrapper_line;
+    }
+    after_wrapper_line
 }
 
 pub(super) fn format_ssh_direct_prompt_notification(
@@ -2632,46 +3822,321 @@ pub(super) fn format_ssh_direct_prompt_notification(
     )
 }
 
+/// Neutral session note for a system/compact continuation injection (#3100).
+///
+/// Unlike [`format_ssh_direct_prompt_notification`], this does NOT present the
+/// text as "터미널에 직접 주입된 입력" (an active-turn marker); it is a passive
+/// session event so a reader does not mistake it for a pending human request.
+pub(super) fn format_system_continuation_note(tmux_session_name: &str, prompt: &str) -> String {
+    let prompt = strip_terminal_controls(prompt);
+    let preview =
+        truncate_chars(prompt.trim(), SSH_DIRECT_PROMPT_PREVIEW_LIMIT).replace("```", "` ` `");
+    format!(
+        "🧩 세션 컨텍스트 이어가기 (tmux : `{}`) — 시스템 주입 (활성 턴 아님):\n```text\n{}\n```",
+        sanitize_inline_code(tmux_session_name),
+        preview,
+    )
+}
+
 fn sanitize_inline_code(value: &str) -> String {
     value.replace('`', "'")
 }
 
-fn strip_terminal_controls(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek().copied() == Some('[') {
-                chars.next();
-                for next in chars.by_ref() {
-                    if ('@'..='~').contains(&next) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
-            continue;
-        }
-        output.push(ch);
-    }
-    output
-}
-
-fn truncate_chars(value: &str, limit: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
-}
+// #3075: `strip_terminal_controls` and the ASCII `truncate_chars` are shared
+// with the task-card renderer; the single definitions now live in
+// `tui_task_card` so the classifier, formatters, and card parser stay in sync.
+use super::tui_task_card::{strip_terminal_controls, truncate_chars_ascii as truncate_chars};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #3018: the tmux_watchers registry is the SINGLE authority for
+    // tmux-session→channel resolution. When the registry has a mapping it wins
+    // outright (the dedupe mirror is never consulted as a reverse authority).
+    #[test]
+    fn registry_is_authoritative_for_owner_channel_resolution() {
+        let registry_channel = ChannelId::new(123_000_000_000_000);
+
+        // Registry hit, no mirror.
+        assert_eq!(
+            resolve_owner_channel_authoritatively("tmux-a", Some(registry_channel), None),
+            Some(registry_channel),
+        );
+
+        // Registry hit takes precedence even when the mirror disagrees.
+        assert_eq!(
+            resolve_owner_channel_authoritatively(
+                "tmux-a",
+                Some(registry_channel),
+                Some(999_000_000_000_000),
+            ),
+            Some(registry_channel),
+            "registry must win over a disagreeing dedupe mirror"
+        );
+    }
+
+    // #3018: a registry miss while the dedupe mirror still holds a mapping is
+    // observable drift. The resolver must NOT fall back to the mirror; it
+    // returns None (the warn drift alert is emitted as a side effect).
+    #[test]
+    fn registry_miss_but_dedupe_hit_drops_and_does_not_use_mirror() {
+        assert_eq!(
+            resolve_owner_channel_authoritatively("tmux-drift", None, Some(456_000_000_000_000),),
+            None,
+            "dedupe mirror must never act as a reverse routing authority"
+        );
+
+        // Both miss → None.
+        assert_eq!(
+            resolve_owner_channel_authoritatively("tmux-empty", None, None),
+            None,
+        );
+    }
+
+    // #3105: a LIVE TUI session where the dedupe mirror holds a channel but the
+    // `tmux_watchers` registry is missing must NOT be permanently dropped. The
+    // fix self-heals by promoting the authoritative (settings-derived) channel
+    // into the registry — NOT by routing from the mirror. This end-to-end relay
+    // test asserts: (1) before repair the resolver drops (registry single
+    // authority); (2) the dedupe mirror alone is never used as the routing
+    // owner; (3) after an authoritative registry restore the relay routes again.
+    #[test]
+    fn live_session_relay_self_heals_via_authoritative_registry_not_mirror() {
+        let shared = super::super::make_shared_data_for_tests();
+        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471";
+        let owner = ChannelId::new(1_504_468_805_772_902_471);
+
+        // The dedupe mirror has a mapping (live TUI session), but the
+        // authoritative registry misses (slot evicted by compact/restart/rebind).
+        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux, owner.get());
+        assert_eq!(
+            crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(tmux),
+            Some(owner.get()),
+            "precondition: dedupe mirror holds the live session's channel"
+        );
+
+        // (1)+(2): the mirror alone must never be used as the delivery owner —
+        // the resolver drops (the #3018 single-authority rule stays intact).
+        assert_eq!(
+            owner_channel_for_tmux_session(&shared, tmux),
+            None,
+            "registry miss + dedupe mirror hit must drop, never route from the mirror"
+        );
+
+        // (3): an authoritative registry restore (what the rehydrate loop does
+        // from the settings-derived channel) makes the live session route again.
+        let repaired = shared
+            .tmux_watchers
+            .restore_owner_channel_for_tmux_session(tmux, owner);
+        assert!(
+            repaired,
+            "first restore reports a change (single bounded incident)"
+        );
+        assert_eq!(
+            owner_channel_for_tmux_session(&shared, tmux),
+            Some(owner),
+            "after authoritative re-registration the live session must route again"
+        );
+
+        // Cleanup shared global dedupe state for cross-test isolation.
+        crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(tmux);
+    }
+
+    // #3105 (codex P1 sub-case B): a DEAD/orphaned tmux session (pane gone, not
+    // present on this host) whose dedupe mirror still holds a stale ClaudeTui
+    // runtime binding + channel mapping must NOT spam the per-poll drift/skip
+    // WARN forever. After the rehydrate pass evicts the mirror, the next idle
+    // relay iteration finds NO runtime binding to iterate and NO channel mapping
+    // to drift on — proving the 0.5s spam is stopped. A unique, never-created
+    // session name guarantees `tmux_session_has_live_pane` is false.
+    #[cfg(unix)]
+    #[test]
+    fn dead_orphaned_session_mirror_is_evicted_and_stops_drift_spam() {
+        let _guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let shared = super::super::make_shared_data_for_tests();
+        // A session that does not exist on this host (pane gone / orphaned).
+        let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471-DEAD-ORPHAN-fix3105";
+        let owner = 1_504_468_805_772_902_471u64;
+
+        // Seed the stale dedupe mirror exactly as a dead/orphaned session leaves it:
+        // a ClaudeTui runtime binding (what the relay loop iterates) and a
+        // last-seen channel mapping (what the drift-alert resolver reads).
+        crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
+            tmux,
+            crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+                runtime_kind: RuntimeHandoffKind::ClaudeTui,
+                output_path: "/tmp/claude-transcript-dead-orphan.jsonl".to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: None,
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux, owner);
+
+        // Preconditions: the relay loop WOULD iterate this binding and drift.
+        assert!(
+            crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(
+                RuntimeHandoffKind::ClaudeTui
+            )
+            .iter()
+            .any(|(name, _)| name == tmux),
+            "precondition: dead session's binding is in the relay loop's iteration set"
+        );
+        assert_eq!(
+            owner_channel_for_tmux_session(&shared, tmux),
+            None,
+            "precondition: registry misses + mirror hit == the drift the relay loop hits"
+        );
+        // The session is genuinely dead/orphaned (no live pane, no live watcher).
+        assert!(
+            claude_tui_session_is_dead_orphaned(&shared, tmux),
+            "precondition: a never-created session is dead/orphaned"
+        );
+
+        // The rehydrate pass runs the eviction. (rehydrate_existing_claude_tui_bindings
+        // calls evict_dead_orphaned_claude_tui_mirrors first; we call it directly
+        // so the assertion does not depend on a live tmux binary for list-sessions.)
+        evict_dead_orphaned_claude_tui_mirrors(&shared);
+
+        // After eviction: the relay loop iterates an EMPTY set for this session,
+        // and the drift-alert resolver finds NO mapping → no drift/skip WARN.
+        assert!(
+            !crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(
+                RuntimeHandoffKind::ClaudeTui
+            )
+            .iter()
+            .any(|(name, _)| name == tmux),
+            "the stale runtime binding must be evicted so the relay loop no longer iterates it"
+        );
+        assert_eq!(
+            crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(tmux),
+            None,
+            "the stale channel mirror must be evicted so no drift WARN can fire"
+        );
+
+        // Idempotent on the next pass (the ~0.5s repeat): no binding, no work,
+        // no second incident — proving the spam is bounded to one line.
+        evict_dead_orphaned_claude_tui_mirrors(&shared);
+        assert!(
+            !crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(
+                RuntimeHandoffKind::ClaudeTui
+            )
+            .iter()
+            .any(|(name, _)| name == tmux),
+            "subsequent iterations stay clean (0.5s spam stopped)"
+        );
+    }
+
+    // #3105 (codex P1 sub-case A guard): a LIVE thread-suffixed session whose
+    // authoritative registry entry was evicted must NOT be treated as
+    // dead/orphaned — its mirror must survive so the live self-heal path can
+    // re-register the authoritative owner. We assert the dead-orphaned predicate
+    // is gated on pane-liveness: with a live watcher handle present the predicate
+    // is false even though the registry owner map is otherwise empty.
+    #[cfg(unix)]
+    #[test]
+    fn live_session_with_watcher_handle_is_not_dead_orphaned() {
+        let shared = super::super::make_shared_data_for_tests();
+        let tmux = "AgentDesk-claude-adk-cc-LIVE-fix3105";
+        let owner = ChannelId::new(1_504_468_805_772_902_471);
+
+        // A live watcher handle owns the session → it is NOT dead/orphaned even
+        // though the host has no real tmux pane for this synthetic name.
+        let dir = std::env::temp_dir();
+        let output_path = dir.join("claude-live-fix3105.jsonl");
+        shared
+            .tmux_watchers
+            .insert(owner, test_watcher_handle(tmux, &output_path));
+        assert!(
+            shared.tmux_watchers.has_live_watcher_handle(tmux),
+            "precondition: a live watcher handle owns the session"
+        );
+        assert!(
+            !claude_tui_session_is_dead_orphaned(&shared, tmux),
+            "a session with a live watcher handle must never be tombstoned as dead/orphaned"
+        );
+    }
+
+    // #3105 (codex P2): a LIVE session with no watcher handle whose FIRST pane
+    // probe flakes (reads not-live) but whose subsequent probes report live must
+    // NOT be classified dead/orphaned. A single transient negative read can never
+    // trigger the destructive eviction, so the live session keeps its mirror and
+    // self-heal path. We drive the pure predicate with a scripted probe sequence
+    // [false, true] so the flake is deterministic (no real tmux needed).
+    #[cfg(unix)]
+    #[test]
+    fn transient_pane_flake_on_live_session_is_not_dead_orphaned() {
+        use std::cell::RefCell;
+
+        // First probe flakes (not live), second probe reports live.
+        let live_reads = RefCell::new(vec![false, true].into_iter());
+        let is_dead = pane_is_confirmed_dead_orphaned(
+            || live_reads.borrow_mut().next().unwrap_or(true),
+            // session_exists must NOT even be consulted once a live pane is seen.
+            || panic!("session_exists must not be probed once a live pane is observed"),
+            DEAD_ORPHANED_PANE_PROBE_SAMPLES,
+            None,
+        );
+        assert!(
+            !is_dead,
+            "a single flaky negative pane read followed by a live read must NOT be dead/orphaned"
+        );
+    }
+
+    // #3105 (codex P2 / sub-case B regression): a genuinely-gone session reads no
+    // live pane on EVERY sample AND the hard has-session check confirms it does
+    // not exist → it is still classified dead/orphaned, so the per-poll WARN spam
+    // is still stopped. The retries must not make the real dead session immortal.
+    #[cfg(unix)]
+    #[test]
+    fn genuinely_gone_session_is_still_dead_orphaned_after_retries() {
+        use std::cell::Cell;
+
+        let probe_count = Cell::new(0usize);
+        let is_dead = pane_is_confirmed_dead_orphaned(
+            || {
+                probe_count.set(probe_count.get() + 1);
+                false // never a live pane
+            },
+            || false, // hard has-session: session truly gone
+            DEAD_ORPHANED_PANE_PROBE_SAMPLES,
+            None,
+        );
+        assert!(
+            is_dead,
+            "a session with no live pane across all samples AND no has-session must still evict"
+        );
+        assert_eq!(
+            probe_count.get(),
+            DEAD_ORPHANED_PANE_PROBE_SAMPLES,
+            "all configured samples must be taken before declaring a session dead"
+        );
+    }
+
+    // #3105 (codex P2): the weakest-signal guard. Even when every soft pane probe
+    // reports dead, if the hard `tmux has-session` check still finds the session
+    // present on this host (a transient pane read with the session very much
+    // alive), it must NOT be evicted — "no live pane" alone is never sufficient
+    // when there is no watcher handle.
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_existing_session_is_not_dead_even_if_pane_probes_flake() {
+        let is_dead = pane_is_confirmed_dead_orphaned(
+            || false, // soft pane probe: reads dead on every sample
+            || true,  // hard has-session: the session IS present on this host
+            DEAD_ORPHANED_PANE_PROBE_SAMPLES,
+            None,
+        );
+        assert!(
+            !is_dead,
+            "a session still present per has-session must not be evicted on soft pane reads alone"
+        );
+    }
 
     #[test]
     fn formats_ssh_direct_prompt_notification() {
@@ -2733,6 +4198,305 @@ mod tests {
             );
         }
         assert!(output.contains("ringpagedelc1\n\tkeep"));
+    }
+
+    // #3100: a human typing directly into the TUI is a real active turn.
+    #[test]
+    fn classify_injected_prompt_human_direct_input() {
+        assert_eq!(
+            classify_injected_prompt("please review PR #1234"),
+            InjectedPromptClass::HumanTuiDirect,
+        );
+        assert!(classify_injected_prompt("hi").is_human_active_turn());
+    }
+
+    // #3099: a `<task-notification>` auto-turn is a real provider turn (it earns
+    // a `⏳`) but is not human-driven; its completion cleanup is anchored on the
+    // injected message id, so it is classified distinctly from human input.
+    #[test]
+    fn classify_injected_prompt_task_notification_event() {
+        assert_eq!(
+            classify_injected_prompt(
+                "<task-notification><status>completed</status><task_id>codex-background-event</task_id></task-notification>"
+            ),
+            InjectedPromptClass::TaskNotificationEvent,
+        );
+        // Tolerates a leading terminal-control prefix some injectors prepend.
+        assert_eq!(
+            classify_injected_prompt(
+                "\u{1b}[0m<task-notification><status>completed</status></task-notification>"
+            ),
+            InjectedPromptClass::TaskNotificationEvent,
+        );
+        // An attribute-form opening tag is still recognised.
+        assert_eq!(
+            classify_injected_prompt("<task-notification kind=\"background\"></task-notification>"),
+            InjectedPromptClass::TaskNotificationEvent,
+        );
+        assert!(
+            !classify_injected_prompt(
+                "<task-notification><status>completed</status></task-notification>"
+            )
+            .is_human_active_turn()
+        );
+    }
+
+    // #3100: a compact/system continuation prologue is NOT a human request and
+    // must classify away from the active-turn lifecycle.
+    #[test]
+    fn classify_injected_prompt_system_continuation() {
+        assert_eq!(
+            classify_injected_prompt(
+                "This session is being continued from a previous conversation that ran out of context... Summary:"
+            ),
+            InjectedPromptClass::SystemContinuation,
+        );
+        assert_eq!(
+            classify_injected_prompt("Please continue the conversation from where we left it off"),
+            InjectedPromptClass::SystemContinuation,
+        );
+        assert!(
+            !classify_injected_prompt(
+                "This session is being continued from a previous conversation"
+            )
+            .is_human_active_turn()
+        );
+    }
+
+    // #3100: the system-continuation predicate is the most specific signal and
+    // must win even if the continuation summary embeds a `<task-notification>`.
+    #[test]
+    fn classify_injected_prompt_continuation_wins_over_embedded_task_tag() {
+        let mixed = "This session is being continued from a previous conversation.\nSummary: \
+                     the agent ran <task-notification><status>completed</status></task-notification>";
+        assert_eq!(
+            classify_injected_prompt(mixed),
+            InjectedPromptClass::SystemContinuation,
+        );
+    }
+
+    // #3099 codex re-review (P1): a SystemContinuation must suppress ONLY the
+    // user-turn lifecycle (⏳ + anchor + synthetic ownership) — it must STILL
+    // deliver the provider's assistant output via the bridge tail. The original
+    // early-return ran before the bridge tail spawn, orphaning Claude's output.
+    // This guards the contract that drives the restructured relay flow.
+    #[test]
+    fn system_continuation_suppresses_user_turn_but_still_delivers_output() {
+        let cont = InjectedPromptClass::SystemContinuation;
+        assert!(
+            cont.suppresses_user_turn_lifecycle(),
+            "SystemContinuation must drop the ⏳/user-turn lifecycle"
+        );
+        assert!(
+            cont.still_delivers_assistant_output(),
+            "SystemContinuation must still relay Claude's assistant output (no orphaning)"
+        );
+        assert!(!cont.is_human_active_turn());
+
+        // Human + task-notification turns keep their user-turn lifecycle AND
+        // deliver output.
+        for active in [
+            InjectedPromptClass::HumanTuiDirect,
+            InjectedPromptClass::TaskNotificationEvent,
+        ] {
+            assert!(
+                !active.suppresses_user_turn_lifecycle(),
+                "{active:?} must keep its user-turn lifecycle"
+            );
+            assert!(active.still_delivers_assistant_output());
+        }
+    }
+
+    // #3100 codex re-review (P2): a human message that merely *quotes* the
+    // continuation banner inside a normal request must NOT be mis-classified as
+    // SystemContinuation — otherwise the human silently loses their `⏳`/turn.
+    // Detection is anchored to start-of-prompt, so an embedded quote never trips.
+    #[test]
+    fn classify_injected_prompt_human_quote_of_banner_is_not_continuation() {
+        let human = "Can you check why \"This session is being continued from a previous \
+                     conversation\" keeps showing up in my logs? Please continue the \
+                     conversation from where we left it off was also printed.";
+        assert_eq!(
+            classify_injected_prompt(human),
+            InjectedPromptClass::HumanTuiDirect,
+            "a human quoting the banner mid-message must stay a human turn",
+        );
+        assert!(classify_injected_prompt(human).is_human_active_turn());
+    }
+
+    // #3100 codex re-review (P2): a real machine-injected continuation banner is
+    // the WHOLE prompt body and starts with the canonical opening — even with a
+    // leading terminal-control prefix or leading whitespace the injector may
+    // prepend, it must still classify as SystemContinuation (no false negative).
+    #[test]
+    fn classify_injected_prompt_real_injection_with_leading_controls_is_continuation() {
+        let injected = "\u{1b}[2K\u{1b}[0m  \n\tThis session is being continued from a previous \
+                        conversation that ran out of context.\nAnalysis:\n... summary body ...";
+        assert_eq!(
+            classify_injected_prompt(injected),
+            InjectedPromptClass::SystemContinuation,
+            "a real banner with leading controls/whitespace must classify as continuation",
+        );
+    }
+
+    // #3100 codex P2: a real machine-injected continuation banner can arrive
+    // WRAPPED with the SSH-direct injection envelope (the
+    // `터미널에 직접 주입된 입력 (tmux : <session>):` line + a ```text fence) when a
+    // previously-rendered notification round-trips back into the terminal and is
+    // re-observed. After stripping the wrapper the banner body still starts with
+    // the canonical opening, so it MUST classify as SystemContinuation — otherwise
+    // it falls into the active-turn handler and wrongly gains a ⏳/anchor/synthetic
+    // turn (the exact #3100 path this PR claims to fix).
+    #[test]
+    fn classify_injected_prompt_wrapped_continuation_is_continuation() {
+        // Wrapper + ```text fence, exactly as `format_ssh_direct_prompt_notification`
+        // renders it.
+        let wrapped = "터미널에 직접 주입된 입력 (tmux : `AgentDesk-claude-adk-cc`):\n```text\n\
+                       This session is being continued from a previous conversation that ran out \
+                       of context.\nAnalysis: ... summary body ...\n```";
+        assert_eq!(
+            classify_injected_prompt(wrapped),
+            InjectedPromptClass::SystemContinuation,
+            "a wrapped continuation banner must classify as SystemContinuation",
+        );
+        assert!(!classify_injected_prompt(wrapped).is_human_active_turn());
+
+        // Wrapper without a ```text fence (banner body directly on the next line).
+        let wrapped_no_fence = "터미널에 직접 주입된 입력 (tmux : `s`):\n\
+                                Please continue the conversation from where we left it off";
+        assert_eq!(
+            classify_injected_prompt(wrapped_no_fence),
+            InjectedPromptClass::SystemContinuation,
+        );
+
+        // Wrapper + leading control codes the injector may prepend before the body.
+        let wrapped_with_controls = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n\u{1b}[2K  \
+                                     This session is being continued from a previous conversation.";
+        assert_eq!(
+            classify_injected_prompt(wrapped_with_controls),
+            InjectedPromptClass::SystemContinuation,
+        );
+    }
+
+    // #3100 codex P2: stripping the wrapper is anchored to the START. A human
+    // message whose body merely contains/quotes the wrapper marker (not as the
+    // leading line) must NOT be unwrapped and must stay a human turn.
+    #[test]
+    fn classify_injected_prompt_wrapper_quoted_mid_body_is_not_continuation() {
+        let human = "Why does \"터미널에 직접 주입된 입력 (tmux : `s`):\" appear, then \
+                     This session is being continued from a previous conversation in my logs?";
+        assert_eq!(
+            classify_injected_prompt(human),
+            InjectedPromptClass::HumanTuiDirect,
+            "a human quoting the wrapper mid-body must stay a human turn",
+        );
+        assert!(classify_injected_prompt(human).is_human_active_turn());
+
+        // A leading wrapper line whose body is NOT a continuation banner stays a
+        // human turn (the wrapper alone must not force a continuation verdict).
+        let wrapped_human =
+            "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\nplease review PR #1234\n```";
+        assert_eq!(
+            classify_injected_prompt(wrapped_human),
+            InjectedPromptClass::HumanTuiDirect,
+        );
+    }
+
+    // #3100: the neutral session note must not present the system continuation
+    // as "터미널에 직접 주입된 입력" (an active-turn marker).
+    #[test]
+    fn system_continuation_note_is_neutral_not_active_turn() {
+        let note = format_system_continuation_note(
+            "AgentDesk-claude-adk-cc",
+            "This session is being continued from a previous conversation. Summary: ...",
+        );
+        assert!(!note.contains("터미널에 직접 주입된 입력"));
+        assert!(note.contains("세션 컨텍스트 이어가기"));
+        assert!(note.contains("활성 턴 아님"));
+        assert!(note.contains("(tmux : `AgentDesk-claude-adk-cc`)"));
+    }
+
+    // #3099 codex re-review (P2): the `user_msg_id == 0` completion cleanup must
+    // target THIS turn's pinned injected message id, not whatever the single
+    // shared prompt-anchor slot currently holds. A non-zero pinned id selects the
+    // pinned-message path; an absent / zero pinned id falls back to the slot.
+    #[test]
+    fn pinned_anchor_cleanup_target_prefers_pinned_id_over_shared_slot() {
+        assert_eq!(pinned_anchor_cleanup_target(Some(9001)), Some(9001));
+        assert_eq!(pinned_anchor_cleanup_target(Some(0)), None);
+        assert_eq!(pinned_anchor_cleanup_target(None), None);
+    }
+
+    // #3099 codex re-review (P2): the cross-turn A/B race. Injection A records the
+    // shared anchor slot, then injection B overwrites it. When A completes
+    // (`user_msg_id == 0`) it must clean up A's OWN message — the shared slot now
+    // belongs to B, so reading it would `✅` B's still-running message and leave
+    // A's `⏳` stale. The pinned-id cleanup clears the shared slot ONLY if it
+    // still matches this turn, so B's anchor survives until B completes.
+    #[test]
+    fn cross_turn_anchor_cleanup_targets_own_message_and_preserves_later_turn() {
+        use crate::services::tui_prompt_dedupe::{
+            TuiPromptAnchor, clear_prompt_anchor_for_response, prompt_anchor_for_response,
+            record_prompt_anchor,
+        };
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        crate::services::tui_prompt_dedupe::reset_state_for_tests();
+
+        let tmux = "AgentDesk-claude-anchor-race";
+        let channel = 42_u64;
+        let msg_a = 1001_u64;
+        let msg_b = 2002_u64;
+
+        // A injected: records the shared slot. A's inflight pins msg_a.
+        record_prompt_anchor("claude", tmux, channel, msg_a);
+        // B injected: overwrites the single shared slot with msg_b. B pins msg_b.
+        record_prompt_anchor("claude", tmux, channel, msg_b);
+        assert_eq!(
+            prompt_anchor_for_response("claude", tmux, channel),
+            Some(TuiPromptAnchor {
+                channel_id: channel,
+                message_id: msg_b,
+            }),
+            "shared slot now holds B (the latest injection)"
+        );
+
+        // A completes first. The cleanup selects A's pinned id (not the slot).
+        assert_eq!(pinned_anchor_cleanup_target(Some(msg_a)), Some(msg_a));
+        // The pinned-id path attempts to clear the shared slot for A's anchor; the
+        // slot holds B, so the match guard refuses to clear it — B keeps its `⏳`.
+        assert!(
+            !clear_prompt_anchor_for_response(
+                "claude",
+                tmux,
+                TuiPromptAnchor {
+                    channel_id: channel,
+                    message_id: msg_a,
+                },
+            ),
+            "A's cleanup must NOT clear B's shared slot"
+        );
+        assert_eq!(
+            prompt_anchor_for_response("claude", tmux, channel),
+            Some(TuiPromptAnchor {
+                channel_id: channel,
+                message_id: msg_b,
+            }),
+            "B's anchor survives A's completion"
+        );
+
+        // B completes: it owns the slot, so its pinned cleanup clears it.
+        assert_eq!(pinned_anchor_cleanup_target(Some(msg_b)), Some(msg_b));
+        assert!(clear_prompt_anchor_for_response(
+            "claude",
+            tmux,
+            TuiPromptAnchor {
+                channel_id: channel,
+                message_id: msg_b,
+            },
+        ));
+        assert_eq!(prompt_anchor_for_response("claude", tmux, channel), None);
     }
 
     #[test]
@@ -3177,6 +4941,120 @@ mod tests {
         );
     }
 
+    // #3075 codex P1 #2: a `<task-notification>` edit-repeat records a fresh
+    // external-input turn lease (record_observed_external_turn_lease) but then
+    // early-returns before the normal bridge-tail / lease-guard cleanup. The
+    // repeat path must clear exactly the lease it recorded so a dangling
+    // non-Unassigned lease cannot make session-bound delivery skip a legitimate
+    // bridge-tail delivery.
+    #[test]
+    fn task_notification_repeat_clears_its_recorded_external_lease() {
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let tmux = "AgentDesk-task-card-repeat-lease";
+        let channel_id = ChannelId::new(950_000_000_000_001);
+        let prompt = ObservedTuiPrompt {
+            provider: ProviderKind::Claude.as_str().to_string(),
+            tmux_session_name: tmux.to_string(),
+            prompt: "<task-notification><task-id>repeat-x</task-id><status>completed</status></task-notification>".to_string(),
+            observed_at: chrono::Utc::now(),
+        };
+        let lease = ExternalInputRelayLease {
+            channel_id: Some(channel_id.get()),
+            turn_id: Some("external:claude:950000000000001:repeat:1".to_string()),
+            session_key: Some("host:AgentDesk-task-card-repeat-lease".to_string()),
+            // A BridgeAdapter (non-Unassigned) lease is exactly what would block
+            // session-bound delivery if left dangling.
+            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
+            runtime_kind: Some(RuntimeHandoffKind::ClaudeTui),
+        };
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Claude.as_str(),
+            tmux,
+            lease.clone(),
+        );
+        // Sanity: the lease is present and would block delivery.
+        assert!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease_present(
+                ProviderKind::Claude.as_str(),
+                tmux,
+                channel_id.get(),
+            )
+        );
+
+        // The repeat early-return clears exactly its recorded lease.
+        assert!(clear_observed_external_turn_lease_if_current(
+            &prompt, channel_id, &lease,
+        ));
+        assert!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+                ProviderKind::Claude.as_str(),
+                tmux,
+                channel_id.get(),
+            )
+            .is_none(),
+            "a task-notification edit-repeat must not leave a stale lease that blocks bridge-tail delivery"
+        );
+    }
+
+    // #3075 codex P1 #2: the exact-match guard must NOT clobber a newer turn's
+    // lease that reused the same provider/session/channel after the repeat
+    // recorded its lease.
+    #[test]
+    fn task_notification_repeat_lease_clear_preserves_newer_turn() {
+        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap();
+        let tmux = "AgentDesk-task-card-repeat-newer";
+        let channel_id = ChannelId::new(950_000_000_000_002);
+        let prompt = ObservedTuiPrompt {
+            provider: ProviderKind::Claude.as_str().to_string(),
+            tmux_session_name: tmux.to_string(),
+            prompt: "<task-notification><task-id>repeat-y</task-id></task-notification>"
+                .to_string(),
+            observed_at: chrono::Utc::now(),
+        };
+        let repeat_lease = ExternalInputRelayLease {
+            channel_id: Some(channel_id.get()),
+            turn_id: Some("external:claude:950000000000002:repeat:1".to_string()),
+            session_key: Some("host:AgentDesk-task-card-repeat-newer".to_string()),
+            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
+            runtime_kind: Some(RuntimeHandoffKind::ClaudeTui),
+        };
+        let newer_lease = ExternalInputRelayLease {
+            turn_id: Some("external:claude:950000000000002:repeat:2".to_string()),
+            ..repeat_lease.clone()
+        };
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Claude.as_str(),
+            tmux,
+            repeat_lease.clone(),
+        );
+        // A newer turn overwrites the lease before the repeat's cleanup runs.
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            ProviderKind::Claude.as_str(),
+            tmux,
+            newer_lease.clone(),
+        );
+
+        // The repeat's exact-match clear is a no-op against the newer lease.
+        assert!(!clear_observed_external_turn_lease_if_current(
+            &prompt,
+            channel_id,
+            &repeat_lease,
+        ));
+        assert_eq!(
+            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+                ProviderKind::Claude.as_str(),
+                tmux,
+                channel_id.get(),
+            ),
+            Some(newer_lease),
+            "exact-match clear must preserve a newer turn's lease",
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn bridge_adapter_emits_bridge_compatible_stream_events() {
@@ -3225,6 +5103,119 @@ mod tests {
         assert_eq!(state.session_key.as_deref(), lease.session_key.as_deref());
         assert_eq!(state.runtime_kind, Some(RuntimeHandoffKind::CodexTui));
         assert_eq!(state.turn_start_offset, Some(333));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_watcher_inflight_marks_existing_tui_turn_without_prompt_resubmit() {
+        let output_path = PathBuf::from("/tmp/adk-tui-direct-watcher.jsonl");
+        let lease = ExternalInputRelayLease {
+            channel_id: Some(42),
+            turn_id: Some("external:codex:42:tmux:2".to_string()),
+            session_key: Some("token:AgentDesk-codex-owner-split".to_string()),
+            relay_owner: ExternalInputRelayOwner::TmuxWatcher,
+            runtime_kind: Some(RuntimeHandoffKind::CodexTui),
+        };
+        let state = build_tui_direct_synthetic_inflight_state(
+            ProviderKind::Codex,
+            ChannelId::new(42),
+            MessageId::new(101),
+            None,
+            "typed in TUI",
+            "AgentDesk-codex-owner-split",
+            Some(&output_path),
+            333,
+            &lease,
+            RelayOwnerKind::Watcher,
+        );
+
+        assert_eq!(state.turn_source, TurnSource::ExternalInput);
+        assert_eq!(state.effective_relay_owner_kind(), RelayOwnerKind::Watcher);
+        assert_eq!(
+            state.request_owner_user_id,
+            TUI_DIRECT_SYNTHETIC_OWNER_USER_ID
+        );
+        assert_eq!(state.user_msg_id, 101);
+        assert_eq!(state.current_msg_id, 0);
+        assert_eq!(state.user_text, "typed in TUI");
+        assert_eq!(state.output_path.as_deref(), output_path.to_str());
+        assert_eq!(state.input_fifo_path, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_watcher_claim_requires_live_watcher_covering_output() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let output_path = dir.path().join("output.jsonl");
+        let other_path = dir.path().join("other.jsonl");
+        let tmux_session_name = "AgentDesk-codex-synthetic-owner";
+        let watchers = super::super::TmuxWatcherRegistry::new();
+
+        assert!(!tui_direct_watcher_can_own_output(
+            &watchers,
+            tmux_session_name,
+            Some(&output_path),
+        ));
+
+        watchers.insert(
+            ChannelId::new(940_000_000_000_007),
+            test_watcher_handle(tmux_session_name, &output_path),
+        );
+        assert!(tui_direct_watcher_can_own_output(
+            &watchers,
+            tmux_session_name,
+            Some(&output_path),
+        ));
+        assert!(!tui_direct_watcher_can_own_output(
+            &watchers,
+            tmux_session_name,
+            Some(&other_path),
+        ));
+    }
+
+    #[tokio::test]
+    async fn tui_direct_pre_save_cleanup_does_not_decrement_global_active() {
+        let shared = super::super::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let channel_id = ChannelId::new(940_000_000_000_008);
+        let user_message_id = MessageId::new(940_000_000_000_108);
+        let started = super::super::mailbox_try_start_turn(
+            shared.as_ref(),
+            channel_id,
+            Arc::new(CancelToken::new()),
+            serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
+            user_message_id,
+        )
+        .await;
+        assert!(started, "test precondition: synthetic mailbox turn starts");
+
+        shared.global_active.store(3, Ordering::Relaxed);
+        finish_tui_direct_synthetic_pre_save_failure(&shared, &provider, channel_id).await;
+
+        assert_eq!(
+            shared.global_active.load(Ordering::Relaxed),
+            3,
+            "pre-save cleanup must not decrement a counter it has not incremented"
+        );
+        let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
+        assert!(snapshot.cancel_token.is_none());
+        assert_eq!(snapshot.active_user_message_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_direct_gateway_has_no_live_bot_owner_for_local_queue_dispatch() {
+        let gateway = TuiDirectBridgeGateway {
+            http: Arc::new(serenity::Http::new("test-token")),
+            shared: super::super::make_shared_data_for_tests(),
+            provider: ProviderKind::Codex,
+        };
+
+        assert_eq!(gateway.bot_owner_provider(), None);
+        assert!(
+            gateway.can_chain_locally(),
+            "bridge adapter still owns Discord delivery for the already-submitted turn"
+        );
     }
 
     #[cfg(unix)]
@@ -3304,109 +5295,6 @@ mod tests {
             &existing, &fresh
         ));
         assert!(claude_tui_runtime_binding_matches_launch(&fresh, &fresh));
-    }
-
-    #[cfg(all(unix, feature = "legacy-sqlite-tests"))]
-    #[test]
-    fn rehydrates_claude_tui_binding_from_launch_script_and_exact_session_name() {
-        let _guard = crate::services::discord::runtime_store::lock_test_env();
-        let temp = tempfile::tempdir().expect("temp dir");
-        let root = temp.path().join(".adk");
-        let config_dir = root.join("config");
-        std::fs::create_dir_all(&config_dir).expect("config dir");
-        std::fs::write(
-            config_dir.join("agentdesk.yaml"),
-            r#"
-server:
-  port: 8791
-agents:
-  - id: adk-dashboard
-    name: "Dashboard"
-    provider: claude
-    channels:
-      claude:
-        id: "1490141479707086938"
-        name: "adk-dash-cc"
-"#,
-        )
-        .expect("config");
-        let claude_home = temp.path().join(".claude");
-        let prev_root = std::env::var_os("AGENTDESK_ROOT_DIR");
-        let prev_claude_home = std::env::var_os("CLAUDE_CONFIG_DIR");
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", &root);
-            std::env::set_var("CLAUDE_CONFIG_DIR", &claude_home);
-        }
-
-        let result = (|| {
-            let tmux_session_name = crate::services::provider::ProviderKind::Claude
-                .build_tmux_session_name("adk-dash-cc");
-            let working_dir = temp.path().join("workspace");
-            std::fs::create_dir_all(&working_dir).expect("working dir");
-            let session_id = "01234567-89ab-cdef-0123-456789abcdef";
-            let transcript_path =
-                crate::services::claude_tui::transcript_tail::claude_transcript_path(
-                    &working_dir,
-                    session_id,
-                    Some(&claude_home),
-                )
-                .expect("transcript path");
-            std::fs::create_dir_all(transcript_path.parent().expect("transcript parent"))
-                .expect("transcript parent dir");
-            let before = concat!(
-                "{\"type\":\"system\",\"subtype\":\"init\"}\n",
-                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old answer\"}]}}\n",
-            );
-            let prompt = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"direct prompt during restart\"}]}}\n";
-            let after = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"new answer\"}]}}\n";
-            let transcript_body = format!("{before}{prompt}{after}");
-            std::fs::write(&transcript_path, &transcript_body).expect("transcript");
-            let launch_script_path = crate::services::tmux_common::session_temp_path(
-                &tmux_session_name,
-                crate::services::tmux_common::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
-            );
-            std::fs::write(
-                &launch_script_path,
-                format!(
-                    "#!/bin/bash\ncd {}\nexec {} '--dangerously-skip-permissions' '--session-id' '{}' '--settings' '/tmp/settings.json'\n",
-                    crate::services::process::shell_escape(&working_dir.display().to_string()),
-                    crate::services::process::shell_escape("/usr/local/bin/claude"),
-                    session_id,
-                ),
-            )
-            .expect("launch script");
-
-            (
-                resolve_rehydrated_claude_tmux_channel_id(&tmux_session_name)
-                    .expect("resolved channel"),
-                rehydrated_claude_tui_binding_for_tmux_session(&tmux_session_name)
-                    .expect("rehydrated binding"),
-                transcript_body.len() as u64,
-            )
-        })();
-
-        match prev_root {
-            Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-            None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-        }
-        match prev_claude_home {
-            Some(value) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", value) },
-            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
-        }
-
-        let (channel_id, binding, expected_start_offset) = result;
-        assert_eq!(channel_id, 1490141479707086938);
-        assert_eq!(binding.runtime_kind, RuntimeHandoffKind::ClaudeTui);
-        assert_eq!(
-            binding.session_id.as_deref(),
-            Some("01234567-89ab-cdef-0123-456789abcdef")
-        );
-        assert_eq!(binding.last_offset, expected_start_offset);
-        assert!(
-            binding
-                .output_path
-                .ends_with("01234567-89ab-cdef-0123-456789abcdef.jsonl")
-        );
     }
 
     // U-11 Missing transcripts still start at zero; existing transcripts

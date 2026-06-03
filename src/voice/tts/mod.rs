@@ -130,11 +130,17 @@ impl TtsRuntime {
 
     /// Re-read voice config after a voice-change command mutates backend
     /// settings, rebinding the backend and progress cache target together.
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn rebind_from_voice_config(&mut self, config: &VoiceConfig) -> Result<()> {
         *self = Self::from_voice_config(config)?;
         Ok(())
     }
 
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn cache_key_parts(&self) -> Vec<String> {
         self.backend.cache_key_parts()
     }

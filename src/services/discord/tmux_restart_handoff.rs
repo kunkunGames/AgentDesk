@@ -123,81 +123,46 @@ fn restart_handoff_notice_target(
     RestartHandoffNoticeTarget::Edit(state.current_msg_id)
 }
 
-fn resolve_dispatched_thread_dispatch(
-    sqlite: &crate::db::Db,
-    thread_channel_id: u64,
-) -> Option<String> {
-    let thread_channel_id = thread_channel_id.to_string();
-    let conn = sqlite.read_conn().ok()?;
-
-    conn.query_row(
-        "SELECT id FROM task_dispatches
-         WHERE status = 'dispatched' AND thread_id = ?1
-         ORDER BY datetime(created_at) DESC, rowid DESC
-         LIMIT 1",
-        [thread_channel_id.as_str()],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .or_else(|| {
-        conn.query_row(
-            "SELECT active_dispatch_id FROM sessions
-             WHERE thread_channel_id = ?1
-               AND status IN ('turn_active', 'working')
-               AND active_dispatch_id IS NOT NULL
-             ORDER BY datetime(COALESCE(last_heartbeat, created_at)) DESC, id DESC
-             LIMIT 1",
-            [thread_channel_id.as_str()],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    })
-}
-
 pub(super) fn resolve_dispatched_thread_dispatch_from_db(
-    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     thread_channel_id: u64,
 ) -> Option<String> {
-    if let Some(pg_pool) = pg_pool {
-        let thread_channel_id = thread_channel_id.to_string();
-        return crate::utils::async_bridge::block_on_pg_result(
-            pg_pool,
-            move |pool| async move {
-                if let Some(dispatch_id) = sqlx::query_scalar::<_, String>(
-                    "SELECT id FROM task_dispatches
-                     WHERE status = 'dispatched' AND thread_id = $1
-                     ORDER BY created_at DESC, id DESC
-                     LIMIT 1",
-                )
-                .bind(&thread_channel_id)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|error| format!("load pg dispatched thread dispatch: {error}"))?
-                {
-                    return Ok(Some(dispatch_id));
-                }
+    let pg_pool = pg_pool?;
+    let thread_channel_id = thread_channel_id.to_string();
+    crate::utils::async_bridge::block_on_pg_result(
+        pg_pool,
+        move |pool| async move {
+            if let Some(dispatch_id) = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM task_dispatches
+                 WHERE status = 'dispatched' AND thread_id = $1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+            )
+            .bind(&thread_channel_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|error| format!("load pg dispatched thread dispatch: {error}"))?
+            {
+                return Ok(Some(dispatch_id));
+            }
 
-                sqlx::query_scalar::<_, String>(
-                    "SELECT active_dispatch_id FROM sessions
-                     WHERE thread_channel_id = $1
-                       AND status IN ('turn_active', 'working')
-                       AND active_dispatch_id IS NOT NULL
-                     ORDER BY COALESCE(last_heartbeat, created_at) DESC, id DESC
-                     LIMIT 1",
-                )
-                .bind(&thread_channel_id)
-                .fetch_optional(&pool)
-                .await
-                .map_err(|error| format!("load pg session dispatch fallback: {error}"))
-            },
-            |message| message,
-        )
-        .ok()
-        .flatten();
-    }
-
-    resolve_dispatched_thread_dispatch(db?, thread_channel_id)
+            sqlx::query_scalar::<_, String>(
+                "SELECT active_dispatch_id FROM sessions
+                 WHERE thread_channel_id = $1
+                   AND status IN ('turn_active', 'working')
+                   AND active_dispatch_id IS NOT NULL
+                 ORDER BY COALESCE(last_heartbeat, created_at) DESC, id DESC
+                 LIMIT 1",
+            )
+            .bind(&thread_channel_id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|error| format!("load pg session dispatch fallback: {error}"))
+        },
+        |message| message,
+    )
+    .ok()
+    .flatten()
 }
 
 fn build_restart_handoff_session_key(
@@ -413,11 +378,60 @@ pub(super) async fn resume_aborted_restart_turn(
     };
     let Some(state) = super::inflight::load_inflight_state(&provider_kind, channel_id.get()) else {
         let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] ⚠ watcher death recovery: no inflight state for channel {} (provider {})",
-            channel_id.get(),
-            provider_kind.as_str()
-        );
+        // #3014: there is no persisted inflight turn to hand off, but the pane
+        // may have died *mid-turn while Discord inputs were queued*. Without
+        // inflight there is nothing to resume, so the historical behavior just
+        // returned here — leaving the queued backlog orphaned until the next
+        // dcserver restart (or the next user message) finally triggered a
+        // kickoff. That produced multi-minute "stuck queue" stalls (71-minute
+        // case). Reuse the proven deferred idle-queue kickoff so the backlog
+        // drains on its own: the kickoff gate passes for a dead session
+        // (no live pane ⇒ not "busy", no active turn ⇒ kickable), and the
+        // dispatch path spawns a fresh session for the queued item.
+        let snapshot = super::mailbox_snapshot(shared.as_ref(), channel_id).await;
+        let has_queued_backlog = !snapshot.intervention_queue.is_empty();
+        // codex review P2: only auto-drain when the mailbox is IDLE. The
+        // watcher death handler runs asynchronously, so by the time it fires a
+        // concurrent kickoff / user message may already have started the next
+        // queued turn in a fresh session — that turn holds a live cancel_token
+        // while the remaining backlog is still queued. The tmux session name is
+        // derived from the channel and thus shared across the dead and the
+        // fresh session, so it cannot distinguish the stale dead turn from a
+        // live one. Acting on backlog-presence alone would let a channel-scoped
+        // finish cancel that unrelated live turn and corrupt global_active.
+        // When an active turn is present we therefore leave the mailbox
+        // untouched: a live turn drains the backlog when it completes, and a
+        // stale dead-turn slot is reconciled by the watchdog / placeholder
+        // sweeper paths (which then trigger their own kickoff). Only the
+        // genuinely-idle case is the orphaned backlog this path must rescue.
+        let mailbox_idle = snapshot.cancel_token.is_none()
+            && snapshot.active_request_owner.is_none()
+            && snapshot.active_user_message_id.is_none();
+        if has_queued_backlog && mailbox_idle {
+            tracing::info!(
+                "  [{ts}] ↻ watcher death recovery: idle mailbox for channel {} (provider {}) with queued backlog — scheduling idle-queue kickoff (#3014)",
+                channel_id.get(),
+                provider_kind.as_str()
+            );
+            super::queue_io::schedule_deferred_idle_queue_kickoff(
+                shared.clone(),
+                provider_kind,
+                channel_id,
+                "watcher_death_backlog_recovery",
+            );
+        } else if has_queued_backlog {
+            tracing::info!(
+                "  [{ts}] ⚠ watcher death recovery: no inflight for channel {} (provider {}); queued backlog deferred — mailbox has an active turn (live drain or reconciler will handle)",
+                channel_id.get(),
+                provider_kind.as_str()
+            );
+        } else {
+            tracing::info!(
+                "  [{ts}] ⚠ watcher death recovery: no inflight state for channel {} (provider {})",
+                channel_id.get(),
+                provider_kind.as_str()
+            );
+        }
         return false;
     };
 
@@ -504,225 +518,5 @@ mod notice_target_tests {
         let target = restart_handoff_notice_target(&state);
 
         assert_eq!(target, RestartHandoffNoticeTarget::MissingCurrentMessage);
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::{
-        RestartHandoffScope, build_restart_handoff_session_key, preserve_dispatch_on_watcher_death,
-        resolve_restart_handoff_scope, seed_restart_handoff_session_metadata,
-    };
-    use crate::services::discord::DiscordSession;
-    use crate::services::discord::inflight::InflightTurnState;
-    use crate::services::provider::ProviderKind;
-    use poise::serenity_prelude::ChannelId;
-
-    fn sample_inflight_state() -> InflightTurnState {
-        InflightTurnState::new(
-            ProviderKind::Claude,
-            1479671298497183835,
-            Some("adk-cc".to_string()),
-            1,
-            10,
-            11,
-            "restart me".to_string(),
-            Some("session-123".to_string()),
-            Some("AgentDesk-claude-adk-cc".to_string()),
-            Some("/tmp/adk-cc.jsonl".to_string()),
-            None,
-            0,
-        )
-    }
-
-    fn fresh_restart_handoff_db() -> (tempfile::TempDir, crate::db::Db) {
-        let temp = tempfile::tempdir().unwrap();
-        let db = crate::db::test_db();
-        (temp, db)
-    }
-
-    #[test]
-    fn restart_handoff_prefers_exact_metadata_match() {
-        let state = sample_inflight_state();
-        let scope = resolve_restart_handoff_scope(
-            &state,
-            "AgentDesk-claude-adk-cc",
-            "/tmp/other-output.jsonl",
-        );
-        assert_eq!(scope, RestartHandoffScope::ExactMetadata);
-    }
-
-    #[test]
-    fn restart_handoff_allows_provider_channel_fallback_on_metadata_drift() {
-        let state = sample_inflight_state();
-        let scope = resolve_restart_handoff_scope(
-            &state,
-            "AgentDesk-claude-adk-cc-restarted",
-            "/tmp/new-output.jsonl",
-        );
-        assert_eq!(scope, RestartHandoffScope::ProviderChannelScopedFallback);
-    }
-
-    #[test]
-    fn restart_handoff_session_key_prefers_persisted_inflight_key() {
-        let mut state = sample_inflight_state();
-        state.session_key = Some("claude/token-hash/host:AgentDesk-claude-adk-cc".to_string());
-
-        let resolved =
-            build_restart_handoff_session_key(&state, "other-token-hash", &ProviderKind::Claude);
-
-        assert_eq!(
-            resolved.as_deref(),
-            Some("claude/token-hash/host:AgentDesk-claude-adk-cc")
-        );
-    }
-
-    #[test]
-    fn restart_handoff_session_key_falls_back_to_tmux_name() {
-        let mut state = sample_inflight_state();
-        state.session_key = None;
-        let hostname = crate::services::platform::hostname_short();
-        let expected = format!("claude/token-hash/{hostname}:AgentDesk-claude-adk-cc");
-
-        let resolved =
-            build_restart_handoff_session_key(&state, "token-hash", &ProviderKind::Claude);
-
-        assert_eq!(resolved.as_deref(), Some(expected.as_str()));
-    }
-
-    #[test]
-    fn restart_handoff_seeds_channel_name_into_missing_session() {
-        let state = sample_inflight_state();
-        let mut sessions = std::collections::HashMap::new();
-
-        let changed = seed_restart_handoff_session_metadata(
-            &mut sessions,
-            ChannelId::new(state.channel_id),
-            &state,
-        );
-
-        assert!(changed);
-        let seeded = sessions.get(&ChannelId::new(state.channel_id)).unwrap();
-        assert_eq!(seeded.channel_name.as_deref(), Some("adk-cc"));
-        assert_eq!(seeded.channel_id, Some(state.channel_id));
-    }
-
-    #[test]
-    fn restart_handoff_preserves_existing_session_channel_name() {
-        let state = sample_inflight_state();
-        let channel_id = ChannelId::new(state.channel_id);
-        let mut sessions = std::collections::HashMap::new();
-        sessions.insert(
-            channel_id,
-            DiscordSession {
-                session_id: None,
-                memento_context_loaded: false,
-                memento_reflected: false,
-                current_path: None,
-                history: Vec::new(),
-                pending_uploads: Vec::new(),
-                cleared: false,
-                remote_profile_name: None,
-                channel_id: Some(state.channel_id),
-                channel_name: Some("already-set".to_string()),
-                category_name: None,
-                last_active: tokio::time::Instant::now(),
-                worktree: None,
-                born_generation: 0,
-                assistant_turns: 0,
-            },
-        );
-
-        let changed = seed_restart_handoff_session_metadata(&mut sessions, channel_id, &state);
-
-        assert!(!changed);
-        let seeded = sessions.get(&channel_id).unwrap();
-        assert_eq!(seeded.channel_name.as_deref(), Some("already-set"));
-    }
-
-    #[test]
-    fn watcher_death_preserves_verdict_driven_dispatch_types() {
-        assert!(preserve_dispatch_on_watcher_death(Some("review")));
-        assert!(preserve_dispatch_on_watcher_death(Some("phase-gate")));
-        assert!(!preserve_dispatch_on_watcher_death(Some("implementation")));
-        assert!(!preserve_dispatch_on_watcher_death(None));
-    }
-
-    #[test]
-    fn watcher_dispatch_db_fallback_prefers_dispatched_thread_row() {
-        let (_temp, db) = fresh_restart_handoff_db();
-        let conn = db.lock().unwrap();
-        conn.execute_batch(
-            "
-            DROP TABLE IF EXISTS task_dispatches;
-            DROP TABLE IF EXISTS sessions;
-            CREATE TABLE task_dispatches (
-                id TEXT PRIMARY KEY,
-                status TEXT,
-                thread_id TEXT,
-                created_at TEXT
-            );
-            CREATE TABLE sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                status TEXT,
-                active_dispatch_id TEXT,
-                created_at TEXT,
-                last_heartbeat TEXT,
-                thread_channel_id TEXT
-            );
-            INSERT INTO task_dispatches (id, status, thread_id, created_at)
-            VALUES
-                ('older-dispatch', 'dispatched', '1492091375422930966', '2026-04-11 00:15:42'),
-                ('latest-dispatch', 'dispatched', '1492091375422930966', '2026-04-11 00:15:43');
-            INSERT INTO sessions (status, active_dispatch_id, created_at, last_heartbeat, thread_channel_id)
-            VALUES ('turn_active', 'session-dispatch', '2026-04-11 00:15:40', '2026-04-11 00:24:21', '1492091375422930966');
-            ",
-        )
-        .unwrap();
-        drop(conn);
-
-        let resolved = super::resolve_dispatched_thread_dispatch_from_db(
-            Some(&db),
-            None,
-            1_492_091_375_422_930_966,
-        );
-        assert_eq!(resolved.as_deref(), Some("latest-dispatch"));
-    }
-
-    #[test]
-    fn watcher_dispatch_db_fallback_uses_session_when_thread_row_missing() {
-        let (_temp, db) = fresh_restart_handoff_db();
-        let conn = db.lock().unwrap();
-        conn.execute_batch(
-            "
-            DROP TABLE IF EXISTS task_dispatches;
-            DROP TABLE IF EXISTS sessions;
-            CREATE TABLE task_dispatches (
-                id TEXT PRIMARY KEY,
-                status TEXT,
-                thread_id TEXT,
-                created_at TEXT
-            );
-            CREATE TABLE sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                status TEXT,
-                active_dispatch_id TEXT,
-                created_at TEXT,
-                last_heartbeat TEXT,
-                thread_channel_id TEXT
-            );
-            INSERT INTO sessions (status, active_dispatch_id, created_at, last_heartbeat, thread_channel_id)
-            VALUES ('turn_active', 'session-dispatch', '2026-04-11 00:15:40', '2026-04-11 00:24:21', '1492091380045189131');
-            ",
-        )
-        .unwrap();
-        drop(conn);
-
-        let resolved = super::resolve_dispatched_thread_dispatch_from_db(
-            Some(&db),
-            None,
-            1_492_091_380_045_189_131,
-        );
-        assert_eq!(resolved.as_deref(), Some("session-dispatch"));
     }
 }

@@ -43,7 +43,7 @@ import yaml  # type: ignore[import-untyped]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from tui_relay import assertions, discord, lease, tmux  # noqa: E402
+from tui_relay import assertions, discord, fixtures, lease, tmux  # noqa: E402
 
 
 SUPPORTED_CELLS: tuple[str, ...] = (
@@ -63,6 +63,43 @@ RUNTIME_QUEUE_DIRS: tuple[tuple[str, str], ...] = (
     ("pending_queue", "discord_pending_queue"),
     ("queued_placeholders", "discord_queued_placeholders"),
 )
+TUI_IDLE_DRAFT_GUARD_AFTER_S = float(
+    os.environ.get("AGENTDESK_E2E_TUI_IDLE_DRAFT_GUARD_AFTER_S", "15")
+)
+TUI_IDLE_DRAFT_GUARD_POLL_S = float(
+    os.environ.get("AGENTDESK_E2E_TUI_IDLE_DRAFT_GUARD_POLL_S", "2")
+)
+DIRECT_INPUT_NOTIFICATION_MARKER = "터미널에 직접 주입된 입력"
+REPORT_RECORD_KEYS: tuple[str, ...] = (
+    "relay_count",
+    "raw_count",
+    "message_updates",
+    "sample_relay",
+    "recent_relay",
+    "sample_raw",
+    "recent_raw",
+    "tmux_key_sequences",
+    "direct_input_prompts",
+    "wait_timeouts",
+    "provider_hold_prompts",
+    "provider_hold_states",
+    "cancel_turns",
+    "health_assertions",
+    "post_scenario_idle",
+    "fixture_steps",
+    "fixture_replays",
+    "fixture_state",
+    "fixture_health",
+    "fixture_followup_probes",
+)
+
+
+class ScenarioStepAssertionError(assertions.AssertionError):
+    """Assertion failure that carries the partial scenario record."""
+
+    def __init__(self, message: str, *, record: dict[str, Any]):
+        super().__init__(message)
+        self.record = record
 
 
 def parse_args() -> argparse.Namespace:
@@ -185,6 +222,61 @@ def cell_workspace_substring(cell: str) -> str:
     return f"adk-{cell}-e2e"
 
 
+def _truncate_text(value: str, *, max_chars: int = 500) -> str:
+    if len(value) <= max_chars:
+        return value
+    return f"{value[:max_chars]}..."
+
+
+def _message_debug_summary(message: dict[str, Any]) -> dict[str, Any]:
+    author = message.get("author") if isinstance(message.get("author"), dict) else {}
+    content = message.get("content") or ""
+    return {
+        "id": str(message.get("id") or ""),
+        "type": message.get("type"),
+        "timestamp": message.get("timestamp"),
+        "edited_timestamp": message.get("edited_timestamp"),
+        "author_id": str(author.get("id") or ""),
+        "author_bot": author.get("bot"),
+        "is_our_send": assertions.is_our_send(message),
+        "is_relay_response": assertions.is_relay_response(message),
+        "content": _truncate_text(str(content), max_chars=700),
+    }
+
+
+def _update_record_window_snapshot(
+    record: dict[str, Any],
+    window: assertions.Window,
+) -> None:
+    record["relay_count"] = len(window.messages)
+    record["raw_count"] = len(window.raw_messages)
+    record["message_updates"] = len(window.message_updates)
+    record["sample_relay"] = [
+        (message.get("content") or "")[:120] for message in window.messages[:6]
+    ]
+    record["recent_relay"] = [
+        _message_debug_summary(message) for message in window.messages[-6:]
+    ]
+    record["sample_raw"] = [
+        _message_debug_summary(message) for message in window.raw_messages[:6]
+    ]
+    record["recent_raw"] = [
+        _message_debug_summary(message) for message in window.raw_messages[-8:]
+    ]
+
+
+def _merge_record_into_result(
+    result: dict[str, Any],
+    record: dict[str, Any] | None,
+) -> None:
+    if not record:
+        return
+    result["assertions"].extend(record.get("assertions") or [])
+    for key in REPORT_RECORD_KEYS:
+        if key in record:
+            result[key] = record[key]
+
+
 def resolve_output_dir(arg: str | None, cell: str) -> Path:
     if arg:
         path = Path(arg)
@@ -226,6 +318,20 @@ def is_destructive(scenario: dict[str, Any]) -> bool:
         ):
             if key in step:
                 return True
+    return False
+
+
+def is_local_fixture_scenario(scenario: dict[str, Any]) -> bool:
+    if str(scenario.get("execution") or "").strip().lower() in {
+        "fixture",
+        "local_fixture",
+    }:
+        return True
+    for step in scenario.get("steps") or []:
+        if isinstance(step, dict) and (
+            "replay_fixture" in step or "fixture_followup_probe" in step
+        ):
+            return True
     return False
 
 
@@ -585,6 +691,48 @@ def send_tmux_key_sequence(
     }
 
 
+def _looks_like_tmux_control_key(key: str) -> bool:
+    normalized = key.strip()
+    if not normalized:
+        return True
+    if normalized in {
+        "BSpace",
+        "BTab",
+        "DC",
+        "Delete",
+        "Down",
+        "End",
+        "Enter",
+        "Escape",
+        "Home",
+        "IC",
+        "Left",
+        "NEnter",
+        "PageDown",
+        "PageUp",
+        "Right",
+        "Space",
+        "Tab",
+        "Up",
+    }:
+        return True
+    return len(normalized) <= 16 and normalized.startswith(("C-", "M-", "S-"))
+
+
+def _infer_direct_input_prompt_from_keys(keys: list[str]) -> str | None:
+    submit_indexes = [
+        idx for idx, key in enumerate(keys) if key.strip() in {"C-m", "Enter", "NEnter"}
+    ]
+    search_end = submit_indexes[-1] if submit_indexes else len(keys)
+    for key in reversed(keys[:search_end]):
+        if not _looks_like_tmux_control_key(key):
+            return key
+    for key in reversed(keys):
+        if not _looks_like_tmux_control_key(key):
+            return key
+    return None
+
+
 def build_provider_hold_prompt(params: Any, *, scenario_id: str) -> str:
     """Build a provider-agnostic stop-mid-turn prompt fixture.
 
@@ -755,6 +903,34 @@ def _provider_hold_state_summary(
     )
 
 
+def _provider_hold_observation(
+    *,
+    path: Path,
+    expected_identity: dict[str, str],
+    full_response: str,
+    ok_marker: str,
+    late_marker: str,
+    any_tool_used: bool,
+    has_post_tool_text: bool,
+    terminal_delivery_committed: bool,
+    classification: str,
+) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "turn_identity": dict(expected_identity),
+        "classification": classification,
+        "provider_hold_observed": classification == "provider_hold_observed",
+        "full_response_len": len(full_response),
+        "ok_marker": ok_marker,
+        "ok_marker_seen": ok_marker in full_response,
+        "late_marker": late_marker,
+        "late_marker_seen": late_marker in full_response,
+        "any_tool_used": any_tool_used,
+        "has_post_tool_text": has_post_tool_text,
+        "terminal_delivery_committed": terminal_delivery_committed,
+    }
+
+
 def wait_for_provider_hold_state(
     *,
     runtime_root: str | Path,
@@ -774,7 +950,9 @@ def wait_for_provider_hold_state(
     The durable inflight row is the stable witness that OK was captured before
     the tool call and no post-tool text has been produced yet. The row must
     match the current prompt's turn identity so stale E-18 rows cannot satisfy
-    or fail the current run.
+    or fail the current run. Codex TUI can also complete the turn before a
+    durable tool hold exists; that is classified separately when it emitted OK
+    and did not emit the late marker.
     """
 
     if timeout_s <= 0:
@@ -794,10 +972,17 @@ def wait_for_provider_hold_state(
     )
     deadline = time.monotonic() + timeout_s
     last_state = f"inflight state missing at {path}"
+    last_current_turn_state: str | None = None
     while time.monotonic() < deadline:
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
+            if last_current_turn_state is not None:
+                raise assertions.AssertionError(
+                    "provider hold state disappeared before cancel after "
+                    "the current turn was observed: "
+                    f"path={path} last_current_state={last_current_turn_state}"
+                )
             last_state = f"inflight state missing at {path}"
         except OSError as error:
             last_state = f"inflight state unreadable at {path}: {error}"
@@ -823,39 +1008,57 @@ def wait_for_provider_hold_state(
                         last_state = f"identity_mismatch={identity_mismatch}; {summary}"
                         time.sleep(poll_interval_s)
                         continue
+                    last_current_turn_state = summary
                     full_response = str(state.get("full_response") or "")
-                    if late_marker in full_response:
+                    ok_seen = ok_marker in full_response
+                    late_seen = late_marker in full_response
+                    any_tool_used = state.get("any_tool_used") is True
+                    has_post_tool_text = state.get("has_post_tool_text") is True
+                    terminal_delivery_committed = (
+                        state.get("terminal_delivery_committed") is True
+                    )
+                    if late_seen:
                         raise assertions.AssertionError(
                             "late marker appeared in provider response before "
                             f"the cancel step could observe a hold: {summary}"
                         )
-                    if state.get("terminal_delivery_committed") is True:
+                    if terminal_delivery_committed:
+                        if ok_seen and not any_tool_used and not has_post_tool_text:
+                            return _provider_hold_observation(
+                                path=path,
+                                expected_identity=expected_identity,
+                                full_response=full_response,
+                                ok_marker=ok_marker,
+                                late_marker=late_marker,
+                                any_tool_used=any_tool_used,
+                                has_post_tool_text=has_post_tool_text,
+                                terminal_delivery_committed=True,
+                                classification="fast_terminal_completion_before_hold",
+                            )
                         raise assertions.AssertionError(
                             "turn delivered before provider hold was observed: "
                             f"{summary}"
                         )
                     if (
-                        ok_marker in full_response
-                        and state.get("any_tool_used") is True
-                        and state.get("has_post_tool_text") is False
+                        ok_seen
+                        and any_tool_used
+                        and not has_post_tool_text
                     ):
                         # Both Claude and Codex relay parsers persist
                         # `any_tool_used` from provider tool_use frames. If a
                         # provider stops doing that, this current-turn witness
                         # times out instead of matching stale content.
-                        return {
-                            "path": str(path),
-                            "turn_identity": dict(expected_identity),
-                            "full_response_len": len(full_response),
-                            "ok_marker": ok_marker,
-                            "ok_marker_seen": True,
-                            "late_marker": late_marker,
-                            "late_marker_seen": False,
-                            "any_tool_used": True,
-                            "has_post_tool_text": bool(
-                                state.get("has_post_tool_text")
-                            ),
-                        }
+                        return _provider_hold_observation(
+                            path=path,
+                            expected_identity=expected_identity,
+                            full_response=full_response,
+                            ok_marker=ok_marker,
+                            late_marker=late_marker,
+                            any_tool_used=True,
+                            has_post_tool_text=has_post_tool_text,
+                            terminal_delivery_committed=False,
+                            classification="provider_hold_observed",
+                        )
                     last_state = summary
         time.sleep(poll_interval_s)
 
@@ -1361,6 +1564,366 @@ def assert_cell_idle(
     )
 
 
+def _target_mailbox_idle_snapshot(
+    *, base_url: str, channel_id: str, provider: str
+) -> dict[str, Any] | None:
+    try:
+        detail = _read_health_detail(base_url)
+    except Exception:  # noqa: BLE001 - marker wait should poll through transient health errors
+        return None
+    mailboxes = detail.get("mailboxes")
+    if not isinstance(mailboxes, list):
+        return None
+    target_mailboxes = [
+        mailbox
+        for mailbox in mailboxes
+        if isinstance(mailbox, dict)
+        and _mailbox_channel_id(mailbox) == str(channel_id)
+        and _mailbox_provider(mailbox) == provider
+    ]
+    if not target_mailboxes:
+        return None
+    violations: list[str] = []
+    for mailbox in target_mailboxes:
+        violations.extend(_mailbox_busy_reasons(mailbox))
+    if violations:
+        return None
+    return {
+        "provider": provider,
+        "channel_id": str(channel_id),
+        "mailboxes_seen": len(target_mailboxes),
+        "global_active": detail.get("global_active"),
+        "global_finalizing": detail.get("global_finalizing"),
+        "global_queue_depth": detail.get("global_queue_depth")
+        or detail.get("queue_depth"),
+        "status": "idle",
+    }
+
+
+def _pane_tail_contains_prompt_draft(pane: str, prompt: str) -> bool:
+    prompt = prompt.strip()
+    if not prompt:
+        return False
+    for line in reversed(pane.splitlines()[-40:]):
+        trimmed = line.strip().strip("\u00a0")
+        if not trimmed.startswith("\u276f"):
+            continue
+        rest = trimmed[1:].strip().strip("\u00a0")
+        if rest.lower().startswith("[user:"):
+            continue
+        if prompt in rest:
+            return True
+    return False
+
+
+def _body_complete_head_for_tail(scenario: dict[str, Any], tail: str) -> str | None:
+    for spec in scenario.get("assertions") or []:
+        if not isinstance(spec, dict):
+            continue
+        params = spec.get("body_complete")
+        if not isinstance(params, dict):
+            continue
+        if str(params.get("tail") or "") == tail:
+            head = params.get("head")
+            return str(head) if head is not None else None
+    return None
+
+
+def _expected_markers_for_wait(scenario: dict[str, Any], needle: str) -> list[str]:
+    markers: list[str] = [needle]
+
+    def add_marker(value: Any) -> None:
+        if isinstance(value, str) and value and value not in markers:
+            markers.append(value)
+
+    for spec in scenario.get("assertions") or []:
+        if not isinstance(spec, dict):
+            continue
+        add_marker(spec.get("text_present"))
+        add_marker(spec.get("no_duplicate_marker"))
+        ordered = spec.get("ordered_text_present")
+        if isinstance(ordered, list):
+            for item in ordered:
+                add_marker(item)
+        body = spec.get("body_complete")
+        if isinstance(body, dict):
+            add_marker(body.get("head"))
+            add_marker(body.get("tail"))
+    return markers[:12]
+
+
+def _marker_presence(
+    window: assertions.Window,
+    markers: list[str],
+) -> dict[str, dict[str, Any]]:
+    presence: dict[str, dict[str, Any]] = {}
+    for marker in markers:
+        relay_hits = [
+            str(message.get("id") or "")
+            for message in window.messages
+            if marker in (message.get("content") or "")
+        ]
+        raw_hits = [
+            str(message.get("id") or "")
+            for message in window.raw_messages
+            if marker in (message.get("content") or "")
+        ]
+        presence[marker] = {
+            "relay": bool(relay_hits),
+            "relay_message_ids": relay_hits[:6],
+            "raw": bool(raw_hits),
+            "raw_message_ids": raw_hits[:6],
+        }
+    return presence
+
+
+def _mailbox_debug_summary(mailbox: dict[str, Any]) -> dict[str, Any]:
+    relay = _relay_health(mailbox)
+    return {
+        "provider": _mailbox_provider(mailbox),
+        "channel_id": _mailbox_channel_id(mailbox),
+        "busy_reasons": _mailbox_busy_reasons(mailbox),
+        "agent_turn_status": mailbox.get("agent_turn_status"),
+        "inflight_state_present": mailbox.get("inflight_state_present"),
+        "active_user_message_id": mailbox.get("active_user_message_id"),
+        "active_dispatch_present": mailbox.get("active_dispatch_present"),
+        "queue_depth": mailbox.get("queue_depth"),
+        "relay_stall_state": mailbox.get("relay_stall_state"),
+        "relay_health": {
+            "active_turn": relay.get("active_turn"),
+            "bridge_inflight_present": relay.get("bridge_inflight_present"),
+            "mailbox_active_user_msg_id": relay.get("mailbox_active_user_msg_id"),
+            "pending_discord_callback_msg_id": relay.get(
+                "pending_discord_callback_msg_id"
+            ),
+            "queue_depth": relay.get("queue_depth"),
+            "desynced": relay.get("desynced"),
+        },
+    }
+
+
+def _target_mailbox_debug_snapshot(
+    *,
+    base_url: str,
+    channel_id: str,
+    provider: str,
+) -> dict[str, Any]:
+    try:
+        detail = _read_health_detail(base_url)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not mask failure
+        return {"error": f"{type(error).__name__}: {error}"}
+    mailboxes = detail.get("mailboxes")
+    if not isinstance(mailboxes, list):
+        return {
+            "error": "mailboxes_not_list",
+            "payload": _payload_summary(detail),
+        }
+    target = [
+        mailbox
+        for mailbox in mailboxes
+        if isinstance(mailbox, dict)
+        and _mailbox_channel_id(mailbox) == str(channel_id)
+        and _mailbox_provider(mailbox) == provider
+    ]
+    return {
+        "status": detail.get("status"),
+        "ok": detail.get("ok"),
+        "fully_recovered": detail.get("fully_recovered"),
+        "global_active": detail.get("global_active"),
+        "global_finalizing": detail.get("global_finalizing"),
+        "global_queue_depth": detail.get("global_queue_depth")
+        or detail.get("queue_depth"),
+        "target_mailbox_count": len(target),
+        "target_mailboxes": [_mailbox_debug_summary(mailbox) for mailbox in target],
+    }
+
+
+def _classify_wait_timeout(
+    *,
+    window: assertions.Window,
+    needle: str,
+    head: str | None,
+    prompt_draft_present: bool | None,
+    health: dict[str, Any],
+) -> str:
+    if prompt_draft_present is True:
+        return "prompt_not_submitted_input_buffer_still_contains_prompt"
+
+    raw_has_needle = any(needle in (m.get("content") or "") for m in window.raw_messages)
+    relay_has_needle = any(needle in (m.get("content") or "") for m in window.messages)
+    if raw_has_needle and not relay_has_needle:
+        return "relay_surface_filter_miss_raw_contains_needle"
+
+    if head:
+        for message in window.messages:
+            body = message.get("content") or ""
+            head_at = body.find(head)
+            if head_at != -1 and body.find(needle, head_at + len(head)) == -1:
+                return "body_truncated_or_tail_missing_after_head"
+
+    direct_notice_seen = any(
+        DIRECT_INPUT_NOTIFICATION_MARKER in (m.get("content") or "")
+        for m in window.raw_messages
+    )
+    target_mailboxes = health.get("target_mailboxes")
+    busy = False
+    if isinstance(target_mailboxes, list):
+        busy = any((m.get("busy_reasons") or []) for m in target_mailboxes if isinstance(m, dict))
+    if direct_notice_seen and busy:
+        return "direct_input_notified_provider_or_relay_still_busy"
+    if direct_notice_seen:
+        return "direct_input_notified_no_tail_observed"
+    return "no_direct_input_or_relay_evidence"
+
+
+def _collect_wait_timeout_diagnostics(
+    *,
+    base_url: str,
+    channel_id: str,
+    cell: str,
+    scenario: dict[str, Any],
+    thread_channel_id: str | None,
+    after_id: str,
+    wait_kind: str,
+    needle: str,
+    prompt: str | None,
+    window: assertions.Window,
+) -> dict[str, Any]:
+    markers = _expected_markers_for_wait(scenario, needle)
+    head = _body_complete_head_for_tail(scenario, needle)
+    health = _target_mailbox_debug_snapshot(
+        base_url=base_url,
+        channel_id=channel_id,
+        provider=cell_provider(cell),
+    )
+    tmux_snapshot: dict[str, Any] = {}
+    prompt_draft_present: bool | None = None
+    if cell_runtime(cell) == "tui":
+        session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
+        pane = tmux.capture_pane(session_name, -120)
+        pane_tail = "\n".join(pane.splitlines()[-40:])
+        prompt_draft_present = (
+            _pane_tail_contains_prompt_draft(pane, prompt) if prompt else None
+        )
+        tmux_snapshot = {
+            "session_name": session_name,
+            "pane_tail": _truncate_text(pane_tail, max_chars=4000),
+            "prompt_draft_present": prompt_draft_present,
+            "diagnostic_prompt": _truncate_text(prompt or "", max_chars=700),
+        }
+
+    return {
+        "wait_kind": wait_kind,
+        "needle": needle,
+        "after_id": after_id,
+        "scenario_id": str(scenario.get("id") or ""),
+        "cell": cell,
+        "classification": _classify_wait_timeout(
+            window=window,
+            needle=needle,
+            head=head,
+            prompt_draft_present=prompt_draft_present,
+            health=health,
+        ),
+        "relay_count": len(window.messages),
+        "raw_count": len(window.raw_messages),
+        "message_updates": len(window.message_updates),
+        "body_complete_head_for_tail": head,
+        "marker_presence": _marker_presence(window, markers),
+        "recent_relay": [
+            _message_debug_summary(message) for message in window.messages[-6:]
+        ],
+        "recent_raw": [
+            _message_debug_summary(message) for message in window.raw_messages[-8:]
+        ],
+        "tmux": tmux_snapshot,
+        "health": health,
+    }
+
+
+def _raise_if_tui_prompt_stuck_while_idle(
+    *,
+    base_url: str,
+    channel_id: str,
+    cell: str,
+    prompt: str | None,
+    thread_channel_id: str | None,
+) -> None:
+    if cell != "claude-tui" or not prompt:
+        return
+    idle = _target_mailbox_idle_snapshot(
+        base_url=base_url,
+        channel_id=channel_id,
+        provider=cell_provider(cell),
+    )
+    if idle is None:
+        return
+    session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
+    pane = tmux.capture_pane(session_name, -80)
+    if not _pane_tail_contains_prompt_draft(pane, prompt):
+        return
+    pane_tail = "\n".join(pane.splitlines()[-24:])
+    raise assertions.AssertionError(
+        "Discord marker wait would stall: prompt remained in Claude TUI input "
+        "buffer while mailbox was idle; "
+        f"cell={cell}; channel_id={channel_id}; tmux_session={session_name}; "
+        f"mailbox={idle}; prompt={prompt!r}; pane_tail={pane_tail!r}"
+    )
+
+
+def wait_for_discord_text_with_tui_idle_draft_guard(
+    *,
+    client: discord.DiscordClient,
+    channel_id: str,
+    cell: str,
+    after_id: str,
+    needle: str,
+    prompt: str | None,
+    thread_channel_id: str | None,
+    timeout_s: float,
+    debug_label: str,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    deadline = time.monotonic() + timeout_s
+    guard_after_s = min(TUI_IDLE_DRAFT_GUARD_AFTER_S, max(timeout_s, 0.0))
+    next_guard_at = time.monotonic() + max(guard_after_s, 0.0)
+    observed: list[dict[str, Any]] = []
+    observed_by_id: dict[str, dict[str, Any]] = {}
+    predicate = lambda message: (  # noqa: E731
+        assertions.is_relay_response(message)
+        and needle in (message.get("content") or "")
+    )
+    while time.monotonic() < deadline:
+        messages = client.fetch_messages(channel_id, after_id=after_id, limit=100)
+        for message in sorted(messages, key=lambda m: int(m.get("id", "0"))):
+            mid = str(message.get("id") or "")
+            previous = observed_by_id.get(mid)
+            if mid and previous is not None and not discord._message_changed(previous, message):
+                continue
+            if mid:
+                observed_by_id[mid] = message
+            observed.append(message)
+            if predicate(message):
+                return message, observed
+
+        now = time.monotonic()
+        if now >= next_guard_at:
+            _raise_if_tui_prompt_stuck_while_idle(
+                base_url=client.base_url,
+                channel_id=channel_id,
+                cell=cell,
+                prompt=prompt,
+                thread_channel_id=thread_channel_id,
+            )
+            next_guard_at = now + max(TUI_IDLE_DRAFT_GUARD_POLL_S, 0.1)
+        time.sleep(min(5.0, max(0.1, deadline - time.monotonic())))
+    if os.environ.get("AGENTDESK_E2E_WAIT_DEBUG"):
+        print(
+            f"[wait_for_message] timeout label={debug_label!r} "
+            f"after_id={after_id!r} observed_total={len(observed)}"
+        )
+    return None, observed
+
+
 def run_scenario(
     scenario: dict[str, Any],
     *,
@@ -1403,7 +1966,7 @@ def run_scenario(
         )
         return result
 
-    if args.reset_before_each and not args.dry_run:
+    if args.reset_before_each and not args.dry_run and not is_local_fixture_scenario(scenario):
         runtime_root = Path(args.queue_runtime_root)
         result["resets"] = [
             reset_channel_state(
@@ -1436,21 +1999,25 @@ def run_scenario(
             dry_run=args.dry_run,
             args=args,
         )
-        result["assertions"].extend(window["assertions"])
-        for key in (
-            "relay_count",
-            "raw_count",
-            "message_updates",
-            "sample_relay",
-            "provider_hold_prompts",
-            "provider_hold_states",
-            "cancel_turns",
-            "health_assertions",
-            "post_scenario_idle",
-        ):
-            if key in window:
-                result[key] = window[key]
+        _merge_record_into_result(result, window)
         result["status"] = "pass"
+    except ScenarioStepAssertionError as error:
+        result["status"] = "fail"
+        result["reason"] = f"assertion: {error}"
+        _merge_record_into_result(result, error.record)
+        if not args.dry_run:
+            try:
+                send_teardown_marker(
+                    client=client,
+                    channel_id=target_channel_id,
+                    scenario_id=scenario_id,
+                    cell=cell,
+                    run_id=run_id,
+                )
+            except Exception as teardown_error:  # noqa: BLE001 - report without masking failure
+                result["teardown_error"] = (
+                    f"{type(teardown_error).__name__}: {teardown_error}"
+                )
     except assertions.AssertionError as error:
         result["status"] = "fail"
         result["reason"] = f"assertion: {error}"
@@ -1499,6 +2066,15 @@ def run_one_cell(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     scenario_id = scenario.get("id")
+    if is_local_fixture_scenario(scenario):
+        return run_local_fixture_scenario(
+            scenario=scenario,
+            cell=cell,
+            channel_id=channel_id,
+            run_id=run_id,
+            dry_run=dry_run,
+        )
+
     setup_marker = f"### E2E SETUP {scenario_id} cell={cell} run={run_id}"
     record: dict[str, Any] = {"assertions": []}
 
@@ -1538,6 +2114,7 @@ def run_one_cell(
             first_send_done = True
 
     last_turn_identity: dict[str, str] | None = None
+    last_sent_prompt: str | None = None
 
     for step in scenario.get("steps") or []:
         if not isinstance(step, dict):
@@ -1545,9 +2122,10 @@ def run_one_cell(
         if "send_prompt" in step:
             _prepare_first_prompt_window()
             window.mark_prompt_sent()
+            last_sent_prompt = str(step["send_prompt"])
             response = client.send_prompt(
                 channel_id,
-                step["send_prompt"],
+                last_sent_prompt,
                 channel_kind=cell_channel_kind(cell),
             )
             last_turn_identity = turn_identity_from_send_response(
@@ -1562,6 +2140,7 @@ def run_one_cell(
                 scenario_id=str(scenario_id),
             )
             window.mark_prompt_sent()
+            last_sent_prompt = prompt
             response = client.send_prompt(
                 channel_id,
                 prompt,
@@ -1599,21 +2178,41 @@ def run_one_cell(
             time.sleep(float(step["wait_idle_s"]))
         elif "wait_for_discord_text" in step:
             needle = step["wait_for_discord_text"]
-            predicate = lambda message: (  # noqa: E731
-                assertions.is_relay_response(message)
-                and needle in (message.get("content") or "")
-            )
-            found, observed = client.wait_for_message(
-                channel_id,
-                predicate=predicate,
+            found, observed = wait_for_discord_text_with_tui_idle_draft_guard(
+                client=client,
+                channel_id=channel_id,
+                cell=cell,
                 after_id=after_id,
+                needle=str(needle),
+                prompt=last_sent_prompt,
+                thread_channel_id=(
+                    channel_id if scenario.get("requires_thread_channel") else None
+                ),
                 timeout_s=float(step.get("timeout_s", 240)),
                 debug_label=f"{scenario.get('id')}::{cell}::wait_for_text:{needle[:32]}",
             )
             _ingest_observed(observed)
             if not found:
-                raise assertions.AssertionError(
-                    f"timeout waiting for Discord text {needle!r}"
+                diagnostic = _collect_wait_timeout_diagnostics(
+                    base_url=client.base_url,
+                    channel_id=channel_id,
+                    cell=cell,
+                    scenario=scenario,
+                    thread_channel_id=(
+                        channel_id if scenario.get("requires_thread_channel") else None
+                    ),
+                    after_id=after_id,
+                    wait_kind="relay",
+                    needle=str(needle),
+                    prompt=last_sent_prompt,
+                    window=window,
+                )
+                record.setdefault("wait_timeouts", []).append(diagnostic)
+                _update_record_window_snapshot(record, window)
+                raise ScenarioStepAssertionError(
+                    f"timeout waiting for Discord text {needle!r}; "
+                    f"diagnostic={_payload_summary(diagnostic, max_chars=1400)}",
+                    record=record,
                 )
         elif "wait_for_raw_discord_text" in step:
             needle = step["wait_for_raw_discord_text"]
@@ -1630,8 +2229,26 @@ def run_one_cell(
             )
             _ingest_observed(observed)
             if not found:
-                raise assertions.AssertionError(
-                    f"timeout waiting for raw Discord text {needle!r}"
+                diagnostic = _collect_wait_timeout_diagnostics(
+                    base_url=client.base_url,
+                    channel_id=channel_id,
+                    cell=cell,
+                    scenario=scenario,
+                    thread_channel_id=(
+                        channel_id if scenario.get("requires_thread_channel") else None
+                    ),
+                    after_id=after_id,
+                    wait_kind="raw",
+                    needle=str(needle),
+                    prompt=last_sent_prompt,
+                    window=window,
+                )
+                record.setdefault("wait_timeouts", []).append(diagnostic)
+                _update_record_window_snapshot(record, window)
+                raise ScenarioStepAssertionError(
+                    f"timeout waiting for raw Discord text {needle!r}; "
+                    f"diagnostic={_payload_summary(diagnostic, max_chars=1400)}",
+                    record=record,
                 )
         elif "wait_for_provider_hold_state" in step:
             params = step["wait_for_provider_hold_state"] or {}
@@ -1760,6 +2377,21 @@ def run_one_cell(
             if bool(params.get("mark_prompt_sent", True)):
                 window.mark_prompt_sent()
             key_args = [str(key) for key in keys]
+            last_sent_prompt = (
+                str(params["diagnostic_prompt"])
+                if "diagnostic_prompt" in params
+                else _infer_direct_input_prompt_from_keys(key_args)
+            )
+            if last_sent_prompt:
+                record.setdefault("direct_input_prompts", []).append(
+                    {
+                        "mode": "send_keys_sequence",
+                        "prompt_preview": _truncate_text(
+                            last_sent_prompt,
+                            max_chars=700,
+                        ),
+                    }
+                )
             key_interval_s = float(
                 params.get("key_interval_s", params.get("interval_s", 0.0))
             )
@@ -1775,6 +2407,13 @@ def run_one_cell(
             thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
             session_name = cell_session_name(cell, thread_channel_id=thread_channel_id)
             window.mark_prompt_sent()
+            last_sent_prompt = str(step["send_keys"])
+            record.setdefault("direct_input_prompts", []).append(
+                {
+                    "mode": "send_keys",
+                    "prompt_preview": _truncate_text(last_sent_prompt, max_chars=700),
+                }
+            )
             if not tmux.send_keys(session_name, step["send_keys"]):
                 raise assertions.AssertionError(
                     f"tmux send-keys failed for session {session_name!r}"
@@ -1796,12 +2435,7 @@ def run_one_cell(
             time.sleep(final_refetch_interval_s)
         _ingest_observed(client.fetch_messages(channel_id, after_id=after_id, limit=100))
 
-    record["relay_count"] = len(window.messages)
-    record["raw_count"] = len(window.raw_messages)
-    record["message_updates"] = len(window.message_updates)
-    record["sample_relay"] = [
-        (m.get("content") or "")[:120] for m in window.messages[:6]
-    ]
+    _update_record_window_snapshot(record, window)
 
     for assertion_spec in scenario.get("assertions") or []:
         run_assertion(assertion_spec, window=window, record=record)
@@ -1824,6 +2458,90 @@ def run_one_cell(
         scenario_id=str(scenario_id),
         cell=cell,
         run_id=run_id,
+    )
+    return record
+
+
+def run_local_fixture_scenario(
+    *,
+    scenario: dict[str, Any],
+    cell: str,
+    channel_id: str,
+    run_id: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    scenario_id = str(scenario.get("id"))
+    record: dict[str, Any] = {
+        "assertions": [],
+        "local_fixture": True,
+        "fixture_steps": [],
+    }
+    if dry_run:
+        print(f"[dry-run] {scenario_id} ({cell}): would replay local fixture")
+        return record
+
+    window = assertions.Window(setup_marker_id=f"fixture-setup-{scenario_id}")
+    for step in scenario.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        if "replay_fixture" in step:
+            result = fixtures.replay_fixture(
+                step["replay_fixture"],
+                cell=cell,
+                channel_id=channel_id,
+                scenario_id=scenario_id,
+                run_id=run_id,
+            )
+            for message in result["messages"]:
+                window.add(message)
+            record.setdefault("fixture_replays", []).append(result["replay"])
+            record["fixture_state"] = result["state"]
+            record["fixture_health"] = result["health"]
+            record["fixture_steps"].append(
+                {
+                    "step": "replay_fixture",
+                    "kind": result["replay"]["kind"],
+                    "deliveries": result["replay"]["deliveries"],
+                }
+            )
+        elif "fixture_followup_probe" in step:
+            probe = fixtures.probe_followup_ready(
+                record,
+                step["fixture_followup_probe"],
+            )
+            record.setdefault("fixture_followup_probes", []).append(probe)
+            record["fixture_steps"].append(
+                {"step": "fixture_followup_probe", "accepted": probe["accepted"]}
+            )
+        elif "wait_idle_s" in step:
+            time.sleep(float(step["wait_idle_s"]))
+        else:
+            raise assertions.AssertionError(f"unknown local fixture step shape: {step!r}")
+
+    record["relay_count"] = len(window.messages)
+    record["raw_count"] = len(window.raw_messages)
+    record["message_updates"] = len(window.message_updates)
+    record["sample_relay"] = [
+        (message.get("content") or "")[:120] for message in window.messages[:6]
+    ]
+
+    for assertion_spec in scenario.get("assertions") or []:
+        run_assertion(assertion_spec, window=window, record=record)
+        record["assertions"].append({"spec": assertion_spec, "passed": True})
+
+    idle_check = {
+        "channel_id": str(channel_id),
+        "provider": cell_provider(cell),
+        "status": "idle",
+        "source": "local_fixture",
+    }
+    record["post_scenario_idle"] = idle_check
+    record["assertions"].append(
+        {
+            "spec": {"post_scenario_fixture_idle": True},
+            "passed": True,
+            "details": idle_check,
+        }
     )
     return record
 
@@ -2151,6 +2869,26 @@ def run_assertion(
         assertions.no_control_chars(window)
     elif spec.get("no_resume_prompt_chrome"):
         assertions.no_resume_prompt_chrome(window)
+    elif "fixture_state" in spec:
+        fixtures.assert_fixture_state(record, spec["fixture_state"])
+    elif "fixture_task_notification" in spec:
+        params = spec["fixture_task_notification"]
+        if not isinstance(params, dict):
+            raise assertions.AssertionError(
+                f"fixture_task_notification requires mapping: {spec!r}"
+            )
+        fixtures.assert_fixture_task_notification(record, params)
+    elif "fixture_finalized" in spec:
+        fixtures.assert_fixture_finalized(record, spec["fixture_finalized"])
+    elif spec.get("fixture_followup_ready"):
+        fixtures.assert_fixture_followup_ready(record)
+    elif spec.get("fixture_no_health_degradation"):
+        fixtures.assert_fixture_no_health_degradation(record)
+    elif "fixture_task_complete_finalized" in spec:
+        fixtures.assert_fixture_task_complete_finalized(
+            record,
+            spec["fixture_task_complete_finalized"],
+        )
     else:
         raise assertions.AssertionError(f"unknown assertion: {spec!r}")
 

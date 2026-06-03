@@ -30,8 +30,7 @@ src/
 │   ├── migrate/
 │   │   ├── apply.rs
 │   │   ├── plan.rs
-│   │   ├── source.rs
-│   │   └── tests.rs
+│   │   └── source.rs
 │   ├── provider_cli/
 │   │   └── mod.rs
 │   ├── args.rs
@@ -60,6 +59,7 @@ src/
 │   │   ├── phase_gates.rs
 │   │   ├── queries.rs
 │   │   ├── runs.rs
+│   │   ├── slot_predicate.rs
 │   │   ├── slots.rs
 │   │   ├── test_support.rs
 │   │   └── tests.rs
@@ -104,7 +104,6 @@ src/
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
-│   ├── schema.rs
 │   ├── session_agent_resolution.rs
 │   ├── session_observability.rs
 │   ├── session_status.rs
@@ -113,16 +112,11 @@ src/
 │   └── turns.rs
 ├── dispatch/
 │   ├── dispatch_cancel.rs
-│   ├── dispatch_cancel_tests.rs
 │   ├── dispatch_channel.rs
-│   ├── dispatch_channel_relocated_tests.rs
 │   ├── dispatch_context.rs
-│   ├── dispatch_context_relocated_tests.rs
 │   ├── dispatch_create.rs
-│   ├── dispatch_create_relocated_tests.rs
 │   ├── dispatch_query.rs
 │   ├── dispatch_status.rs
-│   ├── dispatch_status_relocated_tests.rs
 │   ├── dispatch_summary.rs
 │   ├── mod.rs
 │   ├── test_support.rs
@@ -148,8 +142,7 @@ src/
 │   │   ├── queue_ops.rs
 │   │   ├── review_automation_ops.rs
 │   │   ├── review_ops.rs
-│   │   ├── runtime_ops.rs
-│   │   └── tests.rs
+│   │   └── runtime_ops.rs
 │   ├── hooks.rs
 │   ├── intent.rs
 │   ├── loader.rs
@@ -163,15 +156,6 @@ src/
 │   ├── mod.rs
 │   ├── sync.rs
 │   └── triage.rs
-├── integration_tests/
-│   ├── discord_flow/
-│   │   ├── harness.rs
-│   │   ├── mock_discord.rs
-│   │   ├── mod.rs
-│   │   └── scenarios.rs
-│   ├── tests/
-│   │   └── high_risk_recovery.rs
-│   └── agents_setup_e2e.rs
 ├── kanban/
 │   ├── audit.rs
 │   ├── github_sync.rs
@@ -181,7 +165,6 @@ src/
 │   ├── review_tuning.rs
 │   ├── state_machine.rs
 │   ├── terminal_cleanup.rs
-│   ├── test_support.rs
 │   ├── transition_cleanup.rs
 │   └── transition_core.rs
 ├── runtime_layout/
@@ -202,11 +185,8 @@ src/
 │   │   ├── dispatches/
 │   │   │   ├── crud.rs
 │   │   │   ├── discord_delivery.rs
-│   │   │   ├── discord_delivery_tests.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── outbox.rs
-│   │   │   ├── outbox_tests.rs
-│   │   │   ├── tests.rs
 │   │   │   └── thread_reuse.rs
 │   │   ├── domains/
 │   │   │   ├── access.rs
@@ -222,25 +202,12 @@ src/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── review_state_repo.rs
-│   │   │   ├── tests.rs
 │   │   │   ├── tuning_aggregate.rs
 │   │   │   └── verdict_route.rs
-│   │   ├── routes_tests/
-│   │   │   ├── agents_tests.rs
-│   │   │   ├── api_docs_tests.rs
-│   │   │   ├── auto_queue_tests.rs
-│   │   │   ├── common.rs
-│   │   │   ├── dispatch_tests.rs
-│   │   │   ├── github_tests.rs
-│   │   │   ├── health_tests.rs
-│   │   │   ├── infra_tests.rs
-│   │   │   ├── kanban_tests.rs
-│   │   │   └── mod.rs
 │   │   ├── agents.rs
 │   │   ├── agents_crud.rs
 │   │   ├── agents_setup.rs
 │   │   ├── analytics.rs
-│   │   ├── analytics_tests.rs
 │   │   ├── auth.rs
 │   │   ├── auto_queue.rs
 │   │   ├── automation_candidates.rs
@@ -279,7 +246,6 @@ src/
 │   │   ├── routines.rs
 │   │   ├── session_activity.rs
 │   │   ├── settings.rs
-│   │   ├── settings_tests.rs
 │   │   ├── skill_usage_analytics.rs
 │   │   ├── skills_api.rs
 │   │   ├── stats.rs
@@ -314,13 +280,6 @@ src/
 │   │   ├── queue_metrics.rs
 │   │   └── session_metrics.rs
 │   ├── api_friction/
-│   │   ├── tests/
-│   │   │   ├── helpers.rs
-│   │   │   ├── memory_sync.rs
-│   │   │   ├── mod.rs
-│   │   │   ├── parser.rs
-│   │   │   ├── pg_storage.rs
-│   │   │   └── processing.rs
 │   │   ├── core.rs
 │   │   ├── issue_body.rs
 │   │   ├── issues.rs
@@ -378,11 +337,13 @@ src/
 │   │   ├── intake_routing.rs
 │   │   ├── intake_worker.rs
 │   │   ├── mod.rs
+│   │   ├── node_registry.rs
 │   │   ├── registry_adapter_sink.rs
 │   │   ├── relay_producer_registry.rs
 │   │   ├── session_discovery.rs
 │   │   ├── session_matcher.rs
 │   │   ├── session_registry.rs
+│   │   ├── session_routing.rs
 │   │   ├── stream_relay.rs
 │   │   └── watcher_supervisor.rs
 │   ├── codex_tui/
@@ -445,8 +406,11 @@ src/
 │   │   │   ├── recent_events.rs
 │   │   │   ├── session_panel.rs
 │   │   │   ├── status_events.rs
+│   │   │   ├── status_panel.rs
+│   │   │   ├── subagent_rollout.rs
 │   │   │   ├── task_panel.rs
-│   │   │   └── tests.rs
+│   │   │   ├── tests.rs
+│   │   │   └── workflow_panel.rs
 │   │   ├── prompt_builder/
 │   │   │   ├── dispatch_contract.rs
 │   │   │   ├── dispatch_contract_tests.rs
@@ -454,12 +418,22 @@ src/
 │   │   │   ├── manifest.rs
 │   │   │   ├── memory_guidance.rs
 │   │   │   ├── mod.rs
-│   │   │   ├── section_dedupe.rs
-│   │   │   └── tests.rs
+│   │   │   └── section_dedupe.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── mod.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
+│   │   │   ├── message_handler/
+│   │   │   │   ├── attachments.rs
+│   │   │   │   ├── control.rs
+│   │   │   │   ├── goal_lifecycle.rs
+│   │   │   │   ├── headless_turn.rs
+│   │   │   │   ├── intake_turn.rs
+│   │   │   │   ├── provider_isolation.rs
+│   │   │   │   ├── session_strategy_lifecycle_tests.rs
+│   │   │   │   ├── tui_followup.rs
+│   │   │   │   ├── turn_lifecycle.rs
+│   │   │   │   └── watchdog.rs
 │   │   │   ├── authorization.rs
 │   │   │   ├── control_intent.rs
 │   │   │   ├── dispatch_trigger.rs
@@ -467,7 +441,6 @@ src/
 │   │   │   ├── message_handler.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── response_format.rs
-│   │   │   ├── tests.rs
 │   │   │   ├── thread_binding.rs
 │   │   │   └── turn_start.rs
 │   │   ├── settings/
@@ -488,7 +461,6 @@ src/
 │   │   │   ├── skill_usage.rs
 │   │   │   ├── stale_resume.rs
 │   │   │   ├── terminal_delivery.rs
-│   │   │   ├── tests.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   └── turn_analytics.rs
 │   │   ├── watchers/
@@ -497,6 +469,7 @@ src/
 │   │   ├── adk_session.rs
 │   │   ├── agent_handoff.rs
 │   │   ├── agentdesk_config.rs
+│   │   ├── answer_flush_barrier.rs
 │   │   ├── discord_io.rs
 │   │   ├── formatting.rs
 │   │   ├── gateway.rs
@@ -539,9 +512,12 @@ src/
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
 │   │   ├── settings.rs
+│   │   ├── shadow_parity_warn.rs
 │   │   ├── shared_memory.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
+│   │   ├── status_panel_controller.rs
+│   │   ├── status_panel_orphan_store.rs
 │   │   ├── streaming_finalizer.rs
 │   │   ├── task_supervisor.rs
 │   │   ├── tmux.rs
@@ -556,6 +532,8 @@ src/
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
 │   │   ├── tui_prompt_relay.rs
+│   │   ├── tui_task_card.rs
+│   │   ├── turn_finalizer.rs
 │   │   ├── voice_background_driver.rs
 │   │   ├── voice_barge_in.rs
 │   │   └── voice_routing.rs
@@ -677,6 +655,7 @@ src/
 │   ├── pr_summary.rs
 │   ├── process.rs
 │   ├── provider.rs
+│   ├── provider_auth.rs
 │   ├── provider_exec.rs
 │   ├── provider_hosting.rs
 │   ├── provider_runtime.rs
@@ -746,7 +725,6 @@ src/
 ├── credential.rs
 ├── error.rs
 ├── high_risk_recovery.rs
-├── integration_tests.rs
 ├── launch.rs
 ├── lib.rs
 ├── logging.rs
@@ -776,7 +754,6 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/dispatch/` | Dispatch context construction, review metadata, and worktree targeting. |
 | `src/engine/` | QuickJS policy runtime, hook wiring, transition logic, and Rust-JS bridge ops. |
 | `src/github/` | GitHub sync, issue triage, and Definition-of-Done mirroring. |
-| `src/integration_tests/` | Scenario-specific integration test modules that supplement `src/integration_tests.rs`. |
 | `src/kanban/` | High-level kanban orchestration, state machine facade, and shared test support. |
 | `src/runtime_layout/` | Managed runtime layout, memory-path migration, shared prompt sync, and skill deployment. |
 | `src/server/` | Axum server boot, routes, workers, background loops, and WebSocket broadcast. |
@@ -790,7 +767,6 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/credential.rs` | Reads runtime credential files such as Discord bot tokens from the AgentDesk root. |
 | `src/error.rs` | Shared HTTP and policy error type with typed codes and JSON response helpers. |
 | `src/high_risk_recovery.rs` | PG-only high-risk recovery tests for boot reconciliation and review refire paths. |
-| `src/integration_tests.rs` | End-to-end pipeline, dispatch, review, and recovery integration test harness. |
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |
 | `src/lib.rs` | Library crate boundary that exposes the server/CLI modules for the slim binary entry point and tests. |
 | `src/logging.rs` | Tracing span helpers that stamp dispatch, card, agent, and hook context onto logs. |

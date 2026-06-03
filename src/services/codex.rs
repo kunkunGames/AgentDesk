@@ -29,7 +29,8 @@ use crate::services::session_backend::{
 };
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, tmux_session_exists, tmux_session_has_live_pane,
+    record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
+    tmux_session_exists, tmux_session_has_live_pane,
 };
 
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
@@ -275,7 +276,7 @@ fn render_codex_wrapper_tmux_script(
         --input-fifo {input_fifo} \\\n  \
         --prompt-file {prompt} \\\n  \
         --cwd {wd} \\\n  \
-        --input-mode pipe{wrapper_args}\n",
+        --input-mode fifo{wrapper_args}\n",
         env = env_lines,
         exe = shell_escape(exe),
         output = shell_escape(output_path),
@@ -656,23 +657,73 @@ fn should_preserve_live_reused_provider_session(
         && !force_fresh_provider_session
 }
 
+/// Input transport a live Codex tmux wrapper was launched with, inferred from
+/// its launch `.sh` marker. `Unknown` covers a missing/unreadable marker (e.g.
+/// a dcserver restart that lost /tmp), which is distinct from an explicit
+/// legacy `Pipe` marker — the two must be treated differently when deciding
+/// whether to preserve a live pane.
 #[cfg(unix)]
-fn codex_wrapper_script_uses_pipe_input(script: &str) -> bool {
-    script
-        .lines()
-        .any(|line| line.trim() == "--input-mode pipe \\" || line.trim() == "--input-mode pipe")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexWrapperInputMode {
+    Fifo,
+    Pipe,
+    Unknown,
 }
 
 #[cfg(unix)]
-fn codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name: &str) -> bool {
+fn codex_wrapper_script_input_mode(script: &str) -> CodexWrapperInputMode {
+    let mentions = |needle: &str| {
+        script
+            .lines()
+            .any(|line| line.trim() == format!("{needle} \\") || line.trim() == needle)
+    };
+    if mentions("--input-mode fifo") {
+        CodexWrapperInputMode::Fifo
+    } else if mentions("--input-mode pipe") {
+        CodexWrapperInputMode::Pipe
+    } else {
+        CodexWrapperInputMode::Unknown
+    }
+}
+
+#[cfg(unix)]
+fn codex_tmux_wrapper_session_input_mode(tmux_session_name: &str) -> CodexWrapperInputMode {
     let Some(script_path) =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "sh")
     else {
-        return false;
+        return CodexWrapperInputMode::Unknown;
     };
     std::fs::read_to_string(script_path)
-        .map(|script| codex_wrapper_script_uses_pipe_input(&script))
-        .unwrap_or(false)
+        .map(|script| codex_wrapper_script_input_mode(&script))
+        .unwrap_or(CodexWrapperInputMode::Unknown)
+}
+
+#[cfg(unix)]
+fn codex_fifo_wrapper_session_usable(
+    has_live_pane: bool,
+    has_output_path: bool,
+    input_mode: CodexWrapperInputMode,
+    has_input_fifo_path: bool,
+) -> bool {
+    // A reused FIFO wrapper needs the live pane / output transport, an explicit
+    // FIFO input mode this build can drive, and a resolvable input FIFO, because
+    // the follow-up path now writes the base64 sentinel line directly into that
+    // FIFO (issue #3001). Without the FIFO file there is nothing to write to, so
+    // the session is not reusable.
+    has_live_pane
+        && has_output_path
+        && input_mode == CodexWrapperInputMode::Fifo
+        && has_input_fifo_path
+}
+
+/// Whether a live, resume-eligible Codex pane should be preserved (not killed)
+/// when its I/O files are unavailable. Preserve FIFO-mode panes this build can
+/// drive and Unknown panes (missing marker after restart), but NOT an explicit
+/// legacy pipe-mode pane — that one cannot be driven here and must be recreated
+/// (which resumes the conversation via session id) instead of stranding.
+#[cfg(unix)]
+fn codex_input_mode_allows_live_session_preservation(input_mode: CodexWrapperInputMode) -> bool {
+    !matches!(input_mode, CodexWrapperInputMode::Pipe)
 }
 
 #[cfg(unix)]
@@ -1514,7 +1565,6 @@ fn execute_streaming_remote_tmux(
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 fn execute_streaming_local_tui_tmux(
     prompt: &str,
     session_id: Option<&str>,
@@ -1679,6 +1729,13 @@ fn execute_streaming_local_tui_tmux(
     }
 
     crate::services::platform::tmux::set_option(tmux_session_name, "remain-on-exit", "on");
+
+    // #3087: stamp a per-spawn nonce on the Codex-TUI DIRECT spawn path too.
+    // Without it this path produces no `.spawn_nonce`, so the status-panel
+    // instance key is `None` and the new-session boundary cannot be detected.
+    if let Err(e) = crate::services::discord::write_spawn_nonce(tmux_session_name) {
+        tracing::warn!("failed to write spawn nonce for {tmux_session_name} (codex-tui): {e}");
+    }
 
     if let Some(ref token) = cancel_token {
         *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -1979,10 +2036,13 @@ fn execute_streaming_local_tmux(
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
-    let session_usable = has_live_pane
-        && resolved_output.is_some()
-        && resolved_input.is_some()
-        && codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name);
+    let wrapper_input_mode = codex_tmux_wrapper_session_input_mode(tmux_session_name);
+    let session_usable = codex_fifo_wrapper_session_usable(
+        has_live_pane,
+        resolved_output.is_some(),
+        wrapper_input_mode,
+        resolved_input.is_some(),
+    );
 
     if should_reuse_existing_provider_session(session_usable, force_fresh_provider_session) {
         let output_path = resolved_output
@@ -2019,17 +2079,26 @@ fn execute_streaming_local_tmux(
                 // Fall through to new session creation below
             }
         }
-    } else if should_preserve_live_reused_provider_session(
-        session_id,
-        has_live_pane,
-        force_fresh_provider_session,
-    ) {
+    } else if codex_input_mode_allows_live_session_preservation(wrapper_input_mode)
+        && should_preserve_live_reused_provider_session(
+            session_id,
+            has_live_pane,
+            force_fresh_provider_session,
+        )
+    {
+        // Refuse cleanup for a live wrapper whose input/output files are merely
+        // temporarily missing (e.g. a dcserver restart lost /tmp): FIFO-mode
+        // panes this build can drive, and Unknown panes whose marker is gone. A
+        // live legacy pipe-mode pane is NOT drivable here, so it must fall
+        // through to the recreate branch — which resumes the conversation via
+        // session id — instead of hard-erroring and stranding the user during a
+        // deploy rollover.
         tracing::warn!(
             tmux_session_name,
             session_id = session_id.unwrap_or_default(),
             output_path_present = resolved_output.is_some(),
             input_path_present = resolved_input.is_some(),
-            pipe_input = codex_tmux_wrapper_session_uses_pipe_input(tmux_session_name),
+            wrapper_input_mode = ?wrapper_input_mode,
             "refusing to kill live Codex tmux selected for provider-session reuse"
         );
         return Err(format!(
@@ -2057,7 +2126,23 @@ fn execute_streaming_local_tmux(
         .cleanup_best_effort();
 
     std::fs::write(&output_path, "").map_err(|e| format!("Failed to create output file: {}", e))?;
+
+    // Create the named input FIFO that the wrapper reads followups from. A FIFO
+    // has no terminal line discipline, so the base64 sentinel line we later
+    // write is delivered to the wrapper's BufReader::lines() loop unambiguously
+    // (unlike PTY paste, which stranded reused prompts — see issue #3001).
     let _ = std::fs::remove_file(&input_fifo_path);
+    let mkfifo = Command::new("mkfifo")
+        .arg(&input_fifo_path)
+        .output()
+        .map_err(|e| format!("Failed to create input FIFO: {}", e))?;
+    if !mkfifo.status.success() {
+        let _ = std::fs::remove_file(&output_path);
+        return Err(format!(
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&mkfifo.stderr)
+        ));
+    }
 
     std::fs::write(&prompt_path, prompt)
         .map_err(|e| format!("Failed to write prompt file: {}", e))?;
@@ -2126,6 +2211,13 @@ fn execute_streaming_local_tmux(
         crate::services::tmux_common::session_temp_path(tmux_session_name, "generation");
     let current_gen = crate::services::discord::runtime_store::load_generation();
     let _ = std::fs::write(&gen_marker_path, current_gen.to_string());
+
+    // #3087: stamp a per-spawn nonce in a SEPARATE marker (see claude.rs). The
+    // status-panel session-instance key reads this unique nonce instead of the
+    // `.generation` mtime, eliminating mtime missing/duplicate collisions.
+    if let Err(e) = crate::services::discord::write_spawn_nonce(tmux_session_name) {
+        tracing::warn!("failed to write spawn nonce for {tmux_session_name}: {e}");
+    }
 
     if let Some(ref token) = cancel_token {
         *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -2210,46 +2302,70 @@ fn codex_pipe_prompt_lines(prompt: &str) -> Vec<String> {
 }
 
 #[cfg(unix)]
-fn send_codex_pipe_prompt_to_tmux(tmux_session_name: &str, prompt: &str) -> Result<(), String> {
-    let encoded = codex_pipe_prompt_lines(prompt).join("\n");
-    let buffer_name = format!("agentdesk-codex-pipe-input-{}", uuid::Uuid::new_v4());
-    let load_output = crate::services::platform::tmux::load_buffer(&buffer_name, &encoded)?;
-    if !load_output.status.success() {
-        let stderr = String::from_utf8_lossy(&load_output.stderr)
-            .trim()
-            .to_string();
-        let detail = if stderr.is_empty() {
-            load_output.status.to_string()
-        } else {
-            stderr
-        };
-        return Err(format!("tmux load-buffer failed: {detail}"));
+fn codex_pipe_prompt_buffer_text(prompt: &str) -> String {
+    let mut encoded = codex_pipe_prompt_lines(prompt).join("\n");
+    encoded.push('\n');
+    encoded
+}
+
+#[cfg(unix)]
+fn send_codex_pipe_prompt_to_fifo(input_fifo_path: &str, prompt: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    // The reused wrapper runs with `--input-mode fifo` and reads followups from
+    // a named FIFO via BufReader::lines(). A FIFO has no terminal line
+    // discipline, so writing the newline-terminated base64 sentinel line(s)
+    // delivers each line unambiguously to the wrapper's decode loop — unlike the
+    // old PTY paste path, which stranded the prompt at "Ready for input"
+    // because the line discipline never submitted the sentinel (issue #3001).
+    let encoded = codex_pipe_prompt_buffer_text(prompt);
+
+    // Open the write side with O_NONBLOCK. The reuse gate observed the FIFO path,
+    // but the wrapper (and thus the FIFO reader) can exit between that check and
+    // this write while the FIFO file lingers — wrapper error paths preserve
+    // session files. A *blocking* O_WRONLY open on a reader-less FIFO would hang
+    // forever and never reach the stale-session recreation path below. With
+    // O_NONBLOCK the open instead fails fast with ENXIO, which we surface as a
+    // recoverable error so the caller can recreate/resume the session (#3001).
+    let fifo = match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(input_fifo_path)
+    {
+        Ok(fifo) => fifo,
+        Err(e) => {
+            // ENXIO == FIFO has no reader attached (wrapper gone). Normalize the
+            // message so should_recreate_session_after_followup_fifo_error()
+            // classifies it as recoverable on every platform (macOS reports
+            // "Device not configured", Linux "No such device or address").
+            if e.raw_os_error() == Some(libc::ENXIO) {
+                return Err(format!(
+                    "Failed to open input FIFO {input_fifo_path}: No such device (no reader attached: {e})"
+                ));
+            }
+            return Err(format!("Failed to open input FIFO {input_fifo_path}: {e}"));
+        }
+    };
+
+    // A reader is attached. Clear O_NONBLOCK so the subsequent write blocks
+    // normally if the prompt exceeds the kernel pipe buffer (chunked base64 can
+    // exceed 64KiB), instead of returning EAGAIN and dropping bytes.
+    let fd = fifo.as_raw_fd();
+    // SAFETY: fd is a valid, owned descriptor for the lifetime of `fifo`.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
     }
-    let paste_output =
-        crate::services::platform::tmux::paste_buffer_raw(tmux_session_name, &buffer_name, true)?;
-    if !paste_output.status.success() {
-        let stderr = String::from_utf8_lossy(&paste_output.stderr)
-            .trim()
-            .to_string();
-        let detail = if stderr.is_empty() {
-            paste_output.status.to_string()
-        } else {
-            stderr
-        };
-        return Err(format!("tmux paste-buffer failed: {detail}"));
-    }
-    let enter_output = crate::services::platform::tmux::send_keys(tmux_session_name, &["Enter"])?;
-    if !enter_output.status.success() {
-        let stderr = String::from_utf8_lossy(&enter_output.stderr)
-            .trim()
-            .to_string();
-        let detail = if stderr.is_empty() {
-            enter_output.status.to_string()
-        } else {
-            stderr
-        };
-        return Err(format!("tmux send Enter failed: {detail}"));
-    }
+
+    let mut fifo = fifo;
+    fifo.write_all(encoded.as_bytes())
+        .map_err(|e| format!("Failed to write to input FIFO {input_fifo_path}: {e}"))?;
+    fifo.flush()
+        .map_err(|e| format!("Failed to flush input FIFO {input_fifo_path}: {e}"))?;
     Ok(())
 }
 
@@ -2264,8 +2380,19 @@ fn send_followup_to_tmux(
 ) -> Result<FollowupResult, String> {
     let start_offset = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
 
-    send_codex_pipe_prompt_to_tmux(tmux_session_name, prompt)
-        .map_err(|e| format!("Failed to send Codex pipe prompt to tmux: {e}"))?;
+    if let Err(error) = send_codex_pipe_prompt_to_fifo(input_fifo_path, prompt) {
+        // The reuse gate passed, but the FIFO/reader can disappear between that
+        // check and this write (wrapper exited, cleaned up its FIFO, broken
+        // pipe). Treat those infrastructure failures as a stale session and
+        // request recreation (which resumes via session id) instead of surfacing
+        // a hard provider error — mirroring the Claude/Qwen FIFO follow-up path.
+        if should_recreate_session_after_followup_fifo_error(&error) {
+            return Ok(FollowupResult::RecreateSession { error });
+        }
+        return Err(format!(
+            "Failed to send Codex follow-up prompt to input FIFO: {error}"
+        ));
+    }
 
     if let Some(ref token) = cancel_token {
         *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -2288,9 +2415,10 @@ fn send_followup_to_tmux(
         Err(failure) => {
             let output_exists = std::fs::metadata(output_path).is_ok();
             let current_file_len = std::fs::metadata(output_path).ok().map(|meta| meta.len());
-            // Codex legacy wrapper now runs in tmux pipe mode. There is no
-            // FIFO file to stat; the live tmux pane is the input transport.
-            let input_exists = true;
+            // Codex legacy wrapper runs in tmux fifo mode: follow-ups are
+            // written to a named input FIFO, so the FIFO file is the input
+            // transport and can be stat'd directly.
+            let input_exists = std::fs::metadata(input_fifo_path).is_ok();
             let session_alive = tmux_session_has_live_pane(tmux_session_name);
             let ready_for_input = session_alive
                 && crate::services::tui_turn_state::jsonl_ready_for_input(
@@ -2683,9 +2811,12 @@ fn handle_codex_json_line(
                     "command_execution" => {
                         let command = item.get("command").and_then(|v| v.as_str()).unwrap_or("");
                         let input = serde_json::json!({ "command": command }).to_string();
+                        let tool_use_id =
+                            item.get("id").and_then(|v| v.as_str()).map(str::to_string);
                         let _ = sender.send(StreamMessage::ToolUse {
                             name: "Bash".to_string(),
                             input,
+                            tool_use_id,
                         });
                     }
                     "reasoning" => {
@@ -2699,15 +2830,28 @@ fn handle_codex_json_line(
             if let Some(invocation) = codex_mcp_invocation(&json)
                 && let Some(name) = codex_mcp_tool_name(invocation)
             {
+                let tool_use_id = json
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 let _ = sender.send(StreamMessage::ToolUse {
                     name,
                     input: codex_mcp_arguments(invocation),
+                    tool_use_id,
                 });
             }
         }
         "mcp_tool_call_end" => {
             let (content, is_error) = codex_mcp_result(json.get("result").unwrap_or(&Value::Null));
-            let _ = sender.send(StreamMessage::ToolResult { content, is_error });
+            let tool_use_id = json
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let _ = sender.send(StreamMessage::ToolResult {
+                content,
+                is_error,
+                tool_use_id,
+            });
         }
         "background_event" => {
             if let Some(summary) = codex_background_event_summary(&json) {
@@ -2745,7 +2889,13 @@ fn handle_codex_json_line(
                             .and_then(|v| v.as_i64())
                             .map(|code| code != 0)
                             .unwrap_or(false);
-                        let _ = sender.send(StreamMessage::ToolResult { content, is_error });
+                        let tool_use_id =
+                            item.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                        let _ = sender.send(StreamMessage::ToolResult {
+                            content,
+                            is_error,
+                            tool_use_id,
+                        });
                     }
                     "reasoning" => {
                         let _ = sender.send(StreamMessage::redacted_thinking());
@@ -2806,8 +2956,10 @@ mod tui_hosting_tests {
     };
     #[cfg(unix)]
     use super::{
+        CodexWrapperInputMode, codex_fifo_wrapper_session_usable,
+        codex_input_mode_allows_live_session_preservation,
         codex_tui_existing_session_termination_reason,
-        codex_wrapper_existing_session_termination_reason, codex_wrapper_script_uses_pipe_input,
+        codex_wrapper_existing_session_termination_reason, codex_wrapper_script_input_mode,
     };
     use crate::services::discord::restart_report::{
         RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
@@ -3121,19 +3273,65 @@ mod tui_hosting_tests {
         assert!(script.contains("'developer rules'"));
         assert!(script.contains("'--compact-token-limit'"));
         assert!(script.contains("'120000'"));
-        assert!(script.contains("--input-mode pipe"));
+        assert!(script.contains("--input-mode fifo"));
+        // The wrapper script no longer self-creates the FIFO; the parent
+        // (execute_streaming_local_tmux) mkfifo's it before launch.
         assert!(!script.contains("mkfifo"));
         assert!(!script.contains("exec '/opt/bin/codex' "));
     }
 
     #[cfg(unix)]
     #[test]
-    fn codex_wrapper_pipe_input_detector_rejects_legacy_scripts() {
+    fn codex_wrapper_input_mode_detector_distinguishes_fifo_pipe_and_unknown() {
+        let fifo_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-mode fifo \\\n";
         let pipe_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-mode pipe \\\n";
-        let legacy_script = "exec agentdesk codex-tmux-wrapper \\\n  --input-fifo /tmp/in \\\n";
+        let unknown_script = "exec agentdesk codex-tmux-wrapper \\\n  --output-file /tmp/o \\\n";
 
-        assert!(codex_wrapper_script_uses_pipe_input(pipe_script));
-        assert!(!codex_wrapper_script_uses_pipe_input(legacy_script));
+        assert_eq!(
+            codex_wrapper_script_input_mode(fifo_script),
+            CodexWrapperInputMode::Fifo
+        );
+        assert_eq!(
+            codex_wrapper_script_input_mode(pipe_script),
+            CodexWrapperInputMode::Pipe
+        );
+        assert_eq!(
+            codex_wrapper_script_input_mode(unknown_script),
+            CodexWrapperInputMode::Unknown
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fifo_wrapper_reuse_requires_live_pane_output_fifo_mode_and_fifo_file() {
+        use CodexWrapperInputMode::{Fifo, Pipe, Unknown};
+        // All four conditions must hold: live pane, output transport, explicit
+        // fifo input mode, and a resolvable input FIFO to write the follow-up
+        // sentinel to.
+        assert!(codex_fifo_wrapper_session_usable(true, true, Fifo, true));
+        assert!(!codex_fifo_wrapper_session_usable(false, true, Fifo, true));
+        assert!(!codex_fifo_wrapper_session_usable(true, false, Fifo, true));
+        assert!(!codex_fifo_wrapper_session_usable(true, true, Pipe, true));
+        assert!(!codex_fifo_wrapper_session_usable(
+            true, true, Unknown, true
+        ));
+        assert!(!codex_fifo_wrapper_session_usable(true, true, Fifo, false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_live_session_preservation_excludes_only_explicit_pipe_mode() {
+        // FIFO-mode (drivable here) and Unknown (marker lost after restart) are
+        // preserved; explicit legacy pipe-mode is recreated, not stranded.
+        assert!(codex_input_mode_allows_live_session_preservation(
+            CodexWrapperInputMode::Fifo
+        ));
+        assert!(codex_input_mode_allows_live_session_preservation(
+            CodexWrapperInputMode::Unknown
+        ));
+        assert!(!codex_input_mode_allows_live_session_preservation(
+            CodexWrapperInputMode::Pipe
+        ));
     }
 
     #[test]
@@ -3213,589 +3411,68 @@ mod tui_hosting_tests {
     }
 }
 
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use std::sync::mpsc;
-
-    use super::{
-        CODEX_BACKGROUND_TASK_NOTIFICATION_ID, CODEX_BACKGROUND_TASK_NOTIFICATION_STATUS,
-        CodexLaunchOptions, TMUX_PROMPT_B64_PREFIX, base_exec_args, build_codex_exec_args,
-        build_tmux_launch_env_lines, compose_codex_developer_instructions, compose_codex_prompt,
-        handle_codex_json_line,
-    };
-    use crate::services::agent_protocol::StreamMessage;
-    use crate::services::discord::restart_report::{
-        RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
-    };
-    use crate::services::provider::ProviderKind;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use serde_json::Value;
-
+#[cfg(test)]
+mod codex_fifo_followup_transport_tests {
+    #[cfg(unix)]
     #[test]
-    fn test_tmux_launch_env_lines_include_exec_path_and_report_envs() {
-        let env_lines = build_tmux_launch_env_lines(
-            Some("/tmp/provider:/usr/bin"),
-            Some(42),
-            Some(ProviderKind::Codex),
+    fn reused_fifo_wrapper_buffer_keeps_protocol_line_terminated() {
+        let buffer = super::codex_pipe_prompt_buffer_text("[E2E:E2:TURN-2]\nreply json");
+
+        assert!(buffer.starts_with(super::TMUX_PROMPT_B64_PREFIX));
+        assert!(
+            buffer.ends_with('\n'),
+            "the FIFO protocol line must be newline-terminated so the wrapper's BufReader::lines() loop submits it"
         );
-
-        assert!(env_lines.contains("unset CLAUDECODE"));
-        assert!(env_lines.contains("export PATH='/tmp/provider:/usr/bin'"));
-        assert!(env_lines.contains(&format!("export {}=42", RESTART_REPORT_CHANNEL_ENV)));
-        assert!(env_lines.contains(&format!("export {}=codex", RESTART_REPORT_PROVIDER_ENV)));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_handle_codex_json_line_maps_thread_and_turn_completion() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
+    fn send_codex_pipe_prompt_writes_sentinel_to_fifo() {
+        use std::io::Read;
 
-        let _ = handle_codex_json_line(
-            r#"{"type":"thread.started","thread_id":"thread-1"}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-        let _ = handle_codex_json_line(
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"hello"}} "#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-        let done = handle_codex_json_line(
-            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":3}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-
-        assert_eq!(thread_id.as_deref(), Some("thread-1"));
-        assert_eq!(done, Some(true));
-
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert!(matches!(items[0], StreamMessage::Init { .. }));
-        assert!(matches!(items[1], StreamMessage::Text { .. }));
-        assert!(matches!(items[2], StreamMessage::StatusUpdate { .. }));
-        assert!(matches!(items[3], StreamMessage::Done { .. }));
-    }
-
-    #[test]
-    fn test_handle_codex_json_line_maps_background_event_to_task_notification() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
-
-        let done = handle_codex_json_line(
-            r#"{"type":"background_event","message":"CI green"}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-
-        assert_eq!(done, Some(false));
-
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert_eq!(items.len(), 1);
-        match &items[0] {
-            StreamMessage::TaskNotification {
-                task_id,
-                status,
-                summary,
-                kind,
-            } => {
-                assert_eq!(task_id, CODEX_BACKGROUND_TASK_NOTIFICATION_ID);
-                assert_eq!(status, CODEX_BACKGROUND_TASK_NOTIFICATION_STATUS);
-                assert_eq!(summary, "CI green");
-                assert_eq!(
-                    *kind,
-                    crate::services::agent_protocol::TaskNotificationKind::Background
-                );
-            }
-            other => panic!("Expected TaskNotification, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_compose_codex_prompt_keeps_authoritative_sections_out_of_user_prompt() {
-        let prompt = compose_codex_prompt(
-            "role과 mission만 답해줘.",
-            Some("role: PMD\nmission: 백로그 관리"),
-            Some(&["Bash".to_string(), "Read".to_string()]),
-        );
-
-        assert_eq!(prompt, "role과 mission만 답해줘.");
-        assert!(!prompt.contains("[Authoritative Instructions]"));
-        assert!(!prompt.contains("role: PMD"));
-    }
-
-    #[test]
-    fn codex_launch_options_put_adk_instructions_in_developer_config() {
-        let developer_instructions =
-            compose_codex_developer_instructions(Some("role: PMD\nmission: 백로그 관리"), None)
-                .unwrap();
-        let args = build_codex_exec_args(
-            &CodexLaunchOptions::new("role과 mission만 답해줘.")
-                .with_developer_instructions(Some(&developer_instructions))
-                .with_model(Some("gpt-5-codex")),
-        );
-
-        assert!(args.windows(2).any(|pair| {
-            pair[0] == "-c"
-                && pair[1].starts_with("developer_instructions=")
-                && pair[1].contains("role: PMD")
-        }));
-        let separator = args.iter().position(|arg| arg == "--").unwrap();
-        assert_eq!(args[separator + 1], "role과 mission만 답해줘.");
-        assert!(!args[separator + 1].contains("[Authoritative Instructions]"));
-    }
-
-    #[test]
-    fn test_compose_codex_prompt_returns_plain_prompt_without_overrides() {
-        let prompt = compose_codex_prompt("just answer", None, None);
-        assert_eq!(prompt, "just answer");
-    }
-
-    #[test]
-    fn test_codex_reasoning_started_sends_thinking() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
-
-        let _ = handle_codex_json_line(
-            r#"{"type":"item.started","item":{"type":"reasoning","id":"rs_001","summary":[]}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert_eq!(items.len(), 1);
-        assert!(matches!(
-            items[0],
-            StreamMessage::Thinking { summary: None }
+        let dir = std::env::temp_dir().join(format!(
+            "agentdesk-codex-fifo-test-{}",
+            uuid::Uuid::new_v4()
         ));
-    }
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let fifo_path = dir.join("input");
+        let fifo_path_str = fifo_path.to_string_lossy().to_string();
 
-    #[test]
-    fn test_codex_reasoning_completed_sends_redacted_thinking() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo should succeed");
 
-        let _ = handle_codex_json_line(
-            r#"{"type":"item.completed","item":{"type":"reasoning","id":"rs_001","summary":[{"type":"summary_text","text":"Analyzing the code structure"}]}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
+        let prompt = "[E2E:E2:TURN-2]\nreply json";
+        let expected = super::codex_pipe_prompt_buffer_text(prompt);
 
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert_eq!(items.len(), 1);
-        assert!(matches!(
-            items[0],
-            StreamMessage::Thinking { summary: None }
-        ));
-    }
+        // In production the codex wrapper holds the input FIFO open `O_RDWR`, so
+        // the reused-wrapper write side — which opens `O_NONBLOCK` and fails fast
+        // with ENXIO when no reader is attached (see `send_codex_pipe_prompt_to_fifo`)
+        // — always finds a reader. Mirror that here by holding a reader fd open
+        // BEFORE writing; a separate reader thread races the non-blocking open and
+        // fails ENXIO. `O_RDWR` attaches a reader without blocking and without an
+        // EOF race, so read exactly the bytes we expect.
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo_path)
+            .expect("open fifo O_RDWR to attach a reader");
 
-    #[test]
-    fn test_codex_mcp_tool_events_map_to_tool_use_and_result() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
+        super::send_codex_pipe_prompt_to_fifo(&fifo_path_str, prompt)
+            .expect("write follow-up sentinel to FIFO");
 
-        let _ = handle_codex_json_line(
-            r#"{"type":"mcp_tool_call_begin","call_id":"call-1","invocation":{"server":"memento","tool":"context","arguments":{"query":"foo","sessionId":"session-1"}}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-        let _ = handle_codex_json_line(
-            r#"{"type":"mcp_tool_call_end","call_id":"call-1","result":{"Ok":{"structuredContent":{"_searchEventId":"search-1","fragments":[{"id":"frag-1"}]}}}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert_eq!(items.len(), 2);
-        match &items[0] {
-            StreamMessage::ToolUse { name, input } => {
-                assert_eq!(name, "mcp__memento__context");
-                assert_eq!(
-                    serde_json::from_str::<Value>(input).unwrap(),
-                    serde_json::json!({
-                        "query": "foo",
-                        "sessionId": "session-1",
-                    })
-                );
-            }
-            other => panic!("Expected ToolUse, got {:?}", other),
-        }
-        match &items[1] {
-            StreamMessage::ToolResult { content, is_error } => {
-                assert!(!is_error);
-                assert_eq!(
-                    serde_json::from_str::<Value>(content).unwrap(),
-                    serde_json::json!({
-                        "_searchEventId": "search-1",
-                        "fragments": [{"id": "frag-1"}],
-                    })
-                );
-            }
-            other => panic!("Expected ToolResult, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_codex_mcp_tool_end_uses_text_payload_and_error_flag() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
-
-        let _ = handle_codex_json_line(
-            r#"{"type":"mcp_tool_call_end","call_id":"call-1","result":{"Ok":{"content":[{"type":"text","text":"{\"success\":false,\"message\":\"boom\"}"}],"isError":true}}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert_eq!(items.len(), 1);
-        match &items[0] {
-            StreamMessage::ToolResult { content, is_error } => {
-                assert!(*is_error);
-                assert_eq!(
-                    serde_json::from_str::<Value>(content).unwrap(),
-                    serde_json::json!({
-                        "success": false,
-                        "message": "boom",
-                    })
-                );
-            }
-            other => panic!("Expected ToolResult, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_codex_mcp_tool_name_preserves_double_underscore_segments() {
-        let (tx, rx) = mpsc::channel();
-        let mut thread_id = None;
-        let mut final_text = String::new();
-        let started_at = std::time::Instant::now();
-
-        let _ = handle_codex_json_line(
-            r#"{"type":"mcp_tool_call_begin","call_id":"call-2","invocation":{"server":"memento__beta","tool":"context","arguments":{}}}"#,
-            &tx,
-            &mut thread_id,
-            &mut final_text,
-            started_at,
-        )
-        .unwrap();
-
-        let items: Vec<StreamMessage> = rx.try_iter().collect();
-        assert_eq!(items.len(), 1);
-        match &items[0] {
-            StreamMessage::ToolUse { name, .. } => {
-                assert_eq!(name, "mcp__memento__beta__context");
-            }
-            other => panic!("Expected ToolUse, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_tmux_followup_encoding_is_single_line() {
-        let prompt = "line1\nline2\nline3";
-        let encoded = format!(
-            "{}{}",
-            TMUX_PROMPT_B64_PREFIX,
-            BASE64_STANDARD.encode(prompt.as_bytes())
-        );
-
-        assert!(!encoded.contains('\n'));
-    }
-
-    #[test]
-    fn test_base_exec_args_includes_model_before_exec() {
-        let args = base_exec_args(
-            None,
-            "- starts like option",
-            Some("gpt-5-codex"),
-            Some("low"),
-            false,
-            Some(true),
-            None,
-        );
-        assert!(args.starts_with(&[
-            "-c".to_string(),
-            r#"model_reasoning_effort="low""#.to_string(),
-            "-m".to_string(),
-            "gpt-5-codex".to_string(),
-            "--enable".to_string(),
-            "fast_mode".to_string(),
-        ]));
-        assert!(args.iter().any(|arg| arg == "exec"));
-        let separator_index = args
-            .iter()
-            .position(|arg| arg == "--")
-            .expect("prompt separator should be present");
+        let mut buf = vec![0u8; expected.len()];
+        reader.read_exact(&mut buf).expect("read fifo");
+        let received = String::from_utf8(buf).expect("fifo bytes are utf-8");
         assert_eq!(
-            args.get(separator_index + 1).map(String::as_str),
-            Some("- starts like option")
+            received, expected,
+            "the wrapper must receive the exact newline-terminated base64 sentinel via the FIFO"
         );
-        assert_eq!(
-            args.iter()
-                .filter(|arg| arg.as_str() == "--skip-git-repo-check")
-                .count(),
-            1
-        );
-    }
+        assert!(received.ends_with('\n'));
 
-    #[test]
-    fn test_base_exec_args_includes_resume_before_flags() {
-        let args = base_exec_args(
-            Some("thread-123"),
-            "hello",
-            None,
-            None,
-            false,
-            Some(false),
-            None,
-        );
-        assert_eq!(
-            args,
-            vec![
-                "--disable".to_string(),
-                "fast_mode".to_string(),
-                "exec".to_string(),
-                "resume".to_string(),
-                "thread-123".to_string(),
-                "--skip-git-repo-check".to_string(),
-                "--json".to_string(),
-                "--dangerously-bypass-approvals-and-sandbox".to_string(),
-                "--".to_string(),
-                "hello".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_base_exec_args_uses_readonly_sandbox_when_requested() {
-        let args = base_exec_args(None, "readonly", None, None, true, Some(false), None);
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["--sandbox", "read-only"])
-        );
-        assert!(args.starts_with(&["--disable".to_string(), "fast_mode".to_string()]));
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox")
-        );
-    }
-
-    #[test]
-    fn test_base_exec_args_leaves_fast_mode_unset_when_not_overridden() {
-        let args = base_exec_args(None, "hello", None, None, false, None, None);
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "--enable" || arg == "--disable")
-        );
-        assert!(!args.iter().any(|arg| arg == "fast_mode"));
-        assert!(args.starts_with(&["exec".to_string()]));
-    }
-
-    #[test]
-    fn test_base_exec_args_includes_goals_feature_override() {
-        let args = base_exec_args(None, "hello", None, None, false, None, Some(true));
-        assert!(args.starts_with(&[
-            "--enable".to_string(),
-            "goals".to_string(),
-            "exec".to_string()
-        ]));
-    }
-
-    // ========== Follow-up transport tests ==========
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_pipe_prompt_line_wraps_base64_payload() {
-        let line = super::codex_pipe_prompt_line("line 1\nline 2");
-        let lines = super::codex_pipe_prompt_lines_with_id("line 1\nline 2", "msg-1");
-
-        assert!(line.starts_with(super::TMUX_PROMPT_B64_PREFIX));
-        assert_eq!(
-            &line[super::TMUX_PROMPT_B64_PREFIX.len()..],
-            "bGluZSAxCmxpbmUgMg=="
-        );
-        assert_eq!(lines, vec![line]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_pipe_prompt_lines_chunk_large_payload() {
-        let prompt = "x".repeat(2048);
-        let lines = super::codex_pipe_prompt_lines_with_id(&prompt, "msg-1");
-
-        assert!(lines.len() > 1);
-        assert!(lines.iter().all(|line| line.len() < 900));
-        assert!(
-            lines
-                .iter()
-                .all(|line| line.starts_with(super::TMUX_PROMPT_B64_CHUNK_PREFIX))
-        );
-        assert!(lines[0].contains("msg-1:0:"));
-    }
-
-    /// Regression test for #2249: on timeout, the spawned Codex child
-    /// AND its grandchildren must be killed via SIGTERM→SIGKILL within
-    /// the grace window, not left running as orphans. The grandchild
-    /// assertion specifically exercises the `configure_child_process_group`
-    /// path — without it, `kill_pid_tree` cannot reach descendants.
-    #[cfg(unix)]
-    #[test]
-    fn execute_command_simple_with_timeout_kills_child_on_timeout() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use std::time::{Duration, Instant};
-
-        let _env_guard = crate::services::discord::runtime_store::lock_test_env();
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let fake_codex = temp.path().join("fake-codex");
-        let pid_file = temp.path().join("fake-codex.pid");
-        let grandchild_pid_file = temp.path().join("fake-codex-grandchild.pid");
-
-        // Fake codex: spawn a long-lived grandchild (its own subshell
-        // sleep loop), record both PIDs, then loop forever. The
-        // grandchild inherits the codex process group, so a SIGTERM
-        // to the negative PID must reach it. If the parent spawn is
-        // not in its own group, kill_pid_tree(-codex_pid) hits our
-        // test runner's group instead and the grandchild survives —
-        // which is exactly the bug #2249 keeps reintroducing.
-        fs::write(
-            &fake_codex,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$AGENTDESK_TEST_PID_FILE\"\n( sleep 600 & printf '%s' \"$!\" > \"$AGENTDESK_TEST_GRANDCHILD_PID_FILE\"; wait ) &\nwhile :; do sleep 1; done\n",
-        )
-        .expect("write fake codex");
-        let mut perms = fs::metadata(&fake_codex).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&fake_codex, perms).expect("set perms");
-
-        let previous_codex_path = std::env::var_os("AGENTDESK_CODEX_PATH");
-        let previous_pid_file = std::env::var_os("AGENTDESK_TEST_PID_FILE");
-        let previous_grandchild_pid_file = std::env::var_os("AGENTDESK_TEST_GRANDCHILD_PID_FILE");
-
-        // SAFETY: env mutations are serialized by lock_test_env().
-        unsafe {
-            std::env::set_var("AGENTDESK_CODEX_PATH", &fake_codex);
-            std::env::set_var("AGENTDESK_TEST_PID_FILE", &pid_file);
-            std::env::set_var("AGENTDESK_TEST_GRANDCHILD_PID_FILE", &grandchild_pid_file);
-        }
-
-        let started = Instant::now();
-        let result = super::execute_command_simple_with_timeout(
-            "ignored prompt",
-            Duration::from_secs(1),
-            "codex 2249 regression",
-        );
-        let elapsed = started.elapsed();
-
-        // Restore env before any assert can panic out of this block.
-        unsafe {
-            match previous_codex_path {
-                Some(value) => std::env::set_var("AGENTDESK_CODEX_PATH", value),
-                None => std::env::remove_var("AGENTDESK_CODEX_PATH"),
-            }
-            match previous_pid_file {
-                Some(value) => std::env::set_var("AGENTDESK_TEST_PID_FILE", value),
-                None => std::env::remove_var("AGENTDESK_TEST_PID_FILE"),
-            }
-            match previous_grandchild_pid_file {
-                Some(value) => std::env::set_var("AGENTDESK_TEST_GRANDCHILD_PID_FILE", value),
-                None => std::env::remove_var("AGENTDESK_TEST_GRANDCHILD_PID_FILE"),
-            }
-        }
-
-        let err = result.expect_err("expected timeout error");
-        assert!(
-            err.contains("codex 2249 regression timeout"),
-            "unexpected error: {err}"
-        );
-        // Grace window is ~200ms in kill_pid_tree; allow generous
-        // slack for CI scheduling but bound it well under a real
-        // child's wall-clock lifetime so we know the kill fired.
-        assert!(
-            elapsed < Duration::from_secs(6),
-            "timeout path took too long: {:?}",
-            elapsed
-        );
-
-        // Confirm both the codex child and its grandchild are gone
-        // within the SIGTERM (200ms grace) + SIGKILL window. If a PID
-        // file never appeared, the shell never reached its printf —
-        // we skip that specific assertion rather than treating a slow
-        // CI scheduler as a regression.
-        fn assert_pid_dead_within(pid_file: &std::path::Path, label: &str) {
-            let pid_deadline = Instant::now() + Duration::from_secs(2);
-            while !pid_file.exists() && Instant::now() < pid_deadline {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            if !pid_file.exists() {
-                return;
-            }
-            let pid_str = std::fs::read_to_string(pid_file).expect("pid file");
-            let pid_str = pid_str.trim();
-            if pid_str.is_empty() {
-                return;
-            }
-            let kill_deadline = Instant::now() + Duration::from_secs(5);
-            let mut still_alive = true;
-            while Instant::now() < kill_deadline {
-                let alive = std::process::Command::new("kill")
-                    .args(["-0", pid_str])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if !alive {
-                    still_alive = false;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            assert!(
-                !still_alive,
-                "{label} pid {pid_str} survived past SIGTERM+SIGKILL grace window"
-            );
-        }
-
-        assert_pid_dead_within(&pid_file, "codex child");
-        assert_pid_dead_within(&grandchild_pid_file, "codex grandchild");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

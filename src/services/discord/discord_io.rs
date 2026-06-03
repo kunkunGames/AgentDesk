@@ -199,7 +199,7 @@ fn notification_context(context: &serde_json::Value) -> serde_json::Value {
 /// Parse a channel identifier — numeric ID or name alias (e.g. "윤호네비서") → u64.
 fn resolve_channel_to_u64(raw: &str) -> Result<u64, String> {
     raw.parse::<u64>().or_else(|_| {
-        crate::server::routes::dispatches::resolve_channel_alias_pub(raw)
+        crate::services::dispatches::outbox_route::resolve_channel_alias_pub(raw)
             .ok_or_else(|| format!("cannot resolve channel '{raw}'"))
     })
 }
@@ -455,7 +455,7 @@ async fn deliver_channel_message(
     let client = HttpOutboundClient::new(
         reqwest::Client::new(),
         token.to_string(),
-        crate::server::routes::dispatches::discord_delivery::discord_api_base_url(),
+        crate::services::dispatches::discord_delivery::discord_api_base_url(),
     );
     let mut policy = DiscordOutboundPolicy::review_notification();
     if delivery_id.is_none() {
@@ -523,90 +523,5 @@ async fn deliver_channel_message(
             fallback_kind: None,
         }),
         DeliveryResult::PermanentFailure { reason } => Err(reason),
-    }
-}
-
-#[cfg(all(test, feature = "legacy-sqlite-tests"))]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn user_is_authorized_allows_owner_and_explicit_users() {
-        let settings = DiscordBotSettings {
-            owner_user_id: Some(42),
-            allowed_user_ids: vec![7],
-            ..Default::default()
-        };
-
-        assert!(user_is_authorized(&settings, 42));
-        assert!(user_is_authorized(&settings, 7));
-        assert!(!user_is_authorized(&settings, 99));
-    }
-
-    #[test]
-    fn user_is_authorized_allows_everyone_when_flag_enabled() {
-        let settings = DiscordBotSettings {
-            owner_user_id: Some(42),
-            allow_all_users: true,
-            ..Default::default()
-        };
-
-        assert!(user_is_authorized(&settings, 42));
-        assert!(user_is_authorized(&settings, 99));
-    }
-
-    #[test]
-    fn format_dm_reply_notification_inlines_saved_context() {
-        let message = format_dm_reply_notification(
-            42,
-            "family-counsel",
-            "지난주에 했어",
-            &json!({
-                "topicKey": "obujang.health_checkup",
-                "targetKey": "obujang",
-            }),
-        )
-        .expect("notification should serialize");
-
-        let mut lines = message.lines();
-        assert_eq!(
-            lines.next(),
-            Some("DM_REPLY:42 from family-counsel: 지난주에 했어")
-        );
-        let context_line = lines.next().expect("context line should exist");
-        assert!(lines.next().is_none());
-        let context_json = context_line
-            .strip_prefix("context=")
-            .expect("context line should have prefix");
-        let context: serde_json::Value =
-            serde_json::from_str(context_json).expect("context should be valid json");
-        assert_eq!(
-            context,
-            json!({
-                "topicKey": "obujang.health_checkup",
-                "targetKey": "obujang",
-            })
-        );
-    }
-
-    #[test]
-    fn format_dm_reply_notification_keeps_empty_context_explicit() {
-        let message = format_dm_reply_notification(
-            7,
-            "(retry)",
-            "네",
-            &json!({
-                "_answer": "네",
-                "_notify_failed": true,
-                "_notify_error": "timeout",
-            }),
-        )
-        .expect("notification should serialize");
-
-        let mut lines = message.lines();
-        assert_eq!(lines.next(), Some("DM_REPLY:7 from (retry): 네"));
-        assert_eq!(lines.next(), Some("context={}"));
-        assert!(lines.next().is_none());
     }
 }

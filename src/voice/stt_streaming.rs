@@ -106,6 +106,9 @@ impl WhisperStreamOverlapSegmenter {
         })
     }
 
+    // reason: voice runtime is wired only when voice config is enabled; no
+    // compile target exercises it. See #3034.
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> StreamingOverlapConfig {
         self.config
     }
