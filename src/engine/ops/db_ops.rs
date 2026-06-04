@@ -523,10 +523,11 @@ fn translate_sqlite_rowid(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut idx = 0usize;
     let mut in_single_quote = false;
+    let mut in_double_quote = false;
 
     while idx < chars.len() {
         let ch = chars[idx];
-        if ch == '\'' {
+        if ch == '\'' && !in_double_quote {
             result.push(ch);
             if in_single_quote {
                 if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
@@ -542,7 +543,23 @@ fn translate_sqlite_rowid(sql: &str) -> String {
             continue;
         }
 
-        if !in_single_quote && (ch.is_ascii_alphabetic() || ch == '_') {
+        if ch == '"' && !in_single_quote {
+            result.push(ch);
+            if in_double_quote {
+                if idx + 1 < chars.len() && chars[idx + 1] == '"' {
+                    result.push('"');
+                    idx += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            } else {
+                in_double_quote = true;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && (ch.is_ascii_alphabetic() || ch == '_') {
             let start = idx;
             idx += 1;
             while idx < chars.len()
@@ -1232,13 +1249,13 @@ mod tests {
 
     #[test]
     fn prepare_policy_sql_for_pg_rewrites_rowid_tokens() {
-        let sql = "SELECT rowid, td.rowid, 'rowid' AS literal FROM task_dispatches td ORDER BY td.rowid DESC, rowid DESC";
+        let sql = "SELECT rowid, td.rowid, 'rowid' AS literal, \"rowid\" AS double_quoted FROM task_dispatches td ORDER BY td.rowid DESC, rowid DESC";
         let prepared = prepare_policy_sql_for_pg(sql, &[]).expect("render rowid");
 
         assert!(
             prepared
                 .sql
-                .contains("SELECT ctid, td.ctid, 'rowid' AS literal")
+                .contains("SELECT ctid, td.ctid, 'rowid' AS literal, \"rowid\" AS double_quoted")
         );
         assert!(prepared.sql.contains("ORDER BY td.ctid DESC, ctid DESC"));
         assert!(prepared.params.is_empty());
