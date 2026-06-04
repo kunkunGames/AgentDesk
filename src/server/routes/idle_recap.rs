@@ -11,13 +11,43 @@
 //!   3. Capture the last ~100 lines of the tmux scrollback (best effort).
 //!   4. Ask Claude Haiku for a 1-2 sentence Korean summary (best effort,
 //!      20 s timeout; fall back to a header-only card if it fails).
-//!   5. Delete the previous recap card for this channel (best effort), post
-//!      the new one via the notify bot, and persist its message id.
+//!   5. Re-check whether a turn became active during the (slow) compose
+//!      window (#3146 Part 1, codex clear/post race); if so, SKIP posting.
+//!   6. Otherwise delete the previous recap card for this channel (best
+//!      effort) and post the new one via the provider bot.
+//!   7. Re-check active-turn ONCE MORE after the POST returns (#3146 Part 1,
+//!      codex R3 P1 — check-then-post TOCTOU). If a turn raced into the
+//!      (step-5 check → step-6 POST) window, UNDO the post: delete the
+//!      just-posted card and do NOT persist its pointer. Otherwise persist.
 //!
-//! Lifecycle hooks live in two places:
-//!   - `router::message_handler::clear_idle_recap_for_channel` — fires the
-//!     moment the user sends the next message in that channel.
+//! Lifecycle hooks live in two places, both now using capture-at-claim +
+//! compare-and-clear (codex R3 P2):
+//!   - `router::intake_gate` — the moment a Discord message is accepted as a
+//!     real turn, it captures the recap pointer synchronously and clears ONLY
+//!     that captured id via `idle_recap::spawn_clear_captured_idle_recap_for_channel`.
+//!   - `tui_prompt_relay` — same capture-at-claim variant when a TUI-driven
+//!     turn becomes active.
 //!   - The next 5-min cycle deletes the previous card before posting fresh.
+//!
+//! Reverse race (codex R2 P2 — closed by capture-at-claim + CAS): a delayed
+//! clear spawned by an *old* turn could, in principle, land after a later
+//! legitimately-posted card. This is NOT self-healing: the policy posts at most
+//! once per idle period (`idle_recap_posted_at < last_heartbeat`), so a card
+//! lost to a stale clear stays gone until new activity re-arms the session.
+//! Both clear call sites now capture the recap card id that exists when the
+//! turn is claimed and clear ONLY that captured id — `delete_previous_card`
+//! probes the captured message and `clear_recap_pointer` is a compare-and-clear,
+//! so a delayed clear cannot delete or unlink a NEWER card (see
+//! `idle_recap::spawn_clear_captured_idle_recap_for_channel`).
+//!
+//! Forward race (codex R3 P1 — closed by the step-7 post-recheck): a turn that
+//! starts AFTER step 5 but BEFORE persist captures the OLD pointer at claim
+//! time, so its clear cannot remove THIS card; the step-7 recheck deletes the
+//! just-posted card and skips persist. RESIDUAL (inherent, acceptable): a turn
+//! starting in the few-ms between the Discord POST returning (step 6) and the
+//! recheck (step 7) can still momentarily show the card — but it is NEVER
+//! persisted as a live pointer, and the NEXT turn's claim-clear or the user's
+//! `[새 세션 시작]` button removes it.
 
 use axum::{
     Json,
@@ -32,6 +62,7 @@ use std::sync::Arc;
 use super::AppState;
 use crate::services::discord::idle_recap;
 use crate::services::discord::idle_recap::RecapSnapshot;
+use crate::services::provider::ProviderKind;
 
 /// POST /api/sessions/{session_key}/idle-recap
 pub async fn post_idle_recap(
@@ -151,6 +182,39 @@ async fn run_idle_recap_post_job(
     };
     let content = idle_recap::compose_recap_text(&snapshot, summary.as_deref());
 
+    // #3146 Part 1 (codex clear/post race): the scrollback + Haiku compose
+    // above can take seconds. During that window a TUI-driven turn may have
+    // become active and the claim path (`claim_tui_direct_synthetic_turn`)
+    // may have already cleared the previous recap card. Re-check turn
+    // activity RIGHT before we commit, and skip posting+persisting entirely
+    // if a turn is now in progress — otherwise we would post a FRESH stale
+    // `📦 … idle` card OVER the live turn (and persist its pointer),
+    // re-opening the exact bug #3146 closes. The idle-cycle stamp at the top
+    // of the route already deduped this cycle, so skipping is safe (we do NOT
+    // post-then-delete; we just don't post).
+    //
+    // codex R2 P1: the recheck consults the MAILBOX active-turn FIRST (the
+    // authoritative signal `mailbox_try_start_turn` sets at the very start of
+    // the claim), ORed with the inflight sidecar for defense-in-depth. The
+    // claim path makes the mailbox turn active BEFORE it writes the inflight
+    // sidecar, so reading only the sidecar left a lag window in which this
+    // recheck saw "idle" and could post a stale card over a now-active turn.
+    // Reading the mailbox closes that window. Genuinely-idle channels have no
+    // active mailbox turn and no (non-stale) inflight, so they still post the
+    // recap as before.
+    let active_turn = match ProviderKind::from_str(&snapshot.provider) {
+        Some(provider) => idle_recap::channel_has_active_turn(&provider, channel_id).await,
+        None => false,
+    };
+    if !idle_recap::should_post_recap(active_turn) {
+        tracing::info!(
+            session_key = %session_key,
+            channel_id = channel_id,
+            "idle_recap post skipped: turn became active during recap compose"
+        );
+        return Ok(());
+    }
+
     if let (Some(prev_msg), Some(prev_chan)) =
         (snapshot.previous_message_id, snapshot.previous_channel_id)
     {
@@ -159,6 +223,44 @@ async fn run_idle_recap_post_job(
 
     match idle_recap::post_recap_card(http.as_ref(), channel_id, &content).await {
         Ok(message_id) => {
+            // #3146 Part 1 (codex R3 P1 — check-then-post TOCTOU): the pre-post
+            // `should_post_recap` check above and the Discord POST are not
+            // atomic. A TUI claim that starts AFTER that check but BEFORE we
+            // persist captures the OLD recap pointer (capture-at-claim sees
+            // whatever id existed at claim time, not this not-yet-persisted
+            // one), so its clear cannot remove THIS card. If we then persisted,
+            // a fresh stale `📦 … idle` card would sit over the live turn.
+            //
+            // So we re-check active-turn AFTER the POST returns and BEFORE we
+            // persist. If a turn raced in, UNDO the post: delete the
+            // just-posted card and do NOT persist its pointer (return Ok). The
+            // idle-cycle stamp at the top already deduped this cycle, so not
+            // persisting is safe. The pre-post check is kept as
+            // defense-in-depth — it avoids the wasted POST in the common case.
+            //
+            // Residual window (inherent, acceptable): a turn that starts in the
+            // few-ms gap between the Discord POST returning and this recheck can
+            // still momentarily show the card. It is then cleared by the NEXT
+            // turn's claim-clear or by the user's `[새 세션 시작]` button — it is
+            // never persisted as a live pointer here, so it cannot be the target
+            // of a future stale-clear race.
+            let active_turn_after_post = match ProviderKind::from_str(&snapshot.provider) {
+                Some(provider) => idle_recap::channel_has_active_turn(&provider, channel_id).await,
+                None => false,
+            };
+            if idle_recap::post_recheck_action(active_turn_after_post)
+                == idle_recap::PostRecheckAction::DeleteAndSkipPersist
+            {
+                idle_recap::delete_previous_card(http.as_ref(), channel_id, message_id).await;
+                tracing::info!(
+                    session_key = %session_key,
+                    channel_id = channel_id,
+                    message_id = message_id,
+                    "idle_recap: turn became active during post; deleted just-posted card"
+                );
+                return Ok(());
+            }
+
             if let Err(e) =
                 idle_recap::persist_recap_message_id(&pool, &session_key, channel_id, message_id)
                     .await

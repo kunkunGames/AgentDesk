@@ -889,6 +889,141 @@ pub(crate) async fn lookup_active_recap_for_channel(
     Ok(row.map(|(k, c, m)| (k, c as u64, m as u64)))
 }
 
+/// Core clear sequence for an idle-recap card bound to a Discord channel,
+/// generic over the lookup / delete / clear-pointer operations so the
+/// decision logic is unit-testable without a live Postgres or Discord http.
+///
+/// Invariant (#3146): while an active turn exists for a channel — regardless
+/// of origin (Discord-intake OR a TUI-driven turn detected by the watcher) —
+/// the `📦 … idle N분` recap card must not remain shown. Both call sites feed
+/// the same `(channel_id)` key into this helper, so a turn that starts via the
+/// TUI clears the card exactly the way a Discord-origin turn already does.
+///
+/// When the lookup returns `None` (no recap card recorded for the channel)
+/// this is a no-op: a still-idle channel keeps its card.
+async fn clear_idle_recap_for_channel_with<Lookup, LookupFut, Delete, DeleteFut, Clear, ClearFut>(
+    channel_id: u64,
+    lookup: Lookup,
+    delete: Delete,
+    clear: Clear,
+) where
+    Lookup: FnOnce(u64) -> LookupFut,
+    LookupFut: std::future::Future<Output = Result<Option<(String, u64, u64)>, sqlx::Error>>,
+    Delete: FnOnce(u64, u64) -> DeleteFut,
+    DeleteFut: std::future::Future<Output = ()>,
+    Clear: FnOnce(String, u64) -> ClearFut,
+    ClearFut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+{
+    match lookup(channel_id).await {
+        Ok(Some((session_key, chan, msg))) => {
+            delete(chan, msg).await;
+            let _ = clear(session_key, msg).await;
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            channel_id = channel_id,
+            "idle_recap clear lookup failed"
+        ),
+    }
+}
+
+// codex R3 P2: the non-captured `clear_idle_recap_for_channel` /
+// `spawn_clear_idle_recap_for_channel` wrappers were removed. Both the
+// Discord-intake path and the TUI claim path now capture the recap pointer
+// SYNCHRONOUSLY at claim time and clear ONLY that captured id via
+// `spawn_clear_captured_idle_recap_for_channel` — see its doc-comment. The
+// non-captured variant ran `lookup_active_recap_for_channel` inside the
+// detached task, so a delayed clear could delete a NEWER card from a later
+// idle period (NOT self-healing). The generic
+// `clear_idle_recap_for_channel_with` seam below is retained only because the
+// unit tests exercise its lookup → delete → clear-pointer decision logic.
+
+/// Clear ONLY the specific recap card identified by `(session_key, channel_id,
+/// message_id)` — never whatever card happens to be current at clear time.
+///
+/// codex R2 P2: the idle-recap policy (`policies/timeouts/idle-recap.js`) posts
+/// at most ONCE per idle period (`idle_recap_posted_at < last_heartbeat`), so a
+/// card it deletes is NOT re-posted until new activity re-arms the session. A
+/// delayed clear that ran the generic `lookup_active_recap_for_channel` could
+/// therefore delete a LATER, legitimately-posted card and lose it for the rest
+/// of the idle period (NOT self-healing). Binding the clear to the card id that
+/// existed when the turn was CLAIMED makes a delayed clear a no-op against any
+/// newer card:
+///   - `delete_previous_card` probes the captured message id and only deletes
+///     it if it is still an idle-recap card (a newer card has a different id, so
+///     the probe targets the old — now-replaced or already-gone — message).
+///   - `clear_recap_pointer` is a compare-and-clear: it nulls the pointer ONLY
+///     when the row's `idle_recap_message_id` still equals the captured id, so
+///     a pointer that has already advanced to a newer card is left intact.
+pub(in crate::services::discord) async fn clear_specific_idle_recap_card(
+    http: &serenity::Http,
+    pool: &PgPool,
+    session_key: &str,
+    channel_id: u64,
+    message_id: u64,
+) {
+    clear_specific_idle_recap_card_with(
+        session_key.to_string(),
+        channel_id,
+        message_id,
+        |chan, msg| delete_previous_card(http, chan, msg),
+        |session_key, msg| async move { clear_recap_pointer(pool, &session_key, msg).await },
+    )
+    .await;
+}
+
+/// Generic seam for `clear_specific_idle_recap_card`, parameterised over the
+/// delete / compare-and-clear operations so the codex R2 P2 invariant (the
+/// clear targets ONLY the captured id, and the CAS is a no-op when the pointer
+/// has advanced) is unit-testable without a live Postgres or Discord http.
+async fn clear_specific_idle_recap_card_with<Delete, DeleteFut, Clear, ClearFut>(
+    session_key: String,
+    channel_id: u64,
+    message_id: u64,
+    delete: Delete,
+    clear: Clear,
+) where
+    Delete: FnOnce(u64, u64) -> DeleteFut,
+    DeleteFut: std::future::Future<Output = ()>,
+    Clear: FnOnce(String, u64) -> ClearFut,
+    ClearFut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+{
+    delete(channel_id, message_id).await;
+    let _ = clear(session_key, message_id).await;
+}
+
+/// Capture-at-claim + compare-and-clear for the TUI claim path (codex R2 P2).
+///
+/// Resolves the recap card that exists for `channel_id` RIGHT NOW (synchronously
+/// relative to the turn becoming active), then spawns a detached task that
+/// clears ONLY that captured card id via `clear_specific_idle_recap_card`. A
+/// clear that wakes after a newer card was posted cannot delete the newer card,
+/// because both the delete probe and the pointer CAS are bound to the captured
+/// id. When no card is recorded for the channel this is a no-op.
+pub(in crate::services::discord) async fn spawn_clear_captured_idle_recap_for_channel(
+    http: std::sync::Arc<serenity::Http>,
+    pool: PgPool,
+    channel_id: u64,
+) {
+    let captured = match lookup_active_recap_for_channel(&pool, channel_id).await {
+        Ok(Some((session_key, chan, msg))) => (session_key, chan, msg),
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                channel_id = channel_id,
+                "idle_recap captured-clear lookup failed"
+            );
+            return;
+        }
+    };
+    let (session_key, chan, msg) = captured;
+    tokio::spawn(async move {
+        clear_specific_idle_recap_card(&http, &pool, &session_key, chan, msg).await;
+    });
+}
+
 /// Extract `tmux_session_name` from a session_key — the part after the last
 /// `:`. Mirrors `parseSessionTmuxName` from `policies/lib/timeouts-helpers.js`.
 pub(crate) fn tmux_session_name_from_key(session_key: &str) -> Option<&str> {
@@ -898,9 +1033,322 @@ pub(crate) fn tmux_session_name_from_key(session_key: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// #3146 Part 1 (codex clear/post race): does this channel currently have an
+/// ACTIVE turn? Probed right before the recap post job commits a card.
+///
+/// Two ORed signals, both consulted so the recheck is correct at the EARLIEST
+/// turn-active point (codex R2 P1):
+///
+///   1. MAILBOX active turn (authoritative, set FIRST). `claim_tui_direct_
+///      synthetic_turn` makes the turn active via `mailbox_try_start_turn`
+///      BEFORE it writes the inflight sidecar — there is a multi-step window
+///      between the two. The mailbox is the same signal `idle_detector` treats
+///      as authoritative; `ChannelMailboxRegistry::global_handle` resolves the
+///      per-channel actor from a process-global registry (the handle is mirrored
+///      into `GLOBAL_CHANNEL_MAILBOXES` by `mailbox()`), so the server route can
+///      consult it without an `Arc<SharedData>`. If no turn has ever touched the
+///      channel the global handle is absent → falls through to the inflight check.
+///   2. INFLIGHT sidecar (defense-in-depth). A present, NON-stale inflight state
+///      for `(provider, channel_id)` — the marker the claim path writes LATER via
+///      `save_inflight_state`. Staleness is applied so a leftover inflight from a
+///      long-crashed dispatch never produces a false skip on a genuinely idle
+///      channel. Kept so a turn that exists only as inflight (e.g. restored from
+///      disk before the mailbox actor is re-spawned) is still detected.
+///
+/// Cross-platform note: both the global mailbox handle and the on-disk inflight
+/// sidecar are cross-platform (no tmux, no `#[cfg(unix)]` symbol), so this
+/// compiles and behaves identically on Windows.
+pub(crate) async fn channel_has_active_turn(provider: &ProviderKind, channel_id: u64) -> bool {
+    if mailbox_has_active_turn(channel_id).await {
+        return true;
+    }
+    inflight_has_active_turn(provider, channel_id)
+}
+
+/// Earliest turn-active signal: consult the process-global mailbox actor for
+/// this channel (set by `mailbox_try_start_turn` BEFORE the inflight sidecar is
+/// written). Returns `false` when no mailbox has ever been spawned for the
+/// channel — a genuinely-idle channel that never hosted a turn.
+async fn mailbox_has_active_turn(channel_id: u64) -> bool {
+    match crate::services::turn_orchestrator::ChannelMailboxRegistry::global_handle(
+        serenity::ChannelId::new(channel_id),
+    ) {
+        Some(handle) => handle.has_active_turn().await,
+        None => false,
+    }
+}
+
+/// Defense-in-depth turn-active signal: a present, NON-stale inflight sidecar
+/// for `(provider, channel_id)`.
+fn inflight_has_active_turn(provider: &ProviderKind, channel_id: u64) -> bool {
+    let Some(state) = super::inflight::load_inflight_state(provider, channel_id) else {
+        return false;
+    };
+    let now_unix = Utc::now().timestamp();
+    !super::inflight::inflight_state_is_stale(
+        &state,
+        now_unix,
+        super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS,
+    )
+}
+
+/// #3146 Part 1 (codex clear/post race): pure decision seam for the recap
+/// post job. We post the fresh recap card ONLY when the channel is still
+/// idle. If a turn became active during the (multi-second) tmux-capture +
+/// Haiku-summary compose window, posting would slap a stale `📦 … idle` card
+/// over a live turn — exactly the bug #3146 closes. The idle-cycle stamp at
+/// the top of the route already deduped this cycle, so skipping is safe.
+pub(crate) fn should_post_recap(active_turn: bool) -> bool {
+    !active_turn
+}
+
+/// #3146 Part 1 (codex R3 P1 — check-then-post TOCTOU): what the post job does
+/// with a card it ALREADY posted, given the active-turn state re-checked AFTER
+/// the Discord POST returned (and before persisting the pointer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostRecheckAction {
+    /// Channel is still idle — persist the just-posted card's pointer.
+    Persist,
+    /// A turn raced into the (check → post) window — UNDO the post: delete the
+    /// just-posted card and do NOT persist its pointer. The capture-at-claim
+    /// clear of that racing turn grabbed the OLD pointer, so it cannot remove
+    /// THIS card; persisting would leave a stale `📦 … idle` card over the live
+    /// turn. The idle-cycle stamp already deduped this cycle, so not persisting
+    /// is safe.
+    DeleteAndSkipPersist,
+}
+
+/// Pure decision seam for the post-recheck. The post job calls this with the
+/// active-turn state observed AFTER `post_recap_card` returns; the residual
+/// window (a turn starting in the few-ms between the POST returning and this
+/// recheck) is inherent and is documented at the call site in
+/// `server::routes::idle_recap::run_idle_recap_post_job`.
+pub(crate) fn post_recheck_action(active_turn_after_post: bool) -> PostRecheckAction {
+    if should_post_recap(active_turn_after_post) {
+        PostRecheckAction::Persist
+    } else {
+        PostRecheckAction::DeleteAndSkipPersist
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// #3146 Part 1: when a turn becomes active for a channel that has a
+    /// recorded idle-recap card, the clear sequence must delete the card AND
+    /// clear the recap pointer. This exercises the SAME core helper both the
+    /// Discord-intake and the TUI-driven turn call sites use, so a TUI-origin
+    /// active turn clears the card exactly the way a Discord-origin turn does.
+    #[tokio::test]
+    async fn clear_idle_recap_for_channel_deletes_card_and_clears_pointer() {
+        let deleted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let cleared: Rc<RefCell<Vec<(String, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let deleted_for_closure = deleted.clone();
+        let cleared_for_closure = cleared.clone();
+
+        clear_idle_recap_for_channel_with(
+            777,
+            |channel_id| async move {
+                assert_eq!(channel_id, 777);
+                Ok(Some(("discord:codex:tui-sess".to_string(), 777, 4242)))
+            },
+            move |chan, msg| {
+                let deleted = deleted_for_closure.clone();
+                async move {
+                    deleted.borrow_mut().push((chan, msg));
+                }
+            },
+            move |session_key, msg| {
+                let cleared = cleared_for_closure.clone();
+                async move {
+                    cleared.borrow_mut().push((session_key, msg));
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(deleted.borrow().as_slice(), &[(777, 4242)]);
+        assert_eq!(
+            cleared.borrow().as_slice(),
+            &[("discord:codex:tui-sess".to_string(), 4242)]
+        );
+    }
+
+    /// A still-idle channel (no recap pointer recorded) must NOT have anything
+    /// deleted or cleared — the clear is a no-op so a legitimately idle card
+    /// survives.
+    #[tokio::test]
+    async fn clear_idle_recap_for_channel_noop_when_no_card_recorded() {
+        let deleted = Rc::new(RefCell::new(0u32));
+        let cleared = Rc::new(RefCell::new(0u32));
+        let deleted_for_closure = deleted.clone();
+        let cleared_for_closure = cleared.clone();
+
+        clear_idle_recap_for_channel_with(
+            123,
+            |_channel_id| async move { Ok(None) },
+            move |_chan, _msg| {
+                let deleted = deleted_for_closure.clone();
+                async move {
+                    *deleted.borrow_mut() += 1;
+                }
+            },
+            move |_session_key, _msg| {
+                let cleared = cleared_for_closure.clone();
+                async move {
+                    *cleared.borrow_mut() += 1;
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(*deleted.borrow(), 0);
+        assert_eq!(*cleared.borrow(), 0);
+    }
+
+    /// codex R2 P2: the captured-id clear targets ONLY the id captured when the
+    /// turn was claimed — it passes the CAPTURED message id to both the delete
+    /// probe and the pointer compare-and-clear, never a freshly-looked-up id.
+    /// When the pointer has advanced to a NEWER card (the row's
+    /// `idle_recap_message_id` no longer matches the captured id), the CAS
+    /// reports `rows_affected == 0` (modeled here as `Ok(false)`) and the newer
+    /// card's pointer is left intact. The delete probe likewise targets the old
+    /// captured id, so `delete_previous_card`'s card-type guard would no-op on a
+    /// message that is no longer the recorded card.
+    #[tokio::test]
+    async fn clear_specific_card_targets_captured_id_and_cas_is_noop_when_pointer_advanced() {
+        let deleted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let cleared: Rc<RefCell<Vec<(String, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let deleted_for_closure = deleted.clone();
+        let cleared_for_closure = cleared.clone();
+
+        // Captured at claim time: the OLD card (id 4242). A NEWER card (id 9999)
+        // was posted afterwards, so the live pointer is 9999 — the CAS keyed on
+        // 4242 must NOT clear it.
+        let captured_msg = 4242u64;
+        clear_specific_idle_recap_card_with(
+            "discord:codex:tui-sess".to_string(),
+            777,
+            captured_msg,
+            move |chan, msg| {
+                let deleted = deleted_for_closure.clone();
+                async move {
+                    deleted.borrow_mut().push((chan, msg));
+                }
+            },
+            move |session_key, msg| {
+                let cleared = cleared_for_closure.clone();
+                async move {
+                    cleared.borrow_mut().push((session_key, msg));
+                    // CAS no-op: pointer advanced to 9999, so an
+                    // `... AND idle_recap_message_id = 4242` UPDATE affects 0 rows.
+                    Ok(false)
+                }
+            },
+        )
+        .await;
+
+        // Delete probe + CAS both used the CAPTURED id (4242), never 9999.
+        assert_eq!(deleted.borrow().as_slice(), &[(777, captured_msg)]);
+        assert_eq!(
+            cleared.borrow().as_slice(),
+            &[("discord:codex:tui-sess".to_string(), captured_msg)]
+        );
+    }
+
+    /// codex R2 P2 (positive case): when the pointer still points at the
+    /// captured card (no newer card posted), the captured-id clear deletes that
+    /// card and the CAS clears the pointer (`Ok(true)`).
+    #[tokio::test]
+    async fn clear_specific_card_clears_when_pointer_still_matches_captured_id() {
+        let deleted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let cleared_count = Rc::new(RefCell::new(0u32));
+        let deleted_for_closure = deleted.clone();
+        let cleared_for_closure = cleared_count.clone();
+
+        clear_specific_idle_recap_card_with(
+            "discord:codex:tui-sess".to_string(),
+            777,
+            4242,
+            move |chan, msg| {
+                let deleted = deleted_for_closure.clone();
+                async move {
+                    deleted.borrow_mut().push((chan, msg));
+                }
+            },
+            move |_session_key, msg| {
+                let cleared = cleared_for_closure.clone();
+                async move {
+                    assert_eq!(msg, 4242);
+                    *cleared.borrow_mut() += 1;
+                    Ok(true)
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(deleted.borrow().as_slice(), &[(777, 4242)]);
+        assert_eq!(*cleared_count.borrow(), 1);
+    }
+
+    /// codex R3 P2: the Discord-INTAKE clear now uses the SAME capture-at-claim
+    /// variant (`spawn_clear_captured_idle_recap_for_channel`) the TUI claim
+    /// path uses, instead of the old non-captured `spawn_clear_idle_recap_for_
+    /// channel` that looked up the pointer INSIDE the detached task. Capturing
+    /// the id at intake time and clearing ONLY that captured id means a delayed
+    /// intake-clear is a no-op against a NEWER card from a later idle period:
+    /// both the delete probe and the pointer CAS are keyed on the captured id,
+    /// so when the pointer has advanced the CAS reports 0 rows affected
+    /// (`Ok(false)`) and the newer card survives. Mirrors the TUI capture test
+    /// for the intake call site (both now route through the same seam).
+    #[tokio::test]
+    async fn intake_capture_clear_targets_captured_id_and_cas_is_noop_when_pointer_advanced() {
+        let deleted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let cleared: Rc<RefCell<Vec<(String, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let deleted_for_closure = deleted.clone();
+        let cleared_for_closure = cleared.clone();
+
+        // Captured at intake time: the OLD card (id 4242). A NEWER card (id
+        // 9999) was posted by a later idle period, so the live pointer is 9999.
+        let intake_captured_msg = 4242u64;
+        clear_specific_idle_recap_card_with(
+            "discord:claude:intake-sess".to_string(),
+            555,
+            intake_captured_msg,
+            move |chan, msg| {
+                let deleted = deleted_for_closure.clone();
+                async move {
+                    deleted.borrow_mut().push((chan, msg));
+                }
+            },
+            move |session_key, msg| {
+                let cleared = cleared_for_closure.clone();
+                async move {
+                    cleared.borrow_mut().push((session_key, msg));
+                    // CAS no-op: the pointer advanced to 9999 (a later idle
+                    // period's card), so the captured-id UPDATE affects 0 rows.
+                    Ok(false)
+                }
+            },
+        )
+        .await;
+
+        // Both the delete probe and the CAS used the id captured AT INTAKE
+        // (4242), never the newer 9999 — the later card is left intact.
+        assert_eq!(deleted.borrow().as_slice(), &[(555, intake_captured_msg)]);
+        assert_eq!(
+            cleared.borrow().as_slice(),
+            &[(
+                "discord:claude:intake-sess".to_string(),
+                intake_captured_msg
+            )]
+        );
+    }
 
     fn snapshot_with_sessions(
         claude_session_id: Option<&str>,
@@ -1140,5 +1588,294 @@ mod tests {
     fn extract_transcript_tail_text_returns_none_when_file_missing() {
         let path = std::path::Path::new("/nonexistent-idle-recap-transcript.jsonl");
         assert_eq!(extract_transcript_tail_text(path), None);
+    }
+
+    // ---------------------------------------------------------------
+    // #3146 Part 1 (codex clear/post race): the post job must SKIP when a
+    // turn became active during compose, and still POST when idle.
+    // ---------------------------------------------------------------
+
+    /// Pure decision seam: post iff NOT active. The detached post job in
+    /// `server::routes::idle_recap::run_idle_recap_post_job` gates its
+    /// delete + post + persist sequence on `should_post_recap(active_turn)`.
+    #[test]
+    fn should_post_recap_skips_when_turn_active_posts_when_idle() {
+        // Idle channel → still post the recap (normal case, no false skip).
+        assert!(should_post_recap(false));
+        // A turn became active during compose → skip (do NOT post a stale
+        // `📦 … idle` card over the live turn).
+        assert!(!should_post_recap(true));
+    }
+
+    // ---------------------------------------------------------------
+    // #3146 Part 1 (codex R3 P1 — check-then-post TOCTOU): after the POST
+    // returns, re-check active-turn. If a turn raced into the (check → post)
+    // window, UNDO the post (delete the just-posted card, do NOT persist).
+    // ---------------------------------------------------------------
+
+    /// Pure recheck decision: idle-after-post → persist; active-after-post →
+    /// delete the just-posted card and skip persist.
+    #[test]
+    fn post_recheck_action_persists_when_idle_deletes_when_turn_raced_in() {
+        assert_eq!(
+            post_recheck_action(false),
+            PostRecheckAction::Persist,
+            "still idle after POST → persist the card pointer"
+        );
+        assert_eq!(
+            post_recheck_action(true),
+            PostRecheckAction::DeleteAndSkipPersist,
+            "a turn raced the check→post window → delete the just-posted card, skip persist"
+        );
+    }
+
+    /// End-to-end of the post-job's commit branch using the SAME seam the route
+    /// uses: simulate "idle at pre-check, ACTIVE at post-recheck". The recheck
+    /// must DELETE the just-posted card and NOT persist its pointer. Mirrors the
+    /// route's `run_idle_recap_post_job` post-recheck without a live Postgres or
+    /// Discord http.
+    #[tokio::test]
+    async fn post_recheck_deletes_just_posted_card_and_does_not_persist_when_turn_raced_in() {
+        let deleted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let persisted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Pre-post check saw idle (so we posted); the POST returned this id.
+        let posted_message_id = 5151u64;
+        let channel_id = 777u64;
+        // ... but a TUI claim raced in during (check → post): active now.
+        let active_turn_after_post = true;
+
+        match post_recheck_action(active_turn_after_post) {
+            PostRecheckAction::DeleteAndSkipPersist => {
+                deleted.borrow_mut().push((channel_id, posted_message_id));
+                // NOTE: no persist call in this branch.
+            }
+            PostRecheckAction::Persist => {
+                persisted.borrow_mut().push((channel_id, posted_message_id));
+            }
+        }
+
+        assert_eq!(
+            deleted.borrow().as_slice(),
+            &[(channel_id, posted_message_id)],
+            "the just-posted card must be deleted"
+        );
+        assert!(
+            persisted.borrow().is_empty(),
+            "the pointer must NOT be persisted when a turn raced the check→post window"
+        );
+    }
+
+    /// Positive control: still idle at the post-recheck → persist the pointer,
+    /// delete nothing. This is the normal, common-case path.
+    #[tokio::test]
+    async fn post_recheck_persists_when_still_idle() {
+        let deleted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+        let persisted: Rc<RefCell<Vec<(u64, u64)>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let posted_message_id = 6262u64;
+        let channel_id = 888u64;
+        let active_turn_after_post = false;
+
+        match post_recheck_action(active_turn_after_post) {
+            PostRecheckAction::DeleteAndSkipPersist => {
+                deleted.borrow_mut().push((channel_id, posted_message_id));
+            }
+            PostRecheckAction::Persist => {
+                persisted.borrow_mut().push((channel_id, posted_message_id));
+            }
+        }
+
+        assert!(
+            deleted.borrow().is_empty(),
+            "nothing deleted when still idle"
+        );
+        assert_eq!(
+            persisted.borrow().as_slice(),
+            &[(channel_id, posted_message_id)],
+            "the pointer is persisted when the channel is still idle at the recheck"
+        );
+    }
+
+    /// Process-wide mutex: `inflight_has_active_turn` resolves the inflight
+    /// root from the PROCESS-WIDE `AGENTDESK_ROOT_DIR`, so the env-mutating
+    /// tests must not race the rest of the suite.
+    fn active_turn_env_test_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct RootEnvGuard(Option<std::ffi::OsString>);
+    impl Drop for RootEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    fn make_inflight(channel_id: u64) -> super::super::inflight::InflightTurnState {
+        super::super::inflight::InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            7,
+            channel_id + 1,
+            channel_id + 1001,
+            "hello".to_string(),
+            None,
+            Some(format!("AgentDesk-codex-adk-cdx-{channel_id}")),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            0,
+        )
+    }
+
+    /// A fresh, non-stale inflight for `(provider, channel_id)` — exactly the
+    /// marker the TUI claim path writes when a turn becomes active — is read
+    /// as an ACTIVE turn, so the post job will skip.
+    #[test]
+    fn channel_has_active_turn_true_for_fresh_inflight() {
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let channel_id = 8_146_001;
+        super::super::inflight::save_inflight_state(&make_inflight(channel_id)).expect("save");
+
+        assert!(inflight_has_active_turn(&ProviderKind::Codex, channel_id));
+        // And the gate skips the post.
+        assert!(!should_post_recap(inflight_has_active_turn(
+            &ProviderKind::Codex,
+            channel_id
+        )));
+    }
+
+    /// A genuinely idle channel (no inflight on disk) is NOT active — the
+    /// post job must still post the recap. This is the no-false-skip guard.
+    #[test]
+    fn channel_has_active_turn_false_when_no_inflight() {
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let channel_id = 8_146_002;
+        assert!(!inflight_has_active_turn(&ProviderKind::Codex, channel_id));
+        // Idle → still post.
+        assert!(should_post_recap(inflight_has_active_turn(
+            &ProviderKind::Codex,
+            channel_id
+        )));
+    }
+
+    /// A stale leftover inflight (its `updated_at` aged past the THREAD-GUARD
+    /// staleness threshold) must NOT be treated as an active turn — otherwise
+    /// a crashed dispatch would permanently suppress the recap on an idle
+    /// channel (a false skip). This mirrors how THREAD-GUARD / the stall-
+    /// watchdog treat such rows.
+    #[test]
+    fn channel_has_active_turn_false_for_stale_inflight() {
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let channel_id = 8_146_003;
+        // `save_inflight_state` always re-stamps `updated_at = now`, so to
+        // simulate an aged row we save normally and then rewrite the
+        // persisted `updated_at` on disk to a stale value.
+        super::super::inflight::save_inflight_state(&make_inflight(channel_id)).expect("save");
+        let state_path = temp
+            .path()
+            .join("runtime")
+            .join("discord_inflight")
+            .join(ProviderKind::Codex.as_str())
+            .join(format!("{channel_id}.json"));
+        // The on-disk `updated_at` uses the same LOCAL-time `%Y-%m-%d
+        // %H:%M:%S` form as `now_string()`; the staleness parser only
+        // understands that form, so we must match it (an RFC3339 string would
+        // be unparseable → treated as NOT stale).
+        let stale_local = chrono::Local::now()
+            - chrono::Duration::seconds(
+                super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64 + 60,
+            );
+        let stale_str = stale_local.format("%Y-%m-%d %H:%M:%S").to_string();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        json["updated_at"] = serde_json::Value::String(stale_str);
+        std::fs::write(&state_path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        assert!(!inflight_has_active_turn(&ProviderKind::Codex, channel_id));
+    }
+
+    /// codex R2 P1: a turn that is MAILBOX-active but whose inflight sidecar has
+    /// NOT yet been written must still be detected as active by
+    /// `channel_has_active_turn`, so the post job skips. This is the exact lag
+    /// window between `mailbox_try_start_turn` (turn active) and the later
+    /// `save_inflight_state` in `claim_tui_direct_synthetic_turn`. We simulate
+    /// it by starting a mailbox turn through the global registry WITHOUT writing
+    /// any inflight sidecar, then asserting the channel reads as active.
+    // SAFETY (await_holding_lock): `active_turn_env_test_mutex()` is a std Mutex
+    // held across awaits to serialize tests that mutate the process-global
+    // `AGENTDESK_ROOT_DIR`; the hold must span the awaits so a concurrent test
+    // cannot clobber the env mid-flight. Test-only.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn channel_has_active_turn_true_for_mailbox_active_without_inflight() {
+        // Isolate the inflight root so no stray sidecar leaks in — the mailbox
+        // signal alone must carry the detection.
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let channel_id = 8_146_004u64;
+        let chan = serenity::ChannelId::new(channel_id);
+
+        // No inflight sidecar written — the defense-in-depth leg is idle.
+        assert!(!inflight_has_active_turn(&ProviderKind::Codex, channel_id));
+
+        // Make the MAILBOX turn active via the same global registry the claim
+        // path feeds (`mailbox_try_start_turn` → `mailbox()` → global handle).
+        let registry = crate::services::turn_orchestrator::ChannelMailboxRegistry::default();
+        let handle = registry.handle(chan);
+        let started = handle
+            .try_start_turn(
+                std::sync::Arc::new(CancelToken::new()),
+                serenity::UserId::new(1),
+                serenity::MessageId::new(99),
+            )
+            .await;
+        assert!(started, "mailbox turn should start");
+
+        // Mailbox-active-but-inflight-not-yet-written ⇒ active ⇒ post skipped.
+        assert!(channel_has_active_turn(&ProviderKind::Codex, channel_id).await);
+        assert!(!should_post_recap(
+            channel_has_active_turn(&ProviderKind::Codex, channel_id).await
+        ));
+
+        // Cleanup: finish the turn so the global handle does not leak an active
+        // state into other tests sharing the process-global registry.
+        handle
+            .finish_turn(
+                crate::services::turn_orchestrator::QueuePersistenceContext::new(
+                    &ProviderKind::Codex,
+                    "idle-recap-mailbox-active-test",
+                    None,
+                ),
+            )
+            .await;
+        assert!(!channel_has_active_turn(&ProviderKind::Codex, channel_id).await);
     }
 }
