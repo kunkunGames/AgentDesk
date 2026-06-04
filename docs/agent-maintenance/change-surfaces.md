@@ -208,7 +208,7 @@
     constructor).
   - `src/services/discord/health/recovery.rs` (2417 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3620 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3658 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -372,7 +372,7 @@
   - `src/server/mod.rs` (2239 lines).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1894 lines).
-  - `src/reconcile.rs` (1809 lines; periodic reconcile loop covering stale
+  - `src/reconcile.rs` (1806 lines; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.
