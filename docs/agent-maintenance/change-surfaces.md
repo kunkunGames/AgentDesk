@@ -375,7 +375,7 @@
   - `src/services/discord/health/recovery.rs` (2567 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3658 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3689 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -529,7 +529,7 @@
   - `src/cli/migrate/apply.rs` (3146 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1444), client.rs (2378), direct.rs (1778),
-    dcserver.rs (1609)}`.
+    dcserver.rs (1618)}`.
   - `src/cli/provider_cli/mod.rs` (1039 lines).
 - active_callsite_coverage: n/a.
 - invariants: LaunchAgent plist and runtime layout are generated only — see
