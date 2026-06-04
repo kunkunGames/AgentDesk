@@ -20,6 +20,9 @@ ARCHITECTURE_TOP_LEVEL_MAP_START = "<!-- BEGIN GENERATED: TOP LEVEL MODULE MAP -
 ARCHITECTURE_TOP_LEVEL_MAP_END = "<!-- END GENERATED: TOP LEVEL MODULE MAP -->"
 GIANT_FILE_THRESHOLD = 1000
 HTTP_METHODS = ("delete", "get", "head", "options", "patch", "post", "put")
+<<<<<<< ours
+TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs", "high_risk_recovery.rs"}
+=======
 TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs"}
 GIANT_FILE_REGISTRY = REPO_ROOT / "scripts" / "giant_file_registry.toml"
 GIANT_FILE_REGISTRY_DOC = GENERATED_DOCS_DIR / "giant-file-registry.md"
@@ -98,6 +101,7 @@ def cfg_requires_test(predicate: str) -> bool:
     if predicate.startswith("not(") and predicate.endswith(")"):
         return False
     return False
+>>>>>>> theirs
 
 TOP_LEVEL_MODULE_PURPOSES = {
     "bootstrap.rs": "Builds config, database, policy engine, and shared app state before launch.",
