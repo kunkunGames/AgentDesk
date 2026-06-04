@@ -91,7 +91,7 @@
 - do_not_edit_without_migration_plan (giant-file, awaiting split issue):
   - `src/dispatch/dispatch_context.rs` (2805 lines).
   - `src/dispatch/dispatch_create.rs` (1381 lines).
-  - `src/dispatch/dispatch_status.rs` (1448 lines).
+  - `src/dispatch/dispatch_status.rs` (1517 lines).
   - `src/services/dispatches/outbox_route.rs` (1118 lines; route extraction
     orchestration surface from #1722, split before adding non-bugfix behavior).
   - `src/services/dispatches/discord_delivery/orchestration.rs` (1652 lines;
@@ -116,11 +116,19 @@
   - `src/services/discord/watchers/lifecycle.rs` (2301 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
-  - `src/services/discord/tmux.rs` (2129 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2241 lines after #2558 dead-code sweep;
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
+    #3016 option A `normal_completion` finalize-decouple param;
+    #3017 monitor-auto-turn finalizer routing + ledger-generation +
+    relay-watermark reset re-exports; +10 from #3041 P1-1 making
+    `advance_watcher_confirmed_end` `pub(in crate::services::discord)` +
+    doc-comment — the watcher commits the delivery lease and advances this
+    monotonic-CAS offset INLINE (synchronously) on a `Delivered` outcome; the
+    finalizer actor's `CommitDelivery`/`ReleaseDelivery` handlers are DORMANT
+    (retained for a later phase, not the live watcher path after the R2 revert);
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7419 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (8168 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -137,6 +145,27 @@
     the bind did not record it, instead of leaking a duplicate);
     +50 from #3104 terminal/idle reconciliation pass that strips a lingering
     `계속 처리 중` streaming footer off the committed-but-unrelayed placeholder;
+    +46 from #3016 option A codex R2 `pinned_finalize_user_msg_id` pure helper
+    that binds the watcher normal-completion finalize id to the OUTPUT RANGE
+    (`turn_start_offset.unwrap_or(last_offset) < current_offset`, mirroring the
+    yield guard at `tmux.rs:2110-2111`) so a follow-up turn started after this
+    range is not released by stale output;
+    +143 from #3017 the no-inflight relay-dedup gate (reads `committed_relay_offset`
+    + generation-aware watermark resets, suppresses a wake/idle terminal already
+    committed by another relay actor) and the monitor-auto-turn synthetic-id /
+    ledger-generation threading through `finish_monitor_auto_turn_if_claimed`;
+    +185 from #3041 P1-1 wiring the WATCHER terminal delivery through the live
+    `DeliveryLeaseCell`: a per-spawn `instance_id`, the B3 acquire-deadline
+    constant + rationale, the pre-send `try_acquire` on the turn-pinned identity,
+    the B2 single-holder skip arm (a replacement watcher must not re-emit a held
+    range), and committing the lease + advancing `advance_watcher_confirmed_end`
+    for the watcher terminal path INLINE (synchronously; the actor
+    `commit_delivery`/`release_delivery` round-trip was reverted in R2 — those
+    actor handlers are DORMANT, retained for a later phase); plus the R2 Issue-1
+    heartbeat: a `DeliveryLeaseHeartbeat` background task `renew()`s the lease
+    every 5s while the send future is in flight (deadline cut to 15s for fast
+    dead-holder recovery), stopped before the inline commit so a long multi-chunk
+    send is never reclaimed mid-flight;
     split loop helpers further before adding behavior).
   - `src/services/discord/tui_prompt_relay.rs` (3849 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
@@ -195,19 +224,23 @@
     `reset_state_for_tests` helper; +26 from #3105 codex-P1 sub-case B
     `evict_dead_tmux_mirror` tombstone helper that drops both the runtime and
     channel mirror for a dead/orphaned session and then allows re-registration).
-  - `src/services/discord/recovery_engine.rs` (4033 lines; +36 from #3099
+  - `src/services/discord/recovery_engine.rs` (4037 lines; +36 from #3099
     task-notification anchor `⏳` cleanup for `user_msg_id == 0` recovery; +4
     from the #3099 re-review pinned-injected-message-id cleanup target; +55 from
     #3078 PR-2 routing recovery completion through `StatusPanelController` behind
     a shadow parity check (the controller adopts the recovered panel id and its
     chosen completion id is asserted equal to the legacy
     `recovery_status_panel_message_id_for_completion` result; the legacy path
-    still executes the Discord IO, so behaviour is unchanged)).
+    still executes the Discord IO, so behaviour is unchanged); +4 from #3017
+    routing the recovery terminal through the single-authority finalizer
+    (`submit_terminal` + `FinalizeContext::monitor`) instead of inline
+    `mailbox_finish_turn`).
   - `src/services/discord/health.rs` (2354 lines after #1879 snapshot/mailbox
     extraction; +3 from #3082 answer-flush-barrier field in the test SharedData
     constructor).
-  - `src/services/discord/health/recovery.rs` (2417 lines; health recovery
-    extraction surface, split further before adding non-bugfix behavior).
+  - `src/services/discord/health/recovery.rs` (2438 lines; health recovery
+    extraction surface, split further before adding non-bugfix behavior; +70
+    from #3126 stall-watchdog completed-idle false-positive guard tests).
   - `src/services/discord/router/message_handler/intake_turn.rs` (3620 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
@@ -223,6 +256,13 @@
     split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1849 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1242 lines).
+  - `src/services/discord/turn_finalizer.rs` (1011 prod lines; single-authority
+    turn-finalize state machine — ledger/actor-loop/reconciler. Crossed the
+    giant-file threshold when #3041 P1-0 added the dormant `DeliveryLeaseCell`
+    finalizer messages/handlers on top of #3143's `FinalizeContext::monitor()` +
+    monitor turn-key/ledger-generation logic; tracked decompose target — see
+    `giant-file-registry.md` (owner `discord-finalizer`, deadline 2026-08-31,
+    issue #3016). Bugfix only outside a finalizer-decomposition plan).
   - `src/services/discord/formatting.rs` (2802 lines; +46 from #3082
     answer-flush-barrier guards (+11 around the plain multi-chunk send loops;
     +24 from the #3082 codex follow-up that also guards the edit/replace path
@@ -252,7 +292,7 @@
     inline — its move-captured locals make a clean extraction risky and is
     deferred).
   - `src/services/discord/session_runtime.rs` (1396 lines).
-  - `src/services/discord/voice_barge_in.rs` (4653 lines; voice STT/TTS,
+  - `src/services/discord/voice_barge_in.rs` (4835 lines; voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
     tracked decompose target — see `giant-file-registry.md` (owner
     `voice-runtime`, deadline 2026-08-31, #3036)).
@@ -438,7 +478,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
-- `src/services/onboarding/mod.rs` (2966),
+- `src/services/onboarding/mod.rs` (2936),
   `src/services/dispatched_sessions.rs` (1326), and
   `src/services/settings.rs` (1007) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`

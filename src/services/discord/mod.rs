@@ -1558,10 +1558,19 @@ pub(super) struct TmuxRelayCoord {
     /// End offset (exclusive) of the last relay this process has confirmed
     /// delivery for. 0 = no confirmed delivery yet this process lifetime.
     ///
-    /// This is telemetry/stop-state only. Relay dedupe is scoped to the
-    /// watcher instance via its local `last_relayed_offset`; cross-watcher
-    /// ownership is enforced at registration time so a valid owner is never
-    /// suppressed solely because another watcher advanced this watermark.
+    /// #3017: this is the single output-offset authority for the relay-dedup
+    /// paths (read via `SharedData::committed_relay_offset`, advanced by the
+    /// watcher's `advance_watcher_confirmed_end`). For an inflight-less wake /
+    /// idle-background / monitor-auto-turn turn, the secondary relay actors
+    /// (idle-JSONL relay, session-bound sink) CONSULT this watermark so a
+    /// byte-range the watcher already committed is relayed exactly once
+    /// regardless of which actor observes it first (the E-13 dedup invariant).
+    /// For a normal
+    /// Discord-origin turn (inflight present) the watcher remains the sole
+    /// relay owner and relay dedupe is still scoped to the watcher instance via
+    /// its local `last_relayed_offset` — a valid owner is never suppressed
+    /// solely because another watcher advanced this watermark; only the
+    /// no-inflight wake/idle paths gate on it.
     pub(super) confirmed_end_offset: Arc<std::sync::atomic::AtomicU64>,
     /// Wall-clock timestamp (ms since epoch) of the most recent confirmed
     /// relay. 0 = no confirmed relay observed yet. Read by the
@@ -1589,17 +1598,471 @@ pub(super) struct TmuxRelayCoord {
     /// written once per spawn and never touched by the live wrapper, so its
     /// mtime survives jsonl rotation but flips on a fresh spawn.
     pub(super) confirmed_end_generation_mtime_ns: Arc<std::sync::atomic::AtomicI64>,
+    /// #3041 P1-1: the LIVE per-channel delivery lease. Added ALONGSIDE
+    /// `relay_slot` (which is NOT removed yet — its guard migration is a later
+    /// step). The watcher acquires this before delivering the terminal response
+    /// and commits it after; the commit is what advances `confirmed_end_offset`
+    /// (replacing the watcher's inline advance). Shared via `Arc` across all
+    /// watcher instances for the channel so a replacement watcher observes a
+    /// live holder's lease and skips the duplicate send (the §5.2 B2 invariant).
+    pub(in crate::services::discord) delivery_lease: Arc<DeliveryLeaseCell>,
 }
 
 impl TmuxRelayCoord {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(channel_id: ChannelId) -> Self {
         Self {
             relay_slot: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_offset: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_relay_ts_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             reconnect_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             confirmed_end_generation_mtime_ns: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            delivery_lease: Arc::new(DeliveryLeaseCell::new(channel_id)),
         }
+    }
+}
+
+// ===========================================================================
+// #3041 §2-§3 — Delivery-lease `DeliveryLeaseCell` state machine.
+//
+// As of P1-1 the WATCHER terminal-delivery path wires this LIVE: the watcher
+// acquires the cell before sending, heartbeat-renews it during the send, and
+// commits+advances+releases INLINE. The `relay_slot` field above is LEFT
+// UNTOUCHED for now (its guard migration is a later step). The SINK/BRIDGE
+// committers (P1-2) and the 3-way ACK reconciliation (P1-3) are not wired yet,
+// so the actor `CommitDelivery`/`ReleaseDelivery` messages and some helpers
+// remain dormant — those still carry targeted `#[allow(dead_code)]` attributes
+// tagged with this issue/phase, to be wired/removed by the follow-up phases.
+//
+// Design (faithful to #3041 §2-§3):
+//   lease = (channel_id, turn_identity: TurnKey, byte_range [start,end))
+//           → a "one-time terminal-delivery right".
+//   The turn identity reuses `TurnKey` from `turn_finalizer.rs` (no new key).
+//   State machine:
+//     Unleased --(CAS acquire)--> Leased{holder, deadline, range}
+//               --(commit)-------> Committed{Delivered|NotDelivered|Unknown}
+//               --(release)------> Unleased
+//     deadline reclaim: Leased --(deadline elapsed)--> Unleased
+// ===========================================================================
+
+/// Who currently holds (or is attempting to hold) the delivery lease.
+///
+/// #3041 P1-0: dormant, wired in P1-1.. — the holder is matched on
+/// compare-and-release so an actor can only release a lease it actually owns.
+#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::services::discord) enum LeaseHolder {
+    /// A tmux watcher instance. `instance_id` distinguishes an outgoing
+    /// watcher from its successor across a reattach so a stale watcher cannot
+    /// release the live watcher's lease.
+    Watcher { instance_id: u64 },
+    /// The standby / output sink relay.
+    Sink,
+    /// The bridge (turn-bridge handoff path).
+    Bridge,
+}
+
+/// The three-way commit outcome (#3041 §3). `Unknown` is the safety value for
+/// any ambiguous terminal (drop / panic / partial write) and MUST NOT advance
+/// the confirmed-delivery offset — only `Delivered` does.
+///
+/// #3041 P1-0: dormant, wired in P1-1...
+#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::services::discord) enum LeaseOutcome {
+    /// Terminal output was confirmed delivered to Discord; the offset may
+    /// advance to `end`.
+    Delivered,
+    /// Delivery was intentionally suppressed / not performed; offset unchanged.
+    NotDelivered,
+    /// Ambiguous (drop / panic / partial). Offset MUST NOT advance.
+    Unknown,
+}
+
+/// The lease state machine value, owned behind the cell's mutex. The `AtomicU8`
+/// tag below is the single-winner CAS gate for acquire; this payload is only
+/// ever mutated by that winner (or by a deadline reclaim), and every mutation
+/// flips the tag AND writes the payload under the SAME mutex, so the tag and
+/// payload are always observed coherently (#3041 codex). `read()` also takes
+/// the mutex — there is no lock-free read fast path.
+///
+/// #3041 P1-0: dormant, wired in P1-1...
+#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+#[derive(Clone, Debug)]
+enum LeaseState {
+    /// No holder; the lease is available to acquire.
+    Unleased,
+    /// Held by `holder` for turn identity `turn` until `deadline` (monotonic ms
+    /// since process start); covers the half-open byte range `[start, end)`.
+    /// The lease key is the FULL `(channel_id, turn, [start,end))` identity
+    /// (#3041 §2): `commit`/`release` verify it so a stale commit or release
+    /// from an OLDER turn (or the same turn with a different range) cannot act
+    /// on a reacquired NEWER lease. `reclaim_if_expired` is intentionally
+    /// deadline-only (identity-agnostic) — it force-returns an expired lease
+    /// regardless of holder/turn so a dead holder cannot strand the cell.
+    Leased {
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        deadline_ms: u64,
+        start: u64,
+        end: u64,
+    },
+    /// Committed with a three-way outcome; carries the same `(holder, turn,
+    /// range)` identity forward so a stale release is rejected. Awaits a
+    /// `release` to return to `Unleased`.
+    Committed {
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        start: u64,
+        end: u64,
+        outcome: LeaseOutcome,
+    },
+}
+
+/// #3041 P1-1: process-monotonic millisecond clock for delivery-lease
+/// deadlines. The acquire deadline and the reconciler's `reclaim_if_expired`
+/// MUST read the SAME clock; a wall clock would jump on NTP steps and could
+/// reclaim a live holder or strand a dead one. Anchored to a process-start
+/// `Instant` so it is purely monotonic (never goes backwards). NOTE: this is a
+/// real wall-monotonic clock, not the Tokio test clock; gated-clock tests drive
+/// `reclaim_if_expired` with explicit `now_ms` arguments rather than this fn.
+pub(in crate::services::discord) fn lease_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Internal CAS gate tag for the [`DeliveryLeaseCell`]. The CAS that flips
+/// `UNLEASED → LEASED` is the single-winner acquire primitive — exactly one
+/// acquirer wins; concurrent losers serialize on the payload mutex and observe
+/// a non-`UNLEASED` tag under the lock. The tag is taken/flipped under the
+/// payload mutex (never on its own); it is NOT a lock-free read fast path —
+/// `read()` always takes the mutex (#3041 R1 coherence fix).
+const TAG_UNLEASED: u8 = 0;
+const TAG_LEASED: u8 = 1;
+const TAG_COMMITTED: u8 = 2;
+
+/// One-time terminal-delivery right for a single `(channel, turn, byte_range)`
+/// (#3041 §2-§3). DORMANT in P1-0 — added alongside, NOT replacing,
+/// `TmuxRelayCoord::relay_slot`. The `state_tag` is the single-winner CAS
+/// acquire primitive; the `payload` mutex carries the rich lease state (holder
+/// / deadline / range / outcome). The tag flip, payload write, and `read()` all
+/// happen under the one mutex, so they are always mutually coherent.
+///
+/// #3041 P1-0: dormant, wired in P1-1...
+#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+pub(in crate::services::discord) struct DeliveryLeaseCell {
+    /// The channel this lease coordinates. Part of the lease identity.
+    channel_id: ChannelId,
+    /// Internal CAS gate tag (`TAG_*`). The acquire CAS on this word is the
+    /// single-winner gate; it is flipped under the payload mutex, NOT lock-free
+    /// for readers — `read()` takes the mutex.
+    state_tag: std::sync::atomic::AtomicU8,
+    /// Rich lease payload. Mutated by the CAS winner or a deadline reclaim, and
+    /// read by `read()` — all under this one mutex (the coherence invariant).
+    payload: std::sync::Mutex<LeaseState>,
+}
+
+/// A point-in-time snapshot of a [`DeliveryLeaseCell`], returned by `read()`
+/// (which materializes it under the payload mutex).
+///
+/// #3041 P1-0: dormant, wired in P1-1...
+#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+#[derive(Clone, Debug)]
+pub(in crate::services::discord) enum LeaseSnapshot {
+    Unleased,
+    Leased {
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        deadline_ms: u64,
+        start: u64,
+        end: u64,
+    },
+    Committed {
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        start: u64,
+        end: u64,
+        outcome: LeaseOutcome,
+    },
+}
+
+#[allow(dead_code)] // #3041 P1-0: dormant, wired in P1-1..
+impl DeliveryLeaseCell {
+    /// Construct a fresh `Unleased` cell for `channel_id`. The turn identity
+    /// (`TurnKey`) and byte range are supplied per-acquire, not at
+    /// construction, so one cell serves the channel across sequential turns.
+    pub(in crate::services::discord) fn new(channel_id: ChannelId) -> Self {
+        Self {
+            channel_id,
+            state_tag: std::sync::atomic::AtomicU8::new(TAG_UNLEASED),
+            payload: std::sync::Mutex::new(LeaseState::Unleased),
+        }
+    }
+
+    /// The channel this lease coordinates.
+    pub(in crate::services::discord) fn channel_id(&self) -> ChannelId {
+        self.channel_id
+    }
+
+    /// Read the current lease state. Always materialized UNDER the payload
+    /// mutex so the snapshot can never disagree with a concurrently-acquiring
+    /// writer (#3041 codex): because `try_acquire`/`commit`/`release`/`reclaim`
+    /// flip `state_tag` AND write `payload` while holding the SAME mutex, any
+    /// observer that takes the lock sees a tag/payload pair that are mutually
+    /// coherent. `state_tag` remains the single-winner CAS gate for acquire; it
+    /// is NOT used as a lock-free read fast-path here because that reintroduced
+    /// the publish/observe window the codex review flagged.
+    pub(in crate::services::discord) fn read(&self) -> LeaseSnapshot {
+        let guard = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*guard {
+            LeaseState::Unleased => LeaseSnapshot::Unleased,
+            LeaseState::Leased {
+                holder,
+                turn,
+                deadline_ms,
+                start,
+                end,
+            } => LeaseSnapshot::Leased {
+                holder: *holder,
+                turn: *turn,
+                deadline_ms: *deadline_ms,
+                start: *start,
+                end: *end,
+            },
+            LeaseState::Committed {
+                holder,
+                turn,
+                start,
+                end,
+                outcome,
+            } => LeaseSnapshot::Committed {
+                holder: *holder,
+                turn: *turn,
+                start: *start,
+                end: *end,
+                outcome: *outcome,
+            },
+        }
+    }
+
+    /// CAS-acquire the lease for the full `(channel, turn, [start,end))`
+    /// identity (#3041 §2) on behalf of `holder` until `deadline_ms`. Records
+    /// `turn` so a later `commit`/`release` carrying a STALE older turn key is
+    /// rejected (the §2 hazard: a reclaim+reacquire reuses the same holder kind,
+    /// so holder alone is insufficient).
+    ///
+    /// Ordering invariant (codex coherence fix): the tag CAS and the payload
+    /// write happen UNDER the SAME mutex, and `read()` also locks, so a tag and
+    /// its payload are never observed out of step. The CAS keeps single-winner
+    /// semantics — exactly one acquirer flips `UNLEASED → LEASED`; every
+    /// concurrent loser (already holding the lock by then) sees a non-`UNLEASED`
+    /// tag under the lock and returns `false` without mutating the payload.
+    pub(in crate::services::discord) fn try_acquire(
+        &self,
+        turn: turn_finalizer::TurnKey,
+        holder: LeaseHolder,
+        start: u64,
+        end: u64,
+        deadline_ms: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut guard = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Single-winner gate, taken while holding the payload lock so the tag
+        // flip and the payload write publish together. Concurrent acquirers
+        // serialize on the mutex; whoever runs second sees a non-`UNLEASED` tag.
+        if self
+            .state_tag
+            .compare_exchange(
+                TAG_UNLEASED,
+                TAG_LEASED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        *guard = LeaseState::Leased {
+            holder,
+            turn,
+            deadline_ms,
+            start,
+            end,
+        };
+        true
+    }
+
+    /// Commit the lease three-way (#3041 §3). Verifies the FULL `(holder, turn,
+    /// [start,end))` identity against the currently-`Leased` lease (#3041 §2):
+    /// any mismatch — wrong holder, a STALE older `turn`, or a different range
+    /// — or a non-`Leased` state is a no-op that returns `false`. This closes
+    /// the §2 hazard where a stale commit from an older turn could act on a
+    /// reacquired same-channel/same-holder-kind lease. On success the tag
+    /// advances `LEASED → COMMITTED` (under the lock) and the outcome is
+    /// recorded. `Unknown` records but the caller MUST NOT advance the offset.
+    pub(in crate::services::discord) fn commit(
+        &self,
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        start: u64,
+        end: u64,
+        outcome: LeaseOutcome,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut guard = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*guard {
+            LeaseState::Leased {
+                holder: cur_holder,
+                turn: cur_turn,
+                start: cur_start,
+                end: cur_end,
+                ..
+            } if *cur_holder == holder
+                && cur_turn.exact_key() == turn.exact_key()
+                && *cur_start == start
+                && *cur_end == end =>
+            {
+                *guard = LeaseState::Committed {
+                    holder,
+                    turn,
+                    start,
+                    end,
+                    outcome,
+                };
+                self.state_tag.store(TAG_COMMITTED, Ordering::Release);
+                true
+            }
+            // Identity mismatch (holder / stale turn / range) or not Leased.
+            _ => false,
+        }
+    }
+
+    /// Compare-and-release: return the cell to `Unleased` ONLY if the FULL
+    /// `(holder, turn, [start,end))` identity matches the recorded lease (#3041
+    /// §2-§3) — symmetric with `commit`. Verifying the turn AND the byte range
+    /// (not just the holder) is what closes the §2 hazard: a stale release from
+    /// an OLDER turn — or from the SAME turn but an OLDER byte range after a
+    /// reclaim+reacquire re-leased a different range (e.g. a continuation chunk)
+    /// — is a no-op returning `false`, so it can never release the live newer
+    /// lease. A release is valid from either `Leased` (abandoned without commit)
+    /// or `Committed` (the normal post-commit release).
+    pub(in crate::services::discord) fn release(
+        &self,
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut guard = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let matches = match &*guard {
+            LeaseState::Leased {
+                holder: cur,
+                turn: cur_turn,
+                start: cur_start,
+                end: cur_end,
+                ..
+            }
+            | LeaseState::Committed {
+                holder: cur,
+                turn: cur_turn,
+                start: cur_start,
+                end: cur_end,
+                ..
+            } => {
+                *cur == holder
+                    && cur_turn.exact_key() == turn.exact_key()
+                    && *cur_start == start
+                    && *cur_end == end
+            }
+            LeaseState::Unleased => false,
+        };
+        if !matches {
+            return false;
+        }
+        *guard = LeaseState::Unleased;
+        self.state_tag.store(TAG_UNLEASED, Ordering::Release);
+        true
+    }
+
+    /// #3041 P1-1 (§3, codex R2 Issue-1): HEARTBEAT renew. While the holder's
+    /// terminal send future is in flight, the holder periodically calls this to
+    /// extend the lease deadline so the (deliberately SHORT) deadline is a
+    /// HOLDER-LIVENESS signal, not a hard cap on delivery duration. If the cell
+    /// is `Leased` by EXACTLY `(holder, turn)` (matched on holder + the turn's
+    /// `exact_key()`), its `deadline_ms` is overwritten with `new_deadline_ms`
+    /// and `true` is returned. ANY other state — a different holder, a stale
+    /// older turn, a `Committed`/`Unleased` cell, or a cell already reclaimed and
+    /// reacquired by someone else — is a no-op returning `false`. The range is
+    /// intentionally NOT matched: a renew only ever needs to prove "this exact
+    /// holder for this exact turn is still alive", and the live holder's range is
+    /// fixed for the lifetime of the lease anyway.
+    ///
+    /// Race-safety (why renew can never extend SOMEONE ELSE's lease): the match
+    /// requires the recorded `holder` AND `turn` to equal the caller's, both
+    /// taken UNDER the same payload mutex as every other mutation. If the cell
+    /// was reclaimed (→ `Unleased`) and reacquired by a replacement, the holder
+    /// or turn will differ and the renew no-ops. A late heartbeat tick that
+    /// fires after the holder already committed sees `Committed` (not `Leased`)
+    /// and no-ops. The ONLY successful renew extends the caller's OWN live lease.
+    pub(in crate::services::discord) fn renew(
+        &self,
+        holder: LeaseHolder,
+        turn: turn_finalizer::TurnKey,
+        new_deadline_ms: u64,
+    ) -> bool {
+        let mut guard = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let LeaseState::Leased {
+            holder: cur_holder,
+            turn: cur_turn,
+            deadline_ms,
+            ..
+        } = &mut *guard
+        {
+            if *cur_holder == holder && cur_turn.exact_key() == turn.exact_key() {
+                *deadline_ms = new_deadline_ms;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Deadline reclaim: if the lease is `Leased` and `now_ms >= deadline_ms`,
+    /// force it back to `Unleased` regardless of holder (the holder is presumed
+    /// dead/stuck). Returns `true` if a reclaim occurred. A `Committed` lease is
+    /// never reclaimed by deadline — it awaits an explicit holder `release`.
+    pub(in crate::services::discord) fn reclaim_if_expired(&self, now_ms: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut guard = self
+            .payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let LeaseState::Leased { deadline_ms, .. } = &*guard {
+            if now_ms >= *deadline_ms {
+                *guard = LeaseState::Unleased;
+                self.state_tag.store(TAG_UNLEASED, Ordering::Release);
+                return true;
+            }
+        }
+        false
     }
 }
 #[derive(Clone)]
@@ -1961,8 +2424,61 @@ impl SharedData {
     pub(super) fn tmux_relay_coord(&self, channel_id: ChannelId) -> Arc<TmuxRelayCoord> {
         self.tmux_relay_coords
             .entry(channel_id)
-            .or_insert_with(|| Arc::new(TmuxRelayCoord::new()))
+            .or_insert_with(|| Arc::new(TmuxRelayCoord::new(channel_id)))
             .clone()
+    }
+
+    /// #3041 P1-1: the LIVE per-channel delivery-lease cell, created on first
+    /// access alongside the relay coord. The watcher acquires/commits through
+    /// this to make terminal delivery + offset advance a single-holder unit
+    /// (§5.2). The returned `Arc` is shared across all watcher instances for the
+    /// channel so a replacement watcher sees the live holder and skips the
+    /// duplicate send (B2).
+    pub(in crate::services::discord) fn delivery_lease(
+        &self,
+        channel_id: ChannelId,
+    ) -> Arc<DeliveryLeaseCell> {
+        self.tmux_relay_coord(channel_id).delivery_lease.clone()
+    }
+
+    /// #3041 P1-1 (B3): reclaim any delivery lease whose acquire deadline has
+    /// elapsed, force-returning a dead holder's cell to `Unleased` so a later
+    /// legitimate acquire can win. Identity-agnostic (deadline-only) by design —
+    /// a `Committed` lease is never reclaimed here (it awaits an explicit holder
+    /// release). Driven from the finalizer's reconcile tick. Returns the number
+    /// of cells reclaimed (for observability/tests).
+    pub(in crate::services::discord) fn reclaim_expired_delivery_leases(
+        &self,
+        now_ms: u64,
+    ) -> usize {
+        let mut reclaimed = 0usize;
+        for coord in self.tmux_relay_coords.iter() {
+            if coord.value().delivery_lease.reclaim_if_expired(now_ms) {
+                reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
+    /// #3017 single output-offset authority for the relay-dedup paths — a
+    /// read-only snapshot of the authoritative committed relayed offset.
+    ///
+    /// The per-channel `confirmed_end_offset` is the ONE authoritative "JSONL
+    /// byte offset (exclusive) past which output has already been relayed to
+    /// Discord". The single committer is the tmux watcher (the primary relay)
+    /// via `advance_watcher_confirmed_end`. The inflight-less wake /
+    /// idle-background / monitor relay paths (idle-JSONL relay, session-bound
+    /// sink) CONSULT this BEFORE relaying so a byte-range the watcher already
+    /// delivered is relayed EXACTLY ONCE regardless of which actor observes it
+    /// first (the E-13 dedup invariant). They do NOT claim it themselves —
+    /// claiming on a secondary path could suppress the primary watcher's own
+    /// delivery on a failed forward and drop the response. It is the
+    /// cross-actor generalization of the watcher's process-local
+    /// `last_relayed_offset`.
+    pub(super) fn committed_relay_offset(&self, channel_id: ChannelId) -> u64 {
+        self.tmux_relay_coord(channel_id)
+            .confirmed_end_offset
+            .load(Ordering::Acquire)
     }
 
     /// Record that this process spawned a watcher during recovery/reattach.

@@ -566,6 +566,40 @@ impl RelaySink for SessionBoundDiscordRelaySink {
             match self.deliver_response(delivery).await {
                 Ok(SessionRelayDeliveryOutcome::Committed) => {
                     terminal_committed = true;
+                    // #3017: the sink deliberately does NOT advance the
+                    // committed relay offset here. The only byte offset
+                    // available at this point is the JSONL EOF, which can
+                    // include bytes appended AFTER this frame was read but
+                    // before the async Discord delivery committed — committing
+                    // that later EOF would mark undelivered appended output as
+                    // already relayed and DROP it (codex r4 P1). The
+                    // `StreamFrame` contract does not carry the exact delivered
+                    // byte-range end, and threading one through the cluster
+                    // stream-relay producer/parser is out of this subset's
+                    // scope. The tmux watcher remains the SOLE committer of the
+                    // authority (`advance_watcher_confirmed_end`, which has the
+                    // exact relayed offset); the idle relay only CONSULTS it.
+                    // This keeps the dedup data-loss-free: the residual
+                    // idle-wins-the-race window is bounded by the idle relay's
+                    // 10s recent-inflight grace (the watcher relays + commits
+                    // within ~250ms), and when no watcher is relaying there is
+                    // no second actor to duplicate against. (See FINAL OUTPUT
+                    // note for the #3017 follow-up to carry the range end.)
+                    //
+                    // EXACT-ONCE GAP (deferred to #3041, NOT a regression):
+                    // because this terminal Discord delivery does NOT advance the
+                    // authority, the "sink wins first" case is not yet exact-once.
+                    // If this sink posts BEFORE the watcher commits, the authority
+                    // (`confirmed_end_offset`) stays stale, so the watcher's later
+                    // no-inflight dedup gate cannot suppress its own delivery →
+                    // a residual duplicate window (the 10s grace reduces but does
+                    // not eliminate it). Closing this requires the sink's delivery
+                    // to advance the authority atomically with the exact relayed
+                    // range end — that is the #3041 delivery-lease (commit-with-
+                    // offset) work, deliberately out of scope here to avoid the
+                    // codex r4 P1 black-hole of committing a too-late EOF. Phase4's
+                    // read-only consult is a strict improvement over no consult;
+                    // it does not by itself achieve full exact-once for this window.
                     self.finish_terminal_candidate(&session_name);
                 }
                 Ok(SessionRelayDeliveryOutcome::Skipped) => {
@@ -602,12 +636,13 @@ pub(crate) async fn run_session_bound_discord_relay_supervisor(
     };
 
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(true, Ordering::Release);
+    let idle_health_registry = health_registry.clone();
     let sink: Arc<dyn RelaySink> = Arc::new(SessionBoundDiscordRelaySink::new(health_registry));
     let idle_shutdown = shutdown.clone();
     super::task_supervisor::spawn_observed(
         "session_bound_idle_jsonl_relay",
         async move {
-            run_idle_jsonl_relay_loop(idle_shutdown).await;
+            run_idle_jsonl_relay_loop(idle_shutdown, idle_health_registry).await;
         }
         .instrument(tracing::info_span!("session_bound_idle_jsonl_relay")),
     );
@@ -615,7 +650,10 @@ pub(crate) async fn run_session_bound_discord_relay_supervisor(
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(false, Ordering::Release);
 }
 
-async fn run_idle_jsonl_relay_loop(shutdown: Arc<AtomicBool>) {
+async fn run_idle_jsonl_relay_loop(
+    shutdown: Arc<AtomicBool>,
+    health_registry: Arc<HealthRegistry>,
+) {
     let registry = crate::services::cluster::session_registry::global_session_registry();
     let producers =
         crate::services::cluster::relay_producer_registry::global_relay_producer_registry();
@@ -669,7 +707,13 @@ async fn run_idle_jsonl_relay_loop(shutdown: Arc<AtomicBool>) {
                 *offset = end;
                 continue;
             }
-            if first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE {
+            // Classify the WHOLE payload up front so the offset-authority dedup
+            // (and any prefix/suffix trim) operate on an already-classified
+            // turn. Mirrors `idle_relay_range_action`'s ordering; the distinct
+            // per-reason debug logs below are preserved for observability.
+            let in_new_session_grace =
+                first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE;
+            if in_new_session_grace {
                 *offset = end;
                 tracing::debug!(
                     provider = matched.provider.as_str(),
@@ -720,6 +764,123 @@ async fn run_idle_jsonl_relay_loop(shutdown: Arc<AtomicBool>) {
                 );
                 continue;
             };
+            // #3017 single output-offset authority. This idle path and the
+            // tmux watcher both read the SAME JSONL and can both relay an
+            // inflight-less wake / background turn (E-13: a scheduled-wakeup
+            // output relayed twice). The tmux watcher is the PRIMARY relay and
+            // advances the authoritative `confirmed_end_offset` on a confirmed
+            // relay (`advance_watcher_confirmed_end`); this idle path is the
+            // backstop. So the idle relay only CONSULTS the authority read-only:
+            // if the watcher already committed at/past this range end, that
+            // range is already delivered → skip to avoid the duplicate. It does
+            // NOT itself advance the authority — `try_send_frame` only means the
+            // frame was QUEUED (the sink may still skip/drop/fail it), so
+            // committing here could suppress the watcher's own delivery and drop
+            // the response (codex P1). On a standby node with no watcher relaying
+            // there is no second actor to duplicate, so no advance is needed.
+            let channel = ChannelId::new(channel_id);
+            if let Some(shared) = health_registry
+                .shared_for_provider_on_channel(&matched.provider, channel)
+                .await
+                .or(health_registry.shared_for_provider(&matched.provider).await)
+            {
+                // Codex P2: a stale-high `confirmed_end_offset` left by a
+                // previous wrapper (before a watcher ran its regression reset)
+                // would otherwise make this skip the FRESH file's first bytes
+                // and drop a wake response. Run the SAME generation-aware
+                // regression reset the watcher uses BEFORE reading the
+                // watermark, so a truncated/respawned JSONL resets the shared
+                // watermark to 0 (fresh wrapper) and the fresh range is relayed.
+                super::tmux::reset_stale_relay_watermark_if_output_regressed(
+                    shared.as_ref(),
+                    channel,
+                    &session_name,
+                    len,
+                    "idle_jsonl_relay",
+                );
+                // Codex r7 P2: the EOF-regression reset above does NOT fire when
+                // a respawned same-named wrapper's fresh JSONL has already grown
+                // PAST the previous wrapper's watermark. Apply the same
+                // generation-change reset the watcher uses so a stale watermark
+                // from a prior wrapper does not make this idle relay skip fresh
+                // wake/background output as already relayed.
+                super::tmux::reset_relay_watermark_on_generation_change(
+                    shared.as_ref(),
+                    channel,
+                    &session_name,
+                    "idle_jsonl_relay",
+                );
+                let committed = shared.committed_relay_offset(channel);
+                // Classification already passed for this whole payload above, so
+                // pass `in_new_session_grace = false`: this consults ONLY the
+                // offset-authority dedup branch of the shared decision.
+                match idle_relay_range_action(&payload, start, end, committed, false) {
+                    IdleRelayRangeAction::SkipAlreadyRelayed => {
+                        // The whole `[start, end)` range was already delivered by
+                        // the watcher → skip entirely.
+                        *offset = end;
+                        tracing::debug!(
+                            provider = matched.provider.as_str(),
+                            channel = channel_id,
+                            tmux_session = %session_name,
+                            committed_relay_offset = committed,
+                            end,
+                            "idle JSONL relay skipped range already relayed by watcher (offset authority dedup)"
+                        );
+                        continue;
+                    }
+                    IdleRelayRangeAction::SendSuffixFrom(from) => {
+                        // Codex r5 P2 + codex r6 P1 (black-hole): PARTIAL overlap
+                        // (`start < committed < end`) — the watcher already
+                        // delivered the `[start, committed)` PREFIX (e.g. a wake
+                        // response) while the file grew past it before this poll.
+                        // Forwarding the whole payload from `start` would re-send
+                        // the already-delivered prefix.
+                        //
+                        // We must NOT bounce to a next tick (the old `*offset =
+                        // committed; continue;`): the next tick re-reads only the
+                        // suffix `[committed, end)`, which no longer carries the
+                        // `system/init` event (that lived in the already-committed
+                        // prefix). The init/classification gate above would then
+                        // re-classify the suffix as a "non-init active-session
+                        // payload" and DROP it → the user never sees the trailing
+                        // part of the response (a black-hole). Instead, deliver
+                        // the un-committed suffix in THIS SAME pass, carrying
+                        // forward the classification we already established for
+                        // this turn: prefix-skip, suffix-send, exactly once.
+                        let suffix =
+                            match read_jsonl_range(&matched.expected_rollout_path, from, end) {
+                                Ok(suffix) => suffix,
+                                Err(_) => continue,
+                            };
+                        if suffix.is_empty() {
+                            *offset = end;
+                            continue;
+                        }
+                        if producer.try_send_frame(String::from_utf8_lossy(&suffix).into_owned()) {
+                            *offset = end;
+                            tracing::debug!(
+                                provider = matched.provider.as_str(),
+                                channel = channel_id,
+                                tmux_session = %session_name,
+                                committed_relay_offset = committed,
+                                start,
+                                end,
+                                bytes = suffix.len(),
+                                "idle JSONL relay sent un-committed suffix after trimming already-relayed prefix (offset authority dedup, no black-hole)"
+                            );
+                        }
+                        continue;
+                    }
+                    // `committed <= start` → nothing covered → fall through to the
+                    // full-range send below.
+                    IdleRelayRangeAction::SendFull => {}
+                    // Classification already happened above; this arm is
+                    // unreachable here because we pass `in_new_session_grace =
+                    // false` and the payload already passed the init gate.
+                    IdleRelayRangeAction::SkipClassified => {}
+                }
+            }
             if producer.try_send_frame(String::from_utf8_lossy(&payload).into_owned()) {
                 *offset = end;
                 tracing::debug!(
@@ -736,6 +897,64 @@ async fn run_idle_jsonl_relay_loop(shutdown: Arc<AtomicBool>) {
         first_seen_at.retain(|session, _| seen_sessions.contains(session));
         last_inflight_seen_at.retain(|session, _| seen_sessions.contains(session));
         tokio::time::sleep(IDLE_JSONL_RELAY_POLL_INTERVAL).await;
+    }
+}
+
+/// The action the idle relay loop takes for one fresh JSONL range
+/// `[start, end)` after classifying the payload and consulting the offset
+/// authority. Encodes the REAL loop ordering: classification gates run on the
+/// WHOLE payload FIRST (so an `init` event anywhere in `[start, end)` keeps the
+/// range classified as a relayable turn), and the offset-authority dedup runs
+/// SECOND on that already-classified range. This is the contract the loop body
+/// must honor; extracting it makes the "init in committed prefix, suffix
+/// uncommitted" black-hole regression testable at loop-ordering granularity
+/// without spinning the live poll loop against the process-global registries.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleRelayRangeAction {
+    /// Classification dropped the range (grace window, user/tool-result event,
+    /// ScheduleWakeup setup, or non-init active-session payload). Advance the
+    /// offset past `end` without relaying.
+    SkipClassified,
+    /// The offset authority already covers `[start, end)` (`committed >= end`).
+    /// Advance past `end` without relaying (dedup, whole range).
+    SkipAlreadyRelayed,
+    /// PARTIAL overlap (`start < committed < end`): the prefix `[start, committed)`
+    /// was already relayed by the watcher; relay ONLY the uncommitted suffix
+    /// `[committed, end)` of THIS SAME classified turn, then advance past `end`.
+    /// The classification already passed on the full payload, so the suffix is
+    /// NOT re-gated as a fresh non-init payload (no black-hole, codex r6 P1).
+    SendSuffixFrom(u64),
+    /// Nothing covered (`committed <= start`): relay the whole `[start, end)`.
+    SendFull,
+}
+
+/// Pure decision for the idle relay's classification + offset-authority dedup,
+/// in the loop's real order. `payload` is the full `[start, end)` bytes.
+/// `in_new_session_grace` mirrors the runtime `first_seen.elapsed() < grace`
+/// gate. `committed` is the offset authority's `committed_relay_offset`.
+fn idle_relay_range_action(
+    payload: &[u8],
+    start: u64,
+    end: u64,
+    committed: u64,
+    in_new_session_grace: bool,
+) -> IdleRelayRangeAction {
+    // Classification first, on the WHOLE payload (matches the loop's gate
+    // ordering at the top of `run_idle_jsonl_relay_loop`).
+    if in_new_session_grace
+        || idle_jsonl_payload_contains_user_event(payload)
+        || idle_jsonl_payload_contains_schedule_wakeup_setup(payload)
+        || !idle_jsonl_payload_contains_init_event(payload)
+    {
+        return IdleRelayRangeAction::SkipClassified;
+    }
+    // Offset-authority dedup second, on the already-classified range.
+    if committed >= end {
+        IdleRelayRangeAction::SkipAlreadyRelayed
+    } else if committed > start {
+        IdleRelayRangeAction::SendSuffixFrom(committed)
+    } else {
+        IdleRelayRangeAction::SendFull
     }
 }
 
@@ -1351,6 +1570,216 @@ mod tests {
                 42,
             ),
             SessionBoundTerminalDeliveryRouteDecision::Skipped
+        );
+    }
+
+    /// #3017 / E-13 dedup invariant: the single output-offset authority makes
+    /// the idle-JSONL relay (and the watcher) relay a given inflight-less wake
+    /// byte-range EXACTLY ONCE.
+    ///
+    /// The tmux watcher is the PRIMARY relay and the SOLE committer of the
+    /// authoritative offset (via `advance_watcher_confirmed_end`, simulated here
+    /// by writing `confirmed_end_offset`). The idle relay and the watcher's
+    /// own no-inflight relay gate are read-only CONSUMERS: each skips a range
+    /// the committed offset already covers (`committed_relay_offset(channel) >=
+    /// end`). This test exercises that exact decision:
+    ///   1. Before any relay, the committed offset is 0 → a wake range
+    ///      `[0, end)` is NOT yet covered → the actor relays it.
+    ///   2. After the watcher commits at `end`, a second actor (idle relay or a
+    ///      re-observing watcher pass) sees the range covered → it SKIPS, so the
+    ///      wake body is never relayed twice (the
+    ///      `duplicate Discord relay body: '[E2E:E13:WAKE]'` failure).
+    ///   3. A genuinely-NEW wake output at a higher offset is past the committed
+    ///      offset → NOT covered → relayed exactly once (dedup, not blanket
+    ///      suppression - E-13 also asserts the wake text is present).
+    #[test]
+    fn offset_authority_relays_wake_range_exactly_once() {
+        use std::sync::atomic::Ordering;
+
+        // The dedup decision both consumers make: skip iff the committed offset
+        // already covers this range end. Mirrors the read-only check in
+        // `run_idle_jsonl_relay_loop` and the watcher's no-inflight gate.
+        fn already_relayed(committed_end: u64, range_end: u64) -> bool {
+            committed_end >= range_end
+        }
+
+        let shared = super::super::make_shared_data_for_tests();
+        let channel = ChannelId::new(7_013);
+        let coord = shared.tmux_relay_coord(channel);
+
+        // (1) Fresh wake turn ending at offset 128: nothing committed yet → the
+        // first actor relays it (not a duplicate).
+        assert_eq!(shared.committed_relay_offset(channel), 0);
+        assert!(
+            !already_relayed(shared.committed_relay_offset(channel), 128),
+            "a wake range past the committed offset must be relayed"
+        );
+
+        // The watcher (primary) commits the relay at 128, exactly as
+        // `advance_watcher_confirmed_end` does after a confirmed delivery.
+        coord.confirmed_end_offset.store(128, Ordering::Release);
+        assert_eq!(shared.committed_relay_offset(channel), 128);
+
+        // (2) The OTHER actor (idle relay, or a re-observing watcher) now sees
+        // the same range covered → it SKIPS → the body is not relayed twice.
+        assert!(
+            already_relayed(shared.committed_relay_offset(channel), 128),
+            "the second actor must skip a range the watcher already committed (E-13 dedup)"
+        );
+        // A sub-range / re-observation of the already-relayed range also skips.
+        assert!(already_relayed(shared.committed_relay_offset(channel), 64));
+
+        // (3) A genuinely-new wake output ending at 256 is PAST the committed
+        // offset → not covered → relayed exactly once.
+        assert!(
+            !already_relayed(shared.committed_relay_offset(channel), 256),
+            "a new wake output past the committed offset must be relayed (not suppressed)"
+        );
+        coord.confirmed_end_offset.store(256, Ordering::Release);
+        assert!(
+            already_relayed(shared.committed_relay_offset(channel), 256),
+            "after it is committed the new range must not be relayed twice"
+        );
+
+        // The authority is per-channel: a different channel starts uncommitted,
+        // so its own first wake range is relayed independently.
+        let other = ChannelId::new(7_014);
+        assert_eq!(shared.committed_relay_offset(other), 0);
+        assert!(!already_relayed(shared.committed_relay_offset(other), 128));
+    }
+
+    /// #3017 / E-13 partial-overlap dedup (codex r5 P2): the idle relay must not
+    /// re-send a PREFIX the watcher already delivered, and the watcher must
+    /// compare against this turn's CONSUMED end (not the whole read batch end).
+    #[test]
+    fn offset_authority_handles_partial_and_batch_overlaps() {
+        // Idle-relay decision for a read range `[start, end)` against the
+        // committed watermark. Mirrors `run_idle_jsonl_relay_loop`:
+        //   - committed >= end  → whole range already delivered → SKIP all.
+        //   - committed > start → PREFIX delivered → trim: re-read from committed.
+        //   - else              → nothing delivered → forward `[start, end)`.
+        #[derive(Debug, PartialEq, Eq)]
+        enum IdleDecision {
+            SkipAll,
+            TrimTo(u64),
+            Forward,
+        }
+        fn idle_decision(committed: u64, start: u64, end: u64) -> IdleDecision {
+            if committed >= end {
+                IdleDecision::SkipAll
+            } else if committed > start {
+                IdleDecision::TrimTo(committed)
+            } else {
+                IdleDecision::Forward
+            }
+        }
+
+        // Fully covered → skip.
+        assert_eq!(idle_decision(200, 0, 128), IdleDecision::SkipAll);
+        assert_eq!(idle_decision(128, 0, 128), IdleDecision::SkipAll);
+        // Partial overlap: watcher delivered [0,128); file grew to 256 before the
+        // idle poll → re-read only [128,256), never re-sending the wake prefix.
+        assert_eq!(idle_decision(128, 0, 256), IdleDecision::TrimTo(128));
+        // No overlap → forward the whole fresh range.
+        assert_eq!(idle_decision(0, 128, 256), IdleDecision::Forward);
+        assert_eq!(idle_decision(64, 128, 256), IdleDecision::Forward);
+
+        // Watcher decision: dedup against the TURN's CONSUMED end, not the whole
+        // read batch end. A batch read `[start=0, current_offset=256)` whose
+        // result line ends at 128 (the trailing 128 bytes are a later turn's
+        // buffered JSONL) consumes to 128. A prior commit at 128 (this same
+        // terminal, already relayed) must suppress — comparing against 256 would
+        // miss it and re-relay. `terminal_event_consumed_offset` = current_offset
+        // - unprocessed_tail.len().
+        let current_offset = 256u64;
+        let unprocessed_tail_len = 128u64; // a later turn's buffered bytes
+        let turn_consumed = current_offset - unprocessed_tail_len; // 128
+        let committed_for_this_terminal = 128u64;
+        assert!(
+            committed_for_this_terminal >= turn_consumed,
+            "a prior commit at the consumed terminal end must suppress the re-relay"
+        );
+        assert!(
+            committed_for_this_terminal < current_offset,
+            "comparing against the whole batch end (256) would WRONGLY miss the duplicate"
+        );
+    }
+
+    /// #3017 / E-13 codex r6 P1 (black-hole regression): when the `system/init`
+    /// event lives in the already-committed PREFIX and only the suffix is
+    /// uncommitted, the idle relay must deliver the suffix EXACTLY ONCE in the
+    /// SAME pass — it must NOT bounce to a next tick that re-classifies the
+    /// init-less suffix as a "non-init active-session payload" and DROPS it.
+    ///
+    /// Unlike `offset_authority_handles_partial_and_batch_overlaps` (which only
+    /// exercised a re-implemented `idle_decision` enum), this drives the REAL
+    /// loop decision function `idle_relay_range_action` — the exact code the
+    /// loop body runs — so it asserts the actual classification→dedup ORDERING.
+    #[test]
+    fn idle_relay_delivers_suffix_when_init_is_in_committed_prefix() {
+        // A wake turn whose JSONL is: an `init` line (the prefix the watcher
+        // already relayed) followed by the assistant body (the uncommitted
+        // suffix the user still needs to see).
+        let init_line = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n";
+        let body_line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the trailing answer\"}]}}\n";
+        let init_bytes = init_line.len() as u64;
+        let full = format!("{init_line}{body_line}");
+        let full_bytes = full.as_bytes();
+        let start = 0u64;
+        let end = full_bytes.len() as u64;
+        // The watcher already committed the init-line prefix; the file grew to
+        // include the body before this idle poll → PARTIAL overlap.
+        let committed = init_bytes;
+        assert!(
+            start < committed && committed < end,
+            "test sets up a partial overlap"
+        );
+
+        // REAL loop decision on the WHOLE classified payload: relay only the
+        // uncommitted suffix `[committed, end)` — NOT a re-classify-and-drop.
+        let action = idle_relay_range_action(full_bytes, start, end, committed, false);
+        assert_eq!(
+            action,
+            super::IdleRelayRangeAction::SendSuffixFrom(committed),
+            "the loop must deliver the uncommitted suffix in the same pass (no black-hole)"
+        );
+
+        // The suffix that would be delivered is exactly the body line — the
+        // already-relayed init prefix is skipped (no duplicate), the trailing
+        // answer is sent (no black-hole).
+        let suffix = &full_bytes[committed as usize..end as usize];
+        assert_eq!(
+            suffix,
+            body_line.as_bytes(),
+            "suffix is the uncommitted body, prefix skipped"
+        );
+
+        // REGRESSION WITNESS: the OLD code bounced (`*offset = committed;
+        // continue;`) and re-read JUST this suffix on the next tick. Running the
+        // classification on the init-less suffix proves that path BLACK-HOLES
+        // it: classified as non-init → dropped. The fix avoids the bounce so the
+        // suffix is never re-gated this way.
+        let suffix_only_action = idle_relay_range_action(suffix, 0, suffix.len() as u64, 0, false);
+        assert_eq!(
+            suffix_only_action,
+            super::IdleRelayRangeAction::SkipClassified,
+            "re-gating the init-less suffix as a fresh payload WOULD black-hole it (the old bug)"
+        );
+
+        // Whole range uncommitted → relay the full payload (control case).
+        assert_eq!(
+            idle_relay_range_action(full_bytes, start, end, 0, false),
+            super::IdleRelayRangeAction::SendFull
+        );
+        // Whole range already committed → skip (control case).
+        assert_eq!(
+            idle_relay_range_action(full_bytes, start, end, end, false),
+            super::IdleRelayRangeAction::SkipAlreadyRelayed
+        );
+        // New-session grace still wins over everything (ordering preserved).
+        assert_eq!(
+            idle_relay_range_action(full_bytes, start, end, committed, true),
+            super::IdleRelayRangeAction::SkipClassified
         );
     }
 

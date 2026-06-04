@@ -1634,13 +1634,18 @@ async fn refresh_session_panel_line_from_lifecycle(
     let Some(pg_pool) = shared.pg_pool.as_ref() else {
         return false;
     };
+    // `session_panel_instance_key` lives in the unix-only `tmux` module; on
+    // non-unix targets there is no tmux session, so the instance key is None.
     #[cfg(unix)]
     let session_instance_key = tmux_session_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .and_then(super::tmux::session_panel_instance_key);
     #[cfg(not(unix))]
-    let session_instance_key: Option<String> = None;
+    let session_instance_key: Option<String> = {
+        let _ = tmux_session_name;
+        None
+    };
     let channel_id_text = channel_id.get().to_string();
     match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
         pg_pool,
