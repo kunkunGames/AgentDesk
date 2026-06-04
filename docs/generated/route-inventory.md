@@ -252,7 +252,7 @@
 | `GET` | `/api/sessions` | `agents_crud::list_sessions` | `src/server/routes/agents_crud.rs:1831` | `src/server/routes/domains/agents.rs:50` |
 | `GET` | `/api/sessions/{id}/tmux-output` | `dispatched_sessions::tmux_output` | `src/server/routes/dispatched_sessions.rs:94` | `src/server/routes/domains/ops.rs:199` |
 | `POST` | `/api/sessions/{session_key}/force-kill` | `dispatched_sessions::force_kill_session` | `src/server/routes/dispatched_sessions.rs:110` | `src/server/routes/domains/ops.rs:185` |
-| `POST` | `/api/sessions/{session_key}/idle-recap` | `idle_recap::post_idle_recap` | `src/server/routes/idle_recap.rs:37` | `src/server/routes/domains/ops.rs:193` |
+| `POST` | `/api/sessions/{session_key}/idle-recap` | `idle_recap::post_idle_recap` | `src/server/routes/idle_recap.rs:68` | `src/server/routes/domains/ops.rs:193` |
 | `POST` | `/api/sessions/{session_key}/kill-tmux` | `dispatched_sessions::kill_tmux_session` | `src/server/routes/dispatched_sessions.rs:126` | `src/server/routes/domains/ops.rs:189` |
 | `GET` | `/api/settings` | `settings::get_settings` | `src/server/routes/settings.rs:28` | `src/server/routes/domains/admin.rs:48` |
 | `PUT` | `/api/settings` | `settings::put_settings` | `src/server/routes/settings.rs:38` | `src/server/routes/domains/admin.rs:48` |
