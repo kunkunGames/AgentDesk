@@ -116,11 +116,12 @@
   - `src/services/discord/watchers/lifecycle.rs` (2301 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
-  - `src/services/discord/tmux.rs` (2129 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2154 lines after #2558 dead-code sweep;
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
+    #3016 option A `normal_completion` finalize-decouple param;
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7419 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (7662 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -137,6 +138,11 @@
     the bind did not record it, instead of leaking a duplicate);
     +50 from #3104 terminal/idle reconciliation pass that strips a lingering
     `계속 처리 중` streaming footer off the committed-but-unrelayed placeholder;
+    +46 from #3016 option A codex R2 `pinned_finalize_user_msg_id` pure helper
+    that binds the watcher normal-completion finalize id to the OUTPUT RANGE
+    (`turn_start_offset.unwrap_or(last_offset) < current_offset`, mirroring the
+    yield guard at `tmux.rs:2110-2111`) so a follow-up turn started after this
+    range is not released by stale output;
     split loop helpers further before adding behavior).
   - `src/services/discord/tui_prompt_relay.rs` (3849 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only

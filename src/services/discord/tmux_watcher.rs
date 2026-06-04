@@ -983,6 +983,103 @@ fn matching_watcher_turn_identity(
         .map(crate::services::discord::inflight::InflightTurnIdentity::from_state)
 }
 
+/// #3016 (codex R2): pick the `user_msg_id` handed to the normal-completion
+/// finalize, gated on the OUTPUT-RANGE relationship so we only ever finalize
+/// the turn whose output THIS completion actually is.
+///
+/// Offset-aliasing hazard: the watcher loop is not turn-scoped, and the
+/// watcher-yield guard `watcher_should_yield_to_inflight_state`
+/// (tmux.rs ~2083-2112) lets the watcher PROCEED on this old range in the
+/// `RelayOwnerKind::None` arm whenever it does NOT satisfy
+/// `data_start_offset <= turn_start_offset && turn_start_offset < current_offset`
+/// (tmux.rs:2110-2111). One such non-yield case is a FOLLOW-UP turn started on
+/// the SAME tmux session whose `turn_start_offset >= current_offset` — i.e. it
+/// begins AFTER the range this completion covers. In that case
+/// `inflight_before_relay` already holds the NEWER turn's `user_msg_id`; handing
+/// that id to the finalizer would `mailbox_finish_turn_if_matches` and release
+/// the WRONG (newer, still-running) turn.
+///
+/// Binding rule (mirrors the guard's exact offset semantics so the two cannot
+/// disagree): only return the pinned id when the pinned inflight turn has
+/// actually produced output by this completion point — its effective start
+/// offset `turn_start_offset.unwrap_or(last_offset)` is `< current_offset`. A
+/// newer turn (start offset `>= current_offset`) does NOT satisfy this → return
+/// `0` (no exact ledger match; the finalizer refuses to release a mismatched
+/// live turn). The session-match + `user_msg_id != 0` checks are kept too.
+///
+/// Note: `InflightTurnIdentity` (inflight.rs:665) does NOT carry
+/// `turn_start_offset`, so this reads it from the `InflightTurnState` directly.
+fn pinned_finalize_user_msg_id(
+    inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
+    tmux_session_name: &str,
+    current_offset: u64,
+) -> u64 {
+    inflight_before_relay
+        .filter(|state| {
+            state.user_msg_id != 0
+                && state.tmux_session_name.as_deref().map(str::trim)
+                    == Some(tmux_session_name.trim())
+                // Mirror the guard at tmux.rs:2110-2111: effective turn start =
+                // `turn_start_offset.unwrap_or(last_offset)`. Only this turn's
+                // output reaches `current_offset` when its start precedes it.
+                && state.turn_start_offset.unwrap_or(state.last_offset) < current_offset
+        })
+        .map(|state| state.user_msg_id)
+        .unwrap_or(0)
+}
+
+/// #3016 (codex R3): the watcher's `terminal_output_committed &&
+/// !lifecycle_stage_paused` block runs MORE destructive side-effects than the
+/// finalize on a LATE re-read `inflight_state` (loaded AFTER the relay, NOT
+/// turn-pinned): the `⏳ → ✅` reaction + `session_transcript` + `turn_analytics`
+/// write (targets the late read's `user_msg_id`) and `clear_inflight_state`
+/// (deletes the on-disk inflight). In the R2/R3 aliasing scenario a FOLLOW-UP
+/// turn on the SAME tmux session has `turn_start_offset >= current_offset` (it
+/// begins AFTER the output range this completion covers), so the watcher-yield
+/// guard (tmux.rs:2110-2111: yields only when
+/// `data_start_offset <= turn_start_offset && turn_start_offset < current_offset`)
+/// does NOT yield and the watcher processes this OLD range — yet the late
+/// `inflight_state` (and possibly the pre-relay snapshot) already holds the
+/// NEWER turn's id. Running those side-effects would ✅ the newer (still-running)
+/// turn's message, write its transcript/analytics prematurely, and delete its
+/// inflight — wrong-turn lifecycle corruption.
+///
+/// This pure gate returns TRUE iff EITHER snapshot is a real NEWER turn on the
+/// SAME session that this committed range does not belong to: for that snapshot
+/// `user_msg_id != 0` AND trimmed session match AND effective start
+/// `turn_start_offset.unwrap_or(last_offset) >= current_offset`. This is the
+/// EXACT complement of `pinned_finalize_user_msg_id`'s `< current_offset` range
+/// test (and mirrors the same offset/fallback semantics as the yield guard), so
+/// the two decisions cannot disagree: when the finalize helper returns 0 because
+/// the snapshot is a newer turn, this gate returns TRUE and the call site skips
+/// the reaction/transcript/analytics/clear too.
+///
+/// Narrow by construction: for a normal completion where the inflight is THIS
+/// turn or an OLDER turn (`turn_start_offset < current_offset`), or there is no
+/// inflight, or it is `rebind_origin`/`user_msg_id == 0`, this returns FALSE and
+/// all existing behavior is preserved.
+fn committed_completion_is_stale_for_newer_turn(
+    inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
+    inflight_state: Option<&crate::services::discord::inflight::InflightTurnState>,
+    tmux_session_name: &str,
+    current_offset: u64,
+) -> bool {
+    let snapshot_is_newer_turn =
+        |snapshot: Option<&crate::services::discord::inflight::InflightTurnState>| {
+            snapshot.is_some_and(|state| {
+                state.user_msg_id != 0
+                    && state.tmux_session_name.as_deref().map(str::trim)
+                        == Some(tmux_session_name.trim())
+                    // Complement of `pinned_finalize_user_msg_id`'s
+                    // `< current_offset`: a newer turn starts AT/AFTER this
+                    // committed range. Same `turn_start_offset.unwrap_or(last_offset)`
+                    // fallback as the finalize helper and the yield guard.
+                    && state.turn_start_offset.unwrap_or(state.last_offset) >= current_offset
+            })
+        };
+    snapshot_is_newer_turn(inflight_before_relay) || snapshot_is_newer_turn(inflight_state)
+}
+
 fn refresh_watcher_turn_identity(
     current: &mut Option<crate::services::discord::inflight::InflightTurnIdentity>,
     provider: &ProviderKind,
@@ -1038,6 +1135,231 @@ mod pane_dead_identity_tests {
         identity = matching_watcher_turn_identity(Some(&second), "AgentDesk-codex-adk-cdx");
 
         assert!(identity.is_none());
+    }
+
+    // #3016 codex R2 (offset-aliasing id-selection). Exercises the SELECTION
+    // path the call site uses (`pinned_finalize_user_msg_id`) — which the
+    // direct-helper `stale_normal_completion_does_not_release_newer_active_turn`
+    // test does NOT cover. The hazard: a follow-up turn on the SAME session whose
+    // `turn_start_offset >= current_offset` (it begins AFTER the range this
+    // completion covers) sits in `inflight_before_relay`; passing its id to the
+    // finalizer would release the WRONG (newer, still-running) turn. The
+    // selection must return 0 in that case, mirroring the watcher-yield guard at
+    // tmux.rs:2110-2111.
+    fn state_with_offsets(
+        user_msg_id: u64,
+        tmux_session_name: &str,
+        turn_start_offset: Option<u64>,
+        last_offset: u64,
+    ) -> InflightTurnState {
+        let mut state = state_for_turn(user_msg_id, tmux_session_name);
+        state.last_offset = last_offset;
+        state.turn_start_offset = turn_start_offset;
+        state
+    }
+
+    #[test]
+    fn pinned_finalize_id_matching_turn_in_range_returns_its_id() {
+        // (a) The pinned turn's output reaches current_offset
+        // (turn_start_offset 10 < current_offset 50) → return its id.
+        let state = state_with_offsets(700, "AgentDesk-codex-adk-cdx", Some(10), 10);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&state), "AgentDesk-codex-adk-cdx", 50),
+            700
+        );
+    }
+
+    #[test]
+    fn pinned_finalize_id_newer_followup_turn_after_range_returns_zero() {
+        // (b) Follow-up turn started AFTER this range
+        // (turn_start_offset 50 >= current_offset 50) → 0, NOT the newer id.
+        let newer = state_with_offsets(800, "AgentDesk-codex-adk-cdx", Some(50), 50);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&newer), "AgentDesk-codex-adk-cdx", 50),
+            0
+        );
+        // Also strictly-after (start 60 > 50) → 0.
+        let later = state_with_offsets(801, "AgentDesk-codex-adk-cdx", Some(60), 60);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&later), "AgentDesk-codex-adk-cdx", 50),
+            0
+        );
+    }
+
+    #[test]
+    fn pinned_finalize_id_falls_back_to_last_offset_like_the_guard() {
+        // Mirror the guard's `turn_start_offset.unwrap_or(last_offset)`: with no
+        // turn_start_offset, last_offset 50 >= current_offset 50 → 0.
+        let no_start = state_with_offsets(802, "AgentDesk-codex-adk-cdx", None, 50);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&no_start), "AgentDesk-codex-adk-cdx", 50),
+            0
+        );
+        // last_offset 10 < 50 → return id.
+        let in_range = state_with_offsets(803, "AgentDesk-codex-adk-cdx", None, 10);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&in_range), "AgentDesk-codex-adk-cdx", 50),
+            803
+        );
+    }
+
+    #[test]
+    fn pinned_finalize_id_wrong_session_returns_zero() {
+        // (c) Different tmux session → 0 even though it is in range.
+        let other = state_with_offsets(900, "AgentDesk-codex-adk-cdx-fresh", Some(10), 10);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&other), "AgentDesk-codex-adk-cdx", 50),
+            0
+        );
+    }
+
+    #[test]
+    fn pinned_finalize_id_zero_user_msg_id_returns_zero() {
+        // (d) Anchorless turn (user_msg_id == 0) → 0.
+        let anchorless = state_with_offsets(0, "AgentDesk-codex-adk-cdx", Some(10), 10);
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&anchorless), "AgentDesk-codex-adk-cdx", 50),
+            0
+        );
+    }
+
+    #[test]
+    fn pinned_finalize_id_none_returns_zero() {
+        // (e) No pre-relay snapshot → 0.
+        assert_eq!(
+            pinned_finalize_user_msg_id(None, "AgentDesk-codex-adk-cdx", 50),
+            0
+        );
+    }
+
+    // #3016 codex R3 (wrong-turn lifecycle corruption). The SAME committed block
+    // that finalizes also runs `⏳ → ✅` + transcript/analytics + clear on the
+    // LATE-read inflight. `committed_completion_is_stale_for_newer_turn` is the
+    // exact complement of `pinned_finalize_user_msg_id`'s `< current_offset`
+    // range test: it returns TRUE iff EITHER snapshot is a real NEWER turn on the
+    // SAME session that began AT/AFTER this range (so those side-effects must be
+    // skipped). Mirrors the yield guard's offset/fallback semantics.
+    #[test]
+    fn committed_completion_stale_for_newer_turn_matrix() {
+        let session = "AgentDesk-codex-adk-cdx";
+        // (a) newer turn after range (start 50 >= current 50, same session,
+        // id != 0) → true. Here it sits in inflight_state (late read).
+        let newer = state_with_offsets(800, session, Some(50), 50);
+        assert!(committed_completion_is_stale_for_newer_turn(
+            None,
+            Some(&newer),
+            session,
+            50
+        ));
+        // strictly-after (start 60 > 50) → true.
+        let later = state_with_offsets(801, session, Some(60), 60);
+        assert!(committed_completion_is_stale_for_newer_turn(
+            None,
+            Some(&later),
+            session,
+            50
+        ));
+
+        // (b) current/older turn (start 10 < current 50) → false (normal path).
+        let in_range = state_with_offsets(700, session, Some(10), 10);
+        assert!(!committed_completion_is_stale_for_newer_turn(
+            Some(&in_range),
+            Some(&in_range),
+            session,
+            50
+        ));
+
+        // (c) wrong session, even though it is a newer turn → false.
+        let other_session = state_with_offsets(900, "AgentDesk-codex-adk-cdx-fresh", Some(50), 50);
+        assert!(!committed_completion_is_stale_for_newer_turn(
+            None,
+            Some(&other_session),
+            session,
+            50
+        ));
+
+        // (d) id == 0 (anchorless / rebind-style) newer turn → false.
+        let anchorless = state_with_offsets(0, session, Some(50), 50);
+        assert!(!committed_completion_is_stale_for_newer_turn(
+            None,
+            Some(&anchorless),
+            session,
+            50
+        ));
+
+        // (e) None / None → false (no inflight at all).
+        assert!(!committed_completion_is_stale_for_newer_turn(
+            None, None, session, 50
+        ));
+
+        // (f) only inflight_before_relay is newer (inflight_state older) → true.
+        assert!(committed_completion_is_stale_for_newer_turn(
+            Some(&newer),
+            Some(&in_range),
+            session,
+            50
+        ));
+        // …and vice-versa: only inflight_state is newer → true.
+        assert!(committed_completion_is_stale_for_newer_turn(
+            Some(&in_range),
+            Some(&newer),
+            session,
+            50
+        ));
+
+        // Fallback parity with the guard: no turn_start_offset → use last_offset.
+        // last_offset 50 >= current 50 → newer → true.
+        let no_start_after = state_with_offsets(802, session, None, 50);
+        assert!(committed_completion_is_stale_for_newer_turn(
+            None,
+            Some(&no_start_after),
+            session,
+            50
+        ));
+        // last_offset 10 < current 50 → not newer → false.
+        let no_start_before = state_with_offsets(803, session, None, 10);
+        assert!(!committed_completion_is_stale_for_newer_turn(
+            None,
+            Some(&no_start_before),
+            session,
+            50
+        ));
+    }
+
+    /// #3016 (codex B1): the call-site guard proof. In the stale-newer-turn
+    /// scenario the watcher MUST skip `finish_restored_watcher_active_turn`
+    /// because `pinned_finalize_user_msg_id` would return 0 and an id-0
+    /// `Complete` would collapse onto the newer live turn (see
+    /// `turn_finalizer::tests::stale_completion_skips_finalize_no_id0_collapse`).
+    /// This asserts the two predicates the call site relies on line up:
+    ///   1. `committed_completion_is_stale_for_newer_turn` is TRUE (→ guard skips
+    ///      the finalize), AND
+    ///   2. `pinned_finalize_user_msg_id` is 0 for the SAME snapshot (→ the id
+    ///      that WOULD have been submitted is the unsafe channel-collapse id),
+    /// so "stale" ⇔ "id 0" ⇔ "skip" by construction.
+    #[test]
+    fn stale_completion_skips_finalize_no_id0_collapse() {
+        let session = "AgentDesk-codex-adk-cdx";
+        // A NEWER same-session turn (id 999) that started AT/AFTER this range
+        // (turn_start_offset 50 >= current_offset 50). This is the late-read
+        // inflight a follow-up turn rewrote onto disk before this stale pass.
+        let newer = state_with_offsets(999, session, Some(50), 50);
+
+        // (1) Guard predicate: stale → the call site skips the finalize entirely.
+        assert!(
+            committed_completion_is_stale_for_newer_turn(Some(&newer), Some(&newer), session, 50),
+            "newer same-session turn at/after the range must be classified stale so the \
+             call site skips finish_restored_watcher_active_turn"
+        );
+
+        // (2) The id that WOULD have been submitted is 0 — the unsafe
+        // channel-collapse id proven hazardous in the turn_finalizer test.
+        assert_eq!(
+            pinned_finalize_user_msg_id(Some(&newer), session, 50),
+            0,
+            "stale newer turn pins to 0 — submitting Complete with this id would \
+             collapse onto the newer live ledger entry (wrong-turn finalize)"
+        );
     }
 
     #[test]
@@ -5230,6 +5552,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         fresh_idle_user_msg_id,
                         finish_mailbox_on_completion,
                         owed,
+                        // #3016 option A: this fresh-idle arm is already gated by
+                        // the outer `if should_finish_mailbox` (= flag-driven), so
+                        // it keeps the legacy flag semantics — `normal_completion`
+                        // stays `false` here. (No new assistant text was committed
+                        // in this pass, so it is not the canonical-completion
+                        // point that the decoupling targets.)
+                        false,
                         true,
                         "watcher fresh ready-for-input idle with queued backlog",
                     )
@@ -7535,6 +7864,27 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             );
         }
 
+        // #3016 (codex R3): the late `inflight_state` re-read above (and the
+        // pre-relay snapshot) can already hold a NEWER follow-up turn's id in the
+        // R2/R3 offset-aliasing scenario — a follow-up on the SAME tmux session
+        // whose `turn_start_offset >= current_offset` (it begins AFTER this
+        // committed output range) does NOT make the watcher-yield guard yield, so
+        // the watcher still processes this OLD range while inflight on disk
+        // belongs to the newer turn. The finalize below is already safe (it uses
+        // `pinned_finalize_user_msg_id`, which returns 0 for such a newer turn —
+        // the EXACT complement of this gate's offset test), but the SAME block
+        // also runs the `⏳ → ✅` reaction + transcript + analytics write and
+        // `clear_inflight_state` on that late read. Compute the stale-range gate
+        // ONCE here and skip those wrong-turn side-effects (see the two call sites
+        // below). For every normal completion (inflight is THIS or an OLDER turn,
+        // absent, or rebind_origin/`user_msg_id == 0`) this is FALSE → no-op.
+        let completion_is_stale_for_newer_turn = committed_completion_is_stale_for_newer_turn(
+            inflight_before_relay.as_ref(),
+            inflight_state.as_ref(),
+            &tmux_session_name,
+            current_offset,
+        );
+
         if crate::services::discord::tui_prompt_relay::should_complete_tui_direct_anchor_lifecycle(
             terminal_output_committed,
             tui_direct_anchor_terminal_body_visible,
@@ -7608,8 +7958,18 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // analytics/turn-id key, and `MessageId::new(0)` would panic. The
         // recovered response was already delivered via the notify-bot outbox
         // enqueue above, so skipping the reaction/analytics step is safe.
+        //
+        // #3016 (codex R3): also skip when `completion_is_stale_for_newer_turn` —
+        // the late `inflight_state` belongs to a NEWER follow-up turn that began
+        // AFTER this committed range. Marking it `✅` and writing its transcript /
+        // analytics here would lie about a still-running turn's completion. The
+        // finalize below independently refuses this turn (its
+        // `pinned_finalize_user_msg_id` returns 0 via the complementary offset
+        // test), so this gate keeps the reaction/transcript/analytics consistent
+        // with that decision. No-op for every normal completion.
         if terminal_output_committed
             && !lifecycle_stage_paused
+            && !completion_is_stale_for_newer_turn
             && let Some(state) = inflight_state
                 .as_ref()
                 .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
@@ -7839,33 +8199,45 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             //     that survives into the next turn will not accidentally clear
             //     that turn's freshly registered cancel_token.
             let owed = mailbox_finalize_owed.swap(false, std::sync::atomic::Ordering::AcqRel);
-            crate::services::discord::inflight::clear_inflight_state(
-                &provider_kind,
-                channel_id.get(),
-            );
-            let watcher_turn_id = inflight_state
-                .as_ref()
-                .filter(|s| s.user_msg_id != 0)
-                .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
-            let watcher_session_key_owned =
-                inflight_state.as_ref().and_then(|s| s.session_key.clone());
-            let watcher_dispatch_id_owned = resolved_did
-                .clone()
-                .or_else(|| inflight_state.as_ref().and_then(|s| s.dispatch_id.clone()));
-            crate::services::observability::emit_inflight_lifecycle_event(
-                provider_kind.as_str(),
-                channel_id.get(),
-                watcher_dispatch_id_owned.as_deref(),
-                watcher_session_key_owned.as_deref(),
-                watcher_turn_id.as_deref(),
-                "cleared_by_watcher",
-                serde_json::json!({
-                    "owed_finalize": owed,
-                    "dispatch_ok": dispatch_ok,
-                    "has_assistant_response": has_assistant_response,
-                    "full_response_len": full_response.len(),
-                }),
-            );
+            // #3016 (codex R3): do NOT delete the on-disk inflight when it
+            // belongs to a NEWER follow-up turn (same session, started AT/AFTER
+            // this committed range). The same offset decision that makes
+            // `pinned_finalize_user_msg_id` return 0 just below gates the clear
+            // here, so this stale-range pass cannot wipe the newer turn's
+            // inflight out from under it. Only the on-disk file is gated; the
+            // in-memory `inflight_state` used afterward (finalize id source,
+            // dispatch resolution, history push) is unaffected. The
+            // `cleared_by_watcher` observability event only fires when the clear
+            // actually ran (preserve existing semantics).
+            if !completion_is_stale_for_newer_turn {
+                crate::services::discord::inflight::clear_inflight_state(
+                    &provider_kind,
+                    channel_id.get(),
+                );
+                let watcher_turn_id = inflight_state
+                    .as_ref()
+                    .filter(|s| s.user_msg_id != 0)
+                    .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
+                let watcher_session_key_owned =
+                    inflight_state.as_ref().and_then(|s| s.session_key.clone());
+                let watcher_dispatch_id_owned = resolved_did
+                    .clone()
+                    .or_else(|| inflight_state.as_ref().and_then(|s| s.dispatch_id.clone()));
+                crate::services::observability::emit_inflight_lifecycle_event(
+                    provider_kind.as_str(),
+                    channel_id.get(),
+                    watcher_dispatch_id_owned.as_deref(),
+                    watcher_session_key_owned.as_deref(),
+                    watcher_turn_id.as_deref(),
+                    "cleared_by_watcher",
+                    serde_json::json!({
+                        "owed_finalize": owed,
+                        "dispatch_ok": dispatch_ok,
+                        "has_assistant_response": has_assistant_response,
+                        "full_response_len": full_response.len(),
+                    }),
+                );
+            }
             // codex P2 (#1670): cleanup (mailbox_finish_turn + cancel_token
             // release) MUST run on every relay-completed terminal even when
             // `dispatch_ok = false`, otherwise organic turns leak forever.
@@ -7875,21 +8247,109 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // entry. The redundant `should_kickoff_queue` block further
             // below is also `dispatch_ok`-gated and remains as a fallback
             // for paths where the helper short-circuited.
-            // #3016: the in-memory `inflight_state` (loaded at L~5860) still
-            // holds the real id even though the on-disk file was cleared above,
-            // so pass it for an exact ledger match.
-            let restored_user_msg_id = inflight_state.as_ref().map(|s| s.user_msg_id).unwrap_or(0);
-            finish_restored_watcher_active_turn(
-                &shared,
-                &provider_kind,
-                channel_id,
-                restored_user_msg_id,
-                finish_mailbox_on_completion,
-                owed,
-                dispatch_ok,
-                "restored watcher completed with queued backlog",
-            )
-            .await;
+            // #3016 (codex R1+R2): derive the finalize id from the TURN-PINNED
+            // pre-relay snapshot, never from the late `inflight_state` re-read
+            // above. That late read reloads the on-disk inflight AFTER the
+            // relay/emit; the watcher loop is not turn-scoped (see the L~7327
+            // warning), so a follow-up turn may have already rewritten inflight on
+            // disk by then — its `user_msg_id` would belong to a NEWER turn. Under
+            // the old flag-gated path this finalize fired narrowly; with
+            // `normal_completion = true` it fires UNCONDITIONALLY, so a stale-id
+            // match here could `finish_turn_if_matches` and release the WRONG
+            // (follow-up) turn.
+            //
+            // R2 (offset-aliasing): even the pre-relay snapshot
+            // `inflight_before_relay` (loaded L~6163) is NOT inherently pinned to
+            // the OUTPUT RANGE being completed. The watcher-yield guard
+            // `watcher_should_yield_to_inflight_state` (tmux.rs:2110-2111) lets the
+            // watcher PROCEED on this old range when a FOLLOW-UP turn on the SAME
+            // session has `turn_start_offset >= current_offset` (it starts AFTER
+            // this range). In that case the snapshot holds the newer turn's id, and
+            // a session-only filter would still pass it. `pinned_finalize_user_msg_id`
+            // gates on the range relationship — effective start
+            // `turn_start_offset.unwrap_or(last_offset) < current_offset` — exactly
+            // mirroring the guard, so a newer turn yields 0 (no exact ledger match;
+            // turn_finalizer L~526 refuses to release a mismatched live turn). It
+            // keeps the session-match + `user_msg_id != 0` checks too.
+            //
+            // `current_offset` here is the end of the range this completion covers
+            // (same value passed to `commit_watcher_direct_terminal_session_idle`
+            // just below).
+            //
+            // R3 cross-ref: this SAME offset decision now also gates the
+            // `⏳ → ✅` reaction + transcript + analytics block and the
+            // `clear_inflight_state` above, via
+            // `completion_is_stale_for_newer_turn`
+            // (`committed_completion_is_stale_for_newer_turn` is the exact
+            // complement of this helper's `< current_offset` range test). So the
+            // newer-turn case yields 0 here AND skips those destructive
+            // side-effects — the two stay consistent by construction.
+            let restored_user_msg_id = pinned_finalize_user_msg_id(
+                inflight_before_relay.as_ref(),
+                &tmux_session_name,
+                current_offset,
+            );
+            // #3016 (codex B1): SKIP the normal-completion finalize ENTIRELY in the
+            // stale-newer-turn case — do NOT call it with `restored_user_msg_id == 0`.
+            // Why a 0-id submit here is unsafe, not a harmless no-op: with
+            // `normal_completion = true` this site finalizes UNCONDITIONALLY, and in
+            // the stale case `pinned_finalize_user_msg_id` returns 0. A 0-id
+            // `TurnKey` reaches `resolve_channel_only`
+            // (turn_finalizer.rs:161-181), which — when NO terminal(finalized)
+            // ledger entry exists for this channel/generation — collapses onto the
+            // SINGLE live non-finalized entry. In the stale scenario the OLD turn
+            // whose trailing output this is was already completed/finalized via its
+            // own path earlier (that is precisely WHAT makes a NEWER same-session
+            // turn already live), so its ledger entry may have been finalized/GC'd
+            // and the only live entry is the NEWER still-running turn. Submitting
+            // Complete with id 0 would then collapse onto and finalize that newer
+            // live turn — a wrong-turn finalize that releases its cancel_token /
+            // ledger entry mid-flight. The correct action is to finalize NOTHING
+            // here: the newer live turn owns its own normal-completion finalize when
+            // ITS terminal output is committed in a later watcher-loop iteration.
+            //
+            // `completion_is_stale_for_newer_turn` is the exact complement of the
+            // `< current_offset` range test inside `pinned_finalize_user_msg_id`, so
+            // "id == 0 here" and "skip the finalize" are the same predicate by
+            // construction (see the R3 cross-ref comment above).
+            //
+            // Skip-path bookkeeping: the watcher did NOT drive the finalize, so
+            // `watcher_drove_finalize = false`. The `owed = mailbox_finalize_owed
+            // .swap(false, AcqRel)` at L~8165 already ran UNCONDITIONALLY (pre-
+            // existing option-A ordering), so this skip does not change the atomic's
+            // lifecycle — and dropping the LOCAL `owed` here drops no legitimate
+            // work: with option A's decoupling the newer live turn no longer depends
+            // on the `owed` flag to finalize (it finalizes via its own
+            // `normal_completion = true` path with its real id). `delegated_finalize_owed
+            // = owed` below still feeds `watcher_handled_mailbox_finish` so queue-
+            // kickoff suppression / terminal-stop accounting keep the legacy flag
+            // intent intact on the skip path.
+            let watcher_drove_finalize = if !completion_is_stale_for_newer_turn {
+                finish_restored_watcher_active_turn(
+                    &shared,
+                    &provider_kind,
+                    channel_id,
+                    restored_user_msg_id,
+                    finish_mailbox_on_completion,
+                    owed,
+                    // #3016 option A: terminal output was committed above
+                    // (`terminal_output_committed && !lifecycle_stage_paused`), the
+                    // canonical *normal completion* point. Finalize unconditionally —
+                    // independent of `owed` / `finish_mailbox_on_completion` — so the
+                    // normal live bridge→watcher delegation turn no longer depends on
+                    // the legacy `mailbox_finalize_owed` flag. The finalizer is
+                    // idempotent (bridge winner → AlreadyFinalized here), so this
+                    // cannot over-finalize.
+                    true,
+                    dispatch_ok,
+                    "restored watcher completed with queued backlog",
+                )
+                .await
+            } else {
+                // Stale-newer-turn: finalize skipped (see above). The watcher did
+                // not drive any finalize on this pass.
+                false
+            };
             if !watcher_direct_terminal_idle_committed {
                 watcher_direct_terminal_idle_committed =
                     commit_watcher_direct_terminal_session_idle(
@@ -7906,8 +8366,16 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let delegated_finalize_owed = owed;
             let mailbox = shared.mailbox(channel_id);
             let has_active_turn = mailbox.has_active_turn().await;
+            // #3016 (codex R1): couple the post-finalize lifecycle to the ACTUAL
+            // finalize, not just the legacy flag intent. `watcher_drove_finalize`
+            // is true whenever the helper ran the finalizer (here always, via
+            // `normal_completion = true`) — so queue-kickoff suppression and the
+            // terminal-stop-candidate path below correctly account for the newly
+            // decoupled normal-completion finalize even when both legacy flags are
+            // false. (Folding the flags in too keeps behavior identical on the
+            // flag-driven paths.)
             let watcher_handled_mailbox_finish =
-                finish_mailbox_on_completion || delegated_finalize_owed;
+                watcher_drove_finalize || finish_mailbox_on_completion || delegated_finalize_owed;
             let should_kickoff_queue = if watcher_handled_mailbox_finish
                 || monitor_auto_turn_finished
                 || has_active_turn
@@ -8884,9 +9352,10 @@ mod tests {
             &provider,
             channel_id,
             state.user_msg_id,
-            true,
-            false,
-            false,
+            true,  // finish_mailbox_on_completion (restore semantics)
+            false, // delegated_finalize_owed
+            false, // normal_completion (#3016: this path is flag-gated, not the decoupled normal-completion arm)
+            false, // kickoff_queue
             "terminal_delivery_timeout_cleanup_test",
         )
         .await;
@@ -8903,6 +9372,291 @@ mod tests {
             .into_intervention()
             .map(|(intervention, _)| intervention.text);
         assert_eq!(next.as_deref(), Some("queued follow-up"));
+    }
+
+    // #3016 test helper: a real, non-stale watcher handle so the
+    // `mailbox_finalize_owed` precondition is NON-vacuous and the helper's
+    // `swap(false)` revoke path actually has a slot to act on. Mirrors the
+    // `live_watcher_handle` builder in mod.rs's registry tests.
+    fn test_watcher_handle(
+        tmux_session_name: &str,
+        mailbox_finalize_owed: bool,
+    ) -> crate::services::discord::TmuxWatcherHandle {
+        crate::services::discord::TmuxWatcherHandle {
+            tmux_session_name: tmux_session_name.to_string(),
+            output_path: format!("/tmp/{tmux_session_name}.jsonl"),
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_offset: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            turn_delivered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_heartbeat_ts_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+                crate::services::discord::tmux_watcher_now_ms(),
+            )),
+            mailbox_finalize_owed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                mailbox_finalize_owed,
+            )),
+        }
+    }
+
+    // #3016 option A (watcher normal-completion finalize decouple).
+    //
+    // Proves the decoupling directly: a *normal completion* drives the
+    // single-authority finalizer even when BOTH legacy flags are false —
+    // `finish_mailbox_on_completion = false` (fresh live watcher, see
+    // tmux.rs:`tmux_output_watcher` default) AND `delegated_finalize_owed =
+    // false` (`mailbox_finalize_owed` never set / already revoked). This is the
+    // exact gate that `mailbox_finalize_owed` USED to be the sole driver of on
+    // the normal live bridge→watcher delegation turn; after this change the
+    // finalize fires from the confirmed-completion signal instead, so the flag
+    // is now redundant for this path (flag_now_redundant). The finalizer's
+    // idempotence (proven by the #3140 matrix) keeps this from over-finalizing
+    // when the bridge already finalized first.
+    //
+    // codex R1 hardening: registers a REAL watcher handle (so the
+    // `mailbox_finalize_owed` precondition is non-vacuous and the helper's
+    // `swap(false)` revoke path is exercised), asserts the finalize drove via
+    // the return value, and keeps the idempotence assertion.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn normal_completion_finalizes_with_both_legacy_flags_false() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(987_3016);
+        let tmux_session_name = "AgentDesk-claude-adk-cc-9873016";
+
+        // Register a REAL watcher handle. The `mailbox_finalize_owed` flag is
+        // false here, so the precondition below is observed on an ACTUAL slot
+        // (not the vacuous "no handle exists" case the original test had).
+        shared
+            .tmux_watchers
+            .insert(channel_id, test_watcher_handle(tmux_session_name, false));
+
+        // Seed a live active mailbox turn (cancel token registered) so we can
+        // observe the finalize releasing it.
+        assert!(
+            mailbox_try_start_turn(
+                &shared,
+                channel_id,
+                std::sync::Arc::new(CancelToken::new()),
+                UserId::new(42),
+                MessageId::new(3001),
+            )
+            .await
+        );
+
+        // Pre-condition (NON-vacuous: real handle present): the legacy debt flag
+        // is NOT set for this channel's watcher. Combined with
+        // `finish_mailbox_on_completion = false` below, BOTH legacy gates are
+        // off — the only thing that can drive the finalize is the new
+        // `normal_completion` signal.
+        let watcher = shared
+            .tmux_watchers
+            .get(&channel_id)
+            .expect("real watcher handle must be registered for a non-vacuous precondition");
+        assert!(
+            !watcher
+                .mailbox_finalize_owed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "precondition: mailbox_finalize_owed must be false for the decouple proof"
+        );
+        drop(watcher);
+
+        crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
+        let drove = super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            3001,  // real user_msg_id (exact ledger match)
+            false, // finish_mailbox_on_completion — fresh live watcher
+            false, // delegated_finalize_owed — flag never set
+            true,  // normal_completion — confirmed terminal-output-committed point
+            false, // kickoff_queue
+            "normal_completion_decouple_test",
+        )
+        .await;
+        assert!(
+            drove,
+            "normal_completion must drive the finalize (helper must not early-return)"
+        );
+
+        // The finalize fired purely on `normal_completion`: the active mailbox
+        // turn's cancel token is released even though both legacy flags were
+        // false. Under the OLD flag-only gate this call would have early-returned
+        // and left the token in place.
+        let snapshot = mailbox_snapshot(&shared, channel_id).await;
+        assert!(
+            snapshot.cancel_token.is_none(),
+            "normal completion must finalize and release the mailbox token even with both legacy flags false"
+        );
+
+        // Idempotent: a second normal-completion submit for the same turn is a
+        // no-op (AlreadyFinalized) — no over-finalize, no underflow.
+        super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            3001,
+            false,
+            false,
+            true,
+            false,
+            "normal_completion_decouple_test_double",
+        )
+        .await;
+        let snapshot_after = mailbox_snapshot(&shared, channel_id).await;
+        assert!(
+            snapshot_after.cancel_token.is_none(),
+            "second normal-completion submit stays a no-op (idempotent finalizer)"
+        );
+    }
+
+    // #3016 codex R1 (wrong-turn finalize guard). Companion to the decouple
+    // test above. Exercises the SAFETY PROPERTY the Issue-1 call-site fix
+    // depends on: once `normal_completion = true` finalizes UNCONDITIONALLY,
+    // the id handed to the finalizer must name the SAME turn the watcher just
+    // completed — otherwise a stale/follow-up id would `finish_turn_if_matches`
+    // and release the WRONG (newer) live turn.
+    //
+    // Scenario: turn A (id 3001) is finalized correctly; then a NEWER turn B
+    // (id 4002) becomes the live active turn; a stale normal-completion submit
+    // that mistakenly carries turn A's id (3001) must NOT release turn B. The
+    // call site avoids this by deriving the id from the turn-PINNED pre-relay
+    // snapshot (falling back to 0), but the finalizer's exact-id match is the
+    // backstop this asserts.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn stale_normal_completion_does_not_release_newer_active_turn() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _root_guard = AgentdeskRootGuard::set(tmp.path());
+
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let provider = ProviderKind::Claude;
+        let channel_id = ChannelId::new(987_3017);
+        let tmux_session_name = "AgentDesk-claude-adk-cc-9873017";
+
+        // Real watcher handle with the legacy debt flag PRE-SET so we can also
+        // assert the helper's `swap(false)` revoke path runs on the matching
+        // (correct-turn) finalize.
+        shared
+            .tmux_watchers
+            .insert(channel_id, test_watcher_handle(tmux_session_name, true));
+
+        // Turn A is the live active turn (id 3001).
+        assert!(
+            mailbox_try_start_turn(
+                &shared,
+                channel_id,
+                std::sync::Arc::new(CancelToken::new()),
+                UserId::new(42),
+                MessageId::new(3001),
+            )
+            .await
+        );
+
+        crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
+        // Finalize turn A with its OWN id — releases turn A and revokes the
+        // legacy flag.
+        let drove_a = super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            3001,
+            false,
+            true, // delegated_finalize_owed (real flag-driven correct-turn finalize)
+            true,
+            false,
+            "stale_guard_turn_a",
+        )
+        .await;
+        assert!(drove_a, "correct-turn finalize must drive");
+        assert!(
+            mailbox_snapshot(&shared, channel_id)
+                .await
+                .cancel_token
+                .is_none(),
+            "turn A must be released by its matching finalize"
+        );
+        // The matching finalize consumed the debt: legacy flag revoked.
+        let watcher = shared
+            .tmux_watchers
+            .get(&channel_id)
+            .expect("handle present");
+        assert!(
+            !watcher
+                .mailbox_finalize_owed
+                .load(std::sync::atomic::Ordering::Acquire),
+            "matching finalize must revoke mailbox_finalize_owed (swap(false) path)"
+        );
+        drop(watcher);
+
+        // A NEWER turn B (id 4002) becomes the live active turn.
+        let token_b = std::sync::Arc::new(CancelToken::new());
+        assert!(
+            mailbox_try_start_turn(
+                &shared,
+                channel_id,
+                token_b.clone(),
+                UserId::new(42),
+                MessageId::new(4002),
+            )
+            .await
+        );
+
+        // A STALE normal-completion submit mistakenly carrying turn A's id
+        // (3001) must NOT release turn B (4002). It drove the finalizer (past
+        // the gate) but the exact-id match misses, so turn B stays live.
+        let drove_stale = super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            3001, // STALE id (turn A), while turn B (4002) is live
+            false,
+            false,
+            true, // normal_completion fires unconditionally
+            false,
+            "stale_guard_stale_id",
+        )
+        .await;
+        assert!(
+            drove_stale,
+            "the stale submit still passes the gate (normal_completion = true)"
+        );
+        let snapshot_b = mailbox_snapshot(&shared, channel_id).await;
+        assert!(
+            snapshot_b.cancel_token.is_some(),
+            "a stale id MUST NOT release the newer active turn B (wrong-turn guard)"
+        );
+
+        // Sanity: turn B finalizes correctly when handed its OWN id.
+        super::finish_restored_watcher_active_turn(
+            &shared,
+            &provider,
+            channel_id,
+            4002,
+            false,
+            false,
+            true,
+            false,
+            "stale_guard_turn_b",
+        )
+        .await;
+        assert!(
+            mailbox_snapshot(&shared, channel_id)
+                .await
+                .cancel_token
+                .is_none(),
+            "turn B is released by its matching finalize"
+        );
     }
 
     #[test]
