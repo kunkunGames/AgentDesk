@@ -1,0 +1,29 @@
+**What changed**
+Modified `scripts/ci-script-checks.sh` to remove the warning fallback for inventory drift (exit code 1) in PR pipelines (`GITHUB_EVENT_NAME=pull_request` or `GITHUB_WORKFLOW="CI PR"`). The script now hard-fails on exit code 1.
+
+**Why**
+Previously, PRs that drifted `docs/generated/` inventories were allowed to merge because the CI script only warned on exit code 1. This meant drift accumulated on `main`, which then automatically triggered downstream "Redline" and "Cartographer-Lite" bots to create duplicate cleanup PRs to regenerate the inventories. By hard-failing in the PR itself, the author is forced to run `python3 scripts/generate_inventory_docs.py` and commit the updated files before merging, completely preventing this category of duplicate PRs.
+
+**WorkFingerprint**
+- Agent: Gatekeeper
+- Category: CI/merge-readiness
+- Primary file: `scripts/ci-script-checks.sh`
+- Invariant: Generated inventory drift cannot enter `main`.
+- Public API impact: None
+- Docs impact: None
+- Verification: ran `shellcheck`, ran `scripts/ci-script-checks.sh` locally.
+
+**Duplicate/Overlap Check**
+Checked open PRs across the repository; there are no overlapping CI script edits or Gatekeeper drift guard PRs targeting this change.
+
+**Verification commands & results**
+- `git diff --check` passed.
+- `shellcheck scripts/ci-script-checks.sh` passed.
+- `./scripts/ci-script-checks.sh` executed locally and correctly passed (as no drift was present on the working tree).
+
+**Skipped checks with reasons**
+Rust unit tests and dashboard verification were skipped because this change is entirely constrained to bash script execution paths within CI.
+
+**Risk and Rollback**
+- Risk is low. This enforces a stricter rule that was previously a warning.
+- To rollback, revert the commit or add the warning `if` block back to `scripts/ci-script-checks.sh`.

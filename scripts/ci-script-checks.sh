@@ -79,16 +79,9 @@ echo "=== Generate inventory docs (also gates giant-file registry, #3036) ==="
 # The generator hard-fails (exit 2) on giant-file registry drift: unregistered
 # new giants, ghost registrations left after decomposition, or deadline-less
 # [[entry]] tables in scripts/giant_file_registry.toml. Generated-docs drift
-# (exit 1) stays warning-only for CI PR script checks; exit 2 is a hard fail.
-set +e
+# (exit 1) is a hard fail in PRs to prevent drift merging and spawning
+# duplicate downstream inventory refresh PRs.
 python3 scripts/generate_inventory_docs.py --check
-INVENTORY_STATUS=$?
-set -e
-if [ "$INVENTORY_STATUS" -eq 1 ] && { [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] || [ "${GITHUB_WORKFLOW:-}" = "CI PR" ]; }; then
-  echo "::warning::Inventory docs drift detected. Generated docs drift is warning-only for CI PR script checks; run python3 scripts/generate_inventory_docs.py or wait for the weekly Regen inventory docs workflow."
-elif [ "$INVENTORY_STATUS" -ne 0 ]; then
-  exit "$INVENTORY_STATUS"
-fi
 
 echo "=== Agent maintenance freshness gate (warn, #1432; LoC hard-gate, #3036) ==="
 # --warning-only keeps the #1432 freshness/touch rollout non-fatal, while
