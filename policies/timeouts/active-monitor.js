@@ -97,7 +97,7 @@ module.exports = function attachActiveMonitor(timeouts, helpers) {
       // #219: Increased grace period from 3min to 10min — agents running long tool
       // calls (cargo build, subagents) may not send heartbeats for several minutes.
       var staleWorkingSessions = agentdesk.db.query(
-        "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') " +
+        "SELECT session_key, active_dispatch_id FROM sessions WHERE status IN ('turn_active', 'working') " +
         "AND last_heartbeat < datetime('now', '-10 minutes')"
       );
       for (var sw = 0; sw < staleWorkingSessions.length; sw++) {
@@ -119,11 +119,8 @@ module.exports = function attachActiveMonitor(timeouts, helpers) {
           // Without this, the dispatch stays "pending" as an orphan and gets
           // re-delivered or auto-completed, causing the failure loop.
           try {
-            var swSessInfo = agentdesk.db.query(
-              "SELECT active_dispatch_id FROM sessions WHERE session_key = ?", [swKey]
-            );
-            if (swSessInfo.length > 0 && swSessInfo[0].active_dispatch_id) {
-              var swDispId = swSessInfo[0].active_dispatch_id;
+            var swDispId = staleWorkingSessions[sw].active_dispatch_id;
+            if (swDispId) {
               var swDispStatus = agentdesk.db.query(
                 "SELECT status FROM task_dispatches WHERE id = ?", [swDispId]
               );

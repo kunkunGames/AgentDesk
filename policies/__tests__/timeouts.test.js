@@ -359,7 +359,7 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
         result: []
       },
       {
-        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        match: "SELECT session_key, active_dispatch_id FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
         result: []
       },
       {
@@ -421,7 +421,7 @@ test("timeouts active monitor opt-in review hang recovery retries stale review d
     dbQuery: createSqlRouter([
       { match: "DELETE FROM kv_meta WHERE key IN", result: [] },
       {
-        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        match: "SELECT session_key, active_dispatch_id FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
         result: []
       },
       {
@@ -483,7 +483,7 @@ test("timeouts active monitor review fast path leaves non-review sessions on the
     dbQuery: createSqlRouter([
       { match: "DELETE FROM kv_meta WHERE key IN", result: [] },
       {
-        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        match: "SELECT session_key, active_dispatch_id FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
         result: []
       },
       {
