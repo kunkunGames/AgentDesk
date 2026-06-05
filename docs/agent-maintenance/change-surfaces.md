@@ -128,7 +128,7 @@
     finalizer actor's `CommitDelivery`/`ReleaseDelivery` handlers are DORMANT
     (retained for a later phase, not the live watcher path after the R2 revert);
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (8102 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (8739 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -166,6 +166,56 @@
     every 5s while the send future is in flight (deadline cut to 15s for fast
     dead-holder recovery), stopped before the inline commit so a long multi-chunk
     send is never reclaimed mid-flight;
+    +164 from #3041 P1-3 Part b: REPLACING the 10s blind terminal re-send with the
+    §3.2 committed-offset reconciliation — `watcher_terminal_resend_action`
+    (skip-already-committed / send-suffix / send-full against
+    `committed_relay_offset`), a dedicated `SkipAlreadyCommitted` relay arm that
+    treats an already-committed range as a completed delegated delivery (no
+    duplicate, no placeholder double-handling), and the suffix-trim wiring; the ACK
+    polling itself is preserved;
+    +75 from #3041 P1-3 Part a (frame-carried B1 commit fence): the RESULT-bearing
+    `StreamFrame` now carries `terminal_consumed_end` + the pinned turn identity
+    (`watcher_terminal_commit_fence`; deferred forward at both read sites so the
+    terminal frame is detected post-`process_watcher_lines` and rides the commit
+    data), the sink advances `confirmed_end_offset` identity-gated on its CONFIRMED
+    POST (`advance_offset_for_confirmed_delegated_terminal`), and the RACY
+    inflight-persist Part a (`session_bound_delegated_terminal_end`) is REMOVED;
+    +21 from #3041 P1-3 codex review (PR #3150) fixes: issue-1 multi-turn-chunk
+    split (`split_decoded_chunk_at_terminal_boundary` +
+    `forward_terminal_chunk_with_trailing_to_supervisor_relay` — the TERMINAL frame
+    carries ONLY the just-completed turn's bytes, a trailing later-turn tail rides a
+    separate non-terminal frame so it is never black-holed), and the
+    `WatcherTerminalResendAction::SendFull` slow-sink-in-flight deferral doc (#3151);
+    +R4 (PR #3150) codex P1-3 R4: STRICT frame `turn_start_offset` identity gate
+    (no weak `is_none_or` None fallback) with the producer guarantee that
+    `watcher_terminal_commit_fence` only emits a fence when the turn's
+    `turn_start_offset` is known (else a non-terminal frame + watcher SendFull),
+    plus the issue-1 ACK-correlation close: a fence-less frame reports
+    `FrameAccepted` (never a terminal outcome) so turn B's tail post can never mask
+    turn A's terminal-ACK (multi-RESULT-per-chunk per-turn fence deferred to #3151,
+    no black-hole);
+    +R6 (PR #3150) codex P1-3 R6: TURN-SCOPE the carried session-bound
+    `ack_target` (`SessionBoundRelayAckTarget` now stamps the terminal frame's
+    pinned `turn_start_offset`; `carry_session_bound_ack_for_turn` resets a stored
+    ack to `None` on a turn boundary instead of the legacy "store only when Some").
+    A single chunk holding `result(A)+result(B)` where B completes inside the split
+    tail (its frame sequence discarded) no longer lets B inherit A's stale ack: B's
+    pass sees a different pinned turn identity → ack reset to `None` → B reconciles
+    against `committed_relay_offset` (None → MissingTarget → §3.2 SendFull/Skip),
+    NEVER black-holed even when A reported Delivered;
+    +59 from R7 (PR #3150) codex P1-3 R7: TURN-BOUNDARY ack reset at the split.
+    R6's `carry_session_bound_ack_for_turn` STILL black-holes a later turn when
+    `turn_identity_for_panel` is NOT refreshed (B's inflight not yet established when
+    B's leftover bytes are processed → the pinned offset is STILL A's → the carry
+    helper KEEPS A's ack). `SupervisorRelayForward` now carries a `trailing_turn_follows`
+    signal set by `forward_terminal_chunk_with_trailing_to_supervisor_relay` whenever it
+    splits a result-bearing chunk with a non-empty trailing tail (a later turn follows).
+    A pass-scoped `split_trailing_turn_follows` latch ORs that over both forward sites;
+    AFTER this turn waits on (consumes) its own terminal ACK — right after the relay
+    flight-recorder log — the watcher resets `all_data_session_bound_relay_ack` to `None`.
+    So a later turn ALWAYS starts with no inherited ack → MissingTarget → §3.2 reconcile
+    (SendFull/Skip) → never black-holed, independent of whether the pinned identity
+    refreshed. A's own delivery still resolves on A's ack (the reset is post-wait);
     split loop helpers further before adding behavior).
   - `src/services/discord/tui_prompt_relay.rs` (3874 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only

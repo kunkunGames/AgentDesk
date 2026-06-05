@@ -666,6 +666,12 @@ pub(in crate::services::discord) struct InflightTurnIdentity {
     pub user_msg_id: u64,
     pub started_at: String,
     pub tmux_session_name: Option<String>,
+    /// #3041 P1-3 (codex P1-3 issue 2): the turn's `turn_start_offset` — the JSONL
+    /// byte offset at which this turn began. Used to disambiguate two consecutive
+    /// `user_msg_id == 0` TUI-direct turns whose `started_at` collides because
+    /// `now_string` only has 1-second resolution. Monotonic per turn, so it makes
+    /// the frame-carried turn identity unique even within a single second.
+    pub turn_start_offset: Option<u64>,
 }
 
 impl InflightTurnIdentity {
@@ -674,6 +680,7 @@ impl InflightTurnIdentity {
             user_msg_id: state.user_msg_id,
             started_at: state.started_at.clone(),
             tmux_session_name: state.tmux_session_name.clone(),
+            turn_start_offset: state.turn_start_offset,
         }
     }
 
@@ -3392,6 +3399,47 @@ mod stall_recovery_tests {
         );
         assert_eq!(outcome, GuardedClearOutcome::Cleared);
         assert!(load_inflight_states_from_root(temp.path(), &ProviderKind::Claude).is_empty());
+    }
+
+    /// #3041 P1-3 (Part a, B1): the identity-guarded save must NOT let a stale write
+    /// clobber a NEWER turn that has taken over the inflight row (e.g. a fast
+    /// follow-up turn on the same channel between the watcher's compute and its
+    /// write). A mismatched identity yields `IdentityMismatch` and the newer turn's
+    /// row is preserved. (The frame-carried B1 commit fence removed the racy
+    /// delegated-terminal-end inflight persist; this keeps the generic guard covered
+    /// via a still-live field.)
+    #[test]
+    fn identity_guarded_save_rejects_stale_write_against_newer_turn() {
+        let temp = TempDir::new().unwrap();
+        // The original turn (user_msg_id = 100).
+        let mut original = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 100);
+        original.user_msg_id = 100;
+        let original_identity = InflightTurnIdentity::from_state(&original);
+
+        // A NEWER turn (distinct user_msg_id) now owns the row on disk.
+        let mut newer = build_inflight_for_guard_tests(ProviderKind::Claude, 321, 200);
+        newer.user_msg_id = 200;
+        save_inflight_state_in_root(temp.path(), &newer).unwrap();
+
+        // Stale write under the OLD identity → must be rejected, leaving the newer
+        // turn intact.
+        let mut stale_persist = original.clone();
+        stale_persist.last_watcher_relayed_offset = Some(256);
+        let outcome = save_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &stale_persist,
+            &original_identity,
+            original.turn_start_offset,
+        );
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+
+        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user_msg_id, 200, "newer turn must be preserved");
+        assert_eq!(
+            rows[0].last_watcher_relayed_offset, None,
+            "the newer turn must NOT inherit the old turn's stale write"
+        );
     }
 
     /// #2427 Pitfall #1 — stale TurnCompleted carrying the previous
