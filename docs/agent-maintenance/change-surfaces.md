@@ -113,10 +113,10 @@
   parsing), `src/services/discord/inflight.rs` (state file contract).
 - legacy_modules: none — relay routes are being consolidated, not replaced.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/services/discord/watchers/lifecycle.rs` (2301 lines — canonical
+  - `src/services/discord/watchers/lifecycle.rs` (2303 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
-  - `src/services/discord/tmux.rs` (2241 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2242 lines after #2558 dead-code sweep;
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
     #3016 option A `normal_completion` finalize-decouple param;
@@ -241,7 +241,7 @@
   - `src/services/discord/health/recovery.rs` (2438 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3620 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3658 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -340,7 +340,7 @@
   its query/command/view/FSM behavior lives under
   `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
   smaller route-delegation slices.
-  `src/services/auto_queue/activate_command.rs` (1351 lines, post-#1444
+  `src/services/auto_queue/activate_command.rs` (1354 lines, post-#1444
   idempotency-guard expansion + #3038 phase-helper decomposition) is the
   canonical activate/dispatch-next command surface; it is intentionally above
   the giant-file threshold and tracked here. The `activate_with_deps_pg`
@@ -384,7 +384,7 @@
 - do_not_edit_without_migration_plan (giant-file):
   - `src/cli/migrate.rs` is the retired postgres-cutover facade (now below the
     giant-file threshold; bugfix only).
-  - `src/cli/doctor/orchestrator.rs` (4376 lines).
+  - `src/cli/doctor/orchestrator.rs` (4374 lines).
   - `src/cli/migrate/apply.rs` (3146 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
@@ -412,7 +412,7 @@
   - `src/server/mod.rs` (2239 lines).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1894 lines).
-  - `src/reconcile.rs` (1809 lines; periodic reconcile loop covering stale
+  - `src/reconcile.rs` (1806 lines; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.
