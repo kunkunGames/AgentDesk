@@ -1417,8 +1417,7 @@ fn run_bot_spawn_deferred_restart_poller(
                     // and stale-removal trips after 1800s even
                     // while the tmux pane is still alive. Mirrors
                     // the graceful-shutdown preserve block below.
-                    let inflight_states_qe =
-                        inflight::load_inflight_states(&provider_for_deferred);
+                    let inflight_states_qe = inflight::load_inflight_states(&provider_for_deferred);
                     if !inflight_states_qe.is_empty() {
                         let ts2 = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!(
@@ -1788,11 +1787,8 @@ fn run_bot_spawn_recovery_and_flush_restart_reports(
                     .iter()
                     .map(|entry| entry.key().get())
                     .collect();
-                super::tmux::store_recovery_handled_channels(
-                    &shared_for_tmux2,
-                    &recovery_channels,
-                )
-                .await;
+                super::tmux::store_recovery_handled_channels(&shared_for_tmux2, &recovery_channels)
+                    .await;
 
                 restore_tmux_watchers(&http_for_tmux, &shared_for_tmux2).await;
                 cleanup_orphan_tmux_sessions(&shared_for_tmux2).await;
