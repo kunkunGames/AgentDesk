@@ -44,7 +44,9 @@ pub(crate) fn dispatch_slot_index_expr(column: &str) -> String {
     if column == "c.ctx" {
         "COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1)".to_string()
     } else {
-        format!("COALESCE(NULLIF((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1)")
+        format!(
+            "COALESCE(NULLIF((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1)"
+        )
     }
 }
 
@@ -52,7 +54,9 @@ fn dispatch_bool_flag_expr(column: &str, key: &str) -> String {
     if column == "c.ctx" {
         format!("COALESCE((c.ctx->>'{key}')::BOOLEAN, FALSE)")
     } else {
-        format!("COALESCE(((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'{key}')::BOOLEAN, FALSE)")
+        format!(
+            "COALESCE(((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'{key}')::BOOLEAN, FALSE)"
+        )
     }
 }
 
@@ -222,11 +226,10 @@ mod tests {
             DispatchSlotPolarity::Exists,
             Some("d.id != $3"),
         );
-        let expected = legacy_claim_predicate("EXISTS", "$1", "$2")
-            .replace(
-                "AND c.ctx->'phase_gate' IS NULL\n",
-                "AND c.ctx->'phase_gate' IS NULL\n               AND (d.id != $3)\n",
-            );
+        let expected = legacy_claim_predicate("EXISTS", "$1", "$2").replace(
+            "AND c.ctx->'phase_gate' IS NULL\n",
+            "AND c.ctx->'phase_gate' IS NULL\n               AND (d.id != $3)\n",
+        );
         assert_eq!(generated, expected);
         // Exclude clause is injected before the review-class guard, never after.
         let phase_gate_pos = generated.find("phase_gate' IS NULL").unwrap();
