@@ -2285,92 +2285,37 @@ pub async fn complete(
     (status, Json(response))
 }
 
-/// Shared error context threaded into every phase helper so that an early
-/// return can rebuild the exact same `completion_response` the monolithic
-/// implementation produced. Holds the request-derived metadata that is
-/// constant once the request has been validated.
-struct CompleteErrorContext<'a> {
-    provider: &'a str,
-    rerun_policy: OnboardingRerunPolicy,
-    explicit_rerun_policy: bool,
-}
-
-impl<'a> CompleteErrorContext<'a> {
-    fn error(
-        &self,
-        status: StatusCode,
-        completion_state: Option<&OnboardingCompletionState>,
-        error: Option<String>,
-        conflicts: Vec<String>,
-    ) -> (StatusCode, serde_json::Value) {
-        completion_response(
-            status,
-            false,
-            self.provider,
-            self.rerun_policy,
-            self.explicit_rerun_policy,
-            completion_state,
-            error,
-            conflicts,
-            serde_json::Map::new(),
-        )
-    }
-}
-
-/// Records `error` on the completion state, best-effort persists it, and returns
-/// the matching INTERNAL_SERVER_ERROR response. Mirrors the repeated
-/// "set last_error + save + respond" tail used throughout the persistence phase.
-fn fail_and_persist_completion_state(
-    ctx: &CompleteErrorContext<'_>,
-    root: &Path,
-    completion_state: &mut OnboardingCompletionState,
-    error: String,
-) -> (StatusCode, serde_json::Value) {
-    completion_state.last_error = Some(error);
-    let _ = save_onboarding_completion_state(root, completion_state);
-    ctx.error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Some(completion_state),
-        completion_state.last_error.clone(),
-        Vec::new(),
-    )
-}
-
-/// Validates the request payload and parses the request-derived metadata.
-/// Returns the rerun policy, whether it was explicitly supplied, and the
-/// channel fingerprint, or a ready-to-return BAD_REQUEST response. Pure: no
-/// filesystem or network side effects.
-fn validate_complete_request(
+async fn complete_with_options(
+    state: &AppState,
     body: &CompleteBody,
-    provider: &str,
-) -> Result<(OnboardingRerunPolicy, bool, String), (StatusCode, serde_json::Value)> {
-    let bad_request = |rerun_policy, explicit, error: String| {
-        completion_response(
+    options: &CompleteExecutionOptions,
+) -> (StatusCode, serde_json::Value) {
+    let provider = body.provider.as_deref().unwrap_or("claude");
+    if body.guild_id.trim().is_empty() {
+        return completion_response(
             StatusCode::BAD_REQUEST,
             false,
             provider,
-            rerun_policy,
-            explicit,
+            OnboardingRerunPolicy::ReuseExisting,
+            false,
+            None,
+            Some("guild_id is required for onboarding completion".to_string()),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+    if let Err(error) = parse_owner_id(body.owner_id.as_deref()) {
+        return completion_response(
+            StatusCode::BAD_REQUEST,
+            false,
+            provider,
+            OnboardingRerunPolicy::ReuseExisting,
+            false,
             None,
             Some(error),
             Vec::new(),
             serde_json::Map::new(),
-        )
-    };
-
-    if body.guild_id.trim().is_empty() {
-        return Err(bad_request(
-            OnboardingRerunPolicy::ReuseExisting,
-            false,
-            "guild_id is required for onboarding completion".to_string(),
-        ));
-    }
-    if let Err(error) = parse_owner_id(body.owner_id.as_deref()) {
-        return Err(bad_request(
-            OnboardingRerunPolicy::ReuseExisting,
-            false,
-            error,
-        ));
+        );
     }
     let explicit_rerun_policy = body
         .rerun_policy
@@ -2381,63 +2326,84 @@ fn validate_complete_request(
     let rerun_policy = match OnboardingRerunPolicy::parse(body.rerun_policy.as_deref()) {
         Ok(policy) => policy,
         Err(error) => {
-            return Err(bad_request(
+            return completion_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                provider,
                 OnboardingRerunPolicy::ReuseExisting,
                 explicit_rerun_policy,
-                error,
-            ));
+                None,
+                Some(error),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
         }
     };
     let request_fingerprint = match requested_channel_fingerprint(body, provider) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
-            return Err(bad_request(rerun_policy, explicit_rerun_policy, error));
-        }
-    };
-    Ok((rerun_policy, explicit_rerun_policy, request_fingerprint))
-}
-
-/// Resolves the runtime root and ensures the runtime layout exists. Returns the
-/// root path or a ready-to-return INTERNAL_SERVER_ERROR response.
-fn prepare_complete_runtime_root(
-    ctx: &CompleteErrorContext<'_>,
-) -> Result<PathBuf, (StatusCode, serde_json::Value)> {
-    let Some(root) = crate::cli::agentdesk_runtime_root() else {
-        return Err(ctx.error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            Some("cannot determine runtime root".to_string()),
-            Vec::new(),
-        ));
-    };
-    if let Err(error) = crate::runtime_layout::ensure_runtime_layout(&root) {
-        return Err(ctx.error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            None,
-            Some(format!("failed to prepare runtime layout: {error}")),
-            Vec::new(),
-        ));
-    }
-    Ok(root)
-}
-
-/// Loads any existing completion state and guards against a partial apply that
-/// targets a different channel plan. Returns the loaded state or a
-/// ready-to-return error response.
-fn load_existing_completion_for_request(
-    ctx: &CompleteErrorContext<'_>,
-    root: &Path,
-    request_fingerprint: &str,
-) -> Result<Option<OnboardingCompletionState>, (StatusCode, serde_json::Value)> {
-    let existing_completion_state = match load_onboarding_completion_state(root) {
-        Ok(state) => state,
-        Err(error) => {
-            return Err(ctx.error(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            return completion_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
                 None,
                 Some(error),
                 Vec::new(),
-            ));
+                serde_json::Map::new(),
+            );
+        }
+    };
+    let discord_token = body
+        .announce_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(body.token.as_str());
+
+    let Some(root) = crate::cli::agentdesk_runtime_root() else {
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            None,
+            Some("cannot determine runtime root".to_string()),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    };
+
+    if let Err(error) = crate::runtime_layout::ensure_runtime_layout(&root) {
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            None,
+            Some(format!("failed to prepare runtime layout: {error}")),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    let existing_completion_state = match load_onboarding_completion_state(&root) {
+        Ok(state) => state,
+        Err(error) => {
+            return completion_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
+                None,
+                Some(error),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
         }
     };
 
@@ -2445,30 +2411,25 @@ fn load_existing_completion_for_request(
         .as_ref()
         .filter(|state| state.partial_apply && state.request_fingerprint != request_fingerprint)
     {
-        return Err(ctx.error(
+        return completion_response(
             StatusCode::CONFLICT,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(existing_state),
             Some(
                 "an incomplete onboarding attempt exists for a different channel plan; retry the same payload or reset the previous partial apply before changing channel mappings".to_string(),
             ),
             Vec::new(),
-        ));
+            serde_json::Map::new(),
+        );
     }
 
-    Ok(existing_completion_state)
-}
+    let checkpoint_state = existing_completion_state
+        .as_ref()
+        .filter(|state| state.request_fingerprint == request_fingerprint);
 
-/// Resolves every requested channel mapping (reusing checkpoints where possible)
-/// and validates that the resolved channels are unique. Returns the resolved
-/// channels or a ready-to-return BAD_REQUEST response.
-async fn resolve_complete_channels(
-    ctx: &CompleteErrorContext<'_>,
-    body: &CompleteBody,
-    options: &CompleteExecutionOptions,
-    discord_token: &str,
-    existing_completion_state: Option<&OnboardingCompletionState>,
-    checkpoint_state: Option<&OnboardingCompletionState>,
-) -> Result<Vec<ResolvedChannelMapping>, (StatusCode, serde_json::Value)> {
     let client = reqwest::Client::new();
     let mut resolved_channels = Vec::with_capacity(body.channels.len());
     for mapping in &body.channels {
@@ -2491,226 +2452,38 @@ async fn resolve_complete_channels(
         {
             Ok(resolved) => resolved,
             Err(error) => {
-                return Err(ctx.error(
+                return completion_response(
                     StatusCode::BAD_REQUEST,
-                    existing_completion_state,
+                    false,
+                    provider,
+                    rerun_policy,
+                    explicit_rerun_policy,
+                    existing_completion_state.as_ref(),
                     Some(format!(
                         "failed to resolve channel for agent '{}': {}",
                         mapping.role_id, error
                     )),
                     Vec::new(),
-                ));
+                    serde_json::Map::new(),
+                );
             }
         };
         resolved_channels.push(resolved);
     }
 
     if let Err(error) = validate_unique_resolved_channels(&resolved_channels) {
-        return Err(ctx.error(
+        return completion_response(
             StatusCode::BAD_REQUEST,
-            existing_completion_state,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            existing_completion_state.as_ref(),
             Some(error),
             Vec::new(),
-        ));
+            serde_json::Map::new(),
+        );
     }
-
-    Ok(resolved_channels)
-}
-
-/// Persists the filesystem artifacts (config/workspace dirs, role map, channel
-/// bindings, discord config, credentials) and verifies the settings and
-/// pipeline artifacts. On any failure the error is recorded on
-/// `completion_state`, best-effort persisted, and a ready-to-return response is
-/// produced. On success returns the settings and pipeline verification reports.
-fn persist_complete_filesystem_artifacts(
-    ctx: &CompleteErrorContext<'_>,
-    root: &Path,
-    body: &CompleteBody,
-    provider: &str,
-    resolved_channels: &[ResolvedChannelMapping],
-    completion_state: &mut OnboardingCompletionState,
-) -> Result<(serde_json::Value, serde_json::Value), (StatusCode, serde_json::Value)> {
-    let config_dir = crate::runtime_layout::config_dir(root);
-    if let Err(error) = std::fs::create_dir_all(&config_dir) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            format!(
-                "failed to create config dir {}: {error}",
-                config_dir.display()
-            ),
-        ));
-    }
-
-    let workspaces_dir = root.join("workspaces");
-    if let Err(error) = std::fs::create_dir_all(&workspaces_dir) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            format!(
-                "failed to create workspaces dir {}: {error}",
-                workspaces_dir.display()
-            ),
-        ));
-    }
-    for mapping in resolved_channels {
-        let ws_dir = workspaces_dir.join(&mapping.role_id);
-        if let Err(error) = std::fs::create_dir_all(&ws_dir) {
-            return Err(fail_and_persist_completion_state(
-                ctx,
-                root,
-                completion_state,
-                format!("failed to create workspace {}: {error}", ws_dir.display()),
-            ));
-        }
-    }
-
-    if let Err(error) = write_onboarding_role_map(root, provider, resolved_channels) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            error,
-        ));
-    }
-
-    if let Err(error) = write_agentdesk_channel_bindings(root, provider, resolved_channels) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            format!("failed to write agentdesk.yaml: {error}"),
-        ));
-    }
-
-    if let Err(error) = write_agentdesk_discord_config(
-        root,
-        &body.guild_id,
-        &body.token,
-        provider,
-        body.command_token_2.as_deref(),
-        body.command_provider_2.as_deref(),
-        body.owner_id.as_deref(),
-    ) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            format!("failed to write agentdesk.yaml discord config: {error}"),
-        ));
-    }
-
-    if let Err(error) = write_credential_token(root, "announce", body.announce_token.as_deref()) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            format!("failed to write announce credential: {error}"),
-        ));
-    }
-
-    if let Err(error) = write_credential_token(root, "notify", body.notify_token.as_deref()) {
-        return Err(fail_and_persist_completion_state(
-            ctx,
-            root,
-            completion_state,
-            format!("failed to write notify credential: {error}"),
-        ));
-    }
-
-    let settings_report = match verify_onboarding_settings_artifacts(
-        root,
-        &body.token,
-        provider,
-        body.command_token_2.as_deref(),
-        body.command_provider_2.as_deref(),
-        &body.guild_id,
-        body.owner_id.as_deref(),
-        body.announce_token.as_deref(),
-        body.notify_token.as_deref(),
-        resolved_channels,
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            return Err(fail_and_persist_completion_state(
-                ctx,
-                root,
-                completion_state,
-                format!("onboarding settings verification failed: {error}"),
-            ));
-        }
-    };
-
-    let pipeline_report = match verify_onboarding_pipeline_artifact(root) {
-        Ok(report) => report,
-        Err(error) => {
-            return Err(fail_and_persist_completion_state(
-                ctx,
-                root,
-                completion_state,
-                format!("onboarding pipeline verification failed: {error}"),
-            ));
-        }
-    };
-
-    Ok((settings_report, pipeline_report))
-}
-
-async fn complete_with_options(
-    state: &AppState,
-    body: &CompleteBody,
-    options: &CompleteExecutionOptions,
-) -> (StatusCode, serde_json::Value) {
-    let provider = body.provider.as_deref().unwrap_or("claude");
-
-    let (rerun_policy, explicit_rerun_policy, request_fingerprint) =
-        match validate_complete_request(body, provider) {
-            Ok(parsed) => parsed,
-            Err(response) => return response,
-        };
-    let ctx = CompleteErrorContext {
-        provider,
-        rerun_policy,
-        explicit_rerun_policy,
-    };
-
-    let discord_token = body
-        .announce_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(body.token.as_str());
-
-    let root = match prepare_complete_runtime_root(&ctx) {
-        Ok(root) => root,
-        Err(response) => return response,
-    };
-
-    let existing_completion_state =
-        match load_existing_completion_for_request(&ctx, &root, &request_fingerprint) {
-            Ok(state) => state,
-            Err(response) => return response,
-        };
-
-    let checkpoint_state = existing_completion_state
-        .as_ref()
-        .filter(|state| state.request_fingerprint == request_fingerprint);
-
-    let resolved_channels = match resolve_complete_channels(
-        &ctx,
-        body,
-        options,
-        discord_token,
-        existing_completion_state.as_ref(),
-        checkpoint_state,
-    )
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(response) => return response,
-    };
 
     let channels_created = resolved_channels
         .iter()
@@ -2737,11 +2510,16 @@ async fn complete_with_options(
         &resolved_channels,
     );
     if let Err(error) = save_onboarding_completion_state(&root, &completion_state) {
-        return ctx.error(
+        return completion_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(&completion_state),
             Some(error),
             Vec::new(),
+            serde_json::Map::new(),
         );
     }
 
@@ -2753,20 +2531,30 @@ async fn complete_with_options(
         completion_state.last_error = Some(error.clone());
         completion_state.retry_recommended = true;
         if let Err(save_error) = save_onboarding_completion_state(&root, &completion_state) {
-            return ctx.error(
+            return completion_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
                 Some(&completion_state),
                 Some(format!(
                     "{error}; additionally failed to persist completion state: {save_error}"
                 )),
                 Vec::new(),
+                serde_json::Map::new(),
             );
         }
-        return ctx.error(
+        return completion_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(&completion_state),
             Some(error),
             Vec::new(),
+            serde_json::Map::new(),
         );
     }
 
@@ -2782,11 +2570,16 @@ async fn complete_with_options(
         Err(error) => {
             completion_state.last_error = Some(error.clone());
             let _ = save_onboarding_completion_state(&root, &completion_state);
-            return ctx.error(
+            return completion_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
                 Some(&completion_state),
                 Some(error),
                 Vec::new(),
+                serde_json::Map::new(),
             );
         }
     };
@@ -2795,24 +2588,219 @@ async fn complete_with_options(
         completion_state.last_error = Some(error.clone());
         completion_state.retry_recommended = false;
         let _ = save_onboarding_completion_state(&root, &completion_state);
-        return ctx.error(
+        return completion_response(
             StatusCode::CONFLICT,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(&completion_state),
             Some(error),
             conflicts,
+            serde_json::Map::new(),
         );
     }
 
-    let (settings_report, pipeline_report) = match persist_complete_filesystem_artifacts(
-        &ctx,
+    let config_dir = crate::runtime_layout::config_dir(&root);
+    if let Err(error) = std::fs::create_dir_all(&config_dir) {
+        completion_state.last_error = Some(format!(
+            "failed to create config dir {}: {error}",
+            config_dir.display()
+        ));
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    let workspaces_dir = root.join("workspaces");
+    if let Err(error) = std::fs::create_dir_all(&workspaces_dir) {
+        completion_state.last_error = Some(format!(
+            "failed to create workspaces dir {}: {error}",
+            workspaces_dir.display()
+        ));
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+    for mapping in &resolved_channels {
+        let ws_dir = workspaces_dir.join(&mapping.role_id);
+        if let Err(error) = std::fs::create_dir_all(&ws_dir) {
+            completion_state.last_error = Some(format!(
+                "failed to create workspace {}: {error}",
+                ws_dir.display()
+            ));
+            let _ = save_onboarding_completion_state(&root, &completion_state);
+            return completion_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
+                Some(&completion_state),
+                completion_state.last_error.clone(),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
+        }
+    }
+
+    if let Err(error) = write_onboarding_role_map(&root, provider, &resolved_channels) {
+        completion_state.last_error = Some(error);
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    if let Err(error) = write_agentdesk_channel_bindings(&root, provider, &resolved_channels) {
+        completion_state.last_error = Some(format!("failed to write agentdesk.yaml: {error}"));
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    if let Err(error) = write_agentdesk_discord_config(
         &root,
-        body,
+        &body.guild_id,
+        &body.token,
         provider,
-        &resolved_channels,
-        &mut completion_state,
+        body.command_token_2.as_deref(),
+        body.command_provider_2.as_deref(),
+        body.owner_id.as_deref(),
     ) {
-        Ok(reports) => reports,
-        Err(response) => return response,
+        completion_state.last_error = Some(format!(
+            "failed to write agentdesk.yaml discord config: {error}"
+        ));
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    if let Err(error) = write_credential_token(&root, "announce", body.announce_token.as_deref()) {
+        completion_state.last_error = Some(format!("failed to write announce credential: {error}"));
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    if let Err(error) = write_credential_token(&root, "notify", body.notify_token.as_deref()) {
+        completion_state.last_error = Some(format!("failed to write notify credential: {error}"));
+        let _ = save_onboarding_completion_state(&root, &completion_state);
+        return completion_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
+            Some(&completion_state),
+            completion_state.last_error.clone(),
+            Vec::new(),
+            serde_json::Map::new(),
+        );
+    }
+
+    let settings_report = match verify_onboarding_settings_artifacts(
+        &root,
+        &body.token,
+        provider,
+        body.command_token_2.as_deref(),
+        body.command_provider_2.as_deref(),
+        &body.guild_id,
+        body.owner_id.as_deref(),
+        body.announce_token.as_deref(),
+        body.notify_token.as_deref(),
+        &resolved_channels,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            completion_state.last_error =
+                Some(format!("onboarding settings verification failed: {error}"));
+            let _ = save_onboarding_completion_state(&root, &completion_state);
+            return completion_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
+                Some(&completion_state),
+                completion_state.last_error.clone(),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
+        }
+    };
+
+    let pipeline_report = match verify_onboarding_pipeline_artifact(&root) {
+        Ok(report) => report,
+        Err(error) => {
+            completion_state.last_error =
+                Some(format!("onboarding pipeline verification failed: {error}"));
+            let _ = save_onboarding_completion_state(&root, &completion_state);
+            return completion_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
+                Some(&completion_state),
+                completion_state.last_error.clone(),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
+        }
     };
 
     completion_state = build_onboarding_completion_state(
@@ -2827,11 +2815,16 @@ async fn complete_with_options(
         &resolved_channels,
     );
     if let Err(error) = save_onboarding_completion_state(&root, &completion_state) {
-        return ctx.error(
+        return completion_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(&completion_state),
             Some(error),
             Vec::new(),
+            serde_json::Map::new(),
         );
     }
 
@@ -2843,34 +2836,66 @@ async fn complete_with_options(
         completion_state.last_error = Some(error.clone());
         completion_state.retry_recommended = true;
         if let Err(save_error) = save_onboarding_completion_state(&root, &completion_state) {
-            return ctx.error(
+            return completion_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
                 Some(&completion_state),
                 Some(format!(
                     "{error}; additionally failed to persist completion state: {save_error}"
                 )),
                 Vec::new(),
+                serde_json::Map::new(),
             );
         }
-        return ctx.error(
+        return completion_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(&completion_state),
             Some(error),
             Vec::new(),
+            serde_json::Map::new(),
         );
     }
 
     if let Some(pool) = state.pg_pool_ref() {
         if let Err(error) = persist_onboarding_pg(pool, body, provider, &resolved_channels).await {
-            return fail_and_persist_completion_state(&ctx, &root, &mut completion_state, error);
+            completion_state.last_error = Some(error);
+            let _ = save_onboarding_completion_state(&root, &completion_state);
+            return completion_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
+                Some(&completion_state),
+                completion_state.last_error.clone(),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
         }
     } else {
-        return fail_and_persist_completion_state(
-            &ctx,
-            &root,
-            &mut completion_state,
-            "Postgres pool is required to persist onboarding state".to_string(),
-        );
+        {
+            completion_state.last_error =
+                Some("Postgres pool is required to persist onboarding state".to_string());
+            let _ = save_onboarding_completion_state(&root, &completion_state);
+            return completion_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                false,
+                provider,
+                rerun_policy,
+                explicit_rerun_policy,
+                Some(&completion_state),
+                completion_state.last_error.clone(),
+                Vec::new(),
+                serde_json::Map::new(),
+            );
+        }
     }
 
     completion_state = build_onboarding_completion_state(
@@ -2885,11 +2910,16 @@ async fn complete_with_options(
         &resolved_channels,
     );
     if let Err(error) = save_onboarding_completion_state(&root, &completion_state) {
-        return ctx.error(
+        return completion_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            false,
+            provider,
+            rerun_policy,
+            explicit_rerun_policy,
             Some(&completion_state),
             Some(error),
             Vec::new(),
+            serde_json::Map::new(),
         );
     }
     if let Err(error) = clear_onboarding_draft(&root) {

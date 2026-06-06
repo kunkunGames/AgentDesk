@@ -91,7 +91,7 @@
 - do_not_edit_without_migration_plan (giant-file, awaiting split issue):
   - `src/dispatch/dispatch_context.rs` (2805 lines).
   - `src/dispatch/dispatch_create.rs` (1381 lines).
-  - `src/dispatch/dispatch_status.rs` (1517 lines).
+  - `src/dispatch/dispatch_status.rs` (1448 lines).
   - `src/services/dispatches/outbox_route.rs` (1118 lines; route extraction
     orchestration surface from #1722, split before adding non-bugfix behavior).
   - `src/services/dispatches/discord_delivery/orchestration.rs` (1652 lines;
@@ -116,19 +116,11 @@
   - `src/services/discord/watchers/lifecycle.rs` (2303 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
-  - `src/services/discord/tmux.rs` (2242 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2130 lines after #2558 dead-code sweep;
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
     re-exports; #3107 `RestoredWatcherTurn.injected_prompt_message_id`;
-    #3016 option A `normal_completion` finalize-decouple param;
-    #3017 monitor-auto-turn finalizer routing + ledger-generation +
-    relay-watermark reset re-exports; +10 from #3041 P1-1 making
-    `advance_watcher_confirmed_end` `pub(in crate::services::discord)` +
-    doc-comment — the watcher commits the delivery lease and advances this
-    monotonic-CAS offset INLINE (synchronously) on a `Delivered` outcome; the
-    finalizer actor's `CommitDelivery`/`ReleaseDelivery` handlers are DORMANT
-    (retained for a later phase, not the live watcher path after the R2 revert);
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (8971 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (7419 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -145,131 +137,10 @@
     the bind did not record it, instead of leaking a duplicate);
     +50 from #3104 terminal/idle reconciliation pass that strips a lingering
     `계속 처리 중` streaming footer off the committed-but-unrelayed placeholder;
-    +46 from #3016 option A codex R2 `pinned_finalize_user_msg_id` pure helper
-    that binds the watcher normal-completion finalize id to the OUTPUT RANGE
-    (`turn_start_offset.unwrap_or(last_offset) < current_offset`, mirroring the
-    yield guard at `tmux.rs:2110-2111`) so a follow-up turn started after this
-    range is not released by stale output;
-    +143 from #3017 the no-inflight relay-dedup gate (reads `committed_relay_offset`
-    + generation-aware watermark resets, suppresses a wake/idle terminal already
-    committed by another relay actor) and the monitor-auto-turn synthetic-id /
-    ledger-generation threading through `finish_monitor_auto_turn_if_claimed`;
-    +185 from #3041 P1-1 wiring the WATCHER terminal delivery through the live
-    `DeliveryLeaseCell`: a per-spawn `instance_id`, the B3 acquire-deadline
-    constant + rationale, the pre-send `try_acquire` on the turn-pinned identity,
-    the B2 single-holder skip arm (a replacement watcher must not re-emit a held
-    range), and committing the lease + advancing `advance_watcher_confirmed_end`
-    for the watcher terminal path INLINE (synchronously; the actor
-    `commit_delivery`/`release_delivery` round-trip was reverted in R2 — those
-    actor handlers are DORMANT, retained for a later phase); plus the R2 Issue-1
-    heartbeat: a `DeliveryLeaseHeartbeat` background task `renew()`s the lease
-    every 5s while the send future is in flight (deadline cut to 15s for fast
-    dead-holder recovery), stopped before the inline commit so a long multi-chunk
-    send is never reclaimed mid-flight;
-    +164 from #3041 P1-3 Part b: REPLACING the 10s blind terminal re-send with the
-    §3.2 committed-offset reconciliation — `watcher_terminal_resend_action`
-    (skip-already-committed / send-suffix / send-full against
-    `committed_relay_offset`), a dedicated `SkipAlreadyCommitted` relay arm that
-    treats an already-committed range as a completed delegated delivery (no
-    duplicate, no placeholder double-handling), and the suffix-trim wiring; the ACK
-    polling itself is preserved;
-    +75 from #3041 P1-3 Part a (frame-carried B1 commit fence): the RESULT-bearing
-    `StreamFrame` now carries `terminal_consumed_end` + the pinned turn identity
-    (`watcher_terminal_commit_fence`; deferred forward at both read sites so the
-    terminal frame is detected post-`process_watcher_lines` and rides the commit
-    data), the sink advances `confirmed_end_offset` identity-gated on its CONFIRMED
-    POST (`advance_offset_for_confirmed_delegated_terminal`), and the RACY
-    inflight-persist Part a (`session_bound_delegated_terminal_end`) is REMOVED;
-    +21 from #3041 P1-3 codex review (PR #3150) fixes: issue-1 multi-turn-chunk
-    split (`split_decoded_chunk_at_terminal_boundary` +
-    `forward_terminal_chunk_with_trailing_to_supervisor_relay` — the TERMINAL frame
-    carries ONLY the just-completed turn's bytes, a trailing later-turn tail rides a
-    separate non-terminal frame so it is never black-holed), and the
-    `WatcherTerminalResendAction::SendFull` slow-sink-in-flight deferral doc (#3151);
-    +R4 (PR #3150) codex P1-3 R4: STRICT frame `turn_start_offset` identity gate
-    (no weak `is_none_or` None fallback) with the producer guarantee that
-    `watcher_terminal_commit_fence` only emits a fence when the turn's
-    `turn_start_offset` is known (else a non-terminal frame + watcher SendFull),
-    plus the issue-1 ACK-correlation close: a fence-less frame reports
-    `FrameAccepted` (never a terminal outcome) so turn B's tail post can never mask
-    turn A's terminal-ACK (multi-RESULT-per-chunk per-turn fence deferred to #3151,
-    no black-hole);
-    +R6 (PR #3150) codex P1-3 R6: TURN-SCOPE the carried session-bound
-    `ack_target` (`SessionBoundRelayAckTarget` now stamps the terminal frame's
-    pinned `turn_start_offset`; `carry_session_bound_ack_for_turn` resets a stored
-    ack to `None` on a turn boundary instead of the legacy "store only when Some").
-    A single chunk holding `result(A)+result(B)` where B completes inside the split
-    tail (its frame sequence discarded) no longer lets B inherit A's stale ack: B's
-    pass sees a different pinned turn identity → ack reset to `None` → B reconciles
-    against `committed_relay_offset` (None → MissingTarget → §3.2 SendFull/Skip),
-    NEVER black-holed even when A reported Delivered;
-    +59 from R7 (PR #3150) codex P1-3 R7: TURN-BOUNDARY ack reset at the split.
-    R6's `carry_session_bound_ack_for_turn` STILL black-holes a later turn when
-    `turn_identity_for_panel` is NOT refreshed (B's inflight not yet established when
-    B's leftover bytes are processed → the pinned offset is STILL A's → the carry
-    helper KEEPS A's ack). `SupervisorRelayForward` now carries a `trailing_turn_follows`
-    signal set by `forward_terminal_chunk_with_trailing_to_supervisor_relay` whenever it
-    splits a result-bearing chunk with a non-empty trailing tail (a later turn follows).
-    A pass-scoped `split_trailing_turn_follows` latch ORs that over both forward sites;
-    AFTER this turn waits on (consumes) its own terminal ACK — right after the relay
-    flight-recorder log — the watcher resets `all_data_session_bound_relay_ack` to `None`.
-    So a later turn ALWAYS starts with no inherited ack → MissingTarget → §3.2 reconcile
-    (SendFull/Skip) → never black-holed, independent of whether the pinned identity
-    refreshed. A's own delivery still resolves on A's ack (the reset is post-wait);
-    split loop helpers further before adding behavior;
-    +24 from #3041 P1-4 codex: the watcher post-delivery external-input lease clear
-    now snapshots the lease GENERATION before the awaited relay
-    (`external_input_lease_generation_before_relay`) and clears via
-    `clear_external_input_relay_lease_if_generation_matches` instead of the
-    unconditional by-key `clear_external_input_relay_lease`, closing the
-    stale-snapshot clobber where a turn-2 same-key lease recorded during turn-1's
-    in-flight send was wrongly removed by turn-1's success clear);
-    +3 from #3041 P1-4 codex R3: the snapshot now reads the lease ONCE
-    (`external_input_relay_lease(...)` under a SINGLE STATE lock) and derives BOTH
-    the presence bool and the generation from that one atomic read, closing the
-    present/generation TOCTOU where two separate accessor calls re-locked STATE and
-    a concurrently-started turn could slip a newer same-key lease into the gap);
-    +60 from #3041 P1-5 (FINAL phase): unify the terminal delivery outcome into the
-    cross-actor 3-way `DeliveryOutcome { Delivered, NotDelivered, Unknown }`. The
-    watcher's `SessionBoundRelayAckOutcome::TerminalSkipped` is renamed `NotDelivered`
-    (folds ring `DeliveryOutcome::NotDelivered`), a new `RingUnknown` arm folds the
-    explicit ring `Unknown`, and the failure/unconfirmed arms
-    (`RingUnknown`/`Dropped`/`SinkError`/`TimedOut`/`MissingTarget`) collapse to
-    `DeliveryOutcome::Unknown` via the new pure `session_bound_ack_delivery_outcome`
-    fold. `watcher_should_direct_send_after_session_bound_ack` now decides on that
-    3-way (`!= Delivered`) instead of the implicit `ack_outcome != Delivered` bit.
-    §3.2 SAFETY INVARIANT: BOTH `NotDelivered` AND every `Unknown`-class arm still
-    flow through `watcher_terminal_resend_action` (committed-offset reconciliation:
-    `committed >= end` → SkipAlreadyCommitted, else SendFull) — NO blind-skip for
-    NotDelivered, NO blind 10s re-send for Unknown; the should-direct-send bool stays
-    the precondition gate, the send paths stay masked by `!SkipAlreadyCommitted`. New
-    tests `unknown_outcome_triggers_committed_offset_reconciliation_not_blind_resend`
-    and `not_delivered_outcome_keeps_no_resend_when_foreign_owner_committed`);
-    +18 from #3041 P1-5 (codex P1 follow-up) routing the ownerless `TimedOut`
-    through §3.2: the pre-existing #3042 band-aid (`if !relay_owner_present &&
-    TimedOut { return false }` early-return in
-    `watcher_should_direct_send_after_session_bound_ack`) blanket-suppressed an
-    ownerless TimedOut BEFORE it could reach `watcher_terminal_resend_action`
-    (committed-offset reconciliation) — neither reconciling nor resending → a
-    potential black-hole when committed < end. P1-3 Part (a)
-    (`advance_offset_for_confirmed_delegated_terminal`) made the committed offset
-    authoritative on a CONFIRMED post (the same fence that arms the ACK target →
-    TimedOut), so the band-aid is obsolete: the early-return is removed and an
-    ownerless TimedOut now flows through the SAME §3.2 path as every other
-    non-Delivered outcome (committed >= end → SkipAlreadyCommitted → the #3042 3×
-    duplicate is prevented PRINCIPALLY; committed < end → SendFull → black-hole
-    closed). The §3.2 universality invariant now covers EVERY non-Delivered arm with
-    no exception. New/updated tests `ownerless_timed_out_intends_resend_via_gate`
-    (renamed from `ownerless_timeout_suppresses_watcher_direct_fallback`),
-    `ownerless_timed_out_reconciles_skip_when_committed_reaches_end` (#3042
-    regression guard), `ownerless_timed_out_reconciles_full_when_not_committed`.
-  - `src/services/discord/tui_prompt_relay.rs` (3994 lines; SSH-direct TUI
+    split loop helpers further before adding behavior).
+  - `src/services/discord/tui_prompt_relay.rs` (3849 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
-    outside an extraction plan; +12 from #3041 P1-4 codex: the lease record
-    helpers now RETURN the recorded lease (with its per-record `generation`
-    nonce) and callers adopt it back so a later exact-match/by-generation clear
-    targets the precise stored identity (no clobber of a newer lease); +4 from
-    #3082 queued-only answer-flush gate
+    outside an extraction plan; +4 from #3082 queued-only answer-flush gate
     (`is_queued_notice = false` for the TUI idle-response placeholder); +139
     from #3099/#3100 injected-prompt classifier + neutral system-continuation
     note; +140 from the #3099/#3100 codex re-review: P1 bridge-tail output
@@ -314,68 +185,30 @@
     recorded real id) so a transient Discord post failure no longer leaves a
     stuck `Pending` slot suppressing that task-id for up to 1h; the next
     same-task notification reserves fresh and reposts (plus failed-post-reposts /
-    preserve-recorded-id / missing-id regression tests); +15 from #3146 Part 1:
-    `claim_tui_direct_synthetic_turn` now clears the stale `📦 … idle N분`
-    idle-recap card once a TUI-driven turn is owned for the channel, reusing the
-    shared `idle_recap::spawn_clear_idle_recap_for_channel` helper (keyed on
-    `channel_id`, mirrors the Discord-intake clear);
-    +96 from #3041 P1-4 codex: a `TuiDirectObservedLeaseEarlyReturnGuard` (arm right
-    after `record_observed_external_turn_lease`, disarm on the success path before
-    the bridge-tail ownership block) closes the early-return leak where a FAILURE
-    abort (health registry None, notify `resolve_bot_http` Err/503, task-card repeat,
-    anchor POST failure) left the recorded (possibly BridgeAdapter-owned) lease set
-    for the full TTL, blocking the legitimate watcher/sink delivery. The guard clears
-    BY the recorded generation (`clear_external_input_relay_lease_if_generation_matches`)
-    so a newer same-key lease recorded during the await is never clobbered; success
-    persistence is preserved by disarming before the bridge legitimately retains the
-    turn (plus failure-clear / disarm-persist / no-clobber regression tests).
-  - `src/services/discord/idle_recap.rs` (1881 prod lines; idle-recap card
-    compose/post/clear surface, registered giant-file (#3036) — bugfix only
-    outside an extraction plan. Crossed 1000 prod LoC with #3146 Part 1: the
-    shared capture-at-claim + CAS clear helpers, the `channel_has_active_turn`
-    mailbox/inflight probe, and the `post_recheck_action` seam that skips/undoes
-    a recap post when a turn raced the compose window. Split compose vs
-    lifecycle/clear submodules before adding behavior).
+    preserve-recorded-id / missing-id regression tests).
   - `src/services/codex_tmux_wrapper.rs` (1222 lines; Codex tmux wrapper JSON
     event parser and relay bridge for native Codex session events — bugfix only
     outside an extraction plan).
-  - `src/services/tui_prompt_dedupe.rs` (1152 lines; shared TUI prompt
+  - `src/services/tui_prompt_dedupe.rs` (1064 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
-    outside an extraction plan; +88 from #3041 P1-4 codex: a per-record
-    `generation: u64` nonce on `ExternalInputRelayLease` (process-global
-    `AtomicU64`, stamped in `record_external_input_turn_lease` which now returns
-    the recorded lease) plus the `clear_external_input_relay_lease_if_generation_matches`
-    no-clobber primitive — two value-identical `Unassigned` leases for the same
-    key get DISTINCT generations so a slow old delivery's RAII guard never clears
-    a newer lease; +9 from the #3099 re-review crate-visible
+    outside an extraction plan; +9 from the #3099 re-review crate-visible
     `reset_state_for_tests` helper; +26 from #3105 codex-P1 sub-case B
     `evict_dead_tmux_mirror` tombstone helper that drops both the runtime and
-    channel mirror for a dead/orphaned session and then allows re-registration;
-    -20 from #3041 P1-4 codex R3: REMOVED the now-unused
-    `external_input_relay_lease_generation` read-only accessor (its only caller was the
-    watcher, which now snapshots the lease ONCE via the single-lock
-    `external_input_relay_lease` and derives both presence + generation from that one
-    atomic read, closing the present/generation TOCTOU) plus its dedicated accessor unit
-    test; the watcher-snapshot no-clobber regression test is retained, rewritten to take
-    its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`).
-  - `src/services/discord/recovery_engine.rs` (4037 lines; +36 from #3099
+    channel mirror for a dead/orphaned session and then allows re-registration).
+  - `src/services/discord/recovery_engine.rs` (4033 lines; +36 from #3099
     task-notification anchor `⏳` cleanup for `user_msg_id == 0` recovery; +4
     from the #3099 re-review pinned-injected-message-id cleanup target; +55 from
     #3078 PR-2 routing recovery completion through `StatusPanelController` behind
     a shadow parity check (the controller adopts the recovered panel id and its
     chosen completion id is asserted equal to the legacy
     `recovery_status_panel_message_id_for_completion` result; the legacy path
-    still executes the Discord IO, so behaviour is unchanged); +4 from #3017
-    routing the recovery terminal through the single-authority finalizer
-    (`submit_terminal` + `FinalizeContext::monitor`) instead of inline
-    `mailbox_finish_turn`).
-  - `src/services/discord/health.rs` (2369 lines after #1879 snapshot/mailbox
+    still executes the Discord IO, so behaviour is unchanged)).
+  - `src/services/discord/health.rs` (2354 lines after #1879 snapshot/mailbox
     extraction; +3 from #3082 answer-flush-barrier field in the test SharedData
     constructor).
-  - `src/services/discord/health/recovery.rs` (2567 lines; health recovery
-    extraction surface, split further before adding non-bugfix behavior; +70
-    from #3126 stall-watchdog completed-idle false-positive guard tests).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3689 lines;
+  - `src/services/discord/health/recovery.rs` (2417 lines; health recovery
+    extraction surface, split further before adding non-bugfix behavior).
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3658 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -390,20 +223,6 @@
     split before adding non-bugfix behavior).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1849 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1242 lines).
-  - `src/services/discord/turn_bridge/terminal_delivery.rs` (1341 prod lines;
-    registered giant-file (#3036) — bugfix only outside an extraction plan.
-    Crossed 1000 prod LoC with #3041 P1-2: the `BridgeDeliveryLease`
-    acquire/commit_and_advance/heartbeat helper that routes the bridge's terminal
-    delivery through the shared delivery-lease, the watcher-owner-channel
-    resolution, and the skip-epilogue/identity-guarded-save decision seams. Split
-    the lease wiring vs the delivery helpers before adding behavior).
-  - `src/services/discord/turn_finalizer.rs` (1011 prod lines; single-authority
-    turn-finalize state machine — ledger/actor-loop/reconciler. Crossed the
-    giant-file threshold when #3041 P1-0 added the dormant `DeliveryLeaseCell`
-    finalizer messages/handlers on top of #3143's `FinalizeContext::monitor()` +
-    monitor turn-key/ledger-generation logic; tracked decompose target — see
-    `giant-file-registry.md` (owner `discord-finalizer`, deadline 2026-08-31,
-    issue #3016). Bugfix only outside a finalizer-decomposition plan).
   - `src/services/discord/formatting.rs` (2802 lines; +46 from #3082
     answer-flush-barrier guards (+11 around the plain multi-chunk send loops;
     +24 from the #3082 codex follow-up that also guards the edit/replace path
@@ -415,7 +234,7 @@
     `finalize_stale_streaming_footer` / `text_ends_with_streaming_footer` shared
     terminal-idle reconciliation helpers + their unit tests).
   - `src/services/discord/prompt_builder/` (directory, refactored).
-  - `src/services/discord/runtime_bootstrap.rs` (2800 lines after #2558
+  - `src/services/discord/runtime_bootstrap.rs` (2762 lines after #2558
     thread-session GC loopback shim cleanup; +3 from #3082 answer-flush-barrier
     field in the SharedData constructor; +1 from #3037 cluster backflow path
     rewrite wrapping a longer `services::cluster::node_registry::*` call; +3 from
@@ -433,7 +252,7 @@
     inline — its move-captured locals make a clean extraction risky and is
     deferred).
   - `src/services/discord/session_runtime.rs` (1396 lines).
-  - `src/services/discord/voice_barge_in.rs` (4835 lines; voice STT/TTS,
+  - `src/services/discord/voice_barge_in.rs` (4653 lines; voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
     tracked decompose target — see `giant-file-registry.md` (owner
     `voice-runtime`, deadline 2026-08-31, #3036)).
@@ -528,8 +347,8 @@
   - `src/cli/doctor/orchestrator.rs` (4374 lines).
   - `src/cli/migrate/apply.rs` (3146 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
-  - `src/cli/{init.rs (1444), client.rs (2378), direct.rs (1778),
-    dcserver.rs (1611)}`.
+  - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
+    dcserver.rs (1560)}`.
   - `src/cli/provider_cli/mod.rs` (1039 lines).
 - active_callsite_coverage: n/a.
 - invariants: LaunchAgent plist and runtime layout are generated only — see
@@ -619,7 +438,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
-- `src/services/onboarding/mod.rs` (2936),
+- `src/services/onboarding/mod.rs` (2966),
   `src/services/dispatched_sessions.rs` (1326), and
   `src/services/settings.rs` (1007) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`

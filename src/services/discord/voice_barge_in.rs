@@ -1102,237 +1102,15 @@ fn progress_feedback_channel_id(channel_id: u64, playback_channel_id: Option<u64
     playback_channel_id.unwrap_or(channel_id)
 }
 
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the live barge-in
-/// sensitivity state (#3038 STT/TTS/playback/routing split, sensitivity slice).
-///
-/// Bundles the three sensitivity-related fields that previously lived directly
-/// on `VoiceBargeInRuntime`. Behavior is preserved exactly: the atomic mirror is
-/// always stored *before* the `RwLock` write (F18, #2046), and `current` falls
-/// back to the atomic mirror on `try_read` contention.
-struct SensitivityState {
-    // F18 (#2046): boot-time default. Retained for parity with the original
-    // field layout; never read after construction.
-    #[allow(dead_code)]
+pub(in crate::services::discord) struct VoiceBargeInRuntime {
+    enabled: bool,
+    barge_in_enabled: bool,
     default_sensitivity: BargeInSensitivity,
     // F18 (#2046): RwLock try_read 실패 시 default 로 폴백하면 사용자가 설정한
     // Conservative 가 잠깐 Normal 로 잘못 평가될 수 있다. 최신 값을 lock-free 로
     // 읽을 수 있도록 atomic mirror 유지.
-    atom: std::sync::atomic::AtomicU8,
-    state: Arc<RwLock<BargeInSensitivityState>>,
-}
-
-impl SensitivityState {
-    fn new(default_sensitivity: BargeInSensitivity, conservative_ttl: Duration) -> Self {
-        Self {
-            default_sensitivity,
-            atom: std::sync::atomic::AtomicU8::new(default_sensitivity.as_u8()),
-            state: Arc::new(RwLock::new(BargeInSensitivityState::new(
-                default_sensitivity,
-                conservative_ttl,
-            ))),
-        }
-    }
-
-    fn disabled() -> Self {
-        let default_sensitivity = BargeInSensitivity::Normal;
-        Self {
-            default_sensitivity,
-            atom: std::sync::atomic::AtomicU8::new(default_sensitivity.as_u8()),
-            state: Arc::new(RwLock::new(BargeInSensitivityState::default())),
-        }
-    }
-
-    /// Clone the shared `RwLock` handle for the TTL reset background task.
-    fn state_handle(&self) -> Arc<RwLock<BargeInSensitivityState>> {
-        self.state.clone()
-    }
-
-    /// F18 (#2046): atomic mirror 를 먼저 갱신해 두면 try_read 충돌 윈도우에서도
-    /// `current` 가 최신 값을 본다.
-    async fn set(&self, sensitivity: BargeInSensitivity) {
-        self.atom.store(sensitivity.as_u8(), Ordering::Relaxed);
-        self.state
-            .write()
-            .await
-            .set_sensitivity(sensitivity, Instant::now());
-    }
-
-    async fn apply_voice_command(&self, transcript: &str) -> Option<BargeInSensitivity> {
-        self.state
-            .write()
-            .await
-            .apply_voice_command(transcript, Instant::now())
-    }
-
-    /// F18 (#2046): try_read 실패 시 boot-time default 가 아닌 가장 최근에
-    /// 설정된 sensitivity 를 반환하도록 atomic mirror 로 폴백한다.
-    fn current(&self) -> BargeInSensitivity {
-        self.state
-            .try_read()
-            .map(|state| state.sensitivity())
-            .unwrap_or_else(|_| BargeInSensitivity::from_u8(self.atom.load(Ordering::Relaxed)))
-    }
-}
-
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: monotonic ID allocators
-/// (#3038 god-object split, id-sequence slice).
-///
-/// Bundles the three independent `AtomicU64` counters that previously lived
-/// directly on `VoiceBargeInRuntime`. Each `next_*` accessor preserves the
-/// original `fetch_add` semantics — including the exact memory `Ordering` and
-/// the per-counter seed value — so issued IDs are byte-for-byte identical to
-/// the pre-extraction layout:
-/// - spoken-result playbacks seed at `1` (`SeqCst`),
-/// - progress playbacks seed at `PROGRESS_PLAYBACK_OWNER_START` (`SeqCst`),
-/// - internal voice messages seed at `INTERNAL_VOICE_MESSAGE_ID_START`
-///   (`Relaxed`).
-struct VoiceIdSequences {
-    next_spoken_result_playback_id: AtomicU64,
-    // F4 (#2046): progress/ack 재생 owner id 발급용. 30s 만료 타이머가 owner 일치
-    // 시에만 playback entry 를 정리하도록 한다.
-    next_progress_playback_id: AtomicU64,
-    next_internal_message_id: AtomicU64,
-}
-
-impl VoiceIdSequences {
-    fn new() -> Self {
-        Self {
-            next_spoken_result_playback_id: AtomicU64::new(1),
-            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
-            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
-        }
-    }
-
-    /// Allocate the next spoken-result playback id (`SeqCst`, seeded at `1`).
-    fn next_spoken_result_playback_id(&self) -> u64 {
-        self.next_spoken_result_playback_id
-            .fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Allocate the next progress/ack playback owner id (`SeqCst`, seeded at
-    /// `PROGRESS_PLAYBACK_OWNER_START`).
-    fn next_progress_playback_id(&self) -> u64 {
-        self.next_progress_playback_id
-            .fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Allocate the next internal voice message id (`Relaxed`, seeded at
-    /// `INTERNAL_VOICE_MESSAGE_ID_START`).
-    fn next_internal_message_id(&self) -> u64 {
-        self.next_internal_message_id
-            .fetch_add(1, Ordering::Relaxed)
-    }
-}
-
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the streaming-STT per-user
-/// session bookkeeping (#3038 god-object split, streaming-STT slice).
-///
-/// Bundles the two `DashMap`s that were previously sibling fields on
-/// `VoiceBargeInRuntime`, both keyed by the same `StreamingSttKey`
-/// (channel/user pair):
-/// - `sessions` holds the in-flight `SttSessionHandle` for each speaker, and
-/// - `feed_tasks` holds the per-key bucket of spawned PCM-feed `JoinHandle`s.
-///
-/// The accessors below are intentionally thin: `sessions()` / `feed_tasks()`
-/// hand back `&DashMap<...>` so the existing entry / get / remove call sites
-/// keep their exact `DashMap` semantics — including entry guards held across
-/// `await` during session finalization — and `clear()` wipes both maps in the
-/// same order as the original inline `streaming_stt_sessions.clear();
-/// streaming_stt_feed_tasks.clear();` pair. No locking, ordering, or
-/// side-effect sequencing changes relative to the pre-extraction layout.
-struct StreamingSttSessions {
-    sessions: dashmap::DashMap<StreamingSttKey, SttSessionHandle>,
-    feed_tasks: dashmap::DashMap<StreamingSttKey, Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>>,
-}
-
-impl StreamingSttSessions {
-    fn new() -> Self {
-        Self {
-            sessions: dashmap::DashMap::new(),
-            feed_tasks: dashmap::DashMap::new(),
-        }
-    }
-
-    /// Per-speaker streaming session handles, keyed by channel/user pair.
-    fn sessions(&self) -> &dashmap::DashMap<StreamingSttKey, SttSessionHandle> {
-        &self.sessions
-    }
-
-    /// Per-speaker buckets of spawned PCM-feed tasks, keyed by channel/user pair.
-    fn feed_tasks(
-        &self,
-    ) -> &dashmap::DashMap<StreamingSttKey, Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>> {
-        &self.feed_tasks
-    }
-
-    /// Drop every session and feed-task bucket. Sessions are cleared before
-    /// feed tasks, matching the original inline ordering in
-    /// `set_runtime_language`.
-    fn clear(&self) {
-        self.sessions.clear();
-        self.feed_tasks.clear();
-    }
-}
-
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the F6 (#2046) `Config`
-/// snapshot hot-cache (#3038 god-object split, config-cache slice).
-///
-/// Wraps the single `Mutex<Option<(Instant, Arc<Config>)>>` slot that used to
-/// live directly on `VoiceBargeInRuntime`. The accessors below preserve the
-/// original lock discipline and TTL fallback exactly:
-/// - `lookup_within_ttl` returns the cached `Arc<Config>` only while the entry
-///   is younger than `VOICE_CONFIG_CACHE_TTL`, silently treating a poisoned /
-///   contended lock as a miss (`Ok` guard required, never blocking-on-panic),
-/// - `store` overwrites the slot with a freshly stamped entry, also ignoring a
-///   failed lock,
-/// - the spawn_blocking reload itself stays on the runtime so the async control
-///   flow and side-effect ordering are byte-for-byte unchanged.
-struct ConfigSnapshotCache {
-    slot: std::sync::Mutex<Option<(Instant, Arc<crate::config::Config>)>>,
-}
-
-impl ConfigSnapshotCache {
-    fn new() -> Self {
-        Self {
-            slot: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Return the cached snapshot iff it is still within the TTL window as of
-    /// `now`. A poisoned or contended lock is treated as a cache miss, matching
-    /// the original `if let Ok(guard) = ... .lock()` fallback.
-    fn lookup_within_ttl(&self, now: Instant) -> Option<Arc<crate::config::Config>> {
-        if let Ok(guard) = self.slot.lock()
-            && let Some((loaded_at, cached)) = guard.as_ref()
-            && now.duration_since(*loaded_at) < VOICE_CONFIG_CACHE_TTL
-        {
-            return Some(cached.clone());
-        }
-        None
-    }
-
-    /// Stamp and store a freshly loaded snapshot. A failed lock is ignored,
-    /// matching the original `if let Ok(mut guard) = ... .lock()` write.
-    fn store(&self, loaded_at: Instant, config: Arc<crate::config::Config>) {
-        if let Ok(mut guard) = self.slot.lock() {
-            *guard = Some((loaded_at, config));
-        }
-    }
-
-    /// Test-only seed of the cache slot (mirrors the previous direct
-    /// `*runtime.config_cache.lock().unwrap() = Some(...)` writes).
-    #[cfg(test)]
-    fn seed(&self, loaded_at: Instant, config: Arc<crate::config::Config>) {
-        *self.slot.lock().unwrap() = Some((loaded_at, config));
-    }
-}
-
-pub(in crate::services::discord) struct VoiceBargeInRuntime {
-    enabled: bool,
-    barge_in_enabled: bool,
-    // #3038: sensitivity 관심사를 sub-struct 로 격리. default_sensitivity /
-    // atomic mirror / RwLock 상태를 하나로 묶어 락 순서와 폴백 동작을 보존.
-    sensitivity: SensitivityState,
+    sensitivity_atom: std::sync::atomic::AtomicU8,
+    sensitivity_state: Arc<RwLock<BargeInSensitivityState>>,
     acknowledgement_enabled: bool,
     acknowledgement_text: String,
     transcript_dirs: Vec<PathBuf>,
@@ -1340,10 +1118,9 @@ pub(in crate::services::discord) struct VoiceBargeInRuntime {
     spoken_result_language: RwLock<String>,
     verbose_progress: AtomicBool,
     stt: RwLock<Option<VoiceSttRuntime>>,
-    // #3038: streaming-STT 세션/피드 태스크 DashMap 쌍을 sub-struct 로 격리.
-    // 동일한 StreamingSttKey 로 묶이며 entry/get/remove 의미와 clear 순서를
-    // 그대로 보존한다.
-    streaming_stt: StreamingSttSessions,
+    streaming_stt_sessions: dashmap::DashMap<StreamingSttKey, SttSessionHandle>,
+    streaming_stt_feed_tasks:
+        dashmap::DashMap<StreamingSttKey, Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>>,
     tts: RwLock<Option<TtsRuntime>>,
     progress_tx: broadcast::Sender<VoiceProgressEvent>,
     monitors: dashmap::DashMap<u64, Arc<std::sync::Mutex<LiveBargeInMonitor>>>,
@@ -1352,14 +1129,14 @@ pub(in crate::services::discord) struct VoiceBargeInRuntime {
     voice_guilds: dashmap::DashMap<u64, GuildId>,
     active_voice_routes: dashmap::DashMap<u64, ActiveVoiceRoute>,
     deferred_buffers: dashmap::DashMap<u64, Arc<Mutex<DeferredBargeInBuffer>>>,
-    // #3038: monotonic ID 발급 관심사를 sub-struct 로 격리. 세 카운터(spoken
-    // result / progress playback / internal message)의 seed 값과 memory
-    // Ordering 을 그대로 보존한다.
-    id_sequences: VoiceIdSequences,
+    next_spoken_result_playback_id: AtomicU64,
+    // F4 (#2046): progress/ack 재생 owner id 발급용. 30s 만료 타이머가 owner 일치
+    // 시에만 playback entry 를 정리하도록 한다.
+    next_progress_playback_id: AtomicU64,
+    next_internal_message_id: AtomicU64,
     // F6 (#2046): `resolve_voice_turn_target` 가 매 utterance 마다 YAML 을
-    // 재파싱하지 않도록 한 `Config` snapshot 핫캐시. #3038: TTL/lock 규율을
-    // ConfigSnapshotCache 로 격리해 폴백 동작을 보존.
-    config_cache: ConfigSnapshotCache,
+    // 재파싱하지 않도록 한 `Config` snapshot 핫캐시.
+    config_cache: std::sync::Mutex<Option<(Instant, Arc<crate::config::Config>)>>,
     // F12 (#2046): voice alias collision 경고를 1회만 노출. utterance 마다 같은
     // collision 으로 warn 이 쏟아져 운영 로그가 묻히는 것을 막는다.
     alias_collision_signature: std::sync::Mutex<Option<String>>,
@@ -1394,7 +1171,12 @@ impl VoiceBargeInRuntime {
         Self {
             enabled: config.enabled,
             barge_in_enabled: config.enabled && config.barge_in.enabled,
-            sensitivity: SensitivityState::new(default_sensitivity, conservative_ttl),
+            default_sensitivity,
+            sensitivity_atom: std::sync::atomic::AtomicU8::new(default_sensitivity.as_u8()),
+            sensitivity_state: Arc::new(RwLock::new(BargeInSensitivityState::new(
+                default_sensitivity,
+                conservative_ttl,
+            ))),
             acknowledgement_enabled: config.barge_in.acknowledgement_enabled,
             acknowledgement_text: config.barge_in.acknowledgement_text.clone(),
             transcript_dirs: transcript_dirs_from_config(config),
@@ -1402,7 +1184,8 @@ impl VoiceBargeInRuntime {
             spoken_result_language: RwLock::new(config.stt.language.clone()),
             verbose_progress: AtomicBool::new(config.verbose_progress),
             stt: RwLock::new(stt),
-            streaming_stt: StreamingSttSessions::new(),
+            streaming_stt_sessions: dashmap::DashMap::new(),
+            streaming_stt_feed_tasks: dashmap::DashMap::new(),
             tts: RwLock::new(tts),
             progress_tx,
             monitors: dashmap::DashMap::new(),
@@ -1411,8 +1194,10 @@ impl VoiceBargeInRuntime {
             voice_guilds: dashmap::DashMap::new(),
             active_voice_routes: dashmap::DashMap::new(),
             deferred_buffers: dashmap::DashMap::new(),
-            id_sequences: VoiceIdSequences::new(),
-            config_cache: ConfigSnapshotCache::new(),
+            next_spoken_result_playback_id: AtomicU64::new(1),
+            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
+            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
+            config_cache: std::sync::Mutex::new(None),
             alias_collision_signature: std::sync::Mutex::new(None),
             inflight_foreground_cancels: dashmap::DashMap::new(),
             #[cfg(test)]
@@ -1425,7 +1210,9 @@ impl VoiceBargeInRuntime {
         Self {
             enabled: false,
             barge_in_enabled: false,
-            sensitivity: SensitivityState::disabled(),
+            default_sensitivity: BargeInSensitivity::Normal,
+            sensitivity_atom: std::sync::atomic::AtomicU8::new(BargeInSensitivity::Normal.as_u8()),
+            sensitivity_state: Arc::new(RwLock::new(BargeInSensitivityState::default())),
             acknowledgement_enabled: false,
             acknowledgement_text: String::new(),
             transcript_dirs: Vec::new(),
@@ -1433,7 +1220,8 @@ impl VoiceBargeInRuntime {
             spoken_result_language: RwLock::new(DEFAULT_STT_LANGUAGE.to_string()),
             verbose_progress: AtomicBool::new(false),
             stt: RwLock::new(None),
-            streaming_stt: StreamingSttSessions::new(),
+            streaming_stt_sessions: dashmap::DashMap::new(),
+            streaming_stt_feed_tasks: dashmap::DashMap::new(),
             tts: RwLock::new(None),
             progress_tx,
             monitors: dashmap::DashMap::new(),
@@ -1442,8 +1230,10 @@ impl VoiceBargeInRuntime {
             voice_guilds: dashmap::DashMap::new(),
             active_voice_routes: dashmap::DashMap::new(),
             deferred_buffers: dashmap::DashMap::new(),
-            id_sequences: VoiceIdSequences::new(),
-            config_cache: ConfigSnapshotCache::new(),
+            next_spoken_result_playback_id: AtomicU64::new(1),
+            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
+            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
+            config_cache: std::sync::Mutex::new(None),
             alias_collision_signature: std::sync::Mutex::new(None),
             inflight_foreground_cancels: dashmap::DashMap::new(),
             #[cfg(test)]
@@ -1776,7 +1566,8 @@ impl VoiceBargeInRuntime {
         };
         *self.spoken_result_language.write().await = language;
         if self.enabled {
-            self.streaming_stt.clear();
+            self.streaming_stt_sessions.clear();
+            self.streaming_stt_feed_tasks.clear();
             *self.stt.write().await = Some(VoiceSttRuntime::from_voice_config(&config));
         }
     }
@@ -1932,7 +1723,7 @@ impl VoiceBargeInRuntime {
             return;
         }
 
-        let state = self.sensitivity.state_handle();
+        let state = self.sensitivity_state.clone();
         let token = CancellationToken::new();
         let reset_token = token.clone();
         tokio::spawn(run_sensitivity_ttl_reset(state, reset_token));
@@ -2311,7 +2102,14 @@ impl VoiceBargeInRuntime {
         &self,
         sensitivity: BargeInSensitivity,
     ) {
-        self.sensitivity.set(sensitivity).await;
+        // F18 (#2046): atomic mirror 를 먼저 갱신해 두면 try_read 충돌 윈도우에서도
+        // current_sensitivity 가 최신 값을 본다.
+        self.sensitivity_atom
+            .store(sensitivity.as_u8(), Ordering::Relaxed);
+        self.sensitivity_state
+            .write()
+            .await
+            .set_sensitivity(sensitivity, Instant::now());
         self.update_existing_monitor_sensitivity(sensitivity);
     }
 
@@ -2322,7 +2120,11 @@ impl VoiceBargeInRuntime {
         if !self.barge_in_enabled {
             return None;
         }
-        let sensitivity = self.sensitivity.apply_voice_command(transcript).await?;
+        let sensitivity = self
+            .sensitivity_state
+            .write()
+            .await
+            .apply_voice_command(transcript, Instant::now())?;
         self.update_existing_monitor_sensitivity(sensitivity);
         Some(sensitivity)
     }
@@ -2380,7 +2182,9 @@ impl VoiceBargeInRuntime {
     }
 
     fn start_spoken_result_playback(&self, channel_id: ChannelId) -> (u64, CancellationToken) {
-        let id = self.id_sequences.next_spoken_result_playback_id();
+        let id = self
+            .next_spoken_result_playback_id
+            .fetch_add(1, Ordering::SeqCst);
         let cancellation = CancellationToken::new();
         if let Some(previous) = self.spoken_result_playbacks.insert(
             channel_id.get(),
@@ -2454,8 +2258,7 @@ impl VoiceBargeInRuntime {
             user_id,
         };
         let task_bucket = self
-            .streaming_stt
-            .feed_tasks()
+            .streaming_stt_feed_tasks
             .entry(key)
             .or_insert_with(|| Arc::new(StdMutex::new(Vec::new())))
             .clone();
@@ -2488,7 +2291,7 @@ impl VoiceBargeInRuntime {
             channel_id: channel_id.get(),
             user_id,
         };
-        let session = match self.streaming_stt.sessions().get(&key) {
+        let session = match self.streaming_stt_sessions.get(&key) {
             Some(entry) => entry.value().clone(),
             None => {
                 let language = self.spoken_result_language().await;
@@ -2504,7 +2307,7 @@ impl VoiceBargeInRuntime {
                         return;
                     }
                 };
-                match self.streaming_stt.sessions().entry(key) {
+                match self.streaming_stt_sessions.entry(key) {
                     dashmap::mapref::entry::Entry::Occupied(entry) => {
                         let existing = entry.get().clone();
                         if let Err(error) = stt.finalize(new_session).await {
@@ -2558,7 +2361,7 @@ impl VoiceBargeInRuntime {
     }
 
     async fn drain_streaming_stt_feed_tasks(&self, key: StreamingSttKey) {
-        let Some((_, task_bucket)) = self.streaming_stt.feed_tasks().remove(&key) else {
+        let Some((_, task_bucket)) = self.streaming_stt_feed_tasks.remove(&key) else {
             return;
         };
         let tasks = match task_bucket.lock() {
@@ -3548,14 +3351,19 @@ impl VoiceBargeInRuntime {
     /// 5초 TTL 로 묶어 부하를 줄이고 async executor 블록도 회피한다.
     async fn cached_config(&self) -> Arc<crate::config::Config> {
         let now = Instant::now();
-        if let Some(cached) = self.config_cache.lookup_within_ttl(now) {
-            return cached;
+        if let Ok(guard) = self.config_cache.lock()
+            && let Some((loaded_at, cached)) = guard.as_ref()
+            && now.duration_since(*loaded_at) < VOICE_CONFIG_CACHE_TTL
+        {
+            return cached.clone();
         }
         let fresh = tokio::task::spawn_blocking(crate::config::load_graceful)
             .await
             .unwrap_or_else(|_| crate::config::Config::default());
         let arc = Arc::new(fresh);
-        self.config_cache.store(Instant::now(), arc.clone());
+        if let Ok(mut guard) = self.config_cache.lock() {
+            *guard = Some((Instant::now(), arc.clone()));
+        }
         arc
     }
 
@@ -4125,7 +3933,10 @@ impl VoiceBargeInRuntime {
             }
         }
 
-        let message_id = MessageId::new(self.id_sequences.next_internal_message_id());
+        let message_id = MessageId::new(
+            self.next_internal_message_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
         super::enqueue_internal_followup(
             shared,
             provider,
@@ -4288,7 +4099,9 @@ impl VoiceBargeInRuntime {
         // 30s 만료 타이머는 `clear_playback_if_owner` 로 동일 owner 일 때만 정리.
         // 후속 progress/spoken_result playback 이 entry 를 덮어쓰면 mismatch 로
         // no-op → 후속 playback 의 barge-in 이 깨지지 않는다.
-        let playback_id = self.id_sequences.next_progress_playback_id();
+        let playback_id = self
+            .next_progress_playback_id
+            .fetch_add(1, Ordering::SeqCst);
         self.reset_after_playback_start_with_owner(
             channel_id,
             Arc::new(track),
@@ -4459,7 +4272,7 @@ impl VoiceBargeInRuntime {
                     user_id: utterance.user_id,
                 };
                 self.drain_streaming_stt_feed_tasks(key).await;
-                if let Some((_, session)) = self.streaming_stt.sessions().remove(&key) {
+                if let Some((_, session)) = self.streaming_stt_sessions.remove(&key) {
                     match stt.finalize(session).await {
                         Ok(transcript) if !transcript.text.trim().is_empty() => {
                             let stt_latency_ms =
@@ -4641,7 +4454,12 @@ impl VoiceBargeInRuntime {
         // 설정된 sensitivity 를 반환하도록 atomic mirror 로 폴백한다. TTL reset
         // 이 일어나는 짧은 윈도우라도 사용자가 설정한 Conservative 가 잠깐
         // Normal 로 평가되는 회귀를 막는다.
-        self.sensitivity.current()
+        self.sensitivity_state
+            .try_read()
+            .map(|state| state.sensitivity())
+            .unwrap_or_else(|_| {
+                BargeInSensitivity::from_u8(self.sensitivity_atom.load(Ordering::Relaxed))
+            })
     }
 
     fn update_existing_monitor_sensitivity(&self, sensitivity: BargeInSensitivity) {
@@ -6073,7 +5891,7 @@ mod tests {
         let runtime = enabled_runtime();
         let mut config = crate::config::Config::default();
         config.agents = vec![test_agent("codex")];
-        runtime.config_cache.seed(Instant::now(), Arc::new(config));
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
 
         assert_eq!(
             runtime
@@ -6098,7 +5916,7 @@ mod tests {
         agent_b.id = "agent-b".to_string();
         agent_b.voice.channel_id = Some("400".to_string());
         config.agents = vec![agent_a, agent_b];
-        runtime.config_cache.seed(Instant::now(), Arc::new(config));
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
 
         assert_eq!(
             runtime
@@ -6123,7 +5941,7 @@ mod tests {
         agent_b.id = "agent-b".to_string();
         agent_b.voice.channel_id = Some("400".to_string());
         config.agents = vec![agent_a, agent_b];
-        runtime.config_cache.seed(Instant::now(), Arc::new(config));
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
 
         assert_eq!(
             runtime
@@ -6152,7 +5970,7 @@ mod tests {
         agent_b.id = "agent-b".to_string();
         agent_b.voice.channel_id = Some("400".to_string());
         config.agents = vec![agent_a, agent_b];
-        runtime.config_cache.seed(Instant::now(), Arc::new(config));
+        *runtime.config_cache.lock().unwrap() = Some((Instant::now(), Arc::new(config)));
 
         assert_eq!(
             runtime
