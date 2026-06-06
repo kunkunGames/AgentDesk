@@ -1,49 +1,6 @@
 use super::*;
 use crate::services::discord::InflightTurnState;
 
-/// #3041 P1-1: process-global monotonic counter that mints a unique
-/// `instance_id` for each watcher spawn. It distinguishes an outgoing watcher
-/// from its replacement across a reattach so the delivery-lease holder
-/// (`LeaseHolder::Watcher { instance_id }`) of a still-running send cannot be
-/// confused with — or released/committed by — a successor watcher that picks
-/// up the same channel/session (the §5.2 B2 single-holder invariant).
-static WATCHER_INSTANCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn next_watcher_instance_id() -> u64 {
-    WATCHER_INSTANCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// #3041 P1-1 (B3, codex R2 Issue-1): delivery-lease acquire deadline for the
-/// watcher terminal send. The deadline is a HOLDER-LIVENESS signal, NOT a hard
-/// cap on delivery duration — while the send future is in flight the watcher
-/// keeps the lease alive with a background HEARTBEAT that `renew()`s the
-/// deadline every heartbeat interval. Because a LIVE holder always re-extends
-/// within one interval, a long multi-chunk send (which can exceed any FIXED
-/// deadline — an unbounded response splits into 2000-char chunks paced ~500ms
-/// apart plus a 1s rate limiter, so 60+ chunks can run past 90s) is NEVER
-/// reclaimed mid-flight. Conversely, a genuinely DEAD holder (its watcher
-/// task/process gone) stops renewing, so the lease expires and a replacement
-/// reclaims it within ~one deadline.
-///
-/// #3041 P1-2: this is now an ALIAS for the shared
-/// [`crate::services::discord::DELIVERY_LEASE_DEADLINE_MS`] so the watcher and
-/// the bridge use the SAME deadline against the SAME per-channel cell. Kept as a
-/// named alias to minimize churn at the watcher call/test sites.
-const WATCHER_DELIVERY_LEASE_DEADLINE_MS: u64 =
-    crate::services::discord::DELIVERY_LEASE_DEADLINE_MS;
-
-/// #3041 P1-1 (§3, codex R2 Issue-1): how often the in-flight watcher send
-/// renews its delivery lease. Alias for the shared
-/// [`crate::services::discord::DELIVERY_LEASE_HEARTBEAT_MS`] (P1-2).
-const WATCHER_DELIVERY_LEASE_HEARTBEAT_MS: u64 =
-    crate::services::discord::DELIVERY_LEASE_HEARTBEAT_MS;
-
-/// #3041 P1-2: the heartbeat RAII handle now lives in the shared `discord` module
-/// (`super::DeliveryLeaseHeartbeat`) so the watcher and the bridge reuse one
-/// implementation. Re-exported here under the watcher-local name to keep the
-/// existing watcher call sites and tests unchanged.
-use crate::services::discord::DeliveryLeaseHeartbeat;
-
 /// #2441 (H1) — race a fixed sleep against a `notify`-backed wake-up
 /// from `JsonlWatcher`. Returns as soon as EITHER the sleep elapses or
 /// the watcher fires its `Notify`. This is the primitive used to replace
@@ -1026,103 +983,6 @@ fn matching_watcher_turn_identity(
         .map(crate::services::discord::inflight::InflightTurnIdentity::from_state)
 }
 
-/// #3016 (codex R2): pick the `user_msg_id` handed to the normal-completion
-/// finalize, gated on the OUTPUT-RANGE relationship so we only ever finalize
-/// the turn whose output THIS completion actually is.
-///
-/// Offset-aliasing hazard: the watcher loop is not turn-scoped, and the
-/// watcher-yield guard `watcher_should_yield_to_inflight_state`
-/// (tmux.rs ~2083-2112) lets the watcher PROCEED on this old range in the
-/// `RelayOwnerKind::None` arm whenever it does NOT satisfy
-/// `data_start_offset <= turn_start_offset && turn_start_offset < current_offset`
-/// (tmux.rs:2110-2111). One such non-yield case is a FOLLOW-UP turn started on
-/// the SAME tmux session whose `turn_start_offset >= current_offset` — i.e. it
-/// begins AFTER the range this completion covers. In that case
-/// `inflight_before_relay` already holds the NEWER turn's `user_msg_id`; handing
-/// that id to the finalizer would `mailbox_finish_turn_if_matches` and release
-/// the WRONG (newer, still-running) turn.
-///
-/// Binding rule (mirrors the guard's exact offset semantics so the two cannot
-/// disagree): only return the pinned id when the pinned inflight turn has
-/// actually produced output by this completion point — its effective start
-/// offset `turn_start_offset.unwrap_or(last_offset)` is `< current_offset`. A
-/// newer turn (start offset `>= current_offset`) does NOT satisfy this → return
-/// `0` (no exact ledger match; the finalizer refuses to release a mismatched
-/// live turn). The session-match + `user_msg_id != 0` checks are kept too.
-///
-/// Note: `InflightTurnIdentity` (inflight.rs:665) does NOT carry
-/// `turn_start_offset`, so this reads it from the `InflightTurnState` directly.
-fn pinned_finalize_user_msg_id(
-    inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
-    tmux_session_name: &str,
-    current_offset: u64,
-) -> u64 {
-    inflight_before_relay
-        .filter(|state| {
-            state.user_msg_id != 0
-                && state.tmux_session_name.as_deref().map(str::trim)
-                    == Some(tmux_session_name.trim())
-                // Mirror the guard at tmux.rs:2110-2111: effective turn start =
-                // `turn_start_offset.unwrap_or(last_offset)`. Only this turn's
-                // output reaches `current_offset` when its start precedes it.
-                && state.turn_start_offset.unwrap_or(state.last_offset) < current_offset
-        })
-        .map(|state| state.user_msg_id)
-        .unwrap_or(0)
-}
-
-/// #3016 (codex R3): the watcher's `terminal_output_committed &&
-/// !lifecycle_stage_paused` block runs MORE destructive side-effects than the
-/// finalize on a LATE re-read `inflight_state` (loaded AFTER the relay, NOT
-/// turn-pinned): the `⏳ → ✅` reaction + `session_transcript` + `turn_analytics`
-/// write (targets the late read's `user_msg_id`) and `clear_inflight_state`
-/// (deletes the on-disk inflight). In the R2/R3 aliasing scenario a FOLLOW-UP
-/// turn on the SAME tmux session has `turn_start_offset >= current_offset` (it
-/// begins AFTER the output range this completion covers), so the watcher-yield
-/// guard (tmux.rs:2110-2111: yields only when
-/// `data_start_offset <= turn_start_offset && turn_start_offset < current_offset`)
-/// does NOT yield and the watcher processes this OLD range — yet the late
-/// `inflight_state` (and possibly the pre-relay snapshot) already holds the
-/// NEWER turn's id. Running those side-effects would ✅ the newer (still-running)
-/// turn's message, write its transcript/analytics prematurely, and delete its
-/// inflight — wrong-turn lifecycle corruption.
-///
-/// This pure gate returns TRUE iff EITHER snapshot is a real NEWER turn on the
-/// SAME session that this committed range does not belong to: for that snapshot
-/// `user_msg_id != 0` AND trimmed session match AND effective start
-/// `turn_start_offset.unwrap_or(last_offset) >= current_offset`. This is the
-/// EXACT complement of `pinned_finalize_user_msg_id`'s `< current_offset` range
-/// test (and mirrors the same offset/fallback semantics as the yield guard), so
-/// the two decisions cannot disagree: when the finalize helper returns 0 because
-/// the snapshot is a newer turn, this gate returns TRUE and the call site skips
-/// the reaction/transcript/analytics/clear too.
-///
-/// Narrow by construction: for a normal completion where the inflight is THIS
-/// turn or an OLDER turn (`turn_start_offset < current_offset`), or there is no
-/// inflight, or it is `rebind_origin`/`user_msg_id == 0`, this returns FALSE and
-/// all existing behavior is preserved.
-fn committed_completion_is_stale_for_newer_turn(
-    inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
-    inflight_state: Option<&crate::services::discord::inflight::InflightTurnState>,
-    tmux_session_name: &str,
-    current_offset: u64,
-) -> bool {
-    let snapshot_is_newer_turn =
-        |snapshot: Option<&crate::services::discord::inflight::InflightTurnState>| {
-            snapshot.is_some_and(|state| {
-                state.user_msg_id != 0
-                    && state.tmux_session_name.as_deref().map(str::trim)
-                        == Some(tmux_session_name.trim())
-                    // Complement of `pinned_finalize_user_msg_id`'s
-                    // `< current_offset`: a newer turn starts AT/AFTER this
-                    // committed range. Same `turn_start_offset.unwrap_or(last_offset)`
-                    // fallback as the finalize helper and the yield guard.
-                    && state.turn_start_offset.unwrap_or(state.last_offset) >= current_offset
-            })
-        };
-    snapshot_is_newer_turn(inflight_before_relay) || snapshot_is_newer_turn(inflight_state)
-}
-
 fn refresh_watcher_turn_identity(
     current: &mut Option<crate::services::discord::inflight::InflightTurnIdentity>,
     provider: &ProviderKind,
@@ -1178,231 +1038,6 @@ mod pane_dead_identity_tests {
         identity = matching_watcher_turn_identity(Some(&second), "AgentDesk-codex-adk-cdx");
 
         assert!(identity.is_none());
-    }
-
-    // #3016 codex R2 (offset-aliasing id-selection). Exercises the SELECTION
-    // path the call site uses (`pinned_finalize_user_msg_id`) — which the
-    // direct-helper `stale_normal_completion_does_not_release_newer_active_turn`
-    // test does NOT cover. The hazard: a follow-up turn on the SAME session whose
-    // `turn_start_offset >= current_offset` (it begins AFTER the range this
-    // completion covers) sits in `inflight_before_relay`; passing its id to the
-    // finalizer would release the WRONG (newer, still-running) turn. The
-    // selection must return 0 in that case, mirroring the watcher-yield guard at
-    // tmux.rs:2110-2111.
-    fn state_with_offsets(
-        user_msg_id: u64,
-        tmux_session_name: &str,
-        turn_start_offset: Option<u64>,
-        last_offset: u64,
-    ) -> InflightTurnState {
-        let mut state = state_for_turn(user_msg_id, tmux_session_name);
-        state.last_offset = last_offset;
-        state.turn_start_offset = turn_start_offset;
-        state
-    }
-
-    #[test]
-    fn pinned_finalize_id_matching_turn_in_range_returns_its_id() {
-        // (a) The pinned turn's output reaches current_offset
-        // (turn_start_offset 10 < current_offset 50) → return its id.
-        let state = state_with_offsets(700, "AgentDesk-codex-adk-cdx", Some(10), 10);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&state), "AgentDesk-codex-adk-cdx", 50),
-            700
-        );
-    }
-
-    #[test]
-    fn pinned_finalize_id_newer_followup_turn_after_range_returns_zero() {
-        // (b) Follow-up turn started AFTER this range
-        // (turn_start_offset 50 >= current_offset 50) → 0, NOT the newer id.
-        let newer = state_with_offsets(800, "AgentDesk-codex-adk-cdx", Some(50), 50);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&newer), "AgentDesk-codex-adk-cdx", 50),
-            0
-        );
-        // Also strictly-after (start 60 > 50) → 0.
-        let later = state_with_offsets(801, "AgentDesk-codex-adk-cdx", Some(60), 60);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&later), "AgentDesk-codex-adk-cdx", 50),
-            0
-        );
-    }
-
-    #[test]
-    fn pinned_finalize_id_falls_back_to_last_offset_like_the_guard() {
-        // Mirror the guard's `turn_start_offset.unwrap_or(last_offset)`: with no
-        // turn_start_offset, last_offset 50 >= current_offset 50 → 0.
-        let no_start = state_with_offsets(802, "AgentDesk-codex-adk-cdx", None, 50);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&no_start), "AgentDesk-codex-adk-cdx", 50),
-            0
-        );
-        // last_offset 10 < 50 → return id.
-        let in_range = state_with_offsets(803, "AgentDesk-codex-adk-cdx", None, 10);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&in_range), "AgentDesk-codex-adk-cdx", 50),
-            803
-        );
-    }
-
-    #[test]
-    fn pinned_finalize_id_wrong_session_returns_zero() {
-        // (c) Different tmux session → 0 even though it is in range.
-        let other = state_with_offsets(900, "AgentDesk-codex-adk-cdx-fresh", Some(10), 10);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&other), "AgentDesk-codex-adk-cdx", 50),
-            0
-        );
-    }
-
-    #[test]
-    fn pinned_finalize_id_zero_user_msg_id_returns_zero() {
-        // (d) Anchorless turn (user_msg_id == 0) → 0.
-        let anchorless = state_with_offsets(0, "AgentDesk-codex-adk-cdx", Some(10), 10);
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&anchorless), "AgentDesk-codex-adk-cdx", 50),
-            0
-        );
-    }
-
-    #[test]
-    fn pinned_finalize_id_none_returns_zero() {
-        // (e) No pre-relay snapshot → 0.
-        assert_eq!(
-            pinned_finalize_user_msg_id(None, "AgentDesk-codex-adk-cdx", 50),
-            0
-        );
-    }
-
-    // #3016 codex R3 (wrong-turn lifecycle corruption). The SAME committed block
-    // that finalizes also runs `⏳ → ✅` + transcript/analytics + clear on the
-    // LATE-read inflight. `committed_completion_is_stale_for_newer_turn` is the
-    // exact complement of `pinned_finalize_user_msg_id`'s `< current_offset`
-    // range test: it returns TRUE iff EITHER snapshot is a real NEWER turn on the
-    // SAME session that began AT/AFTER this range (so those side-effects must be
-    // skipped). Mirrors the yield guard's offset/fallback semantics.
-    #[test]
-    fn committed_completion_stale_for_newer_turn_matrix() {
-        let session = "AgentDesk-codex-adk-cdx";
-        // (a) newer turn after range (start 50 >= current 50, same session,
-        // id != 0) → true. Here it sits in inflight_state (late read).
-        let newer = state_with_offsets(800, session, Some(50), 50);
-        assert!(committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&newer),
-            session,
-            50
-        ));
-        // strictly-after (start 60 > 50) → true.
-        let later = state_with_offsets(801, session, Some(60), 60);
-        assert!(committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&later),
-            session,
-            50
-        ));
-
-        // (b) current/older turn (start 10 < current 50) → false (normal path).
-        let in_range = state_with_offsets(700, session, Some(10), 10);
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            Some(&in_range),
-            Some(&in_range),
-            session,
-            50
-        ));
-
-        // (c) wrong session, even though it is a newer turn → false.
-        let other_session = state_with_offsets(900, "AgentDesk-codex-adk-cdx-fresh", Some(50), 50);
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&other_session),
-            session,
-            50
-        ));
-
-        // (d) id == 0 (anchorless / rebind-style) newer turn → false.
-        let anchorless = state_with_offsets(0, session, Some(50), 50);
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&anchorless),
-            session,
-            50
-        ));
-
-        // (e) None / None → false (no inflight at all).
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            None, None, session, 50
-        ));
-
-        // (f) only inflight_before_relay is newer (inflight_state older) → true.
-        assert!(committed_completion_is_stale_for_newer_turn(
-            Some(&newer),
-            Some(&in_range),
-            session,
-            50
-        ));
-        // …and vice-versa: only inflight_state is newer → true.
-        assert!(committed_completion_is_stale_for_newer_turn(
-            Some(&in_range),
-            Some(&newer),
-            session,
-            50
-        ));
-
-        // Fallback parity with the guard: no turn_start_offset → use last_offset.
-        // last_offset 50 >= current 50 → newer → true.
-        let no_start_after = state_with_offsets(802, session, None, 50);
-        assert!(committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&no_start_after),
-            session,
-            50
-        ));
-        // last_offset 10 < current 50 → not newer → false.
-        let no_start_before = state_with_offsets(803, session, None, 10);
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&no_start_before),
-            session,
-            50
-        ));
-    }
-
-    /// #3016 (codex B1): the call-site guard proof. In the stale-newer-turn
-    /// scenario the watcher MUST skip `finish_restored_watcher_active_turn`
-    /// because `pinned_finalize_user_msg_id` would return 0 and an id-0
-    /// `Complete` would collapse onto the newer live turn (see
-    /// `turn_finalizer::tests::stale_completion_skips_finalize_no_id0_collapse`).
-    /// This asserts the two predicates the call site relies on line up:
-    ///   1. `committed_completion_is_stale_for_newer_turn` is TRUE (→ guard skips
-    ///      the finalize), AND
-    ///   2. `pinned_finalize_user_msg_id` is 0 for the SAME snapshot (→ the id
-    ///      that WOULD have been submitted is the unsafe channel-collapse id),
-    /// so "stale" ⇔ "id 0" ⇔ "skip" by construction.
-    #[test]
-    fn stale_completion_skips_finalize_no_id0_collapse() {
-        let session = "AgentDesk-codex-adk-cdx";
-        // A NEWER same-session turn (id 999) that started AT/AFTER this range
-        // (turn_start_offset 50 >= current_offset 50). This is the late-read
-        // inflight a follow-up turn rewrote onto disk before this stale pass.
-        let newer = state_with_offsets(999, session, Some(50), 50);
-
-        // (1) Guard predicate: stale → the call site skips the finalize entirely.
-        assert!(
-            committed_completion_is_stale_for_newer_turn(Some(&newer), Some(&newer), session, 50),
-            "newer same-session turn at/after the range must be classified stale so the \
-             call site skips finish_restored_watcher_active_turn"
-        );
-
-        // (2) The id that WOULD have been submitted is 0 — the unsafe
-        // channel-collapse id proven hazardous in the turn_finalizer test.
-        assert_eq!(
-            pinned_finalize_user_msg_id(Some(&newer), session, 50),
-            0,
-            "stale newer turn pins to 0 — submitting Complete with this id would \
-             collapse onto the newer live ledger entry (wrong-turn finalize)"
-        );
     }
 
     #[test]
@@ -1674,34 +1309,12 @@ mod pane_dead_identity_tests {
 struct SessionBoundRelayAckTarget {
     metrics: std::sync::Arc<crate::services::cluster::stream_relay::RelayMetrics>,
     sequence: u64,
-    /// #3041 P1-3 (codex P1-3 R6): the `turn_start_offset` of the turn this ACK
-    /// target belongs to — taken from the terminal frame's commit fence (the ONLY
-    /// frame that yields an ack target). The watcher's per-turn forward carries the
-    /// stored ack forward ONLY when it belongs to the turn currently being
-    /// ACK-waited (same `turn_start_offset`); a stale ack from a FINISHED/DIFFERENT
-    /// turn is reset to `None` so a new turn never inherits a previous turn's
-    /// terminal sequence (no false-Delivered black-hole). `None` means the fence
-    /// carried no `turn_start_offset` (legacy / no pinned identity) — treated as
-    /// "no turn binding", so it is never reused across a turn boundary.
-    turn_start_offset: Option<u64>,
 }
 
 #[derive(Clone)]
 struct SupervisorRelayForward {
     mirrored: bool,
     ack_target: Option<SessionBoundRelayAckTarget>,
-    /// #3041 P1-3 (codex P1-3 R7): TRUE when this forward SPLIT a result-bearing
-    /// physical chunk and a NON-EMPTY trailing tail (a LATER turn's bytes) followed
-    /// the just-completed turn's terminal frame. This is the turn-boundary signal:
-    /// after the just-completed turn (A) consumes its own terminal ACK, the watcher
-    /// must RESET the stored ack to `None` so the trailing turn (B) — which is
-    /// processed from the leftover buffer on a later pass, possibly while
-    /// `turn_identity_for_panel` is STILL pinned to A's offset — can NEVER inherit
-    /// A's finished ACK. With no inherited ack B reads `MissingTarget` → §3.2
-    /// reconciliation (committed-offset SendFull-or-Skip) → B is never black-holed.
-    /// Only the SPLIT terminal forward sets this; every other forward leaves it
-    /// `false` (no boundary crossed).
-    trailing_turn_follows: bool,
 }
 
 impl SupervisorRelayForward {
@@ -1709,7 +1322,6 @@ impl SupervisorRelayForward {
         Self {
             mirrored: true,
             ack_target: None,
-            trailing_turn_follows: false,
         }
     }
 
@@ -1717,59 +1329,7 @@ impl SupervisorRelayForward {
         Self {
             mirrored: false,
             ack_target: None,
-            trailing_turn_follows: false,
         }
-    }
-}
-
-/// #3041 P1-3 (codex P1-3 R6): turn-scope the session-bound terminal ACK target so
-/// a NEW turn never inherits a FINISHED turn's stale ack.
-///
-/// The watcher carries `all_data_session_bound_relay_ack` across `'watcher_loop`
-/// passes (it is reset only at explicit turn-finalize/suppress sites). A single
-/// physical chunk can hold `result(A) + assistant(B) + result(B)`: turn A rides a
-/// terminal frame (ack = A.seq), and turn B completes ENTIRELY inside the split
-/// tail whose non-terminal frame sequence is DISCARDED. On the next pass B is
-/// processed from the leftover buffer; if no fresh bytes arrive the deferred
-/// forward emits no frame and returns NO ack target. With the legacy "store only
-/// when `Some`" rule the stored ack would stay pinned to A's sequence, and A's
-/// `Delivered` outcome would then FALSELY satisfy B's ACK → B black-holed.
-///
-/// This decides the ack target the watcher keeps for the turn whose pinned
-/// identity offset is `current_turn_start_offset` — the SAME coordinate the
-/// terminal fence stamps onto the ack target (`InflightTurnIdentity.turn_start_offset`,
-/// the inflight-recorded JSONL offset at which the turn began, monotonic per turn),
-/// NOT the watcher's per-pass buffer `turn_data_start_offset`:
-///   * `fresh` is `Some` → THIS pass just forwarded a terminal frame for the
-///     current turn; adopt it (a turn whose terminal frame WAS forwarded with a
-///     real ack keeps it).
-///   * `fresh` is `None` → keep `stored` ONLY when it belongs to the SAME turn
-///     (`stored.turn_start_offset == current_turn_start_offset`, and both `Some`),
-///     so an ack legitimately set earlier in THIS turn survives a later
-///     non-terminal pass. A `stored` from a DIFFERENT/finished turn — or either
-///     side lacking a turn binding (`None`) — is dropped to `None`. A `None` ack
-///     target makes `wait_for_session_bound_relay_delivery_ack` return
-///     `MissingTarget` (NOT `Delivered`), so the watcher falls through to the §3.2
-///     reconciliation against `committed_relay_offset` (committed >= end → Skip;
-///     committed < end → SendFull) → the turn is re-sent at worst (possible
-///     duplicate), NEVER black-holed.
-fn carry_session_bound_ack_for_turn(
-    stored: Option<SessionBoundRelayAckTarget>,
-    fresh: Option<SessionBoundRelayAckTarget>,
-    current_turn_start_offset: Option<u64>,
-) -> Option<SessionBoundRelayAckTarget> {
-    if let Some(fresh) = fresh {
-        return Some(fresh);
-    }
-    match (stored, current_turn_start_offset) {
-        // Same turn (both bound to the same pinned `turn_start_offset`): an ack set
-        // earlier in THIS turn survives a later non-terminal pass.
-        (Some(ack), Some(current)) if ack.turn_start_offset == Some(current) => Some(ack),
-        // A stale ack from a finished/different turn — or any case where the turn
-        // binding is unknown on either side — is never consulted: reset to `None`
-        // so the new turn reconciles instead of satisfying its ACK against the
-        // previous turn's sequence.
-        _ => None,
     }
 }
 
@@ -1866,156 +1426,6 @@ fn forward_chunk_to_supervisor_relay(
     >,
     cached_producer: &mut Option<crate::services::cluster::stream_relay::RelayProducer>,
 ) -> SupervisorRelayForward {
-    forward_chunk_to_supervisor_relay_inner(
-        tmux_session_name,
-        chunk,
-        registry,
-        cached_producer,
-        None,
-    )
-}
-
-/// #3041 P1-3 (Part a, B1): forward the RESULT-bearing chunk as a TERMINAL frame
-/// carrying the commit fence (`terminal.consumed_end` + the pinned turn identity).
-/// Every non-terminal chunk goes through `forward_chunk_to_supervisor_relay` with
-/// no fence (unchanged behaviour). Only the result-bearing chunk — detected AFTER
-/// `process_watcher_lines` sets `found_result` — uses this so the commit data rides
-/// the exact frame that triggers the sink's terminal delivery (FIFO single-task: a
-/// separate later frame would arrive after the delivery already dispatched).
-fn forward_terminal_chunk_to_supervisor_relay(
-    tmux_session_name: &str,
-    chunk: &str,
-    registry: &std::sync::Arc<
-        crate::services::cluster::relay_producer_registry::RelayProducerRegistry,
-    >,
-    cached_producer: &mut Option<crate::services::cluster::stream_relay::RelayProducer>,
-    terminal: crate::services::cluster::stream_relay::TerminalCommitFence,
-) -> SupervisorRelayForward {
-    forward_chunk_to_supervisor_relay_inner(
-        tmux_session_name,
-        chunk,
-        registry,
-        cached_producer,
-        Some(terminal),
-    )
-}
-
-/// #3041 P1-3 (codex P1-3 issue 1): forward a RESULT-bearing physical chunk that
-/// may ALSO contain a trailing LATER-turn tail. `leftover_len` is the post-parse
-/// `all_data.len()` — the bytes `process_watcher_lines` did NOT consume (the next
-/// turn's bytes). We split `decoded` at that boundary and:
-///   1. forward the just-completed turn's bytes (`terminal_part`) on a TERMINAL
-///      frame carrying THIS turn's commit fence, and
-///   2. forward the trailing later-turn bytes (`tail_part`) on a SEPARATE
-///      NON-terminal frame so they are still mirrored into the sink's parser and
-///      the later turn is never black-holed (it gets its own fence when it
-///      completes on a later pass).
-///
-/// The returned ACK target is the TERMINAL frame's (so the watcher's terminal-ACK
-/// wait correlates to THIS turn's delivery, not the trailing fragment). `mirrored`
-/// is the AND of both forwards. When there is no trailing tail this is exactly the
-/// single terminal forward.
-fn forward_terminal_chunk_with_trailing_to_supervisor_relay(
-    tmux_session_name: &str,
-    decoded: &str,
-    leftover_len: usize,
-    registry: &std::sync::Arc<
-        crate::services::cluster::relay_producer_registry::RelayProducerRegistry,
-    >,
-    cached_producer: &mut Option<crate::services::cluster::stream_relay::RelayProducer>,
-    terminal: crate::services::cluster::stream_relay::TerminalCommitFence,
-) -> SupervisorRelayForward {
-    let (terminal_part, tail_part) =
-        split_decoded_chunk_at_terminal_boundary(decoded, leftover_len);
-    let terminal_forward = forward_terminal_chunk_to_supervisor_relay(
-        tmux_session_name,
-        terminal_part,
-        registry,
-        cached_producer,
-        terminal,
-    );
-    if tail_part.is_empty() {
-        return terminal_forward;
-    }
-    // Forward the later-turn tail as its OWN non-terminal frame (no fence). This
-    // keeps it in the sink's parser stream so the later turn is mirrored; its
-    // terminal fence rides a future result-bearing chunk. We keep the TERMINAL
-    // frame's ack_target (the watcher waits on THIS turn's delivery) and AND the
-    // tail's mirror flag so a failed tail forward still surfaces "not fully
-    // mirrored".
-    //
-    // #3041 P1-3 (codex P1-3 issue 1 R4 — DEFERRED multi-RESULT edge, #3151): a
-    // per-result split that gives turn B its OWN terminal fence is INFEASIBLE in
-    // this pass — a fence requires B's PINNED turn identity (`turn_start_offset` +
-    // `user_msg_id` + `started_at`), but only turn A's identity
-    // (`turn_identity_for_panel`) is loaded here; B's inflight is established on a
-    // LATER watcher loop pass. Any fence we emitted for B's bytes would carry A's
-    // identity and the sink's STRICT identity gate would (correctly) BLOCK it. So B
-    // rides this fence-less tail: it is MIRRORED (no black-hole) and gets its own
-    // real fence when B completes on a later pass. If this tail already contains
-    // B's COMPLETE result, the sink posts B from it; the watcher's later SendFull
-    // may then re-post B → a possible DUPLICATE (never a black-hole). The
-    // ACK-correlation hazard is closed in the sink (`deliver`): a fence-less frame
-    // reports `FrameAccepted`, NEVER a terminal commit, so B's post can never
-    // satisfy turn A's terminal-ACK and the ACK stays bound to A's terminal frame.
-    let tail_forward =
-        forward_chunk_to_supervisor_relay(tmux_session_name, tail_part, registry, cached_producer);
-    SupervisorRelayForward {
-        mirrored: terminal_forward.mirrored && tail_forward.mirrored,
-        ack_target: terminal_forward.ack_target,
-        // #3041 P1-3 (codex P1-3 R7): a NON-EMPTY trailing tail means a LATER turn's
-        // bytes followed THIS turn's terminal frame inside ONE physical chunk — a
-        // turn-boundary signal. The watcher resets the stored ack AFTER this turn
-        // consumes its own terminal ACK, so the trailing turn never inherits this
-        // finished turn's ACK (R7 black-hole close), regardless of whether
-        // `turn_identity_for_panel` has refreshed to the trailing turn yet.
-        trailing_turn_follows: true,
-    }
-}
-
-/// #3041 P1-3 (codex P1-3 issue 1 — multi-turn-chunk black-hole close): split the
-/// freshly-decoded physical chunk at the consumed-terminal boundary so a TERMINAL
-/// frame carries ONLY the just-completed turn's bytes, and the trailing bytes of a
-/// LATER turn ride a SEPARATE (non-terminal) frame.
-///
-/// A single physical read can contain turn A's `result` PLUS turn B's first bytes.
-/// `process_watcher_lines` stops at A's `result` and leaves B's bytes in the
-/// outer-scope `all_data` (the `leftover_len` after the parse). If we forwarded the
-/// WHOLE chunk on A's terminal frame, B's bytes would be consumed by the sink's
-/// parser as part of A's frame; on the NEXT loop pass `decoded.text` can be empty,
-/// so `forward_chunk_to_supervisor_relay_inner` emits NO frame for B → B is never
-/// delivered (black-hole), and the now-stale ACK for A can be reused for B
-/// (mis-commit). Splitting here forwards A's bytes terminal (with A's fence) and
-/// B's trailing bytes as their own non-terminal frame, so B is still mirrored and
-/// — when B completes — gets its OWN terminal frame + fence on a later pass.
-///
-/// The trailing `min(decoded.len(), leftover_len)` bytes of `decoded` are the part
-/// that survived the parse as leftover (B's bytes); the rest is A's terminal
-/// payload. `leftover_len` is the post-parse `all_data.len()` (bytes the parser did
-/// NOT consume). The split index is clamped to a UTF-8 char boundary (defensive —
-/// the leftover always begins on a JSONL `\n` line boundary in practice).
-fn split_decoded_chunk_at_terminal_boundary(decoded: &str, leftover_len: usize) -> (&str, &str) {
-    let trailing = leftover_len.min(decoded.len());
-    let mut split = decoded.len() - trailing;
-    while split < decoded.len() && !decoded.is_char_boundary(split) {
-        // A multibyte scalar straddles the nominal split: keep it whole on the
-        // terminal side rather than panic-slicing mid-scalar. The leftover begins
-        // one boundary later; the sink reorders nothing within a single line, so a
-        // whole extra line on the terminal side is harmless and never drops bytes.
-        split += 1;
-    }
-    decoded.split_at(split)
-}
-
-fn forward_chunk_to_supervisor_relay_inner(
-    tmux_session_name: &str,
-    chunk: &str,
-    registry: &std::sync::Arc<
-        crate::services::cluster::relay_producer_registry::RelayProducerRegistry,
-    >,
-    cached_producer: &mut Option<crate::services::cluster::stream_relay::RelayProducer>,
-    terminal: Option<crate::services::cluster::stream_relay::TerminalCommitFence>,
-) -> SupervisorRelayForward {
     if chunk.is_empty() {
         return SupervisorRelayForward::mirrored_without_ack();
     }
@@ -2030,16 +1440,7 @@ fn forward_chunk_to_supervisor_relay_inner(
     // file reads is forwarded after the next read completes it instead of being
     // replaced with U+FFFD.
     let payload = chunk.to_string();
-    // #3041 P1-3 R6: capture the terminal frame's `turn_start_offset` BEFORE the
-    // fence is moved into the send so the resulting ack target can be turn-scoped
-    // (a stored ack is reused across a watcher pass ONLY when it belongs to the
-    // turn now being ACK-waited). A non-terminal frame has no fence → no ack
-    // target is produced (the `outcome.sequence.map` below yields `None`).
-    let ack_turn_start_offset = terminal.as_ref().and_then(|fence| fence.turn_start_offset);
-    let outcome = match terminal {
-        Some(fence) => producer.try_send_terminal_frame_with_sequence(payload, fence),
-        None => producer.try_send_frame_with_sequence(payload),
-    };
+    let outcome = producer.try_send_frame_with_sequence(payload);
     if !outcome.is_alive() {
         // Relay was torn down between our registry read and the send —
         // drop the cache so the next chunk re-resolves. If the supervisor
@@ -2053,60 +1454,18 @@ fn forward_chunk_to_supervisor_relay_inner(
         ack_target: outcome.sequence.map(|sequence| SessionBoundRelayAckTarget {
             metrics: producer.metrics().clone(),
             sequence,
-            turn_start_offset: ack_turn_start_offset,
         }),
-        // A single forward of one frame never crosses a turn boundary; only the
-        // split helper sets this when it forwards a separate trailing tail.
-        trailing_turn_follows: false,
     }
 }
 
-/// #3041 P1-5: the watcher's view of the session-bound terminal ACK. The
-/// non-failure arms fold 1:1 onto the cross-actor 3-way `DeliveryOutcome`:
-///   * `Delivered`      ← ring `DeliveryOutcome::Delivered`
-///   * `NotDelivered`   ← ring `DeliveryOutcome::NotDelivered` (the former
-///                        `TerminalSkipped`; a deterministic sink decline)
-///   * the failure/unconfirmed arms (`Unknown`-class) — `RingUnknown` (the ring
-///     recorded an explicit `Unknown`: sink POSTed without confirming),
-///     `Dropped`, `SinkError`, `TimedOut`, `MissingTarget` — ALL collapse to
-///     `DeliveryOutcome::Unknown` for the resend DECISION (see
-///     [`session_bound_ack_delivery_outcome`]). They stay DISTINCT variants here
-///     so the flight-recorder / metrics keep their exact provenance.
-///
-/// §3.2 SAFETY INVARIANT: BOTH `NotDelivered` AND every `Unknown`-class arm route
-/// through `watcher_terminal_resend_action` (committed-offset reconciliation).
-/// There is NO blind skip for `NotDelivered` and NO blind 10s re-send for any
-/// `Unknown`-class arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionBoundRelayAckOutcome {
     Delivered,
-    NotDelivered,
-    RingUnknown,
+    TerminalSkipped,
     Dropped,
     SinkError,
     TimedOut,
     MissingTarget,
-}
-
-/// #3041 P1-5: collapse the watcher ACK onto the canonical cross-actor 3-way
-/// `DeliveryOutcome` for the resend DECISION. `Delivered` → delivered (no resend);
-/// `NotDelivered` → not-delivered (reconcile); every failure/unconfirmed arm →
-/// `Unknown` (reconcile). The §3.2 reconciliation treats `NotDelivered` and
-/// `Unknown` IDENTICALLY (both consult the committed offset → SendFull-or-Skip),
-/// so this fold is what guarantees neither gets a blind fast-path.
-fn session_bound_ack_delivery_outcome(
-    ack_outcome: SessionBoundRelayAckOutcome,
-) -> crate::services::cluster::stream_relay::DeliveryOutcome {
-    use crate::services::cluster::stream_relay::DeliveryOutcome;
-    match ack_outcome {
-        SessionBoundRelayAckOutcome::Delivered => DeliveryOutcome::Delivered,
-        SessionBoundRelayAckOutcome::NotDelivered => DeliveryOutcome::NotDelivered,
-        SessionBoundRelayAckOutcome::RingUnknown
-        | SessionBoundRelayAckOutcome::Dropped
-        | SessionBoundRelayAckOutcome::SinkError
-        | SessionBoundRelayAckOutcome::TimedOut
-        | SessionBoundRelayAckOutcome::MissingTarget => DeliveryOutcome::Unknown,
-    }
 }
 
 fn sequence_reached(latest: Option<u64>, target: u64) -> bool {
@@ -2116,44 +1475,14 @@ fn sequence_reached(latest: Option<u64>, target: u64) -> bool {
 fn session_bound_relay_ack_snapshot_outcome(
     target: Option<&SessionBoundRelayAckTarget>,
 ) -> Option<SessionBoundRelayAckOutcome> {
-    use crate::services::cluster::stream_relay::DeliveryOutcome;
     let target = target?;
-    // #3041 P1-3 R5 (per-sequence terminal-ACK correlation): resolve the terminal
-    // ACK on THIS watcher's OWN terminal frame (`target.sequence`) EXACT outcome,
-    // NOT the `>=` high-water-mark. When two turns share a physical chunk (turn A
-    // frame seq N, turn B tail seq N+1), B committing bumps the high-water-mark to
-    // N+1; the old `committed >= N` test would then falsely report A as Delivered
-    // even when A's own terminal frame was SKIPPED — black-holing A. Keying the
-    // ACK to A's exact sequence decouples A from B: A reads outcome[N] (its own
-    // result), B reads outcome[N+1]. `None` (not yet resolved / dropped / evicted)
-    // falls through so a dropped/lagging frame keeps waiting → eventually TimedOut
-    // → the watcher reconciles against the committed offset (no false ACK).
-    match target
-        .metrics
-        .terminal_outcome_for_sequence(target.sequence)
-    {
-        Some(DeliveryOutcome::Delivered) => {
-            return Some(SessionBoundRelayAckOutcome::Delivered);
-        }
-        Some(DeliveryOutcome::NotDelivered) => {
-            return Some(SessionBoundRelayAckOutcome::NotDelivered);
-        }
-        // #3041 P1-5: an explicit ring `Unknown` (sink POSTed but could not confirm
-        // the commit) RESOLVES the per-sequence ACK immediately to a `RingUnknown`
-        // — the watcher reconciles against the committed offset NOW instead of
-        // waiting out the 10s ACK timeout. `RingUnknown` folds to
-        // `DeliveryOutcome::Unknown`, which §3.2 treats exactly like `NotDelivered`
-        // (committed-offset SendFull-or-Skip), so this is a faster path to the SAME
-        // safe reconciliation — never a blind re-send.
-        Some(DeliveryOutcome::Unknown) => {
-            return Some(SessionBoundRelayAckOutcome::RingUnknown);
-        }
-        None => {}
-    }
-    // Sink-error / drop remain high-water-mark signals (terminal outcome was never
-    // recorded for this sequence in those paths): they are per-sequence-monotonic
-    // failure markers, not a co-chunked-turn confusion vector.
     let snapshot = target.metrics.snapshot();
+    if sequence_reached(snapshot.last_terminal_committed_sequence, target.sequence) {
+        return Some(SessionBoundRelayAckOutcome::Delivered);
+    }
+    if sequence_reached(snapshot.last_terminal_skipped_sequence, target.sequence) {
+        return Some(SessionBoundRelayAckOutcome::TerminalSkipped);
+    }
     if sequence_reached(snapshot.last_sink_error_sequence, target.sequence) {
         return Some(SessionBoundRelayAckOutcome::SinkError);
     }
@@ -2176,199 +1505,21 @@ fn watcher_should_direct_send_after_session_bound_ack(
     ack_outcome: SessionBoundRelayAckOutcome,
     relay_owner_present: bool,
 ) -> bool {
-    use crate::services::cluster::stream_relay::DeliveryOutcome;
-    // #3042 (relay-stability P1, OBSOLETE band-aid — removed by #3041 P1-5):
-    // #3042 added an early `return false` here for an ownerless (`relay_owner_kind=none`
-    // / `inflight_present=false`, the post-restart restore_inflight gap) `TimedOut`,
-    // blanket-suppressing the watcher-direct fallback. Its rationale: in that gap the
-    // StreamRelay sink "may have posted and merely failed to ADVANCE the committed-
-    // sequence metric", so a blind re-send produced the observed 3× duplicate.
-    //
-    // That rationale no longer holds. #3041 P1-3 Part (a)
-    // (`advance_offset_for_confirmed_delegated_terminal`, session_relay_sink.rs ~459)
-    // now COUPLES a CONFIRMED sink terminal POST to advancing the offset authority
-    // (`confirmed_end_offset`) to the producer's fenced `end`. A `TimedOut` (NOT
-    // `MissingTarget`) is ONLY produced when a FENCED terminal frame was forwarded
-    // (tmux_watcher.rs ~2038/2053) — and that SAME fence is what the sink advances on,
-    // so the committed offset now DOES reflect a confirmed post even in the ownerless
-    // state (the authority is a plain owner-independent atomic; it is always readable).
-    //
-    // Therefore the blanket suppression is obsolete and HARMFUL: it returned `false`
-    // BEFORE the outcome could reach the §3.2 committed-offset reconciliation
-    // (`watcher_terminal_resend_action`), so an ownerless `TimedOut` whose bytes were
-    // NOT actually delivered (committed < end) neither reconciled nor resent — a
-    // potential black-hole. Routing it through §3.2 instead (drop the early return):
-    //   * committed >= end → `SkipAlreadyCommitted` → NO resend → the #3042 3×
-    //     duplicate is prevented PRINCIPALLY (not by blanket suppression);
-    //   * committed < end → `SendFull` → the bytes were genuinely undelivered →
-    //     recover → the black-hole the band-aid left is closed.
-    // This completes the P1-5 §3.2 invariant: EVERY non-`Delivered` outcome
-    // (NotDelivered, RingUnknown, MissingTarget, Dropped, SinkError, and now ownerless
-    // `TimedOut`) routes through committed-offset reconciliation — none blind-skips,
-    // none blind-resends. (`relay_owner_present` is retained in the signature for the
-    // flight-recorder/telemetry call site even though the gate no longer branches on
-    // it.)
-    let _ = relay_owner_present;
-    // #3041 P1-5: decide on the cross-actor 3-way `DeliveryOutcome` instead of the
-    // implicit `ack_outcome != Delivered` bit. `Delivered` → no watcher re-send.
-    // `NotDelivered` AND `Unknown` (every failure/unconfirmed arm) BOTH intend a
-    // re-send here — but that intent is only the PRECONDITION GATE; the actual send
-    // is masked downstream by `watcher_terminal_resend_action` (committed-offset
-    // reconciliation), so neither gets a blind skip (NotDelivered) nor a blind
-    // re-send (Unknown). §3.2 SAFETY INVARIANT.
-    should_direct_send
-        && !matches!(
-            session_bound_ack_delivery_outcome(ack_outcome),
-            DeliveryOutcome::Delivered
-        )
-}
-
-/// #3041 P1-3 (Part b, §3.2): the watcher's terminal re-send DECISION after a
-/// non-`Delivered` session-bound ACK, reconciled against the offset authority
-/// (`committed_relay_offset`) instead of BLINDLY re-sending. This is the
-/// watcher-terminal counterpart of the idle relay's `idle_relay_range_action`
-/// (skip / suffix / full), extended to the terminal re-send path so the 10s
-/// blind re-send (the `relay_terminal_ack_timeout` duplicate vector) is removed.
-///
-/// Because Part (a) makes a confirmed sink delivery ADVANCE the authority to the
-/// watcher's own consumed-terminal `end`, this reconciliation is exact:
-///   * `committed >= end`           → the range was already delivered (by the
-///                                     sink, ACK merely lagged) → SKIP (no dup).
-///   * `committed < end`            → the range is NOT (fully) delivered → re-send
-///                                     the FULL response (no black-hole).
-///
-/// codex BLOCKER 2 (no SendSuffix for the watcher path): a partial-overlap
-/// `start < committed < end` case would in principle let us send only the
-/// uncommitted suffix — BUT the watcher delivers RESPONSE TEXT sliced by
-/// `response_sent_offset` (a streaming/render offset), which is a DIFFERENT
-/// coordinate system from the JSONL byte `committed`/`start`/`end`. There is no
-/// correct way to map `[committed, end)` JSONL bytes onto a `response_sent_offset`
-/// suffix, so a "SendSuffix" here would post an incoherent / mis-offset slice (or
-/// nothing while committed<end → black-hole). Crucially, the sink-delegated
-/// terminal delivery is ALL-OR-NOTHING: the sink advances `confirmed_end_offset`
-/// to the FULL `end` ONLY after one confirmed `replace_message_with_outcome`
-/// (`advance_offset_for_confirmed_delegated_terminal`, sink ~453/506), so for this
-/// path `committed` is either `>= end` (delivered → Skip) or `<= start` (not
-/// delivered → Full) — the partial-overlap middle case effectively does not occur.
-/// Therefore SendFull on `committed < end` is SAFE: no black-hole (the missing
-/// content is always re-delivered), and no incoherent mid-response tail. The
-/// idle-relay path still does a real JSONL `[committed,end)` re-read for its
-/// suffix; only the watcher response-text path is restricted to Skip/Full.
-///
-/// #3041 P1-3 (codex P1-3 issue 4 — DEFERRED, no regression, tracked by #3151):
-/// the watcher's 10s terminal-commit ACK wait can elapse while the sink's Discord
-/// POST is still IN FLIGHT (not failed). In that window `committed < end` (the sink
-/// has not advanced the authority yet because its POST has not returned), so this
-/// reconciliation chooses `SendFull` and the watcher re-sends — producing a
-/// duplicate when the in-flight sink POST later succeeds. This is NOT a regression:
-/// the pre-P1-3 path ALSO blind-re-sent on the 10s timeout, and `SendFull` IS the
-/// retry, so there is no black-hole (the content is always delivered). Fully closing
-/// the slow-sink-in-flight duplicate needs an in-flight/reclaimable sink-delivery
-/// marker (the sink signals "delivering this range" so the watcher waits/skips
-/// instead of re-sending) — OUT OF SCOPE for P1-3, tracked by #3151.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum WatcherTerminalResendAction {
-    /// `committed >= end`: the whole range is already delivered. Do NOT re-send.
-    SkipAlreadyCommitted,
-    /// `committed < end`: the range is not (fully) covered — re-send the full
-    /// response. See the type doc for why no partial-suffix variant exists for
-    /// the watcher response-text path (coordinate mismatch + all-or-nothing sink).
-    ///
-    /// #3041 P1-3 (codex P1-3 issue 4 — DEFERRED, #3151): this arm also fires when
-    /// the sink's POST is still IN FLIGHT at the 10s ACK timeout (committed has not
-    /// advanced yet) → a duplicate once that POST succeeds. No regression (the
-    /// pre-P1-3 path re-sent on timeout too) and no black-hole (SendFull is the
-    /// retry). The remaining slow-sink-in-flight duplicate is closed by the future
-    /// in-flight sink-delivery marker tracked in #3151.
-    SendFull,
-    /// #3151: a sink POST is genuinely IN FLIGHT for this range (the per-channel
-    /// `DeliveryLeaseCell` is `Leased{Sink, fresh}`). The watcher must NOT re-send
-    /// this pass — neither SendFull nor a Skip-log — and let its NEXT terminal pass
-    /// re-evaluate. This is a BOUNDED wait: each pass re-reads the cell, and within
-    /// at most one `DELIVERY_LEASE_DEADLINE_MS` the sink either commits+releases
-    /// (→ committed >= end → Skip) or dies (→ deadline lapses → reclaim + SendFull).
-    /// No busy-loop is introduced — it rides the existing watcher iteration cadence.
-    WaitInFlight,
-}
-
-/// #3151: gate the watcher terminal re-send on the in-flight sink-delivery marker
-/// BEFORE deferring to [`watcher_terminal_resend_action`]. The marker is a
-/// `Leased{Sink, ..}` state on the per-channel `DeliveryLeaseCell`; this reads a
-/// coherent `snapshot` (materialized under the cell's payload mutex) and decides:
-///
-/// - `Leased{Sink}` AND `now_ms < deadline_ms` → [`WatcherTerminalResendAction::WaitInFlight`]
-///   (a sink POST is genuinely in flight — do not re-send this pass).
-/// - `Leased{Sink}` AND `now_ms >= deadline_ms` → RECLAIM (the caller force-clears
-///   the dead sink's marker via `reclaim_if_expired`) then fall through to
-///   `watcher_terminal_resend_action` → `SendFull` (committed < end). No black-hole.
-/// - `Committed{Sink}` (sink committed Delivered, not yet released) → Skip (belt-and-
-///   suspenders; `committed >= end` already yields Skip below).
-/// - ANY non-Sink holder / `Unleased` / committed-covered → behave EXACTLY as today:
-///   defer to `watcher_terminal_resend_action`. The gate ONLY interposes for a
-///   Sink-held lease, so the watcher-direct B2 path is untouched.
-///
-/// Returns `(action, reclaim_expired_sink)`. When `reclaim_expired_sink` is true
-/// the caller MUST call `reclaim_if_expired(now_ms)` on the cell before sending
-/// (the side effect is kept out of this pure decision fn so it stays unit-testable).
-fn watcher_terminal_resend_action_gated(
-    snapshot: &crate::services::discord::LeaseSnapshot,
-    committed: u64,
-    start: u64,
-    end: u64,
-    now_ms: u64,
-) -> (WatcherTerminalResendAction, bool) {
-    use crate::services::discord::{LeaseHolder, LeaseSnapshot};
-    match snapshot {
-        LeaseSnapshot::Leased {
-            holder: LeaseHolder::Sink,
-            deadline_ms,
-            ..
-        } => {
-            if now_ms < *deadline_ms {
-                // Live, in-flight sink POST — wait this pass (bounded by deadline).
-                (WatcherTerminalResendAction::WaitInFlight, false)
-            } else {
-                // Dead/stalled sink — reclaim its marker and re-send (no black-hole).
-                (watcher_terminal_resend_action(committed, start, end), true)
-            }
-        }
-        LeaseSnapshot::Committed {
-            holder: LeaseHolder::Sink,
-            ..
-        } => {
-            // The sink committed Delivered but hasn't released yet; the range is
-            // delivered. Skip (belt-and-suspenders; committed>=end also yields Skip).
-            (WatcherTerminalResendAction::SkipAlreadyCommitted, false)
-        }
-        // Unleased, or held/committed by a non-Sink holder (Watcher/Bridge): the
-        // #3151 marker does not apply — behave exactly as the pre-#3151 path.
-        _ => (watcher_terminal_resend_action(committed, start, end), false),
+    // #3042 (relay-stability P1, immediate mitigation): after a restart the
+    // channel can run with `relay_owner_kind=none` + `inflight_present=false`
+    // (restore_inflight failed to rebind ownership), so the session-bound
+    // StreamRelay terminal-commit ACK never lands and the 10s wait reports
+    // `TimedOut` on every poll. In that ownerless state a `TimedOut` is NOT a
+    // reliable "not delivered" signal — the StreamRelay sink may have posted
+    // and merely failed to advance the committed-sequence metric — so blindly
+    // re-sending the same byte-range once per ACK-timeout poll produces the
+    // observed 3× duplicate. Suppress the watcher-direct fallback for an
+    // ownerless `TimedOut`. Owned outcomes and non-timeout outcomes keep the
+    // existing fallback behaviour.
+    if !relay_owner_present && matches!(ack_outcome, SessionBoundRelayAckOutcome::TimedOut) {
+        return false;
     }
-}
-
-/// Reconcile a watcher terminal re-send against the committed offset authority.
-/// Only ever consulted when the watcher WOULD have re-sent (a non-`Delivered`
-/// ACK and a real body); the caller still applies the existing `relay_owner`
-/// suppression. A zero/inverted range (`end <= start`) yields `SendFull` so the
-/// existing zero-range guards (which never lease/advance) stay in control — the
-/// reconciliation never manufactures a skip for a range it cannot reason about.
-fn watcher_terminal_resend_action(
-    committed: u64,
-    start: u64,
-    end: u64,
-) -> WatcherTerminalResendAction {
-    if end <= start {
-        // Degenerate range: defer to the existing no-range handling downstream.
-        return WatcherTerminalResendAction::SendFull;
-    }
-    if committed >= end {
-        WatcherTerminalResendAction::SkipAlreadyCommitted
-    } else {
-        // committed < end (incl. the partial `start < committed < end` case which
-        // the all-or-nothing sink delegation does not actually produce): re-send
-        // the FULL response. No black-hole; no mis-offset suffix (codex BLOCKER 2).
-        WatcherTerminalResendAction::SendFull
-    }
+    should_direct_send && !matches!(ack_outcome, SessionBoundRelayAckOutcome::Delivered)
 }
 
 fn watcher_terminal_response_for_direct_send<'a>(
@@ -2470,71 +1621,6 @@ async fn wait_for_session_bound_relay_delivery_ack(
 
 fn terminal_event_consumed_offset(current_offset: u64, unprocessed_tail: &str) -> u64 {
     current_offset.saturating_sub(unprocessed_tail.len() as u64)
-}
-
-/// #3041 P1-3 (Part a, B1 — codex real-close): the watcher's AUTHORITATIVE
-/// consumed-terminal END to persist into inflight BEFORE the sink loads it in
-/// `deliver_response`, or `None` when this turn must NOT record a delegated end.
-///
-/// Pure decision so the BEFORE-the-ACK-wait ordering and the gating are unit
-/// testable without driving the whole watcher loop. Returns the end to persist
-/// only when (1) the turn has visible response output the watcher would delegate
-/// (`has_current_response`), (2) the session-bound sink is eligible to own the
-/// terminal delivery for this inflight (`sink_can_own`), and (3) the consumed
-/// range is real (`end > start`). A zero/inverted range or a bridge-owned /
-/// mismatched inflight yields `None` so no spurious end is recorded.
-/// #3041 P1-3 (Part a, B1 — frame-carried commit fence): build the
-/// `TerminalCommitFence` to ride on the RESULT-bearing chunk's frame, or `None`
-/// when this chunk is not the terminal one / has no real consumed range / has no
-/// pinned turn identity to gate the sink's advance.
-///
-/// The fence carries the watcher's AUTHORITATIVE consumed-terminal `end`
-/// (`terminal_event_consumed_offset(current_offset, all_data)` == the watcher's
-/// own lease `end`) plus the PINNED turn identity (`user_msg_id` + `started_at`,
-/// matching #3141 pinned-id semantics — taken from the inflight snapshot loaded at
-/// turn start, filtered to THIS tmux session). The sink advances
-/// `confirmed_end_offset` to `end` on a CONFIRMED delivery ONLY when this identity
-/// still matches the channel's current inflight (delayed-old-frame / wrong-turn
-/// protection). We DO NOT gate on `sink_can_own` here: the fence is inert unless
-/// the sink confirms a delivery (route-gated) AND the identity still matches, so
-/// carrying it on every real terminal chunk is safe and the sink's own gates
-/// decide whether it ever advances.
-fn watcher_terminal_commit_fence(
-    found_result: bool,
-    turn_data_start_offset: u64,
-    consumed_end: u64,
-    pinned_identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
-    tmux_session_name: &str,
-) -> Option<crate::services::cluster::stream_relay::TerminalCommitFence> {
-    if !found_result || consumed_end <= turn_data_start_offset {
-        return None;
-    }
-    let identity = pinned_identity?;
-    // Only pin an identity for THIS tmux session (the panel-identity snapshot is
-    // already filtered to it, but guard defensively so a cross-session snapshot
-    // can never seed a wrong-turn fence).
-    if identity.tmux_session_name.as_deref() != Some(tmux_session_name) {
-        return None;
-    }
-    // #3041 P1-3 (codex P1-3 issue 2 R4): a fence MUST carry a real
-    // `turn_start_offset`. The sink's identity gate is STRICT on this field (no
-    // None fallback) so two consecutive `user_msg_id == 0` (TUI-direct) turns in
-    // the same one-second `started_at` cannot collide. If the would-be terminal
-    // turn's start offset is unknown, DO NOT emit a fence: returning None forwards
-    // a non-terminal frame instead, and the watcher reconciliation's SendFull then
-    // safely delivers this turn (no black-hole, no weakly-gated advance).
-    let turn_start_offset = identity.turn_start_offset?;
-    Some(
-        crate::services::cluster::stream_relay::TerminalCommitFence {
-            consumed_end,
-            turn_user_msg_id: identity.user_msg_id,
-            turn_started_at: identity.started_at.clone(),
-            // A fence ALWAYS carries a real `turn_start_offset` (guaranteed above)
-            // so the sink's identity gate can disambiguate two consecutive
-            // `user_msg_id == 0` turns started in the same second.
-            turn_start_offset: Some(turn_start_offset),
-        },
-    )
 }
 
 /// Resolve the provider session selector to durably persist at turn end.
@@ -3399,7 +2485,6 @@ mod matched_session_jsonl_gate_tests {
         let target = SessionBoundRelayAckTarget {
             metrics: metrics.clone(),
             sequence: 7,
-            turn_start_offset: None,
         };
         assert_eq!(
             wait_for_session_bound_relay_delivery_ack(
@@ -3421,7 +2506,6 @@ mod matched_session_jsonl_gate_tests {
         let dropped_target = SessionBoundRelayAckTarget {
             metrics: dropped_metrics.clone(),
             sequence: 9,
-            turn_start_offset: None,
         };
         dropped_metrics.record_dropped_sequence_for_test(9);
         assert_eq!(
@@ -3434,12 +2518,11 @@ mod matched_session_jsonl_gate_tests {
         let skipped_target = SessionBoundRelayAckTarget {
             metrics: skipped_metrics.clone(),
             sequence: 11,
-            turn_start_offset: None,
         };
         skipped_metrics.record_terminal_skipped_sequence_for_test(11);
         assert_eq!(
             session_bound_relay_ack_snapshot_outcome(Some(&skipped_target)),
-            Some(SessionBoundRelayAckOutcome::NotDelivered)
+            Some(SessionBoundRelayAckOutcome::TerminalSkipped)
         );
 
         let delivered_metrics =
@@ -3447,7 +2530,6 @@ mod matched_session_jsonl_gate_tests {
         let delivered_target = SessionBoundRelayAckTarget {
             metrics: delivered_metrics.clone(),
             sequence: 3,
-            turn_start_offset: None,
         };
         delivered_metrics.record_delivered_sequence_for_test(3);
         assert_eq!(
@@ -3473,313 +2555,6 @@ mod matched_session_jsonl_gate_tests {
             wait_for_session_bound_relay_delivery_ack(None, std::time::Duration::from_millis(1))
                 .await,
             SessionBoundRelayAckOutcome::MissingTarget
-        );
-    }
-
-    // #3041 P1-3 R5 (per-sequence terminal-ACK correlation): turn A (seq N) was
-    // NOT delivered, turn B's tail (seq N+1) delivered in the same chunk. A's ACK
-    // must resolve on A's OWN sequence → NotDelivered (so the watcher reconciles /
-    // SendFull → A delivered, no black-hole), NOT Delivered from B bumping the
-    // committed high-water-mark to N+1. B's ACK at its own sequence → Delivered.
-    #[test]
-    fn session_bound_relay_ack_is_per_sequence_not_high_water_mark() {
-        let metrics =
-            std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-        // A at seq N=5 skipped, B at seq N+1=6 committed (higher → bumps HWM).
-        metrics.record_terminal_skipped_sequence_for_test(5);
-        metrics.record_terminal_committed_sequence_for_test(6);
-
-        let a_target = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 5,
-            turn_start_offset: None,
-        };
-        assert_eq!(
-            session_bound_relay_ack_snapshot_outcome(Some(&a_target)),
-            Some(SessionBoundRelayAckOutcome::NotDelivered),
-            "A's ACK reads A's own seq-5 outcome (NotDelivered), not B's delivered HWM"
-        );
-
-        let b_target = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 6,
-            turn_start_offset: None,
-        };
-        assert_eq!(
-            session_bound_relay_ack_snapshot_outcome(Some(&b_target)),
-            Some(SessionBoundRelayAckOutcome::Delivered),
-            "B's ACK reads its own seq-6 committed outcome"
-        );
-    }
-
-    // #3041 P1-3 R6: a single physical chunk holds `result(A) + assistant(B) +
-    // result(B)`. Turn A rides a TERMINAL frame (ack = A.seq, bound to A's pinned
-    // `turn_start_offset`); turn B completes ENTIRELY inside the split tail whose
-    // non-terminal frame sequence is DISCARDED. On B's processing pass the deferred
-    // forward emits NO frame (the leftover decoded text is empty) → NO fresh ack.
-    // B must NOT inherit A's stale ack: with B's own pinned identity, the carry
-    // helper resets the stored ack to `None` so B reconciles (None → MissingTarget
-    // → §3.2 committed-offset reconcile → SendFull/Skip) and is NEVER black-holed,
-    // even though A reported Delivered on A's own sequence.
-    #[test]
-    fn new_turn_does_not_inherit_finished_turn_stale_ack_target() {
-        let metrics =
-            std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-        // A's terminal frame (seq 5) bound to A's pinned turn_start_offset = 100.
-        let a_ack = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 5,
-            turn_start_offset: Some(100),
-        };
-
-        // B's processing pass: pinned identity is B's turn (turn_start_offset = 240,
-        // the leftover/result(B) range), and the deferred forward produced NO fresh
-        // ack (B's tail frame sequence was discarded). The stored ack still holds
-        // A's seq-5 target. Carrying it forward for B must RESET to None.
-        let carried = carry_session_bound_ack_for_turn(Some(a_ack.clone()), None, Some(240));
-        assert!(
-            carried.is_none(),
-            "a NEW turn (different pinned turn_start_offset) with no fresh ack must \
-             NOT inherit the finished turn's stale ack_target → reconcile, no black-hole"
-        );
-
-        // Sanity: the same turn (A's own later non-terminal pass) keeps A's ack so a
-        // legitimately-set terminal ack is not clobbered within the SAME turn.
-        let same_turn = carry_session_bound_ack_for_turn(Some(a_ack.clone()), None, Some(100));
-        assert_eq!(
-            same_turn.map(|ack| ack.sequence),
-            Some(5),
-            "an ack set earlier in THIS turn survives a later non-terminal pass"
-        );
-    }
-
-    // #3041 P1-3 (codex P1-3 R7): the forward of a result-bearing physical chunk that
-    // ALSO carries a trailing later-turn tail MUST surface the turn-boundary signal
-    // (`trailing_turn_follows = true`) while still keeping the TERMINAL frame's ack as
-    // the wait target. A single-turn forward (no tail) must NOT raise the signal. This
-    // is the primitive the watcher latches to reset the stored ack at the boundary.
-    #[tokio::test]
-    async fn split_terminal_forward_signals_trailing_turn_and_keeps_terminal_ack() {
-        use crate::services::cluster::session_matcher::MatchedChannel;
-        use crate::services::cluster::session_matcher::expected_rollout_path_for;
-        use crate::services::cluster::stream_relay::{
-            DiscardSink, RelaySink, TerminalCommitFence, spawn_stream_relay,
-        };
-        use crate::services::provider::ProviderKind;
-
-        let session = ProviderKind::Claude.build_tmux_session_name("c-r7-split");
-        let matched = MatchedChannel {
-            channel_id: "c-r7-split".to_string(),
-            agent_id: "a-r7-split".to_string(),
-            provider: ProviderKind::Claude,
-            expected_session_name: session.clone(),
-            expected_rollout_path: expected_rollout_path_for(&session),
-        };
-        let registry = std::sync::Arc::new(
-            crate::services::cluster::relay_producer_registry::RelayProducerRegistry::new(),
-        );
-        let sink: std::sync::Arc<dyn RelaySink> = std::sync::Arc::new(DiscardSink);
-        let handle = spawn_stream_relay(matched.clone(), sink);
-        registry.register(session.clone(), handle.producer());
-        let mut cached = None;
-
-        // Turn A's result + turn B's first bytes in ONE physical chunk. After the
-        // parse, `all_data` holds turn B's bytes → leftover_len = turn_b.len().
-        let turn_a = "{\"type\":\"result\",\"result\":\"A done\"}\n";
-        let turn_b = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n";
-        let combined = format!("{turn_a}{turn_b}");
-        let fence = TerminalCommitFence {
-            consumed_end: 240,
-            turn_user_msg_id: 0,
-            turn_started_at: "12:00:00".to_string(),
-            // A's pinned identity — the SAME offset the watcher carry helper keys on.
-            turn_start_offset: Some(100),
-        };
-        let split_forward = forward_terminal_chunk_with_trailing_to_supervisor_relay(
-            &session,
-            &combined,
-            turn_b.len(),
-            &registry,
-            &mut cached,
-            fence.clone(),
-        );
-        assert!(
-            split_forward.trailing_turn_follows,
-            "a result+next-turn split must signal that a later turn follows (R7 \
-             turn-boundary)"
-        );
-        assert!(
-            split_forward.ack_target.is_some(),
-            "the split still waits on the TERMINAL frame's ack (turn A's delivery)"
-        );
-        assert_eq!(
-            split_forward
-                .ack_target
-                .as_ref()
-                .and_then(|ack| ack.turn_start_offset),
-            Some(100),
-            "the kept ack is bound to turn A's pinned offset"
-        );
-
-        // A single complete turn (no trailing tail) must NOT raise the signal.
-        let single_forward = forward_terminal_chunk_with_trailing_to_supervisor_relay(
-            &session,
-            turn_a,
-            0,
-            &registry,
-            &mut cached,
-            fence,
-        );
-        assert!(
-            !single_forward.trailing_turn_follows,
-            "a single-turn terminal forward never crosses a turn boundary"
-        );
-        registry.deregister(&session);
-        let _ = handle;
-    }
-
-    // #3041 P1-3 (codex P1-3 R7): END-TO-END boundary semantics. The R6 carry helper
-    // ALONE still black-holes turn B when `turn_identity_for_panel` is STILL pinned to
-    // A's offset on B's pass (B's inflight not yet established): the carry KEEPS A's
-    // ack, and A's `Delivered` falsely satisfies B's ACK. R7 closes this by RESETTING
-    // the stored ack to `None` at A's split boundary AFTER A consumes its own ack —
-    // independent of whether the pinned identity refreshed. This test models that exact
-    // sequence: A's split signals the boundary → reset → B (even with A's stale pinned
-    // offset) starts with NO inherited ack → MissingTarget → §3.2 reconcile → B NOT
-    // black-holed even though A reported Delivered and B's tail was skipped/dropped.
-    #[test]
-    fn split_boundary_reset_prevents_later_turn_inheriting_finished_turn_ack() {
-        let metrics =
-            std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-        // A's terminal frame ack (seq 5), pinned to A's turn_start_offset = 100.
-        let a_ack = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 5,
-            turn_start_offset: Some(100),
-        };
-
-        // A's pass forwards the split (result(A) + tail(B)) → the carry helper adopts
-        // A's fresh terminal ack (A's own delivery resolves correctly on A's ack).
-        let mut stored = carry_session_bound_ack_for_turn(None, Some(a_ack.clone()), Some(100));
-        assert_eq!(
-            stored.as_ref().map(|ack| ack.sequence),
-            Some(5),
-            "A's own delivery still uses A's ack (no spurious reset mid-A)"
-        );
-
-        // The split signalled a trailing turn. AFTER A's terminal block consumes A's
-        // ack, the watcher resets the stored ack at the boundary (the R7 fix).
-        let split_trailing_turn_follows = true;
-        if split_trailing_turn_follows {
-            stored = None;
-        }
-
-        // B's pass: `turn_identity_for_panel` is STILL pinned to A's offset (100) —
-        // the exact R7 condition the R6 carry helper could NOT fix. B's deferred
-        // forward produced NO fresh ack (B's tail was already mirrored, or skipped /
-        // dropped on the failure path). WITHOUT the reset, the carry helper would KEEP
-        // A's seq-5 ack here (same pinned offset) → black-hole. WITH the reset, the
-        // stored ack is already `None`, so B reconciles.
-        let carried_for_b = carry_session_bound_ack_for_turn(stored, None, Some(100));
-        assert!(
-            carried_for_b.is_none(),
-            "after A's split boundary reset, turn B NEVER inherits A's finished ack — \
-             even with `turn_identity_for_panel` STILL pinned to A's offset → B reads \
-             MissingTarget → §3.2 reconcile (SendFull/Skip) → B not black-holed"
-        );
-
-        // Contrast: WITHOUT the boundary reset (pre-R7), the very same B pass with A's
-        // stale pinned offset would KEEP A's ack — the regression R7 fixes.
-        let without_reset = carry_session_bound_ack_for_turn(Some(a_ack.clone()), None, Some(100));
-        assert_eq!(
-            without_reset.map(|ack| ack.sequence),
-            Some(5),
-            "documents the R7 regression the boundary reset closes: the carry helper \
-             alone keeps A's ack when the pinned offset is still A's"
-        );
-    }
-
-    // #3041 P1-3 R6 (turn-boundary): a fresh turn with no terminal ack does not
-    // inherit the prior turn's ack_target, and a fresh `Some` always wins (the
-    // current turn's terminal frame ack replaces any stored value).
-    #[test]
-    fn carry_session_bound_ack_for_turn_is_turn_scoped() {
-        let metrics =
-            std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-        let prior = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 11,
-            turn_start_offset: Some(50),
-        };
-        let fresh = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 12,
-            turn_start_offset: Some(80),
-        };
-
-        // Fresh Some always adopted (THIS turn forwarded a real terminal frame).
-        assert_eq!(
-            carry_session_bound_ack_for_turn(Some(prior.clone()), Some(fresh.clone()), Some(80))
-                .map(|ack| ack.sequence),
-            Some(12),
-            "a fresh terminal-frame ack for the current turn replaces the stored value"
-        );
-
-        // No fresh ack + different turn → reset (never inherit).
-        assert!(
-            carry_session_bound_ack_for_turn(Some(prior.clone()), None, Some(80)).is_none(),
-            "a fresh turn with no terminal ack does not inherit the prior turn's ack_target"
-        );
-
-        // No fresh ack + unknown current turn binding → reset (defensive: never
-        // reuse an ack we cannot prove belongs to the current turn).
-        assert!(
-            carry_session_bound_ack_for_turn(Some(prior.clone()), None, None).is_none(),
-            "an ack is not reused when the current turn's pinned offset is unknown"
-        );
-
-        // No fresh ack + stored ack with no turn binding → reset.
-        let unbound = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 13,
-            turn_start_offset: None,
-        };
-        assert!(
-            carry_session_bound_ack_for_turn(Some(unbound), None, Some(50)).is_none(),
-            "an ack lacking a turn binding is never carried across a pass"
-        );
-
-        // Nothing stored, nothing fresh → None.
-        assert!(carry_session_bound_ack_for_turn(None, None, Some(50)).is_none());
-    }
-
-    // #3041 P1-3 R5: a target sequence that was never terminally resolved (dropped
-    // before the sink, or evicted from the bounded ring) reads None → the snapshot
-    // outcome is None → the wait times out → the watcher reconciles (no false ACK,
-    // no black-hole).
-    #[tokio::test]
-    async fn session_bound_relay_ack_unresolved_sequence_times_out() {
-        let metrics =
-            std::sync::Arc::new(crate::services::cluster::stream_relay::RelayMetrics::default());
-        // A different sequence committed; OUR target (42) was never resolved.
-        metrics.record_terminal_committed_sequence_for_test(40);
-        let target = SessionBoundRelayAckTarget {
-            metrics: metrics.clone(),
-            sequence: 42,
-            turn_start_offset: None,
-        };
-        assert_eq!(
-            session_bound_relay_ack_snapshot_outcome(Some(&target)),
-            None
-        );
-        assert_eq!(
-            wait_for_session_bound_relay_delivery_ack(
-                Some(&target),
-                std::time::Duration::from_millis(1),
-            )
-            .await,
-            SessionBoundRelayAckOutcome::TimedOut,
-            "unresolved/evicted target sequence times out → reconcile, never a false ACK"
         );
     }
 
@@ -3840,7 +2615,7 @@ mod matched_session_jsonl_gate_tests {
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
-            SessionBoundRelayAckOutcome::NotDelivered,
+            SessionBoundRelayAckOutcome::TerminalSkipped,
             true
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
@@ -3853,17 +2628,6 @@ mod matched_session_jsonl_gate_tests {
             SessionBoundRelayAckOutcome::Delivered,
             true
         ));
-        // #3041 P1-5: an ownerless `TimedOut` now ALSO returns true (intends a
-        // re-send) — the gate is the precondition only; the §3.2 committed-offset
-        // reconciliation at the call site decides Skip vs Full. (Previously #3042
-        // blanket-suppressed this to false.)
-        assert!(watcher_should_direct_send_after_session_bound_ack(
-            true,
-            SessionBoundRelayAckOutcome::TimedOut,
-            false
-        ));
-        // should_direct_send=false still gates the precondition off regardless of
-        // owner presence.
         assert!(!watcher_should_direct_send_after_session_bound_ack(
             false,
             SessionBoundRelayAckOutcome::TimedOut,
@@ -3871,35 +2635,29 @@ mod matched_session_jsonl_gate_tests {
         ));
     }
 
-    /// #3041 P1-5 (was `ownerless_timeout_suppresses_watcher_direct_fallback`,
-    /// #3042): after a restart `restore_inflight` can leave the channel with
+    /// #3042: after a restart `restore_inflight` can leave the channel with
     /// `relay_owner_kind=none`/`inflight_present=false`, so the session-bound
     /// terminal-commit ACK never lands and every 10s poll reports `TimedOut`.
-    /// #3042 blanket-suppressed the gate to `false` there to avoid a 3× duplicate;
-    /// #3041 P1-5 REMOVES that band-aid because P1-3 Part (a) made the committed
-    /// offset authoritative on a confirmed post. The gate now returns `true` (intends
-    /// a re-send) for an ownerless `TimedOut` — JUST the precondition — and the §3.2
-    /// committed-offset reconciliation (`watcher_terminal_resend_action`) decides
-    /// Skip-vs-Full downstream. The actual no-duplicate / no-black-hole guarantees
-    /// are asserted by `ownerless_timed_out_reconciles_*` below.
+    /// In that ownerless state a `TimedOut` is not a reliable not-delivered
+    /// signal, so the watcher-direct blind re-send must be suppressed (the
+    /// observed 3× duplicate). Owner-absent + non-timeout outcomes still fall
+    /// back so genuine sink failures/skips are not silently dropped.
     #[test]
-    fn ownerless_timed_out_intends_resend_via_gate() {
+    fn ownerless_timeout_suppresses_watcher_direct_fallback() {
         // The exact incident shape: should_direct_send=true, TimedOut, no owner.
-        // Now PASSES the gate (was suppressed to false by #3042); §3.2 then
-        // reconciles (see `ownerless_timed_out_reconciles_*`).
-        assert!(watcher_should_direct_send_after_session_bound_ack(
+        assert!(!watcher_should_direct_send_after_session_bound_ack(
             true,
             SessionBoundRelayAckOutcome::TimedOut,
             false
         ));
-        // Owner present with the same TimedOut also intends the fallback —
-        // universality: the gate no longer branches on owner presence.
+        // Owner present with the same TimedOut keeps the fallback (regression
+        // guard so the suppression is owner-scoped, not a blanket TimedOut mute).
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
             SessionBoundRelayAckOutcome::TimedOut,
             true
         ));
-        // Ownerless but a non-timeout (definitive) outcome still intends the fallback.
+        // Ownerless but a non-timeout (definitive) outcome still falls back.
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
             SessionBoundRelayAckOutcome::SinkError,
@@ -3907,70 +2665,15 @@ mod matched_session_jsonl_gate_tests {
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
-            SessionBoundRelayAckOutcome::NotDelivered,
+            SessionBoundRelayAckOutcome::TerminalSkipped,
             false
         ));
-        // should_direct_send=false still gates the precondition off.
+        // Ownerless TimedOut with should_direct_send=false is also suppressed.
         assert!(!watcher_should_direct_send_after_session_bound_ack(
             false,
             SessionBoundRelayAckOutcome::TimedOut,
             false
         ));
-    }
-
-    /// #3041 P1-5 / #3042 REGRESSION GUARD: an ownerless (`relay_owner_present=false`)
-    /// `TimedOut` whose range is ALREADY committed at/past `end` (the sink posted and
-    /// P1-3 advanced `confirmed_end_offset`) reconciles to `SkipAlreadyCommitted` —
-    /// NO re-send. This is the principled replacement for #3042's blanket suppression:
-    /// the observed 3× duplicate is still prevented, but now via the committed-offset
-    /// authority rather than a blind owner-scoped mute (so a genuine non-delivery is
-    /// no longer black-holed — see `ownerless_timed_out_reconciles_full_when_not_committed`).
-    #[test]
-    fn ownerless_timed_out_reconciles_skip_when_committed_reaches_end() {
-        // Ownerless TimedOut now passes the precondition gate (no longer suppressed).
-        assert!(watcher_should_direct_send_after_session_bound_ack(
-            true,
-            SessionBoundRelayAckOutcome::TimedOut,
-            false
-        ));
-        // The §3.2 reconciliation against the offset authority: committed has reached
-        // (or passed) the consumed-terminal `end` → the sink delivered, ACK merely
-        // lagged → SKIP. No duplicate (the #3042 3× incident cannot recur).
-        let (start, end) = (1_000u64, 1_500u64);
-        assert_eq!(
-            watcher_terminal_resend_action(end, start, end),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-        );
-        assert_eq!(
-            watcher_terminal_resend_action(end + 256, start, end),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-        );
-    }
-
-    /// #3041 P1-5 (black-hole closed): an ownerless `TimedOut` whose range is NOT
-    /// committed (committed < end → the sink did NOT confirm a post) reconciles to
-    /// `SendFull` — the bytes are recovered. Under the old #3042 blanket suppression
-    /// this outcome neither reconciled nor resent: a potential black-hole.
-    #[test]
-    fn ownerless_timed_out_reconciles_full_when_not_committed() {
-        // Same ownerless TimedOut precondition.
-        assert!(watcher_should_direct_send_after_session_bound_ack(
-            true,
-            SessionBoundRelayAckOutcome::TimedOut,
-            false
-        ));
-        // committed < end → genuinely undelivered → re-send the FULL response.
-        let (start, end) = (1_000u64, 1_500u64);
-        assert_eq!(
-            watcher_terminal_resend_action(start, start, end),
-            WatcherTerminalResendAction::SendFull,
-        );
-        // committed at/below start (the all-or-nothing sink delegation's not-delivered
-        // shape) also re-sends.
-        assert_eq!(
-            watcher_terminal_resend_action(0, start, end),
-            WatcherTerminalResendAction::SendFull,
-        );
     }
 
     #[test]
@@ -3982,7 +2685,7 @@ mod matched_session_jsonl_gate_tests {
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
             true,
-            SessionBoundRelayAckOutcome::NotDelivered,
+            SessionBoundRelayAckOutcome::TerminalSkipped,
             true
         ));
         assert!(watcher_should_direct_send_after_session_bound_ack(
@@ -3995,329 +2698,6 @@ mod matched_session_jsonl_gate_tests {
             SessionBoundRelayAckOutcome::Delivered,
             true
         ));
-    }
-
-    // #3041 P1-3 (Part b, §3.2): the watcher's terminal re-send reconciliation
-    // against the committed offset authority — REPLACING the blind re-send. These
-    // assert the exact 2-way skip/full decision so the failure-mode-① skip (no
-    // duplicate) and the black-hole guard (full still sent on committed<end) are
-    // pinned. codex BLOCKER 2: there is no SendSuffix for the watcher response-text
-    // path (coordinate mismatch + all-or-nothing sink) — `committed < end` always
-    // re-sends the FULL response (no black-hole, no mis-offset slice).
-    #[test]
-    fn watcher_terminal_resend_skips_when_range_already_committed() {
-        // failure-mode-①: the sink delivered `[0, 100)` (Part a advanced the
-        // authority to 100) but the terminal-commit ACK lagged the 10s wait →
-        // committed >= end → SKIP. No duplicate.
-        assert_eq!(
-            watcher_terminal_resend_action(100, 0, 100),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-            "committed == end must skip the re-send (no duplicate)"
-        );
-        assert_eq!(
-            watcher_terminal_resend_action(150, 0, 100),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-            "committed past end must skip the re-send (no duplicate)"
-        );
-    }
-
-    #[test]
-    fn watcher_terminal_resend_partial_overlap_sends_full_not_suffix() {
-        // codex BLOCKER 2: a partial overlap `start < committed < end` would in
-        // principle allow a suffix-only re-send, but the watcher delivers RESPONSE
-        // TEXT sliced by `response_sent_offset` (a render offset), NOT JSONL bytes
-        // — so it cannot coherently map `[committed, end)`. The all-or-nothing sink
-        // never actually produces this case (it advances to the FULL end on a
-        // single confirmed post, or not at all). Decision: SendFull on committed<end
-        // — no black-hole (missing content always re-delivered), no mis-offset send.
-        assert_eq!(
-            watcher_terminal_resend_action(60, 0, 100),
-            WatcherTerminalResendAction::SendFull,
-            "partial overlap must SendFull (no mis-offset suffix; no black-hole)"
-        );
-        // Boundary: committed just past start is still committed<end → SendFull.
-        assert_eq!(
-            watcher_terminal_resend_action(1, 0, 100),
-            WatcherTerminalResendAction::SendFull,
-            "committed just past start must SendFull (committed<end → re-send)"
-        );
-    }
-
-    #[test]
-    fn watcher_terminal_resend_sends_full_when_nothing_committed() {
-        // BLACK-HOLE GUARD: the sink did NOT deliver (committed < end, and
-        // committed <= start) → the FULL range must still be sent. Removing the
-        // blind re-send must NEVER drop an undelivered range.
-        assert_eq!(
-            watcher_terminal_resend_action(0, 0, 100),
-            WatcherTerminalResendAction::SendFull,
-            "committed == start (nothing delivered) must send the full range"
-        );
-        assert_eq!(
-            watcher_terminal_resend_action(40, 50, 100),
-            WatcherTerminalResendAction::SendFull,
-            "committed below start must send the full range (no black-hole)"
-        );
-    }
-
-    // #3041 P1-5 (§3.2 SAFETY INVARIANT): a cross-actor `Unknown` outcome (the
-    // ring recorded `Unknown` / the ACK timed out / target was missing / dropped /
-    // sink-errored) MUST route through committed-offset reconciliation, NOT a blind
-    // 10s re-send. So `Unknown` with `committed >= end` → SkipAlreadyCommitted (a
-    // foreign owner already committed the range; re-sending would duplicate), and
-    // `Unknown` with `committed < end` → SendFull (the range is uncovered; no
-    // black-hole). The decision is driven SOLELY by the committed offset — it
-    // consults the authority, never blind-sends on the Unknown signal alone.
-    #[test]
-    fn unknown_outcome_triggers_committed_offset_reconciliation_not_blind_resend() {
-        use crate::services::cluster::stream_relay::DeliveryOutcome;
-        // The fold: every failure/unconfirmed ACK arm collapses to `Unknown`.
-        for ack in [
-            SessionBoundRelayAckOutcome::RingUnknown,
-            SessionBoundRelayAckOutcome::Dropped,
-            SessionBoundRelayAckOutcome::SinkError,
-            SessionBoundRelayAckOutcome::TimedOut,
-            SessionBoundRelayAckOutcome::MissingTarget,
-        ] {
-            assert_eq!(
-                session_bound_ack_delivery_outcome(ack),
-                DeliveryOutcome::Unknown,
-                "every failure/unconfirmed ACK arm folds to the cross-actor Unknown"
-            );
-        }
-
-        // §3.2: an Unknown outcome reconciles against the committed offset. The
-        // SAME `watcher_terminal_resend_action` gate that NotDelivered uses — no
-        // separate blind-resend path exists for Unknown.
-        let start = 100u64;
-        let end = 356u64;
-        // committed >= end: a foreign owner already committed the range → SKIP, NOT
-        // a blind re-send (which would duplicate).
-        assert_eq!(
-            watcher_terminal_resend_action(end, start, end),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-            "Unknown + committed>=end must consult the offset and SKIP (no blind 10s re-send / no duplicate)"
-        );
-        // committed < end: the range is genuinely uncovered → SendFull (no
-        // black-hole). The decision came from the offset, not the Unknown signal.
-        assert_eq!(
-            watcher_terminal_resend_action(start, start, end),
-            WatcherTerminalResendAction::SendFull,
-            "Unknown + committed<end must SendFull via the offset authority (no black-hole)"
-        );
-    }
-
-    // #3041 P1-5 (§3.2 SAFETY INVARIANT): a `NotDelivered` outcome (the former
-    // `Ok(Skipped)`, redefined this phase) must ALSO route through committed-offset
-    // reconciliation — there is NO blind-skip fast-path for NotDelivered. When a
-    // FOREIGN owner already committed the range (`committed >= end`), the watcher
-    // must SKIP its re-send (no duplicate), exactly like a delivered turn — proving
-    // NotDelivered consults the offset rather than blindly skipping or blindly
-    // re-sending.
-    #[test]
-    fn not_delivered_outcome_keeps_no_resend_when_foreign_owner_committed() {
-        use crate::services::cluster::stream_relay::DeliveryOutcome;
-        assert_eq!(
-            session_bound_ack_delivery_outcome(SessionBoundRelayAckOutcome::NotDelivered),
-            DeliveryOutcome::NotDelivered,
-            "NotDelivered folds to the cross-actor NotDelivered (not Unknown, not Delivered)"
-        );
-        let start = 100u64;
-        let end = 356u64;
-        // A foreign owner committed the full range out from under this watcher.
-        assert_eq!(
-            watcher_terminal_resend_action(end, start, end),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-            "NotDelivered + committed>=end (foreign owner committed) must SKIP (no duplicate, no blind-skip-without-checking)"
-        );
-        // But when NOTHING committed it still SendFulls — NotDelivered is never a
-        // silent drop (no black-hole).
-        assert_eq!(
-            watcher_terminal_resend_action(start, start, end),
-            WatcherTerminalResendAction::SendFull,
-            "NotDelivered + committed<end must SendFull (no black-hole; not a blind skip)"
-        );
-    }
-
-    // #3041 P1-3 codex BLOCKER 2: the sink-delegated terminal delivery is
-    // ALL-OR-NOTHING — the sink advances `confirmed_end_offset` to the FULL `end`
-    // on ONE confirmed post, or not at all. So for the sink-delegated path the
-    // reconciliation only ever sees committed == end (delivered → Skip) or
-    // committed == start (not delivered → Full); it NEVER sees a partial
-    // `start < committed < end`. This pins that no SendSuffix is reachable on the
-    // delegated path, and that committed<end ALWAYS re-sends the full body (no
-    // black-hole). The watcher response-text path never derives a suffix from the
-    // unrelated `response_sent_offset`.
-    #[test]
-    fn sink_delegated_path_is_all_or_nothing_skip_or_full_never_suffix() {
-        let start = 100u64;
-        let end = 356u64; // full consumed-terminal end after an all-or-nothing post
-
-        // Delivered: the sink committed the FULL range → committed == end → Skip.
-        assert_eq!(
-            watcher_terminal_resend_action(end, start, end),
-            WatcherTerminalResendAction::SkipAlreadyCommitted,
-            "all-or-nothing delivered → committed==end → Skip (no duplicate, failure-mode-①)"
-        );
-
-        // Not delivered: the sink did NOT post → committed stays at the prior
-        // turn's end (<= start) → committed < end → SendFull (no black-hole).
-        assert_eq!(
-            watcher_terminal_resend_action(start, start, end),
-            WatcherTerminalResendAction::SendFull,
-            "all-or-nothing not-delivered → committed<=start → SendFull (no black-hole)"
-        );
-
-        // No reachable input on the delegated path yields SendSuffix — the variant
-        // does not exist. Even an (unreachable) partial value re-sends FULL, not a
-        // mis-offset suffix.
-        for committed in [start + 1, (start + end) / 2, end - 1] {
-            assert_eq!(
-                watcher_terminal_resend_action(committed, start, end),
-                WatcherTerminalResendAction::SendFull,
-                "committed<end must SendFull (no suffix, no mis-offset slice, no black-hole)"
-            );
-        }
-    }
-
-    // BLOCKER 2 payload guard: `watcher_terminal_response_for_direct_send` must
-    // deliver the FULL response (not the `full_response[response_sent_offset..]`
-    // streaming-offset slice) whenever the reconciled re-send is taken, so the
-    // body is coherent and never a mid-response tail driven by an unrelated offset.
-    #[test]
-    fn watcher_resend_delivers_full_response_not_render_offset_slice() {
-        let full_response = "ANSWER-PREFIX|ANSWER-SUFFIX";
-        // A non-zero render offset that has NOTHING to do with JSONL bytes — the
-        // exact mismatch BLOCKER 2 flagged. The old SendSuffix path would have
-        // returned an incoherent slice from here.
-        let response_sent_offset = "ANSWER-PREFIX|".len();
-
-        // SendFull path (session_bound_fallback_uses_full_body = true): the full,
-        // coherent response is delivered — never the render-offset slice.
-        assert_eq!(
-            watcher_terminal_response_for_direct_send(full_response, response_sent_offset, true),
-            full_response,
-            "reconciled re-send must deliver the FULL response (no mis-offset slice)"
-        );
-        // And it is NOT the render-offset suffix that the removed SendSuffix path
-        // would have sent.
-        assert_ne!(
-            watcher_terminal_response_for_direct_send(full_response, response_sent_offset, true),
-            &full_response[response_sent_offset..],
-            "must NOT send the unrelated full_response[response_sent_offset..] slice"
-        );
-    }
-
-    // #3041 P1-3 (Part a, B1 — FRAME-CARRIED): the watcher's decision to ATTACH the
-    // commit fence (consumed_end + pinned identity) to the RESULT-bearing frame is
-    // gated by `watcher_terminal_commit_fence`: only the terminal chunk, only a real
-    // (end > start) consumed range, and only with a pinned identity for THIS tmux
-    // session. A non-terminal chunk, a zero/inverted range, a missing identity, or a
-    // cross-session snapshot yields no fence (the frame stays non-terminal).
-    #[test]
-    fn watcher_terminal_commit_fence_only_for_a_real_terminal_chunk() {
-        use crate::services::discord::inflight::InflightTurnIdentity;
-        let session = "AgentDesk-claude-77";
-        let identity = InflightTurnIdentity {
-            user_msg_id: 0,
-            started_at: "2026-06-04T00:00:00Z".to_string(),
-            tmux_session_name: Some(session.to_string()),
-            turn_start_offset: Some(64),
-        };
-        // Real terminal chunk: found_result, end > start, identity for this session.
-        let fence = watcher_terminal_commit_fence(true, 0, 256, Some(&identity), session)
-            .expect("a real terminal chunk must carry a commit fence");
-        assert_eq!(fence.consumed_end, 256);
-        assert_eq!(fence.turn_user_msg_id, 0);
-        assert_eq!(fence.turn_started_at, "2026-06-04T00:00:00Z");
-        // #3041 P1-3 (codex P1-3 issue 2): the fence carries the pinned
-        // turn_start_offset so the sink can disambiguate same-second turns.
-        assert_eq!(fence.turn_start_offset, Some(64));
-        // Not the result chunk → no fence.
-        assert!(watcher_terminal_commit_fence(false, 0, 256, Some(&identity), session).is_none());
-        // Zero range (end == start) → no fence.
-        assert!(watcher_terminal_commit_fence(true, 256, 256, Some(&identity), session).is_none());
-        // Inverted range → no fence.
-        assert!(watcher_terminal_commit_fence(true, 300, 256, Some(&identity), session).is_none());
-        // No pinned identity → no fence (sink would have nothing to identity-gate).
-        assert!(watcher_terminal_commit_fence(true, 0, 256, None, session).is_none());
-        // Cross-session snapshot → no fence (never seed a wrong-turn fence).
-        let other_identity = InflightTurnIdentity {
-            user_msg_id: 0,
-            started_at: "2026-06-04T00:00:00Z".to_string(),
-            tmux_session_name: Some("AgentDesk-claude-99".to_string()),
-            turn_start_offset: Some(64),
-        };
-        assert!(
-            watcher_terminal_commit_fence(true, 0, 256, Some(&other_identity), session).is_none()
-        );
-
-        // #3041 P1-3 (codex P1-3 issue 2 R4): a fence MUST carry a real
-        // turn_start_offset. If the pinned identity's offset is None, the producer
-        // emits NO fence (forwards a non-terminal frame instead) so the sink's
-        // STRICT offset gate never sees a None and the watcher reconciliation's
-        // SendFull delivers this turn safely (no black-hole, no weak gate).
-        let no_offset_identity = InflightTurnIdentity {
-            user_msg_id: 0,
-            started_at: "2026-06-04T00:00:00Z".to_string(),
-            tmux_session_name: Some(session.to_string()),
-            turn_start_offset: None,
-        };
-        assert!(
-            watcher_terminal_commit_fence(true, 0, 256, Some(&no_offset_identity), session)
-                .is_none(),
-            "a turn with no known turn_start_offset must NOT emit a fence (strict-offset guarantee)"
-        );
-    }
-
-    // #3041 P1-3 (codex P1-3 issue 1): a single physical chunk can carry turn A's
-    // result PLUS turn B's first bytes. The split must put A's bytes on the terminal
-    // side and B's leftover on the trailing side so B is forwarded (not black-holed).
-    #[test]
-    fn split_decoded_chunk_isolates_terminal_turn_from_trailing_tail() {
-        let turn_a = "{\"type\":\"result\",\"result\":\"A done\"}\n";
-        let turn_b = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n";
-        let combined = format!("{turn_a}{turn_b}");
-        // After the parse, `all_data` holds turn B's bytes → leftover_len = turn_b.len().
-        let (terminal_part, tail_part) =
-            split_decoded_chunk_at_terminal_boundary(&combined, turn_b.len());
-        assert_eq!(terminal_part, turn_a, "terminal frame carries ONLY turn A");
-        assert_eq!(tail_part, turn_b, "turn B's bytes ride a separate frame");
-
-        // No leftover (single complete turn) → whole chunk is terminal, no tail.
-        let (only_terminal, no_tail) = split_decoded_chunk_at_terminal_boundary(turn_a, 0);
-        assert_eq!(only_terminal, turn_a);
-        assert!(no_tail.is_empty());
-
-        // Leftover >= chunk (turn A's result was entirely in a prior leftover): the
-        // whole decoded chunk is the trailing tail; terminal side is empty (the
-        // empty terminal frame is then a no-op, the tail is still forwarded).
-        let (empty_terminal, all_tail) =
-            split_decoded_chunk_at_terminal_boundary(turn_b, turn_b.len() + 10);
-        assert!(empty_terminal.is_empty());
-        assert_eq!(all_tail, turn_b);
-
-        // UTF-8 boundary safety: a split that would fall mid-scalar is nudged to the
-        // next char boundary (keeps the scalar whole on the terminal side).
-        let multibyte = "ok한"; // '한' is 3 bytes
-        // leftover_len = 1 would nominally split inside '한'; the helper keeps it whole.
-        let (head, tail) = split_decoded_chunk_at_terminal_boundary(multibyte, 1);
-        assert!(multibyte.is_char_boundary(head.len()));
-        assert_eq!(format!("{head}{tail}"), multibyte, "no bytes dropped");
-    }
-
-    #[test]
-    fn watcher_terminal_resend_degenerate_range_defers_to_full() {
-        // A zero/inverted range manufactures NO skip — it defers to the existing
-        // downstream zero-range guards (which never lease/advance).
-        assert_eq!(
-            watcher_terminal_resend_action(100, 100, 100),
-            WatcherTerminalResendAction::SendFull
-        );
-        assert_eq!(
-            watcher_terminal_resend_action(0, 100, 50),
-            WatcherTerminalResendAction::SendFull
-        );
     }
 
     #[test]
@@ -4710,11 +3090,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     tracing::info!(
         "  [{ts}] 👁 tmux watcher started for #{tmux_session_name} at offset {initial_offset}"
     );
-
-    // #3041 P1-1: this watcher instance's delivery-lease holder id. Minted once
-    // per spawn so a replacement watcher cannot release/commit (or be mistaken
-    // for) this instance's lease across a reattach (§5.2 B2).
-    let watcher_instance_id = next_watcher_instance_id();
 
     // E5 (#2412): cache the supervisor-owned StreamRelay producer for this
     // tmux session, if the supervisor is running and has matched the
@@ -5346,31 +3721,38 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // previous iteration (multi-turn buffer split at the first `result`)
         // is processed before the new disk read.
         let decoded_data = utf8_decoder.decode(&data, data_start_offset);
-        // #3041 P1-3 (Part a, B1): the forward of this outer-read chunk is
-        // DEFERRED until AFTER `process_watcher_lines` below so the result-bearing
-        // chunk can ride a TERMINAL frame carrying the commit fence. Set only the
-        // buffer START offset here (independent of the forward); the mirror flags +
-        // ack target are set from the deferred forward result (see the
-        // `data_mirrored_to_session_relay` binding after the initial parse).
-        let initial_buffer_was_empty = all_data.is_empty();
-        if initial_buffer_was_empty {
+        let data_mirrored_to_session_relay = if decoded_data.text.is_empty() {
+            SupervisorRelayForward::mirrored_without_ack()
+        } else {
+            // E5 (#2412): mirror the freshly-read chunk into the
+            // supervisor-owned StreamRelay if one exists for this session.
+            // This is the *producer* side of the supervisor pipeline —
+            // without this call, `try_send_frame` is never invoked in
+            // production. The Discord sink consumes these frames directly for
+            // eligible session-bound inflight shapes; this watcher remains the
+            // fallback for bridge-owned/no-inflight envelopes.
+            forward_chunk_to_supervisor_relay(
+                &tmux_session_name,
+                &decoded_data.text,
+                &producer_registry,
+                &mut cached_relay_producer,
+            )
+        };
+        if let Some(ack_target) = data_mirrored_to_session_relay.ack_target.clone() {
+            all_data_session_bound_relay_ack = Some(ack_target);
+        }
+        if all_data.is_empty() {
             all_data_start_offset = decoded_data.start_offset.unwrap_or(data_start_offset);
+            all_data_fully_mirrored_to_session_relay = data_mirrored_to_session_relay.mirrored;
+        } else {
+            all_data_fully_mirrored_to_session_relay &= data_mirrored_to_session_relay.mirrored;
         }
         if decoded_data.text.is_empty() && all_data.is_empty() {
             continue;
         }
         all_data.push_str(&decoded_data.text);
         let turn_data_start_offset = all_data_start_offset;
-        // #3041 P1-3 (codex P1-3 R7): pass-scoped turn-boundary latch. Set TRUE when
-        // ANY forward on THIS watcher pass SPLIT a result-bearing chunk with a
-        // non-empty trailing tail (a LATER turn's bytes). After this turn consumes
-        // its own terminal ACK below, the stored ack is reset to `None` so the
-        // trailing turn — processed from the leftover buffer on a LATER pass, where
-        // `turn_identity_for_panel` may STILL be pinned to THIS turn's offset — can
-        // NEVER inherit this finished turn's ACK (→ MissingTarget → §3.2 reconcile,
-        // no black-hole). The reset happens AFTER the terminal ACK wait, so this
-        // turn's OWN ack resolution is untouched.
-        let mut split_trailing_turn_follows = false;
+        let mut session_bound_relay_turn_fully_mirrored = all_data_fully_mirrored_to_session_relay;
         let mut state = StreamLineState::new();
         let restored_turn_seed = restored_turn.take();
         let discard_restored_seed = should_discard_restored_seed_for_idle_direct_prompt(
@@ -5397,13 +3779,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         });
         let restored_response_seed = stream_seed.full_response.clone();
         let restored_assistant_text_seen = !restored_response_seed.trim().is_empty();
-        // #3041 P1-3 (Part a, B1): the `restored_assistant_text_seen` →
-        // "not fully mirrored" reset is now applied where
-        // `session_bound_relay_turn_fully_mirrored` is DECLARED (after the deferred
-        // initial forward below). A restored response prefix came from watcher
-        // state, not from chunks mirrored into the session-bound StreamRelay
-        // parser, so the legacy watcher delivery owner keeps this terminal envelope
-        // (we do not delegate a partial response).
+        if restored_assistant_text_seen {
+            // The restored response prefix came from watcher state, not from
+            // chunks mirrored into the session-bound StreamRelay parser. Keep
+            // the legacy watcher delivery owner for this terminal envelope so
+            // we do not delegate a partial response.
+            session_bound_relay_turn_fully_mirrored = false;
+        }
         let mut full_response = stream_seed.full_response;
         let mut tool_state = WatcherToolState::new();
 
@@ -5476,13 +3858,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let mut monitor_auto_turn_claimed = false;
         let mut monitor_auto_turn_deferred = false;
         let mut monitor_auto_turn_finished = false;
-        // #3016 P1: the synthetic mailbox message id + process-monotonic ledger
-        // generation the active monitor turn started under, threaded to
-        // `finish_monitor_auto_turn_if_claimed` so it finalizes the EXACT monitor
-        // turn (distinct ledger entries for sequential monitor turns even when
-        // the byte-offset-derived synthetic id repeats after a wrapper respawn).
-        let mut monitor_auto_turn_synthetic_msg_id: Option<MessageId> = None;
-        let mut monitor_auto_turn_ledger_generation: Option<u64> = None;
         // #1009: 1-shot tracker for the monitor-auto-turn preamble hint so the
         // hint text is emitted exactly once per watcher turn frame.
         let mut monitor_auto_turn_preamble_injected = false;
@@ -5496,70 +3871,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             &mut full_response,
             &mut tool_state,
         );
-        // #3041 P1-3 (Part a, B1): DEFERRED forward of the outer-read chunk. We now
-        // know — from `initial_outcome.found_result` — whether THIS chunk is the
-        // RESULT-bearing (terminal) one. If so, forward it as a TERMINAL frame
-        // carrying the commit fence (`terminal_event_consumed_offset(..)` + the
-        // pinned turn identity loaded at turn start), so the SAME frame that
-        // triggers the sink's terminal delivery carries the consumed_end + identity
-        // (FIFO single-task: a separate later frame would arrive after the sink
-        // already dispatched). Non-terminal chunks forward exactly as before (no
-        // fence, no streaming-latency change beyond the synchronous parse reorder).
-        // The ACK target is captured from THIS forward, so the watcher's wait now
-        // correlates to the terminal frame's sequence (more precise).
-        let initial_terminal_fence = watcher_terminal_commit_fence(
-            initial_outcome.found_result,
-            turn_data_start_offset,
-            terminal_event_consumed_offset(current_offset, &all_data),
-            turn_identity_for_panel.as_ref(),
-            &tmux_session_name,
-        );
-        let data_mirrored_to_session_relay = match initial_terminal_fence {
-            // #3041 P1-3 (codex P1-3 issue 1): a single physical chunk may carry
-            // turn A's result PLUS turn B's first bytes. `all_data` after the parse
-            // holds turn B's leftover; split the decoded chunk at that boundary so
-            // the TERMINAL frame carries only turn A's bytes and turn B's tail rides
-            // a separate non-terminal frame (no black-hole, no shared-ACK reuse).
-            Some(fence) => forward_terminal_chunk_with_trailing_to_supervisor_relay(
-                &tmux_session_name,
-                &decoded_data.text,
-                all_data.len(),
-                &producer_registry,
-                &mut cached_relay_producer,
-                fence,
-            ),
-            None => forward_chunk_to_supervisor_relay(
-                &tmux_session_name,
-                &decoded_data.text,
-                &producer_registry,
-                &mut cached_relay_producer,
-            ),
-        };
-        // #3041 P1-3 R6: turn-scope the carried ack target. A fresh `Some` (THIS
-        // turn forwarded a terminal frame) replaces it; a `None` keeps the stored
-        // ack ONLY when it belongs to THIS turn (`turn_data_start_offset`), so a new
-        // turn processed from leftover bytes never inherits a finished turn's stale
-        // ACK (which would let the prior turn's `Delivered` falsely satisfy this
-        // turn → black-hole). A reset-to-`None` makes this turn reconcile against
-        // the committed offset instead of waiting on a foreign sequence.
-        all_data_session_bound_relay_ack = carry_session_bound_ack_for_turn(
-            all_data_session_bound_relay_ack.take(),
-            data_mirrored_to_session_relay.ack_target.clone(),
-            turn_identity_for_panel
-                .as_ref()
-                .and_then(|identity| identity.turn_start_offset),
-        );
-        // #3041 P1-3 (codex P1-3 R7): latch the turn-boundary signal. If this initial
-        // forward split a result+next-turn chunk, a later turn follows; reset the ack
-        // after THIS turn's terminal ACK wait so the later turn never inherits it.
-        split_trailing_turn_follows |= data_mirrored_to_session_relay.trailing_turn_follows;
-        if initial_buffer_was_empty {
-            all_data_fully_mirrored_to_session_relay = data_mirrored_to_session_relay.mirrored;
-        } else {
-            all_data_fully_mirrored_to_session_relay &= data_mirrored_to_session_relay.mirrored;
-        }
-        let mut session_bound_relay_turn_fully_mirrored =
-            all_data_fully_mirrored_to_session_relay && !restored_assistant_text_seen;
         all_data_start_offset =
             advance_buffer_start_offset(turn_data_start_offset, initial_buffer_len, all_data.len());
         let live_events_dirty = flush_placeholder_live_events(&shared, channel_id, &mut tool_state);
@@ -5621,10 +3932,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             .await;
             monitor_auto_turn_claimed = start.acquired;
             monitor_auto_turn_deferred = monitor_auto_turn_deferred || start.deferred;
-            if start.acquired {
-                monitor_auto_turn_synthetic_msg_id = start.synthetic_message_id;
-                monitor_auto_turn_ledger_generation = start.ledger_generation;
-            }
             if !start.acquired {
                 all_data.clear();
                 all_data_start_offset = current_offset;
@@ -5736,14 +4043,37 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         ready_for_input_tracker.record_output();
                         let chunk_start_offset = current_offset.saturating_sub(chunk.len() as u64);
                         let decoded_chunk = utf8_decoder.decode(&chunk, chunk_start_offset);
-                        // #3041 P1-3 (Part a, B1): DEFER the forward until AFTER the
-                        // parse so the RESULT-bearing streaming chunk rides a TERMINAL
-                        // frame carrying the commit fence. Set only the buffer START
-                        // offset here (independent of the forward).
-                        let chunk_buffer_was_empty = all_data.is_empty();
-                        if chunk_buffer_was_empty {
+                        let chunk_forwarded_to_session_relay = if decoded_chunk.text.is_empty() {
+                            SupervisorRelayForward::mirrored_without_ack()
+                        } else {
+                            // E5 (#2412): producer-side wiring for the
+                            // supervisor-owned StreamRelay. Same rationale as
+                            // the outer read site in this fn — every decoded
+                            // chunk read off the tmux output file is also
+                            // pushed into the relay's MPSC so the
+                            // session-bound Discord sink receives frames in
+                            // production.
+                            forward_chunk_to_supervisor_relay(
+                                &tmux_session_name,
+                                &decoded_chunk.text,
+                                &producer_registry,
+                                &mut cached_relay_producer,
+                            )
+                        };
+                        if let Some(ack_target) = chunk_forwarded_to_session_relay.ack_target {
+                            all_data_session_bound_relay_ack = Some(ack_target);
+                        }
+                        let chunk_mirrored_to_session_relay =
+                            chunk_forwarded_to_session_relay.mirrored;
+                        session_bound_relay_turn_fully_mirrored &= chunk_mirrored_to_session_relay;
+                        if all_data.is_empty() {
                             all_data_start_offset =
                                 decoded_chunk.start_offset.unwrap_or(chunk_start_offset);
+                            all_data_fully_mirrored_to_session_relay =
+                                chunk_mirrored_to_session_relay;
+                        } else {
+                            all_data_fully_mirrored_to_session_relay &=
+                                chunk_mirrored_to_session_relay;
                         }
                         if decoded_chunk.text.is_empty() && all_data.is_empty() {
                             continue;
@@ -5762,68 +4092,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             &mut full_response,
                             &mut tool_state,
                         );
-                        // #3041 P1-3 (Part a, B1): deferred forward of THIS streaming
-                        // chunk. `outcome.found_result` now tells us whether this is
-                        // the RESULT-bearing chunk; if so it rides a TERMINAL frame
-                        // carrying the commit fence (consumed_end + pinned identity).
-                        // E5 (#2412): every decoded chunk is still pushed into the
-                        // relay MPSC; only the terminality of the frame changed.
-                        let streaming_terminal_fence = watcher_terminal_commit_fence(
-                            outcome.found_result,
-                            chunk_buffer_start_offset,
-                            terminal_event_consumed_offset(current_offset, &all_data),
-                            turn_identity_for_panel.as_ref(),
-                            &tmux_session_name,
-                        );
-                        let chunk_forwarded_to_session_relay = match streaming_terminal_fence {
-                            // #3041 P1-3 (codex P1-3 issue 1): split a result+next-turn
-                            // physical chunk at the leftover boundary so turn A's
-                            // terminal frame carries only A's bytes and turn B's tail
-                            // rides a separate non-terminal frame (no black-hole).
-                            Some(fence) => {
-                                forward_terminal_chunk_with_trailing_to_supervisor_relay(
-                                    &tmux_session_name,
-                                    &decoded_chunk.text,
-                                    all_data.len(),
-                                    &producer_registry,
-                                    &mut cached_relay_producer,
-                                    fence,
-                                )
-                            }
-                            None => forward_chunk_to_supervisor_relay(
-                                &tmux_session_name,
-                                &decoded_chunk.text,
-                                &producer_registry,
-                                &mut cached_relay_producer,
-                            ),
-                        };
-                        // #3041 P1-3 R6: turn-scope the carried ack target (see the
-                        // initial-parse site above). A fresh terminal frame's ack
-                        // replaces it; a non-terminal pass keeps the stored ack ONLY
-                        // when it belongs to THIS turn (`turn_data_start_offset`), so
-                        // a later turn never inherits a finished turn's stale ACK.
-                        all_data_session_bound_relay_ack = carry_session_bound_ack_for_turn(
-                            all_data_session_bound_relay_ack.take(),
-                            chunk_forwarded_to_session_relay.ack_target.clone(),
-                            turn_identity_for_panel
-                                .as_ref()
-                                .and_then(|identity| identity.turn_start_offset),
-                        );
-                        // #3041 P1-3 (codex P1-3 R7): latch the turn-boundary signal
-                        // for the streaming-chunk forward too (a result+next-turn
-                        // chunk can arrive mid-stream).
-                        split_trailing_turn_follows |=
-                            chunk_forwarded_to_session_relay.trailing_turn_follows;
-                        let chunk_mirrored_to_session_relay =
-                            chunk_forwarded_to_session_relay.mirrored;
-                        session_bound_relay_turn_fully_mirrored &= chunk_mirrored_to_session_relay;
-                        if chunk_buffer_was_empty {
-                            all_data_fully_mirrored_to_session_relay =
-                                chunk_mirrored_to_session_relay;
-                        } else {
-                            all_data_fully_mirrored_to_session_relay &=
-                                chunk_mirrored_to_session_relay;
-                        }
                         last_output_at = tokio::time::Instant::now();
                         all_data_start_offset = advance_buffer_start_offset(
                             chunk_buffer_start_offset,
@@ -5875,10 +4143,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 monitor_auto_turn_claimed = start.acquired;
                                 monitor_auto_turn_deferred =
                                     monitor_auto_turn_deferred || start.deferred;
-                                if start.acquired {
-                                    monitor_auto_turn_synthetic_msg_id = start.synthetic_message_id;
-                                    monitor_auto_turn_ledger_generation = start.ledger_generation;
-                                }
                                 if !start.acquired {
                                     was_paused = true;
                                     break;
@@ -6863,8 +5127,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         channel_id,
                         &mut monitor_auto_turn_claimed,
                         &mut monitor_auto_turn_finished,
-                        &mut monitor_auto_turn_synthetic_msg_id,
-                        &mut monitor_auto_turn_ledger_generation,
                     )
                     .await;
                     continue;
@@ -6968,13 +5230,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         fresh_idle_user_msg_id,
                         finish_mailbox_on_completion,
                         owed,
-                        // #3016 option A: this fresh-idle arm is already gated by
-                        // the outer `if should_finish_mailbox` (= flag-driven), so
-                        // it keeps the legacy flag semantics — `normal_completion`
-                        // stays `false` here. (No new assistant text was committed
-                        // in this pass, so it is not the canonical-completion
-                        // point that the decoupling targets.)
-                        false,
                         true,
                         "watcher fresh ready-for-input idle with queued backlog",
                     )
@@ -7001,8 +5256,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     channel_id,
                     &mut monitor_auto_turn_claimed,
                     &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
                 )
                 .await;
                 continue;
@@ -7057,8 +5310,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         channel_id,
                         &mut monitor_auto_turn_claimed,
                         &mut monitor_auto_turn_finished,
-                        &mut monitor_auto_turn_synthetic_msg_id,
-                        &mut monitor_auto_turn_ledger_generation,
                     )
                     .await;
                     continue;
@@ -7157,8 +5408,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     channel_id,
                     &mut monitor_auto_turn_claimed,
                     &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
                 )
                 .await;
                 continue;
@@ -7196,8 +5445,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             all_data.clear();
@@ -7260,8 +5507,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             continue;
@@ -7350,8 +5595,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     channel_id,
                     &mut monitor_auto_turn_claimed,
                     &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
                 )
                 .await;
                 continue;
@@ -7403,8 +5646,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             continue;
@@ -7517,8 +5758,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     channel_id,
                     &mut monitor_auto_turn_claimed,
                     &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
                 )
                 .await;
                 continue;
@@ -7609,8 +5848,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             continue;
@@ -7654,8 +5891,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             discard_watcher_pending_buffer_after_suppressed_turn(
@@ -7722,8 +5957,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             discard_watcher_pending_buffer_after_suppressed_turn(
@@ -7784,8 +6017,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     channel_id,
                     &mut monitor_auto_turn_claimed,
                     &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
                 )
                 .await;
                 discard_watcher_pending_buffer_after_suppressed_turn(
@@ -7916,27 +6147,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id.get(),
             )
             .is_some();
-        // #3041 P1-4 codex: snapshot the external-input lease ONCE under a single STATE
-        // lock and derive BOTH the presence bool and the generation from that one atomic
-        // read. Two separate accessor calls (present + generation) re-lock STATE between
-        // them, so a concurrently-started turn could record a NEWER same-key lease in the
-        // gap — leaving the bool reflecting turn-1 but the generation captured from
-        // turn-2's lease (present/generation TOCTOU). The post-delivery clear uses this
-        // generation so it only removes the EXACT lease this relay consumed; a NEWER
-        // same-key lease recorded by a concurrently-started turn during the slow send
-        // survives (no stale-snapshot clobber).
-        let external_input_lease_before_relay_snapshot =
-            crate::services::tui_prompt_dedupe::external_input_relay_lease(
+        let external_input_lease_before_relay =
+            crate::services::tui_prompt_dedupe::external_input_relay_lease_present(
                 watcher_provider.as_str(),
                 &tmux_session_name,
                 channel_id.get(),
             );
-        let external_input_lease_before_relay =
-            external_input_lease_before_relay_snapshot.is_some();
-        let external_input_lease_generation_before_relay =
-            external_input_lease_before_relay_snapshot
-                .as_ref()
-                .map(|lease| lease.generation);
         let inflight_before_relay = crate::services::discord::inflight::load_inflight_state(
             &watcher_provider,
             channel_id.get(),
@@ -7976,18 +6192,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let has_assistant_response = !full_response.trim().is_empty();
         let current_response = full_response.get(response_sent_offset..).unwrap_or("");
         let has_current_response = !current_response.trim().is_empty();
-
-        // #3041 P1-3 (Part a, B1 — FRAME-CARRIED, codex): the watcher's
-        // AUTHORITATIVE consumed-terminal END is NO LONGER persisted to the inflight
-        // FILE here. The old inflight-persist Part (a) was RACY (the sink read the
-        // end back from the file in `deliver_response`, a separate read/write across
-        // the relay's async drain). It is REPLACED by the frame-carried commit
-        // fence: the RESULT-bearing `StreamFrame` itself carries `consumed_end` +
-        // the pinned turn identity (forwarded during line collection above), and the
-        // sink advances `confirmed_end_offset` identity-gated on its CONFIRMED POST —
-        // POST + advance atomic per-frame, no file race. See
-        // `watcher_terminal_commit_fence` (producer) and
-        // `advance_offset_for_confirmed_delegated_terminal` (sink).
 
         let recent_stop_for_output =
             recent_turn_stop_for_watcher_range(channel_id, &tmux_session_name, data_start_offset);
@@ -8111,8 +6315,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             continue;
@@ -8181,105 +6383,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             continue;
-        }
-
-        // #3017 single output-offset authority — cross-actor relay dedup for
-        // the inflight-less wake / idle-background / monitor turn (E-13). When
-        // there is NO inflight, the idle-JSONL relay
-        // (`session_relay_sink::run_idle_jsonl_relay_loop`) reads the SAME
-        // JSONL and can relay this exact range. If it already committed the
-        // authoritative relayed offset at/past this turn's END, that range was
-        // already delivered to Discord — so the watcher must SKIP to avoid the
-        // duplicate `[E2E:E13:WAKE]`. This is deliberately gated on
-        // `inflight_missing_before_relay`: a normal Discord-origin turn
-        // (inflight present) keeps the watcher as the sole relay owner and is
-        // NEVER suppressed by the shared watermark (the long-standing
-        // invariant), so this only de-duplicates the un-owned wake/idle paths.
-        if inflight_missing_before_relay
-            && has_current_response
-            && current_offset > turn_data_start_offset
-        {
-            // Codex P1: a stale-high `confirmed_end_offset` left by a PREVIOUS
-            // wrapper (before any actor ran the regression reset) would make a
-            // FRESH wake/idle response with a lower `current_offset` look already
-            // delivered and get dropped. Run the SAME generation-aware
-            // regression reset BEFORE reading the watermark (a truncated /
-            // respawned JSONL resets it to 0 for a fresh wrapper), exactly as
-            // the idle relay path does. The unconditional pre-relay reset below
-            // at `pre_relay` is for the general path; this one guards the
-            // no-inflight dedup read specifically.
-            if let Ok(meta) = std::fs::metadata(&output_path) {
-                reset_stale_relay_watermark_if_output_regressed(
-                    &shared,
-                    channel_id,
-                    &tmux_session_name,
-                    meta.len(),
-                    "no_inflight_dedup",
-                );
-            }
-            // Codex r6 P2: `reset_stale_relay_watermark_if_output_regressed` only
-            // resets when the current EOF is LOWER than the stored watermark. A
-            // respawned same-named wrapper whose fresh JSONL has ALREADY grown
-            // PAST the previous wrapper's watermark would NOT trip that
-            // EOF-regression check, so a fresh no-inflight result whose consumed
-            // end is below the stale watermark would be wrongly suppressed.
-            // Independently reset the watermark when the `.generation` mtime has
-            // CHANGED since the watermark was committed (a fresh wrapper names a
-            // different byte stream). Shared with the idle relay path.
-            reset_relay_watermark_on_generation_change(
-                &shared,
-                channel_id,
-                &tmux_session_name,
-                "watcher_no_inflight_dedup",
-            );
-            // Read-only check against the authority. If the sink (fed by the
-            // idle-JSONL relay or the watcher's own session-bound delegation)
-            // already COMMITTED at/past this turn's END, that range was already
-            // delivered — the watcher skips to avoid the duplicate. The watcher
-            // does NOT claim here (a claim followed by a relay failure would mark
-            // the range delivered while dropping it); it advances the authority
-            // only on a CONFIRMED relay at `advance_watcher_confirmed_end` below.
-            //
-            // Codex r5 P2: compare against this TURN's consumed terminal end, NOT
-            // the whole read batch end (`current_offset`). A batch can contain a
-            // completed turn PLUS trailing JSONL for a later turn —
-            // `process_watcher_lines` stops at the first result, so the turn's
-            // output actually ends at `current_offset - all_data.len()` (the
-            // unprocessed tail), which is exactly what the normal commit path
-            // advances to (`runtime_binding_candidate_offset`). Comparing against
-            // `current_offset` would MISS a prior commit at that smaller consumed
-            // end and re-relay the already-committed terminal.
-            let turn_consumed_offset = terminal_event_consumed_offset(current_offset, &all_data);
-            let committed = shared.committed_relay_offset(channel_id);
-            if committed >= turn_consumed_offset && turn_consumed_offset > turn_data_start_offset {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 👁 watcher: suppressed no-inflight terminal relay for channel {} — range {}..{} already committed by another relay actor (offset authority, committed_end={})",
-                    channel_id.get(),
-                    turn_data_start_offset,
-                    turn_consumed_offset,
-                    committed
-                );
-                last_relayed_offset = Some(current_offset);
-                last_observed_generation_mtime_ns =
-                    Some(read_generation_file_mtime_ns(&tmux_session_name));
-                finish_monitor_auto_turn_if_claimed(
-                    &shared,
-                    &watcher_provider,
-                    channel_id,
-                    &mut monitor_auto_turn_claimed,
-                    &mut monitor_auto_turn_finished,
-                    &mut monitor_auto_turn_synthetic_msg_id,
-                    &mut monitor_auto_turn_ledger_generation,
-                )
-                .await;
-                continue;
-            }
         }
 
         // Relay coordination is limited to serialization plus telemetry. The
@@ -8335,8 +6441,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id,
                 &mut monitor_auto_turn_claimed,
                 &mut monitor_auto_turn_finished,
-                &mut monitor_auto_turn_synthetic_msg_id,
-                &mut monitor_auto_turn_ledger_generation,
             )
             .await;
             continue;
@@ -8420,137 +6524,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 crate::services::discord::inflight::RelayOwnerKind::None
             )
         });
-        let watcher_direct_fallback_intended = watcher_should_direct_send_after_session_bound_ack(
-            relay_decision.should_direct_send,
-            session_bound_ack_outcome,
-            relay_owner_present,
-        );
-        // #3041 P1-3 (Part b, §3.2): REPLACE the blind re-send. When the watcher
-        // would re-send its terminal body after a non-`Delivered` session-bound
-        // ACK (the `relay_terminal_ack_timeout` duplicate vector), reconcile
-        // against the offset authority FIRST. The range is the SAME consumed
-        // terminal range the lease/advance use:
-        // `[data_start_offset, terminal_event_consumed_offset(current_offset, all_data))`.
-        // Part (a) makes a confirmed sink delivery advance `committed_relay_offset`
-        // to the watcher's own `end`, so this consult is exact:
-        //   * committed >= end → SKIP (the sink delivered; ACK merely lagged) → no
-        //     duplicate (failure-mode-①);
-        //   * committed < end → re-send the FULL response (no black-hole). codex
-        //     BLOCKER 2: NO partial-suffix send for the watcher response-text path
-        //     (its `response_sent_offset` render coordinate cannot be derived from
-        //     the JSONL `committed` byte offset), and the sink delegation is
-        //     all-or-nothing so `committed` is never strictly between start and end.
-        // Reconcile ONLY on the session-bound re-send path (an attempted delegation
-        // whose ACK was not `Delivered`); the plain watcher-direct path (no
-        // delegation) keeps its existing behaviour untouched.
-        let watcher_resend_range_start = data_start_offset;
-        let watcher_resend_range_end = terminal_event_consumed_offset(current_offset, &all_data);
-        let watcher_resend_committed = shared.committed_relay_offset(channel_id);
-        let watcher_resend_reconciled = session_bound_terminal_delivery_attempted
-            && watcher_direct_fallback_intended
-            && !matches!(
+        let watcher_direct_fallback_after_session_bound_ack =
+            watcher_should_direct_send_after_session_bound_ack(
+                relay_decision.should_direct_send,
                 session_bound_ack_outcome,
-                SessionBoundRelayAckOutcome::Delivered
+                relay_owner_present,
             );
-        let watcher_resend_action = if watcher_resend_reconciled {
-            // Self-heal a stale-high authority left by a respawned/truncated
-            // wrapper BEFORE consulting it, exactly as the no-inflight gate and the
-            // idle relay do — so a fresh range is never wrongly skipped (codex P2).
-            reset_relay_watermark_on_generation_change(
-                &shared,
-                channel_id,
-                &tmux_session_name,
-                "watcher_terminal_resend_reconcile",
-            );
-            let committed = shared.committed_relay_offset(channel_id);
-            // #3151: gate the re-send on the in-flight sink-delivery marker BEFORE
-            // the committed-offset reconciliation. The marker is a `Leased{Sink}`
-            // state on the SAME per-channel `DeliveryLeaseCell` the watcher's own
-            // direct-send path acquires (B2). Read a coherent snapshot, then:
-            //   * Leased{Sink, fresh}  → WaitInFlight: a sink POST is in flight; do
-            //     NOT re-send this pass (the slow-sink-in-flight duplicate #3151).
-            //   * Leased{Sink, expired} → reclaim the dead sink's marker, then
-            //     SendFull (committed<end) — the no-black-hole arm.
-            //   * Committed{Sink} / committed>=end → Skip (range delivered).
-            //   * Unleased / non-Sink holder → unchanged (defer to the existing
-            //     committed-offset reconciliation).
-            let gate_cell = shared.delivery_lease(channel_id);
-            let snapshot = gate_cell.read();
-            let now_ms = crate::services::discord::lease_now_ms();
-            let (action, reclaim_expired_sink) = watcher_terminal_resend_action_gated(
-                &snapshot,
-                committed,
-                watcher_resend_range_start,
-                watcher_resend_range_end,
-                now_ms,
-            );
-            if reclaim_expired_sink {
-                // Force the dead sink's marker Unleased so the watcher-direct path
-                // below can re-acquire and SendFull (no black-hole). Deadline-only /
-                // identity-agnostic — a LIVE sink (fresh deadline) is never reached.
-                gate_cell.reclaim_if_expired(now_ms);
-            }
-            Some(action)
-        } else {
-            None
-        };
-        // #3151: WaitInFlight suppresses BOTH the re-send and the skip-log this
-        // pass — the watcher's NEXT terminal pass re-evaluates (bounded by the
-        // sink's lease deadline). It must NOT be treated as "send" by the fallback.
-        let watcher_resend_wait_in_flight = matches!(
-            watcher_resend_action,
-            Some(WatcherTerminalResendAction::WaitInFlight)
-        );
-        if watcher_resend_wait_in_flight {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                provider = watcher_provider.as_str(),
-                channel = channel_id.get(),
-                tmux_session = %tmux_session_name,
-                start = watcher_resend_range_start,
-                end = watcher_resend_range_end,
-                committed = watcher_resend_committed,
-                ?session_bound_ack_outcome,
-                "  [{ts}] 👁 #3151: deferred watcher terminal re-send — sink POST in flight (Leased{{Sink}}, fresh); will re-evaluate next pass (no duplicate)"
-            );
-        }
-        if matches!(
-            watcher_resend_action,
-            Some(WatcherTerminalResendAction::SkipAlreadyCommitted)
-        ) {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                provider = watcher_provider.as_str(),
-                channel = channel_id.get(),
-                tmux_session = %tmux_session_name,
-                start = watcher_resend_range_start,
-                end = watcher_resend_range_end,
-                committed = watcher_resend_committed,
-                ?session_bound_ack_outcome,
-                "  [{ts}] 👁 #3041 P1-3 §3.2: skipped watcher terminal re-send — range already committed by the sink (offset authority); no duplicate"
-            );
-        }
-        // The watcher actually direct-sends only when the reconciliation did NOT
-        // skip the range AND is not WAITING on an in-flight sink POST.
-        // `SkipAlreadyCommitted` suppresses the re-send (no dup); `WaitInFlight`
-        // (#3151) suppresses it this pass (re-evaluated next pass); `SendFull`/the
-        // non-reconciled path proceed to send.
-        let watcher_direct_fallback_after_session_bound_ack = watcher_direct_fallback_intended
-            && !matches!(
-                watcher_resend_action,
-                Some(
-                    WatcherTerminalResendAction::SkipAlreadyCommitted
-                        | WatcherTerminalResendAction::WaitInFlight
-                )
-            );
-        // codex BLOCKER 2: on a non-skip reconciled re-send the action is always
-        // `SendFull` (the watcher response-text coordinate cannot be derived from
-        // the JSONL `committed` offset, and the sink delegation is all-or-nothing,
-        // so no partial-suffix variant exists). The full body is re-sent: no
-        // black-hole when committed<end, and never a mis-offset
-        // `full_response[response_sent_offset..]` slice driven by an unrelated
-        // streaming offset. The non-reconciled path keeps the existing full-body
-        // fallback semantics.
         let session_bound_fallback_uses_full_body = session_bound_terminal_delivery_attempted
             && watcher_direct_fallback_after_session_bound_ack;
         let direct_terminal_response = watcher_terminal_response_for_direct_send(
@@ -8622,146 +6601,10 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             frame_ack_outcome = ?session_bound_ack_outcome,
             "relay flight recorder"
         );
-        // #3041 P1-3 (codex P1-3 R7): turn-boundary ACK reset. THIS turn's terminal
-        // ACK has now been waited on (`session_bound_ack_outcome` is captured) and
-        // logged. If a forward on this pass SPLIT a result-bearing chunk with a
-        // trailing tail, a LATER turn (B) follows in the leftover buffer. B is
-        // processed on a SUBSEQUENT pass — possibly while `turn_identity_for_panel`
-        // is STILL pinned to THIS turn's offset (B's inflight not yet established),
-        // which would make `carry_session_bound_ack_for_turn` KEEP this turn's stale
-        // ack and let this turn's `Delivered` falsely satisfy B's ACK → B
-        // black-holed. RESET the stored ack to `None` HERE, AFTER this turn consumed
-        // it, so B starts with NO inherited ack → MissingTarget → §3.2 reconcile
-        // (committed-offset SendFull-or-Skip) → B is never black-holed (worst case a
-        // duplicate, the #3151-deferred edge). This is the primary R7 guarantee and
-        // is independent of whether the pinned identity refreshes.
-        if split_trailing_turn_follows {
-            all_data_session_bound_relay_ack = None;
-        }
         let mut watcher_direct_terminal_idle_committed = false;
         let mut tui_direct_anchor_terminal_body_visible = false;
         let mut tui_direct_anchor_or_lease_present_for_lifecycle =
             prompt_anchor_present_before_relay || external_input_lease_before_relay;
-
-        // #3041 P1-1: acquire the delivery lease BEFORE the watcher direct-sends
-        // its terminal response. The lease identity is the turn-pinned id (NOT a
-        // stale late re-read — `pinned_finalize_user_msg_id` mirrors the same
-        // id-pinning #3141 established) and the byte range this delivery covers,
-        // `[data_start_offset, terminal_event_consumed_offset(..))` — the SAME
-        // consumed end the commit/offset-advance uses, so acquire and commit
-        // carry one identity. We only acquire on the watcher-direct path: the
-        // session-bound delegation path is the sink's lease (P1-2) and the
-        // suppression/no-response arms deliver nothing.
-        //
-        // B2 (single-holder, §5.2): if a DIFFERENT watcher instance already
-        // holds this cell (Leased, not yet committed/released/reclaimed) for the
-        // same channel, `try_acquire` returns false and this watcher MUST NOT
-        // direct-send (see the dedicated skip arm below). The acquire is the
-        // atomic fast-path on the cell (B4); commit/advance/release happen
-        // INLINE in the watcher (synchronously, to preserve the pre-P1-1 prompt
-        // confirmed_end advance and avoid an actor-deferral duplicate window).
-        // The actor CommitDelivery/ReleaseDelivery messages remain dormant.
-        let watcher_lease_turn = crate::services::discord::turn_finalizer::TurnKey::new(
-            channel_id,
-            pinned_finalize_user_msg_id(
-                inflight_before_relay.as_ref(),
-                &tmux_session_name,
-                current_offset,
-            ),
-            shared.current_generation,
-        );
-        let watcher_lease_holder = crate::services::discord::LeaseHolder::Watcher {
-            instance_id: watcher_instance_id,
-        };
-        let watcher_lease_start = data_start_offset;
-        let watcher_lease_end = terminal_event_consumed_offset(current_offset, &all_data);
-        let watcher_lease_cell = shared.delivery_lease(channel_id);
-        // Only the watcher-direct fallback path actually direct-sends; acquire
-        // exactly when that path will run with a real body so the lease identity
-        // matches the bytes we are about to deliver. A zero/inverted range never
-        // delivers, so do not lease it.
-        let watcher_will_direct_send =
-            watcher_direct_fallback_after_session_bound_ack && has_direct_terminal_response;
-        let watcher_lease_acquired =
-            if watcher_will_direct_send && watcher_lease_end > watcher_lease_start {
-                // #3041 P1-1 (B3, Issue 1): SELF-HEALING acquire. Before trying to
-                // acquire, reclaim the current lease IFF it is EXPIRED — a dead
-                // holder that `try_acquire`d but died before commit/release (e.g.
-                // on a cold/no-terminal path where the finalizer actor never
-                // cached `SharedData`, so the reconcile-tick reclaim would never
-                // run). Without this, a replacement watcher's `try_acquire` would
-                // lose to the dead holder's stuck `Leased` lease forever and take
-                // the B2 skip arm permanently → the range is never delivered
-                // (black-hole). `reclaim_if_expired` only frees a `Leased` lease
-                // whose `deadline_ms` has elapsed against the SAME process-monotonic
-                // `lease_now_ms()` clock the acquire deadline is computed against,
-                // so a LIVE holder mid-send (whose deadline is continuously pushed
-                // forward by the heartbeat below) is NOT reclaimed and this watcher
-                // still correctly B2-skips it (single-holder, §5.2).
-                // This makes the acquire the PRIMARY black-hole guarantee — bounded
-                // to the lease deadline, with NO dependency on the finalizer actor
-                // having `SharedData` cached. The reconcile-tick reclaim stays as a
-                // secondary net (harmless if redundant).
-                watcher_lease_cell.reclaim_if_expired(crate::services::discord::lease_now_ms());
-                watcher_lease_cell.try_acquire(
-                    watcher_lease_turn,
-                    watcher_lease_holder,
-                    watcher_lease_start,
-                    watcher_lease_end,
-                    crate::services::discord::lease_now_ms()
-                        .saturating_add(WATCHER_DELIVERY_LEASE_DEADLINE_MS),
-                )
-            } else {
-                false
-            };
-        // B2 skip flag: the watcher intended to direct-send but a different
-        // holder owns the lease for this range. Used to route to the skip arm
-        // (no duplicate send) instead of the send arm. NOTE (P1-3 residual): the
-        // 10s ACK-timeout blind re-send is intentionally NOT removed here. If the
-        // SAME watcher that holds the lease hits its ACK timeout it would
-        // re-enter this block in a LATER iteration; because the prior iteration
-        // committed-and-released the lease (Committed→Unleased), a same-holder
-        // re-send re-acquires and re-commits the SAME range — but the commit's
-        // offset advance is a monotonic CAS, so it CANNOT double-advance
-        // `confirmed_end_offset`. P1-3 replaces the blind re-send with
-        // committed-offset reconciliation; until then this residual same-holder
-        // re-send window is bounded and offset-idempotent.
-        let watcher_lease_b2_skip = watcher_will_direct_send
-            && watcher_lease_end > watcher_lease_start
-            && !watcher_lease_acquired;
-
-        // #3041 P1-1 (codex R2 Issue-2, BLOCKER B5 — DEFERRED, NOT a regression):
-        // the lease range is the FULL `[data_start_offset, consumed_end)`. If THIS
-        // holder dies AFTER posting chunk 1 but BEFORE its commit, a replacement
-        // reclaims the EXPIRED lease (after the deadline) and re-sends the WHOLE
-        // range → a partial DUPLICATE of the already-posted chunks. Exact-once on
-        // a partial multi-chunk crash needs per-message-id partial-commit state,
-        // which the #3041 design EXPLICITLY defers to BLOCKER B5 (a later phase) —
-        // it is intentionally NOT built here. This is NOT a P1-1 regression: the
-        // heartbeat (just below) guarantees a LIVE holder is NEVER reclaimed
-        // mid-send, so this duplicate can only happen on a GENUINE crash mid-send
-        // — which is EXACTLY the pre-P1-1 behavior (pre-P1-1 had no lease, so a
-        // replacement watcher re-sent the full range on crash too). P1-1 only ADDS
-        // a bounded delay (≤ the lease deadline) before the replacement re-delivers.
-        //
-        // #3041 P1-1 (§3, codex R2 Issue-1): keep the lease alive WHILE the send
-        // future is in flight. The deadline is short (15s) for fast dead-holder
-        // recovery; a long legitimate send (60+ rate-limited chunks can exceed any
-        // FIXED deadline) is covered because this background heartbeat `renew()`s
-        // the lease every 5s. The heartbeat is `stop()`ped BEFORE the inline commit
-        // (and aborts on drop), so it can never race the commit. Spawned ONLY when
-        // we actually acquired (the send arm runs); on the B2-skip / no-send arms
-        // there is no lease of ours to renew.
-        let watcher_lease_heartbeat = if watcher_lease_acquired {
-            Some(DeliveryLeaseHeartbeat::spawn(
-                watcher_lease_cell.clone(),
-                watcher_lease_holder,
-                watcher_lease_turn,
-            ))
-        } else {
-            None
-        };
-
         let relay_ok = if session_bound_relay_owns_terminal_delivery {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
@@ -8791,76 +6634,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         inflight.last_watcher_relayed_offset = Some(turn_data_start_offset);
                         inflight.last_watcher_relayed_generation_mtime_ns =
                             last_observed_generation_mtime_ns;
-                        // #3041 P1-3 (Part a, B1 — FRAME-CARRIED): the authoritative
-                        // consumed-terminal END is NO LONGER written to the inflight
-                        // file (the racy inflight-persist Part (a) is removed). It now
-                        // rides the RESULT-bearing `StreamFrame` and the sink advances
-                        // `confirmed_end_offset` identity-gated on its confirmed POST.
                         let _ = crate::services::discord::inflight::save_inflight_state(&inflight);
                     }
                 }
             }
             clear_provider_overload_retry_state(channel_id);
             true
-        } else if matches!(
-            watcher_resend_action,
-            Some(WatcherTerminalResendAction::SkipAlreadyCommitted)
-        ) {
-            // #3041 P1-3 (Part b, §3.2): the offset authority already covers this
-            // terminal range (`committed >= end`) — the session-bound sink already
-            // delivered it (the terminal-commit ACK merely lagged the 10s wait, and
-            // Part (a) advanced the authority on the sink's confirmed POST). This is
-            // the failure-mode-① case: re-sending would DUPLICATE. Treat it as a
-            // completed delegated delivery (mirror the delegation-success arm): the
-            // sink owns the placeholder/body, so do NOT delete the placeholder and
-            // do NOT re-send. `relay_ok = true` so the turn's lifecycle finalizes
-            // (completion observed, inflight cleared) exactly as a delivered turn —
-            // the response IS on the channel, just posted by the sink. The offset is
-            // already at `end`, so the inline advance below is an idempotent no-op.
-            if has_current_response {
-                tui_direct_anchor_terminal_body_visible = true;
-                last_relayed_offset = Some(turn_data_start_offset);
-                last_observed_generation_mtime_ns =
-                    Some(read_generation_file_mtime_ns(&tmux_session_name));
-            }
-            clear_provider_overload_retry_state(channel_id);
-            true
-        } else if matches!(
-            watcher_resend_action,
-            Some(WatcherTerminalResendAction::WaitInFlight)
-        ) {
-            // #3151: a sink POST is genuinely IN FLIGHT for this range
-            // (`Leased{Sink, fresh}` on the per-channel delivery lease). Do NOT
-            // re-send and do NOT finalize this pass — and crucially do NOT delete
-            // the placeholder (the sink is about to edit/post into it). Return
-            // `false` so `terminal_output_committed` stays false: the turn is left
-            // OPEN and the watcher re-enters this terminal block on its NEXT pass.
-            // The wait is BOUNDED by the sink's lease deadline — within one
-            // `DELIVERY_LEASE_DEADLINE_MS` the sink either commits+releases
-            // (→ committed>=end → SkipAlreadyCommitted next pass) or dies (→ the
-            // deadline lapses → the gate reclaims + SendFull next pass). This is the
-            // sole arm that closes the slow-sink-in-flight duplicate (#3151).
-            false
-        } else if watcher_lease_b2_skip {
-            // #3041 P1-1 B2 (single-holder, §5.2): a DIFFERENT watcher instance
-            // already holds the delivery lease for this exact channel/turn/range
-            // (it is mid-send or its lease has not yet been committed/released/
-            // reclaimed). A replacement watcher MUST NOT re-acquire and re-emit
-            // the same range — that is precisely the duplicate-send vector the
-            // lease closes. Skip the direct send; `terminal_output_committed`
-            // stays false so no offset advance / lifecycle side-effects run for
-            // this suppressed re-emit. The live holder will commit-advance the
-            // offset itself.
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                provider = %watcher_provider.as_str(),
-                channel = channel_id.get(),
-                tmux_session = %tmux_session_name,
-                data_start_offset = watcher_lease_start,
-                lease_end = watcher_lease_end,
-                "  [{ts}] 👁 #3041 B2: delivery lease held by another holder — skipped duplicate terminal send for {tmux_session_name} (range {watcher_lease_start}..{watcher_lease_end})"
-            );
-            false
         } else if watcher_direct_fallback_after_session_bound_ack {
             let formatted = if shared.status_panel_v2_enabled {
                 crate::services::discord::formatting::format_for_discord_with_status_panel(
@@ -9166,23 +6945,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             if relay_ok {
                 if direct_send_delivered || !has_direct_terminal_response {
                     if direct_send_delivered {
-                        // #3041 P1-4 codex: clear BY the generation snapshotted before
-                        // this awaited delivery, NOT by key. The old unconditional by-key
-                        // clear had a stale-snapshot clobber: turn-1 snapshots the lease
-                        // present, starts its send; turn-2 records a NEWER same-key lease;
-                        // turn-1's send succeeds and the by-key clear removed turn-2's
-                        // lease (re-introducing the exact no-clobber race the generation
-                        // nonce was added to kill). Generation-scoped clear only removes
-                        // the lease this relay actually consumed; sentinel/None (no lease
-                        // was present) clears nothing — guarded by the consumed gate too.
-                        if let Some(generation) = external_input_lease_generation_before_relay
-                            && external_input_lease_consumed_by_relay
-                        {
-                            crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_generation_matches(
+                        if external_input_lease_consumed_by_relay {
+                            crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
                                 watcher_provider.as_str(),
                                 &tmux_session_name,
                                 channel_id.get(),
-                                generation,
                             );
                         }
                         if watcher_direct_terminal_should_commit_session_idle(
@@ -9249,25 +7016,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 clear_provider_overload_retry_state(channel_id);
             }
             if retry_terminal_delivery_from_offset {
-                // #3041 P1-1: this is a SAME-holder abandon-without-commit — the
-                // partial send failed and we are about to reset the offset and
-                // retry the SAME range on the next loop iteration. If we left the
-                // lease `Leased`, the retry's `try_acquire` would lose to our own
-                // held lease and the B2 skip arm would suppress the legitimate
-                // retry until the lease-deadline reclaim. Abandon-release the lease
-                // here (Leased→Unleased) so the retry can re-acquire. This is the
-                // sole abandon point that must not commit; it is released on the
-                // cell directly (a same-holder abandon, not a commit/release race
-                // that needs actor serialization). Identity-matched no-op if the
-                // lease was never acquired on this path.
-                if watcher_lease_acquired {
-                    watcher_lease_cell.release(
-                        watcher_lease_holder,
-                        watcher_lease_turn,
-                        watcher_lease_start,
-                        watcher_lease_end,
-                    );
-                }
                 current_offset = turn_data_start_offset;
                 all_data.clear();
                 all_data_start_offset = current_offset;
@@ -9686,97 +7434,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // `confirmed_end` on the retry, falsely claiming there's nothing
         // new to relay.
         let terminal_committed_offset = runtime_binding_candidate_offset.unwrap_or(current_offset);
-        // #3041 P1-1 (§3, codex R2 Issue-1): the send future has completed (success
-        // or failure) by here. STOP the heartbeat BEFORE the inline commit so the
-        // renew loop is guaranteed not to race the `commit`/`release` below. Even a
-        // tick that already fired between the send completing and this `stop()` can
-        // only `renew` our OWN still-`Leased` lease (a no-op extension), which the
-        // commit immediately flips to `Committed`. After `stop()` no further renews
-        // can occur. On the non-acquired arms `watcher_lease_heartbeat` is `None`,
-        // so this is a no-op there.
-        if let Some(hb) = watcher_lease_heartbeat {
-            hb.stop();
-        }
-        if watcher_lease_acquired {
-            // #3041 P1-1 (§5.2): the watcher-direct terminal delivery was leased
-            // above. Commit the 3-way outcome and, on `Delivered`, advance the
-            // `confirmed_end_offset` watermark — both INLINE (synchronously),
-            // exactly at the pre-P1-1 call site/timing.
-            //
-            // WHY INLINE (and NOT the awaited `CommitDelivery`/`ReleaseDelivery`
-            // actor round-trip a prior P1-1 iteration used): the actor-commit
-            // DEFERRED the offset advance behind the finalize owner's mailbox.
-            // A `CommitDelivery` can queue behind an awaited `Terminal` handler,
-            // so `confirmed_end_offset` stays OLD for the duration of that await.
-            // Meanwhile `session_relay_sink` dedups purely on
-            // `shared.committed_relay_offset(channel)` (no lease consult until
-            // P1-2), so during the deferral window it can re-relay the SAME range
-            // → duplicate. That reopened the #3143 read-only offset-authority
-            // duplicate window the pre-P1-1 inline advance had closed. Committing
-            // the cell and advancing the watermark inline restores the prompt
-            // advance so #3143's `committed_relay_offset` consult sees it
-            // immediately — closing the window. The cell's `commit` is itself an
-            // atomic CAS on the payload mutex, so §5.2's "offset advances IFF the
-            // Delivered commit succeeds" still holds atomically without the actor.
-            // The ledger-coupling of the commit (§5.3) is a deferred later step;
-            // nothing here requires the actor to serialize commit against
-            // `Terminal` today (the advance is a standalone monotonic CAS).
-            //
-            // 3-way outcome: `Delivered` on a confirmed send (advances the
-            // watermark to the leased `end`), `NotDelivered` on a clean send
-            // failure, `Unknown` when the TUI quiescence gate left us
-            // lifecycle-paused (ambiguous — visible completion deferred to the
-            // backstop, so we must NOT claim these bytes delivered). We advance
-            // ONLY on `Delivered`, mirroring the old inline `!lifecycle_stage_paused`
-            // gate exactly. The leased `end` equals `terminal_committed_offset` on
-            // the committed path, so the offset reaches the same value the inline
-            // call used. Then release the lease (inline, same-holder) so the cell
-            // is free for the next turn.
-            let commit_outcome = if lifecycle_stage_paused {
-                crate::services::discord::LeaseOutcome::Unknown
-            } else if relay_ok {
-                crate::services::discord::LeaseOutcome::Delivered
-            } else {
-                crate::services::discord::LeaseOutcome::NotDelivered
-            };
-            let committed = watcher_lease_cell.commit(
-                watcher_lease_holder,
-                watcher_lease_turn,
-                watcher_lease_start,
-                watcher_lease_end,
-                commit_outcome,
-            );
-            debug_assert!(
-                committed,
-                "watcher must be able to commit its own freshly-acquired lease"
-            );
-            if committed && commit_outcome == crate::services::discord::LeaseOutcome::Delivered {
-                // INLINE advance — exactly the pre-P1-1 call site/timing.
-                advance_watcher_confirmed_end(
-                    &shared,
-                    &watcher_provider,
-                    channel_id,
-                    &tmux_session_name,
-                    watcher_lease_end,
-                    "src/services/discord/tmux_watcher.rs:watcher_lease_commit_advance",
-                );
-            }
-            // Release so the cell returns to Unleased for the next turn. Inline
-            // (same-holder) compare-and-release. Idempotent: a release that loses
-            // the identity match (e.g. the lease was reclaimed because the holder
-            // died and stopped heartbeating, so the short deadline elapsed) is a
-            // harmless no-op.
-            let _ = watcher_lease_cell.release(
-                watcher_lease_holder,
-                watcher_lease_turn,
-                watcher_lease_start,
-                watcher_lease_end,
-            );
-        } else if terminal_output_committed && !lifecycle_stage_paused {
-            // Non-watcher-direct committed paths (relay-suppressed task
-            // notifications, empty-turn cleanup, session-bound delegation that
-            // still consumed the range) keep the inline monotonic-CAS advance —
-            // they are NOT the watcher terminal-delivery path the lease governs.
+        if terminal_output_committed && !lifecycle_stage_paused {
             advance_watcher_confirmed_end(
                 &shared,
                 &watcher_provider,
@@ -9849,8 +7507,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             channel_id,
             &mut monitor_auto_turn_claimed,
             &mut monitor_auto_turn_finished,
-            &mut monitor_auto_turn_synthetic_msg_id,
-            &mut monitor_auto_turn_ledger_generation,
         )
         .await;
 
@@ -9878,27 +7534,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 channel_id.get()
             );
         }
-
-        // #3016 (codex R3): the late `inflight_state` re-read above (and the
-        // pre-relay snapshot) can already hold a NEWER follow-up turn's id in the
-        // R2/R3 offset-aliasing scenario — a follow-up on the SAME tmux session
-        // whose `turn_start_offset >= current_offset` (it begins AFTER this
-        // committed output range) does NOT make the watcher-yield guard yield, so
-        // the watcher still processes this OLD range while inflight on disk
-        // belongs to the newer turn. The finalize below is already safe (it uses
-        // `pinned_finalize_user_msg_id`, which returns 0 for such a newer turn —
-        // the EXACT complement of this gate's offset test), but the SAME block
-        // also runs the `⏳ → ✅` reaction + transcript + analytics write and
-        // `clear_inflight_state` on that late read. Compute the stale-range gate
-        // ONCE here and skip those wrong-turn side-effects (see the two call sites
-        // below). For every normal completion (inflight is THIS or an OLDER turn,
-        // absent, or rebind_origin/`user_msg_id == 0`) this is FALSE → no-op.
-        let completion_is_stale_for_newer_turn = committed_completion_is_stale_for_newer_turn(
-            inflight_before_relay.as_ref(),
-            inflight_state.as_ref(),
-            &tmux_session_name,
-            current_offset,
-        );
 
         if crate::services::discord::tui_prompt_relay::should_complete_tui_direct_anchor_lifecycle(
             terminal_output_committed,
@@ -9973,18 +7608,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // analytics/turn-id key, and `MessageId::new(0)` would panic. The
         // recovered response was already delivered via the notify-bot outbox
         // enqueue above, so skipping the reaction/analytics step is safe.
-        //
-        // #3016 (codex R3): also skip when `completion_is_stale_for_newer_turn` —
-        // the late `inflight_state` belongs to a NEWER follow-up turn that began
-        // AFTER this committed range. Marking it `✅` and writing its transcript /
-        // analytics here would lie about a still-running turn's completion. The
-        // finalize below independently refuses this turn (its
-        // `pinned_finalize_user_msg_id` returns 0 via the complementary offset
-        // test), so this gate keeps the reaction/transcript/analytics consistent
-        // with that decision. No-op for every normal completion.
         if terminal_output_committed
             && !lifecycle_stage_paused
-            && !completion_is_stale_for_newer_turn
             && let Some(state) = inflight_state
                 .as_ref()
                 .filter(|s| !s.rebind_origin && s.user_msg_id != 0)
@@ -10214,45 +7839,33 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             //     that survives into the next turn will not accidentally clear
             //     that turn's freshly registered cancel_token.
             let owed = mailbox_finalize_owed.swap(false, std::sync::atomic::Ordering::AcqRel);
-            // #3016 (codex R3): do NOT delete the on-disk inflight when it
-            // belongs to a NEWER follow-up turn (same session, started AT/AFTER
-            // this committed range). The same offset decision that makes
-            // `pinned_finalize_user_msg_id` return 0 just below gates the clear
-            // here, so this stale-range pass cannot wipe the newer turn's
-            // inflight out from under it. Only the on-disk file is gated; the
-            // in-memory `inflight_state` used afterward (finalize id source,
-            // dispatch resolution, history push) is unaffected. The
-            // `cleared_by_watcher` observability event only fires when the clear
-            // actually ran (preserve existing semantics).
-            if !completion_is_stale_for_newer_turn {
-                crate::services::discord::inflight::clear_inflight_state(
-                    &provider_kind,
-                    channel_id.get(),
-                );
-                let watcher_turn_id = inflight_state
-                    .as_ref()
-                    .filter(|s| s.user_msg_id != 0)
-                    .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
-                let watcher_session_key_owned =
-                    inflight_state.as_ref().and_then(|s| s.session_key.clone());
-                let watcher_dispatch_id_owned = resolved_did
-                    .clone()
-                    .or_else(|| inflight_state.as_ref().and_then(|s| s.dispatch_id.clone()));
-                crate::services::observability::emit_inflight_lifecycle_event(
-                    provider_kind.as_str(),
-                    channel_id.get(),
-                    watcher_dispatch_id_owned.as_deref(),
-                    watcher_session_key_owned.as_deref(),
-                    watcher_turn_id.as_deref(),
-                    "cleared_by_watcher",
-                    serde_json::json!({
-                        "owed_finalize": owed,
-                        "dispatch_ok": dispatch_ok,
-                        "has_assistant_response": has_assistant_response,
-                        "full_response_len": full_response.len(),
-                    }),
-                );
-            }
+            crate::services::discord::inflight::clear_inflight_state(
+                &provider_kind,
+                channel_id.get(),
+            );
+            let watcher_turn_id = inflight_state
+                .as_ref()
+                .filter(|s| s.user_msg_id != 0)
+                .map(|s| format!("discord:{}:{}", s.channel_id, s.user_msg_id));
+            let watcher_session_key_owned =
+                inflight_state.as_ref().and_then(|s| s.session_key.clone());
+            let watcher_dispatch_id_owned = resolved_did
+                .clone()
+                .or_else(|| inflight_state.as_ref().and_then(|s| s.dispatch_id.clone()));
+            crate::services::observability::emit_inflight_lifecycle_event(
+                provider_kind.as_str(),
+                channel_id.get(),
+                watcher_dispatch_id_owned.as_deref(),
+                watcher_session_key_owned.as_deref(),
+                watcher_turn_id.as_deref(),
+                "cleared_by_watcher",
+                serde_json::json!({
+                    "owed_finalize": owed,
+                    "dispatch_ok": dispatch_ok,
+                    "has_assistant_response": has_assistant_response,
+                    "full_response_len": full_response.len(),
+                }),
+            );
             // codex P2 (#1670): cleanup (mailbox_finish_turn + cancel_token
             // release) MUST run on every relay-completed terminal even when
             // `dispatch_ok = false`, otherwise organic turns leak forever.
@@ -10262,109 +7875,21 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // entry. The redundant `should_kickoff_queue` block further
             // below is also `dispatch_ok`-gated and remains as a fallback
             // for paths where the helper short-circuited.
-            // #3016 (codex R1+R2): derive the finalize id from the TURN-PINNED
-            // pre-relay snapshot, never from the late `inflight_state` re-read
-            // above. That late read reloads the on-disk inflight AFTER the
-            // relay/emit; the watcher loop is not turn-scoped (see the L~7327
-            // warning), so a follow-up turn may have already rewritten inflight on
-            // disk by then — its `user_msg_id` would belong to a NEWER turn. Under
-            // the old flag-gated path this finalize fired narrowly; with
-            // `normal_completion = true` it fires UNCONDITIONALLY, so a stale-id
-            // match here could `finish_turn_if_matches` and release the WRONG
-            // (follow-up) turn.
-            //
-            // R2 (offset-aliasing): even the pre-relay snapshot
-            // `inflight_before_relay` (loaded L~6163) is NOT inherently pinned to
-            // the OUTPUT RANGE being completed. The watcher-yield guard
-            // `watcher_should_yield_to_inflight_state` (tmux.rs:2110-2111) lets the
-            // watcher PROCEED on this old range when a FOLLOW-UP turn on the SAME
-            // session has `turn_start_offset >= current_offset` (it starts AFTER
-            // this range). In that case the snapshot holds the newer turn's id, and
-            // a session-only filter would still pass it. `pinned_finalize_user_msg_id`
-            // gates on the range relationship — effective start
-            // `turn_start_offset.unwrap_or(last_offset) < current_offset` — exactly
-            // mirroring the guard, so a newer turn yields 0 (no exact ledger match;
-            // turn_finalizer L~526 refuses to release a mismatched live turn). It
-            // keeps the session-match + `user_msg_id != 0` checks too.
-            //
-            // `current_offset` here is the end of the range this completion covers
-            // (same value passed to `commit_watcher_direct_terminal_session_idle`
-            // just below).
-            //
-            // R3 cross-ref: this SAME offset decision now also gates the
-            // `⏳ → ✅` reaction + transcript + analytics block and the
-            // `clear_inflight_state` above, via
-            // `completion_is_stale_for_newer_turn`
-            // (`committed_completion_is_stale_for_newer_turn` is the exact
-            // complement of this helper's `< current_offset` range test). So the
-            // newer-turn case yields 0 here AND skips those destructive
-            // side-effects — the two stay consistent by construction.
-            let restored_user_msg_id = pinned_finalize_user_msg_id(
-                inflight_before_relay.as_ref(),
-                &tmux_session_name,
-                current_offset,
-            );
-            // #3016 (codex B1): SKIP the normal-completion finalize ENTIRELY in the
-            // stale-newer-turn case — do NOT call it with `restored_user_msg_id == 0`.
-            // Why a 0-id submit here is unsafe, not a harmless no-op: with
-            // `normal_completion = true` this site finalizes UNCONDITIONALLY, and in
-            // the stale case `pinned_finalize_user_msg_id` returns 0. A 0-id
-            // `TurnKey` reaches `resolve_channel_only`
-            // (turn_finalizer.rs:161-181), which — when NO terminal(finalized)
-            // ledger entry exists for this channel/generation — collapses onto the
-            // SINGLE live non-finalized entry. In the stale scenario the OLD turn
-            // whose trailing output this is was already completed/finalized via its
-            // own path earlier (that is precisely WHAT makes a NEWER same-session
-            // turn already live), so its ledger entry may have been finalized/GC'd
-            // and the only live entry is the NEWER still-running turn. Submitting
-            // Complete with id 0 would then collapse onto and finalize that newer
-            // live turn — a wrong-turn finalize that releases its cancel_token /
-            // ledger entry mid-flight. The correct action is to finalize NOTHING
-            // here: the newer live turn owns its own normal-completion finalize when
-            // ITS terminal output is committed in a later watcher-loop iteration.
-            //
-            // `completion_is_stale_for_newer_turn` is the exact complement of the
-            // `< current_offset` range test inside `pinned_finalize_user_msg_id`, so
-            // "id == 0 here" and "skip the finalize" are the same predicate by
-            // construction (see the R3 cross-ref comment above).
-            //
-            // Skip-path bookkeeping: the watcher did NOT drive the finalize, so
-            // `watcher_drove_finalize = false`. The `owed = mailbox_finalize_owed
-            // .swap(false, AcqRel)` at L~8165 already ran UNCONDITIONALLY (pre-
-            // existing option-A ordering), so this skip does not change the atomic's
-            // lifecycle — and dropping the LOCAL `owed` here drops no legitimate
-            // work: with option A's decoupling the newer live turn no longer depends
-            // on the `owed` flag to finalize (it finalizes via its own
-            // `normal_completion = true` path with its real id). `delegated_finalize_owed
-            // = owed` below still feeds `watcher_handled_mailbox_finish` so queue-
-            // kickoff suppression / terminal-stop accounting keep the legacy flag
-            // intent intact on the skip path.
-            let watcher_drove_finalize = if !completion_is_stale_for_newer_turn {
-                finish_restored_watcher_active_turn(
-                    &shared,
-                    &provider_kind,
-                    channel_id,
-                    restored_user_msg_id,
-                    finish_mailbox_on_completion,
-                    owed,
-                    // #3016 option A: terminal output was committed above
-                    // (`terminal_output_committed && !lifecycle_stage_paused`), the
-                    // canonical *normal completion* point. Finalize unconditionally —
-                    // independent of `owed` / `finish_mailbox_on_completion` — so the
-                    // normal live bridge→watcher delegation turn no longer depends on
-                    // the legacy `mailbox_finalize_owed` flag. The finalizer is
-                    // idempotent (bridge winner → AlreadyFinalized here), so this
-                    // cannot over-finalize.
-                    true,
-                    dispatch_ok,
-                    "restored watcher completed with queued backlog",
-                )
-                .await
-            } else {
-                // Stale-newer-turn: finalize skipped (see above). The watcher did
-                // not drive any finalize on this pass.
-                false
-            };
+            // #3016: the in-memory `inflight_state` (loaded at L~5860) still
+            // holds the real id even though the on-disk file was cleared above,
+            // so pass it for an exact ledger match.
+            let restored_user_msg_id = inflight_state.as_ref().map(|s| s.user_msg_id).unwrap_or(0);
+            finish_restored_watcher_active_turn(
+                &shared,
+                &provider_kind,
+                channel_id,
+                restored_user_msg_id,
+                finish_mailbox_on_completion,
+                owed,
+                dispatch_ok,
+                "restored watcher completed with queued backlog",
+            )
+            .await;
             if !watcher_direct_terminal_idle_committed {
                 watcher_direct_terminal_idle_committed =
                     commit_watcher_direct_terminal_session_idle(
@@ -10381,16 +7906,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             let delegated_finalize_owed = owed;
             let mailbox = shared.mailbox(channel_id);
             let has_active_turn = mailbox.has_active_turn().await;
-            // #3016 (codex R1): couple the post-finalize lifecycle to the ACTUAL
-            // finalize, not just the legacy flag intent. `watcher_drove_finalize`
-            // is true whenever the helper ran the finalizer (here always, via
-            // `normal_completion = true`) — so queue-kickoff suppression and the
-            // terminal-stop-candidate path below correctly account for the newly
-            // decoupled normal-completion finalize even when both legacy flags are
-            // false. (Folding the flags in too keeps behavior identical on the
-            // flag-driven paths.)
             let watcher_handled_mailbox_finish =
-                watcher_drove_finalize || finish_mailbox_on_completion || delegated_finalize_owed;
+                finish_mailbox_on_completion || delegated_finalize_owed;
             let should_kickoff_queue = if watcher_handled_mailbox_finish
                 || monitor_auto_turn_finished
                 || has_active_turn
@@ -11367,10 +8884,9 @@ mod tests {
             &provider,
             channel_id,
             state.user_msg_id,
-            true,  // finish_mailbox_on_completion (restore semantics)
-            false, // delegated_finalize_owed
-            false, // normal_completion (#3016: this path is flag-gated, not the decoupled normal-completion arm)
-            false, // kickoff_queue
+            true,
+            false,
+            false,
             "terminal_delivery_timeout_cleanup_test",
         )
         .await;
@@ -11387,291 +8903,6 @@ mod tests {
             .into_intervention()
             .map(|(intervention, _)| intervention.text);
         assert_eq!(next.as_deref(), Some("queued follow-up"));
-    }
-
-    // #3016 test helper: a real, non-stale watcher handle so the
-    // `mailbox_finalize_owed` precondition is NON-vacuous and the helper's
-    // `swap(false)` revoke path actually has a slot to act on. Mirrors the
-    // `live_watcher_handle` builder in mod.rs's registry tests.
-    fn test_watcher_handle(
-        tmux_session_name: &str,
-        mailbox_finalize_owed: bool,
-    ) -> crate::services::discord::TmuxWatcherHandle {
-        crate::services::discord::TmuxWatcherHandle {
-            tmux_session_name: tmux_session_name.to_string(),
-            output_path: format!("/tmp/{tmux_session_name}.jsonl"),
-            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            resume_offset: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pause_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            turn_delivered: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_heartbeat_ts_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
-                crate::services::discord::tmux_watcher_now_ms(),
-            )),
-            mailbox_finalize_owed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                mailbox_finalize_owed,
-            )),
-        }
-    }
-
-    // #3016 option A (watcher normal-completion finalize decouple).
-    //
-    // Proves the decoupling directly: a *normal completion* drives the
-    // single-authority finalizer even when BOTH legacy flags are false —
-    // `finish_mailbox_on_completion = false` (fresh live watcher, see
-    // tmux.rs:`tmux_output_watcher` default) AND `delegated_finalize_owed =
-    // false` (`mailbox_finalize_owed` never set / already revoked). This is the
-    // exact gate that `mailbox_finalize_owed` USED to be the sole driver of on
-    // the normal live bridge→watcher delegation turn; after this change the
-    // finalize fires from the confirmed-completion signal instead, so the flag
-    // is now redundant for this path (flag_now_redundant). The finalizer's
-    // idempotence (proven by the #3140 matrix) keeps this from over-finalizing
-    // when the bridge already finalized first.
-    //
-    // codex R1 hardening: registers a REAL watcher handle (so the
-    // `mailbox_finalize_owed` precondition is non-vacuous and the helper's
-    // `swap(false)` revoke path is exercised), asserts the finalize drove via
-    // the return value, and keeps the idempotence assertion.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn normal_completion_finalizes_with_both_legacy_flags_false() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _root_guard = AgentdeskRootGuard::set(tmp.path());
-
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(987_3016);
-        let tmux_session_name = "AgentDesk-claude-adk-cc-9873016";
-
-        // Register a REAL watcher handle. The `mailbox_finalize_owed` flag is
-        // false here, so the precondition below is observed on an ACTUAL slot
-        // (not the vacuous "no handle exists" case the original test had).
-        shared
-            .tmux_watchers
-            .insert(channel_id, test_watcher_handle(tmux_session_name, false));
-
-        // Seed a live active mailbox turn (cancel token registered) so we can
-        // observe the finalize releasing it.
-        assert!(
-            mailbox_try_start_turn(
-                &shared,
-                channel_id,
-                std::sync::Arc::new(CancelToken::new()),
-                UserId::new(42),
-                MessageId::new(3001),
-            )
-            .await
-        );
-
-        // Pre-condition (NON-vacuous: real handle present): the legacy debt flag
-        // is NOT set for this channel's watcher. Combined with
-        // `finish_mailbox_on_completion = false` below, BOTH legacy gates are
-        // off — the only thing that can drive the finalize is the new
-        // `normal_completion` signal.
-        let watcher = shared
-            .tmux_watchers
-            .get(&channel_id)
-            .expect("real watcher handle must be registered for a non-vacuous precondition");
-        assert!(
-            !watcher
-                .mailbox_finalize_owed
-                .load(std::sync::atomic::Ordering::Acquire),
-            "precondition: mailbox_finalize_owed must be false for the decouple proof"
-        );
-        drop(watcher);
-
-        crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
-        let drove = super::finish_restored_watcher_active_turn(
-            &shared,
-            &provider,
-            channel_id,
-            3001,  // real user_msg_id (exact ledger match)
-            false, // finish_mailbox_on_completion — fresh live watcher
-            false, // delegated_finalize_owed — flag never set
-            true,  // normal_completion — confirmed terminal-output-committed point
-            false, // kickoff_queue
-            "normal_completion_decouple_test",
-        )
-        .await;
-        assert!(
-            drove,
-            "normal_completion must drive the finalize (helper must not early-return)"
-        );
-
-        // The finalize fired purely on `normal_completion`: the active mailbox
-        // turn's cancel token is released even though both legacy flags were
-        // false. Under the OLD flag-only gate this call would have early-returned
-        // and left the token in place.
-        let snapshot = mailbox_snapshot(&shared, channel_id).await;
-        assert!(
-            snapshot.cancel_token.is_none(),
-            "normal completion must finalize and release the mailbox token even with both legacy flags false"
-        );
-
-        // Idempotent: a second normal-completion submit for the same turn is a
-        // no-op (AlreadyFinalized) — no over-finalize, no underflow.
-        super::finish_restored_watcher_active_turn(
-            &shared,
-            &provider,
-            channel_id,
-            3001,
-            false,
-            false,
-            true,
-            false,
-            "normal_completion_decouple_test_double",
-        )
-        .await;
-        let snapshot_after = mailbox_snapshot(&shared, channel_id).await;
-        assert!(
-            snapshot_after.cancel_token.is_none(),
-            "second normal-completion submit stays a no-op (idempotent finalizer)"
-        );
-    }
-
-    // #3016 codex R1 (wrong-turn finalize guard). Companion to the decouple
-    // test above. Exercises the SAFETY PROPERTY the Issue-1 call-site fix
-    // depends on: once `normal_completion = true` finalizes UNCONDITIONALLY,
-    // the id handed to the finalizer must name the SAME turn the watcher just
-    // completed — otherwise a stale/follow-up id would `finish_turn_if_matches`
-    // and release the WRONG (newer) live turn.
-    //
-    // Scenario: turn A (id 3001) is finalized correctly; then a NEWER turn B
-    // (id 4002) becomes the live active turn; a stale normal-completion submit
-    // that mistakenly carries turn A's id (3001) must NOT release turn B. The
-    // call site avoids this by deriving the id from the turn-PINNED pre-relay
-    // snapshot (falling back to 0), but the finalizer's exact-id match is the
-    // backstop this asserts.
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn stale_normal_completion_does_not_release_newer_active_turn() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _root_guard = AgentdeskRootGuard::set(tmp.path());
-
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(987_3017);
-        let tmux_session_name = "AgentDesk-claude-adk-cc-9873017";
-
-        // Real watcher handle with the legacy debt flag PRE-SET so we can also
-        // assert the helper's `swap(false)` revoke path runs on the matching
-        // (correct-turn) finalize.
-        shared
-            .tmux_watchers
-            .insert(channel_id, test_watcher_handle(tmux_session_name, true));
-
-        // Turn A is the live active turn (id 3001).
-        assert!(
-            mailbox_try_start_turn(
-                &shared,
-                channel_id,
-                std::sync::Arc::new(CancelToken::new()),
-                UserId::new(42),
-                MessageId::new(3001),
-            )
-            .await
-        );
-
-        crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
-        // Finalize turn A with its OWN id — releases turn A and revokes the
-        // legacy flag.
-        let drove_a = super::finish_restored_watcher_active_turn(
-            &shared,
-            &provider,
-            channel_id,
-            3001,
-            false,
-            true, // delegated_finalize_owed (real flag-driven correct-turn finalize)
-            true,
-            false,
-            "stale_guard_turn_a",
-        )
-        .await;
-        assert!(drove_a, "correct-turn finalize must drive");
-        assert!(
-            mailbox_snapshot(&shared, channel_id)
-                .await
-                .cancel_token
-                .is_none(),
-            "turn A must be released by its matching finalize"
-        );
-        // The matching finalize consumed the debt: legacy flag revoked.
-        let watcher = shared
-            .tmux_watchers
-            .get(&channel_id)
-            .expect("handle present");
-        assert!(
-            !watcher
-                .mailbox_finalize_owed
-                .load(std::sync::atomic::Ordering::Acquire),
-            "matching finalize must revoke mailbox_finalize_owed (swap(false) path)"
-        );
-        drop(watcher);
-
-        // A NEWER turn B (id 4002) becomes the live active turn.
-        let token_b = std::sync::Arc::new(CancelToken::new());
-        assert!(
-            mailbox_try_start_turn(
-                &shared,
-                channel_id,
-                token_b.clone(),
-                UserId::new(42),
-                MessageId::new(4002),
-            )
-            .await
-        );
-
-        // A STALE normal-completion submit mistakenly carrying turn A's id
-        // (3001) must NOT release turn B (4002). It drove the finalizer (past
-        // the gate) but the exact-id match misses, so turn B stays live.
-        let drove_stale = super::finish_restored_watcher_active_turn(
-            &shared,
-            &provider,
-            channel_id,
-            3001, // STALE id (turn A), while turn B (4002) is live
-            false,
-            false,
-            true, // normal_completion fires unconditionally
-            false,
-            "stale_guard_stale_id",
-        )
-        .await;
-        assert!(
-            drove_stale,
-            "the stale submit still passes the gate (normal_completion = true)"
-        );
-        let snapshot_b = mailbox_snapshot(&shared, channel_id).await;
-        assert!(
-            snapshot_b.cancel_token.is_some(),
-            "a stale id MUST NOT release the newer active turn B (wrong-turn guard)"
-        );
-
-        // Sanity: turn B finalizes correctly when handed its OWN id.
-        super::finish_restored_watcher_active_turn(
-            &shared,
-            &provider,
-            channel_id,
-            4002,
-            false,
-            false,
-            true,
-            false,
-            "stale_guard_turn_b",
-        )
-        .await;
-        assert!(
-            mailbox_snapshot(&shared, channel_id)
-                .await
-                .cancel_token
-                .is_none(),
-            "turn B is released by its matching finalize"
-        );
     }
 
     #[test]
@@ -12294,423 +9525,5 @@ TUI-E2E-marker ssh-direct
         assert_eq!(format!("{}{}", first.text, second.text), payload);
         assert!(!first.text.contains('\u{FFFD}'));
         assert!(!second.text.contains('\u{FFFD}'));
-    }
-
-    /// #3041 P1-1 (§3, codex R2 Issue-1): heartbeat-renew lifecycle for the
-    /// in-flight watcher delivery lease. These tests use the GATED Tokio clock
-    /// (`start_paused`) to drive the heartbeat's `tokio::time::interval` WITHOUT
-    /// real sleeps; `lease_now_ms()` is a separate real monotonic clock, so we
-    /// assert reclaim behaviour with EXPLICIT `now_ms` arguments anchored to the
-    /// observed `lease_now_ms()` baseline.
-    mod delivery_lease_heartbeat {
-        use super::super::{
-            DeliveryLeaseHeartbeat, WATCHER_DELIVERY_LEASE_DEADLINE_MS,
-            WATCHER_DELIVERY_LEASE_HEARTBEAT_MS,
-        };
-        use crate::services::discord::turn_finalizer::TurnKey;
-        use crate::services::discord::{
-            DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
-        };
-        use serenity::model::id::ChannelId;
-        use std::sync::Arc;
-
-        fn watcher(id: u64) -> LeaseHolder {
-            LeaseHolder::Watcher { instance_id: id }
-        }
-
-        fn deadline_of(cell: &DeliveryLeaseCell) -> Option<u64> {
-            match cell.read() {
-                LeaseSnapshot::Leased { deadline_ms, .. } => Some(deadline_ms),
-                _ => None,
-            }
-        }
-
-        /// (a) A send that runs LONGER than the (short) deadline, but with the
-        /// heartbeat renewing every interval, is NEVER reclaimed mid-send: the
-        /// ORIGINAL holder's commit SUCCEEDS and advances the offset exactly once.
-        /// We acquire with a deliberately SHORT deadline (would expire almost
-        /// immediately), then let the heartbeat push it far forward, and confirm a
-        /// reclaim attempt well past the original deadline is a no-op.
-        #[tokio::test(flavor = "current_thread", start_paused = true)]
-        async fn long_send_heartbeat_renew_prevents_midsend_reclaim() {
-            let ch = ChannelId::new(7101);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 11, 0);
-            let h = watcher(1);
-
-            // Acquire with a TINY deadline relative to lease_now_ms(): without a
-            // heartbeat it would be reclaimable almost immediately.
-            let acquire_now = lease_now_ms();
-            let short_deadline = acquire_now.saturating_add(100);
-            assert!(cell.try_acquire(turn, h, 0, 64, short_deadline));
-            assert_eq!(deadline_of(&cell), Some(short_deadline));
-
-            // Start the heartbeat (owned by this "watcher" frame).
-            let hb = DeliveryLeaseHeartbeat::spawn(cell.clone(), h, turn);
-
-            // Drive the gated clock across SEVERAL heartbeat intervals — i.e. a
-            // long multi-chunk send. Each crossed interval fires one renew.
-            for _ in 0..6 {
-                tokio::time::advance(std::time::Duration::from_millis(
-                    WATCHER_DELIVERY_LEASE_HEARTBEAT_MS,
-                ))
-                .await;
-                tokio::task::yield_now().await;
-            }
-
-            // The heartbeat has pushed the deadline far beyond the original short
-            // one: it is now lease_now_ms()+DEADLINE_MS (a much larger value).
-            let renewed_deadline = deadline_of(&cell).expect("still Leased mid-send");
-            assert!(
-                renewed_deadline > short_deadline,
-                "heartbeat must have renewed the deadline forward (was {short_deadline}, now {renewed_deadline})"
-            );
-
-            // A reclaim attempt at a time PAST the ORIGINAL short deadline (but
-            // before the renewed one) is a no-op — the live holder is protected.
-            assert!(
-                !cell.reclaim_if_expired(short_deadline.saturating_add(1)),
-                "a renewed (live) lease must NOT be reclaimed past its original deadline"
-            );
-
-            // Stop the heartbeat (as the watcher does before committing), then the
-            // ORIGINAL holder commits successfully and advances exactly once.
-            hb.stop();
-            tokio::task::yield_now().await;
-            assert!(
-                cell.commit(h, turn, 0, 64, LeaseOutcome::Delivered),
-                "the original holder's own commit must succeed (lease never lost)"
-            );
-            match cell.read() {
-                LeaseSnapshot::Committed { outcome, end, .. } => {
-                    assert_eq!(outcome, LeaseOutcome::Delivered);
-                    assert_eq!(end, 64);
-                }
-                other => panic!("expected Committed, got {other:?}"),
-            }
-        }
-
-        /// (b) A holder that "dies" (its heartbeat is dropped/stopped and never
-        /// renews) lets the SHORT deadline elapse, so a replacement reclaims and
-        /// acquires. We simulate death by dropping the heartbeat handle BEFORE the
-        /// renew interval fires, then asserting a reclaim past the (un-renewed)
-        /// deadline succeeds and a replacement acquires.
-        #[tokio::test(flavor = "current_thread", start_paused = true)]
-        async fn dead_holder_no_renew_is_reclaimed_after_short_deadline() {
-            let ch = ChannelId::new(7102);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 22, 0);
-            let dead = watcher(1);
-
-            let acquire_now = lease_now_ms();
-            let deadline = acquire_now.saturating_add(WATCHER_DELIVERY_LEASE_DEADLINE_MS);
-            assert!(cell.try_acquire(turn, dead, 0, 40, deadline));
-
-            // The holder "dies": its heartbeat is dropped immediately (Drop aborts
-            // it) WITHOUT ever renewing.
-            let hb = DeliveryLeaseHeartbeat::spawn(cell.clone(), dead, turn);
-            drop(hb);
-            tokio::task::yield_now().await;
-
-            // Before the deadline: NOT reclaimable (single-holder still honored).
-            assert!(!cell.reclaim_if_expired(deadline.saturating_sub(1)));
-            // Past the (un-renewed, short) deadline: a replacement reclaims it.
-            assert!(
-                cell.reclaim_if_expired(deadline),
-                "a dead holder that stopped heartbeating is reclaimed after the short deadline"
-            );
-            // And a replacement (new instance, new turn) can acquire the freed cell.
-            let replacement = watcher(2);
-            let turn_b = TurnKey::new(ch, 33, 0);
-            assert!(
-                cell.try_acquire(
-                    turn_b,
-                    replacement,
-                    40,
-                    72,
-                    deadline.saturating_add(WATCHER_DELIVERY_LEASE_DEADLINE_MS),
-                ),
-                "a reclaimed cell is acquirable by the replacement (no black-hole)"
-            );
-        }
-
-        /// (c) `renew` by a NON-holder, or for the WRONG turn, is a no-op (false)
-        /// and does NOT touch the live holder's deadline — the heartbeat of one
-        /// holder can never extend (or steal) another's lease.
-        #[tokio::test(flavor = "current_thread", start_paused = true)]
-        async fn renew_by_non_holder_or_wrong_turn_is_noop() {
-            let ch = ChannelId::new(7103);
-            let cell = DeliveryLeaseCell::new(ch);
-            let turn = TurnKey::new(ch, 44, 0);
-            let holder = watcher(1);
-
-            let now = lease_now_ms();
-            let deadline = now.saturating_add(1_000);
-            assert!(cell.try_acquire(turn, holder, 0, 16, deadline));
-
-            // Wrong holder, correct turn → no-op.
-            assert!(
-                !cell.renew(watcher(2), turn, now.saturating_add(99_999)),
-                "a different holder cannot renew the lease"
-            );
-            // Correct holder, wrong (stale) turn → no-op.
-            let wrong_turn = TurnKey::new(ch, 45, 0);
-            assert!(
-                !cell.renew(holder, wrong_turn, now.saturating_add(99_999)),
-                "a stale/wrong turn cannot renew the lease"
-            );
-            // The deadline is UNCHANGED by the rejected renews.
-            assert_eq!(
-                deadline_of(&cell),
-                Some(deadline),
-                "rejected renews must not mutate the deadline"
-            );
-
-            // The TRUE holder/turn CAN renew → deadline extends.
-            let extended = now.saturating_add(WATCHER_DELIVERY_LEASE_DEADLINE_MS);
-            assert!(cell.renew(holder, turn, extended));
-            assert_eq!(deadline_of(&cell), Some(extended));
-
-            // After commit (Committed, not Leased) even the true holder's renew
-            // no-ops — a late heartbeat tick after commit cannot disturb the cell.
-            assert!(cell.commit(holder, turn, 0, 16, LeaseOutcome::Delivered));
-            assert!(
-                !cell.renew(holder, turn, extended.saturating_add(1)),
-                "a renew on a Committed lease (a late tick after commit) is a no-op"
-            );
-        }
-    }
-
-    /// #3151: the deterministic decision seam for the in-flight sink-delivery
-    /// marker gate (`watcher_terminal_resend_action_gated`). Table-drives the gate
-    /// over every lease-snapshot variant and asserts the reclaim side-effect flag.
-    /// The decision fn is PURE (no cell mutation) so the side effect is testable in
-    /// isolation; the integration tests below exercise the actual `reclaim_if_expired`.
-    mod inflight_sink_marker_gate {
-        use super::super::{
-            WatcherTerminalResendAction, watcher_terminal_resend_action,
-            watcher_terminal_resend_action_gated,
-        };
-        use crate::services::discord::turn_finalizer::TurnKey;
-        use crate::services::discord::{
-            DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
-        };
-        use serenity::model::id::ChannelId;
-
-        const START: u64 = 100;
-        const END: u64 = 200;
-        // `committed < end` so the underlying reconciliation would choose SendFull.
-        const COMMITTED_BELOW_END: u64 = 100;
-        const NOW: u64 = 50_000;
-
-        fn turn() -> TurnKey {
-            TurnKey::new(ChannelId::new(7201), 9, 0)
-        }
-
-        /// Unleased → behaves EXACTLY as the ungated reconciliation (SendFull when
-        /// committed<end), no reclaim.
-        #[test]
-        fn unleased_defers_to_reconciliation() {
-            let (action, reclaim) = watcher_terminal_resend_action_gated(
-                &LeaseSnapshot::Unleased,
-                COMMITTED_BELOW_END,
-                START,
-                END,
-                NOW,
-            );
-            assert_eq!(action, WatcherTerminalResendAction::SendFull);
-            assert!(!reclaim);
-            // ... and committed>=end on an Unleased cell still Skips (unchanged).
-            let (skip, reclaim2) = watcher_terminal_resend_action_gated(
-                &LeaseSnapshot::Unleased,
-                END,
-                START,
-                END,
-                NOW,
-            );
-            assert_eq!(skip, WatcherTerminalResendAction::SkipAlreadyCommitted);
-            assert!(!reclaim2);
-        }
-
-        /// Leased{Sink, FRESH} (now < deadline) → WaitInFlight, no reclaim. This is
-        /// the slow-sink-in-flight case: the watcher must NOT re-send this pass.
-        #[test]
-        fn leased_sink_fresh_waits_in_flight() {
-            let snap = LeaseSnapshot::Leased {
-                holder: LeaseHolder::Sink,
-                turn: turn(),
-                deadline_ms: NOW + 5_000, // fresh: deadline strictly in the future
-                start: START,
-                end: END,
-            };
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
-            assert_eq!(action, WatcherTerminalResendAction::WaitInFlight);
-            assert!(!reclaim, "a fresh sink lease must NOT be reclaimed");
-        }
-
-        /// Leased{Sink, EXPIRED} (now >= deadline) → reclaim flag set AND SendFull
-        /// (committed<end). This is the dead-sink no-black-hole arm.
-        #[test]
-        fn leased_sink_expired_reclaims_and_sends_full() {
-            let snap = LeaseSnapshot::Leased {
-                holder: LeaseHolder::Sink,
-                turn: turn(),
-                deadline_ms: NOW, // expired: now >= deadline
-                start: START,
-                end: END,
-            };
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
-            assert_eq!(action, WatcherTerminalResendAction::SendFull);
-            assert!(
-                reclaim,
-                "an expired sink lease MUST be reclaimed (no black-hole)"
-            );
-        }
-
-        /// Committed{Sink} (sink committed Delivered, not yet released) → Skip,
-        /// no reclaim (belt-and-suspenders early Skip).
-        #[test]
-        fn committed_sink_skips() {
-            let snap = LeaseSnapshot::Committed {
-                holder: LeaseHolder::Sink,
-                turn: turn(),
-                start: START,
-                end: END,
-                outcome: LeaseOutcome::Delivered,
-            };
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
-            assert_eq!(action, WatcherTerminalResendAction::SkipAlreadyCommitted);
-            assert!(!reclaim);
-        }
-
-        /// Leased by a WATCHER (non-Sink) holder → the #3151 gate does NOT interpose;
-        /// it defers to the existing reconciliation (the B2 path is untouched).
-        #[test]
-        fn leased_by_watcher_defers_to_reconciliation() {
-            let snap = LeaseSnapshot::Leased {
-                holder: LeaseHolder::Watcher { instance_id: 1 },
-                turn: turn(),
-                deadline_ms: NOW + 5_000,
-                start: START,
-                end: END,
-            };
-            // committed<end → SendFull (NOT WaitInFlight: only a Sink lease waits).
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
-            assert_eq!(action, WatcherTerminalResendAction::SendFull);
-            assert!(!reclaim);
-            // committed>=end on a watcher-held lease still Skips.
-            let (skip, _) = watcher_terminal_resend_action_gated(&snap, END, START, END, NOW);
-            assert_eq!(skip, WatcherTerminalResendAction::SkipAlreadyCommitted);
-        }
-
-        /// committed>=end with a Bridge holder → Skip (the range is delivered),
-        /// matching the ungated path.
-        #[test]
-        fn committed_covered_skips_for_non_sink() {
-            let snap = LeaseSnapshot::Leased {
-                holder: LeaseHolder::Bridge,
-                turn: turn(),
-                deadline_ms: NOW + 1,
-                start: START,
-                end: END,
-            };
-            let (action, _) = watcher_terminal_resend_action_gated(&snap, END, START, END, NOW);
-            assert_eq!(action, WatcherTerminalResendAction::SkipAlreadyCommitted);
-            // Sanity: the gated decision equals the ungated reconciliation here.
-            assert_eq!(action, watcher_terminal_resend_action(END, START, END));
-        }
-
-        /// (b) Integration: a DEAD/STALE sink marker on a real cell is reclaimed by
-        /// the gate's `reclaim_if_expired` side effect, then the watcher re-acquires
-        /// and SendFulls — NO black-hole. Drives the actual cell, not just the flag.
-        #[test]
-        fn dead_sink_marker_reclaimed_then_resent_no_blackhole() {
-            let ch = ChannelId::new(7202);
-            let cell = DeliveryLeaseCell::new(ch);
-            let sink_turn = TurnKey::new(ch, 9, 0);
-            let now = lease_now_ms();
-            let deadline = now.saturating_add(10);
-            // Sink set the marker then "died" (no heartbeat renews it).
-            assert!(cell.try_acquire(sink_turn, LeaseHolder::Sink, START, END, deadline));
-
-            // The gate, observed at a time PAST the deadline, decides reclaim+SendFull.
-            let past = deadline.saturating_add(1);
-            let snap = cell.read();
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, past);
-            assert_eq!(action, WatcherTerminalResendAction::SendFull);
-            assert!(reclaim);
-
-            // The caller performs the reclaim → the dead marker clears → a
-            // replacement watcher re-acquires and re-delivers (no black-hole).
-            assert!(cell.reclaim_if_expired(past));
-            assert!(matches!(cell.read(), LeaseSnapshot::Unleased));
-            let watcher_turn = TurnKey::new(ch, 9, 0);
-            assert!(
-                cell.try_acquire(
-                    watcher_turn,
-                    LeaseHolder::Watcher { instance_id: 1 },
-                    START,
-                    END,
-                    past.saturating_add(10_000),
-                ),
-                "the reclaimed cell is re-acquirable by the watcher (no black-hole)"
-            );
-        }
-
-        /// (c) reclaim-races-with-late-sink-success cannot corrupt the lease: after a
-        /// dead sink's marker is reclaimed and the watcher re-acquires, the zombie
-        /// sink's late `commit`/`release` (full-identity-gated) NO-OP against the
-        /// watcher's lease — no wrong-holder advance, no stolen release.
-        #[test]
-        fn reclaim_then_late_sink_commit_cannot_corrupt_lease() {
-            let ch = ChannelId::new(7203);
-            let cell = DeliveryLeaseCell::new(ch);
-            let sink_turn = TurnKey::new(ch, 9, 0);
-            let now = lease_now_ms();
-            let deadline = now.saturating_add(10);
-            assert!(cell.try_acquire(sink_turn, LeaseHolder::Sink, START, END, deadline));
-
-            // Watcher reclaims the expired sink marker and re-acquires the SAME range.
-            let past = deadline.saturating_add(1);
-            assert!(cell.reclaim_if_expired(past));
-            let watcher_holder = LeaseHolder::Watcher { instance_id: 1 };
-            assert!(cell.try_acquire(
-                sink_turn,
-                watcher_holder,
-                START,
-                END,
-                past.saturating_add(10_000),
-            ));
-
-            // The zombie sink's LATE commit/release target Sink+sink_turn; the cell
-            // is now held by the Watcher → both no-op (false). No corruption.
-            assert!(
-                !cell.commit(
-                    LeaseHolder::Sink,
-                    sink_turn,
-                    START,
-                    END,
-                    LeaseOutcome::Delivered
-                ),
-                "a late sink commit must NOT act on the watcher's lease"
-            );
-            assert!(
-                !cell.release(LeaseHolder::Sink, sink_turn, START, END),
-                "a late sink release must NOT free the watcher's lease"
-            );
-            // The watcher's lease is intact and committable by its true holder.
-            assert!(cell.commit(
-                watcher_holder,
-                sink_turn,
-                START,
-                END,
-                LeaseOutcome::Delivered
-            ));
-        }
     }
 }

@@ -1058,9 +1058,6 @@ fn status_panel_resets_on_two_distinct_nonces_without_provider_id() {
 /// its instance key from `session_panel_instance_key` (which reads that nonce),
 /// and a second TUI-direct spawn mints a DISTINCT nonce → distinct instance key
 /// → reset — even with no provider-session signal at all.
-// Exercises `write_spawn_nonce` / `session_panel_instance_key`, which live in
-// the unix-only `tmux` module (tmux/TUI-direct paths are unix-only).
-#[cfg(unix)]
 #[test]
 fn status_panel_resets_across_two_tui_direct_spawns_via_stamped_nonce() {
     let _lock = match crate::config::shared_test_env_lock().lock() {

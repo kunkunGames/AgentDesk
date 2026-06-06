@@ -125,35 +125,7 @@ fn session_bound_terminal_delivery_route_decision(
     provider: &ProviderKind,
     channel_id: u64,
 ) -> SessionBoundTerminalDeliveryRouteDecision {
-    // #3041 P1-4 codex (TOCTOU close): read the external-input lease ONCE here and
-    // thread that exact snapshot into BOTH the block decision below AND the RAII
-    // release guard (`arm_with_observed_lease`). Re-reading the lease separately
-    // at arm time could capture a DIFFERENT lease (another thread can overwrite it
-    // between the two mutex acquisitions), so the guard might clear a lease the
-    // route never observed. The shared single read makes the guard's captured
-    // identity == what the route decision saw.
-    let observed_lease = crate::services::tui_prompt_dedupe::external_input_relay_lease(
-        provider.as_str(),
-        tmux_session_name,
-        channel_id,
-    );
-    session_bound_terminal_delivery_route_decision_with_lease(
-        inflight,
-        tmux_session_name,
-        provider,
-        channel_id,
-        observed_lease.as_ref(),
-    )
-}
-
-fn session_bound_terminal_delivery_route_decision_with_lease(
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-    provider: &ProviderKind,
-    channel_id: u64,
-    observed_lease: Option<&crate::services::tui_prompt_dedupe::ExternalInputRelayLease>,
-) -> SessionBoundTerminalDeliveryRouteDecision {
-    if session_bound_external_lease_blocks_delivery(observed_lease) {
+    if session_bound_external_lease_blocks_delivery(provider, channel_id, tmux_session_name) {
         return SessionBoundTerminalDeliveryRouteDecision::Skipped;
     }
     match session_bound_terminal_delivery_route_or_skip(
@@ -168,213 +140,22 @@ fn session_bound_terminal_delivery_route_decision_with_lease(
 }
 
 fn session_bound_external_lease_blocks_delivery(
-    observed_lease: Option<&crate::services::tui_prompt_dedupe::ExternalInputRelayLease>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    tmux_session_name: &str,
 ) -> bool {
-    let Some(lease) = observed_lease else {
+    let Some(lease) = crate::services::tui_prompt_dedupe::external_input_relay_lease(
+        provider.as_str(),
+        tmux_session_name,
+        channel_id,
+    ) else {
         return false;
     };
-    // #3041 P1-4 / §4-④: the external_input lease's role is now "input dedup
-    // only". A *foreign-owner* lease (BridgeAdapter / TuiPromptRelay /
-    // TmuxWatcher) still names the OTHER subsystem that owns this terminal
-    // delivery, so the session-bound sink must still defer to it (that is NOT
-    // the self-block that caused the up-to-10min stall). But an `Unassigned`
-    // or `SessionBoundRelay`-owned lease is THIS sink's own input-dedup marker
-    // — it must NOT block our own delivery (terminal-delivery serialization now
-    // belongs to the `DeliveryLeaseCell` B2 gate + per-sequence ACK +
-    // reconciliation, not to this lease). Keeping the foreign-owner deferral is
-    // a routing concern, not a self-serialization lock, so it does not
-    // re-introduce the duplicate the DeliveryLeaseCell now guards against.
     !matches!(
         lease.relay_owner,
         crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::Unassigned
             | crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::SessionBoundRelay
     )
-}
-
-/// RAII guard that guarantees the session-bound `external_input_relay_lease`
-/// is released on EVERY exit path of a terminal delivery (`deliver_response`):
-/// Ok, Err, `?`-propagation, early-return, HTTP-503, and panic/unwind via
-/// `Drop`. #3041 P1-4 (§4-④, fixes the leak behind #2955).
-///
-/// Before P1-4 the lease was cleared only on the four Ok delivery branches; an
-/// `Err` / `?` / 503 left it set for the full 600s TTL, and
-/// `session_bound_external_lease_blocks_delivery` would then block the NEXT
-/// terminal delivery for up to ~10 minutes.
-///
-/// NO-CLOBBER: the guard captures the UNIQUE `generation` of the EXACT lease the
-/// route decision observed (a SINGLE read threaded in via `arm_with_observed_lease`)
-/// and clears via `clear_external_input_relay_lease_if_generation_matches`, so a
-/// NEWER turn that re-took the same `(provider, tmux_session, channel)` lease
-/// during a slow delivery is left untouched — even when the two leases are
-/// value-identical `Unassigned` markers (all trace fields `None`), their
-/// generations differ, so the guard only ever releases its OWN lease (mirrors
-/// `TuiDirectExternalInputLeaseGuard`). #3041 P1-4 codex.
-struct SessionBoundExternalInputLeaseGuard {
-    provider: ProviderKind,
-    tmux_session_name: String,
-    channel_id: u64,
-    /// `generation` of the recorded lease this guard armed with. Drop clears ONLY
-    /// this exact generation.
-    generation: u64,
-}
-
-impl SessionBoundExternalInputLeaseGuard {
-    /// Arm a guard IFF the lease the route decision observed (threaded in as
-    /// `observed_lease`, a SINGLE shared read) is an `Unassigned`/
-    /// `SessionBoundRelay`-owned input lease for this delivery target. Foreign-owner
-    /// leases are not ours to release (a different subsystem owns them), and
-    /// no-lease deliveries have nothing to clear, so both return `None` (inert — no
-    /// Drop clear). Capturing the generation from the SAME read the route observed
-    /// closes the TOCTOU where a re-read at arm time could see a different lease.
-    fn arm_with_observed_lease(
-        provider: &ProviderKind,
-        channel_id: u64,
-        tmux_session_name: &str,
-        observed_lease: Option<&crate::services::tui_prompt_dedupe::ExternalInputRelayLease>,
-    ) -> Option<Self> {
-        let lease = observed_lease?;
-        if !matches!(
-            lease.relay_owner,
-            crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::Unassigned
-                | crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::SessionBoundRelay
-        ) {
-            return None;
-        }
-        Some(Self {
-            provider: provider.clone(),
-            tmux_session_name: tmux_session_name.to_string(),
-            channel_id,
-            generation: lease.generation,
-        })
-    }
-
-    /// Test-only convenience: read the current lease for this target and arm with
-    /// it (the production path threads in the route's single read instead).
-    #[cfg(test)]
-    fn arm_if_present(
-        provider: &ProviderKind,
-        channel_id: u64,
-        tmux_session_name: &str,
-    ) -> Option<Self> {
-        let observed = crate::services::tui_prompt_dedupe::external_input_relay_lease(
-            provider.as_str(),
-            tmux_session_name,
-            channel_id,
-        );
-        Self::arm_with_observed_lease(provider, channel_id, tmux_session_name, observed.as_ref())
-    }
-}
-
-impl Drop for SessionBoundExternalInputLeaseGuard {
-    fn drop(&mut self) {
-        // Compare-and-clear by generation: only release the lease if the CURRENT
-        // lease for this key is STILL the exact one (same generation) we armed
-        // with. A newer turn's lease that re-took this key during a slow delivery
-        // — even a value-identical `Unassigned` lease — has a DIFFERENT generation
-        // and therefore survives this drop.
-        crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_generation_matches(
-            self.provider.as_str(),
-            &self.tmux_session_name,
-            self.channel_id,
-            self.generation,
-        );
-    }
-}
-
-/// #3151: RAII in-flight sink-delivery marker on the per-channel
-/// [`super::DeliveryLeaseCell`]. The sink ACQUIRES this cell as
-/// [`super::LeaseHolder::Sink`] for the SAME `(channel, turn, [start,end))`
-/// coordinate the watcher's §3.2 reconciliation computes, BEFORE it starts the
-/// Discord POST. While the POST is in flight a [`super::DeliveryLeaseHeartbeat`]
-/// renews the lease deadline, so the watcher's gate reads `Leased{Sink, fresh}`
-/// and WAITS instead of re-sending — closing the slow-sink-in-flight duplicate.
-///
-/// The marker is RECLAIMABLE: it is held by a heartbeat task that dies with the
-/// sink, so a crashed/stalled sink stops renewing → the deadline lapses → the
-/// watcher reclaims and re-sends within ~one deadline (no black-hole).
-///
-/// CLEAR ordering: on the SUCCESS path the caller advances the committed offset
-/// FIRST (via `advance_after_confirmed_post`) then calls [`Self::commit`], so the
-/// instant the marker clears the watcher reconciliation reads `committed >= end`
-/// → Skip (never a re-send into a just-cleared marker). On EVERY exit (Ok / Err /
-/// `?` / panic) Drop RELEASES the lease (compare-and-release on the full
-/// `(holder, turn, [start,end))` identity, so a stale older-turn release no-ops).
-/// A failure path that never commits leaves the cell `Unleased` with committed
-/// NOT advanced — the watcher then reconciles `committed < end` → SendFull.
-struct SinkDeliveryLeaseGuard {
-    cell: Arc<super::DeliveryLeaseCell>,
-    turn: super::turn_finalizer::TurnKey,
-    start: u64,
-    end: u64,
-    /// The in-flight heartbeat; aborted on Drop (mirrors the watcher's RAII).
-    _heartbeat: super::DeliveryLeaseHeartbeat,
-}
-
-impl SinkDeliveryLeaseGuard {
-    /// Self-heal a dead PRIOR holder, then CAS-acquire the cell as
-    /// [`super::LeaseHolder::Sink`] for `(turn, [start,end))`. Returns `Some` (and
-    /// spawns the heartbeat) only when the acquire wins. If the acquire FAILS
-    /// (the watcher/bridge already holds the range), returns `None`: the sink then
-    /// POSTs WITHOUT a marker and WITHOUT a heartbeat — it never blocks delivery on
-    /// a failed acquire (no self-black-hole), and no duplicate arises because the
-    /// other holder owns that range (single-winner CAS).
-    fn acquire(
-        cell: &Arc<super::DeliveryLeaseCell>,
-        turn: super::turn_finalizer::TurnKey,
-        start: u64,
-        end: u64,
-    ) -> Option<Self> {
-        // Mirror the watcher's self-healing acquire (tmux_watcher.rs:8594): reclaim
-        // an EXPIRED prior holder so a stale dead lease cannot make this acquire
-        // lose and leave the sink markerless (which would reintroduce the dup).
-        cell.reclaim_if_expired(super::lease_now_ms());
-        let acquired = cell.try_acquire(
-            turn,
-            super::LeaseHolder::Sink,
-            start,
-            end,
-            super::lease_now_ms().saturating_add(super::DELIVERY_LEASE_DEADLINE_MS),
-        );
-        if !acquired {
-            return None;
-        }
-        let heartbeat =
-            super::DeliveryLeaseHeartbeat::spawn(cell.clone(), super::LeaseHolder::Sink, turn);
-        Some(Self {
-            cell: cell.clone(),
-            turn,
-            start,
-            end,
-            _heartbeat: heartbeat,
-        })
-    }
-
-    /// SUCCESS-path commit. Called AFTER the committed offset has already been
-    /// advanced, so the watcher reconciliation reads `committed >= end` the moment
-    /// the marker clears. Compare-and-X on the full `(Sink, turn, [start,end))`
-    /// identity → a stale clear from an older turn no-ops. Drop still releases.
-    fn commit(&self) {
-        self.cell.commit(
-            super::LeaseHolder::Sink,
-            self.turn,
-            self.start,
-            self.end,
-            super::LeaseOutcome::Delivered,
-        );
-    }
-}
-
-impl Drop for SinkDeliveryLeaseGuard {
-    fn drop(&mut self) {
-        // Release on EVERY exit (Ok after commit, or Err/`?`/panic without commit).
-        // `release` is valid from both `Leased` (failure, never committed) and
-        // `Committed` (success), and is full-identity-gated, so it only ever clears
-        // OUR own marker — a newer turn that re-leased this cell during a slow POST
-        // survives this drop. (The `_heartbeat` field's own Drop aborts the renew
-        // task; field-drop order makes that benign — release is the authority.)
-        self.cell
-            .release(super::LeaseHolder::Sink, self.turn, self.start, self.end);
-    }
 }
 
 fn session_bound_should_send_new_chunks_for_placeholder(response_text: &str) -> bool {
@@ -489,181 +270,24 @@ impl SessionBoundDiscordRelaySink {
         }
     }
 
-    /// #3041 P1-3 (Part a, BLOCKER B1 — the FRAME-CARRIED "commit fence"): on a
-    /// CONFIRMED terminal Discord delivery, advance the offset authority
-    /// (`confirmed_end_offset`) to the producer's AUTHORITATIVE consumed-terminal
-    /// END carried ON the RESULT-bearing `StreamFrame` (`delivery.terminal_consumed_end`),
-    /// NOT a value read back from the inflight FILE. The frame both triggered this
-    /// delivery and carries the commit data, so the POST success and the advance
-    /// are atomic per-frame — no inflight-file read/write race (the old racy
-    /// Part (a) is removed). This couples the POST to the advance in the SAME path
-    /// so the watcher's §3.2 reconciliation (Part b) sees `committed >= end` and
-    /// SKIPS its blind re-send (no duplicate) even when the commit ACK lagged.
-    ///
-    /// IDENTITY GATE (delayed-old-frame / wrong-turn protection): advance ONLY when
-    /// the frame's pinned `(turn_user_msg_id, turn_started_at)` STILL matches the
-    /// channel's CURRENT inflight identity. If a newer/different turn has taken the
-    /// channel (or no inflight remains), a stale terminal frame for the prior turn
-    /// must NOT advance the authority — that would wrongly skip the new turn's
-    /// reconciliation. `inflight` is supplied by the caller; the production path
-    /// (`advance_after_confirmed_post`) re-loads it FRESH after the Discord POST
-    /// returns (codex P1-3 issue 3), so the gate compares against the CURRENT
-    /// channel state rather than a snapshot taken before the slow async POST.
-    ///
-    /// DIRECT ADVANCE, not a Sink lease commit: the sink runs UNDER the watcher's
-    /// delegation and is NOT a per-channel `DeliveryLeaseCell` holder. The producer
-    /// is the byte-range AUTHORITY; the sink advances to its OWN `end` via
-    /// `advance_watcher_confirmed_end`'s monotonic CAS so it can never regress,
-    /// double-advance, or overshoot.
-    ///
-    /// NO-BLACK-HOLE: the sink NEVER reads a fresh JSONL EOF (which could include
-    /// later-appended undelivered bytes, codex r4 P1). `terminal_consumed_end` is
-    /// the producer's exact consumed-terminal end for THIS delivered turn. When the
-    /// producer did not delegate a terminal end on this frame (None / zero) the
-    /// sink does not advance (the watcher's own delivery path advances instead).
-    /// #3041 P1-3 (codex P1-3 issue 3 — stale-snapshot close): re-check the
-    /// identity gate against a FRESHLY-RELOADED inflight AFTER the confirmed
-    /// Discord POST/edit returned, then advance. `deliver_response` loads the
-    /// inflight ONCE before the slow async POST; if the turn is cleared or replaced
-    /// DURING that POST, that pre-POST snapshot still authorizes the advance → a
-    /// wrong-turn advance. Re-loading here (immediately before the advance, after
-    /// the await) means the gate sees the CURRENT channel state: if a newer turn
-    /// took the channel (or inflight was cleared) during the POST, the gate blocks.
-    ///
-    /// This is the ONLY advance path `deliver_response` uses; the pure
-    /// `advance_offset_for_confirmed_delegated_terminal` it delegates to keeps its
-    /// explicit-inflight signature so the gate logic stays unit-testable.
-    fn advance_after_confirmed_post(
-        &self,
-        shared: &super::SharedData,
-        provider: &ProviderKind,
-        channel_id: u64,
-        session_name: &str,
-        delivery: &SessionRelayDelivery,
-        sink_lease_guard: Option<&SinkDeliveryLeaseGuard>,
-    ) {
-        let fresh_inflight = super::inflight::load_inflight_state(provider, channel_id);
-        self.advance_offset_for_confirmed_delegated_terminal(
-            shared,
-            provider,
-            channel_id,
-            session_name,
-            delivery,
-            fresh_inflight.as_ref(),
-        );
-        // #3151 CLEAR (success): advance committed FIRST (above), THEN commit the
-        // marker. Ordering matters — the instant the marker clears the watcher
-        // reconciliation must read `committed >= end` (→ Skip), never re-send into
-        // a just-cleared marker. `commit` is full-identity-gated, so a stale frame
-        // whose `(turn, range)` no longer matches the live lease no-ops. Drop on
-        // exit releases the lease (Committed → Unleased) regardless.
-        if let Some(guard) = sink_lease_guard {
-            guard.commit();
-        }
-    }
-
-    fn advance_offset_for_confirmed_delegated_terminal(
-        &self,
-        shared: &super::SharedData,
-        provider: &ProviderKind,
-        channel_id: u64,
-        session_name: &str,
-        delivery: &SessionRelayDelivery,
-        inflight: Option<&super::inflight::InflightTurnState>,
-    ) {
-        let Some(end) = delivery.terminal_consumed_end.filter(|end| *end > 0) else {
-            return;
-        };
-        // IDENTITY GATE: the frame's pinned turn identity must still match the
-        // channel's current inflight. A delayed frame from an already-replaced
-        // turn (or a cleared inflight) is ignored — never advances a wrong turn.
-        let Some(inflight) = inflight else {
-            tracing::debug!(
-                provider = provider.as_str(),
-                channel = channel_id,
-                tmux_session = %session_name,
-                frame_user_msg_id = delivery.frame_turn_user_msg_id,
-                "session-bound sink: terminal frame carried a commit fence but inflight is gone; identity gate blocks advance"
-            );
-            return;
-        };
-        // #3041 P1-3 (codex P1-3 issue 2 R4): STRICT `turn_start_offset` identity.
-        // Two consecutive `user_msg_id == 0` turns started in the SAME second
-        // (identical `started_at`) would collide on the weak `(user_msg_id,
-        // started_at)` pair alone, so `turn_start_offset` is a REQUIRED part of the
-        // gate — there is NO None fallback. A fenced terminal frame (the only kind
-        // that reaches this advance, since `terminal_consumed_end` is Some) is
-        // GUARANTEED by the producer (`watcher_terminal_commit_fence`) to carry a
-        // real `turn_start_offset`: the producer only sets the fence when the turn's
-        // start offset is known, otherwise it forwards a non-terminal frame and the
-        // watcher reconciliation's SendFull delivers (no black-hole). Therefore a
-        // frame reaching here with `frame_turn_start_offset == None`, or whose
-        // offset does not equal the current inflight's, MUST NOT advance — it is a
-        // stale/mismatched frame, never a legitimate fence for the current turn.
-        let identity_matches = inflight.user_msg_id == delivery.frame_turn_user_msg_id
-            && inflight.started_at == delivery.frame_turn_started_at
-            && delivery.frame_turn_start_offset.is_some()
-            && inflight.turn_start_offset == delivery.frame_turn_start_offset;
-        if !identity_matches {
-            tracing::debug!(
-                provider = provider.as_str(),
-                channel = channel_id,
-                tmux_session = %session_name,
-                frame_user_msg_id = delivery.frame_turn_user_msg_id,
-                inflight_user_msg_id = inflight.user_msg_id,
-                frame_turn_start_offset = delivery.frame_turn_start_offset,
-                inflight_turn_start_offset = inflight.turn_start_offset,
-                "session-bound sink: terminal frame identity != current inflight; identity gate blocks advance (delayed/wrong-turn frame)"
-            );
-            return;
-        }
-        super::tmux::advance_watcher_confirmed_end(
-            shared,
-            provider,
-            ChannelId::new(channel_id),
-            session_name,
-            end,
-            "src/services/discord/session_relay_sink.rs:sink_confirmed_terminal_advance",
-        );
-    }
-
     async fn deliver_response(
         &self,
         delivery: SessionRelayDelivery,
     ) -> Result<SessionRelayDeliveryOutcome, RelaySinkError> {
         let channel_id = delivery.channel_id;
-        let provider = delivery.provider.clone();
+        let provider = delivery.provider;
         let inflight = super::inflight::load_inflight_state(&provider, channel_id);
-        // #3041 P1-3 (Part a, B1 — frame-carried): the producer's authoritative
-        // consumed-terminal END now rides on the RESULT-bearing frame
-        // (`delivery.terminal_consumed_end`), NOT read back from the inflight FILE
-        // (the racy old Part (a) is removed). The `inflight` loaded here is used
-        // ONLY for the route decision + trace context BELOW. The IDENTITY GATE's
-        // advance does NOT reuse this pre-POST snapshot — `advance_after_confirmed_post`
-        // re-loads a FRESH inflight AFTER the await (codex P1-3 issue 3), so a turn
-        // cleared/replaced during the slow POST cannot authorize a wrong-turn advance.
         let trace = session_relay_trace_context(
             &provider,
             channel_id,
             &delivery.session_name,
             inflight.as_ref(),
         );
-        // #3041 P1-4 codex (TOCTOU close): read the external-input lease ONCE and
-        // thread the SAME snapshot into both the route/block decision and the RAII
-        // release guard, so the guard's captured generation == the lease the route
-        // observed. No `.await` runs between this read and arming the guard.
-        let observed_external_lease =
-            crate::services::tui_prompt_dedupe::external_input_relay_lease(
-                provider.as_str(),
-                &delivery.session_name,
-                channel_id,
-            );
-        let route = match session_bound_terminal_delivery_route_decision_with_lease(
+        let route = match session_bound_terminal_delivery_route_decision(
             inflight.as_ref(),
             &delivery.session_name,
             &provider,
             channel_id,
-            observed_external_lease.as_ref(),
         ) {
             SessionBoundTerminalDeliveryRouteDecision::Route(route) => route,
             SessionBoundTerminalDeliveryRouteDecision::Skipped => {
@@ -692,30 +316,9 @@ impl SessionBoundDiscordRelaySink {
                     false,
                     Some("bridge-owned or mismatched inflight"),
                 );
-                // #3041 P1-5: the SOLE sink-local decline. The route decision
-                // declined deterministically (a foreign-owner lease block, or
-                // `route_or_skip` Err = bridge-owned / mismatched inflight). This is
-                // `NotDelivered`, NOT `Unknown`: the sink KNOWS it did not post. The
-                // watcher routes `NotDelivered` through committed-offset
-                // reconciliation (§3.2): if no owner committed, SendFull recovers the
-                // turn — never a blind skip.
-                return Ok(SessionRelayDeliveryOutcome::NotDelivered);
+                return Ok(SessionRelayDeliveryOutcome::Skipped);
             }
         };
-        // #3041 P1-4 (§4-④): arm the RAII release-on-all-paths guard the moment
-        // this sink owns the terminal delivery. From here on EVERY exit — Ok,
-        // Err, `?`-propagation (shared/http unavailable, 503), and panic — drops
-        // this guard, which compare-and-clears (`_if_matches`) ONLY our own
-        // input-dedup lease. This replaces the four scattered Ok-path clears with
-        // ONE release path, closing the leak that left the lease set for the full
-        // 600s TTL on Err/`?`/503 and blocked the next delivery for up to ~10min.
-        let _external_input_lease_guard =
-            SessionBoundExternalInputLeaseGuard::arm_with_observed_lease(
-                &provider,
-                channel_id,
-                &delivery.session_name,
-                observed_external_lease.as_ref(),
-            );
         let shared = self
             .health_registry
             .shared_for_provider(&provider)
@@ -747,37 +350,6 @@ impl SessionBoundDiscordRelaySink {
             formatted
         };
         let channel = ChannelId::new(channel_id);
-
-        // #3151: SET the reclaimable in-flight sink-delivery marker BEFORE the
-        // Discord POST. The marker is a `Leased{Sink, turn, [start,end)}` state on
-        // the SAME per-channel `DeliveryLeaseCell` the watcher gates on, for the
-        // SAME `(channel, turn, range)` coordinate the watcher's §3.2
-        // reconciliation computes. While the POST is in flight the heartbeat keeps
-        // the deadline fresh, so the watcher's gate reads `Leased{Sink, fresh}` and
-        // WAITS instead of re-sending the slow-sink range (the #3151 duplicate).
-        // Only mark a real, ordered `[start,end)` (both Some && e>s): a zero/None
-        // range never advances the offset, so leasing it would gain nothing. ONE
-        // acquire covers ALL three POST branches below (the guard lives across the
-        // whole body and the inline advance). A FAILED acquire (watcher/bridge
-        // already holds the range) yields `None` → the sink POSTs markerless and
-        // never blocks delivery (no self-black-hole; no duplicate, because the
-        // other holder owns the range — single-winner CAS).
-        let sink_lease_guard = match (
-            delivery.frame_turn_start_offset,
-            delivery.terminal_consumed_end,
-        ) {
-            (Some(start), Some(end)) if end > start => {
-                let sink_turn = super::turn_finalizer::TurnKey::new(
-                    channel,
-                    delivery.frame_turn_user_msg_id,
-                    shared.current_generation,
-                );
-                let cell = shared.delivery_lease(channel);
-                SinkDeliveryLeaseGuard::acquire(&cell, sink_turn, start, end)
-            }
-            _ => None,
-        };
-
         if let SessionBoundTerminalDeliveryRoute::PlaceholderEdit(msg_id) = route {
             if session_bound_should_send_new_chunks_for_placeholder(&relay_text) {
                 formatting::send_long_message_raw_with_rollback(
@@ -818,23 +390,12 @@ impl SessionBoundDiscordRelaySink {
                     true,
                     Some("long response sent as ordered chunks"),
                 );
-                // #3041 P1-4 (§4-④): the external_input lease is released by the
-                // RAII `_external_input_lease_guard` on function exit (covering
-                // Err/`?`/503/panic too), so this success branch no longer needs a
-                // manual `clear_external_input_relay_lease`.
-                // #3041 P1-3 (Part a, B1): couple the confirmed POST to the offset
-                // advance in the SAME path. (codex P1-3 issue 3) Re-check the
-                // identity gate against a freshly-reloaded inflight AFTER the POST,
-                // so a turn cleared/replaced during the slow POST blocks the advance.
-                self.advance_after_confirmed_post(
-                    &shared,
-                    &provider,
-                    channel_id,
+                crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                    provider.as_str(),
                     &delivery.session_name,
-                    &delivery,
-                    sink_lease_guard.as_ref(),
+                    channel_id,
                 );
-                return Ok(SessionRelayDeliveryOutcome::Delivered);
+                return Ok(SessionRelayDeliveryOutcome::Committed);
             }
             match formatting::replace_long_message_raw_with_outcome(
                 &http,
@@ -874,18 +435,12 @@ impl SessionBoundDiscordRelaySink {
                         true,
                         Some("placeholder edit"),
                     );
-                    // #3041 P1-4 (§4-④): lease released by the RAII guard on exit.
-                    // #3041 P1-3 (Part a, B1): commit fence. (codex P1-3 issue 3)
-                    // Post-POST fresh-inflight re-check before advancing.
-                    self.advance_after_confirmed_post(
-                        &shared,
-                        &provider,
-                        channel_id,
+                    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                        provider.as_str(),
                         &delivery.session_name,
-                        &delivery,
-                        sink_lease_guard.as_ref(),
+                        channel_id,
                     );
-                    Ok(SessionRelayDeliveryOutcome::Delivered)
+                    Ok(SessionRelayDeliveryOutcome::Committed)
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
                     // #2757: do not delete msg_id here. The 3e158e588 path
@@ -924,19 +479,12 @@ impl SessionBoundDiscordRelaySink {
                         true,
                         Some("fallback after edit failure"),
                     );
-                    // #3041 P1-4 (§4-④): lease released by the RAII guard on exit.
-                    // #3041 P1-3 (Part a, B1): commit fence — the fallback POST
-                    // delivered the response, so advance the authority too. (codex
-                    // P1-3 issue 3) Post-POST fresh-inflight re-check before advance.
-                    self.advance_after_confirmed_post(
-                        &shared,
-                        &provider,
-                        channel_id,
+                    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                        provider.as_str(),
                         &delivery.session_name,
-                        &delivery,
-                        sink_lease_guard.as_ref(),
+                        channel_id,
                     );
-                    Ok(SessionRelayDeliveryOutcome::Delivered)
+                    Ok(SessionRelayDeliveryOutcome::Committed)
                 }
                 Ok(ReplaceLongMessageOutcome::PartialContinuationFailure { error, .. }) => {
                     Err(RelaySinkError::Transient(error.to_string()))
@@ -963,7 +511,11 @@ impl SessionBoundDiscordRelaySink {
                 clear_ssh_direct_prompt_anchor(&provider, &delivery.session_name, prompt_anchor);
             }
             self.delivered_total.fetch_add(1, Ordering::AcqRel);
-            // #3041 P1-4 (§4-④): lease released by the RAII guard on exit.
+            crate::services::tui_prompt_dedupe::clear_external_input_relay_lease(
+                provider.as_str(),
+                &delivery.session_name,
+                channel_id,
+            );
             tracing::info!(
                 provider = provider.as_str(),
                 channel = channel_id,
@@ -992,92 +544,32 @@ impl SessionBoundDiscordRelaySink {
                 true,
                 Some("new message"),
             );
-            // #3041 P1-3 (Part a, B1): commit fence. (codex P1-3 issue 3) Post-POST
-            // fresh-inflight re-check before advancing the authority.
-            self.advance_after_confirmed_post(
-                &shared,
-                &provider,
-                channel_id,
-                &delivery.session_name,
-                &delivery,
-                sink_lease_guard.as_ref(),
-            );
-            Ok(SessionRelayDeliveryOutcome::Delivered)
+            Ok(SessionRelayDeliveryOutcome::Committed)
         }
     }
 }
 
-/// #3041 P1-5: the SINK-LOCAL terminal outcome stays deliberately 2-way. The
-/// session-bound sink always KNOWS its result: a confirmed POST/edit → `Delivered`;
-/// a deterministic route-decision decline (foreign-owner lease block, or
-/// bridge-owned / mismatched inflight) → `NotDelivered`; a transport/format failure
-/// → `Err`. There is NO sink-local `Unknown` (the cross-actor `Unknown` arises in
-/// the relay ring + watcher, not here). `NotDelivered` (the former `Skipped`) is
-/// mapped to `RelaySinkOutcome::TerminalNotDelivered`, which the watcher routes
-/// through committed-offset reconciliation (§3.2) — never a blind skip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionRelayDeliveryOutcome {
-    Delivered,
-    NotDelivered,
+    Committed,
+    Skipped,
 }
 
 #[async_trait]
 impl RelaySink for SessionBoundDiscordRelaySink {
     async fn deliver(&self, frame: &StreamFrame) -> Result<RelaySinkOutcome, RelaySinkError> {
-        // #3041 P1-3 R5 (codex P1-3 — REVERT R4 fence-gating of the terminal
-        // outcome): a RESULT-bearing delivery reports its terminal outcome
-        // (Delivered / NotDelivered) REGARDLESS of whether THIS frame carries a
-        // commit fence (`terminal_consumed_end`). R4 gated the outcome on the fence, which
-        // BROKE the legitimate no-inflight session-bound terminal delivery: that
-        // delivery legitimately has NO fence but IS a real terminal whose ACK must
-        // resolve — under R4 it reported only `FrameAccepted`, so the watcher timed
-        // out, the fallback was suppressed, and the turn was BLACK-HOLED.
-        //
-        // The co-chunked-turn confusion R4 tried to prevent (turn B's fence-less
-        // tail at seq N+1 masking turn A's seq-N outcome) is now handled CORRECTLY
-        // by the per-sequence terminal-ACK (R5): the watcher resolves A's ACK on
-        // outcome[N] (A's own frame), so B's outcome[N+1] no longer touches A —
-        // reverting this gate is safe.
-        //
-        // The commit FENCE still ONLY gates the OFFSET ADVANCE: the advance happens
-        // INLINE in `deliver_response` via `advance_offset_for_confirmed_delegated_terminal`,
-        // which no-ops when `terminal_consumed_end` is None. So "terminal outcome /
-        // ACK marker" (driven by a result-bearing delivery) and "offset advance"
-        // (driven by the fence) are now decoupled.
         let deliveries = self.ingest_frame(frame);
-        let mut terminal_delivered = false;
-        let mut terminal_not_delivered = false;
+        let mut terminal_committed = false;
+        let mut terminal_skipped = false;
         for delivery in deliveries {
             let session_name = delivery.session_name.clone();
             match self.deliver_response(delivery).await {
-                Ok(SessionRelayDeliveryOutcome::Delivered) => {
-                    terminal_delivered = true;
-                    // #3041 P1-3 (Part a, BLOCKER B1 CLOSED — FRAME-CARRIED): the
-                    // offset advance for a confirmed terminal delivery happens INLINE
-                    // inside `deliver_response` (the commit fence:
-                    // `advance_offset_for_confirmed_delegated_terminal`), coupled to
-                    // the POST success in the SAME path. It advances
-                    // `confirmed_end_offset` to the producer's authoritative
-                    // consumed-terminal end carried ON the RESULT-bearing frame
-                    // (`delivery.terminal_consumed_end`), NOT a value read back from
-                    // the inflight FILE (the racy old Part a is removed) and NOT a
-                    // fresh JSONL EOF — so it can never overshoot into later-appended
-                    // undelivered bytes (the codex r4 P1 black-hole) and is a
-                    // monotonic, idempotent CAS. The advance is IDENTITY-GATED: it
-                    // only fires when the frame's pinned turn identity still matches
-                    // the channel's current inflight (delayed/wrong-turn protection).
-                    //
-                    // This closes the prior EXACT-ONCE GAP: if the sink posts BEFORE
-                    // the watcher's terminal-commit ACK lands (or that ACK lags the
-                    // watcher's 10s wait), the authority is now ADVANCED by the sink,
-                    // so the watcher's §3.2 reconciliation (P1-3 Part b) sees
-                    // `committed >= end` and SKIPS its re-send (no duplicate). When
-                    // the producer did NOT delegate (no fence on the frame), the
-                    // watcher's OWN delivery path advances the authority instead.
+                Ok(SessionRelayDeliveryOutcome::Committed) => {
+                    terminal_committed = true;
                     self.finish_terminal_candidate(&session_name);
                 }
-                Ok(SessionRelayDeliveryOutcome::NotDelivered) => {
-                    terminal_not_delivered = true;
+                Ok(SessionRelayDeliveryOutcome::Skipped) => {
+                    terminal_skipped = true;
                     self.finish_terminal_candidate(&session_name);
                 }
                 Err(error) => {
@@ -1086,21 +578,10 @@ impl RelaySink for SessionBoundDiscordRelaySink {
                 }
             }
         }
-        // #3041 P1-3 R5: a result-bearing delivery surfaces its terminal outcome
-        // for THIS frame's sequence (fence-independent — see the revert note above).
-        // The relay records it keyed by this frame's sequence; the watcher resolves
-        // ITS OWN terminal frame's ACK on its exact sequence, so a co-chunked tail
-        // at a different sequence can never satisfy another turn's terminal-ACK.
-        // A frame that produced no result-bearing delivery reports `FrameAccepted`.
-        // #3041 P1-5: the sink emits NO `TerminalUnknown` — it always KNOWS its
-        // own result (confirmed POST → Delivered; deterministic decline →
-        // NotDelivered; failure → the `Err` returned above). `Unknown` is the
-        // cross-actor state (relay ring + watcher), surfaced when the terminal
-        // resolution cannot be confirmed there.
-        if terminal_delivered {
-            Ok(RelaySinkOutcome::TerminalDelivered)
-        } else if terminal_not_delivered {
-            Ok(RelaySinkOutcome::TerminalNotDelivered)
+        if terminal_committed {
+            Ok(RelaySinkOutcome::TerminalCommitted)
+        } else if terminal_skipped {
+            Ok(RelaySinkOutcome::TerminalSkipped)
         } else {
             Ok(RelaySinkOutcome::FrameAccepted)
         }
@@ -1121,13 +602,12 @@ pub(crate) async fn run_session_bound_discord_relay_supervisor(
     };
 
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(true, Ordering::Release);
-    let idle_health_registry = health_registry.clone();
     let sink: Arc<dyn RelaySink> = Arc::new(SessionBoundDiscordRelaySink::new(health_registry));
     let idle_shutdown = shutdown.clone();
     super::task_supervisor::spawn_observed(
         "session_bound_idle_jsonl_relay",
         async move {
-            run_idle_jsonl_relay_loop(idle_shutdown, idle_health_registry).await;
+            run_idle_jsonl_relay_loop(idle_shutdown).await;
         }
         .instrument(tracing::info_span!("session_bound_idle_jsonl_relay")),
     );
@@ -1135,10 +615,7 @@ pub(crate) async fn run_session_bound_discord_relay_supervisor(
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(false, Ordering::Release);
 }
 
-async fn run_idle_jsonl_relay_loop(
-    shutdown: Arc<AtomicBool>,
-    health_registry: Arc<HealthRegistry>,
-) {
+async fn run_idle_jsonl_relay_loop(shutdown: Arc<AtomicBool>) {
     let registry = crate::services::cluster::session_registry::global_session_registry();
     let producers =
         crate::services::cluster::relay_producer_registry::global_relay_producer_registry();
@@ -1192,13 +669,7 @@ async fn run_idle_jsonl_relay_loop(
                 *offset = end;
                 continue;
             }
-            // Classify the WHOLE payload up front so the offset-authority dedup
-            // (and any prefix/suffix trim) operate on an already-classified
-            // turn. Mirrors `idle_relay_range_action`'s ordering; the distinct
-            // per-reason debug logs below are preserved for observability.
-            let in_new_session_grace =
-                first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE;
-            if in_new_session_grace {
+            if first_seen.elapsed() < IDLE_JSONL_RELAY_RECENT_INFLIGHT_GRACE {
                 *offset = end;
                 tracing::debug!(
                     provider = matched.provider.as_str(),
@@ -1249,123 +720,6 @@ async fn run_idle_jsonl_relay_loop(
                 );
                 continue;
             };
-            // #3017 single output-offset authority. This idle path and the
-            // tmux watcher both read the SAME JSONL and can both relay an
-            // inflight-less wake / background turn (E-13: a scheduled-wakeup
-            // output relayed twice). The tmux watcher is the PRIMARY relay and
-            // advances the authoritative `confirmed_end_offset` on a confirmed
-            // relay (`advance_watcher_confirmed_end`); this idle path is the
-            // backstop. So the idle relay only CONSULTS the authority read-only:
-            // if the watcher already committed at/past this range end, that
-            // range is already delivered → skip to avoid the duplicate. It does
-            // NOT itself advance the authority — `try_send_frame` only means the
-            // frame was QUEUED (the sink may still skip/drop/fail it), so
-            // committing here could suppress the watcher's own delivery and drop
-            // the response (codex P1). On a standby node with no watcher relaying
-            // there is no second actor to duplicate, so no advance is needed.
-            let channel = ChannelId::new(channel_id);
-            if let Some(shared) = health_registry
-                .shared_for_provider_on_channel(&matched.provider, channel)
-                .await
-                .or(health_registry.shared_for_provider(&matched.provider).await)
-            {
-                // Codex P2: a stale-high `confirmed_end_offset` left by a
-                // previous wrapper (before a watcher ran its regression reset)
-                // would otherwise make this skip the FRESH file's first bytes
-                // and drop a wake response. Run the SAME generation-aware
-                // regression reset the watcher uses BEFORE reading the
-                // watermark, so a truncated/respawned JSONL resets the shared
-                // watermark to 0 (fresh wrapper) and the fresh range is relayed.
-                super::tmux::reset_stale_relay_watermark_if_output_regressed(
-                    shared.as_ref(),
-                    channel,
-                    &session_name,
-                    len,
-                    "idle_jsonl_relay",
-                );
-                // Codex r7 P2: the EOF-regression reset above does NOT fire when
-                // a respawned same-named wrapper's fresh JSONL has already grown
-                // PAST the previous wrapper's watermark. Apply the same
-                // generation-change reset the watcher uses so a stale watermark
-                // from a prior wrapper does not make this idle relay skip fresh
-                // wake/background output as already relayed.
-                super::tmux::reset_relay_watermark_on_generation_change(
-                    shared.as_ref(),
-                    channel,
-                    &session_name,
-                    "idle_jsonl_relay",
-                );
-                let committed = shared.committed_relay_offset(channel);
-                // Classification already passed for this whole payload above, so
-                // pass `in_new_session_grace = false`: this consults ONLY the
-                // offset-authority dedup branch of the shared decision.
-                match idle_relay_range_action(&payload, start, end, committed, false) {
-                    IdleRelayRangeAction::SkipAlreadyRelayed => {
-                        // The whole `[start, end)` range was already delivered by
-                        // the watcher → skip entirely.
-                        *offset = end;
-                        tracing::debug!(
-                            provider = matched.provider.as_str(),
-                            channel = channel_id,
-                            tmux_session = %session_name,
-                            committed_relay_offset = committed,
-                            end,
-                            "idle JSONL relay skipped range already relayed by watcher (offset authority dedup)"
-                        );
-                        continue;
-                    }
-                    IdleRelayRangeAction::SendSuffixFrom(from) => {
-                        // Codex r5 P2 + codex r6 P1 (black-hole): PARTIAL overlap
-                        // (`start < committed < end`) — the watcher already
-                        // delivered the `[start, committed)` PREFIX (e.g. a wake
-                        // response) while the file grew past it before this poll.
-                        // Forwarding the whole payload from `start` would re-send
-                        // the already-delivered prefix.
-                        //
-                        // We must NOT bounce to a next tick (the old `*offset =
-                        // committed; continue;`): the next tick re-reads only the
-                        // suffix `[committed, end)`, which no longer carries the
-                        // `system/init` event (that lived in the already-committed
-                        // prefix). The init/classification gate above would then
-                        // re-classify the suffix as a "non-init active-session
-                        // payload" and DROP it → the user never sees the trailing
-                        // part of the response (a black-hole). Instead, deliver
-                        // the un-committed suffix in THIS SAME pass, carrying
-                        // forward the classification we already established for
-                        // this turn: prefix-skip, suffix-send, exactly once.
-                        let suffix =
-                            match read_jsonl_range(&matched.expected_rollout_path, from, end) {
-                                Ok(suffix) => suffix,
-                                Err(_) => continue,
-                            };
-                        if suffix.is_empty() {
-                            *offset = end;
-                            continue;
-                        }
-                        if producer.try_send_frame(String::from_utf8_lossy(&suffix).into_owned()) {
-                            *offset = end;
-                            tracing::debug!(
-                                provider = matched.provider.as_str(),
-                                channel = channel_id,
-                                tmux_session = %session_name,
-                                committed_relay_offset = committed,
-                                start,
-                                end,
-                                bytes = suffix.len(),
-                                "idle JSONL relay sent un-committed suffix after trimming already-relayed prefix (offset authority dedup, no black-hole)"
-                            );
-                        }
-                        continue;
-                    }
-                    // `committed <= start` → nothing covered → fall through to the
-                    // full-range send below.
-                    IdleRelayRangeAction::SendFull => {}
-                    // Classification already happened above; this arm is
-                    // unreachable here because we pass `in_new_session_grace =
-                    // false` and the payload already passed the init gate.
-                    IdleRelayRangeAction::SkipClassified => {}
-                }
-            }
             if producer.try_send_frame(String::from_utf8_lossy(&payload).into_owned()) {
                 *offset = end;
                 tracing::debug!(
@@ -1382,64 +736,6 @@ async fn run_idle_jsonl_relay_loop(
         first_seen_at.retain(|session, _| seen_sessions.contains(session));
         last_inflight_seen_at.retain(|session, _| seen_sessions.contains(session));
         tokio::time::sleep(IDLE_JSONL_RELAY_POLL_INTERVAL).await;
-    }
-}
-
-/// The action the idle relay loop takes for one fresh JSONL range
-/// `[start, end)` after classifying the payload and consulting the offset
-/// authority. Encodes the REAL loop ordering: classification gates run on the
-/// WHOLE payload FIRST (so an `init` event anywhere in `[start, end)` keeps the
-/// range classified as a relayable turn), and the offset-authority dedup runs
-/// SECOND on that already-classified range. This is the contract the loop body
-/// must honor; extracting it makes the "init in committed prefix, suffix
-/// uncommitted" black-hole regression testable at loop-ordering granularity
-/// without spinning the live poll loop against the process-global registries.
-#[derive(Debug, PartialEq, Eq)]
-enum IdleRelayRangeAction {
-    /// Classification dropped the range (grace window, user/tool-result event,
-    /// ScheduleWakeup setup, or non-init active-session payload). Advance the
-    /// offset past `end` without relaying.
-    SkipClassified,
-    /// The offset authority already covers `[start, end)` (`committed >= end`).
-    /// Advance past `end` without relaying (dedup, whole range).
-    SkipAlreadyRelayed,
-    /// PARTIAL overlap (`start < committed < end`): the prefix `[start, committed)`
-    /// was already relayed by the watcher; relay ONLY the uncommitted suffix
-    /// `[committed, end)` of THIS SAME classified turn, then advance past `end`.
-    /// The classification already passed on the full payload, so the suffix is
-    /// NOT re-gated as a fresh non-init payload (no black-hole, codex r6 P1).
-    SendSuffixFrom(u64),
-    /// Nothing covered (`committed <= start`): relay the whole `[start, end)`.
-    SendFull,
-}
-
-/// Pure decision for the idle relay's classification + offset-authority dedup,
-/// in the loop's real order. `payload` is the full `[start, end)` bytes.
-/// `in_new_session_grace` mirrors the runtime `first_seen.elapsed() < grace`
-/// gate. `committed` is the offset authority's `committed_relay_offset`.
-fn idle_relay_range_action(
-    payload: &[u8],
-    start: u64,
-    end: u64,
-    committed: u64,
-    in_new_session_grace: bool,
-) -> IdleRelayRangeAction {
-    // Classification first, on the WHOLE payload (matches the loop's gate
-    // ordering at the top of `run_idle_jsonl_relay_loop`).
-    if in_new_session_grace
-        || idle_jsonl_payload_contains_user_event(payload)
-        || idle_jsonl_payload_contains_schedule_wakeup_setup(payload)
-        || !idle_jsonl_payload_contains_init_event(payload)
-    {
-        return IdleRelayRangeAction::SkipClassified;
-    }
-    // Offset-authority dedup second, on the already-classified range.
-    if committed >= end {
-        IdleRelayRangeAction::SkipAlreadyRelayed
-    } else if committed > start {
-        IdleRelayRangeAction::SendSuffixFrom(committed)
-    } else {
-        IdleRelayRangeAction::SendFull
     }
 }
 
@@ -1604,15 +900,6 @@ impl SessionRelayParser {
                     session_name: frame.session_name.clone(),
                     response_text: self.full_response.clone(),
                     task_notification_kind: self.task_notification_kind,
-                    // #3041 P1-3 (Part a, B1): the RESULT-bearing frame both
-                    // accumulated the final `result` AND carries the producer's
-                    // commit fence. The sink emits the delivery on THIS ingest,
-                    // so copying the frame's commit data here keeps the POST and
-                    // the identity-gated offset advance atomic per-frame.
-                    terminal_consumed_end: frame.terminal_consumed_end,
-                    frame_turn_user_msg_id: frame.turn_user_msg_id,
-                    frame_turn_started_at: frame.turn_started_at.clone(),
-                    frame_turn_start_offset: frame.turn_start_offset,
                 });
                 break;
             } else {
@@ -1642,25 +929,6 @@ struct SessionRelayDelivery {
     session_name: String,
     response_text: String,
     task_notification_kind: Option<TaskNotificationKind>,
-    /// #3041 P1-3 (Part a, B1 — frame-carried commit fence): the producer's
-    /// AUTHORITATIVE consumed-terminal END, carried on the RESULT-bearing frame
-    /// that triggered THIS delivery. `None` if the producer did not delegate a
-    /// terminal end on this frame (legacy / watcher-owned path). On a CONFIRMED
-    /// delivery the sink advances `confirmed_end_offset` to this value, gated by
-    /// the carried turn identity matching the channel's current inflight.
-    terminal_consumed_end: Option<u64>,
-    /// Pinned turn identity (`user_msg_id`, `started_at`) of the inflight the
-    /// producer delegated. The sink's IDENTITY GATE compares it to the channel's
-    /// current inflight before advancing — a delayed/wrong-turn frame is ignored.
-    frame_turn_user_msg_id: u64,
-    frame_turn_started_at: String,
-    /// #3041 P1-3 (codex P1-3 issue 2): the pinned turn's `turn_start_offset`,
-    /// part of the IDENTITY GATE. `now_string` has 1-second resolution, so two
-    /// back-to-back `user_msg_id == 0` turns started in the same second share an
-    /// identical `(0, started_at)` — without this a delayed OLD terminal frame
-    /// would pass the gate for the NEW turn. `turn_start_offset` is monotonic per
-    /// turn, so it makes the identity unique. `None` on legacy/non-fence frames.
-    frame_turn_start_offset: Option<u64>,
 }
 
 fn ssh_direct_prompt_anchor_for_response(
@@ -1719,7 +987,6 @@ mod tests {
     use super::*;
     use crate::services::cluster::session_matcher::{MatchedChannel, expected_rollout_path_for};
     use crate::services::discord::inflight::{RelayOwnerKind, TurnSource};
-    use crate::services::tui_prompt_dedupe::{ExternalInputRelayLease, ExternalInputRelayOwner};
 
     fn matched(channel_id: &str) -> MatchedChannel {
         let session = ProviderKind::Claude.build_tmux_session_name(channel_id);
@@ -1738,51 +1005,6 @@ mod tests {
             binding: binding.clone(),
             payload: payload.to_string(),
             sequence,
-            terminal_consumed_end: None,
-            turn_user_msg_id: 0,
-            turn_started_at: String::new(),
-            turn_start_offset: None,
-        }
-    }
-
-    fn terminal_frame(
-        binding: &MatchedChannel,
-        payload: &str,
-        sequence: u64,
-        consumed_end: u64,
-        turn_user_msg_id: u64,
-        turn_started_at: &str,
-    ) -> StreamFrame {
-        terminal_frame_offset(
-            binding,
-            payload,
-            sequence,
-            consumed_end,
-            turn_user_msg_id,
-            turn_started_at,
-            Some(0),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn terminal_frame_offset(
-        binding: &MatchedChannel,
-        payload: &str,
-        sequence: u64,
-        consumed_end: u64,
-        turn_user_msg_id: u64,
-        turn_started_at: &str,
-        turn_start_offset: Option<u64>,
-    ) -> StreamFrame {
-        StreamFrame {
-            session_name: binding.expected_session_name.clone(),
-            binding: binding.clone(),
-            payload: payload.to_string(),
-            sequence,
-            terminal_consumed_end: Some(consumed_end),
-            turn_user_msg_id,
-            turn_started_at: turn_started_at.to_string(),
-            turn_start_offset,
         }
     }
 
@@ -2033,8 +1255,6 @@ mod tests {
                 relay_owner:
                     crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::SessionBoundRelay,
                 runtime_kind: Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui),
-                generation:
-                    crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
             },
         );
 
@@ -2069,12 +1289,8 @@ mod tests {
             session_key: Some("host:AgentDesk-codex-bridge-owned-direct".to_string()),
             relay_owner: crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::BridgeAdapter,
             runtime_kind: Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui),
-            generation:
-                crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
         };
-        // Capture the RECORDED lease (with its stamped generation) so the later
-        // `_if_matches` clear compares against the exact stored identity.
-        let recorded = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
             ProviderKind::Codex.as_str(),
             tmux,
             lease.clone(),
@@ -2089,7 +1305,7 @@ mod tests {
                 ProviderKind::Codex.as_str(),
                 tmux,
                 4243,
-                &recorded,
+                &lease,
             )
         );
         assert_eq!(
@@ -2123,16 +1339,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // #3041 P1-5: a route-layer `Skipped` decision (the route enum legitimately
-    // keeps "Skipped" — a bridge-owned / mismatched inflight has no place to
-    // route) is the SOLE producer of the sink-local `NotDelivered` outcome
-    // (`deliver_response` returns `SessionRelayDeliveryOutcome::NotDelivered` at
-    // the route-decline arm), which `deliver` surfaces as
-    // `RelaySinkOutcome::TerminalNotDelivered`. The watcher then routes
-    // `NotDelivered` through committed-offset reconciliation (§3.2) — never a
-    // blind skip. This pins the route-`Skipped` → `NotDelivered` mapping origin.
     #[test]
-    fn terminal_delivery_route_skip_maps_to_not_delivered_outcome() {
+    fn terminal_delivery_route_skip_maps_to_terminal_skipped_outcome() {
         let tmux = "AgentDesk-claude-relay-test";
         let bridge_owned = inflight_for(tmux, RelayOwnerKind::None, false);
         assert_eq!(
@@ -2142,220 +1350,7 @@ mod tests {
                 &ProviderKind::Claude,
                 42,
             ),
-            SessionBoundTerminalDeliveryRouteDecision::Skipped,
-            "a bridge-owned / mismatched inflight declines → route-layer Skipped, \
-             which deliver_response maps to the sink-local NotDelivered outcome \
-             (surfaced as RelaySinkOutcome::TerminalNotDelivered)"
-        );
-    }
-
-    /// #3017 / E-13 dedup invariant: the single output-offset authority makes
-    /// the idle-JSONL relay (and the watcher) relay a given inflight-less wake
-    /// byte-range EXACTLY ONCE.
-    ///
-    /// The tmux watcher is the PRIMARY relay and the SOLE committer of the
-    /// authoritative offset (via `advance_watcher_confirmed_end`, simulated here
-    /// by writing `confirmed_end_offset`). The idle relay and the watcher's
-    /// own no-inflight relay gate are read-only CONSUMERS: each skips a range
-    /// the committed offset already covers (`committed_relay_offset(channel) >=
-    /// end`). This test exercises that exact decision:
-    ///   1. Before any relay, the committed offset is 0 → a wake range
-    ///      `[0, end)` is NOT yet covered → the actor relays it.
-    ///   2. After the watcher commits at `end`, a second actor (idle relay or a
-    ///      re-observing watcher pass) sees the range covered → it SKIPS, so the
-    ///      wake body is never relayed twice (the
-    ///      `duplicate Discord relay body: '[E2E:E13:WAKE]'` failure).
-    ///   3. A genuinely-NEW wake output at a higher offset is past the committed
-    ///      offset → NOT covered → relayed exactly once (dedup, not blanket
-    ///      suppression - E-13 also asserts the wake text is present).
-    #[test]
-    fn offset_authority_relays_wake_range_exactly_once() {
-        use std::sync::atomic::Ordering;
-
-        // The dedup decision both consumers make: skip iff the committed offset
-        // already covers this range end. Mirrors the read-only check in
-        // `run_idle_jsonl_relay_loop` and the watcher's no-inflight gate.
-        fn already_relayed(committed_end: u64, range_end: u64) -> bool {
-            committed_end >= range_end
-        }
-
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(7_013);
-        let coord = shared.tmux_relay_coord(channel);
-
-        // (1) Fresh wake turn ending at offset 128: nothing committed yet → the
-        // first actor relays it (not a duplicate).
-        assert_eq!(shared.committed_relay_offset(channel), 0);
-        assert!(
-            !already_relayed(shared.committed_relay_offset(channel), 128),
-            "a wake range past the committed offset must be relayed"
-        );
-
-        // The watcher (primary) commits the relay at 128, exactly as
-        // `advance_watcher_confirmed_end` does after a confirmed delivery.
-        coord.confirmed_end_offset.store(128, Ordering::Release);
-        assert_eq!(shared.committed_relay_offset(channel), 128);
-
-        // (2) The OTHER actor (idle relay, or a re-observing watcher) now sees
-        // the same range covered → it SKIPS → the body is not relayed twice.
-        assert!(
-            already_relayed(shared.committed_relay_offset(channel), 128),
-            "the second actor must skip a range the watcher already committed (E-13 dedup)"
-        );
-        // A sub-range / re-observation of the already-relayed range also skips.
-        assert!(already_relayed(shared.committed_relay_offset(channel), 64));
-
-        // (3) A genuinely-new wake output ending at 256 is PAST the committed
-        // offset → not covered → relayed exactly once.
-        assert!(
-            !already_relayed(shared.committed_relay_offset(channel), 256),
-            "a new wake output past the committed offset must be relayed (not suppressed)"
-        );
-        coord.confirmed_end_offset.store(256, Ordering::Release);
-        assert!(
-            already_relayed(shared.committed_relay_offset(channel), 256),
-            "after it is committed the new range must not be relayed twice"
-        );
-
-        // The authority is per-channel: a different channel starts uncommitted,
-        // so its own first wake range is relayed independently.
-        let other = ChannelId::new(7_014);
-        assert_eq!(shared.committed_relay_offset(other), 0);
-        assert!(!already_relayed(shared.committed_relay_offset(other), 128));
-    }
-
-    /// #3017 / E-13 partial-overlap dedup (codex r5 P2): the idle relay must not
-    /// re-send a PREFIX the watcher already delivered, and the watcher must
-    /// compare against this turn's CONSUMED end (not the whole read batch end).
-    #[test]
-    fn offset_authority_handles_partial_and_batch_overlaps() {
-        // Idle-relay decision for a read range `[start, end)` against the
-        // committed watermark. Mirrors `run_idle_jsonl_relay_loop`:
-        //   - committed >= end  → whole range already delivered → SKIP all.
-        //   - committed > start → PREFIX delivered → trim: re-read from committed.
-        //   - else              → nothing delivered → forward `[start, end)`.
-        #[derive(Debug, PartialEq, Eq)]
-        enum IdleDecision {
-            SkipAll,
-            TrimTo(u64),
-            Forward,
-        }
-        fn idle_decision(committed: u64, start: u64, end: u64) -> IdleDecision {
-            if committed >= end {
-                IdleDecision::SkipAll
-            } else if committed > start {
-                IdleDecision::TrimTo(committed)
-            } else {
-                IdleDecision::Forward
-            }
-        }
-
-        // Fully covered → skip.
-        assert_eq!(idle_decision(200, 0, 128), IdleDecision::SkipAll);
-        assert_eq!(idle_decision(128, 0, 128), IdleDecision::SkipAll);
-        // Partial overlap: watcher delivered [0,128); file grew to 256 before the
-        // idle poll → re-read only [128,256), never re-sending the wake prefix.
-        assert_eq!(idle_decision(128, 0, 256), IdleDecision::TrimTo(128));
-        // No overlap → forward the whole fresh range.
-        assert_eq!(idle_decision(0, 128, 256), IdleDecision::Forward);
-        assert_eq!(idle_decision(64, 128, 256), IdleDecision::Forward);
-
-        // Watcher decision: dedup against the TURN's CONSUMED end, not the whole
-        // read batch end. A batch read `[start=0, current_offset=256)` whose
-        // result line ends at 128 (the trailing 128 bytes are a later turn's
-        // buffered JSONL) consumes to 128. A prior commit at 128 (this same
-        // terminal, already relayed) must suppress — comparing against 256 would
-        // miss it and re-relay. `terminal_event_consumed_offset` = current_offset
-        // - unprocessed_tail.len().
-        let current_offset = 256u64;
-        let unprocessed_tail_len = 128u64; // a later turn's buffered bytes
-        let turn_consumed = current_offset - unprocessed_tail_len; // 128
-        let committed_for_this_terminal = 128u64;
-        assert!(
-            committed_for_this_terminal >= turn_consumed,
-            "a prior commit at the consumed terminal end must suppress the re-relay"
-        );
-        assert!(
-            committed_for_this_terminal < current_offset,
-            "comparing against the whole batch end (256) would WRONGLY miss the duplicate"
-        );
-    }
-
-    /// #3017 / E-13 codex r6 P1 (black-hole regression): when the `system/init`
-    /// event lives in the already-committed PREFIX and only the suffix is
-    /// uncommitted, the idle relay must deliver the suffix EXACTLY ONCE in the
-    /// SAME pass — it must NOT bounce to a next tick that re-classifies the
-    /// init-less suffix as a "non-init active-session payload" and DROPS it.
-    ///
-    /// Unlike `offset_authority_handles_partial_and_batch_overlaps` (which only
-    /// exercised a re-implemented `idle_decision` enum), this drives the REAL
-    /// loop decision function `idle_relay_range_action` — the exact code the
-    /// loop body runs — so it asserts the actual classification→dedup ORDERING.
-    #[test]
-    fn idle_relay_delivers_suffix_when_init_is_in_committed_prefix() {
-        // A wake turn whose JSONL is: an `init` line (the prefix the watcher
-        // already relayed) followed by the assistant body (the uncommitted
-        // suffix the user still needs to see).
-        let init_line = "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\"}\n";
-        let body_line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the trailing answer\"}]}}\n";
-        let init_bytes = init_line.len() as u64;
-        let full = format!("{init_line}{body_line}");
-        let full_bytes = full.as_bytes();
-        let start = 0u64;
-        let end = full_bytes.len() as u64;
-        // The watcher already committed the init-line prefix; the file grew to
-        // include the body before this idle poll → PARTIAL overlap.
-        let committed = init_bytes;
-        assert!(
-            start < committed && committed < end,
-            "test sets up a partial overlap"
-        );
-
-        // REAL loop decision on the WHOLE classified payload: relay only the
-        // uncommitted suffix `[committed, end)` — NOT a re-classify-and-drop.
-        let action = idle_relay_range_action(full_bytes, start, end, committed, false);
-        assert_eq!(
-            action,
-            super::IdleRelayRangeAction::SendSuffixFrom(committed),
-            "the loop must deliver the uncommitted suffix in the same pass (no black-hole)"
-        );
-
-        // The suffix that would be delivered is exactly the body line — the
-        // already-relayed init prefix is skipped (no duplicate), the trailing
-        // answer is sent (no black-hole).
-        let suffix = &full_bytes[committed as usize..end as usize];
-        assert_eq!(
-            suffix,
-            body_line.as_bytes(),
-            "suffix is the uncommitted body, prefix skipped"
-        );
-
-        // REGRESSION WITNESS: the OLD code bounced (`*offset = committed;
-        // continue;`) and re-read JUST this suffix on the next tick. Running the
-        // classification on the init-less suffix proves that path BLACK-HOLES
-        // it: classified as non-init → dropped. The fix avoids the bounce so the
-        // suffix is never re-gated this way.
-        let suffix_only_action = idle_relay_range_action(suffix, 0, suffix.len() as u64, 0, false);
-        assert_eq!(
-            suffix_only_action,
-            super::IdleRelayRangeAction::SkipClassified,
-            "re-gating the init-less suffix as a fresh payload WOULD black-hole it (the old bug)"
-        );
-
-        // Whole range uncommitted → relay the full payload (control case).
-        assert_eq!(
-            idle_relay_range_action(full_bytes, start, end, 0, false),
-            super::IdleRelayRangeAction::SendFull
-        );
-        // Whole range already committed → skip (control case).
-        assert_eq!(
-            idle_relay_range_action(full_bytes, start, end, end, false),
-            super::IdleRelayRangeAction::SkipAlreadyRelayed
-        );
-        // New-session grace still wins over everything (ordering preserved).
-        assert_eq!(
-            idle_relay_range_action(full_bytes, start, end, committed, true),
-            super::IdleRelayRangeAction::SkipClassified
+            SessionBoundTerminalDeliveryRouteDecision::Skipped
         );
     }
 
@@ -2371,672 +1366,6 @@ mod tests {
             .expect("frame without terminal delivery should be accepted");
 
         assert_eq!(outcome, RelaySinkOutcome::FrameAccepted);
-    }
-
-    // #3041 P1-3 R5 (codex P1-3 — fence gates the ADVANCE, not the ACK): a
-    // FENCE-LESS frame that carries a COMPLETE result (e.g. turn B's result riding
-    // turn A's trailing tail) produces a delivery whose `terminal_consumed_end` is
-    // None — so the identity-gated OFFSET ADVANCE can NEVER fire for it (the advance
-    // requires `Some(end > 0)`). After the R4 revert, `deliver` DOES surface this
-    // frame's terminal outcome (the no-inflight terminal needs its ACK to resolve),
-    // but that outcome is recorded keyed by THIS frame's own sequence, so it can
-    // never satisfy ANOTHER turn's terminal-ACK (which queries its own sequence).
-    // Driving a real terminal COMMIT needs Discord HTTP, so we assert the
-    // load-bearing offset-advance invariant directly: a fence-less frame's delivery
-    // carries no consumed_end → it can never advance the offset authority.
-    #[test]
-    fn fenceless_frame_with_complete_result_carries_no_commit_fence() {
-        let binding = matched("44");
-        let mut parser = SessionRelayParser::default();
-        // A COMPLETE turn result on a fence-less frame (terminal_consumed_end=None).
-        let payload = concat!(
-            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"turn B done\"}]}}\n",
-            "{\"type\":\"result\",\"result\":\"turn B done\"}\n"
-        );
-        let fenceless = frame(&binding, payload, 7);
-        assert!(
-            fenceless.terminal_consumed_end.is_none(),
-            "precondition: this is a fence-less frame — its result is still delivered and its ACK still resolves, but it can never ADVANCE the offset"
-        );
-
-        let deliveries = parser.ingest_frame(&fenceless);
-        assert_eq!(
-            deliveries.len(),
-            1,
-            "the complete result on the fence-less frame is still delivered (B is mirrored, not black-holed)"
-        );
-        assert_eq!(
-            deliveries[0].terminal_consumed_end, None,
-            "a fence-less frame's delivery carries NO consumed_end → it can never advance the offset authority (no wrong-turn advance)"
-        );
-    }
-
-    fn delivery_with_fence(
-        session_name: &str,
-        consumed_end: Option<u64>,
-        turn_user_msg_id: u64,
-        turn_started_at: &str,
-    ) -> SessionRelayDelivery {
-        delivery_with_fence_offset(
-            session_name,
-            consumed_end,
-            turn_user_msg_id,
-            turn_started_at,
-            None,
-        )
-    }
-
-    fn delivery_with_fence_offset(
-        session_name: &str,
-        consumed_end: Option<u64>,
-        turn_user_msg_id: u64,
-        turn_started_at: &str,
-        turn_start_offset: Option<u64>,
-    ) -> SessionRelayDelivery {
-        SessionRelayDelivery {
-            provider: ProviderKind::Claude,
-            channel_id: 8_041,
-            session_name: session_name.to_string(),
-            response_text: "answer".to_string(),
-            task_notification_kind: None,
-            terminal_consumed_end: consumed_end,
-            frame_turn_user_msg_id: turn_user_msg_id,
-            frame_turn_started_at: turn_started_at.to_string(),
-            frame_turn_start_offset: turn_start_offset,
-        }
-    }
-
-    fn inflight_with_identity(
-        channel_id: u64,
-        session_name: &str,
-        user_msg_id: u64,
-        started_at: &str,
-    ) -> super::super::inflight::InflightTurnState {
-        inflight_with_identity_offset(channel_id, session_name, user_msg_id, started_at, None)
-    }
-
-    fn inflight_with_identity_offset(
-        channel_id: u64,
-        session_name: &str,
-        user_msg_id: u64,
-        started_at: &str,
-        turn_start_offset: Option<u64>,
-    ) -> super::super::inflight::InflightTurnState {
-        let mut state = super::super::inflight::InflightTurnState::new(
-            ProviderKind::Claude,
-            channel_id,
-            None,
-            1,
-            user_msg_id,
-            0,
-            "hi".to_string(),
-            None,
-            Some(session_name.to_string()),
-            None,
-            None,
-            0,
-        );
-        state.started_at = started_at.to_string();
-        state.turn_start_offset = turn_start_offset;
-        state
-    }
-
-    // #3041 P1-3 (Part a, BLOCKER B1 — FRAME-CARRIED): when the sink CONFIRMS a
-    // terminal delivery, it advances `committed_relay_offset` to the producer's
-    // authoritative consumed-terminal END carried ON the RESULT-bearing frame
-    // (`SessionRelayDelivery::terminal_consumed_end`), identity-gated against the
-    // channel's CURRENT inflight. This is the B1 "commit fence": the POST success
-    // and the offset advance are coupled per-frame (no inflight-file read race), so
-    // the watcher's §3.2 reconciliation (Part b) sees the delegated range as
-    // delivered even if the terminal-commit ACK lags.
-    #[tokio::test]
-    async fn sink_confirmed_delivery_advances_committed_offset_to_frame_end() {
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(8_041);
-        let session = "AgentDesk-claude-8041";
-        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
-        // The channel's current inflight identity the frame must match to advance.
-        // A fence ALWAYS carries a real `turn_start_offset` (producer guarantee),
-        // and the STRICT gate requires it to match, so the inflight carries one too.
-        let inflight = inflight_with_identity_offset(
-            channel.get(),
-            session,
-            0,
-            "2026-06-04T00:00:00Z",
-            Some(0),
-        );
-
-        // Before any delivery the authority is at 0.
-        assert_eq!(shared.committed_relay_offset(channel), 0);
-
-        // A confirmed sink delivery for the producer-delegated range `[0, 256)`:
-        // the frame carries end=256 + the matching identity, so the sink advances.
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery_with_fence_offset(session, Some(256), 0, "2026-06-04T00:00:00Z", Some(0)),
-            Some(&inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "a confirmed sink delivery must advance committed_relay_offset to the frame end (B1 close)"
-        );
-
-        // Idempotent / no double-advance: re-confirming the SAME range is a
-        // monotonic-CAS no-op (cannot regress or double-advance).
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery_with_fence_offset(session, Some(256), 0, "2026-06-04T00:00:00Z", Some(0)),
-            Some(&inflight),
-        );
-        assert_eq!(shared.committed_relay_offset(channel), 256);
-
-        // When the producer did NOT delegate a range (None / zero end), the sink
-        // does NOT advance — the watcher's own delivery path owns the advance.
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery_with_fence_offset(session, None, 0, "2026-06-04T00:00:00Z", Some(0)),
-            Some(&inflight),
-        );
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery_with_fence_offset(session, Some(0), 0, "2026-06-04T00:00:00Z", Some(0)),
-            Some(&inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "no delegated range (None/0) must not advance the authority"
-        );
-
-        // Monotonic guard: a later confirmed delivery at a LARGER end advances; a
-        // stale smaller end never regresses the authority.
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery_with_fence_offset(session, Some(128), 0, "2026-06-04T00:00:00Z", Some(0)),
-            Some(&inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "a smaller (stale) end must not regress the authority"
-        );
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery_with_fence_offset(session, Some(512), 0, "2026-06-04T00:00:00Z", Some(0)),
-            Some(&inflight),
-        );
-        assert_eq!(shared.committed_relay_offset(channel), 512);
-    }
-
-    // #3041 P1-3 (Part a, B1 — IDENTITY GATE): a terminal frame whose pinned turn
-    // identity does NOT match the channel's current inflight (a delayed/old frame,
-    // or a newer turn already on the channel, or no inflight at all) must NOT
-    // advance the authority — that would wrongly skip the new turn's reconciliation.
-    #[tokio::test]
-    async fn sink_identity_gate_blocks_advance_on_wrong_turn() {
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(8_041);
-        let session = "AgentDesk-claude-8041";
-        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
-
-        // Current inflight is turn started_at=NEW; the frame carries the OLD turn's
-        // identity (same user_msg_id=0 external-input, different started_at). A fence
-        // ALWAYS carries a real `turn_start_offset` (producer guarantee).
-        let current_inflight = inflight_with_identity_offset(
-            channel.get(),
-            session,
-            0,
-            "2026-06-04T00:00:09Z",
-            Some(4096),
-        );
-        let stale_frame =
-            delivery_with_fence_offset(session, Some(256), 0, "2026-06-04T00:00:00Z", Some(0));
-
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &stale_frame,
-            Some(&current_inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "a stale/wrong-turn terminal frame must NOT advance the authority (identity gate)"
-        );
-
-        // No inflight at all (cleared by stop/cancel) → also no advance.
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &stale_frame,
-            None,
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "a terminal frame with no current inflight must NOT advance (identity gate)"
-        );
-
-        // Different user_msg_id (a managed turn replaced the external-input turn)
-        // → no advance even if started_at coincidentally matched.
-        let replaced_inflight = inflight_with_identity_offset(
-            channel.get(),
-            session,
-            999,
-            "2026-06-04T00:00:00Z",
-            Some(0),
-        );
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &stale_frame,
-            Some(&replaced_inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "a frame whose user_msg_id != current inflight must NOT advance (identity gate)"
-        );
-
-        // Sanity: the SAME identity (including matching turn_start_offset) DOES
-        // advance, proving the gate isn't blocking everything.
-        let matching_inflight = inflight_with_identity_offset(
-            channel.get(),
-            session,
-            0,
-            "2026-06-04T00:00:00Z",
-            Some(0),
-        );
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &stale_frame,
-            Some(&matching_inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "a matching-identity terminal frame DOES advance the authority"
-        );
-    }
-
-    // #3041 P1-3 (codex P1-3 issue 2 — same-second identity collision close): two
-    // consecutive TUI-direct turns with `user_msg_id == 0` started in the SAME
-    // `now_string` second share an identical `(0, started_at)` pair. WITHOUT the
-    // `turn_start_offset` discriminator a delayed OLD terminal frame would pass the
-    // NEW turn's identity gate and wrongly advance. The gate now also compares
-    // `turn_start_offset` (monotonic per turn), so the old frame is blocked.
-    #[tokio::test]
-    async fn sink_identity_gate_blocks_same_second_turn_by_turn_start_offset() {
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(8_041);
-        let session = "AgentDesk-claude-8041";
-        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
-
-        // Both turns: user_msg_id == 0 AND the SAME started_at (same second). They
-        // differ ONLY by turn_start_offset (the JSONL byte offset they began at).
-        let same_second = "2026-06-04T00:00:00Z";
-        // The NEW turn now owns the channel (turn_start_offset = 4096).
-        let new_inflight =
-            inflight_with_identity_offset(channel.get(), session, 0, same_second, Some(4096));
-        // A delayed OLD terminal frame from the PRIOR turn (turn_start_offset = 0)
-        // arrives — its (user_msg_id, started_at) pair matches, but its offset does
-        // not. Pre-fix this would have advanced the NEW turn's authority.
-        let stale_same_second_frame =
-            delivery_with_fence_offset(session, Some(256), 0, same_second, Some(0));
-
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &stale_same_second_frame,
-            Some(&new_inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "an old same-second frame (matching user_msg_id+started_at but different turn_start_offset) must NOT advance the new turn"
-        );
-
-        // The NEW turn's OWN terminal frame (matching turn_start_offset) DOES
-        // advance, proving the offset gate is discriminating, not blocking all.
-        let new_turn_frame =
-            delivery_with_fence_offset(session, Some(512), 0, same_second, Some(4096));
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &new_turn_frame,
-            Some(&new_inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            512,
-            "the matching-offset frame for the current turn DOES advance the authority"
-        );
-    }
-
-    // #3041 P1-3 (codex P1-3 issue 2 R4 — STRICT offset gate, no weak fallback): a
-    // fenced terminal frame whose `turn_start_offset` is None must NOT advance, even
-    // when its `(user_msg_id, started_at)` pair matches the current inflight. The
-    // producer GUARANTEES every fence carries a real offset, so a None here is a
-    // malformed/legacy frame and the strict gate refuses the advance — closing the
-    // old `is_none_or` weak fallback that let a None authorize an advance and could
-    // collide for consecutive same-second `user_msg_id == 0` turns.
-    #[tokio::test]
-    async fn sink_strict_gate_blocks_advance_when_frame_offset_is_none() {
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(8_041);
-        let session = "AgentDesk-claude-8041";
-        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
-
-        // Current inflight has a real turn_start_offset; the (user_msg_id, started_at)
-        // pair matches the frame exactly. Only the frame's missing offset differs.
-        let same_second = "2026-06-04T00:00:00Z";
-        let inflight =
-            inflight_with_identity_offset(channel.get(), session, 0, same_second, Some(4096));
-        // A fenced frame whose turn_start_offset is None (the weak-fallback case).
-        let none_offset_frame =
-            delivery_with_fence_offset(session, Some(256), 0, same_second, None);
-
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &none_offset_frame,
-            Some(&inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "a fenced frame with turn_start_offset=None must NOT advance (no weak None fallback)"
-        );
-
-        // Two `user_msg_id == 0` turns differing ONLY by turn_start_offset: only the
-        // frame whose offset matches the current inflight advances. The mismatched
-        // one (the prior turn's offset) is blocked even though user_msg_id+started_at
-        // are identical (same-second TUI-direct collision).
-        let mismatched_offset_frame =
-            delivery_with_fence_offset(session, Some(256), 0, same_second, Some(0));
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &mismatched_offset_frame,
-            Some(&inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "an offset-mismatched same-second frame must NOT advance"
-        );
-
-        let matching_offset_frame =
-            delivery_with_fence_offset(session, Some(256), 0, same_second, Some(4096));
-        sink.advance_offset_for_confirmed_delegated_terminal(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &matching_offset_frame,
-            Some(&inflight),
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "the offset-matching same-second frame DOES advance"
-        );
-    }
-
-    // #3041 P1-3 (codex P1-3 issue 3 — stale-snapshot close): the production
-    // advance path re-loads the inflight FRESH after the confirmed POST. If the
-    // turn was cleared/replaced DURING the slow POST, the post-POST re-check sees
-    // the CURRENT (replaced/cleared) inflight and blocks the wrong-turn advance —
-    // even though a snapshot taken before the POST would have matched.
-    #[test]
-    fn sink_post_post_recheck_blocks_advance_when_inflight_replaced_during_post() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let temp = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
-
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(8_041);
-        let session = "AgentDesk-claude-8041";
-        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
-
-        // The frame was delegated for the ORIGINAL turn (turn_start_offset=0). A
-        // pre-POST snapshot would carry this identity and authorize the advance.
-        let delivery =
-            delivery_with_fence_offset(session, Some(256), 0, "2026-06-04T00:00:00Z", Some(0));
-
-        // DURING the (simulated) slow POST a NEW turn took the channel: same
-        // user_msg_id==0 and same second, but a later turn_start_offset. We persist
-        // THAT as the on-disk inflight so the fresh post-POST reload reads it.
-        let replaced = inflight_with_identity_offset(
-            channel.get(),
-            session,
-            0,
-            "2026-06-04T00:00:00Z",
-            Some(4096),
-        );
-        super::super::inflight::save_inflight_state(&replaced).expect("persist replaced inflight");
-
-        // Post-POST advance: re-loads inflight from disk (the REPLACED turn) → the
-        // identity gate (turn_start_offset 0 != 4096) blocks the advance.
-        sink.advance_after_confirmed_post(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery,
-            None,
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            0,
-            "a turn replaced DURING the POST must block the advance (post-POST fresh re-check)"
-        );
-
-        // Control: if the original turn STILL owns the channel at post-POST time,
-        // the fresh reload matches and the advance proceeds.
-        let still_original = inflight_with_identity_offset(
-            channel.get(),
-            session,
-            0,
-            "2026-06-04T00:00:00Z",
-            Some(0),
-        );
-        super::super::inflight::save_inflight_state(&still_original).expect("persist original");
-        sink.advance_after_confirmed_post(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &delivery,
-            None,
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "when the original turn still owns the channel at post-POST time, the advance proceeds"
-        );
-
-        // Cleared inflight (stop/cancel during POST) → no advance either.
-        super::super::make_shared_data_for_tests();
-        super::super::inflight::clear_inflight_state(&ProviderKind::Claude, channel.get());
-        let advanced_delivery =
-            delivery_with_fence_offset(session, Some(512), 0, "2026-06-04T00:00:00Z", Some(0));
-        sink.advance_after_confirmed_post(
-            &shared,
-            &ProviderKind::Claude,
-            channel.get(),
-            session,
-            &advanced_delivery,
-            None,
-        );
-        assert_eq!(
-            shared.committed_relay_offset(channel),
-            256,
-            "a cleared inflight at post-POST time must block the advance (identity gate, no inflight)"
-        );
-    }
-
-    // #3041 P1-3 (Part a, B1): the RESULT-bearing terminal frame's commit fence
-    // (consumed_end + identity) is copied onto the emitted `SessionRelayDelivery`,
-    // so `deliver_response` advances the authority from frame data — not an inflight
-    // file read. A non-terminal frame's delivery (none here) would carry None/0.
-    #[test]
-    fn parser_propagates_terminal_frame_commit_fence_onto_delivery() {
-        let binding = matched("46");
-        let mut parser = SessionRelayParser::default();
-        // A non-terminal text frame: accumulates, emits nothing.
-        let assistant = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"final answer\"}]}}\n";
-        assert!(
-            parser
-                .ingest_frame(&frame(&binding, assistant, 1))
-                .is_empty()
-        );
-        // The result-bearing TERMINAL frame carries the commit fence.
-        let result = "{\"type\":\"result\",\"result\":\"final answer\"}\n";
-        let deliveries = parser.ingest_frame(&terminal_frame(
-            &binding,
-            result,
-            2,
-            512,
-            77,
-            "2026-06-04T00:00:00Z",
-        ));
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].response_text, "final answer");
-        assert_eq!(
-            deliveries[0].terminal_consumed_end,
-            Some(512),
-            "the delivery must carry the terminal frame's consumed_end"
-        );
-        assert_eq!(deliveries[0].frame_turn_user_msg_id, 77);
-        assert_eq!(deliveries[0].frame_turn_started_at, "2026-06-04T00:00:00Z");
-        // #3041 P1-3 (codex P1-3 issue 2): the delivery also carries the frame's
-        // pinned turn_start_offset for the sink's identity gate.
-        assert_eq!(deliveries[0].frame_turn_start_offset, Some(0));
-    }
-
-    // #3041 P1-3 (codex P1-3 issue 1 — multi-turn-chunk close): after the watcher
-    // SPLITS a `result(A) + bytes(B)` physical chunk, the sink's parser receives
-    // turn A's bytes on a TERMINAL frame (A's fence) and turn B's bytes on a
-    // SEPARATE frame. A commits to A's end with A's identity; B is NOT black-holed —
-    // it is mirrored and, when it completes, commits to B's end with B's identity.
-    // Pre-fix, B's bytes rode A's terminal frame and a follow-up empty chunk emitted
-    // no frame for B (black-hole) and could reuse A's ACK (mis-commit).
-    #[test]
-    fn split_multi_turn_chunk_commits_each_turn_with_its_own_fence() {
-        let binding = matched("8051");
-        let mut parser = SessionRelayParser::default();
-
-        // The watcher split produced: terminal frame = turn A (result + A's fence),
-        // then a separate non-terminal frame = turn B's leading bytes.
-        let turn_a_result = "{\"type\":\"result\",\"result\":\"answer A\"}\n";
-        let turn_a_deliveries = parser.ingest_frame(&terminal_frame_offset(
-            &binding,
-            turn_a_result,
-            1,
-            /*consumed_end=*/ 100,
-            /*user_msg_id=*/ 0,
-            "2026-06-04T00:00:00Z",
-            /*turn_start_offset=*/ Some(0),
-        ));
-        // Turn A commits to A's end (100) with A's identity (offset 0).
-        assert_eq!(turn_a_deliveries.len(), 1, "turn A must produce a delivery");
-        assert_eq!(turn_a_deliveries[0].response_text, "answer A");
-        assert_eq!(turn_a_deliveries[0].terminal_consumed_end, Some(100));
-        assert_eq!(turn_a_deliveries[0].frame_turn_start_offset, Some(0));
-
-        // The sink resets the parser after each terminal delivery (via
-        // `finish_terminal_candidate`); model that so turn B starts a fresh turn.
-        parser.reset_turn();
-
-        // Turn B's leading bytes arrive on their OWN (non-terminal) frame — the
-        // split-out tail. The parser accumulates them (B not yet complete → no
-        // delivery), proving B is MIRRORED rather than black-holed.
-        let turn_b_assistant = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer B\"}]}}\n";
-        assert!(
-            parser
-                .ingest_frame(&frame(&binding, turn_b_assistant, 2))
-                .is_empty(),
-            "turn B's split-out bytes must accumulate (mirrored), not vanish"
-        );
-
-        // When turn B completes on a later pass, it gets its OWN terminal frame +
-        // fence: B commits to B's end (250) with B's identity (offset 100) — NOT
-        // turn A's. No shared-ACK reuse, no mis-commit.
-        let turn_b_result = "{\"type\":\"result\",\"result\":\"answer B\"}\n";
-        let turn_b_deliveries = parser.ingest_frame(&terminal_frame_offset(
-            &binding,
-            turn_b_result,
-            3,
-            /*consumed_end=*/ 250,
-            /*user_msg_id=*/ 0,
-            "2026-06-04T00:00:01Z",
-            /*turn_start_offset=*/ Some(100),
-        ));
-        assert_eq!(
-            turn_b_deliveries.len(),
-            1,
-            "turn B must commit (not black-holed)"
-        );
-        assert_eq!(turn_b_deliveries[0].response_text, "answer B");
-        assert_eq!(
-            turn_b_deliveries[0].terminal_consumed_end,
-            Some(250),
-            "turn B commits to B's end, not A's"
-        );
-        assert_eq!(
-            turn_b_deliveries[0].frame_turn_start_offset,
-            Some(100),
-            "turn B commits with B's own identity (turn_start_offset), not A's"
-        );
     }
 
     #[test]
@@ -3161,444 +1490,5 @@ mod tests {
             deliveries[0].task_notification_kind,
             Some(TaskNotificationKind::MonitorAutoTurn)
         );
-    }
-
-    fn external_input_delivery(session_name: &str, channel_id: u64) -> SessionRelayDelivery {
-        SessionRelayDelivery {
-            provider: ProviderKind::Claude,
-            channel_id,
-            session_name: session_name.to_string(),
-            response_text: "answer".to_string(),
-            task_notification_kind: None,
-            terminal_consumed_end: None,
-            frame_turn_user_msg_id: 0,
-            frame_turn_started_at: "2026-06-04T00:00:00Z".to_string(),
-            frame_turn_start_offset: None,
-        }
-    }
-
-    fn session_bound_lease(
-        channel_id: u64,
-        session: &str,
-        turn_seq: u64,
-    ) -> ExternalInputRelayLease {
-        ExternalInputRelayLease {
-            channel_id: Some(channel_id),
-            turn_id: Some(format!("external:claude:{channel_id}:{session}:{turn_seq}")),
-            session_key: Some(format!("host:{session}")),
-            relay_owner: ExternalInputRelayOwner::SessionBoundRelay,
-            runtime_kind: Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui),
-            generation:
-                crate::services::tui_prompt_dedupe::EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
-        }
-    }
-
-    // #3041 P1-4 (§4-④): the CORE regression. Before P1-4 the session-bound
-    // external_input lease was cleared only on the four Ok delivery branches; an
-    // Err / `?` / HTTP-503 left it set for the full 600s TTL. This drives a real
-    // `deliver_response` whose `shared_for_provider` is unavailable (empty
-    // HealthRegistry) so the FIRST `?` returns `Err(Transient)` — and asserts the
-    // RAII guard's Drop STILL released the lease, so the NEXT terminal delivery
-    // is NOT blocked for up to ~10 minutes.
-    //
-    // SAFETY (await_holding_lock): `shared_test_env_lock()` and the dedupe
-    // `TEST_LOCK` are std test-serialization Mutexes (NOT production locks). They
-    // are held across `deliver_response().await` only to keep this test's
-    // `AGENTDESK_ROOT_DIR` + shared dedupe state isolated from other tests; the
-    // awaited future itself never tries to re-acquire either lock, so there is no
-    // deadlock — this is the established pattern (see `src/reconcile.rs`).
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn deliver_response_err_path_releases_external_input_lease_via_guard() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        struct EnvReset(Option<std::ffi::OsString>);
-        impl Drop for EnvReset {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _env_reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        let temp = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
-
-        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap();
-        crate::services::tui_prompt_dedupe::reset_state_for_tests();
-
-        let channel_id = 8_041_u64;
-        let session = "AgentDesk-claude-p1-4-err";
-        let lease = session_bound_lease(channel_id, session, 1);
-        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            lease.clone(),
-        );
-        // Precondition: the input-dedup lease is present (it routes, does not block).
-        assert!(
-            crate::services::tui_prompt_dedupe::external_input_relay_lease_present(
-                ProviderKind::Claude.as_str(),
-                session,
-                channel_id,
-            )
-        );
-
-        // Empty HealthRegistry → `shared_for_provider` is None → the first `?`
-        // in `deliver_response` returns Err(Transient) before any Discord POST.
-        let sink = SessionBoundDiscordRelaySink::new(Arc::new(HealthRegistry::new()));
-        let result = sink
-            .deliver_response(external_input_delivery(session, channel_id))
-            .await;
-        assert!(
-            matches!(result, Err(RelaySinkError::Transient(_))),
-            "precondition: this path must return Err (shared unavailable) to exercise the leak path, got {result:?}"
-        );
-
-        // The RAII guard's Drop fired on the Err `?` exit → lease released.
-        assert!(
-            !crate::services::tui_prompt_dedupe::external_input_relay_lease_present(
-                ProviderKind::Claude.as_str(),
-                session,
-                channel_id,
-            ),
-            "the external_input lease MUST be released on the Err/`?` path (RAII guard Drop), so the next terminal delivery is not blocked for the 600s TTL"
-        );
-    }
-
-    // #3041 P1-4: NO-CLOBBER. If a NEWER turn re-takes the same
-    // (provider, tmux_session, channel) lease DURING a slow delivery, an old
-    // delivery's guard Drop must NOT clear the newer turn's lease — the guard
-    // compare-and-clears (`_if_matches`) only its OWN captured lease.
-    #[test]
-    fn lease_guard_drop_preserves_newer_turn_lease_no_clobber() {
-        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap();
-        crate::services::tui_prompt_dedupe::reset_state_for_tests();
-
-        let channel_id = 8_042_u64;
-        let session = "AgentDesk-claude-p1-4-no-clobber";
-
-        // Turn 1 records its lease; the sink arms a guard capturing turn 1's lease.
-        let lease1 = session_bound_lease(channel_id, session, 1);
-        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            lease1.clone(),
-        );
-        let guard = SessionBoundExternalInputLeaseGuard::arm_if_present(
-            &ProviderKind::Claude,
-            channel_id,
-            session,
-        )
-        .expect("guard arms when a SessionBoundRelay lease is present");
-
-        // DURING the slow delivery a NEWER turn (turn 2) re-takes the same key.
-        let lease2 = session_bound_lease(channel_id, session, 2);
-        let recorded2 = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            lease2.clone(),
-        );
-        assert_ne!(
-            guard.generation, recorded2.generation,
-            "each recorded lease must get a DISTINCT generation"
-        );
-
-        // The OLD guard drops (turn 1 finished/errored) — must NOT clobber turn 2.
-        drop(guard);
-        assert_eq!(
-            crate::services::tui_prompt_dedupe::external_input_relay_lease(
-                ProviderKind::Claude.as_str(),
-                session,
-                channel_id,
-            ),
-            Some(recorded2),
-            "a newer turn's lease must survive an old guard's drop (compare-and-clear by generation)"
-        );
-    }
-
-    // #3041 P1-4 codex: NO-CLOBBER for two VALUE-IDENTICAL `Unassigned` leases.
-    // Two legacy `Unassigned` turns for the same (provider, tmux_session, channel)
-    // have `turn_id`/`session_key`/`runtime_kind` ALL `None`, so they are
-    // indistinguishable by value. The per-record `generation` makes them distinct:
-    // an OLD guard's Drop must clear ONLY its own generation and leave the newer
-    // (value-identical) lease in place. Without the generation, a slow old
-    // delivery's guard would wrongly release the newer turn's lease.
-    #[test]
-    fn lease_guard_drop_preserves_newer_unassigned_lease_by_generation() {
-        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap();
-        crate::services::tui_prompt_dedupe::reset_state_for_tests();
-
-        let channel_id = 8_044_u64;
-        let session = "AgentDesk-claude-p1-4-unassigned-no-clobber";
-
-        // Turn 1: a legacy/Unassigned lease (all trace fields None) is recorded and
-        // the sink arms a guard capturing turn 1's generation.
-        crate::services::tui_prompt_dedupe::record_external_input_relay_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            Some(channel_id),
-        );
-        let guard = SessionBoundExternalInputLeaseGuard::arm_if_present(
-            &ProviderKind::Claude,
-            channel_id,
-            session,
-        )
-        .expect("guard arms for an Unassigned input-dedup lease");
-
-        // DURING the slow delivery a NEWER, VALUE-IDENTICAL Unassigned turn re-takes
-        // the same key (same provider/session/channel; all trace fields None).
-        crate::services::tui_prompt_dedupe::record_external_input_relay_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            Some(channel_id),
-        );
-        let newer = crate::services::tui_prompt_dedupe::external_input_relay_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            channel_id,
-        )
-        .expect("newer Unassigned lease present");
-        assert_eq!(
-            newer.relay_owner,
-            ExternalInputRelayOwner::Unassigned,
-            "the newer lease is the value-identical Unassigned marker"
-        );
-        assert_ne!(
-            guard.generation, newer.generation,
-            "two Unassigned leases for the same key must get DISTINCT generations"
-        );
-
-        // The OLD guard drops — by generation it does NOT match the newer lease, so
-        // the newer (value-identical) lease must SURVIVE.
-        drop(guard);
-        assert_eq!(
-            crate::services::tui_prompt_dedupe::external_input_relay_lease(
-                ProviderKind::Claude.as_str(),
-                session,
-                channel_id,
-            ),
-            Some(newer),
-            "a newer value-identical Unassigned lease must survive an old guard's drop (clear-by-generation, no clobber)"
-        );
-    }
-
-    // #3041 P1-4: when the guard's OWN lease is still current at drop time, the
-    // Drop releases it (the happy-path release that replaces the manual Ok-path
-    // clears). Also verifies arm_if_present is INERT for a foreign-owner lease
-    // (BridgeAdapter) — that lease belongs to another subsystem and must be left
-    // for ITS guard, never cleared by the session-bound sink.
-    #[test]
-    fn lease_guard_drop_clears_own_lease_and_is_inert_for_foreign_owner() {
-        let _dedupe_guard = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap();
-        crate::services::tui_prompt_dedupe::reset_state_for_tests();
-
-        let channel_id = 8_043_u64;
-        let session = "AgentDesk-claude-p1-4-own";
-
-        // Own (SessionBoundRelay) lease → guard arms and clears on drop.
-        let own = session_bound_lease(channel_id, session, 1);
-        crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            own.clone(),
-        );
-        {
-            let _guard = SessionBoundExternalInputLeaseGuard::arm_if_present(
-                &ProviderKind::Claude,
-                channel_id,
-                session,
-            )
-            .expect("guard arms for own SessionBoundRelay lease");
-        }
-        assert!(
-            !crate::services::tui_prompt_dedupe::external_input_relay_lease_present(
-                ProviderKind::Claude.as_str(),
-                session,
-                channel_id,
-            ),
-            "the guard releases its own lease on drop (replaces the manual Ok-path clears)"
-        );
-
-        // Foreign-owner (BridgeAdapter) lease → guard does NOT arm; the foreign
-        // lease is left intact for the owning subsystem's own guard.
-        let foreign = ExternalInputRelayLease {
-            relay_owner: ExternalInputRelayOwner::BridgeAdapter,
-            ..session_bound_lease(channel_id, session, 2)
-        };
-        let recorded_foreign = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
-            ProviderKind::Claude.as_str(),
-            session,
-            foreign.clone(),
-        );
-        assert!(
-            SessionBoundExternalInputLeaseGuard::arm_if_present(
-                &ProviderKind::Claude,
-                channel_id,
-                session,
-            )
-            .is_none(),
-            "the session-bound sink must NOT take ownership of a foreign-owner (BridgeAdapter) lease"
-        );
-        assert_eq!(
-            crate::services::tui_prompt_dedupe::external_input_relay_lease(
-                ProviderKind::Claude.as_str(),
-                session,
-                channel_id,
-            ),
-            Some(recorded_foreign),
-            "a foreign-owner lease is preserved (input-dedup / cross-subsystem routing not regressed)"
-        );
-    }
-
-    /// #3151: the `SinkDeliveryLeaseGuard` is the deterministic seam for the
-    /// in-flight sink-delivery marker. Driving the full `deliver_response` needs
-    /// Discord HTTP, so these tests exercise the guard's acquire/commit/release
-    /// semantics directly on a real per-channel `DeliveryLeaseCell` — the exact
-    /// cell the watcher gate reads.
-    mod inflight_sink_marker {
-        use super::super::SinkDeliveryLeaseGuard;
-        use crate::services::discord::turn_finalizer::TurnKey;
-        use crate::services::discord::{
-            DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot,
-        };
-        use serenity::model::id::ChannelId;
-        use std::sync::Arc;
-
-        const START: u64 = 100;
-        const END: u64 = 200;
-
-        /// (a) SLOW SINK IN FLIGHT: acquiring the guard sets the cell to
-        /// `Leased{Sink, [start,end)}` — the marker the watcher gate reads as
-        /// "a sink POST is in flight" → WaitInFlight (no duplicate).
-        #[tokio::test]
-        async fn acquire_sets_leased_sink_marker() {
-            let ch = ChannelId::new(7301);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 5, 0);
-            let guard =
-                SinkDeliveryLeaseGuard::acquire(&cell, turn, START, END).expect("acquire wins");
-            match cell.read() {
-                LeaseSnapshot::Leased {
-                    holder, start, end, ..
-                } => {
-                    assert_eq!(holder, LeaseHolder::Sink);
-                    assert_eq!((start, end), (START, END));
-                }
-                other => panic!("expected Leased{{Sink}}, got {other:?}"),
-            }
-            drop(guard);
-        }
-
-        /// SUCCESS path: commit() flips the marker to `Committed{Sink, Delivered}`;
-        /// the guard's Drop then RELEASES it back to `Unleased`. (Production advances
-        /// the committed offset BEFORE commit, so the watcher reads committed>=end.)
-        #[tokio::test]
-        async fn commit_then_drop_releases_to_unleased() {
-            let ch = ChannelId::new(7302);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 5, 0);
-            {
-                let guard =
-                    SinkDeliveryLeaseGuard::acquire(&cell, turn, START, END).expect("acquire wins");
-                guard.commit();
-                match cell.read() {
-                    LeaseSnapshot::Committed {
-                        holder, outcome, ..
-                    } => {
-                        assert_eq!(holder, LeaseHolder::Sink);
-                        assert_eq!(outcome, LeaseOutcome::Delivered);
-                    }
-                    other => panic!("expected Committed{{Sink}}, got {other:?}"),
-                }
-            }
-            // Guard dropped without an explicit release call — Drop released it.
-            assert!(
-                matches!(cell.read(), LeaseSnapshot::Unleased),
-                "Drop releases the committed marker back to Unleased"
-            );
-        }
-
-        /// FAILURE/Err path: the guard is dropped WITHOUT commit (the POST `?`-errored
-        /// or the identity gate blocked the advance) → the cell returns to `Unleased`
-        /// and committed is NOT advanced (the watcher then SendFulls — no black-hole).
-        #[tokio::test]
-        async fn drop_without_commit_releases_without_committing() {
-            let ch = ChannelId::new(7303);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 5, 0);
-            {
-                let _guard =
-                    SinkDeliveryLeaseGuard::acquire(&cell, turn, START, END).expect("acquire wins");
-                // No commit() — simulate the Err/`?` path.
-            }
-            assert!(
-                matches!(cell.read(), LeaseSnapshot::Unleased),
-                "a failure path that never commits leaves the cell Unleased (committed not advanced)"
-            );
-        }
-
-        /// ACQUIRE FAILS when the watcher/bridge already holds the range: the guard is
-        /// `None` → the sink POSTs markerless (no double-commit, no self-black-hole),
-        /// and the existing holder's lease is untouched.
-        #[test]
-        fn acquire_fails_when_another_holder_owns_range() {
-            let ch = ChannelId::new(7304);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 5, 0);
-            let now = crate::services::discord::lease_now_ms();
-            let watcher_holder = LeaseHolder::Watcher { instance_id: 1 };
-            // A watcher already holds the cell for this range (B2).
-            assert!(
-                cell.try_acquire(turn, watcher_holder, START, END, now.saturating_add(10_000),)
-            );
-            // The sink's acquire loses → None (markerless POST; no duplicate).
-            assert!(
-                SinkDeliveryLeaseGuard::acquire(&cell, turn, START, END).is_none(),
-                "the sink acquire must lose to the watcher's existing lease"
-            );
-            // The watcher's lease is intact (still Leased by the watcher).
-            match cell.read() {
-                LeaseSnapshot::Leased { holder, .. } => assert_eq!(holder, watcher_holder),
-                other => panic!("expected the watcher's lease intact, got {other:?}"),
-            }
-        }
-
-        /// A STALE-EXPIRED prior holder is self-healed by `acquire`'s
-        /// `reclaim_if_expired` (mirrors the watcher) so the sink's acquire still
-        /// wins — otherwise the sink would POST markerless and reintroduce the dup.
-        #[tokio::test]
-        async fn acquire_self_heals_an_expired_prior_holder() {
-            let ch = ChannelId::new(7305);
-            let cell = Arc::new(DeliveryLeaseCell::new(ch));
-            let turn = TurnKey::new(ch, 5, 0);
-            let now = crate::services::discord::lease_now_ms();
-            // A dead prior holder whose deadline is already in the past.
-            assert!(cell.try_acquire(
-                turn,
-                LeaseHolder::Watcher { instance_id: 9 },
-                START,
-                END,
-                now.saturating_sub(1),
-            ));
-            // The sink's acquire reclaims the expired holder first, then wins.
-            let guard = SinkDeliveryLeaseGuard::acquire(&cell, turn, START, END)
-                .expect("acquire wins after self-healing the expired holder");
-            match cell.read() {
-                LeaseSnapshot::Leased { holder, .. } => assert_eq!(holder, LeaseHolder::Sink),
-                other => panic!("expected Leased{{Sink}} after reclaim, got {other:?}"),
-            }
-            drop(guard);
-        }
     }
 }
