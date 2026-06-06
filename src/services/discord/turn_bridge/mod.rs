@@ -1645,9 +1645,9 @@ async fn refresh_session_panel_line_from_lifecycle(
         .filter(|name| !name.is_empty())
         .and_then(super::tmux::session_panel_instance_key);
     #[cfg(not(unix))]
-    let session_instance_key = {
+    let session_instance_key: Option<String> = {
         let _ = tmux_session_name;
-        Option::<String>::None
+        None
     };
     let channel_id_text = channel_id.get().to_string();
     match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
