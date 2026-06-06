@@ -1151,12 +1151,16 @@ async fn start_monitor_auto_turn_when_available(
         }
 
         let token = Arc::new(crate::services::provider::CancelToken::new());
-        let started = super::mailbox_try_start_turn(
+        // #3167 — the monitor auto-turn is a low-priority background relay; mark
+        // it `Background` so a queued external USER intervention is not starved
+        // behind a continuously-cycling monitor turn.
+        let started = super::mailbox_try_start_turn_kinded(
             shared,
             channel_id,
             token,
             UserId::new(1),
             synthetic_message_id,
+            crate::services::turn_orchestrator::ActiveTurnKind::Background,
         )
         .await;
         if started {
@@ -1316,6 +1320,12 @@ fn ensure_monitor_auto_turn_inflight(
     // originating Discord message. The session-bound relay does NOT branch
     // on this — recorded for diagnostics only.
     synthetic.turn_source = super::inflight::TurnSource::MonitorTriggered;
+    // status-panel-v2: make this watcher-owned so the panel-eligibility
+    // predicate (watcher_inflight_is_panel_eligible_for_session) recognises the
+    // synthetic monitor/self-paced-loop turn and the watcher can create/update/
+    // clean up a live status panel for it. The shared external-input predicate
+    // (lease + ⏳ anchor lifecycle, #3164/#3174) stays untouched.
+    synthetic.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
 
     match super::inflight::save_inflight_state_create_new(&synthetic) {
         Ok(()) => {
