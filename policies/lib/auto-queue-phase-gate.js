@@ -593,7 +593,9 @@ function _buildPhaseGateGroups(runId, phase) {
     }
 
     var latestResult = {};
-    try { latestResult = JSON.parse(row.latest_result || "{}"); } catch (e) { latestResult = {}; }
+    if (row.latest_result && row.latest_result !== "{}" && row.latest_result !== "[]") {
+      try { latestResult = JSON.parse(row.latest_result); } catch (e) { latestResult = {}; }
+    }
 
     groups[key].card_ids.push(row.kanban_card_id);
     if (row.github_issue_number !== null && row.github_issue_number !== undefined) {
