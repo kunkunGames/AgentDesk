@@ -177,9 +177,13 @@ var autoQueue = {
 
     var dispatch = dispatches[0];
     var context = {};
-    try { context = JSON.parse(dispatch.context || "{}"); } catch (e) { context = {}; }
+    if (dispatch.context && dispatch.context !== "{}" && dispatch.context !== "[]") {
+      try { context = JSON.parse(dispatch.context); } catch (e) { context = {}; }
+    }
     var result = {};
-    try { result = JSON.parse(dispatch.result || "{}"); } catch (e) { result = {}; }
+    if (dispatch.result && dispatch.result !== "{}" && dispatch.result !== "[]") {
+      try { result = JSON.parse(dispatch.result); } catch (e) { result = {}; }
+    }
     var gate = context.phase_gate;
     if (!gate || !gate.run_id || gate.batch_phase == null) {
       return;
@@ -334,8 +338,12 @@ var autoQueue = {
       }
       var gateContext = {};
       var gateResult = {};
-      try { gateContext = JSON.parse(gateDispatch.context || "{}"); } catch (e) { gateContext = {}; }
-      try { gateResult = JSON.parse(gateDispatch.result || "{}"); } catch (e) { gateResult = {}; }
+      if (gateDispatch.context && gateDispatch.context !== "{}" && gateDispatch.context !== "[]") {
+        try { gateContext = JSON.parse(gateDispatch.context); } catch (e) { gateContext = {}; }
+      }
+      if (gateDispatch.result && gateDispatch.result !== "{}" && gateDispatch.result !== "[]") {
+        try { gateResult = JSON.parse(gateDispatch.result); } catch (e) { gateResult = {}; }
+      }
       var expectedVerdict = (gateContext.phase_gate && gateContext.phase_gate.pass_verdict) || "phase_gate_passed";
       var gateVerdict = gateResult.verdict || gateResult.decision || gateResult.phase_gate_verdict || null;
       // #699 (round 2): sibling gate dispatches persisted before the server

@@ -70,7 +70,7 @@ function firstPresent() {
 }
 
 function parseJsonObject(raw) {
-  if (!raw) return {};
+  if (!raw || raw === "{}" || raw === "[]") return {};
   try {
     return JSON.parse(raw) || {};
   } catch (e) {
