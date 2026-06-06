@@ -202,7 +202,7 @@ pub(crate) fn dispatch_delivery_event_recovery_metrics_snapshot()
         .iter()
         .map(|entry| DispatchDeliveryEventMismatchMetric {
             name: "agentdesk_dispatch_delivery_event_recovered_total",
-            kind: entry.key().clone(),
+            kind: entry.key().to_string(),
             value: entry.value().load(Ordering::Relaxed),
         })
         .collect();
@@ -219,7 +219,7 @@ pub(crate) fn dispatch_delivery_event_mismatch_metrics_snapshot()
         .iter()
         .map(|entry| DispatchDeliveryEventMismatchMetric {
             name: "agentdesk_dispatch_delivery_event_mismatch_total",
-            kind: entry.key().clone(),
+            kind: entry.key().to_string(),
             value: entry.value().load(Ordering::Relaxed),
         })
         .collect();
