@@ -280,28 +280,6 @@ fn watcher_inflight_is_external_input_for_session(
         })
 }
 
-/// status-panel-v2 variant of `watcher_inflight_is_external_input_for_session`.
-///
-/// Identical session + watcher-relay-owner guards (same orphan-panel reasoning),
-/// but gated on the broader `watcher_inflight_is_panel_eligible` predicate so the
-/// synthetic monitor/self-paced-loop turns also get a watcher-owned status panel.
-/// Used ONLY at the panel-lifecycle sites; the lease/⏳-anchor sites keep the
-/// narrower external-input predicate.
-fn watcher_inflight_is_panel_eligible_for_session(
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-) -> bool {
-    inflight
-        .filter(|state| state.tmux_session_name.as_deref() == Some(tmux_session_name))
-        .is_some_and(|state| {
-            watcher_inflight_is_panel_eligible(Some(state))
-                && matches!(
-                    state.effective_relay_owner_kind(),
-                    crate::services::discord::inflight::RelayOwnerKind::Watcher
-                )
-        })
-}
-
 /// #3003 single-chokepoint orphan reclaim: has the in-flight TUI-direct turn
 /// been abandoned, so a watcher-created v2 panel can never reach terminal
 /// completion?
@@ -567,26 +545,6 @@ fn watcher_inflight_represents_external_input(inflight: Option<&InflightTurnStat
             crate::services::discord::inflight::TurnSource::ExternalInput
                 | crate::services::discord::inflight::TurnSource::ExternalAdopted
         )
-    })
-}
-
-/// status-panel-v2 eligibility for a watcher-driven inflight turn.
-///
-/// SEPARATE from `watcher_inflight_represents_external_input` on purpose: that
-/// shared predicate backs the external-input delivery LEASE and the `⏳` anchor
-/// lifecycle (#3164/#3174), and broadening it there would regress both. The
-/// panel only needs to know whether the watcher should create/update/clean up a
-/// live status panel for this turn, so it ALSO covers the synthetic
-/// monitor/self-paced-loop turns (`TurnSource::MonitorTriggered`, created by
-/// `ensure_monitor_auto_turn_inflight`) — which the lease/anchor sites must
-/// keep ignoring.
-fn watcher_inflight_is_panel_eligible(inflight: Option<&InflightTurnState>) -> bool {
-    inflight.is_some_and(|state| {
-        watcher_inflight_represents_external_input(Some(state))
-            || matches!(
-                state.turn_source,
-                crate::services::discord::inflight::TurnSource::MonitorTriggered
-            )
     })
 }
 
@@ -1165,54 +1123,6 @@ fn committed_completion_is_stale_for_newer_turn(
     snapshot_is_newer_turn(inflight_before_relay) || snapshot_is_newer_turn(inflight_state)
 }
 
-/// #3142: sibling of [`committed_completion_is_stale_for_newer_turn`] for the
-/// ANCHOR-CLEANUP branches of the committed-output block (the
-/// `should_complete_tui_direct_anchor_lifecycle` first branch and the
-/// `injected_prompt_message_id` task-notification branch). Those branches act on
-/// an anchor identity that can belong to a `user_msg_id == 0` external-input /
-/// injected-anchor newer turn — a case the id!=0 sibling DELIBERATELY excludes
-/// (its `user_msg_id != 0` filter protects the finalize/clear contract against
-/// the id-0 channel-collapse warned about at the clear site). So this helper
-/// must be the id==0-INCLUSIVE variant for the anchor branches ONLY.
-///
-/// Detection rule (mirrors the watcher-yield guard tmux.rs:2110-2111 offset test
-/// exactly, like the sibling): a snapshot is a stale NEWER turn iff trimmed
-/// session match AND effective start
-/// `turn_start_offset.unwrap_or(last_offset) >= current_offset` AND the snapshot
-/// is anchor-relevant — it carries a real anchor/external identity
-/// (`user_msg_id != 0` OR `injected_prompt_message_id.is_some()` OR it represents
-/// external input). The anchor-relevance disjunct ensures a truly empty/no-anchor
-/// row is NOT spuriously treated as a stale newer turn (such a row also fails the
-/// branch's own `watcher_inflight_needs_anchor_lifecycle_cleanup` precondition).
-/// OR-ed across both snapshots exactly like the sibling so the pre-relay snapshot
-/// and the late re-read are both checked.
-///
-/// Narrow by construction: for a normal anchor completion (the inflight is THIS
-/// or an OLDER turn with `start < current_offset`, absent, or on a different
-/// session) this returns FALSE → the anchor cleanup runs as today.
-fn committed_anchor_cleanup_is_stale_for_newer_turn(
-    inflight_before_relay: Option<&crate::services::discord::inflight::InflightTurnState>,
-    inflight_state: Option<&crate::services::discord::inflight::InflightTurnState>,
-    tmux_session_name: &str,
-    current_offset: u64,
-) -> bool {
-    let snapshot_is_newer_anchor_turn =
-        |snapshot: Option<&crate::services::discord::inflight::InflightTurnState>| {
-            snapshot.is_some_and(|state| {
-                (state.user_msg_id != 0
-                    || state.injected_prompt_message_id.is_some()
-                    || watcher_inflight_represents_external_input(Some(state)))
-                    && state.tmux_session_name.as_deref().map(str::trim)
-                        == Some(tmux_session_name.trim())
-                    // Same `turn_start_offset.unwrap_or(last_offset)` fallback as
-                    // the sibling helper and the yield guard.
-                    && state.turn_start_offset.unwrap_or(state.last_offset) >= current_offset
-            })
-        };
-    snapshot_is_newer_anchor_turn(inflight_before_relay)
-        || snapshot_is_newer_anchor_turn(inflight_state)
-}
-
 fn refresh_watcher_turn_identity(
     current: &mut Option<crate::services::discord::inflight::InflightTurnIdentity>,
     provider: &ProviderKind,
@@ -1495,450 +1405,6 @@ mod pane_dead_identity_tests {
         );
     }
 
-    // #3142 test scaffolding: build a snapshot at given offsets that ALSO carries
-    // an anchor/external identity (injected_prompt_message_id and/or
-    // ExternalInput turn_source). `state_with_offsets` cannot set those fields, so
-    // mutate them directly (all pub).
-    fn state_with_anchor(
-        user_msg_id: u64,
-        tmux_session_name: &str,
-        turn_start_offset: Option<u64>,
-        last_offset: u64,
-        injected_prompt_message_id: Option<u64>,
-        external_input: bool,
-    ) -> InflightTurnState {
-        let mut state = state_with_offsets(
-            user_msg_id,
-            tmux_session_name,
-            turn_start_offset,
-            last_offset,
-        );
-        state.injected_prompt_message_id = injected_prompt_message_id;
-        if external_input {
-            state.turn_source = crate::services::discord::inflight::TurnSource::ExternalInput;
-        }
-        state
-    }
-
-    // #3142 (EPIC, follow-up to #3141). The committed-output anchor-cleanup
-    // branches act on a `user_msg_id == 0` external-input / injected-anchor newer
-    // turn that the id!=0 `committed_completion_is_stale_for_newer_turn`
-    // deliberately excludes. `committed_anchor_cleanup_is_stale_for_newer_turn` is
-    // the id==0-inclusive sibling for those branches. This matrix mirrors
-    // `committed_completion_stale_for_newer_turn_matrix` and locks the divergence.
-    #[test]
-    fn committed_anchor_cleanup_stale_for_newer_turn_matrix() {
-        let session = "AgentDesk-codex-adk-cdx";
-
-        // (a) id!=0 newer turn after range (start 50 >= current 50) → true.
-        let newer_id = state_with_offsets(800, session, Some(50), 50);
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&newer_id),
-            session,
-            50
-        ));
-
-        // (b) id==0 + injected_prompt_message_id newer after range → true.
-        // THE new coverage: assert the id!=0 sibling returns FALSE on the SAME
-        // state, locking the divergence.
-        let newer_injected = state_with_anchor(0, session, Some(50), 50, Some(4242), false);
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&newer_injected),
-            session,
-            50
-        ));
-        assert!(
-            !committed_completion_is_stale_for_newer_turn(None, Some(&newer_injected), session, 50),
-            "id!=0 sibling must NOT classify an id==0 injected newer turn as stale"
-        );
-
-        // (c) id==0 + ExternalInput turn_source newer after range → true.
-        let newer_external = state_with_anchor(0, session, Some(50), 50, None, true);
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&newer_external),
-            session,
-            50
-        ));
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&newer_external),
-            session,
-            50
-        ));
-
-        // (d) this/older turn (start 10 < 50), any id → false.
-        let in_range_id = state_with_offsets(700, session, Some(10), 10);
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            Some(&in_range_id),
-            Some(&in_range_id),
-            session,
-            50
-        ));
-        let in_range_injected = state_with_anchor(0, session, Some(10), 10, Some(4243), false);
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            Some(&in_range_injected),
-            Some(&in_range_injected),
-            session,
-            50
-        ));
-
-        // (e) wrong session, even though newer → false.
-        let other_session = state_with_anchor(
-            0,
-            "AgentDesk-codex-adk-cdx-fresh",
-            Some(50),
-            50,
-            Some(9),
-            true,
-        );
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&other_session),
-            session,
-            50
-        ));
-
-        // (f) None / None → false.
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None, None, session, 50
-        ));
-
-        // (g) id==0 + no anchor + no external (plain empty newer row) → false:
-        // the anchor-relevance disjunct gates it out.
-        let empty_newer = state_with_anchor(0, session, Some(50), 50, None, false);
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&empty_newer),
-            session,
-            50
-        ));
-
-        // (h) only inflight_before_relay newer (state older) → true; and vice-versa.
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            Some(&newer_injected),
-            Some(&in_range_id),
-            session,
-            50
-        ));
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            Some(&in_range_id),
-            Some(&newer_injected),
-            session,
-            50
-        ));
-
-        // (i) turn_start_offset=None fallback to last_offset parity.
-        let no_start_after = state_with_anchor(0, session, None, 50, Some(7), false);
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&no_start_after),
-            session,
-            50
-        ));
-        let no_start_before = state_with_anchor(0, session, None, 10, Some(7), false);
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&no_start_before),
-            session,
-            50
-        ));
-    }
-
-    // #3142 consumer-1 (dispatch finalization). The call site at the
-    // `else if let Some(did) = resolved_did.as_deref().filter(|_| !stale)` arm
-    // falls through to the `else => true` no-finalize arm when stale. Pure
-    // predicate alignment: stale → skip; in-range → run.
-    #[test]
-    fn dispatch_finalization_skips_when_stale() {
-        let session = "AgentDesk-codex-adk-cdx";
-        // (a) newer id!=0 snapshot → stale true → dispatch finalize skipped.
-        let newer = state_with_offsets(999, session, Some(50), 50);
-        assert!(committed_completion_is_stale_for_newer_turn(
-            None,
-            Some(&newer),
-            session,
-            50
-        ));
-        // (b) common case: in-range turn → stale false → finalize runs.
-        let in_range = state_with_offsets(700, session, Some(10), 10);
-        assert!(!committed_completion_is_stale_for_newer_turn(
-            Some(&in_range),
-            Some(&in_range),
-            session,
-            50
-        ));
-    }
-
-    // #3142 consumer-2 (history append). The push is gated on
-    // `!completion_is_stale_for_newer_turn`. Same predicate as dispatch; assert
-    // both directions so the (user_text, response) pair is never cross-paired.
-    #[test]
-    fn history_append_skips_when_stale() {
-        let session = "AgentDesk-codex-adk-cdx";
-        // The #3142 history push gate is
-        // `!completion_is_stale_for_newer_turn && !anchor_cleanup_is_stale_for_newer_turn`.
-        let newer = state_with_offsets(800, session, Some(50), 50);
-        assert!(
-            committed_completion_is_stale_for_newer_turn(None, Some(&newer), session, 50),
-            "id!=0 stale newer turn → history push suppressed (no cross-paired user_text/response)"
-        );
-        let in_range = state_with_offsets(700, session, Some(10), 10);
-        assert!(
-            !committed_completion_is_stale_for_newer_turn(
-                Some(&in_range),
-                Some(&in_range),
-                session,
-                50
-            ),
-            "common case → not id!=0-stale (history push runs)"
-        );
-        assert!(
-            !committed_anchor_cleanup_is_stale_for_newer_turn(
-                Some(&in_range),
-                Some(&in_range),
-                session,
-                50
-            ),
-            "common case → not anchor-stale either (history push runs)"
-        );
-
-        // #3142 history-append id==0 gap: a NEWER external-input turn with
-        // `user_msg_id == 0` is DELIBERATELY excluded by the id!=0 sibling, so the
-        // push must ALSO gate on the id==0-inclusive anchor helper — otherwise the
-        // newer turn's `user_text` cross-pairs with the OLDER response in TUI
-        // history (the exact residual the EPIC's proposed direction called out).
-        let newer_external_id0 = state_with_anchor(0, session, Some(50), 50, None, true);
-        assert!(
-            !committed_completion_is_stale_for_newer_turn(
-                None,
-                Some(&newer_external_id0),
-                session,
-                50
-            ),
-            "id!=0 sibling alone does NOT suppress an id==0 external newer turn (the gap)"
-        );
-        assert!(
-            committed_anchor_cleanup_is_stale_for_newer_turn(
-                None,
-                Some(&newer_external_id0),
-                session,
-                50
-            ),
-            "id==0-inclusive anchor helper suppresses the id==0 external newer turn (gap closed)"
-        );
-    }
-
-    // #3142 consumer-4 (status-panel). The completion identity is offset-pinned
-    // via `pinned_finalize_user_msg_id`: None for a newer pre-relay snapshot,
-    // Some(id) in-range, None for rebind_origin/id==0. Mirrors the new derivation.
-    #[test]
-    fn status_panel_id_none_when_pre_relay_snapshot_is_newer() {
-        let session = "AgentDesk-codex-adk-cdx";
-
-        // Reproduce the new derivation as a pure expression.
-        let derive = |inflight: Option<&InflightTurnState>, current: u64| -> Option<u64> {
-            let pinned = pinned_finalize_user_msg_id(inflight, session, current);
-            inflight
-                .filter(|i| !i.rebind_origin)
-                .and_then(|_| (pinned != 0).then_some(pinned))
-        };
-
-        // (a) newer pre-relay snapshot (start 50 >= current 50) → None.
-        let newer = state_with_offsets(800, session, Some(50), 50);
-        assert_eq!(derive(Some(&newer), 50), None);
-
-        // (b) in-range snapshot → Some(its id).
-        let in_range = state_with_offsets(700, session, Some(10), 10);
-        assert_eq!(derive(Some(&in_range), 50), Some(700));
-
-        // (c) rebind_origin in-range → None (parity with the old filter).
-        let mut rebind = state_with_offsets(701, session, Some(10), 10);
-        rebind.rebind_origin = true;
-        assert_eq!(derive(Some(&rebind), 50), None);
-
-        // (d) id==0 in-range → None.
-        let id_zero = state_with_offsets(0, session, Some(10), 10);
-        assert_eq!(derive(Some(&id_zero), 50), None);
-
-        // (e) absent → None.
-        assert_eq!(derive(None, 50), None);
-    }
-
-    // #3142 consumer-4 (status-panel ADOPT + EDIT gate). codex review found a
-    // residual aliasing gap: the completion IDENTITY is offset-pinned (covered
-    // above), but the adopt site (L8328) and the EDIT/finalize site (L10063)
-    // were NOT gated, so the older committed range could still pull
-    // `status_message_id` from a stale NEWER pre-relay snapshot and EDIT that
-    // newer turn's panel. Both sites now gate on
-    // `!committed_anchor_cleanup_is_stale_for_newer_turn(inflight_before_relay,
-    // None, session, current_offset)`. This test exercises:
-    //   (a) stale newer turn (incl. id==0 external/injected) → NOT adopted, NOT
-    //       edited;
-    //   (b) in-range id==0 watcher-direct turn → STILL adopts + edits (the
-    //       over-suppression guard: gate keys off OFFSET staleness, not pinned==0,
-    //       so the common id==0 case is NOT suppressed);
-    //   (c) in-range id!=0 normal turn → unchanged (adopts + edits).
-    #[test]
-    fn status_panel_adopt_and_edit_gate_is_turn_aliasing_safe() {
-        let session = "AgentDesk-codex-adk-cdx";
-
-        // Mirror the call-site predicate exactly: pre-relay snapshot + None second
-        // arg + the function-level current_offset.
-        let gate_skips = |inflight: Option<&InflightTurnState>, current: u64| -> bool {
-            committed_anchor_cleanup_is_stale_for_newer_turn(inflight, None, session, current)
-        };
-
-        // Model the adopt site: a status_panel_msg_id is pulled from the snapshot's
-        // status_message_id ONLY when the gate does NOT skip.
-        let adopt = |inflight: &InflightTurnState, current: u64| -> Option<serenity::MessageId> {
-            let mut placeholder: Option<serenity::MessageId> = None;
-            let mut placeholder_from_restored = false;
-            let mut status_panel: Option<serenity::MessageId> = None;
-            if !gate_skips(Some(inflight), current) {
-                adopt_watcher_terminal_message_ids_from_inflight(
-                    &mut placeholder,
-                    &mut placeholder_from_restored,
-                    &mut status_panel,
-                    inflight,
-                    session,
-                );
-            }
-            status_panel
-        };
-
-        let with_panel = |mut state: InflightTurnState, panel: u64| -> InflightTurnState {
-            state.status_message_id = Some(panel);
-            state
-        };
-
-        // (a-i) stale newer id!=0 turn (start 50 >= current 50): owns panel 5550.
-        // Gate skips → not adopted, not edited.
-        let newer_id = with_panel(state_with_offsets(800, session, Some(50), 50), 5550);
-        assert!(
-            gate_skips(Some(&newer_id), 50),
-            "newer id!=0 → EDIT gate skips"
-        );
-        assert_eq!(
-            adopt(&newer_id, 50),
-            None,
-            "newer id!=0 → panel NOT adopted"
-        );
-
-        // (a-ii) stale newer id==0 EXTERNAL-input turn: owns panel 5551. The id!=0
-        // sibling would MISS this; the anchor variant catches it.
-        let newer_ext = with_panel(
-            state_with_anchor(0, session, Some(50), 50, None, true),
-            5551,
-        );
-        assert!(gate_skips(Some(&newer_ext), 50));
-        assert!(
-            !committed_completion_is_stale_for_newer_turn(Some(&newer_ext), None, session, 50),
-            "id!=0 sibling MISSES the id==0 external panel owner — anchor variant required"
-        );
-        assert_eq!(
-            adopt(&newer_ext, 50),
-            None,
-            "newer id==0 external → panel NOT adopted"
-        );
-
-        // (a-iii) stale newer id==0 INJECTED turn: owns panel 5552 → not adopted.
-        let newer_inj = with_panel(
-            state_with_anchor(0, session, Some(50), 50, Some(4242), false),
-            5552,
-        );
-        assert!(gate_skips(Some(&newer_inj), 50));
-        assert_eq!(adopt(&newer_inj, 50), None);
-
-        // (b) OVER-SUPPRESSION GUARD: in-range id==0 watcher-direct turn
-        // (start 10 < current 50, user_msg_id==0). pinned==0 here (ambiguous), but
-        // the OFFSET gate is FALSE → STILL adopts + edits its panel 6660.
-        let in_range_id0 = with_panel(state_with_offsets(0, session, Some(10), 10), 6660);
-        assert!(
-            !gate_skips(Some(&in_range_id0), 50),
-            "in-range id==0 watcher-direct → EDIT gate must NOT skip (not over-suppressed)"
-        );
-        assert_eq!(
-            adopt(&in_range_id0, 50),
-            Some(serenity::MessageId::new(6660)),
-            "in-range id==0 watcher-direct → panel STILL adopted"
-        );
-
-        // (c) in-range id!=0 normal turn → unchanged: adopts + edits panel 7770.
-        let in_range_id = with_panel(state_with_offsets(700, session, Some(10), 10), 7770);
-        assert!(!gate_skips(Some(&in_range_id), 50));
-        assert_eq!(
-            adopt(&in_range_id, 50),
-            Some(serenity::MessageId::new(7770)),
-            "in-range id!=0 normal → panel adopted as today"
-        );
-
-        // (d) no pre-relay snapshot → gate false (no-op): nothing to adopt anyway.
-        assert!(!gate_skips(None, 50));
-    }
-
-    // #3142 consumer-3 (anchor cleanup, id==0). The second branch is gated on
-    // `!committed_anchor_cleanup_is_stale_for_newer_turn`. Stale id==0 injected
-    // newer → skipped; in-range id==0 injected → runs (not over-suppressed).
-    #[test]
-    fn anchor_cleanup_skips_when_stale_id0() {
-        let session = "AgentDesk-codex-adk-cdx";
-        let newer = state_with_anchor(0, session, Some(50), 50, Some(4242), false);
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&newer),
-            session,
-            50
-        ));
-        // Common case: id==0 injected turn whose output reaches current_offset.
-        let in_range = state_with_anchor(0, session, Some(10), 10, Some(4243), false);
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&in_range),
-            session,
-            50
-        ));
-    }
-
-    // #3142 first-anchor branch (lifecycle_stage_paused). The branch head is
-    // gated on `!committed_anchor_cleanup_is_stale_for_newer_turn`. A paused turn
-    // WITH a newer inflight present → stale true → first branch skipped; with an
-    // in-range inflight → false → runs. (Helper is independent of the paused flag;
-    // the paused flag selects WHICH branch reaches the gate at the call site.)
-    #[test]
-    fn paused_first_branch_anchor_gate() {
-        let session = "AgentDesk-codex-adk-cdx";
-        // Newer inflight present (the paused-with-inflight scenario) → stale.
-        let newer = state_with_anchor(0, session, Some(50), 50, Some(55), true);
-        assert!(committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&newer),
-            session,
-            50
-        ));
-        // In-range inflight → not stale → first branch runs.
-        let in_range = state_with_anchor(0, session, Some(10), 10, Some(55), true);
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None,
-            Some(&in_range),
-            session,
-            50
-        ));
-        // !inflight_present arm: inflight_state is None, only before_relay
-        // inspected. Absent/in-range before_relay → false → legitimate cleanup.
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            None, None, session, 50
-        ));
-        assert!(!committed_anchor_cleanup_is_stale_for_newer_turn(
-            Some(&in_range),
-            None,
-            session,
-            50
-        ));
-    }
-
     #[test]
     fn watcher_creates_status_panel_for_external_input_when_v2_on_and_panel_absent() {
         // #3003: pure TUI-direct (ExternalInput) turn with v2 enabled and no panel
@@ -2182,69 +1648,6 @@ mod pane_dead_identity_tests {
             None,
             "AgentDesk-codex-adk-cdx"
         ));
-    }
-
-    // status-panel-v2: the synthetic monitor/self-paced-loop turn
-    // (`TurnSource::MonitorTriggered`, made watcher-relay-owned by
-    // `ensure_monitor_auto_turn_inflight`) must be panel-eligible for its own
-    // tmux session — but only when the watcher owns the relay and the session
-    // matches, mirroring the external-input guard.
-    #[test]
-    fn watcher_panel_eligible_for_session_includes_monitor_turn() {
-        let mut monitor = state_for_turn(0, "AgentDesk-claude-monitor-relay");
-        monitor.turn_source = crate::services::discord::inflight::TurnSource::MonitorTriggered;
-        monitor.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
-        assert!(watcher_inflight_is_panel_eligible_for_session(
-            Some(&monitor),
-            "AgentDesk-claude-monitor-relay"
-        ));
-
-        // relay_owner=None (the pre-fix synthetic shape) is NOT watcher-owned, so
-        // the panel guard rejects it.
-        let mut owner_none = state_for_turn(0, "AgentDesk-claude-monitor-relay");
-        owner_none.turn_source = crate::services::discord::inflight::TurnSource::MonitorTriggered;
-        owner_none.set_relay_owner_kind(
-            crate::services::discord::inflight::RelayOwnerKind::SessionBoundRelay,
-        );
-        assert!(!watcher_inflight_is_panel_eligible_for_session(
-            Some(&owner_none),
-            "AgentDesk-claude-monitor-relay"
-        ));
-
-        // Wrong session must not adopt the monitor panel.
-        assert!(!watcher_inflight_is_panel_eligible_for_session(
-            Some(&monitor),
-            "AgentDesk-claude-monitor-relay-other"
-        ));
-
-        // A plain managed turn is never panel-eligible via this path.
-        let mut managed = state_for_turn(100, "AgentDesk-claude-monitor-relay");
-        managed.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
-        assert!(!watcher_inflight_is_panel_eligible_for_session(
-            Some(&managed),
-            "AgentDesk-claude-monitor-relay"
-        ));
-    }
-
-    // Regression guard: broadening panel eligibility must NOT leak into the
-    // shared external-input predicate that backs the delivery lease and the
-    // ⏳ anchor lifecycle (#3164/#3174). A MonitorTriggered turn stays false there.
-    #[test]
-    fn watcher_external_input_predicate_excludes_monitor_turn() {
-        let mut monitor = state_for_turn(0, "AgentDesk-claude-monitor-relay");
-        monitor.turn_source = crate::services::discord::inflight::TurnSource::MonitorTriggered;
-        assert!(!watcher_inflight_represents_external_input(Some(&monitor)));
-    }
-
-    // The monitor/self-paced-loop synthetic (user_msg_id == 0, rebind_origin)
-    // must NOT enter the anchor-lifecycle cleanup — that path is external-input
-    // only, and the synthetic has no injected notify-bot anchor to clean up.
-    #[test]
-    fn watcher_monitor_turn_never_needs_anchor_cleanup() {
-        let mut monitor = state_for_turn(0, "AgentDesk-claude-monitor-relay");
-        monitor.turn_source = crate::services::discord::inflight::TurnSource::MonitorTriggered;
-        monitor.rebind_origin = true;
-        assert!(!watcher_inflight_needs_anchor_lifecycle_cleanup(&monitor));
     }
 }
 
@@ -2898,11 +2301,8 @@ enum WatcherTerminalResendAction {
 /// - `Leased{Sink}` AND `now_ms >= deadline_ms` → RECLAIM (the caller force-clears
 ///   the dead sink's marker via `reclaim_if_expired`) then fall through to
 ///   `watcher_terminal_resend_action` → `SendFull` (committed < end). No black-hole.
-/// - `Committed{Sink}` (sink committed its terminal decision, not yet released) →
-///   route through the committed-offset reconciliation: `committed >= end` (a real
-///   Delivered commit) → Skip, `committed < end` (a NotDelivered / refused-advance
-///   commit) → SendFull (re-send; no black-hole). #3159 BUG 1: the marker is no
-///   longer blindly treated as delivered.
+/// - `Committed{Sink}` (sink committed Delivered, not yet released) → Skip (belt-and-
+///   suspenders; `committed >= end` already yields Skip below).
 /// - ANY non-Sink holder / `Unleased` / committed-covered → behave EXACTLY as today:
 ///   defer to `watcher_terminal_resend_action`. The gate ONLY interposes for a
 ///   Sink-held lease, so the watcher-direct B2 path is untouched.
@@ -2936,15 +2336,9 @@ fn watcher_terminal_resend_action_gated(
             holder: LeaseHolder::Sink,
             ..
         } => {
-            // #3159 BUG 1: a Committed{Sink} marker is NO LONGER assumed delivered.
-            // Route through the committed-offset reconciliation; committed >= end
-            // (a real Delivered commit, which advanced the offset BEFORE committing)
-            // → SkipAlreadyCommitted (unchanged), committed < end (a NotDelivered /
-            // refused-advance commit) → SendFull (the range was NOT delivered, so
-            // re-send; no black-hole). This also subsumes the Drop-release fallback
-            // (Unleased + committed < end → SendFull). The committed offset is the
-            // sole delivered-test, so a genuinely-delivered range is never re-sent.
-            (watcher_terminal_resend_action(committed, start, end), false)
+            // The sink committed Delivered but hasn't released yet; the range is
+            // delivered. Skip (belt-and-suspenders; committed>=end also yields Skip).
+            (WatcherTerminalResendAction::SkipAlreadyCommitted, false)
         }
         // Unleased, or held/committed by a non-Sink holder (Watcher/Bridge): the
         // #3151 marker does not apply — behave exactly as the pre-#3151 path.
@@ -4981,21 +4375,7 @@ fn mark_watcher_terminal_delivery_committed(
     let Some(expected_identity) = expected_identity else {
         return false;
     };
-    if full_response.trim().is_empty() {
-        return false;
-    }
-    // #3169 P1: self-paced loop turns carry `user_msg_id == 0` (no anchored
-    // Discord user message), so the original `user_msg_id != 0` requirement
-    // skipped them entirely — they never set `terminal_delivery_committed`, and
-    // the #3126 stall-watchdog guard (recovery.rs:1346) had no architectural
-    // "this turn finished delivering" signal for them, producing the death #1
-    // false-positive force-clean. Allow `user_msg_id == 0` turns to commit, but
-    // (NOT a blanket relaxation) only when the frame-carried identity is fully
-    // anchored: such turns are disambiguated solely by `started_at` +
-    // `turn_start_offset` (#3041 P1-3, inflight.rs:669), so a loop turn without a
-    // known `turn_start_offset` cannot be safely matched and is still skipped.
-    let is_loop_turn = expected_identity.user_msg_id == 0;
-    if is_loop_turn && expected_identity.turn_start_offset.is_none() {
+    if expected_identity.user_msg_id == 0 || full_response.trim().is_empty() {
         return false;
     }
     let Some(mut inflight) =
@@ -5011,14 +4391,6 @@ fn mark_watcher_terminal_delivery_committed(
         || inflight.tmux_session_name.as_deref() != expected_identity.tmux_session_name.as_deref()
         || inflight.tmux_session_name.as_deref() != Some(tmux_session_name)
     {
-        return false;
-    }
-    // #3169 P1: for a loop turn (`user_msg_id == 0`) the 1-second-resolution
-    // `started_at` can collide across two consecutive self-triggered turns, so it
-    // is insufficient to prove this completion belongs to the loaded inflight.
-    // Require the monotonic `turn_start_offset` (#3041 P1-3) to match as well so a
-    // late completion can never commit the WRONG (newer, still-running) loop turn.
-    if is_loop_turn && inflight.turn_start_offset != expected_identity.turn_start_offset {
         return false;
     }
 
@@ -6048,11 +5420,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             &watcher_provider,
             channel_id.get(),
         );
-        // status-panel-v2: panel eligibility (external-input OR synthetic
-        // monitor/self-paced-loop) drives the panel-lifecycle sites that read
-        // this flag. The lease/⏳-anchor sites keep the narrower external-input
-        // predicate and are untouched.
-        let mut turn_is_external_input_for_session = watcher_inflight_is_panel_eligible_for_session(
+        let mut turn_is_external_input_for_session = watcher_inflight_is_external_input_for_session(
             startup_inflight_snapshot.as_ref(),
             &tmux_session_name,
         );
@@ -7037,15 +6405,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             inflight_for_panel.as_ref(),
                             &tmux_session_name,
                         );
-                        // status-panel-v2: panel eligibility (external-input OR
-                        // synthetic monitor/self-paced-loop) drives panel
-                        // creation here; the lease/⏳-anchor sites keep the
-                        // narrower external-input predicate.
-                        let panel_eligible_turn = watcher_inflight_is_panel_eligible_for_session(
+                        let external_input_turn = watcher_inflight_is_external_input_for_session(
                             inflight_for_panel.as_ref(),
                             &tmux_session_name,
                         );
-                        if panel_eligible_turn {
+                        if external_input_turn {
                             turn_is_external_input_for_session = true;
                             // #3003 (codex P2 r15): when the watcher started before
                             // this turn's inflight existed, the startup identity
@@ -7077,7 +6441,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         } else if watcher_should_create_external_input_status_panel(
                             shared.status_panel_v2_enabled,
                             status_panel_msg_id.is_some(),
-                            panel_eligible_turn,
+                            external_input_turn,
                         ) && !watcher_external_input_turn_abandoned(
                             &watcher_provider,
                             channel_id,
@@ -8581,28 +7945,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             matching_watcher_turn_identity(inflight_before_relay.as_ref(), &tmux_session_name);
         let should_adopt_inflight_terminal_message_ids = !external_input_lease_before_relay
             || watcher_inflight_represents_external_input(inflight_before_relay.as_ref());
-        // #3142: do NOT adopt the pre-relay snapshot's terminal message ids
-        // (placeholder_msg_id / status_panel_msg_id) when that snapshot is a STALE
-        // NEWER follow-up turn (`turn_start_offset >= current_offset`). Otherwise the
-        // older committed range pulls `status_message_id` from the still-running newer
-        // turn and aliases its status panel. Use the id==0-INCLUSIVE anchor variant
-        // (NOT the id!=0 sibling) so a newer turn whose `user_msg_id == 0` (external-
-        // input / injected task-notification) panel owner is also caught; the `None`
-        // second arg is sound — the helper's inner closure is `is_some_and`, so it
-        // contributes `false` and the predicate reduces to evaluating only
-        // `inflight_before_relay`, the sole panel-id source at this site. An in-range
-        // id==0 watcher-direct turn (`start < current_offset`) is NOT flagged
-        // (stale=false) and STILL adopts normally — the gate keys off the OFFSET
-        // staleness test, not `pinned == 0`.
-        let inflight_before_relay_is_stale_newer_turn =
-            committed_anchor_cleanup_is_stale_for_newer_turn(
-                inflight_before_relay.as_ref(),
-                None,
-                &tmux_session_name,
-                current_offset,
-            );
         if should_adopt_inflight_terminal_message_ids
-            && !inflight_before_relay_is_stale_newer_turn
             && let Some(inflight) = inflight_before_relay.as_ref()
         {
             adopt_watcher_terminal_message_ids_from_inflight(
@@ -9119,6 +8462,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &tmux_session_name,
                 "watcher_terminal_resend_reconcile",
             );
+            let committed = shared.committed_relay_offset(channel_id);
             // #3151: gate the re-send on the in-flight sink-delivery marker BEFORE
             // the committed-offset reconciliation. The marker is a `Leased{Sink}`
             // state on the SAME per-channel `DeliveryLeaseCell` the watcher's own
@@ -9127,22 +8471,11 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             //     NOT re-send this pass (the slow-sink-in-flight duplicate #3151).
             //   * Leased{Sink, expired} → reclaim the dead sink's marker, then
             //     SendFull (committed<end) — the no-black-hole arm.
-            //   * Committed{Sink} → reconcile vs committed offset: committed>=end →
-            //     Skip (delivered), committed<end → SendFull (#3159: a refused/
-            //     NotDelivered commit re-sends, no black-hole).
+            //   * Committed{Sink} / committed>=end → Skip (range delivered).
             //   * Unleased / non-Sink holder → unchanged (defer to the existing
             //     committed-offset reconciliation).
             let gate_cell = shared.delivery_lease(channel_id);
             let snapshot = gate_cell.read();
-            // #3159 BUG 1 (codex race-1): read `committed` AFTER the lease snapshot.
-            // The sink's CLEAR protocol advances `committed` FIRST, THEN commits the
-            // marker (`Committed{Sink}`). So observing `Committed{Sink}` in `snapshot`
-            // happens-after the sink's committed-offset write; reading `committed`
-            // next is therefore guaranteed to see the advanced value (committed>=end
-            // for a real Delivered commit → Skip). Reading it BEFORE the snapshot
-            // could capture a pre-advance `committed < end` paired with a now-
-            // Committed{Delivered} marker → a spurious SendFull duplicate.
-            let committed = shared.committed_relay_offset(channel_id);
             let now_ms = crate::services::discord::lease_now_ms();
             let (action, reclaim_expired_sink) = watcher_terminal_resend_action_gated(
                 &snapshot,
@@ -10248,50 +9581,21 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             // path). The recovery_engine D wire is preserved because its
             // `state.user_msg_id` is captured from the inflight snapshot
             // pinned at recovery entry, not re-read at completion time.
-            // #3142: offset-pin the status-panel completion identity. The old
-            // session-only derivation would bind the panel to the pre-relay
-            // snapshot's `user_msg_id` even when that snapshot is a NEWER
-            // follow-up turn (`turn_start_offset >= current_offset`) that this
-            // committed range does NOT belong to — aliasing the panel completion
-            // onto the still-running newer turn. Reuse `pinned_finalize_user_msg_id`
-            // (the proven `< current_offset` range test) so the identity is None
-            // for a newer pre-relay snapshot, agreeing by construction with the
-            // reaction/transcript/analytics + finalize gate (both keyed off the
-            // same offset test). The panel EDIT/finalize call below is now ALSO
-            // gated on `!inflight_before_relay_is_stale_newer_turn` (see the binding
-            // just below) so a stale NEWER pre-relay snapshot's panel is never
-            // EDIT-ed/completed — closing the residual UI-only aliasing gap. For an
-            // in-range turn the gate is false and completion fires exactly as today;
-            // only the `expected_user_msg_id` binding is pinned, so the common
-            // (in-range) case is unchanged. `!rebind_origin` is preserved for parity
-            // with the old filter.
-            //
-            // #3142: same stale-newer predicate as the adopt site (L8328). The status
-            // panel can be owned by a NEWER turn whose `user_msg_id == 0` (external-
-            // input / injected), so the id==0-INCLUSIVE anchor variant is required —
-            // the id!=0 sibling would MISS that owner and leave the panel aliased. The
-            // `None` second arg is sound (helper closure is `is_some_and` → contributes
-            // false); an in-range id==0 watcher-direct turn (`start < current_offset`)
-            // is NOT flagged and STILL completes its panel — the gate keys off the
-            // OFFSET staleness test, not `pinned == 0`.
-            let inflight_before_relay_is_stale_newer_turn =
-                committed_anchor_cleanup_is_stale_for_newer_turn(
-                    inflight_before_relay.as_ref(),
-                    None,
-                    &tmux_session_name,
-                    current_offset,
-                );
-            let pinned_status_panel_user_msg_id = pinned_finalize_user_msg_id(
-                inflight_before_relay.as_ref(),
-                &tmux_session_name,
-                current_offset,
-            );
-            let status_panel_completion_user_msg_id = inflight_before_relay
-                .as_ref()
-                .filter(|inflight| !inflight.rebind_origin)
-                .and_then(|_| {
-                    (pinned_status_panel_user_msg_id != 0)
-                        .then_some(pinned_status_panel_user_msg_id)
+            let status_panel_completion_user_msg_id =
+                inflight_before_relay.as_ref().and_then(|inflight| {
+                    let matches_current_watcher_session = inflight
+                        .tmux_session_name
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|name| !name.is_empty() && name == tmux_session_name);
+                    if !inflight.rebind_origin
+                        && inflight.user_msg_id != 0
+                        && matches_current_watcher_session
+                    {
+                        Some(inflight.user_msg_id)
+                    } else {
+                        None
+                    }
                 });
             // #3055: re-derive this turn's session lifecycle panel line before
             // finalizing. The bridge does this on every status tick via
@@ -10320,66 +9624,53 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 &tmux_session_name,
             )
             .await;
-            // #3142: gate the EDIT/finalize + orphan-store reconciliation on
-            // `!inflight_before_relay_is_stale_newer_turn`. When the pre-relay
-            // snapshot is a stale NEWER turn the older committed range must NOT touch
-            // that newer turn's panel (or its orphan record). The current in-range
-            // turn's own panel, if any, is created via the streaming sources and is
-            // unaffected (in-range => gate false => completion fires as today).
-            if !inflight_before_relay_is_stale_newer_turn {
-                let completion_committed = complete_watcher_status_panel_v2(
-                    &http,
-                    &shared,
-                    channel_id,
-                    status_panel_msg_id,
-                    &watcher_provider,
-                    status_panel_started_at,
-                    &mut last_status_panel_text,
-                    matches!(
-                        task_notification_kind,
-                        Some(
-                            TaskNotificationKind::Background
-                                | TaskNotificationKind::MonitorAutoTurn
-                        )
-                    ),
-                    status_panel_completion_user_msg_id,
-                )
-                .await;
-                if turn_is_external_input_for_session
-                    && let Some(panel_msg_id) = status_panel_msg_id
-                {
-                    if completion_committed {
-                        // #3003 (codex P2 r21): an earlier reclaim attempt this turn may
-                        // have enqueued this panel after a transient delete failure, but it
-                        // has now been completed/edited into its final state. Drop the stale
-                        // durable record so a later drain does not delete the valid panel.
-                        crate::services::discord::status_panel_orphan_store::remove(
-                            &watcher_provider,
-                            &shared.token_hash,
-                            channel_id.get(),
-                            panel_msg_id.get(),
-                        );
-                    } else {
-                        // #3003 (codex P2 r20): the final completion edit failed transiently
-                        // and the inflight is about to be cleared on this committed-output
-                        // path, dropping the only handle to the panel that is still stuck at
-                        // the processing state. Enqueue it in the durable store so the sweeper
-                        // drain reclaims (deletes) it independent of inflight lifecycle.
-                        crate::services::discord::status_panel_orphan_store::enqueue(
-                            &watcher_provider,
-                            &shared.token_hash,
-                            channel_id.get(),
-                            panel_msg_id.get(),
-                        );
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::warn!(
-                            "  [{ts}] ⚠ watcher: status-panel-v2 completion did not commit for channel {} panel_msg {}; enqueued durable reclaim",
-                            channel_id.get(),
-                            panel_msg_id.get()
-                        );
-                    }
+            let completion_committed = complete_watcher_status_panel_v2(
+                &http,
+                &shared,
+                channel_id,
+                status_panel_msg_id,
+                &watcher_provider,
+                status_panel_started_at,
+                &mut last_status_panel_text,
+                matches!(
+                    task_notification_kind,
+                    Some(TaskNotificationKind::Background | TaskNotificationKind::MonitorAutoTurn)
+                ),
+                status_panel_completion_user_msg_id,
+            )
+            .await;
+            if turn_is_external_input_for_session && let Some(panel_msg_id) = status_panel_msg_id {
+                if completion_committed {
+                    // #3003 (codex P2 r21): an earlier reclaim attempt this turn may
+                    // have enqueued this panel after a transient delete failure, but it
+                    // has now been completed/edited into its final state. Drop the stale
+                    // durable record so a later drain does not delete the valid panel.
+                    crate::services::discord::status_panel_orphan_store::remove(
+                        &watcher_provider,
+                        &shared.token_hash,
+                        channel_id.get(),
+                        panel_msg_id.get(),
+                    );
+                } else {
+                    // #3003 (codex P2 r20): the final completion edit failed transiently
+                    // and the inflight is about to be cleared on this committed-output
+                    // path, dropping the only handle to the panel that is still stuck at
+                    // the processing state. Enqueue it in the durable store so the sweeper
+                    // drain reclaims (deletes) it independent of inflight lifecycle.
+                    crate::services::discord::status_panel_orphan_store::enqueue(
+                        &watcher_provider,
+                        &shared.token_hash,
+                        channel_id.get(),
+                        panel_msg_id.get(),
+                    );
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ watcher: status-panel-v2 completion did not commit for channel {} panel_msg {}; enqueued durable reclaim",
+                        channel_id.get(),
+                        panel_msg_id.get()
+                    );
                 }
-            } // #3142: end `if !inflight_before_relay_is_stale_newer_turn` (EDIT/finalize gate)
+            }
             // #3003 single-chokepoint reclaim safety: after completion the turn
             // frame ends and the next frame re-seeds `status_panel_msg_id`, so the
             // top-of-interval abandon reclaim never observes this finalized panel's
@@ -10609,24 +9900,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             current_offset,
         );
 
-        // #3142: the id==0-inclusive sibling gate for the two anchor-cleanup
-        // branches below. The id!=0 `completion_is_stale_for_newer_turn` above
-        // deliberately excludes `user_msg_id == 0` newer turns (to protect the
-        // finalize/clear id-0 contract), but a newer external-input / injected
-        // task-notification turn can have `user_msg_id == 0` while still owning a
-        // real anchor (`injected_prompt_message_id` or the shared
-        // `prompt_anchor_by_tmux` slot). Computing this once here keeps the late
-        // re-read and the pre-relay snapshot both checked for the anchor branches.
-        let anchor_cleanup_is_stale_for_newer_turn =
-            committed_anchor_cleanup_is_stale_for_newer_turn(
-                inflight_before_relay.as_ref(),
-                inflight_state.as_ref(),
-                &tmux_session_name,
-                current_offset,
-            );
-
-        if !anchor_cleanup_is_stale_for_newer_turn
-            && crate::services::discord::tui_prompt_relay::should_complete_tui_direct_anchor_lifecycle(
+        if crate::services::discord::tui_prompt_relay::should_complete_tui_direct_anchor_lifecycle(
             terminal_output_committed,
             tui_direct_anchor_terminal_body_visible,
             tui_direct_anchor_or_lease_present_for_lifecycle,
@@ -10647,7 +9921,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             .await;
         } else if terminal_output_committed
             && !lifecycle_stage_paused
-            && !anchor_cleanup_is_stale_for_newer_turn
             && inflight_state
                 .as_ref()
                 .is_some_and(watcher_inflight_needs_anchor_lifecycle_cleanup)
@@ -10851,17 +10124,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 "[{ts}] ⚠ watcher: dispatch finalization deferred — TUI quiescence gate timed out (#2161)"
             );
             false
-        } else if let Some(did) = resolved_did
-            .as_deref()
-            .filter(|_| !completion_is_stale_for_newer_turn)
-        {
-            // #3142: when stale, the late `inflight_state.dispatch_id` (the first
-            // fallback in `resolved_did`) belongs to the NEWER running turn;
-            // completing it here with the OLDER `full_response` is wrong-turn
-            // corruption. Fall through to the `else => true` no-finalize arm
-            // (dispatch_ok stays true; downstream clear/finalize keep their own
-            // stale gates) — the newer turn finalizes its own dispatch on its later
-            // pass. FALSE in every normal case, so the common finalize is untouched.
+        } else if let Some(did) = resolved_did.as_deref() {
             let finalization =
                 crate::services::discord::streaming_finalizer::finalize_watcher_streaming_dispatch(
                     crate::services::discord::streaming_finalizer::WatcherStreamingFinalRequest {
@@ -10899,21 +10162,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // re-evaluates the gate and finishes the cleanup once the pane
         // actually reports idle.
         if terminal_output_committed && !lifecycle_stage_paused {
-            // #3142: gate the TUI history push on `!completion_is_stale_for_newer_turn`.
-            // When stale, the late `inflight_state.user_text` is the NEWER turn's
-            // prompt; pairing it with the OLDER `full_response` would poison the
-            // TUI history. The newer turn pushes its own (user_text, response) pair
-            // on its own completion pass. Only the push is suppressed —
-            // `turn_result_relayed` and the clear/finalize bookkeeping below keep
-            // their own (already-shipped) stale gates. FALSE in every normal case.
-            // #3142: gate on BOTH the id!=0 stale helper AND the id==0-inclusive
-            // `anchor_cleanup_is_stale_for_newer_turn` (computed above) so a NEWER
-            // external-input turn with `user_msg_id == 0` (no own dispatch id,
-            // `rebind_origin == false`, populated `user_text`) cannot cross-pair
-            // its `user_text` with the OLDER `full_response` in the TUI history.
             if has_assistant_response
-                && !completion_is_stale_for_newer_turn
-                && !anchor_cleanup_is_stale_for_newer_turn
                 && let Some(state) = inflight_state.as_ref().filter(|state| !state.rebind_origin)
             {
                 let mut data = shared.core.lock().await;
@@ -11815,85 +11064,6 @@ mod tests {
         assert_eq!(persisted.last_offset, 128);
         assert_eq!(persisted.last_watcher_relayed_offset, Some(64));
         assert_eq!(persisted.last_watcher_relayed_generation_mtime_ns, Some(7));
-    }
-
-    // #3169 P1: a self-paced loop turn (`user_msg_id == 0`) must now set
-    // `terminal_delivery_committed` on a fully-anchored completion. The original
-    // guard rejected every `user_msg_id == 0` turn, so loop sessions never got the
-    // architectural signal the #3126 stall-watchdog guard relies on (death #1).
-    #[test]
-    fn watcher_terminal_delivery_commit_marks_loop_turn_with_zero_user_msg_id() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _root_guard = AgentdeskRootGuard::set(tmp.path());
-
-        let provider = ProviderKind::Claude;
-        let channel_id = ChannelId::new(987_3169);
-        let tmux_session_name = "AgentDesk-claude-adk-cc";
-        let mut state = InflightTurnState::new(
-            provider.clone(),
-            channel_id.get(),
-            Some("adk-cc".to_string()),
-            42,
-            0, // user_msg_id == 0 -> self-paced loop turn (no anchored Discord message)
-            1002,
-            "loop prompt".to_string(),
-            Some("session-3169".to_string()),
-            Some(tmux_session_name.to_string()),
-            Some("/tmp/agentdesk-3169-output.jsonl".to_string()),
-            None,
-            64,
-        );
-        state.runtime_kind = Some(RuntimeHandoffKind::ClaudeTui);
-        state.turn_start_offset = Some(64);
-        crate::services::discord::inflight::save_inflight_state(&state).expect("save inflight");
-        let identity = crate::services::discord::inflight::InflightTurnIdentity::from_state(&state);
-        assert_eq!(identity.user_msg_id, 0, "fixture is a loop turn");
-
-        assert!(
-            mark_watcher_terminal_delivery_committed(
-                &provider,
-                channel_id,
-                tmux_session_name,
-                Some(&identity),
-                "loop delivered response",
-                64,
-                Some(7),
-                128,
-            ),
-            "a fully-anchored loop turn (user_msg_id == 0) must commit"
-        );
-
-        let persisted =
-            crate::services::discord::inflight::load_inflight_state(&provider, channel_id.get())
-                .expect("load inflight");
-        assert!(
-            persisted.terminal_delivery_committed,
-            "loop turn must set terminal_delivery_committed for the #3126 guard"
-        );
-
-        // A loop turn whose frame-carried `turn_start_offset` is missing cannot be
-        // safely disambiguated from a sibling same-second loop turn, so it is still
-        // skipped (NOT a blanket relaxation).
-        crate::services::discord::inflight::clear_inflight_state(&provider, channel_id.get());
-        crate::services::discord::inflight::save_inflight_state(&state).expect("re-save inflight");
-        let mut unanchored_identity = identity.clone();
-        unanchored_identity.turn_start_offset = None;
-        assert!(
-            !mark_watcher_terminal_delivery_committed(
-                &provider,
-                channel_id,
-                tmux_session_name,
-                Some(&unanchored_identity),
-                "loop delivered response",
-                64,
-                Some(7),
-                128,
-            ),
-            "a loop turn without a known turn_start_offset must NOT commit"
-        );
     }
 
     // #3107 (CHANGE 3): a missing inflight is abandonment ONLY when the pane is
@@ -13399,12 +12569,10 @@ TUI-E2E-marker ssh-direct
             );
         }
 
-        /// #3159 BUG 1: Committed{Sink, Delivered} with committed >= end (a real
-        /// delivered commit advances the offset BEFORE committing) → Skip, no reclaim.
-        /// This is the no-duplicate invariant: a genuinely-delivered range is never
-        /// re-sent.
+        /// Committed{Sink} (sink committed Delivered, not yet released) → Skip,
+        /// no reclaim (belt-and-suspenders early Skip).
         #[test]
-        fn committed_sink_delivered_covered_skips() {
+        fn committed_sink_skips() {
             let snap = LeaseSnapshot::Committed {
                 holder: LeaseHolder::Sink,
                 turn: turn(),
@@ -13412,52 +12580,9 @@ TUI-E2E-marker ssh-direct
                 end: END,
                 outcome: LeaseOutcome::Delivered,
             };
-            // committed >= end (END): the advance ran before commit.
             let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, END, START, END, NOW);
+                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
             assert_eq!(action, WatcherTerminalResendAction::SkipAlreadyCommitted);
-            assert!(!reclaim);
-        }
-
-        /// #3159 BUG 1 (no black-hole): Committed{Sink, NotDelivered} — the identity
-        /// gate REFUSED the advance, so committed stayed < end. The gate now routes
-        /// through committed-offset reconciliation → SendFull (re-send, not Skip).
-        /// Previously this blind-Skipped → under-delivery / black-hole.
-        #[test]
-        fn committed_sink_not_delivered_sends_full() {
-            let snap = LeaseSnapshot::Committed {
-                holder: LeaseHolder::Sink,
-                turn: turn(),
-                start: START,
-                end: END,
-                outcome: LeaseOutcome::NotDelivered,
-            };
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
-            assert_eq!(
-                action,
-                WatcherTerminalResendAction::SendFull,
-                "a NotDelivered commit (committed<end) must re-send, not Skip"
-            );
-            assert!(!reclaim);
-        }
-
-        /// #3159 BUG 1 belt-and-suspenders: even a Delivered-labelled commit with
-        /// committed < end (which the fixed producer no longer emits, since Delivered
-        /// is committed only after a real advance) re-sends — the committed offset is
-        /// the SOLE delivered-test, not the outcome label. No black-hole regardless.
-        #[test]
-        fn committed_sink_below_end_sends_full_regardless_of_label() {
-            let snap = LeaseSnapshot::Committed {
-                holder: LeaseHolder::Sink,
-                turn: turn(),
-                start: START,
-                end: END,
-                outcome: LeaseOutcome::Delivered,
-            };
-            let (action, reclaim) =
-                watcher_terminal_resend_action_gated(&snap, COMMITTED_BELOW_END, START, END, NOW);
-            assert_eq!(action, WatcherTerminalResendAction::SendFull);
             assert!(!reclaim);
         }
 

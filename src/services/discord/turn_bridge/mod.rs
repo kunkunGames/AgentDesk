@@ -7362,13 +7362,9 @@ pub(super) fn spawn_turn_bridge(
                 },
                 None => TmuxCleanupPolicy::PreserveSession,
             };
-            // #3169 (death #3): the `None`-cancel_source fallback uses the
-            // shared `ANONYMOUS_TURN_BRIDGE_TEARDOWN_REASON` sentinel so the
-            // tmux_runtime SIGINT guard recognises this anonymous internal
-            // teardown and suppresses claude's session-killing teardown SIGINT.
-            let cancel_source = cancel_token.cancel_source().unwrap_or_else(|| {
-                tmux_runtime::ANONYMOUS_TURN_BRIDGE_TEARDOWN_REASON.to_string()
-            });
+            let cancel_source = cancel_token
+                .cancel_source()
+                .unwrap_or_else(|| "turn_bridge_cancelled".to_string());
             stop_active_turn(
                 &provider,
                 &cancel_token,

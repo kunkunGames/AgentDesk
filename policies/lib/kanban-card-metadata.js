@@ -18,11 +18,8 @@ function _loadCardMetadata(cardId) {
   );
   if (rows.length === 0 || !rows[0].metadata) return {};
   try {
-    if (rows[0].metadata && rows[0].metadata !== "{}" && rows[0].metadata !== "[]") {
-      var parsed = JSON.parse(rows[0].metadata);
-      return parsed && typeof parsed === "object" ? parsed : {};
-    }
-    return {};
+    var parsed = JSON.parse(rows[0].metadata);
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch (e) {
     return {};
   }
