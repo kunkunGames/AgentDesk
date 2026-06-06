@@ -51,3 +51,23 @@ test("MarkdownContent renders links safely with target blank and noopener norefe
     }
   }
 });
+
+test("MarkdownContent only preserves discord protocol URLs on anchor hrefs", async () => {
+  const div = document.createElement("div");
+  const root = createRoot(div);
+
+  await act(async () => {
+    root.render(
+      <MarkdownContent
+        content={
+          "[discord](discord://discord.com/channels/1/2/3) ![discord image](discord://discord.com/channels/1/2/3)"
+        }
+      />
+    );
+  });
+
+  expect(div.querySelector("a")?.getAttribute("href")).toBe("discord://discord.com/channels/1/2/3");
+  expect(div.querySelector("img")?.getAttribute("src")).not.toBe(
+    "discord://discord.com/channels/1/2/3"
+  );
+});

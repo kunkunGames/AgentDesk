@@ -31,11 +31,15 @@ export default function MarkdownContent({ content, className }: Props) {
     <div className={classes}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        urlTransform={(url) => {
+        urlTransform={(url, key, node) => {
           const lowerUrl = url.trim().toLowerCase();
           if (lowerUrl.startsWith("discord:")) {
-            // Only allow specific discord protocol formats used in the app, strip others
-            if (/^discord:\/\/discord\.com\/channels\/[^\/]+\/[^\/]+(\/[^\/]+)?$/.test(lowerUrl)) {
+            // Only allow clickable Discord channel/message links; keep image src and other URL attrs stripped.
+            if (
+              key === "href" &&
+              node.tagName === "a" &&
+              /^discord:\/\/discord\.com\/channels\/[^\/]+\/[^\/]+(\/[^\/]+)?$/.test(lowerUrl)
+            ) {
               return url;
             }
             return "";
