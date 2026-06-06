@@ -1234,31 +1234,35 @@ async fn finish_recovered_turn_mailbox(
     channel_id: ChannelId,
     stop_source: &'static str,
 ) {
-    let finish = mailbox_finish_turn(shared, provider, channel_id).await;
-    if let Some(removed_token) = finish.removed_token {
-        removed_token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        super::saturating_decrement_global_active(shared);
-    }
-
-    super::clear_watchdog_deadline_override(channel_id.get()).await;
-    shared
-        .dispatch_thread_parents
-        .retain(|_, thread| *thread != channel_id);
-
-    if !finish.has_pending {
-        shared.dispatch_role_overrides.remove(&channel_id);
-    }
-
-    if finish.mailbox_online && finish.has_pending {
-        super::schedule_deferred_idle_queue_kickoff(
-            shared.clone(),
+    // #3016 phase 4: route the recovery terminal through the single-authority
+    // finalizer. The recovered turn is channel-scoped here (the caller did not
+    // thread its real `user_msg_id`), so we submit `user_msg_id == 0` — the
+    // finalizer resolves it to the channel's single live entry (or finalizes
+    // the orphan directly) and runs the SAME channel-scoped `mailbox_finish_turn`
+    // + gated counter decrement + watchdog-override clear + dispatch_thread_parents
+    // retain + role-override cleanup + queue kickoff this code did inline. The
+    // ledger phase gate keeps a racing watcher/bridge terminal exactly-once safe.
+    // `FinalizeContext::monitor` reproduces the inline side-effect set (no
+    // inflight clear, no completion-cleanup, no voice drain, kick off backlog).
+    //
+    // Recovery is single-turn-per-channel (the channel is being recovered, not
+    // running a fresh turn), so id-0 here is safe: the finalizer's id-0 guard
+    // makes an AMBIGUOUS submission (a recently-Finalized entry AND a different
+    // live turn) a NO-OP — it never releases a newer turn's token — and the
+    // unambiguous case (the recovered turn is the single live entry) finalizes
+    // it exactly as the inline code did. This reproduces the prior
+    // channel-scoped `mailbox_finish_turn` semantics, now ledger-gated.
+    let _ = shared
+        .turn_finalizer
+        .submit_terminal(
+            super::turn_finalizer::TurnKey::new(channel_id, 0, shared.current_generation),
             provider.clone(),
-            channel_id,
-            stop_source,
-        );
-    }
+            super::turn_finalizer::TerminalEvent::Complete,
+            super::turn_finalizer::FinalizeContext::monitor(),
+            shared.clone(),
+        )
+        .await;
+    let _ = stop_source;
 }
 
 pub(super) async fn reregister_active_turn_from_inflight(
@@ -3957,6 +3961,16 @@ pub(super) async fn restore_inflight_turns(
         let mut state = state;
         state.session_key = state.session_key.or_else(|| adk_session_key.clone());
         state.dispatch_id = state.dispatch_id.or_else(|| recovery_dispatch_id.clone());
+        // #3166: read the real configured thresholds (e.g.
+        // `context_compact_percent_claude`) instead of `ContextThresholds::default()`
+        // so the recovered turn's status panel reflects the user-set auto-compact
+        // percent, matching the live launch paths (intake_turn/headless_turn).
+        // This is the display value; the spawn-side `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
+        // env is exported by the launch script (claude_tui/session.rs, #3166).
+        let recovery_compact_percent =
+            super::adk_session::fetch_context_thresholds(shared.api_port)
+                .await
+                .compact_pct_for(&provider);
         spawn_turn_bridge(
             shared.clone(),
             cancel_token,
@@ -3982,8 +3996,7 @@ pub(super) async fn restore_inflight_turns(
                 dispatch_kind: recovery_dispatch_kind,
                 memory_recall_usage: crate::services::memory::TokenUsage::default(),
                 context_window_tokens: provider.default_context_window(),
-                context_compact_percent: super::adk_session::ContextThresholds::default()
-                    .compact_pct_for(&provider),
+                context_compact_percent: recovery_compact_percent,
                 current_msg_id,
                 response_sent_offset: state.response_sent_offset,
                 full_response: state.full_response.clone(),

@@ -1567,36 +1567,6 @@ pub(super) fn is_model_picker_component_custom_id(
     super::super::commands::parse_model_picker_custom_id(custom_id, fallback_channel_id).is_some()
 }
 
-fn spawn_clear_idle_recap_for_channel(
-    http: std::sync::Arc<serenity::Http>,
-    pool: sqlx::PgPool,
-    channel_id: u64,
-) {
-    tokio::spawn(async move {
-        match crate::services::discord::idle_recap::lookup_active_recap_for_channel(
-            &pool, channel_id,
-        )
-        .await
-        {
-            Ok(Some((session_key, chan, msg))) => {
-                crate::services::discord::idle_recap::delete_previous_card(&http, chan, msg).await;
-                let _ = crate::services::discord::idle_recap::clear_recap_pointer(
-                    &pool,
-                    &session_key,
-                    msg,
-                )
-                .await;
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!(
-                error = %e,
-                channel_id = channel_id,
-                "idle_recap clear lookup failed"
-            ),
-        }
-    });
-}
-
 pub(in crate::services::discord) async fn handle_event(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -2024,14 +1994,18 @@ pub(in crate::services::discord) async fn handle_event(
                 .await;
                 return Ok(());
             }
-            // PR #3b: clear any active idle-recap card once a message is
-            // accepted as a real turn. This intentionally includes
-            // trigger-capable announce/allowed-bot messages used by
-            // `send-to-agent`; clearing only human messages left stale
-            // `📦 idle` cards under valid bot-origin E2E turns.
-            if let Some(pool) = data.shared.pg_pool.as_ref().cloned() {
-                spawn_clear_idle_recap_for_channel(ctx.http.clone(), pool, channel_id.get());
-            }
+            // #3148: the idle-recap card clear (and the per-channel
+            // turn-generation bump) was RELOCATED from here to
+            // `intake_turn::handle_text_message`, immediately AFTER the mailbox
+            // claim succeeds (`started == true`), mirroring the TUI path
+            // (`tui_prompt_relay` claim → bump → clear). Clearing at intake
+            // time — BEFORE the later mailbox claim — was not truly
+            // capture-at-claim: a recap POST could recheck-idle while intake had
+            // captured old/none but the claim had not happened, persist a fresh
+            // card, and the old-id-keyed clear could not remove it (Window 2).
+            // Performing the clear after the claim (and after the claim's
+            // generation bump) closes that window with the same capture-at-claim
+            // semantics the TUI path already has.
 
             // #189: Generic DM reply tracking — consume pending entry if present.
             // Keep this after auth so unauthorized DM senders cannot inject
@@ -3047,6 +3021,7 @@ mod thread_guard_stale_pure_tests {
             tmux_session_alive,
             has_pending_queue: false,
             mailbox_active_user_msg_id: Some(user_msg_id),
+            inflight_terminal_delivery_committed: false,
             relay_stall_state,
             relay_health,
         }

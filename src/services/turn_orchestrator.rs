@@ -13,7 +13,6 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::services::provider::{CancelToken, ProviderKind};
 
 pub(crate) const MAX_INTERVENTIONS_PER_CHANNEL: usize = 30;
-pub(crate) const INTERVENTION_TTL: Duration = Duration::from_secs(10 * 60);
 pub(crate) const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
 const STALE_PENDING_QUEUE_TMP_AGE: Duration = Duration::from_secs(60);
 
@@ -71,17 +70,12 @@ fn prune_interventions(queue: &mut Vec<Intervention>) -> Vec<QueueExitEvent> {
 }
 
 fn prune_interventions_at(queue: &mut Vec<Intervention>, now: Instant) -> Vec<QueueExitEvent> {
+    // #3177: queued user messages are never age-evicted. A busy turn can hold a
+    // reply in the queue well past the old 10-minute TTL, and silently dropping
+    // it (the previous `Expired` retain) lost real user input. Only the
+    // MAX_INTERVENTIONS_PER_CHANNEL overflow cap still bounds the queue.
+    let _ = now;
     let mut queue_exit_events = Vec::new();
-    queue.retain(|intervention| {
-        let keep = now.duration_since(intervention.created_at) <= INTERVENTION_TTL;
-        if !keep {
-            queue_exit_events.push(QueueExitEvent::new(
-                intervention.clone(),
-                QueueExitKind::Expired,
-            ));
-        }
-        keep
-    });
     if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
         let overflow = queue.len() - MAX_INTERVENTIONS_PER_CHANNEL;
         queue_exit_events.extend(
@@ -215,7 +209,8 @@ pub(crate) fn enqueue_intervention(
 }
 
 pub(crate) fn has_soft_intervention_at(queue: &mut Vec<Intervention>, now: Instant) -> bool {
-    queue.retain(|intervention| now.duration_since(intervention.created_at) <= INTERVENTION_TTL);
+    // #3177: no age-based eviction — only the overflow cap bounds the queue.
+    let _ = now;
     if queue.len() > MAX_INTERVENTIONS_PER_CHANNEL {
         let overflow = queue.len() - MAX_INTERVENTIONS_PER_CHANNEL;
         queue.drain(0..overflow);
@@ -2898,6 +2893,10 @@ mod actor_hydrate_regression_tests {
         assert!(other.exists());
     }
 
+    // SAFETY (await_holding_lock): the test-env Mutex is held across awaits to
+    // serialize tests that mutate the process-global `AGENTDESK_ROOT_DIR` env;
+    // releasing before the awaits would race concurrent tests. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn hydrate_from_disk_does_not_reinsert_after_actor_dequeue_removed_file() {
         let _lock = lock_test_env();
@@ -3407,6 +3406,84 @@ mod enqueue_refusal_reason_tests {
     }
 }
 
+// #3177: queued user messages must never be age-evicted. The old
+// `prune_interventions_at` dropped anything older than `INTERVENTION_TTL`
+// (10 min) as `QueueExitKind::Expired`, silently losing user input when a turn
+// stayed busy. These tests pin the new behaviour: arbitrarily old items survive
+// prune, and only the MAX_INTERVENTIONS_PER_CHANNEL overflow cap still trims the
+// queue (as `Superseded`).
+#[cfg(test)]
+mod no_ttl_evict_tests {
+    use super::*;
+
+    fn intervention_at(message_id: u64, created_at: Instant) -> Intervention {
+        Intervention {
+            author_id: UserId::new(1),
+            author_is_bot: false,
+            message_id: MessageId::new(message_id),
+            source_message_ids: vec![MessageId::new(message_id)],
+            text: format!("msg-{message_id}"),
+            mode: InterventionMode::Soft,
+            created_at,
+            reply_context: None,
+            has_reply_boundary: false,
+            merge_consecutive: false,
+            pending_uploads: Vec::new(),
+            voice_announcement: None,
+        }
+    }
+
+    #[test]
+    fn very_old_intervention_survives_prune() {
+        let now = Instant::now();
+        // Far past the old 10-minute TTL.
+        let ancient = now
+            .checked_sub(Duration::from_secs(60 * 60))
+            .expect("test clock should subtract an hour");
+        let mut queue = vec![intervention_at(1, ancient)];
+
+        let exits = prune_interventions_at(&mut queue, now);
+
+        assert_eq!(
+            queue.len(),
+            1,
+            "an hour-old intervention must remain queued (no age eviction)"
+        );
+        assert_eq!(queue[0].message_id, MessageId::new(1));
+        assert!(
+            exits.is_empty(),
+            "no QueueExitEvent should be produced for an old-but-under-cap queue"
+        );
+        // The soft-queue probe must also keep it.
+        assert!(has_soft_intervention_at(&mut queue, now));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn overflow_cap_still_supersedes_oldest() {
+        let now = Instant::now();
+        let mut queue: Vec<Intervention> = (0..(MAX_INTERVENTIONS_PER_CHANNEL as u64 + 3))
+            .map(|i| intervention_at(i + 1, now))
+            .collect();
+
+        let exits = prune_interventions_at(&mut queue, now);
+
+        assert_eq!(
+            queue.len(),
+            MAX_INTERVENTIONS_PER_CHANNEL,
+            "overflow cap must bound the queue"
+        );
+        assert_eq!(exits.len(), 3, "the 3 oldest must be evicted");
+        assert!(
+            exits.iter().all(|e| e.kind == QueueExitKind::Superseded),
+            "overflow eviction must be Superseded, never Expired"
+        );
+        // The evicted ones are the oldest (lowest message ids).
+        assert_eq!(exits[0].intervention.message_id, MessageId::new(1));
+        assert_eq!(exits[2].intervention.message_id, MessageId::new(3));
+    }
+}
+
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
@@ -3501,6 +3578,10 @@ mod persistence_tests {
         }
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits to prevent concurrent env clobbering.
+    // Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn enqueue_rolls_back_when_pending_queue_persistence_fails() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3656,6 +3737,9 @@ mod persistence_tests {
         );
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn actor_hydrate_from_disk_preserves_voice_announcement_payload() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3700,6 +3784,9 @@ mod persistence_tests {
         );
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn restart_drain_persists_voice_announcement_payload() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3734,6 +3821,9 @@ mod persistence_tests {
         assert_eq!(saved[0].voice_announcement.as_ref(), Some(&announcement));
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn restart_drain_all_reports_pending_queue_persistence_errors() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
@@ -3958,6 +4048,9 @@ mod finish_cancelled_turn_tests {
         }
     }
 
+    // SAFETY (await_holding_lock): `TEST_ENV_LOCK` serializes env-mutating tests
+    // and must stay held across the awaits. Test-only.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn finish_cancelled_turn_clears_cancelled_active_without_rehydrating_queue() {
         let _lock = match TEST_ENV_LOCK.lock() {

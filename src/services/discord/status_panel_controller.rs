@@ -448,6 +448,13 @@ impl StatusPanelController {
         self.orphan_parity_target(key, panel_msg_id).await
     }
 
+    // EPIC #3078: watcher CREATE/ADOPT and COMPLETION parity query methods were
+    // deferred to the controller execute-cutover PR. A faithful check must
+    // replicate `watcher_should_create_external_input_status_panel` and the
+    // SendFallback-aware completion id from RAW inputs (not the resolved output,
+    // which `orphan_parity_target` would echo back tautologically). PR-4 ships
+    // only the faithful RECLAIM parity via `sweeper_reclaim_parity_id`.
+
     /// EPIC #3078 PR-3 — the controller's view of "does the live turn still own
     /// THIS EXACT panel?", the gate the orphan-store drain uses to defer a delete
     /// while the live turn's completion path may be finalizing the panel. Must
