@@ -70,10 +70,10 @@ of the typed `discord_channel_cc` / `discord_channel_cdx` columns).
 
 | Field                  | Required | Notes                                                            |
 |------------------------|----------|------------------------------------------------------------------|
-| `prompt_template_path` | yes (create mode) | Path to a template prompt file. Usually `~/.adk/release/config/agents/_shared.prompt.md`. The wizard copies this to `~/.adk/release/config/agents/<agent_id>/IDENTITY.md`. |
+| `prompt_template_path` | yes (create mode) | Path to a template prompt file. Usually `~/.adk/release/config/agents/_shared.prompt.md`. The wizard copies this to `~/.adk/release/config/agents/<agent_id>.prompt.md`. |
 | `prompt_content`       | no       | Inline override edited via `AgentPromptEditor`. Bypasses the template copy step.                                                |
 
-In **duplicate** mode the source agent's `IDENTITY.md` is copied byte-for-byte;
+In **duplicate** mode the source agent's `<source_id>.prompt.md` is copied byte-for-byte;
 the template path is informational.
 
 ### Step 4 — Workspace
@@ -151,7 +151,7 @@ server logs.
 |---|---------------------|----------------------------------------------------------|--------------------|
 | 1 | `agentdesk_yaml`    | Append agent block to `~/.adk/release/config/agentdesk.yaml` | Yes (no-op if equal) |
 | 2 | `discord_binding`   | Bind the existing `channel_id` under `agents[].channels.<provider>` | Yes               |
-| 3 | `prompt_file`       | Copy `prompt_template_path` → `config/agents/<id>/IDENTITY.md` | Yes (byte-equal short-circuit) |
+| 3 | `prompt_file`       | Copy `prompt_template_path` → `config/agents/<id>.prompt.md` | Yes (byte-equal short-circuit) |
 | 4 | `workspace_seed`    | `mkdir -p workspaces/<id>/`                              | Yes                |
 | 5 | `db_seed`           | `INSERT INTO agents` with provider/channel columns       | Yes (matches existing row) |
 | 6 | `skill_mapping`     | Append `(skill, agent)` rows to `skills.manifest.json`   | Yes (entry-equal short-circuit) |
@@ -179,7 +179,7 @@ Symptom matrix:
 | Wizard ended with HTTP 500 + `rolled_back[]` populated | Server already reverted everything in `rolled_back[]`. Confirm one-by-one. | Inspect response body in browser devtools. |
 | Wizard timed out (no response)                  | Any subset of steps may be applied                     | `~/.adk/release/config/agentdesk.yaml` audit log under `config/.audit/` |
 | Wizard succeeded but Discord channel never receives messages | Channel binding was registered but `provider` in DB is mismatched | `SELECT provider, discord_channel_* FROM agents WHERE id=?` |
-| `cargo` errors complaining about a missing prompt file at boot | `agentdesk_yaml` applied, `prompt_file` did not | `ls config/agents/<id>/IDENTITY.md` |
+| `cargo` errors complaining about a missing prompt file at boot | `agentdesk_yaml` applied, `prompt_file` did not | `ls config/agents/<id>.prompt.md` |
 
 ### 5.2 Manual rollback procedure
 
@@ -250,7 +250,7 @@ mappings are restored to the snapshot — no second wizard pass is needed.
 
 1. Loads the source agent's metadata.
 2. Resolves the source `prompt_path` (or falls back to the conventional
-   `config/agents/<source_id>/IDENTITY.md`).
+   `config/agents/<source_id>.prompt.md`).
 3. Calls `agents_setup::setup_agent` internally with the new id + new
    channel.
 4. Updates `agentdesk.yaml` `name` / `name_ko` / `department` /
@@ -263,7 +263,7 @@ caller tries to inject them:
 - `discord_channel_id` (raw column) — must come from the request `channel_id`,
   never the source row.
 - `token`, `api_key`, `system_prompt` — never copied. The new agent's prompt
-  comes from the *source's `IDENTITY.md`*, not from any body parameter.
+  comes from the *source's `<source_id>.prompt.md`*, not from any body parameter.
 
 The smoke test in §8 asserts every one of these.
 
@@ -308,7 +308,7 @@ through the public HTTP surface:
 4. **Dry-run** `POST /api/agents/setup` — assert nothing on disk changed,
    `planned[]` lists all 6 steps.
 5. **Execute** the same body — assert
-   `agentdesk.yaml` / `IDENTITY.md` / workspace dir / DB row / skills
+   `agentdesk.yaml` / `<id>.prompt.md` / workspace dir / DB row / skills
    manifest are all present.
 6. **Discord delivery check** — relay a message via
    `OutboundDeduper::deliver_outbound` to the bound channel and assert the
