@@ -1,0 +1,78 @@
+--- docs/agent-maintenance/change-surfaces.md
++++ docs/agent-maintenance/change-surfaces.md
+@@ -113,10 +113,10 @@
+   `src/services/dispatched_sessions.rs` (3347 lines, post-#2472).
+   `src/services/discord/turn_bridge/completion_guard.rs` (1909 lines, post-#2541).
+   `src/services/discord/commands/config.rs` (1900 lines, post-#3022).
+-  `src/services/discord/watchers/lifecycle.rs` (2301 lines, post-#3117).
++  `src/services/discord/watchers/lifecycle.rs` (2303 lines, post-#3117).
+   `src/server/routes/review_verdict/decision_route.rs` (4832 lines, post-#3170).
+   `src/server/routes/kanban.rs` (3222 lines, post-#3218).
+-  `src/services/discord/tmux.rs` (2241 lines, post-#3284).
++  `src/services/discord/tmux.rs` (2242 lines, post-#3284).
+
+ - **Why:** Prevents "dumping ground" modules. If your feature would
+   add more than a few lines to a >1k module, you must extract a bounded
+@@ -375,7 +375,7 @@
+ - `src/services/discord/router/message_handler/bot_mention.rs` (561).
+ - `src/services/discord/router/message_handler/dm_turn.rs` (461).
+ - `src/services/discord/router/message_handler/headless_turn.rs` (1316).
+-- `src/services/discord/router/message_handler/intake_turn.rs` (3651).
++- `src/services/discord/router/message_handler/intake_turn.rs` (3689).
+ - `src/services/discord/router/message_handler/routine_invoke.rs` (143).
+ - `src/services/discord/router/message_handler/user_action.rs` (520).
+ - `src/services/discord/router/message_handler/voice_join.rs` (255).
+@@ -481,7 +481,7 @@
+ - `src/services/auto_queue/status_command.rs` (519).
+ - `src/services/auto_queue/stop_command.rs` (130).
+ - `src/services/auto_queue/resume_command.rs` (144).
+-- `src/services/auto_queue/activate_command.rs` (1351).
++- `src/services/auto_queue/activate_command.rs` (1354).
+ - `src/db/auto_queue/slots.rs` (204).
+ - `src/db/auto_queue/claim.rs` (819).
+ - `src/db/auto_queue/queries.rs` (533).
+@@ -525,7 +525,7 @@
+ ### CLI
+ - `src/cli/mod.rs` (987).
+ - `src/cli/query.rs` (160).
+-- `src/cli/doctor/orchestrator.rs` (4376).
++- `src/cli/doctor/orchestrator.rs` (4374).
+ - `src/cli/doctor/network.rs` (106).
+ - `src/cli/doctor/config.rs` (626).
+ - `src/cli/doctor/database.rs` (124).
+@@ -553,7 +553,7 @@
+ - `src/utils/github_links.rs` (154).
+ - `src/server/cluster/mod.rs` (90).
+ - `src/utils/auth.rs` (152).
+-- `src/reconcile.rs` (1809).
++- `src/reconcile.rs` (1806).
+ - `src/github/sync.rs` (1894).
+ - `src/supervisor/mod.rs` (867).
+ - `src/github/auth.rs` (834).
+@@ -614,7 +614,7 @@
+   `src/services/auto_queue/status_command.rs` (519).
+   `src/services/auto_queue/stop_command.rs` (130).
+   `src/services/auto_queue/resume_command.rs` (144).
+-  `src/services/auto_queue/activate_command.rs` (1351).
++  `src/services/auto_queue/activate_command.rs` (1354).
+   `src/db/auto_queue/slots.rs` (204).
+   `src/db/auto_queue/claim.rs` (819).
+   `src/db/auto_queue/queries.rs` (533).
+@@ -629,7 +629,7 @@
+ - `src/services/qwen_tmux_wrapper.rs` (1220).
+ - `src/services/claude.rs` (3786).
+ - `src/services/codex.rs` (2928).
+-- `src/services/opencode.rs` (1881).
++- `src/services/opencode.rs` (1886).
+ - `src/services/gemini.rs` (1416).
+
+ ### Session Tracking
+@@ -667,7 +667,7 @@
+ - `src/services/turn_lifecycle.rs` (782).
+ - `src/services/slo/mod.rs` (634).
+ - `src/services/discord_config_audit.rs` (1459).
+-- `src/services/turn_orchestrator.rs` (2760).
++- `src/services/turn_orchestrator.rs` (2761).
+
+ ### Workspace Operations
+ - `src/services/issue_announcements.rs` (483).
