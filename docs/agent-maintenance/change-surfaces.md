@@ -113,7 +113,7 @@
   parsing), `src/services/discord/inflight.rs` (state file contract).
 - legacy_modules: none — relay routes are being consolidated, not replaced.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/services/discord/watchers/lifecycle.rs` (2301 lines — canonical
+  - `src/services/discord/watchers/lifecycle.rs` (2309 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior).
   - `src/services/discord/tmux.rs` (2251 lines after #2558 dead-code sweep;
@@ -130,7 +130,7 @@
     finalizer actor's `CommitDelivery`/`ReleaseDelivery` handlers are DORMANT
     (retained for a later phase, not the live watcher path after the R2 revert);
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (9598 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (9608 lines after #2558
     dead-code sweep; #1520 watcher loop extraction + #2427 D/A
     explicit-cleanup wires + #3055 watcher session-panel lifecycle
     refresh + #3087 session-instance-key panel reset + #3095 durable
@@ -381,7 +381,7 @@
     the REAL atomic helper against REAL on-disk inflight: a follow-up's inflight on
     disk → atomic clear is a no-op (follow-up preserved); the pinned turn on disk →
     atomic clear removes it (happy path).
-  - `src/services/discord/tui_prompt_relay.rs` (4638 lines; SSH-direct TUI
+  - `src/services/discord/tui_prompt_relay.rs` (5142 lines; SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
     outside an extraction plan; +4 from #3167: the self-paced TUI loop relay
     starts its synthetic turn with `ActiveTurnKind::Background` so a queued user
@@ -476,7 +476,46 @@
     (the double-relay duplicate). When the watcher stopped / never covered the turn
     the watermark is 0 (or lags), so the clamp is a no-op and the tail still relays
     from the prompt-timestamp offset — the #3176 outage fallback is preserved
-    (plus clamp-up / outage-noop unit tests).
+    (plus clamp-up / outage-noop unit tests);
+    +104 from #3154 codex P1/P2: the deferred synthetic turn-start path now (P1-3)
+    routes the relay-owner handoff through two shared pure decisions —
+    `observer_should_spawn_bridge_tail` (the observer stands down whenever the
+    start was deferred OR a watcher already owns the lease) and
+    `claim_should_adopt_relay_owner` (a successful claim that flips the owner
+    re-records the lease as the watcher owner) — so the deferred worker is the
+    SINGLE relayer: not zero (no relay GAP) and not two (no duplicate relay). Both
+    the inline and the deferred (`pending_start_claim_fn`) claim paths call the
+    same adoption decision, and the post-anchor bridge-tail block consults
+    `observer_should_spawn_bridge_tail` instead of an inline guard (plus the
+    no-GAP / observer-skip / failed-claim-no-adopt regression tests); +74 from
+    #3154 codex P1 (BridgeAdapter-GAP): the P1-3 fix only closed the TmuxWatcher
+    owner path — a deferred claim that RESOLVED to a BridgeAdapter owner had the
+    observer stand down (deferred) AND no worker bridge tail AND background idle
+    relay suppressed by the inflight, so `relayer_count == 0` (the synthetic
+    turn's output was lost). The observer cannot know the resolved owner pre-claim
+    (the claim runs later in the worker), so the worker (`pending_start_claim_fn`)
+    now mirrors the inline path: after its claim resolves, the new owner-kind-aware
+    `deferred_claim_requires_bridge_tail_relayer` (true iff the resolved owner is
+    the BridgeAdapter) makes the worker spawn EXACTLY ONE bridge tail for the
+    BridgeAdapter case and stand down for the watcher case — `maybe_spawn_claude_idle_response_tail`
+    self-gates on `bridge_adapter_owns_external_turn`, so a watcher/stale lease can
+    never double-relay. New parallel no-GAP tests assert `relayer_count == 1` for
+    BOTH resolved owners (RED before this fix: BridgeAdapter count == 0 == GAP;
+    over-eager spawn would push the watcher path to count == 2 == DUPLICATE);
+    +71 from #3154 codex P1 (timestamp-anchor output loss): the worker-spawned
+    BridgeAdapter tail used to synthesize `observed_at = Utc::now()` AFTER the
+    deferred-claim wait, so `maybe_spawn_claude_idle_response_tail`'s timestamp
+    scan skipped every transcript byte written during the wait window (the bytes
+    of THIS synthetic turn). The claim now carries its post-drain EOF
+    `turn_start_offset` (the `relay_last_offset()` it already seeded into the
+    inflight) on `TuiDirectSyntheticTurnClaim`, and the worker passes it as the
+    new `explicit_start_offset` arg; the shared `resolve_idle_tail_start_offset`
+    choke point anchors DIRECTLY to that offset (bypassing the `Utc::now()` scan)
+    for the deferred path while the inline path keeps the timestamp scan
+    (`None`). The committed-offset clamp still dedupes against watcher delivery,
+    so the relayed window is exactly `[turn_start_offset, EOF)` — no byte skip,
+    no prior-turn re-relay (RED→GREEN test: stale-high fallback skips the turn
+    under the old scan, explicit anchor relays it whole).
   - `src/services/discord/idle_recap.rs` (1881 prod lines; idle-recap card
     compose/post/clear surface, registered giant-file (#3036) — bugfix only
     outside an extraction plan. Crossed 1000 prod LoC with #3146 Part 1: the
