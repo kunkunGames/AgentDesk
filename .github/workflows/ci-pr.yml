@@ -644,7 +644,7 @@ jobs:
           # cross_os_rust=false lets required-check-mirror.sh treat the skip as
           # pass, while cross_os_rust=true still requires the lane to succeed.
           FILTER_NAME: cross_os_rust
-          FILTER_OUTPUT: ${{ needs.changes.outputs.cross_os_rust }}
+          FILTER_OUTPUT: ${{ needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true' }}
           UPSTREAM_JOB_NAME: check_fast_cross_os
           UPSTREAM_RESULT: ${{ needs.check_fast_cross_os.result }}
         run: ./scripts/required-check-mirror.sh
