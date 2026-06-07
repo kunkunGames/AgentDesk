@@ -85,6 +85,7 @@ mod tmux_overload_retry;
 mod tmux_reaper;
 #[cfg(unix)]
 mod tmux_restart_handoff;
+mod tui_direct_pending_start;
 mod tui_prompt_relay;
 mod tui_task_card;
 mod turn_bridge;
@@ -976,9 +977,10 @@ use session_runtime::{
     DiscordSession, RuntimeChannelBindingStatus, WorktreeInfo, auto_restore_session,
     auto_restore_session_force, auto_restore_session_with_dm_hint, bootstrap_thread_session,
     cleanup_git_worktree, create_git_worktree, detect_worktree_conflict, provider_handles_channel,
-    resolve_channel_category, resolve_is_dm_channel, resolve_runtime_channel_binding_status,
-    resolve_thread_parent, select_restored_session_path, synthetic_thread_channel_name,
-    validate_live_channel_routing, validate_live_channel_routing_with_dm_hint,
+    resolve_channel_category, resolve_is_dm_channel, resolve_reusable_worktree,
+    resolve_runtime_channel_binding_status, resolve_thread_parent, select_restored_session_path,
+    synthetic_thread_channel_name, validate_live_channel_routing,
+    validate_live_channel_routing_with_dm_hint,
 };
 
 /// Bot-level settings persisted to disk
@@ -3128,6 +3130,15 @@ fn idle_queue_snapshot_has_kickable_backlog(
         && snapshot.recovery_started_at.is_none()
         && !snapshot.intervention_queue.is_empty()
         && !cleanup_retry_inflight_blocks_idle_kickoff(shared, provider, channel_id)
+        // #3154: while a deferred synthetic turn-start is pending for this
+        // channel, the per-channel worker is waiting for the prior turn to
+        // finalize before claiming. Do NOT kick normal queued work in the
+        // meantime — that would re-introduce the very turn-interleave this fix
+        // serializes away.
+        && !tui_direct_pending_start::pending_synthetic_start_present(
+            provider.as_str(),
+            channel_id.get(),
+        )
 }
 
 #[cfg(unix)]

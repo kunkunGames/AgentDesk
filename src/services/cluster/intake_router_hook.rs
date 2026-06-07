@@ -261,9 +261,28 @@ pub(crate) async fn try_route_intake(
             outbox_id,
         },
         Err(error) => match classify_insert_pending_error(&error) {
-            Some(IntakeInsertConflict::OpenRoutePerChannel) => IntakeRouterDecision::RanLocal {
-                reason: RanLocalReason::OpenRouteAlreadyExists,
-            },
+            Some(IntakeInsertConflict::OpenRoutePerChannel) => {
+                let max_attempt = crate::db::intake_outbox::family_max_attempt(
+                    pool,
+                    ctx.channel_id,
+                    ctx.user_msg_id,
+                )
+                .await
+                .unwrap_or(0);
+
+                if max_attempt > 0 {
+                    tracing::info!(
+                        channel_id = ctx.channel_id,
+                        user_msg_id = ctx.user_msg_id,
+                        "[intake_router] duplicate Discord message \u{2014} existing row already covers it (open route mask); skipping local execution"
+                    );
+                    IntakeRouterDecision::SkippedDuplicate
+                } else {
+                    IntakeRouterDecision::RanLocal {
+                        reason: RanLocalReason::OpenRouteAlreadyExists,
+                    }
+                }
+            }
             Some(IntakeInsertConflict::DuplicateMessageAttempt) => {
                 // Discord delivered the same message twice (or the leader
                 // received it via two different intake paths). The first
@@ -776,6 +795,47 @@ mod pg_tests {
             count, 1,
             "duplicate ingress must NOT allocate a fresh attempt_no"
         );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enforce_mode_with_duplicate_message_and_open_route_conflict_returns_skipped_duplicate() {
+        // Reproduces the case where a duplicate message arrives while the
+        // first attempt is still OPEN. Postgres may raise the OpenRoutePerChannel
+        // violation before the DuplicateMessageAttempt violation. The hook
+        // must still detect it as a duplicate and skip.
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+
+        seed_agent_with_preference(&pool, "agent-dup-open", "ch-dup-open", serde_json::json!(["unreal"]))
+            .await;
+        seed_worker_node(&pool, "worker-dup-open", serde_json::json!(["unreal"]), "online").await;
+
+        // First call should forward (leaving the row in 'pending' aka OPEN).
+        let first = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-dup-open"),
+        )
+        .await;
+        match first {
+            IntakeRouterDecision::Forwarded { .. } => {}
+            other => panic!("expected first Forwarded, got {other:?}"),
+        }
+
+        // Second call (same Discord message, same channel).
+        // Since the first attempt is still 'pending', both the 3-tuple
+        // unique constraint AND the partial open-route unique constraint
+        // are violated. Depending on Postgres evaluation order, it might
+        // throw OpenRoutePerChannel.
+        let second = try_route_intake(
+            &pool,
+            &ctx_for_channel(IntakeRoutingMode::Enforce, "ch-dup-open"),
+        )
+        .await;
+
+        assert_eq!(second, IntakeRouterDecision::SkippedDuplicate);
 
         pool.close().await;
         pg_db.drop().await;
