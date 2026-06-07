@@ -12,17 +12,32 @@ use crate::services::provider::ProviderKind;
 
 /// Expand `~` or `~/` prefix to the user's home directory.
 fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        if let Some(home) = crate::runtime_layout::expand_user_path("~") {
-            if let Some(s) = home.to_str() {
-                return s.to_string();
-            }
+    let is_home_path =
+        path == "~" || path.starts_with("~/") || (cfg!(windows) && path.starts_with("~\\"));
+    if !is_home_path {
+        return path.to_string();
+    }
+
+    let preserve_literal_suffix =
+        path.trim() != path || path.starts_with("~/\\") || path.starts_with("~//");
+    if !preserve_literal_suffix {
+        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+            return expanded.to_string_lossy().into_owned();
         }
-    } else if path.starts_with("~/") || (cfg!(windows) && path.starts_with("~\\")) {
-        if let Some(home) = crate::runtime_layout::expand_user_path("~") {
-            if let Some(s) = home.to_str() {
-                return format!("{}{}", s, &path[1..]);
-            }
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home.display().to_string();
+    }
+    if path.starts_with("~/") {
+        return format!("{}{}", home.display(), &path[1..]);
+    }
+    if cfg!(windows) {
+        if let Some(rest) = path.strip_prefix("~\\") {
+            return home.join(rest).to_string_lossy().into_owned();
         }
     }
     path.to_string()
