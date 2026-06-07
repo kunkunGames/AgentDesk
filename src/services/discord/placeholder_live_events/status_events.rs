@@ -55,6 +55,10 @@ pub(in crate::services::discord) fn status_events_from_tool_use_with_id(
     }
     if is_task_tool(name) {
         let value = tool_input_value(input);
+        let background = value
+            .get("run_in_background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         events.push(StatusEvent::SubagentStart {
             subagent_type: value
                 .get("subagent_type")
@@ -64,6 +68,7 @@ pub(in crate::services::discord) fn status_events_from_tool_use_with_id(
                 .or_else(|| Some(name.to_string())),
             desc: subagent_description(&value).or(args_summary.clone()),
             tool_use_id: tool_use_id.map(str::to_string),
+            background,
         });
     }
     if is_todo_write_tool(name) {
@@ -105,6 +110,14 @@ pub(in crate::services::discord) fn status_events_from_tool_result_with_id(
             success: !is_error,
             tool_use_id: tool_use_id.map(str::to_string),
             summary: None,
+            // The Task `tool_result` always fires when the tool returns. Only a
+            // SUCCESSFUL `run_in_background` launch is an ack-only end: the
+            // dispatch succeeded and the subagent keeps running (often
+            // outliving the launching turn), so the panel must NOT mark it ✓.
+            // A FAILED launch (`is_error`) is terminal — the subagent never
+            // started — so it is not ack-only and the panel finalizes the slot
+            // as failed (✗), exactly like a foreground failure.
+            ack_only: !is_error,
         });
     }
     events
@@ -128,6 +141,10 @@ pub(in crate::services::discord) fn status_events_from_task_notification(
                     success: !task_notification_is_error(status),
                     tool_use_id: None,
                     summary: None,
+                    // A terminal task_notification is the subagent's REAL
+                    // completion (including background subagents), so it always
+                    // finalizes the slot — not an ack.
+                    ack_only: false,
                 });
             }
         }
@@ -153,6 +170,16 @@ pub(in crate::services::discord) fn status_events_from_json(value: &Value) -> Ve
     let workflow_events = status_events_from_workflow_json(value);
     if !workflow_events.is_empty() {
         return workflow_events;
+    }
+
+    // A nested subagent record carries the launching Task's tool-use id as a
+    // top-level `parent_tool_use_id`. Its tool activity belongs to that subagent
+    // slot, not the main panel status, so route it to `SubagentActivity` keyed by
+    // the parent id (matched against the slot's stored Task tool-use id) rather
+    // than emitting a top-level `ToolStart` that would clobber the panel header
+    // and resurrect the foreground "tool running" status.
+    if let Some(parent_id) = subagent_parent_tool_use_id(value) {
+        return subagent_activity_status_events(value, parent_id);
     }
 
     match value.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -474,6 +501,10 @@ fn user_status_events(value: &Value) -> Vec<StatusEvent> {
                         success: !is_error,
                         tool_use_id,
                         summary: Some(summary),
+                        // A summary-bearing end carries real accounting
+                        // (`toolUseResult`/rollout) — a genuine completion that
+                        // always finalizes the slot, never just an ack.
+                        ack_only: false,
                     },
                 ];
             }
@@ -522,6 +553,81 @@ fn system_status_events(value: &Value) -> Vec<StatusEvent> {
     let status = value.get("status").and_then(Value::as_str).unwrap_or("");
     let summary = value.get("summary").and_then(Value::as_str).unwrap_or("");
     status_events_from_task_notification(kind, status, summary)
+}
+
+/// Returns the launching Task's tool-use id from a nested subagent record's
+/// top-level `parent_tool_use_id` (Claude Code stream-json marks every
+/// subagent-internal `assistant`/`content_block_start` record with it). `None`
+/// for top-level records (no parent) so they take the normal panel path.
+fn subagent_parent_tool_use_id(value: &Value) -> Option<String> {
+    ["parent_tool_use_id", "parentToolUseId"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// Builds [`StatusEvent::SubagentActivity`] events for a nested subagent record,
+/// one per tool_use block, keyed by the parent Task id so the panel updates the
+/// owning subagent slot's recent line. The activity line is the same
+/// `[Tool] args` summary the main panel uses for a tool, so a long background
+/// subagent surfaces its current step instead of an opaque "running".
+fn subagent_activity_status_events(value: &Value, parent_id: String) -> Vec<StatusEvent> {
+    let blocks: Vec<(&str, String)> = match value.get("type").and_then(Value::as_str) {
+        Some("assistant") => value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .map(|block| {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+                let input = value_to_compact_string(block.get("input").unwrap_or(&Value::Null));
+                (name, input)
+            })
+            .collect(),
+        Some("content_block_start") => value
+            .get("content_block")
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .map(|block| {
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+                let input = block
+                    .get("input")
+                    .map(value_to_compact_string)
+                    .unwrap_or_default();
+                vec![(name, input)]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    blocks
+        .into_iter()
+        .filter_map(|(name, input)| {
+            subagent_activity_line(name, &input).map(|summary| StatusEvent::SubagentActivity {
+                tool_use_id: Some(parent_id.clone()),
+                summary,
+            })
+        })
+        .collect()
+}
+
+/// Formats a subagent's tool step into a compact activity line, e.g.
+/// `[Bash] cargo test`. Falls back to the bare tool label when no args summary
+/// is available. Returns `None` only when the tool name is unusable.
+fn subagent_activity_line(name: &str, input: &str) -> Option<String> {
+    use super::common::tool_prefix;
+    let args = format_tool_input(name, input);
+    let args = args.trim();
+    let line = if args.is_empty() {
+        tool_prefix(name)
+    } else {
+        format!("{} {}", tool_prefix(name), args)
+    };
+    let line = normalize_summary(&line);
+    (!line.trim().is_empty()).then_some(truncate_chars(&line, EVENT_LINE_MAX_CHARS))
 }
 
 fn background_status_events(value: &Value) -> Vec<StatusEvent> {
