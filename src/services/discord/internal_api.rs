@@ -245,7 +245,7 @@ pub(super) async fn get_escalation_settings() -> Result<Value, String> {
 }
 
 pub(super) async fn put_escalation_settings(
-    settings: routes::escalation::EscalationSettings,
+    settings: crate::config::EscalationSettings,
 ) -> Result<Value, String> {
     request_body(Method::PUT, "/api/settings/escalation", &settings).await
 }
@@ -269,7 +269,7 @@ pub(super) enum DispatchUpdateOutcome {
 
 pub(super) async fn update_dispatch(
     dispatch_id: &str,
-    body: routes::dispatches::UpdateDispatchBody,
+    body: crate::services::dispatches::UpdateDispatchBody,
 ) -> Result<DispatchUpdateOutcome, String> {
     let ctx = load_context()?;
     let path = format!("/api/dispatches/{dispatch_id}");
@@ -299,19 +299,19 @@ pub(super) async fn update_dispatch(
 }
 
 pub(super) async fn submit_review_decision(
-    body: routes::review_verdict::ReviewDecisionBody,
+    body: crate::services::review_decision::ReviewDecisionBody,
 ) -> Result<Value, String> {
     request_body(Method::POST, "/api/reviews/decision", &body).await
 }
 
 pub(super) async fn submit_review_verdict(
-    body: routes::review_verdict::SubmitVerdictBody,
+    body: crate::services::review_decision::SubmitVerdictBody,
 ) -> Result<Value, String> {
     request_body(Method::POST, "/api/reviews/verdict", &body).await
 }
 
 pub(super) async fn upsert_meeting(
-    body: routes::meetings::UpsertMeetingBody,
+    body: crate::services::discord::meeting_artifact_store::UpsertMeetingBody,
 ) -> Result<Value, String> {
     request_body(Method::POST, "/api/round-table-meetings", &body).await
 }

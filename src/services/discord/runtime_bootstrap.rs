@@ -399,7 +399,7 @@ pub(in crate::services::discord) async fn collect_live_queue_message_ids(
 fn spawn_startup_thread_map_validation(pg_pool: Option<sqlx::PgPool>, token: String) {
     tokio::spawn(async move {
         let (checked, cleared) =
-            crate::server::routes::dispatches::validate_channel_thread_maps_on_startup_with_backends(
+            crate::services::dispatches::discord_delivery::validate_channel_thread_maps_on_startup_with_backends(
                 None,
                 pg_pool.as_ref(),
                 &token,
@@ -2855,9 +2855,7 @@ async fn gc_stale_fixed_working_sessions(shared: &Arc<SharedData>) {
     let Some(pool) = shared.pg_pool.as_ref() else {
         return;
     };
-    let cleared =
-        crate::server::routes::dispatched_sessions::gc_stale_fixed_working_sessions_db_pg(pool)
-            .await;
+    let cleared = crate::db::dispatched_sessions::gc_stale_fixed_working_sessions_db_pg(pool).await;
 
     if cleared > 0 {
         let ts = chrono::Local::now().format("%H:%M:%S");

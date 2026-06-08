@@ -2,7 +2,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -34,12 +34,15 @@ use crate::voice::tts::{
 use crate::voice::{CompletedUtterance, VoiceConfig, VoiceReceiveHook};
 
 use super::SharedData;
+use super::voice_acknowledgement::AcknowledgementConfig;
 #[cfg(test)]
 use super::voice_background_driver::{VoiceBackgroundDriverKind, VoiceBackgroundStartOutcome};
 use super::voice_background_driver::{
     VoiceBackgroundStartRequest, VoiceBackgroundTurnDriver, default_voice_announce_generation,
     select_voice_background_driver, voice_announce_delivery_id,
 };
+use super::voice_config_cache::ConfigSnapshotCache;
+use super::voice_id_sequences::VoiceIdSequences;
 pub(in crate::services::discord) const INTERNAL_VOICE_MESSAGE_ID_START: u64 =
     9_000_000_000_000_000_000;
 
@@ -55,11 +58,6 @@ pub(in crate::services::discord) fn is_synthetic_voice_message_id(
 ) -> bool {
     msg_id.get() >= INTERNAL_VOICE_MESSAGE_ID_START
 }
-// F4 (#2046): progress/ack 재생 owner id 시작점. spoken_result owner 공간(1..)과
-// 분리하기 위해 high range 사용.
-const PROGRESS_PLAYBACK_OWNER_START: u64 = 1u64 << 63;
-// F6 (#2046): voice config 핫캐시 TTL. 5초 안 utterance 는 캐시 재사용.
-const VOICE_CONFIG_CACHE_TTL: Duration = Duration::from_secs(5);
 const STT_TRANSCRIPT_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const STT_TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const PROCESSING_CHIME_FILE_NAME: &str = "agentdesk-voice-processing-chime.wav";
@@ -1174,56 +1172,6 @@ impl SensitivityState {
     }
 }
 
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: monotonic ID allocators
-/// (#3038 god-object split, id-sequence slice).
-///
-/// Bundles the three independent `AtomicU64` counters that previously lived
-/// directly on `VoiceBargeInRuntime`. Each `next_*` accessor preserves the
-/// original `fetch_add` semantics — including the exact memory `Ordering` and
-/// the per-counter seed value — so issued IDs are byte-for-byte identical to
-/// the pre-extraction layout:
-/// - spoken-result playbacks seed at `1` (`SeqCst`),
-/// - progress playbacks seed at `PROGRESS_PLAYBACK_OWNER_START` (`SeqCst`),
-/// - internal voice messages seed at `INTERNAL_VOICE_MESSAGE_ID_START`
-///   (`Relaxed`).
-struct VoiceIdSequences {
-    next_spoken_result_playback_id: AtomicU64,
-    // F4 (#2046): progress/ack 재생 owner id 발급용. 30s 만료 타이머가 owner 일치
-    // 시에만 playback entry 를 정리하도록 한다.
-    next_progress_playback_id: AtomicU64,
-    next_internal_message_id: AtomicU64,
-}
-
-impl VoiceIdSequences {
-    fn new() -> Self {
-        Self {
-            next_spoken_result_playback_id: AtomicU64::new(1),
-            next_progress_playback_id: AtomicU64::new(PROGRESS_PLAYBACK_OWNER_START),
-            next_internal_message_id: AtomicU64::new(INTERNAL_VOICE_MESSAGE_ID_START),
-        }
-    }
-
-    /// Allocate the next spoken-result playback id (`SeqCst`, seeded at `1`).
-    fn next_spoken_result_playback_id(&self) -> u64 {
-        self.next_spoken_result_playback_id
-            .fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Allocate the next progress/ack playback owner id (`SeqCst`, seeded at
-    /// `PROGRESS_PLAYBACK_OWNER_START`).
-    fn next_progress_playback_id(&self) -> u64 {
-        self.next_progress_playback_id
-            .fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Allocate the next internal voice message id (`Relaxed`, seeded at
-    /// `INTERNAL_VOICE_MESSAGE_ID_START`).
-    fn next_internal_message_id(&self) -> u64 {
-        self.next_internal_message_id
-            .fetch_add(1, Ordering::Relaxed)
-    }
-}
-
 /// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the streaming-STT per-user
 /// session bookkeeping (#3038 god-object split, streaming-STT slice).
 ///
@@ -1274,67 +1222,13 @@ impl StreamingSttSessions {
     }
 }
 
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the F6 (#2046) `Config`
-/// snapshot hot-cache (#3038 god-object split, config-cache slice).
-///
-/// Wraps the single `Mutex<Option<(Instant, Arc<Config>)>>` slot that used to
-/// live directly on `VoiceBargeInRuntime`. The accessors below preserve the
-/// original lock discipline and TTL fallback exactly:
-/// - `lookup_within_ttl` returns the cached `Arc<Config>` only while the entry
-///   is younger than `VOICE_CONFIG_CACHE_TTL`, silently treating a poisoned /
-///   contended lock as a miss (`Ok` guard required, never blocking-on-panic),
-/// - `store` overwrites the slot with a freshly stamped entry, also ignoring a
-///   failed lock,
-/// - the spawn_blocking reload itself stays on the runtime so the async control
-///   flow and side-effect ordering are byte-for-byte unchanged.
-struct ConfigSnapshotCache {
-    slot: std::sync::Mutex<Option<(Instant, Arc<crate::config::Config>)>>,
-}
-
-impl ConfigSnapshotCache {
-    fn new() -> Self {
-        Self {
-            slot: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Return the cached snapshot iff it is still within the TTL window as of
-    /// `now`. A poisoned or contended lock is treated as a cache miss, matching
-    /// the original `if let Ok(guard) = ... .lock()` fallback.
-    fn lookup_within_ttl(&self, now: Instant) -> Option<Arc<crate::config::Config>> {
-        if let Ok(guard) = self.slot.lock()
-            && let Some((loaded_at, cached)) = guard.as_ref()
-            && now.duration_since(*loaded_at) < VOICE_CONFIG_CACHE_TTL
-        {
-            return Some(cached.clone());
-        }
-        None
-    }
-
-    /// Stamp and store a freshly loaded snapshot. A failed lock is ignored,
-    /// matching the original `if let Ok(mut guard) = ... .lock()` write.
-    fn store(&self, loaded_at: Instant, config: Arc<crate::config::Config>) {
-        if let Ok(mut guard) = self.slot.lock() {
-            *guard = Some((loaded_at, config));
-        }
-    }
-
-    /// Test-only seed of the cache slot (mirrors the previous direct
-    /// `*runtime.config_cache.lock().unwrap() = Some(...)` writes).
-    #[cfg(test)]
-    fn seed(&self, loaded_at: Instant, config: Arc<crate::config::Config>) {
-        *self.slot.lock().unwrap() = Some((loaded_at, config));
-    }
-}
-
 pub(in crate::services::discord) struct VoiceBargeInRuntime {
     enabled: bool,
     barge_in_enabled: bool,
     // #3038: sensitivity 관심사를 sub-struct 로 격리. default_sensitivity /
     // atomic mirror / RwLock 상태를 하나로 묶어 락 순서와 폴백 동작을 보존.
     sensitivity: SensitivityState,
-    acknowledgement_enabled: bool,
-    acknowledgement_text: String,
+    acknowledgement: AcknowledgementConfig,
     transcript_dirs: Vec<PathBuf>,
     voice_config_state: RwLock<VoiceConfig>,
     spoken_result_language: RwLock<String>,
@@ -1395,8 +1289,7 @@ impl VoiceBargeInRuntime {
             enabled: config.enabled,
             barge_in_enabled: config.enabled && config.barge_in.enabled,
             sensitivity: SensitivityState::new(default_sensitivity, conservative_ttl),
-            acknowledgement_enabled: config.barge_in.acknowledgement_enabled,
-            acknowledgement_text: config.barge_in.acknowledgement_text.clone(),
+            acknowledgement: AcknowledgementConfig::from_voice_config(config),
             transcript_dirs: transcript_dirs_from_config(config),
             voice_config_state: RwLock::new(config.clone()),
             spoken_result_language: RwLock::new(config.stt.language.clone()),
@@ -1426,8 +1319,7 @@ impl VoiceBargeInRuntime {
             enabled: false,
             barge_in_enabled: false,
             sensitivity: SensitivityState::disabled(),
-            acknowledgement_enabled: false,
-            acknowledgement_text: String::new(),
+            acknowledgement: AcknowledgementConfig::disabled(),
             transcript_dirs: Vec::new(),
             voice_config_state: RwLock::new(VoiceConfig::default()),
             spoken_result_language: RwLock::new(DEFAULT_STT_LANGUAGE.to_string()),
@@ -4143,8 +4035,9 @@ impl VoiceBargeInRuntime {
             .get(&channel_id.get())
             .map(|entry| entry.value().clone())?;
         let mut buffer = buffer.lock().await;
+        let ack = &self.acknowledgement;
         let acknowledgement = buffer
-            .acknowledgement_before_drain(self.acknowledgement_enabled, &self.acknowledgement_text)
+            .acknowledgement_before_drain(ack.enabled(), ack.text())
             .map(ToOwned::to_owned);
         let prompt = buffer.drain_prompt()?;
         Some(DeferredBargeInDrain {
