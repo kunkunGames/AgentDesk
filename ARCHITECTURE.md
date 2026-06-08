@@ -152,6 +152,7 @@ src/
 │   ├── transition.rs
 │   └── transition_executor_pg.rs
 ├── github/
+│   ├── dod.rs
 │   ├── mod.rs
 │   ├── sync.rs
 │   └── triage.rs
@@ -267,8 +268,7 @@ src/
 ├── services/
 │   ├── agent_quality/
 │   │   ├── mod.rs
-│   │   ├── regression_alerts.rs
-│   │   └── regression_alerts.rs.orig
+│   │   └── regression_alerts.rs
 │   ├── agents/
 │   │   ├── mod.rs
 │   │   ├── query.rs
@@ -408,7 +408,6 @@ src/
 │   │   │   ├── status_events.rs
 │   │   │   ├── status_panel.rs
 │   │   │   ├── subagent_rollout.rs
-│   │   │   ├── subagent_summary.rs
 │   │   │   ├── task_panel.rs
 │   │   │   ├── tests.rs
 │   │   │   └── workflow_panel.rs
@@ -532,7 +531,6 @@ src/
 │   │   ├── tmux_restart_handoff.rs
 │   │   ├── tmux_session_files.rs
 │   │   ├── tmux_watcher.rs
-│   │   ├── tui_direct_pending_start.rs
 │   │   ├── tui_prompt_relay.rs
 │   │   ├── tui_task_card.rs
 │   │   ├── turn_finalizer.rs
@@ -651,7 +649,6 @@ src/
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
 │   ├── mod.rs
-│   ├── monitoring_store.rs
 │   ├── opencode.rs
 │   ├── operator_connectors.rs
 │   ├── pipeline_override.rs
@@ -737,7 +734,8 @@ src/
 ├── manual_intervention.rs
 ├── pipeline.rs
 ├── receipt.rs
-└── reconcile.rs
+├── reconcile.rs
+└── runtime.rs
 ```
 <!-- END GENERATED: SRC TREE -->
 
@@ -779,6 +777,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/pipeline.rs` | Pipeline stage loading, resolution, and transition helpers. |
 | `src/receipt.rs` | Receipt parsing and workspace attribution helpers. |
 | `src/reconcile.rs` | Boot-time reconciliation for persisted state and dispatch-runtime drift. |
+| `src/runtime.rs` | Session runtime abstraction (`SessionRuntime`) plus the tmux-backed implementation. |
 <!-- END GENERATED: TOP LEVEL MODULE MAP -->
 
 ### Discord Runtime

@@ -697,38 +697,21 @@ pub(super) fn extract_result_error_text(value: &serde_json::Value) -> String {
     }
 }
 
-/// Resolve a restored session's persisted cwd (worktree) from the `sessions`
-/// table, scoped to the unique Discord `channel_id`.
-///
-/// #3207 (part 2) P0-b: `session_key` is derived from the sanitized/truncated
-/// channel NAME, so two distinct channels whose names collide produce the SAME
-/// `session_key` and would resolve EACH OTHER's persisted cwd — this restored
-/// cwd is injected straight into the restored runtime state
-/// (`session.current_path` via `select_restored_session_path`), so a collision
-/// would silently recover one channel into another channel's working tree. The
-/// `channel_id = $2` predicate is the cross-channel guard. Legacy rows with a
-/// NULL `channel_id` (written before this column existed) are intentionally NOT
-/// reused: returning their cwd is exactly the cross-channel hazard we are
-/// closing, and reuse self-heals on the next turn once the row is stamped.
 pub(super) fn load_restored_session_cwd(
     db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     session_keys: &[String],
-    channel_id: u64,
 ) -> Option<String> {
     if let Some(pg_pool) = pg_pool {
         let session_keys = session_keys.to_vec();
-        let channel_id = channel_id.to_string();
         return crate::utils::async_bridge::block_on_pg_result(
             pg_pool,
             move |pool| async move {
                 for session_key in session_keys {
                     let path = sqlx::query_scalar::<_, String>(
-                        "SELECT cwd FROM sessions \
-                         WHERE session_key = $1 AND channel_id = $2 LIMIT 1",
+                        "SELECT cwd FROM sessions WHERE session_key = $1 LIMIT 1",
                     )
                     .bind(&session_key)
-                    .bind(&channel_id)
                     .fetch_optional(&pool)
                     .await
                     .map_err(|error| format!("load tmux restore cwd {session_key}: {error}"))?;
@@ -746,7 +729,7 @@ pub(super) fn load_restored_session_cwd(
         .flatten();
     }
 
-    let _ = (db, session_keys, channel_id);
+    let _ = (db, session_keys);
     None
 }
 
@@ -1635,7 +1618,6 @@ pub(super) fn should_skip_streaming_placeholder_without_inflight(
     inflight_missing && !pane_actively_streaming
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn should_suppress_post_terminal_output_without_inflight(
     terminal_success_seen: bool,
     inflight_missing: bool,
@@ -1643,7 +1625,6 @@ pub(super) fn should_suppress_post_terminal_output_without_inflight(
     external_input_lease_present: bool,
     assistant_continuation_present: bool,
     pane_actively_streaming: bool,
-    pending_synthetic_start_present: bool,
 ) -> bool {
     // SSH-direct prompts never create an inflight (they bypass the Discord
     // message path), so the (terminal + no-inflight) shape alone is not enough
@@ -1655,18 +1636,12 @@ pub(super) fn should_suppress_post_terminal_output_without_inflight(
     // #3107: and if the pane is still actively producing assistant output, the
     // turn is live and merely lost its inflight — relay (and re-acquire) rather
     // than suppress.
-    // #3154: while a deferred synthetic turn-start is pending for this channel,
-    // the worker has not yet saved the matching inflight. Suppressing here (or
-    // advancing the confirmed offset) would EAT the wait window and drop the
-    // wakeup turn's response batch. Keep the bytes buffered until the worker
-    // claims (its inflight save then takes over the relay).
     terminal_success_seen
         && inflight_missing
         && !ssh_direct_prompt_pending
         && !external_input_lease_present
         && !assistant_continuation_present
         && !pane_actively_streaming
-        && !pending_synthetic_start_present
 }
 
 #[cfg(test)]
@@ -1679,35 +1654,35 @@ mod post_terminal_output_tests {
     #[test]
     fn post_terminal_output_without_inflight_is_suppressed() {
         assert!(should_suppress_post_terminal_output_without_inflight(
-            true, true, false, false, false, false, false
+            true, true, false, false, false, false
         ));
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                false, true, false, false, false, false, false
+                false, true, false, false, false, false
             ),
             "pre-terminal output still belongs to the active watcher turn"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, false, false, false, false, false, false
+                true, false, false, false, false, false
             ),
             "a newly active inflight owns subsequent output"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, true, true, false, false, false, false
+                true, true, true, false, false, false
             ),
             "SSH-direct prompt anchor present: output is a real direct-input response"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, true, false, true, false, false, false
+                true, true, false, true, false, false
             ),
             "ExternalInput lease present: notification failure must not suppress response output"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, true, false, false
+                true, true, false, false, true, false
             ),
             "assistant continuation after early terminal relay still belongs to the provider turn"
         );
@@ -1717,25 +1692,25 @@ mod post_terminal_output_tests {
     fn post_terminal_hard_result_after_committed_turn_requires_direct_input_evidence() {
         assert!(
             should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, false, false, false
+                true, true, false, false, false, false
             ),
             "a late hard_result envelope after a committed Discord turn must not relay again"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, true, true, false, false, false, false
+                true, true, true, false, false, false
             ),
             "a pending SSH-direct prompt is explicit evidence of a fresh direct-input turn"
         );
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, true, false, true, false, false, false
+                true, true, false, true, false, false
             ),
             "an ExternalInput lease is explicit evidence of a fresh direct-input turn"
         );
         assert!(
             should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, false, false, false
+                true, true, false, false, false, false
             ),
             "a result-only duplicate without assistant continuation stays suppressed"
         );
@@ -1748,7 +1723,7 @@ mod post_terminal_output_tests {
         // the turn is live and merely lost its inflight.
         assert!(
             !should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, false, true, false
+                true, true, false, false, false, true
             ),
             "an actively-streaming pane means the turn is live: relay, do not suppress"
         );
@@ -1756,31 +1731,9 @@ mod post_terminal_output_tests {
         // post-finish ghost noise and stays suppressed.
         assert!(
             should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, false, false, false
+                true, true, false, false, false, false
             ),
             "a finished pane with missing inflight is real ghost noise: still suppressed"
-        );
-    }
-
-    #[test]
-    fn post_terminal_output_with_pending_synthetic_start_is_not_suppressed() {
-        // #3154: while a deferred synthetic turn-start is pending for this
-        // channel (the per-channel worker has not yet saved the matching
-        // inflight), the (terminal + no-inflight) shape that would otherwise be
-        // suppressed must keep its bytes buffered — suppressing here would EAT
-        // the wait window and drop the wakeup turn's response batch.
-        assert!(
-            !should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, false, false, true
-            ),
-            "a pending synthetic turn-start must keep post-terminal bytes buffered, not suppress"
-        );
-        // Without the pending start the same shape is genuine ghost noise.
-        assert!(
-            should_suppress_post_terminal_output_without_inflight(
-                true, true, false, false, false, false, false
-            ),
-            "no pending synthetic start: real ghost noise stays suppressed"
         );
     }
 
@@ -2367,7 +2320,6 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
             None::<&crate::db::Db>,
             shared.pg_pool.as_ref(),
             &session_keys,
-            channel_id.get(),
         );
 
         let mut selected_claude_tui_fallback_transcript: Option<std::path::PathBuf> = None;
@@ -2602,7 +2554,6 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                 None::<&crate::db::Db>,
                 shared.pg_pool.as_ref(),
                 &session_keys,
-                channel_id.get(),
             );
 
             let session =
@@ -2639,16 +2590,10 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
 
             // Restore current_path: DB cwd (worktree-aware) > last_sessions (yaml, main workspace)
             if session.current_path.is_none() {
-                // #3219: prefer the channel's own reusable managed worktree over
-                // the configured base; only log "ignoring" when it is NOT reused.
-                let reusable_worktree = super::super::session_runtime::db_cwd_is_reusable_worktree(
-                    configured_path.as_deref(),
-                    db_cwd.as_deref(),
-                );
                 if let (Some(configured), Some(restored)) =
                     (configured_path.as_ref(), db_cwd.as_ref())
                 {
-                    if configured != restored && !reusable_worktree {
+                    if configured != restored {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!(
                             "  [{ts}] ⚠ Ignoring restored DB cwd for channel {}: {} (configured workspace: {})",
@@ -2663,7 +2608,6 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                     db_cwd,
                     persisted_path,
                     remote_profile.as_deref(),
-                    reusable_worktree,
                 );
                 if let Some(path) = effective_path {
                     session.current_path = Some(path);
@@ -2883,122 +2827,5 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
         // pre-migration wrappers) — we only clean the new persistent
         // directory. See issue #892.
         sweep_orphan_session_files().await;
-    }
-}
-
-#[cfg(test)]
-mod restored_session_cwd_channel_isolation_tests {
-    //! #3207 (part 2) P0-b: watcher restart recovery resolves a restored
-    //! session's cwd via `load_restored_session_cwd` and injects it into the
-    //! restored runtime state (`session.current_path` via
-    //! `select_restored_session_path`). The lookup must be scoped by the unique
-    //! Discord channel id: two channels whose sanitized/truncated names collide
-    //! share one `session_key`, and without the `channel_id = $2` predicate the
-    //! recovering channel would recover into the OTHER channel's working tree.
-    //! RED before the predicate was added, GREEN after.
-    use super::load_restored_session_cwd;
-    use crate::db::auto_queue::test_support::TestPostgresDb;
-    use crate::services::discord::adk_session::build_namespaced_session_key;
-    use crate::services::provider::ProviderKind;
-
-    async fn seed_session(
-        pool: &sqlx::PgPool,
-        session_key: &str,
-        channel_id: Option<&str>,
-        cwd: &str,
-    ) {
-        sqlx::query(
-            "INSERT INTO sessions (session_key, provider, status, cwd, channel_id, last_heartbeat)
-             VALUES ($1, 'claude', 'idle', $2, $3, NOW())",
-        )
-        .bind(session_key)
-        .bind(cwd)
-        .bind(channel_id)
-        .execute(pool)
-        .await
-        .expect("seed sessions row");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watcher_recovery_cwd_does_not_cross_channels() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "tok-3207-watcher";
-        let collide_name = "shared-watcher-name";
-        let tmux_name = provider.build_tmux_session_name(collide_name);
-        let session_key = build_namespaced_session_key(token_hash, &provider, &tmux_name);
-        let session_keys = vec![session_key.clone()];
-        let channel_a: u64 = 777_777_777_777_777_777;
-        let channel_b: u64 = 888_888_888_888_888_888;
-
-        // `load_restored_session_cwd` only returns a path that exists on disk
-        // (`is_dir()`), so seed the owner's cwd as a real temp directory.
-        let owner_dir =
-            std::env::temp_dir().join(format!("adk-3207-watcher-{}", std::process::id()));
-        std::fs::create_dir_all(&owner_dir).expect("create owner cwd dir");
-        let owner_cwd = owner_dir.to_string_lossy().to_string();
-
-        seed_session(
-            &pool,
-            &session_key,
-            Some(&channel_a.to_string()),
-            &owner_cwd,
-        )
-        .await;
-
-        // Owner channel recovers its own cwd.
-        let owner = load_restored_session_cwd(None, Some(&pool), &session_keys, channel_a);
-        assert_eq!(
-            owner.as_deref(),
-            Some(owner_cwd.as_str()),
-            "the owning channel must recover its own persisted cwd"
-        );
-
-        // The colliding (different-id) channel must NOT recover channel A's cwd
-        // (RED before the P0-b `channel_id = $2` fix).
-        let cross = load_restored_session_cwd(None, Some(&pool), &session_keys, channel_b);
-        assert_eq!(
-            cross, None,
-            "a different channel sharing the same session_key must NOT recover \
-             another channel's working tree"
-        );
-
-        let _ = std::fs::remove_dir_all(&owner_dir);
-        pool.close().await;
-        pg_db.drop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watcher_recovery_cwd_legacy_null_channel_id_not_reused() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-
-        let provider = ProviderKind::Claude;
-        let token_hash = "tok-3207-watcher-legacy";
-        let channel_name = "legacy-watcher-chan";
-        let tmux_name = provider.build_tmux_session_name(channel_name);
-        let session_key = build_namespaced_session_key(token_hash, &provider, &tmux_name);
-        let session_keys = vec![session_key.clone()];
-        let channel_id: u64 = 999_999_999_999_999_999;
-
-        let dir =
-            std::env::temp_dir().join(format!("adk-3207-watcher-legacy-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create legacy cwd dir");
-        let cwd = dir.to_string_lossy().to_string();
-
-        // A row written before the channel_id column existed has NULL channel_id.
-        seed_session(&pool, &session_key, None, &cwd).await;
-
-        let resolved = load_restored_session_cwd(None, Some(&pool), &session_keys, channel_id);
-        assert_eq!(
-            resolved, None,
-            "a legacy NULL-channel_id row must not be reused for watcher recovery"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-        pool.close().await;
-        pg_db.drop().await;
     }
 }
