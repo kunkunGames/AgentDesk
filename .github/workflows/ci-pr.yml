@@ -1,5 +1,8 @@
 name: CI PR
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 on:
   # PR-only triggers. The previous `push: branches-ignore: [main]` trigger ran
   # this whole workflow a SECOND time for every push that also had an open PR
