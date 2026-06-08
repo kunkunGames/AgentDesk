@@ -389,6 +389,28 @@
   internally and is invoked at the identical position in `run_bot`. No new
   multinode ownership, singleton, or lease assumption is introduced; the
   leader-only vs worker-local classification of every spawned task is preserved.
+- #3038 (`execute_streaming_local_tui_tmux` god-function decomposition, follow-up
+  slice to #3196): `claude.rs` changed by a **pure, behavior-preserving
+  extraction** of the orchestrator's inline fresh-turn dispatch + completion gate
+  into one `run_claude_tui_fresh_turn_and_finalize` free helper (skip-stale-bytes
+  offset, ready-retry fresh-turn run, and the three terminal outcomes:
+  start-failure, `SessionDied`, and delivery with watcher handoff + producer-exit
+  log). Every original `return Ok/Err` and the audit + exit-reason + kill +
+  owner-marker cleanup ordering are **unchanged** — the helper is invoked at the
+  identical position as a tail call and returns the same `Result` directly. The
+  tmux session ownership marker, turn lock, and termination-audit side effects are
+  all **process-local / per-session**; no new multinode ownership, singleton, or
+  lease assumption is introduced.
+- #3038 (`health.rs` send-to-agent dispatch decomposition): the agent-to-agent
+  relay entry point (`handle_send_to_agent` + `parse_send_to_agent_body` +
+  `ParsedSendToAgentRequest`) was moved by a **pure, behavior-preserving
+  extraction** from `services::discord::health` into the new
+  `services::discord::outbound::send_to_agent` module. The new module is a
+  **stateless** request parser/router: it owns no global state, no durable queue,
+  and no lease, and it still delivers through the unchanged
+  `health::send_message_with_backends`. Call sites (`route_request_generate.rs`,
+  `health_api.rs`) were re-pointed to the new path with identical arguments. No
+  new multinode ownership, singleton, or lease assumption is introduced.
 - #3142 (committed-output turn-aliasing safety): `tmux_watcher.rs` changed by
   adding one **pure** decision helper
   (`committed_anchor_cleanup_is_stale_for_newer_turn`, the id==0-inclusive sibling
@@ -405,3 +427,132 @@
   it owns); this change only narrows which in-process side-effects fire on a
   turn boundary and introduces no new multinode ownership/singleton/lease
   assumption.
+- #3016 phase-5a (reconciler far-backstop enabler): `turn_finalizer.rs` changed
+  by arming a generous `WATCHER_REGISTER_BACKSTOP` (the legacy 1800s
+  placeholder-sweeper horizon) on watcher-owned `register_start` Pending entries
+  and adding a reconciler pass that finalizes them ONLY after a liveness
+  re-check (`watcher_backstop_turn_is_terminal`: never a `PausedLive`/paused/
+  pane-busy turn; `Unknown` non-JSONL runtimes gated on pane-idle). The
+  `TurnFinalizer` actor is already **worker-local** (one actor per in-process
+  `SharedData`, owning its ledger and a `Weak<SharedData>`); the backstop reads
+  only this process's ledger plus the local tmux pane/transcript via the
+  existing `tmux_watchers` registry and `tui_turn_state`/`provider` probes. It
+  acquires no lease, touches no durable queue, and changes no leader/standby
+  ownership — finalize remains the same per-process exactly-once unit. No new
+  multinode ownership/singleton/lease assumption is introduced. (codex HIGH
+  follow-up: the reconcile cache `Weak<SharedData>` is now primed at the FIRST
+  `register_start` — the `Start` message carries a `Weak` downgraded from the
+  caller's `Arc<SharedData>` — instead of only at the first `Terminal`, so the
+  far-backstop is deterministic for a fresh worker-local actor whose first
+  watcher turn never submits its own terminal. Still worker-local `Weak`, no
+  cross-node reference.)
+- #3016 phase-5b1 (make `mailbox_finalize_owed` write-only by replacing its
+  CONSUMERS, not removing it): two consumer rewrites, both behaviour-equivalent
+  to today. (1) `tmux_watcher.rs` — the fresh-idle `Unknown` (non-JSONL runtime)
+  arm no longer reads the flag to gate finalize; it routes to the SAME pane-idle
+  `Finalize` path as `Done` (`watcher_session_ready_for_input` — the SAME
+  `pane_ready_fallback_allowed && tmux_session_ready_for_input` predicate the 5a
+  far-backstop uses for `Unknown` — is already proven at this arm), so an empty
+  `Unknown` completion finalizes promptly instead of at the 1800s far-backstop;
+  the paused-live/paused/epoch/stale-for-newer-turn race guards are kept. (2)
+  `turn_bridge/mod.rs` — the `bridge_handoff_finds_watcher_handle` invariant now
+  queries the ledger via `turn_finalizer.has_live_watcher_pending(channel_id,
+  current_generation)` instead of loading `mailbox_finalize_owed`; the two are
+  equivalent because `owed` is set atomically with the
+  `register_start(.., RelayOwnerKind::Watcher)` keyed by the same channel/
+  generation. Both consumers stay **worker-local**: the watcher reads only the
+  local tmux pane/transcript, and `has_live_watcher_pending` is a read-only query
+  of THIS process's actor-owned ledger (the `TurnFinalizer` is one actor per
+  in-process `SharedData`). No lease, no durable queue, no leader/standby
+  ownership change — finalize remains the same per-process exactly-once unit. No
+  new multinode ownership/singleton/lease assumption. (The flag field/producers
+  remain until phase-5b2.)
+- #3016 phase-5b2 (delete the `mailbox_finalize_owed` flag entirely): pure
+  dead-write elimination, behaviour-identical. Phase-5b1 had already replaced
+  every finalize-decision CONSUMER, leaving the flag write-only. 5b2 removes: the
+  `TmuxWatcherHandle.mailbox_finalize_owed` field (`mod.rs`); both producers — the
+  `turn_bridge/mod.rs` runtime-handoff `store(true)` and the legacy `TmuxReady`
+  `store(true)`, keeping the adjacent `register_start(RelayOwnerKind::Watcher)`
+  ledger authority that already drives the gate-timeout defer; the
+  `tui_prompt_relay.rs` dead `publish_tui_direct_watcher_finalize_debt` producer;
+  all revoke sites (`tmux.rs` watcher-finalize `store(false)`, the
+  `turn_bridge/mod.rs` non-delegation CAS plus its `bridge_published_finalize_owed_for_this_turn`
+  tracking var, and the `turn_finalizer.rs` backstop `store(false)`); the residual
+  `swap(false)` observability reads in `tmux_watcher.rs` (the `owed_finalize`
+  event field is dropped); the now-unreachable `LegacyFlagGated`
+  `FreshIdleFinalizeDecision` variant; and the `delegated_finalize_owed` parameter
+  of `finish_restored_watcher_active_turn` (redundant under `normal_completion =
+  true` at both production call sites). The stale-skip kickoff suppression the
+  flag-derived term used to provide is already covered by the live-`has_active_turn`
+  gate, so the finalize path is identical. Nothing here is worker-non-local: the
+  removed flag was a per-handle in-process atomic, and the surviving authority (the
+  per-process actor-owned ledger) is unchanged. No new multinode
+  ownership/singleton/lease assumption.
+- #3078 (status-panel controller — faithful watcher CREATE/ADOPT shadow-parity):
+  completes the create/adopt sub-step PR-4 deferred. `status_panel_controller.rs`
+  gains a **pure** `watcher_create_parity_decision` (a `WatcherCreateDecision`
+  re-derived from the SAME raw inputs the legacy
+  `watcher_should_create_external_input_status_panel` branch reads — no actor
+  round-trip, no ledger read, no IO); `watcher_panel_parity.rs` gains the
+  `assert_watcher_create_parity` shadow check (independent legacy derivation +
+  `debug_assert`/bounded-warn, legacy still executes the real create/adopt IO);
+  `tmux_watcher.rs` adds a single net-zero hook at the deferred-comment seam
+  (production LoC held at the 9598 freeze, generated docs unchanged). The
+  controller stays a **per-process** in-memory actor on `SharedData` (peer of
+  `TurnFinalizer`); the parity decision reads only the watcher's process-local
+  raw inputs and the still-dormant ledger, performs no Discord IO, acquires no
+  lease, and changes no leader/standby ownership. Behaviour-preserving (shadow
+  only). No new multinode ownership/singleton/lease assumption.
+- #3231 (worktree GC 강화 — `storage.worktree_orphan_sweep`): extends the hourly
+  orphan sweep with (A) a GUID-primary resumable keep-set + a runtime naming
+  whitelist that protects manual dev worktrees, and (B) a one-level recursion into
+  the managed root (`worktrees/<repo_name>/`) that the flat 1-depth scan missed,
+  removing terminal dispatch/automation worktrees via the existing
+  `cleanup_managed_worktree` guards (dirty/unmerged skip). **Multinode class:
+  WORKER-LOCAL maintenance job.** It is one of the `services::maintenance::jobs`
+  registered on the dynamic (non-leader) maintenance scheduler (peer of
+  `storage.target_sweep` / `reconcile.zombie_resources`), NOT the leader-only
+  `worker_registry::MaintenanceScheduler` that owns persistent PG-lease state
+  (`voice.turn_link_gc` / `storage.cancel_tombstone_prune`). The sweep reads PG
+  read-only (the active-dispatch + resumable-GUID keep-set), probes the
+  **process-local** tmux server for live AgentDesk panes (fail-closed on query
+  failure), and deletes only directories on the local filesystem under this host's
+  `~/.adk/release/worktrees`. It acquires no lease, owns no durable queue, and
+  asserts no singleton — each node sweeps its OWN worktree root. The keep/discard
+  predicates derive solely from PG rows + this host's tmux + local disk, so the
+  job stays worker-local and introduces no new multinode
+  ownership/singleton/lease assumption. (Caveat for multinode: the keep-set is
+  global PG state but the live-tmux owner check is host-local — a worktree owned by
+  a pane on ANOTHER node would not be protected by THIS node's tmux probe; today
+  each host only provisions worktrees under its own root, so the sweep never sees
+  another node's directories. If worktree roots ever become shared storage, the
+  live-owner check would need to fan out cross-node.)
+- #3037 (backflow hotfile re-point): `tmux_watcher.rs` changed by a **pure import
+  path correction** — the single `global_monitoring_store()` call in the
+  suppressed-placeholder monitor-entry-key snapshot now resolves the function via
+  its canonical service home (`crate::services::monitoring_store::*`) instead of
+  the `crate::server::routes::state::*` compatibility facade (which re-exports the
+  same symbol). The resolved function, the per-node in-memory `MonitoringStore`,
+  and every call argument are **byte-identical**; the store remains
+  **process-local** (one in-memory `Arc<Mutex<MonitoringStore>>` per node, no PG
+  lease, no durable queue, no leader-only side effect). No behavior, ownership,
+  singleton, or lease assumption changes — this is a layering/import fix only.
+- #3037 (thread_reuse backflow relocation): the Postgres/Discord-API thread-map
+  helpers (`get_thread_for_channel_pg`, `get_mapped_thread_for_channel_pg`,
+  `set_thread_for_channel_pg`, `set_thread_for_channel_map_only_pg`,
+  `clear_thread_for_channel_pg`, `try_reuse_thread`, and
+  `validate_channel_thread_maps_on_startup_with_backends`) were moved by a
+  **pure, behavior-preserving relocation** from
+  `server/routes/dispatches/thread_reuse.rs` into the new
+  `services/dispatches/discord_delivery/thread_reuse.rs`; the axum route handlers
+  (`get_card_thread`, `link_dispatch_thread`, `get_pending_dispatch_for_thread`)
+  stay in the route layer and now consume the relocated helpers. `runtime_bootstrap.rs`
+  changed only by re-pointing its startup thread-map validation call from the
+  `crate::server::routes::dispatches::*` facade to the relocated
+  `crate::services::dispatches::discord_delivery::*` home with **byte-identical**
+  arguments. The thread-map state these helpers read/write is the per-card
+  `kanban_cards.channel_thread_map`/`active_thread_id` columns in **shared
+  Postgres** — already authoritative and node-agnostic — and every SQL statement,
+  Discord-API probe, and clear/reuse decision is unchanged. No new multinode
+  ownership, singleton, or lease assumption is introduced; this is a layering/move
+  fix only.

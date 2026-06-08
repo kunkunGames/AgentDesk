@@ -30,9 +30,6 @@ mod placeholder_cleanup;
 mod placeholder_controller;
 mod placeholder_live_events;
 mod placeholder_sweeper;
-// Phase 5.3 of intake-node-routing (issue #2011): standalone JSONL → Discord
-// relay loop spawned by the bridge on cluster-standby nodes (where the tmux
-// watcher's relay path does not fire). Leader keeps using tmux_watcher.
 mod prompt_builder;
 mod queue_io;
 mod queued_placeholders_store;
@@ -41,6 +38,8 @@ mod relay_recovery;
 pub(crate) mod response_sanitizer;
 #[cfg(unix)]
 mod session_relay_sink;
+// #2011 Phase 5.3: standalone JSONL → Discord relay loop spawned by the bridge
+// on cluster-standby nodes (leader keeps using tmux_watcher's relay path).
 #[cfg(unix)]
 mod standby_relay;
 // #1074: landing zone for the future recovery-engine module split
@@ -90,8 +89,11 @@ mod tui_prompt_relay;
 mod tui_task_card;
 mod turn_bridge;
 mod turn_finalizer;
+mod voice_acknowledgement;
 mod voice_background_driver;
 mod voice_barge_in;
+mod voice_config_cache;
+mod voice_id_sequences;
 mod voice_routing;
 #[path = "watchers/lifecycle_decision.rs"]
 mod watcher_lifecycle_decision;
@@ -1064,51 +1066,15 @@ pub(super) struct TmuxWatcherHandle {
     /// Updated by the watcher task loop. If this stops moving while the registry
     /// still has a slot, the slot is stale and must not suppress a new watcher.
     pub(super) last_heartbeat_ts_ms: Arc<std::sync::atomic::AtomicI64>,
-    /// #1452: turn-scoped finalization debt transferred from bridge to watcher.
-    ///
-    /// When the bridge unpauses a live tmux watcher to take over the
-    /// assistant relay it intentionally skips `mailbox_finish_turn` to
-    /// avoid racing with the still-running watcher turn. Without an
-    /// explicit handoff signal the watcher would also skip the
-    /// finalization (its existing `finish_mailbox_on_completion` gate is
-    /// reserved for inflight-restore semantics), leaving the channel
-    /// mailbox `cancel_token` permanently set and blocking subsequent
-    /// `try_start_turn` calls on brand-new turns.
-    ///
-    /// Protocol:
-    ///   * Bridge unpause: `store(true, Ordering::Release)` at the
-    ///     watcher-unpause site (`turn_bridge/mod.rs` `TmuxReady` branch).
-    ///     The store happens BEFORE `paused.store(false, ...)` so a fast
-    ///     watcher cannot reach its terminal swap before we publish —
-    ///     Codex P1 pointed out that storing later (at the delegation
-    ///     decision in `let has_queued_turns = ...`) is racy.
-    ///   * Bridge non-delegation: when the bridge ends up handling the
-    ///     turn itself, it must take the debt back atomically. It tracks
-    ///     a local `bridge_published_finalize_owed_for_this_turn` flag so
-    ///     it can tell apart "we published debt for this turn" from
-    ///     "we never published" — without this distinction, a paused
-    ///     watcher carried over from a prior turn would leave the
-    ///     handle's value unrelated to the current turn (Codex iter 3 P1).
-    ///     If the flag is set, the bridge runs
-    ///     `compare_exchange(true, false, AcqRel, Acquire)`:
-    ///       * `Ok` → bridge revoked unconsumed debt, runs its own
-    ///         `mailbox_finish_turn`.
-    ///       * `Err(false)` → watcher already swapped and finalized; the
-    ///         bridge MUST skip its own `mailbox_finish_turn` to avoid
-    ///         clearing a turn it no longer owns (Codex P2 from review
-    ///         iter 2).
-    ///     If the flag is NOT set (no `TmuxReady` reached, or watcher
-    ///     missing), the bridge always runs `mailbox_finish_turn`.
-    ///   * Watcher: `swap(false, Ordering::AcqRel)` in its turn-end
-    ///     branch. AcqRel guarantees:
-    ///       1. Acquire — every prior bridge write is observed before we
-    ///          decide to call `mailbox_finish_turn`.
-    ///       2. Release+single-consumer — a paused-survivor watcher
-    ///          cannot accidentally clear a future turn's freshly
-    ///          registered cancel token because the swap returns `false`
-    ///          for it.
-    pub(super) mailbox_finalize_owed: Arc<std::sync::atomic::AtomicBool>,
 }
+
+// #3016 phase-5b2: the per-handle `mailbox_finalize_owed: Arc<AtomicBool>` field
+// (#1452 turn-scoped bridge→watcher finalization debt) has been removed. Phase-5b1
+// replaced every finalize-decision consumer of the flag — the watcher's
+// normal-completion finalize now fires on the confirmed-completion / structural
+// signal (`normal_completion = true`), and the bridge-handoff invariant uses the
+// ledger's `register_start(RelayOwnerKind::Watcher)` authority — so the flag was
+// write-only and is now deleted entirely with identical behaviour.
 
 pub(super) const TMUX_WATCHER_STALE_HEARTBEAT_MS: i64 = 60_000;
 
@@ -1412,7 +1378,6 @@ mod tmux_watcher_registry_restore_tests {
             last_heartbeat_ts_ms: Arc::new(
                 std::sync::atomic::AtomicI64::new(tmux_watcher_now_ms()),
             ),
-            mailbox_finalize_owed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

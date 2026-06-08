@@ -272,6 +272,7 @@ src/
 │   ├── agents/
 │   │   ├── mod.rs
 │   │   ├── query.rs
+│   │   ├── serialization.rs
 │   │   └── turn.rs
 │   ├── analytics/
 │   │   ├── api_usage.rs
@@ -398,6 +399,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
 │   │   │   ├── result.rs
+│   │   │   ├── send_to_agent.rs
 │   │   │   └── transport.rs
 │   │   ├── placeholder_live_events/
 │   │   │   ├── common.rs
@@ -536,8 +538,11 @@ src/
 │   │   ├── tui_prompt_relay.rs
 │   │   ├── tui_task_card.rs
 │   │   ├── turn_finalizer.rs
+│   │   ├── voice_acknowledgement.rs
 │   │   ├── voice_background_driver.rs
 │   │   ├── voice_barge_in.rs
+│   │   ├── voice_config_cache.rs
+│   │   ├── voice_id_sequences.rs
 │   │   ├── voice_routing.rs
 │   │   └── watcher_panel_parity.rs
 │   ├── dispatches/
@@ -545,7 +550,9 @@ src/
 │   │   │   ├── guard.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── orchestration.rs
+│   │   │   ├── thread_reuse.rs
 │   │   │   └── transport.rs
+│   │   ├── dtos.rs
 │   │   ├── mod.rs
 │   │   ├── outbox_claiming.rs
 │   │   ├── outbox_queue.rs
@@ -670,6 +677,7 @@ src/
 │   ├── retrospectives.rs
 │   ├── review_decision.rs
 │   ├── service_error.rs
+│   ├── session_activity.rs
 │   ├── session_backend.rs
 │   ├── session_forwarding.rs
 │   ├── settings.rs
