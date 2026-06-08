@@ -548,6 +548,7 @@ src/
 │   │   │   ├── guard.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── orchestration.rs
+│   │   │   ├── thread_reuse.rs
 │   │   │   └── transport.rs
 │   │   ├── mod.rs
 │   │   ├── outbox_claiming.rs
