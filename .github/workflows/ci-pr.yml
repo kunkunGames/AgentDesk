@@ -48,6 +48,8 @@ jobs:
       ci_relax_safe: ${{ contains(github.head_ref || github.ref_name, 'tui-relay-stabilization') }}
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
         with:
           fetch-depth: 0
 
@@ -197,6 +199,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -222,6 +226,8 @@ jobs:
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -288,6 +294,8 @@ jobs:
         os: [windows-latest]
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -360,6 +368,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Mirror fast check result for branch protection
         if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
@@ -384,6 +394,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Mirror targeted test result for branch protection
         if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
@@ -408,6 +420,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Mirror dashboard result for branch protection
         if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
@@ -449,6 +463,8 @@ jobs:
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -513,6 +529,8 @@ jobs:
       PGPASSWORD: postgres
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -549,6 +567,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Mirror high-risk recovery result for branch protection
         if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
@@ -567,6 +587,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -612,6 +634,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Mirror lint result for branch protection
         if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
@@ -632,6 +656,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
       - name: Mirror check_fast_cross_os result for branch protection
         if: ${{ needs.changes.outputs.ci_relax_safe != 'true' }}
@@ -655,6 +681,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
         with:
           fetch-depth: 0
 
@@ -686,6 +714,8 @@ jobs:
       - name: Upload maintainability audit artifact
         if: always()
         uses: actions/upload-artifact@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
         with:
           name: maintainability-audit
           path: target/maintainability-audit.yaml
