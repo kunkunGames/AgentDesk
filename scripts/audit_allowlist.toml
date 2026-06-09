@@ -31,8 +31,6 @@ route_srp_violations = [
 # fail the hard gate because they produce different keys.
 direct_discord_sends = [
   "src/services/discord/commands/model_picker.rs#direct_discord_sends:9cf1f42bcb8abe4f",
-  "src/services/discord/commands/skill.rs#direct_discord_sends:1e8d329a7b6eeefe",
-  "src/services/discord/commands/skill.rs#direct_discord_sends:192ce5dcdad6764f",
   "src/services/discord/commands/text_commands.rs#direct_discord_sends:db5444d305a41f96",
   "src/services/discord/commands/text_commands.rs#direct_discord_sends:e1dff75fe79e7d70",
   "src/services/discord/discord_io.rs#direct_discord_sends:2f398342de1e7cd7",
@@ -51,9 +49,6 @@ direct_discord_sends = [
   # HTTP status / Discord error code into a string on edit failures.
   "src/services/issue_announcements.rs#direct_discord_sends:c953e696eec38deb",
   "src/services/discord/router/intake_gate.rs#direct_discord_sends:0a2beaabe9619b4f",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:403e086784912951",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:360a790ca3e3dbc3",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:7abf8711963b3515",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:2bf7e5b93d0fda6b",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:07b7e52940af8eab",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:1cc530214eb6c5d6",
@@ -61,8 +56,6 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:edafac97f164fd68",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:b4849c24f5cb7d09",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:1c6f6dcd93167903",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:f950efca7abd900a",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:26d4f3ea346a4c7b",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:d2a63e6f1c91c479",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:c4f1e0c4fddb4380",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9b9526b38f0691a8",
