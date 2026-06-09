@@ -273,7 +273,7 @@ jobs:
     # relay-only PRs (src/services/discord/**, tests/e2e/**) skip it and rely
     # on the nightly full macOS/Windows matrix. `ci_relax_safe` still fully
     # relaxes it for the stabilization branch escape hatch.
-    if: needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true' && needs.changes.outputs.ci_relax_safe != 'true'
+    if: needs.changes.outputs.cross_os_rust == 'true' && needs.changes.outputs.ci_relax_safe != 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
