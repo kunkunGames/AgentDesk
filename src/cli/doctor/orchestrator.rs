@@ -2615,11 +2615,12 @@ fn provider_credential_summary(probe: &ProviderRuntimeProbe) -> String {
 }
 
 fn provider_auth_check_command(provider: &ProviderKind, binary_name: &str) -> String {
-    provider
-        .registry_entry()
-        .and_then(|entry| entry.auth.auth_check_argv)
-        .map(|argv| argv.join(" "))
-        .unwrap_or_else(|| format!("{binary_name} auth status"))
+    crate::services::provider_auth::auth_check_hint(
+        provider
+            .registry_entry()
+            .and_then(|entry| entry.auth.auth_check_argv),
+        binary_name,
+    )
 }
 
 fn provider_runtime_evidence(probe: &ProviderRuntimeProbe) -> Value {

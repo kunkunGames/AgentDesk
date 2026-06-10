@@ -29,6 +29,18 @@ impl ProviderCredentialStatus {
     }
 }
 
+/// Operator-facing hint for verifying provider auth. Falls back to env/settings
+/// guidance for CLIs (like qwen-code 0.15+) that removed their auth subcommand.
+pub fn auth_check_hint(auth_check_argv: Option<&[&str]>, binary_name: &str) -> String {
+    auth_check_argv
+        .map(|argv| argv.join(" "))
+        .unwrap_or_else(|| {
+            format!(
+                "{binary_name}: no auth subcommand in current CLI — configure provider env keys/settings or run the interactive /auth flow"
+            )
+        })
+}
+
 pub fn detect_provider_credentials(
     provider_id: &str,
     spec: &ProviderAuthSpec,
@@ -56,6 +68,7 @@ fn detect_provider_file_auth(provider: &str, spec: &ProviderAuthSpec) -> Option<
         "claude" => detect_claude_oauth_source(),
         "codex" => detect_codex_access_token_source(),
         "gemini" => detect_gemini_oauth_source(),
+        "opencode" => detect_opencode_file_auth(),
         "qwen" => detect_qwen_file_auth(spec),
         _ => None,
     }
@@ -128,6 +141,14 @@ fn detect_qwen_file_auth(spec: &ProviderAuthSpec) -> Option<String> {
         return Some(source);
     }
 
+    if let Some(settings_path) = expanded_auth_path("~/.qwen/settings.json") {
+        if let Some(value) = read_json_path(&settings_path) {
+            if let Some(source) = qwen_settings_credential_source(&value, spec.env_keys) {
+                return Some(format!("file:~/.qwen/settings.json {source}"));
+            }
+        }
+    }
+
     spec.credential_paths.iter().copied().find_map(|path| {
         if path.ends_with(".env") {
             detect_env_file_source(path, spec.env_keys)
@@ -135,6 +156,99 @@ fn detect_qwen_file_auth(spec: &ProviderAuthSpec) -> Option<String> {
             None
         }
     })
+}
+
+/// qwen-code stores headless credentials in settings.json: the `env` block is
+/// exported into the CLI process environment, and `modelProviders` entries can
+/// carry inline `apiKey` values or `envKey` references.
+fn qwen_settings_credential_source(value: &serde_json::Value, env_keys: &[&str]) -> Option<String> {
+    if let Some(env_block) = value.get("env").and_then(|env| env.as_object()) {
+        for (key, entry) in env_block {
+            let non_empty = entry.as_str().is_some_and(|raw| !raw.trim().is_empty());
+            if !non_empty {
+                continue;
+            }
+            let recognized = env_keys.iter().any(|expected| expected == key)
+                || key.ends_with("_API_KEY")
+                || key.ends_with("_TOKEN");
+            if recognized {
+                return Some(format!("env.{key}"));
+            }
+        }
+    }
+
+    let providers = value.get("modelProviders")?.as_object()?;
+    for (provider_id, config) in providers {
+        let entries: Vec<&serde_json::Value> = match config {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        for entry in entries {
+            if json_token_present(entry, "apiKey") {
+                return Some(format!("modelProviders.{provider_id}.apiKey"));
+            }
+            if let Some(env_key) = entry.get("envKey").and_then(|key| key.as_str()) {
+                if env_value_present(env_key) {
+                    return Some(format!("modelProviders.{provider_id}.envKey:{env_key}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_opencode_file_auth() -> Option<String> {
+    let auth_store = xdg_base_dir("XDG_DATA_HOME", ".local/share")
+        .map(|base| base.join("opencode").join("auth.json"));
+    if let Some(path) = auth_store {
+        if let Some(value) = read_json_path(&path) {
+            if opencode_auth_store_has_credentials(&value) {
+                return Some("file:~/.local/share/opencode/auth.json".to_string());
+            }
+        }
+    }
+
+    let config_path = xdg_base_dir("XDG_CONFIG_HOME", ".config")
+        .map(|base| base.join("opencode").join("opencode.json"))?;
+    let value = read_json_path(&config_path)?;
+    opencode_config_api_key_source(&value)
+        .map(|source| format!("file:~/.config/opencode/opencode.json {source}"))
+}
+
+/// `opencode auth login` persists credentials as a non-empty JSON object keyed
+/// by provider id.
+fn opencode_auth_store_has_credentials(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|store| !store.is_empty())
+}
+
+/// opencode.json providers may embed `options.apiKey` either as a literal or
+/// as an `{env:VAR}` template that resolves against the process environment.
+fn opencode_config_api_key_source(value: &serde_json::Value) -> Option<String> {
+    let providers = value.get("provider")?.as_object()?;
+    for (provider_id, config) in providers {
+        let Some(api_key) = config
+            .get("options")
+            .and_then(|options| options.get("apiKey"))
+            .and_then(|key| key.as_str())
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        else {
+            continue;
+        };
+        if let Some(env_key) = api_key
+            .strip_prefix("{env:")
+            .and_then(|rest| rest.strip_suffix('}'))
+        {
+            if env_value_present(env_key.trim()) {
+                return Some(format!(
+                    "provider.{provider_id}.options.apiKey env:{env_key}"
+                ));
+            }
+            continue;
+        }
+        return Some(format!("provider.{provider_id}.options.apiKey"));
+    }
+    None
 }
 
 fn detect_json_token_source(path: &str, keys: &[&str]) -> Option<String> {
@@ -240,6 +354,16 @@ fn expanded_auth_path(raw: &str) -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
+fn xdg_base_dir(env_key: &str, home_fallback: &str) -> Option<PathBuf> {
+    if let Ok(base) = std::env::var(env_key) {
+        let base = base.trim();
+        if !base.is_empty() {
+            return Some(PathBuf::from(base));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(home_fallback))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +414,101 @@ mod tests {
         assert_eq!(parse_env_assignment_key("# QWEN_API_KEY=abc"), None);
         assert_eq!(parse_env_assignment_key("QWEN_API_KEY="), None);
         assert_eq!(parse_env_assignment_key("1BAD=abc"), None);
+    }
+
+    #[test]
+    fn opencode_auth_store_requires_non_empty_object() {
+        assert!(opencode_auth_store_has_credentials(&serde_json::json!({
+            "anthropic": { "type": "oauth" }
+        })));
+        assert!(!opencode_auth_store_has_credentials(&serde_json::json!({})));
+        assert!(!opencode_auth_store_has_credentials(&serde_json::json!([])));
+    }
+
+    #[test]
+    fn opencode_config_api_key_source_accepts_literal_and_resolved_env_template() {
+        let _guard = env_guard();
+        let literal = serde_json::json!({
+            "provider": {
+                "nvidia-kimi": { "options": { "apiKey": "secret", "baseURL": "https://x" } }
+            }
+        });
+        assert_eq!(
+            opencode_config_api_key_source(&literal).as_deref(),
+            Some("provider.nvidia-kimi.options.apiKey")
+        );
+
+        let templated = serde_json::json!({
+            "provider": {
+                "custom": { "options": { "apiKey": "{env:AGENTDESK_OPENCODE_TEST_KEY}" } }
+            }
+        });
+        unsafe {
+            std::env::remove_var("AGENTDESK_OPENCODE_TEST_KEY");
+        }
+        assert_eq!(opencode_config_api_key_source(&templated), None);
+        unsafe {
+            std::env::set_var("AGENTDESK_OPENCODE_TEST_KEY", "token");
+        }
+        assert_eq!(
+            opencode_config_api_key_source(&templated).as_deref(),
+            Some("provider.custom.options.apiKey env:AGENTDESK_OPENCODE_TEST_KEY")
+        );
+        unsafe {
+            std::env::remove_var("AGENTDESK_OPENCODE_TEST_KEY");
+        }
+
+        let empty = serde_json::json!({
+            "provider": { "custom": { "options": { "apiKey": "  " } } }
+        });
+        assert_eq!(opencode_config_api_key_source(&empty), None);
+    }
+
+    #[test]
+    fn qwen_settings_credential_source_reads_env_block_and_model_providers() {
+        let _guard = env_guard();
+        let env_block = serde_json::json!({
+            "env": { "NVIDIA_API_KEY": "secret", "EMPTY_API_KEY": "" },
+            "modelProviders": { "openai": [{ "baseUrl": "https://x" }] }
+        });
+        assert_eq!(
+            qwen_settings_credential_source(&env_block, &["DASHSCOPE_API_KEY"]).as_deref(),
+            Some("env.NVIDIA_API_KEY")
+        );
+
+        let provider_api_key = serde_json::json!({
+            "modelProviders": { "openai": [{ "apiKey": "secret" }] }
+        });
+        assert_eq!(
+            qwen_settings_credential_source(&provider_api_key, &[]).as_deref(),
+            Some("modelProviders.openai.apiKey")
+        );
+
+        let provider_env_key = serde_json::json!({
+            "modelProviders": { "openai": { "envKey": "AGENTDESK_QWEN_TEST_KEY" } }
+        });
+        unsafe {
+            std::env::remove_var("AGENTDESK_QWEN_TEST_KEY");
+        }
+        assert_eq!(
+            qwen_settings_credential_source(&provider_env_key, &[]),
+            None
+        );
+        unsafe {
+            std::env::set_var("AGENTDESK_QWEN_TEST_KEY", "token");
+        }
+        assert_eq!(
+            qwen_settings_credential_source(&provider_env_key, &[]).as_deref(),
+            Some("modelProviders.openai.envKey:AGENTDESK_QWEN_TEST_KEY")
+        );
+        unsafe {
+            std::env::remove_var("AGENTDESK_QWEN_TEST_KEY");
+        }
+
+        let unrelated_env = serde_json::json!({
+            "env": { "SOME_FLAG": "1" }
+        });
+        assert_eq!(qwen_settings_credential_source(&unrelated_env, &[]), None);
     }
 
     #[test]
