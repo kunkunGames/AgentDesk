@@ -188,7 +188,7 @@
 | `pipeline` | `src/pipeline.rs` | 1345 | 1314 | 31 | giant-file |
 | `receipt` | `src/receipt.rs` | 1842 | 1842 | 0 | giant-file |
 | `reconcile` | `src/reconcile.rs` | 2723 | 1806 | 917 | giant-file |
-| `runtime_layout` | `src/runtime_layout/mod.rs` | 725 | 698 | 27 |  |
+| `runtime_layout` | `src/runtime_layout/mod.rs` | 773 | 715 | 58 |  |
 | `runtime_layout::config_merge` | `src/runtime_layout/config_merge.rs` | 601 | 601 | 0 |  |
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 | 396 | 0 |  |
 | `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 144 | 110 | 34 |  |
@@ -577,7 +577,7 @@
 | `services::maintenance::jobs::hang_dump_cleanup` | `src/services/maintenance/jobs/hang_dump_cleanup.rs` | 125 | 125 | 0 |  |
 | `services::maintenance::jobs::memento_consolidation` | `src/services/maintenance/jobs/memento_consolidation.rs` | 301 | 301 | 0 |  |
 | `services::maintenance::jobs::target_sweep` | `src/services/maintenance/jobs/target_sweep.rs` | 200 | 200 | 0 |  |
-| `services::maintenance::jobs::worktree_orphan_sweep` | `src/services/maintenance/jobs/worktree_orphan_sweep.rs` | 1831 | 918 | 913 |  |
+| `services::maintenance::jobs::worktree_orphan_sweep` | `src/services/maintenance/jobs/worktree_orphan_sweep.rs` | 1978 | 975 | 1003 |  |
 | `services::mcp_config` | `src/services/mcp_config.rs` | 893 | 793 | 100 |  |
 | `services::memory` | `src/services/memory/mod.rs` | 270 | 270 | 0 |  |
 | `services::memory::local` | `src/services/memory/local.rs` | 30 | 30 | 0 |  |
