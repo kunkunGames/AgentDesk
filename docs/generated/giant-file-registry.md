@@ -28,7 +28,7 @@
 | `src/cli/client.rs` | 2378 |
 | `src/cli/dcserver.rs` | 1611 |
 | `src/cli/direct.rs` | 1778 |
-| `src/cli/doctor/orchestrator.rs` | 4374 |
+| `src/cli/doctor/orchestrator.rs` | 4373 |
 | `src/cli/init.rs` | 1444 |
 | `src/cli/migrate/apply.rs` | 3230 |
 | `src/cli/migrate/plan.rs` | 1513 |
@@ -101,7 +101,7 @@
 | `src/services/onboarding/mod.rs` | 2936 |
 | `src/services/opencode.rs` | 1886 |
 | `src/services/platform/binary_resolver.rs` | 1221 |
-| `src/services/provider.rs` | 1796 |
+| `src/services/provider.rs` | 1818 |
 | `src/services/qwen.rs` | 2196 |
 | `src/services/routines/agent_executor.rs` | 1273 |
 | `src/services/routines/discord_log.rs` | 1344 |

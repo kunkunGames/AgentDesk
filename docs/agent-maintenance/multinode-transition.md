@@ -4,10 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-10 (against #3278 merge-automation tick git-exec
-> fallback cache + bridge-deadline WARN downgrade; cache is tick-local and the
-> step list/order is unchanged, so ownership, singleton, and lease assumptions
-> are unaffected).
+> Last refreshed: 2026-06-10 (against #3278 merge-automation tick git-exec fallback cache + bridge-deadline WARN downgrade; cache is tick-local and step list/order is unchanged, so ownership, singleton, and lease assumptions are unaffected).
 
 ## Read This First
 

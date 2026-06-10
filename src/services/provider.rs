@@ -93,7 +93,14 @@ const CODEX_AUTH_CHECK: &[&str] = &["codex", "auth", "status"];
 const GEMINI_AUTH_PATHS: &[&str] = &["~/.gemini/oauth_creds.json"];
 const GEMINI_AUTH_ENV: &[&str] = &["GEMINI_API_KEY", "GOOGLE_API_KEY"];
 const GEMINI_AUTH_CHECK: &[&str] = &["gemini", "auth", "status"];
-const OPENCODE_AUTH_PATHS: &[&str] = &[];
+// opencode stores `opencode auth login` credentials in the XDG data dir and
+// accepts per-provider apiKey entries in opencode.json; both are observable
+// credential sources (XDG_DATA_HOME/XDG_CONFIG_HOME overrides handled in
+// provider_auth::detect_opencode_file_auth).
+const OPENCODE_AUTH_PATHS: &[&str] = &[
+    "~/.local/share/opencode/auth.json",
+    "~/.config/opencode/opencode.json",
+];
 const OPENCODE_AUTH_ENV: &[&str] = &[
     "OPENCODE_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -102,9 +109,22 @@ const OPENCODE_AUTH_ENV: &[&str] = &[
     "GOOGLE_API_KEY",
 ];
 const OPENCODE_AUTH_CHECK: &[&str] = &["opencode", "auth", "list"];
-const QWEN_AUTH_PATHS: &[&str] = &["~/.qwen/oauth_creds.json", "./.qwen/.env", "./.env"];
-const QWEN_AUTH_ENV: &[&str] = &["DASHSCOPE_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"];
-const QWEN_AUTH_CHECK: &[&str] = &["qwen", "auth", "status"];
+// qwen-code resolves credentials from OAuth (oauth_creds.json), the
+// settings.json `env`/`modelProviders` blocks, and .env files
+// (~/.qwen/.env plus project-relative fallbacks).
+const QWEN_AUTH_PATHS: &[&str] = &[
+    "~/.qwen/oauth_creds.json",
+    "~/.qwen/settings.json",
+    "~/.qwen/.env",
+    "./.qwen/.env",
+    "./.env",
+];
+const QWEN_AUTH_ENV: &[&str] = &[
+    "DASHSCOPE_API_KEY",
+    "QWEN_API_KEY",
+    "OPENAI_API_KEY",
+    "BAILIAN_CODING_PLAN_API_KEY",
+];
 
 const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
     ProviderRegistryEntry {
@@ -251,7 +271,9 @@ const PROVIDER_REGISTRY: &[ProviderRegistryEntry] = &[
         auth: ProviderAuthSpec {
             credential_paths: QWEN_AUTH_PATHS,
             env_keys: QWEN_AUTH_ENV,
-            auth_check_argv: Some(QWEN_AUTH_CHECK),
+            // qwen-code 0.15+ removed the `qwen auth` subcommand; credentials
+            // are configured via the interactive /auth flow or env keys.
+            auth_check_argv: None,
         },
     },
 ];
