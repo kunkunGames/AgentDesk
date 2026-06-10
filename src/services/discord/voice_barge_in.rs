@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::services::provider::ProviderKind;
 use crate::voice::barge_in::{
-    BargeInPlayerStop, BargeInSensitivity, BargeInSensitivityState, DeferredBargeInBuffer,
-    LiveBargeInCut, LiveBargeInMonitor, ProcessingBargeInDecision, run_sensitivity_ttl_reset,
+    BargeInPlayerStop, BargeInSensitivity, DeferredBargeInBuffer, LiveBargeInCut,
+    LiveBargeInMonitor, ProcessingBargeInDecision, run_sensitivity_ttl_reset,
 };
 use crate::voice::commands::{
     DEFAULT_WAKE_WORD, VoiceActiveAgentContext, VoiceCommand, VoiceLobbyRouteDecision,
@@ -43,6 +43,7 @@ use super::voice_background_driver::{
 };
 use super::voice_config_cache::ConfigSnapshotCache;
 use super::voice_id_sequences::VoiceIdSequences;
+use super::voice_sensitivity::SensitivityState;
 pub(in crate::services::discord) const INTERNAL_VOICE_MESSAGE_ID_START: u64 =
     9_000_000_000_000_000_000;
 
@@ -1100,93 +1101,18 @@ fn progress_feedback_channel_id(channel_id: u64, playback_channel_id: Option<u64
     playback_channel_id.unwrap_or(channel_id)
 }
 
-/// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the live barge-in
-/// sensitivity state (#3038 STT/TTS/playback/routing split, sensitivity slice).
-///
-/// Bundles the three sensitivity-related fields that previously lived directly
-/// on `VoiceBargeInRuntime`. Behavior is preserved exactly: the atomic mirror is
-/// always stored *before* the `RwLock` write (F18, #2046), and `current` falls
-/// back to the atomic mirror on `try_read` contention.
-struct SensitivityState {
-    // F18 (#2046): boot-time default. Retained for parity with the original
-    // field layout; never read after construction.
-    #[allow(dead_code)]
-    default_sensitivity: BargeInSensitivity,
-    // F18 (#2046): RwLock try_read 실패 시 default 로 폴백하면 사용자가 설정한
-    // Conservative 가 잠깐 Normal 로 잘못 평가될 수 있다. 최신 값을 lock-free 로
-    // 읽을 수 있도록 atomic mirror 유지.
-    atom: std::sync::atomic::AtomicU8,
-    state: Arc<RwLock<BargeInSensitivityState>>,
-}
-
-impl SensitivityState {
-    fn new(default_sensitivity: BargeInSensitivity, conservative_ttl: Duration) -> Self {
-        Self {
-            default_sensitivity,
-            atom: std::sync::atomic::AtomicU8::new(default_sensitivity.as_u8()),
-            state: Arc::new(RwLock::new(BargeInSensitivityState::new(
-                default_sensitivity,
-                conservative_ttl,
-            ))),
-        }
-    }
-
-    fn disabled() -> Self {
-        let default_sensitivity = BargeInSensitivity::Normal;
-        Self {
-            default_sensitivity,
-            atom: std::sync::atomic::AtomicU8::new(default_sensitivity.as_u8()),
-            state: Arc::new(RwLock::new(BargeInSensitivityState::default())),
-        }
-    }
-
-    /// Clone the shared `RwLock` handle for the TTL reset background task.
-    fn state_handle(&self) -> Arc<RwLock<BargeInSensitivityState>> {
-        self.state.clone()
-    }
-
-    /// F18 (#2046): atomic mirror 를 먼저 갱신해 두면 try_read 충돌 윈도우에서도
-    /// `current` 가 최신 값을 본다.
-    async fn set(&self, sensitivity: BargeInSensitivity) {
-        self.atom.store(sensitivity.as_u8(), Ordering::Relaxed);
-        self.state
-            .write()
-            .await
-            .set_sensitivity(sensitivity, Instant::now());
-    }
-
-    async fn apply_voice_command(&self, transcript: &str) -> Option<BargeInSensitivity> {
-        self.state
-            .write()
-            .await
-            .apply_voice_command(transcript, Instant::now())
-    }
-
-    /// F18 (#2046): try_read 실패 시 boot-time default 가 아닌 가장 최근에
-    /// 설정된 sensitivity 를 반환하도록 atomic mirror 로 폴백한다.
-    fn current(&self) -> BargeInSensitivity {
-        self.state
-            .try_read()
-            .map(|state| state.sensitivity())
-            .unwrap_or_else(|_| BargeInSensitivity::from_u8(self.atom.load(Ordering::Relaxed)))
-    }
-}
-
 /// Cohesive sub-concern of [`VoiceBargeInRuntime`]: the streaming-STT per-user
 /// session bookkeeping (#3038 god-object split, streaming-STT slice).
 ///
-/// Bundles the two `DashMap`s that were previously sibling fields on
-/// `VoiceBargeInRuntime`, both keyed by the same `StreamingSttKey`
-/// (channel/user pair):
-/// - `sessions` holds the in-flight `SttSessionHandle` for each speaker, and
-/// - `feed_tasks` holds the per-key bucket of spawned PCM-feed `JoinHandle`s.
+/// Bundles the two `DashMap`s previously sibling fields on `VoiceBargeInRuntime`,
+/// both keyed by the same `StreamingSttKey` (channel/user pair): `sessions` holds
+/// the in-flight `SttSessionHandle` per speaker, and `feed_tasks` holds the
+/// per-key bucket of spawned PCM-feed `JoinHandle`s.
 ///
-/// The accessors below are intentionally thin: `sessions()` / `feed_tasks()`
-/// hand back `&DashMap<...>` so the existing entry / get / remove call sites
-/// keep their exact `DashMap` semantics — including entry guards held across
-/// `await` during session finalization — and `clear()` wipes both maps in the
-/// same order as the original inline `streaming_stt_sessions.clear();
-/// streaming_stt_feed_tasks.clear();` pair. No locking, ordering, or
+/// The accessors are intentionally thin: `sessions()` / `feed_tasks()` hand back
+/// `&DashMap<...>` so existing entry / get / remove call sites keep exact `DashMap`
+/// semantics — including entry guards held across `await` during finalization — and
+/// `clear()` wipes both maps in the original order. No locking, ordering, or
 /// side-effect sequencing changes relative to the pre-extraction layout.
 struct StreamingSttSessions {
     sessions: dashmap::DashMap<StreamingSttKey, SttSessionHandle>,
@@ -1313,6 +1239,7 @@ impl VoiceBargeInRuntime {
         }
     }
 
+    #[allow(dead_code)] // #3034: test-only runtime constructor; no production caller
     pub(in crate::services::discord) fn disabled() -> Self {
         let (progress_tx, _) = broadcast::channel(128);
         Self {
@@ -1426,6 +1353,7 @@ impl VoiceBargeInRuntime {
         self.enabled
     }
 
+    #[allow(dead_code)] // #3034: test-only mutable-state inspector; no production caller
     pub(in crate::services::discord) async fn runtime_config_snapshot(
         &self,
     ) -> VoiceRuntimeConfigSnapshot {
@@ -2207,6 +2135,7 @@ impl VoiceBargeInRuntime {
         self.update_existing_monitor_sensitivity(sensitivity);
     }
 
+    #[allow(dead_code)] // #3034: test-only voice-command entry point; no production caller
     pub(in crate::services::discord) async fn apply_voice_command(
         &self,
         transcript: &str,
@@ -2219,6 +2148,7 @@ impl VoiceBargeInRuntime {
         Some(sensitivity)
     }
 
+    #[allow(dead_code)] // #3034: test-only playback-reset; prod uses reset_after_playback_start_with_owner
     pub(in crate::services::discord) fn reset_after_playback_start<P>(
         &self,
         channel_id: ChannelId,
@@ -2262,6 +2192,7 @@ impl VoiceBargeInRuntime {
         );
     }
 
+    #[allow(dead_code)] // #3034: test-only playback clear; prod uses clear_playback_if_owner
     pub(in crate::services::discord) fn clear_playback(&self, channel_id: ChannelId) {
         self.playbacks.remove(&channel_id.get());
     }
@@ -2600,13 +2531,12 @@ impl VoiceBargeInRuntime {
 
         // Issue #2335 (c) — Codex round 2: keep the foreground cancel token
         // REGISTERED through every suppressible side effect (synth, play,
-        // background dispatch). Previously the code unregistered right
-        // after `generate_foreground_ack_text` returned, so any cancel
-        // arriving in the window between unregister and the TTS playback /
-        // handoff dispatch could not flip this token — the stale spoken
-        // ack or background handoff would still fire. We use a RAII guard
-        // so the unregister always runs (panics, early returns, etc.) and
-        // re-check the cancel flag at each awaited boundary below.
+        // background dispatch). Previously the code unregistered right after
+        // `generate_foreground_ack_text` returned, so a cancel arriving between
+        // unregister and the TTS playback / handoff dispatch could not flip this
+        // token — the stale ack or handoff would still fire. We use a RAII guard
+        // so unregister always runs (panics, early returns, etc.) and re-check
+        // the cancel flag at each awaited boundary below.
         struct InflightGuard<'a> {
             runtime: &'a VoiceBargeInRuntime,
             channel_id: ChannelId,
@@ -4588,13 +4518,12 @@ impl VoiceReceiveHook for DiscordVoiceBargeInHook {
         // foreground Codex/Claude child kept running to natural exit.
         //
         // Codex review (round 2): perform the foreground-token cancel
-        // SYNCHRONOUSLY here, BEFORE the tokio::spawn that handles the
-        // (async) mailbox cancel. If we deferred it into the spawned task,
-        // a fast foreground call could complete and unregister its token
-        // between the cut detection and the spawn being scheduled, in
-        // which case `cancel_inflight_foreground_calls` would see an
-        // empty registry and the stale reply / ack / handoff would still
-        // proceed after the user explicitly barged in.
+        // SYNCHRONOUSLY here, BEFORE the tokio::spawn that handles the (async)
+        // mailbox cancel. If deferred into the spawned task, a fast foreground
+        // call could complete and unregister its token between cut detection and
+        // the spawn being scheduled, in which case `cancel_inflight_foreground_calls`
+        // would see an empty registry and the stale reply / ack / handoff would
+        // still proceed after the user explicitly barged in.
         let foreground_cancelled = self
             .runtime
             .cancel_inflight_foreground_calls(channel_id, "voice_barge_in_live_cut");

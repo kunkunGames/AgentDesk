@@ -257,6 +257,14 @@
   later merge gates can require the exact tested commit before accepting a phase.
 - Local telemetry capture and cache state: `src/services/memory/memento_throttle.rs:128`,
   `src/services/observability/mod.rs:460`, `src/services/observability/metrics.rs:238`.
+- #3262 Claude auto-compact `/compact` injection trigger state:
+  `src/services/claude_compact_trigger.rs`. The once-per-fill-cycle "armed" latch
+  is a **worker-local** process-global `LazyLock<Mutex<HashMap<channel_id, bool>>>`
+  and the injection drives the node-local tmux pane via
+  `claude_tui::input::send_followup_prompt`. A channel's live tmux session is
+  pinned to a single worker (see `tmux_provider_sessions`), so the per-channel
+  latch never needs cross-node coordination; a worker restart simply re-arms the
+  channel (re-injecting at most one redundant `/compact` is harmless and idle-gated).
 
 ## Required Invariants
 
@@ -556,3 +564,40 @@
   Discord-API probe, and clear/reuse decision is unchanged. No new multinode
   ownership, singleton, or lease assumption is introduced; this is a layering/move
   fix only.
+- #3248 (deploy-survivable relay, gap-1): `recovery_engine.rs` changed by adding
+  `reseed_watcher_owned_finalizer_ledger` and calling it from the two success
+  paths of `reregister_active_turn_from_inflight` (the pane-alive reattach run by
+  recovery after a mid-turn dcserver restart). The new call re-seeds the
+  **in-process** single-authority finalizer ledger (`turn_finalizer` actor) with
+  the watcher-owned `register_start` that the in-memory ledger lost on restart, so
+  the watcher's gate-timeout arms its backstop instead of finalizing-as-orphan.
+  The finalizer ledger is **worker-local** (a per-process in-memory map owned by
+  the watcher/recovery on the SAME node that holds the live tmux pane) — it owns
+  no leader-only side effect, no durable queue, and no PG lease — so re-seeding it
+  introduces no new multinode ownership/singleton/lease assumption. The register
+  is idempotent vs. a later bridge handoff and only ever seeds a full-identity
+  Watcher entry (id-0 guarded); the normal non-restart path is unaffected.
+- #3256 (incremental operator-prose relay): `tui_prompt_relay.rs` changed so the
+  Claude external-input idle path STREAMS the operator's prose THROUGH a single
+  bridge turn (`stream_tui_idle_response_through_bridge` +
+  `forward_idle_stream_into_bridge`) instead of pre-collecting the whole response
+  and posting one batched `[Text{full}, Done]` at turn end. The transcript
+  reader, the bridge `(tx, rx)`, the intake placeholder, and `spawn_turn_bridge`
+  are all **worker-local** — they run on the SAME node that holds the live tmux
+  pane, exactly as the prior collect-then-send path did; the change only moves
+  WHEN frames reach the in-process bridge (live vs. batched), not WHO owns the
+  relay. The single-card / single-`spawn_turn_bridge` per-turn invariant and the
+  exactly-once bridge finalize (terminal `Done`, "first wins") are preserved. The
+  `committed_relay_offset` clamp (read-side dedupe) and the runtime-binding
+  offset advance on success (write-side ledger) are unchanged — no new multinode
+  ownership, singleton, or lease assumption is introduced. Classification:
+  **worker-local relay path**.
+- #3263 (Codex context-window fallback): `provider.rs` changed by adding a
+  **pure** max-of-cache fallback to Codex context-window resolution
+  (`codex_context_window_from_cache`: exact slug → max-of-cache on slug drift →
+  documented `CODEX_FALLBACK_CONTEXT_WINDOW` last-resort), documenting each
+  provider's hardcoded `default_context_window` intent, and a unit-test module.
+  The resolver is a **worker-local** read of the local CLI cache
+  (`~/.codex/models_cache.json`) on the node that owns the session — it owns no
+  global state, no durable queue, and no lease, and touches no PG-lease/leader
+  path. No new multinode ownership, singleton, or lease assumption is introduced.

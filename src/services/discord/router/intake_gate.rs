@@ -411,6 +411,7 @@ async fn add_queue_pending_reaction_self_healing(
 /// large Read / slow LLM stream can legitimately go silent for minutes.
 /// `thread_guard_should_force_clean_stale_thread` adds the required
 /// secondary signal (watcher snapshot's `desynced == true`).
+#[allow(dead_code)] // #3034: #1446 Layer-2 classifier pinned by the intake-gate unit tests.
 pub(super) fn thread_guard_inflight_is_stale(
     provider: &ProviderKind,
     thread_id: serenity::ChannelId,
@@ -3036,6 +3037,7 @@ mod thread_guard_stale_pure_tests {
             tmux_session: Some("stale-proof-tmux".to_string()),
             tmux_alive: tmux_session_alive,
             watcher_attached: attached,
+            watcher_attached_stale: false,
             watcher_owner_channel_id: attached.then_some(channel_id),
             watcher_owns_live_relay: false,
             bridge_inflight_present: true,

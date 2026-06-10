@@ -22,8 +22,6 @@
 //! reason to the user surface (Discord) and for applying the no-output
 //! timeout independently — see [`wait_with_no_output_timeout`] below.
 
-#![allow(dead_code)]
-
 use std::io::Read;
 use std::process::Child;
 use std::sync::mpsc;
@@ -48,16 +46,6 @@ pub enum GuardDecision {
     /// Command matches a known dangerous pattern. The caller must refuse to
     /// execute it and surface `reason` plus `suggestion` to the user.
     Block { reason: String, suggestion: String },
-}
-
-impl GuardDecision {
-    pub fn is_allow(&self) -> bool {
-        matches!(self, GuardDecision::Allow)
-    }
-
-    pub fn is_block(&self) -> bool {
-        matches!(self, GuardDecision::Block { .. })
-    }
 }
 
 /// Inspect a single shell command string and decide whether to allow it.

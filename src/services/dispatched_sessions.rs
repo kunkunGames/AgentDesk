@@ -1,3 +1,4 @@
+use crate::app_state::AppState;
 use crate::db::dispatched_sessions as dispatched_sessions_db;
 use crate::db::session_agent_resolution::{
     normalize_thread_channel_id, parse_thread_channel_id_from_session_key,
@@ -6,7 +7,6 @@ use crate::db::session_agent_resolution::{
 use crate::db::session_status::{
     is_live_status, is_user_wait_status, normalize_incoming_session_status,
 };
-use crate::server::routes::AppState;
 use crate::services::provider::ProviderKind;
 use crate::services::turn_lifecycle::{TurnLifecycleTarget, force_kill_turn};
 use axum::{
@@ -130,13 +130,13 @@ async fn hook_session_pg(
             {
                 Ok(Some(payload)) => {
                     if is_new_session {
-                        crate::server::ws::emit_event(
+                        crate::eventbus::emit_event(
                             &state.broadcast_tx,
                             "dispatched_session_new",
                             payload,
                         );
                     } else {
-                        crate::server::ws::emit_batched_event(
+                        crate::eventbus::emit_batched_event(
                             &state.batch_buffer,
                             "dispatched_session_update",
                             &body.session_key,
@@ -161,7 +161,7 @@ async fn hook_session_pg(
                 .await
                 {
                     Ok(Some(agent)) => {
-                        crate::server::ws::emit_batched_event(
+                        crate::eventbus::emit_batched_event(
                             &state.batch_buffer,
                             "agent_status",
                             aid,
@@ -191,9 +191,9 @@ fn spawn_auto_queue_activate_for_agent(state: AppState, agent_id: String) {
     tokio::spawn(async move {
         // Let the session/dispatch cleanup commit before queue activation probes.
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        let _ = crate::server::routes::auto_queue::activate(
+        let _ = crate::services::auto_queue::route::activate(
             State(state),
-            Json(crate::server::routes::auto_queue::ActivateBody {
+            Json(crate::services::auto_queue::route::ActivateBody {
                 run_id: None,
                 repo: None,
                 agent_id: Some(agent_id),
@@ -375,7 +375,7 @@ pub async fn delete_session(
         {
             Ok(result) => {
                 if let Some(session_id) = result.session_id {
-                    crate::server::ws::emit_event(
+                    crate::eventbus::emit_event(
                         &state.broadcast_tx,
                         "dispatched_session_disconnect",
                         json!({"id": session_id.to_string()}),
@@ -556,7 +556,7 @@ pub async fn update_dispatched_session(
             Ok(_) => {
                 match dispatched_sessions_db::load_session_update_payload_pg(pool, id).await {
                     Ok(Some(session)) => {
-                        crate::server::ws::emit_batched_event(
+                        crate::eventbus::emit_batched_event(
                             &state.batch_buffer,
                             "dispatched_session_update",
                             &id.to_string(),
@@ -593,20 +593,6 @@ pub struct ForceKillOptions {
     /// Human-readable reason for the kill (e.g. "idle timeout", "slot reclaim").
     #[serde(default)]
     pub reason: Option<String>,
-}
-
-pub(crate) async fn force_kill_session_impl(
-    state: &AppState,
-    session_key: &str,
-    retry: bool,
-) -> (StatusCode, Json<serde_json::Value>) {
-    force_kill_session_impl_with_reason(
-        state,
-        session_key,
-        retry,
-        "force-kill API 직접 호출 (호출자 미상)",
-    )
-    .await
 }
 
 pub(crate) async fn force_kill_session_impl_with_reason(

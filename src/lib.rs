@@ -104,7 +104,13 @@ mod engine;
 // Error-code helpers are kept for API response boundaries that only some
 // routes currently surface.
 mod error;
+// In-process broadcast event bus shared by the WS server layer and background
+// services; lives at crate root to avoid a service→server backflow (#3037).
+mod eventbus;
 mod github;
+// Shared HTTP route handler state; lives at crate root (below server+services)
+// so service-layer handlers reference it without a service→server backflow (#3037).
+mod app_state;
 pub(crate) mod kanban;
 mod launch;
 mod logging;
@@ -121,7 +127,10 @@ pub(crate) mod runtime_layout;
 mod server;
 // Service modules contain provider, Discord, maintenance, and observability
 // feature surfaces that are enabled by runtime config rather than all targets.
-#[allow(dead_code)]
+// #3034: the crate-wide dead_code blanket has been lowered into `services::mod`
+// as per-submodule scoped allows, so the lint is now live on the ~37 clean
+// service submodules. The remaining dirty submodules each carry a scoped allow
+// (with a residual count) to be retired subtree-by-subtree.
 mod services;
 // Supervisor test hooks are intentionally retained for dispatch/runtime tests.
 pub(crate) mod supervisor;

@@ -92,9 +92,9 @@
   - `src/dispatch/dispatch_context.rs` (2805 lines).
   - `src/dispatch/dispatch_create.rs` (1381 lines).
   - `src/dispatch/dispatch_status.rs` (1511 lines).
-  - `src/services/dispatches/outbox_route.rs` (1118 lines; route extraction
+  - `src/services/dispatches/outbox_route.rs` (1089 lines; route extraction
     orchestration surface from #1722, split before adding non-bugfix behavior).
-  - `src/services/dispatches/discord_delivery/orchestration.rs` (1652 lines;
+  - `src/services/dispatches/discord_delivery/orchestration.rs` (1490 lines;
     delivery orchestration surface extracted from the route layer in #1760,
     split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.
@@ -113,11 +113,11 @@
   parsing), `src/services/discord/inflight.rs` (state file contract).
 - legacy_modules: none — relay routes are being consolidated, not replaced.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/services/discord/watchers/lifecycle.rs` (2335 lines — canonical
+  - `src/services/discord/watchers/lifecycle.rs` (2332 lines — canonical
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior; #3016 phase-5b2 dropped the `mailbox_finalize_owed`
     construction from the watcher-spawn handle).
-  - `src/services/discord/tmux.rs` (2242 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2012 lines after #2558 dead-code sweep;
     +4 from #3167: the monitor-auto-turn start passes `ActiveTurnKind::Background`
     so a queued user message can supersede the low-priority monitor/loop turn;
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
@@ -131,7 +131,7 @@
     finalizer actor's `CommitDelivery`/`ReleaseDelivery` handlers are DORMANT
     (retained for a later phase, not the live watcher path after the R2 revert);
     still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (9598 lines after #2558
+  - `src/services/discord/tmux_watcher.rs` (9581 lines after #2558
     dead-code sweep; #3016 phase-5b2 removed the `mailbox_finalize_owed`
     swap reads, the watcher-fn flag params, and the `LegacyFlagGated`
     decision variant; #1520 watcher loop extraction + #2427 D/A
@@ -410,7 +410,13 @@
     flag-independent; EMPTY `Unknown` DEFERS — the codex HIGH regression case that the
     prior 5b1 build finalized prematurely) +
     `fresh_idle_unknown_keeps_wrong_turn_race_guards`.
-  - `src/services/discord/tui_prompt_relay.rs` (5120 lines; #3016 phase-5b2
+    #3262 (-16): the watcher-completed status-panel context-usage backfill block
+    is extracted into `adk_session::backfill_completed_panel_usage_and_maybe_inject_compact`
+    (a single call now replaces the inline `set_context_panel_usage` block). The
+    helper additionally fires the claude-only AgentDesk-side `/compact` injection
+    when live usage crosses `context_compact_percent_claude` (Claude Code ignores
+    `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`); see `src/services/claude_compact_trigger.rs`.
+  - `src/services/discord/tui_prompt_relay.rs` (5438 lines; #3016 phase-5b2
     removed the dead `publish_tui_direct_watcher_finalize_debt` producer;
     SSH-direct TUI
     prompt notification plus Codex rollout response relay surface, bugfix only
@@ -546,7 +552,22 @@
     (`None`). The committed-offset clamp still dedupes against watcher delivery,
     so the relayed window is exactly `[turn_start_offset, EOF)` — no byte skip,
     no prior-turn re-relay (RED→GREEN test: stale-high fallback skips the turn
-    under the old scan, explicit anchor relays it whole).
+    under the old scan, explicit anchor relays it whole); +294 from #3256: the
+    Claude external-input idle path now STREAMS prose THROUGH a single bridge
+    turn instead of pre-collecting the whole response and posting one batched
+    `[Text{full}, Done]` at turn end. `run_claude_idle_response_tail` spawns the
+    transcript reader on a blocking thread, buffers leading frames until the
+    first content frame (empty-turn → original no-card path preserved), then
+    `stream_tui_idle_response_through_bridge` sends EXACTLY ONE intake
+    placeholder + ONE `spawn_turn_bridge` and `forward_idle_stream_into_bridge`
+    forwards each reader `StreamMessage` (Text/ToolUse/OutputOffset/Done) into
+    the same bridge `tx` LIVE so a LONG continuous turn relays prose
+    progressively within that one card; leading TUI chrome is stripped from the
+    FIRST Text frame and a fallback `Done` is appended only if the reader closed
+    without one (bridge finalizes EXACTLY ONCE, "first wins"). The committed
+    runtime-binding offset still advances on successful delivery and the
+    start-offset clamp to `committed_relay_offset` is untouched (no double-send).
+    The Codex idle path (`relay_tui_idle_response_through_bridge`) is unchanged.
   - `src/services/discord/idle_recap.rs` (1319 prod lines; idle-recap card
     compose/post/clear surface, registered giant-file (#3036) — bugfix only
     outside an extraction plan. Crossed 1000 prod LoC with #3146 Part 1: the
@@ -554,7 +575,7 @@
     mailbox/inflight probe, and the `post_recheck_action` seam that skips/undoes
     a recap post when a turn raced the compose window. Split compose vs
     lifecycle/clear submodules before adding behavior).
-  - `src/services/codex_tmux_wrapper.rs` (1222 lines; Codex tmux wrapper JSON
+  - `src/services/codex_tmux_wrapper.rs` (1215 lines; Codex tmux wrapper JSON
     event parser and relay bridge for native Codex session events — bugfix only
     outside an extraction plan).
   - `src/services/tui_prompt_dedupe.rs` (1294 lines; shared TUI prompt
@@ -576,7 +597,7 @@
     atomic read, closing the present/generation TOCTOU) plus its dedicated accessor unit
     test; the watcher-snapshot no-clobber regression test is retained, rewritten to take
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`).
-  - `src/services/discord/recovery_engine.rs` (4034 lines; #3016 phase-5b2
+  - `src/services/discord/recovery_engine.rs` (4090 lines; #3016 phase-5b2
     dropped the `mailbox_finalize_owed` construction from the three recovery
     watcher-spawn handles; +9 from #3166
     fetching real context thresholds for the recovered-turn status panel; +36 from #3099
@@ -589,16 +610,21 @@
     still executes the Discord IO, so behaviour is unchanged); +4 from #3017
     routing the recovery terminal through the single-authority finalizer
     (`submit_terminal` + `FinalizeContext::monitor`) instead of inline
-    `mailbox_finish_turn`).
-  - `src/services/discord/health.rs` (2293 lines after #3038 send-to-agent
-    dispatch extraction to `outbound/send_to_agent.rs`; previously 2369 after
-    #1879 snapshot/mailbox extraction and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2655 lines; health recovery
+    `mailbox_finish_turn`; +60 from #3248 gap-1 adding
+    `reseed_watcher_owned_finalizer_ledger` + two guarded reattach call-sites that
+    re-register the watcher-owned turn in the post-restart finalizer ledger so a
+    mid-turn deploy's live pane auto-reconciles without a new user turn).
+  - `src/services/discord/health.rs` (2240 lines after #3034 dead-code sweep
+    removed `notify_http_clone`/`send_message`/`parse_send_body`; previously
+    2292 after #3038 send-to-agent dispatch extraction to
+    `outbound/send_to_agent.rs`, #1879 snapshot/mailbox extraction, and #3082
+    answer-flush-barrier field).
+  - `src/services/discord/health/recovery.rs` (2645 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests; +88
     from #3169 stall-watchdog jsonl-mtime liveness guard + tests, closing the
     Death #1 force-clean false-positive on loop mid-write sessions).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3809 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3808 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -610,7 +636,8 @@
   - `src/services/discord/router/message_handler/headless_turn.rs` (1316 lines;
     headless Discord turn launch/terminal-response path split from the router
     message handler; bugfix only outside a further extraction plan).
-  - `src/services/discord/meeting_orchestrator.rs` (3227 lines).
+  - `src/services/discord/meeting_orchestrator.rs` (3222 lines after #3034
+    dead-code sweep removed `is_meeting_channel`).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1545 lines; provider
     stop-token/tmux binding runtime + PID-exit observation helper (#2426),
     split before adding non-bugfix behavior. #3169: added the
@@ -624,7 +651,7 @@
     first inline `#[cfg(test)] mod` block over-extended the block to EOF, so
     most of the production code was mislabeled test and the file reported only
     626 prod LoC. Hotfile — bugfix only outside the #3016/#3028 decompose plan).
-  - `src/services/discord/turn_bridge/completion_guard.rs` (1849 lines).
+  - `src/services/discord/turn_bridge/completion_guard.rs` (1834 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1545 lines).
   - `src/services/discord/turn_bridge/terminal_delivery.rs` (504 prod lines;
     no longer a giant-file after the #3028 splitter fix corrected its inline
@@ -638,7 +665,11 @@
     monitor turn-key/ledger-generation logic; tracked decompose target — see
     `giant-file-registry.md` (owner `discord-finalizer`, deadline 2026-08-31,
     issue #3016). Bugfix only outside a finalizer-decomposition plan).
-  - `src/services/discord/formatting.rs` (2802 lines; +46 from #3082
+  - `src/services/discord/formatting.rs` (2802 lines; net +0 from #3034 scoped
+    dead-code allows on the `MonitorHandoffReason::InlineTimeout` /
+    `MonitorHandoffStatus::Failed` reserved variants — the two added `#[allow]`
+    lines were offset by collapsing the adjacent reason comments back to inline
+    form, so the file stays at its frozen baseline; +46 from #3082
     answer-flush-barrier guards (+11 around the plain multi-chunk send loops;
     +24 from the #3082 codex follow-up that also guards the edit/replace path
     `replace_long_message_raw_with_outcome` and bumps `note_progress` after each
@@ -669,8 +700,14 @@
     are net-zero. The poise framework-builder/setup closure (~580 lines) is left
     inline — its move-captured locals make a clean extraction risky and is
     deferred).
-  - `src/services/discord/session_runtime.rs` (1781 lines).
-  - `src/services/discord/voice_barge_in.rs` (4728 lines; voice STT/TTS,
+  - `src/services/discord/session_runtime.rs` (1753 lines).
+  - `src/services/discord/voice_barge_in.rs` (4657 lines; net +0 from #3034
+    scoped dead-code allows on the test-only runtime API
+    (`disabled` / `runtime_config_snapshot` / `apply_voice_command` /
+    `reset_after_playback_start` / `clear_playback`) — the five added `#[allow]`
+    lines were offset by collapsing their reason comments to inline form and
+    rewrapping adjacent doc comments, so the file stays at its frozen baseline;
+    voice STT/TTS,
     lobby routing, progress mirroring, and barge-in orchestration surface;
     tracked decompose target — see `giant-file-registry.md` (owner
     `voice-runtime`, deadline 2026-08-31, #3036)).
@@ -738,8 +775,8 @@
     `resolve_requesting_agent_id_with_pg` auth/identity helpers to
     `crate::services::kanban`).
   - `src/server/routes/docs.rs` (5880 lines).
-  - `src/server/routes/escalation.rs` (1456 lines).
-  - `src/server/routes/meetings.rs` (1686 lines).
+  - `src/server/routes/escalation.rs` (1376 lines).
+  - `src/server/routes/meetings.rs` (1675 lines).
   - `src/server/routes/review_verdict/decision_route.rs` (4377 lines).
   - `src/server/routes/{agents,agents_crud,agents_setup,v1,resume}.rs` (all
     1000+ production lines). (`dispatches/thread_reuse.rs` dropped below the
@@ -768,7 +805,7 @@
   - `src/cli/migrate.rs` is the retired postgres-cutover facade (now below the
     giant-file threshold; bugfix only).
   - `src/cli/doctor/orchestrator.rs` (4374 lines).
-  - `src/cli/migrate/apply.rs` (3146 lines).
+  - `src/cli/migrate/apply.rs` (3230 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
     dcserver.rs (1560)}`.
@@ -855,38 +892,43 @@ The remaining giant-file modules under `src/services/` not covered above.
 Line counts are *production* LoC (the `Prod` column in `module-inventory.md`,
 which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync.
 
-- `src/services/auto_queue.rs` (1626) and
+- `src/services/auto_queue.rs` (1546) and
   `src/services/auto_queue/activate_command.rs` (1354); auto-queue route
   behavior is split across `src/services/auto_queue/*` slices, with
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
 - `src/services/onboarding/mod.rs` (2936),
-  `src/services/dispatched_sessions.rs` (1342), and
+  `src/services/dispatched_sessions.rs` (1328), and
   `src/services/settings.rs` (1007) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`
   and `src/services/api_friction.rs` have been removed/decomposed.)
-- `src/services/dispatches/outbox_route.rs` (1118) — dispatch outbox route
+- `src/services/dispatches/outbox_route.rs` (1089) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
-- `src/services/claude.rs` (3949), `src/services/gemini.rs` (1416),
-  `src/services/qwen.rs` (2200), `src/services/codex.rs` (3083),
-  `src/services/opencode.rs` (1886), `src/services/provider.rs` (1739) —
-  provider adapters.
-- `src/services/codex_tui/rollout_tail.rs` (1738) — Codex TUI rollout tail
+- `src/services/claude.rs` (3938), `src/services/gemini.rs` (1358),
+  `src/services/qwen.rs` (2196), `src/services/codex.rs` (3001),
+  `src/services/opencode.rs` (1886), `src/services/provider.rs` (1796) —
+  provider adapters. (#3034 removed dead non-cancel `execute_command_simple*`
+  twins from the claude/codex/gemini adapters and a superseded
+  `select_counterpart_from` from provider. #3263 added the Codex max-of-cache
+  context-window fallback (now cache-first for both `Some(model)` and the
+  provider-default `None` path — constant only on absent/unusable cache),
+  documented per-provider context-window intent, and a
+  `codex_context_window_from_cache` unit-test module.)
+- `src/services/codex_tui/rollout_tail.rs` (1639) — Codex TUI rollout tail
   parsing and resume identity surface; split before adding non-bugfix behavior
   beyond the #2169 session identity fix.
-- `src/services/codex_tui/input.rs` (1492) — Codex TUI input readiness
+- `src/services/codex_tui/input.rs` (1350) — Codex TUI input readiness
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
   non-bugfix behavior beyond the readiness/cancel contract.
-- `src/services/claude_tui/input.rs` (1296) — Claude TUI input readiness
+- `src/services/claude_tui/input.rs` (1294) — Claude TUI input readiness
   detector, prompt delivery, and cancellation/offset handoff surface. Treat as
   giant-file territory; split before adding non-bugfix behavior beyond the
   readiness/cancel contract.
 - `src/services/memory/memento.rs` (1893).
-- `src/services/observability/pg_io.rs` (1047).
-- `src/services/dispatched_sessions.rs` (1342) — dispatched session domain
+- `src/services/dispatched_sessions.rs` (1328) — dispatched session domain
   service. This is the post-#1515 SRP extraction target for route/database
   callsites, but the module itself is now giant-file territory; split focused
   helpers before adding non-bugfix behavior. (+5 from #3169 exposing the idle-
@@ -896,11 +938,11 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   the route layer in #1519. Keep follow-up changes bugfix-only unless the file
   is split further.
 - `src/services/routines/{store.rs (2844), migrated.rs (1286),
-  discord_log.rs (1353), agent_executor.rs (1044)}` — durable routine storage,
+  discord_log.rs (1344), agent_executor.rs (1044)}` — durable routine storage,
   migrated launchd validation, Discord notification plumbing, and agent
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
-- `src/services/platform/binary_resolver.rs` (1246).
+- `src/services/platform/binary_resolver.rs` (1221).
 - `src/services/discord/mod.rs` (4465; +34 from #3019 added the
   single-authority `increment_global_active` helper + doc mirroring the
   existing decrement helper — offset by removing 6 inline raw `fetch_add`
@@ -910,8 +952,8 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `restore_owner_channel_for_tmux_session`/`clear_restored_owner_for_tmux_session`
   so a live thread-suffixed TUI session with no live watcher slot can be
   re-registered authoritatively instead of dropped forever),
-  `src/services/discord_config_audit.rs` (1318).
-- `src/services/turn_orchestrator.rs` (3091).
+  `src/services/discord_config_audit.rs` (1273).
+- `src/services/turn_orchestrator.rs` (3087).
 
 Decomposed below the giant-file threshold (no longer frozen; bugfix-scoped but
 normal test growth is allowed): `src/services/analytics.rs`,

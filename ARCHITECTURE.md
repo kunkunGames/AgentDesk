@@ -289,7 +289,6 @@ src/
 │   │   ├── patterns.rs
 │   │   └── storage.rs
 │   ├── auto_queue/
-│   │   ├── activate_bridge.rs
 │   │   ├── activate_command.rs
 │   │   ├── activate_preflight.rs
 │   │   ├── activate_route.rs
@@ -437,7 +436,6 @@ src/
 │   │   │   │   ├── turn_lifecycle.rs
 │   │   │   │   └── watchdog.rs
 │   │   │   ├── authorization.rs
-│   │   │   ├── control_intent.rs
 │   │   │   ├── dispatch_trigger.rs
 │   │   │   ├── intake_gate.rs
 │   │   │   ├── message_handler.rs
@@ -464,7 +462,8 @@ src/
 │   │   │   ├── stale_resume.rs
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tmux_runtime.rs
-│   │   │   └── turn_analytics.rs
+│   │   │   ├── turn_analytics.rs
+│   │   │   └── watcher_handoff.rs
 │   │   ├── watchers/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
@@ -543,6 +542,7 @@ src/
 │   │   ├── voice_config_cache.rs
 │   │   ├── voice_id_sequences.rs
 │   │   ├── voice_routing.rs
+│   │   ├── voice_sensitivity.rs
 │   │   └── watcher_panel_parity.rs
 │   ├── dispatches/
 │   │   ├── discord_delivery/
@@ -640,6 +640,7 @@ src/
 │   ├── automation_candidate_contract.rs
 │   ├── automation_candidate_materializer.rs
 │   ├── claude.rs
+│   ├── claude_compact_trigger.rs
 │   ├── codex.rs
 │   ├── codex_remote_policy.rs
 │   ├── codex_tmux_wrapper.rs
@@ -650,6 +651,7 @@ src/
 │   ├── dispatched_sessions.rs
 │   ├── dispatches_followup.rs
 │   ├── envelope_dedup.rs
+│   ├── escalation_settings.rs
 │   ├── gemini.rs
 │   ├── issue_announcements.rs
 │   ├── kanban.rs
@@ -732,10 +734,12 @@ src/
 │   ├── stt_streaming.rs
 │   ├── turn_link.rs
 │   └── utils.rs
+├── app_state.rs
 ├── bootstrap.rs
 ├── config.rs
 ├── credential.rs
 ├── error.rs
+├── eventbus.rs
 ├── high_risk_recovery.rs
 ├── launch.rs
 ├── lib.rs
@@ -773,10 +777,12 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/ui/` | Compatibility shims for persisted UI/session types used by the Discord runtime. |
 | `src/utils/` | Shared formatting and Unicode-safe string utilities. |
 | `src/voice/` | Voice command, STT/TTS, prompt, progress, metrics, receiver, and barge-in helpers. |
+| `src/app_state.rs` | Shared HTTP route-handler state (`AppState`); lives at crate root below server+services so service-layer handlers reference it without a service→server backflow. |
 | `src/bootstrap.rs` | Builds config, database, policy engine, and shared app state before launch. |
 | `src/config.rs` | `agentdesk.yaml` parsing, configuration defaults, and shared test env helpers. |
 | `src/credential.rs` | Reads runtime credential files such as Discord bot tokens from the AgentDesk root. |
 | `src/error.rs` | Shared HTTP and policy error type with typed codes and JSON response helpers. |
+| `src/eventbus.rs` | In-process broadcast event bus (history/replay/batching) shared by the WS server layer and background services without a service→server backflow. |
 | `src/high_risk_recovery.rs` | PG-only high-risk recovery tests for boot reconciliation and review refire paths. |
 | `src/launch.rs` | Starts the Tokio runtime and hands off to server boot. |
 | `src/lib.rs` | Library crate boundary that exposes the server/CLI modules for the slim binary entry point and tests. |
