@@ -21,10 +21,12 @@ const FOLLOWUP_PROMPT_READY_EVENT_BUDGET: Duration = Duration::from_secs(5);
 /// Brief settle delay between hook arrival and the post-event snapshot check
 /// so the TUI has time to redraw the prompt marker after Stop.
 const PROMPT_READY_POST_EVENT_SETTLE: Duration = Duration::from_millis(50);
+const PROMPT_READY_INTERSTITIAL_SETTLE: Duration = Duration::from_millis(500);
 const PROMPT_SUBMIT_INITIAL_SETTLE: Duration = Duration::from_millis(120);
 const PROMPT_SUBMIT_RETRY_SETTLE: Duration = Duration::from_millis(350);
 const PROMPT_SUBMIT_CONFIRM_RETRIES: usize = 2;
 const PROMPT_READY_TIMEOUT_ERROR_PREFIX: &str = "timeout waiting for claude tui";
+const PROMPT_READY_USAGE_LIMIT_ERROR_PREFIX: &str = "claude tui usage limit reached";
 pub const PROMPT_READY_CANCELLED_ERROR: &str = "claude tui prompt readiness wait cancelled";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +170,10 @@ pub fn send_prompt(
 
 pub fn is_prompt_ready_timeout_error(error: &str) -> bool {
     error.starts_with(PROMPT_READY_TIMEOUT_ERROR_PREFIX)
+}
+
+pub fn is_prompt_ready_usage_limit_error(error: &str) -> bool {
+    error.starts_with(PROMPT_READY_USAGE_LIMIT_ERROR_PREFIX)
 }
 
 pub fn is_prompt_ready_cancelled_error(error: &str) -> bool {
@@ -773,6 +779,8 @@ fn wait_for_prompt_ready_polling(
     transcript_path: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let mut wait_interval = Duration::from_millis(100);
+    let mut resume_confirmation_submitted = false;
+    let mut rate_limit_choice_submitted = false;
     loop {
         check_prompt_cancel(cancel_token)?;
         if transcript_idle_confirms_prompt_ready_without_capture(session_name, transcript_path) {
@@ -786,6 +794,47 @@ fn wait_for_prompt_ready_polling(
         }
         let snapshot = prompt_readiness_snapshot(session_name);
         check_prompt_cancel(cancel_token)?;
+        if !resume_confirmation_submitted && snapshot_resume_confirmation_detected(&snapshot) {
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "claude_tui stale-session resume confirmation detected; accepting recommended summary resume"
+            );
+            run_actions(session_name, &[TuiInputAction::Enter], cancel_token)?;
+            resume_confirmation_submitted = true;
+            std::thread::sleep(PROMPT_READY_INTERSTITIAL_SETTLE);
+            continue;
+        }
+        if !rate_limit_choice_submitted && snapshot_rate_limit_choice_detected(&snapshot) {
+            tracing::info!(
+                tmux_session_name = session_name,
+                readiness = readiness.label(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "claude_tui rate-limit choice detected; accepting first option"
+            );
+            crate::services::claude::debug_log_to(
+                "claude_tui.log",
+                &format!(
+                    "prompt readiness rate-limit choice accepted session={} readiness={} pane_tail:\n{}",
+                    session_name,
+                    readiness.label(),
+                    snapshot.pane_tail
+                ),
+            );
+            run_actions(session_name, &[TuiInputAction::Enter], cancel_token)?;
+            rate_limit_choice_submitted = true;
+            std::thread::sleep(PROMPT_READY_INTERSTITIAL_SETTLE);
+            continue;
+        }
+        if snapshot_usage_limit_detected(&snapshot) {
+            log_prompt_ready_usage_limit(session_name, readiness, &snapshot);
+            return Err(format!(
+                "{PROMPT_READY_USAGE_LIMIT_ERROR_PREFIX} before {} prompt input readiness; {}",
+                readiness.label(),
+                usage_limit_summary(&snapshot.pane_tail)
+            ));
+        }
         if prompt_marker_confirms_prompt_ready(&snapshot) {
             return Ok(());
         }
@@ -824,6 +873,27 @@ fn pane_looks_ready_for_prompt(pane: &str) -> bool {
 
 fn prompt_marker_confirms_prompt_ready(snapshot: &PromptReadinessSnapshot) -> bool {
     snapshot.prompt_marker_detected && !snapshot.prompt_draft_detected
+}
+
+fn snapshot_resume_confirmation_detected(snapshot: &PromptReadinessSnapshot) -> bool {
+    snapshot.capture_available
+        && crate::services::tmux_common::tmux_capture_indicates_claude_tui_resume_confirmation(
+            &snapshot.pane_tail,
+        )
+}
+
+fn snapshot_usage_limit_detected(snapshot: &PromptReadinessSnapshot) -> bool {
+    snapshot.capture_available
+        && crate::services::tmux_common::tmux_capture_indicates_claude_tui_usage_limit(
+            &snapshot.pane_tail,
+        )
+}
+
+fn snapshot_rate_limit_choice_detected(snapshot: &PromptReadinessSnapshot) -> bool {
+    snapshot.capture_available
+        && crate::services::tmux_common::tmux_capture_indicates_claude_tui_rate_limit_choice(
+            &snapshot.pane_tail,
+        )
 }
 
 fn transcript_idle_confirms_prompt_ready_without_capture(
@@ -886,6 +956,50 @@ fn log_prompt_ready_timeout(
             snapshot.prompt_marker_detected,
             snapshot.prompt_draft_detected,
             snapshot.tmux_pane_alive && !snapshot.prompt_marker_detected,
+            snapshot.tmux_pane_alive,
+            snapshot.capture_available,
+            snapshot.pane_tail
+        ),
+    );
+}
+
+fn usage_limit_summary(pane_tail: &str) -> String {
+    pane_tail
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("you've hit your") && lower.contains("limit")
+                || lower.contains("you have hit your") && lower.contains("limit")
+        })
+        .filter(|line| !line.is_empty())
+        .unwrap_or("Claude TUI reported a usage or session limit")
+        .to_string()
+}
+
+fn log_prompt_ready_usage_limit(
+    session_name: &str,
+    readiness: PromptReadinessKind,
+    snapshot: &PromptReadinessSnapshot,
+) {
+    tracing::warn!(
+        tmux_session_name = session_name,
+        readiness = readiness.label(),
+        prompt_marker_detected = snapshot.prompt_marker_detected,
+        prompt_draft_detected = snapshot.prompt_draft_detected,
+        tmux_pane_alive = snapshot.tmux_pane_alive,
+        capture_available = snapshot.capture_available,
+        pane_tail = %snapshot.pane_tail,
+        "claude_tui prompt readiness blocked by usage limit"
+    );
+    crate::services::claude::debug_log_to(
+        "claude_tui.log",
+        &format!(
+            "prompt readiness usage limit session={} readiness={} prompt_marker_detected={} prompt_draft_detected={} tmux_pane_alive={} capture_available={} pane_tail:\n{}",
+            session_name,
+            readiness.label(),
+            snapshot.prompt_marker_detected,
+            snapshot.prompt_draft_detected,
             snapshot.tmux_pane_alive,
             snapshot.capture_available,
             snapshot.pane_tail

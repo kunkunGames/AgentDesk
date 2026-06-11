@@ -68,7 +68,7 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
     });
     let idle_footer = lines.iter().any(|line| {
         let line = trim_prompt_line(line);
-        line.contains("Tools: 0 done") || line.contains("bypass permissions")
+        line.contains("bypass permissions")
     });
     separator && idle_footer
 }
@@ -114,6 +114,50 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
 
 pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
     tmux_capture_claude_tui_prompt_draft_backspace_budget(capture).is_some()
+}
+
+pub(crate) fn tmux_capture_indicates_claude_tui_resume_confirmation(capture: &str) -> bool {
+    let normalized = capture.to_ascii_lowercase();
+    normalized.contains("resuming the full session will consume a substantial portion")
+        && normalized.contains("resume from summary")
+        && normalized.contains("enter to confirm")
+}
+
+pub(crate) fn tmux_capture_indicates_claude_tui_rate_limit_choice(capture: &str) -> bool {
+    let normalized = capture.to_ascii_lowercase();
+    if tmux_capture_indicates_claude_tui_resume_confirmation(capture) {
+        return false;
+    }
+    let limit_context = normalized.contains("rate limit")
+        || normalized.contains("usage limit")
+        || normalized.contains("session limit");
+    let continuation_option = normalized.contains("continue")
+        || normalized.contains("switch")
+        || normalized.contains("fall back")
+        || normalized.contains("fallback")
+        || normalized.contains("use ")
+        || normalized.contains("resume");
+    let selected_first_option = capture.lines().any(|line| {
+        let line = trim_prompt_line(line);
+        line.starts_with("❯ 1.") || line.starts_with("> 1.")
+    });
+    limit_context
+        && continuation_option
+        && selected_first_option
+        && normalized.contains("enter to confirm")
+}
+
+pub(crate) fn tmux_capture_indicates_claude_tui_usage_limit(capture: &str) -> bool {
+    if tmux_capture_indicates_claude_tui_rate_limit_choice(capture) {
+        return false;
+    }
+    let normalized = capture.to_ascii_lowercase();
+    normalized.contains("you've hit your session limit")
+        || normalized.contains("you have hit your session limit")
+        || (normalized.contains("you've hit your usage limit")
+            && normalized.contains("increase your usage limit"))
+        || (normalized.contains("you have hit your usage limit")
+            && normalized.contains("increase your usage limit"))
 }
 
 pub(crate) fn tmux_capture_indicates_claude_tui_idle_suggestion(capture: &str) -> bool {
@@ -875,6 +919,88 @@ assistant output
 
         assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
         assert!(tmux_capture_indicates_claude_tui_idle_suggestion(capture));
+    }
+
+    #[test]
+    fn claude_resume_confirmation_is_detected_as_interstitial() {
+        let capture = "\
+참고:
+  - 캐시는 남겨뒀습니다.
+
+✻ Baked for 5m 24s
+
+────────────────────────────────────────────────────────────────────────────────
+  This session is 1d 3h old and 141.7k tokens.
+
+  Resuming the full session will consume a substantial portion of your usage
+  limits. We recommend resuming from a summary.
+
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+
+  Enter to confirm · Esc to cancel";
+
+        assert!(tmux_capture_indicates_claude_tui_resume_confirmation(
+            capture
+        ));
+        assert!(tmux_capture_indicates_claude_tui_prompt_draft(capture));
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+    }
+
+    #[test]
+    fn claude_usage_limit_is_detected_as_interstitial() {
+        let capture = "\
+⏺ Monitor event
+  ⎿  You've hit your session limit · resets 12:50pm (Asia/Seoul)
+     /upgrade to increase your usage limit.
+
+● How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss";
+
+        assert!(tmux_capture_indicates_claude_tui_usage_limit(capture));
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+    }
+
+    #[test]
+    fn claude_rate_limit_choice_is_detected_as_acceptable_interstitial() {
+        let capture = "\
+✻ Baked for 1m 12s
+
+────────────────────────────────────────────────────────────────────────────────
+  You've hit your usage limit for the current model.
+  You can continue with the fallback model until the limit resets.
+
+  ❯ 1. Continue with fallback model
+    2. Wait until reset
+
+  Enter to confirm · Esc to cancel";
+
+        assert!(tmux_capture_indicates_claude_tui_rate_limit_choice(capture));
+        assert!(!tmux_capture_indicates_claude_tui_usage_limit(capture));
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+    }
+
+    #[test]
+    fn claude_resume_confirmation_is_not_rate_limit_choice() {
+        let capture = "\
+  This session is 1d 3h old and 141.7k tokens.
+
+  Resuming the full session will consume a substantial portion of your usage
+  limits. We recommend resuming from a summary.
+
+  ❯ 1. Resume from summary (recommended)
+    2. Resume full session as-is
+    3. Don't ask me again
+
+  Enter to confirm · Esc to cancel";
+
+        assert!(tmux_capture_indicates_claude_tui_resume_confirmation(
+            capture
+        ));
+        assert!(!tmux_capture_indicates_claude_tui_rate_limit_choice(
+            capture
+        ));
     }
 }
 
