@@ -240,9 +240,7 @@ fn opencode_config_api_key_source(value: &serde_json::Value) -> Option<String> {
             .and_then(|rest| rest.strip_suffix('}'))
         {
             if env_value_present(env_key.trim()) {
-                return Some(format!(
-                    "provider.{provider_id}.options.apiKey env:{env_key}"
-                ));
+                return Some(format!("provider.{provider_id}.options.apiKey env:{env_key}"));
             }
             continue;
         }
@@ -490,10 +488,7 @@ mod tests {
         unsafe {
             std::env::remove_var("AGENTDESK_QWEN_TEST_KEY");
         }
-        assert_eq!(
-            qwen_settings_credential_source(&provider_env_key, &[]),
-            None
-        );
+        assert_eq!(qwen_settings_credential_source(&provider_env_key, &[]), None);
         unsafe {
             std::env::set_var("AGENTDESK_QWEN_TEST_KEY", "token");
         }
