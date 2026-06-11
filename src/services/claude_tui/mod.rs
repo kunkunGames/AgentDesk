@@ -3,5 +3,6 @@ pub mod hook_relay;
 pub mod hook_server;
 pub mod input;
 pub mod session;
+pub(crate) mod startup_dialog;
 pub mod transcript_tail;
 pub mod tui_relay;
