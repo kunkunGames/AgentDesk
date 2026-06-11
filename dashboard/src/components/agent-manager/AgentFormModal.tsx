@@ -107,7 +107,7 @@ export default function AgentFormModal({
       <form
         role="dialog"
         aria-modal="true"
-        aria-label={isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
+        aria-labelledby="agent-form-title"
         onSubmit={handleSave}
         className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6"
         style={{
@@ -121,7 +121,7 @@ export default function AgentFormModal({
       >
         {/* Modal header */}
         <div className="flex items-center justify-between mb-5">
-          <h3 className="text-base font-bold" style={{ color: "var(--th-text-heading)" }}>
+          <h3 id="agent-form-title" className="text-base font-bold" style={{ color: "var(--th-text-heading)" }}>
             {isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
           </h3>
           <SurfaceActionButton onClick={onClose} tone="neutral" compact className="h-11 w-11" style={{ padding: 0 }} aria-label={tr("닫기", "Close")}>
