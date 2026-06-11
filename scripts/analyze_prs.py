@@ -26,7 +26,7 @@ def head_commit_timestamp(pr):
     return parse_github_timestamp(timestamp)
 
 print("Fetching PRs...")
-prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid")
+prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
 
 if gh_code != 0 or not prs_json:
     print("Warning: `gh` CLI not available or failed. Skipping PR analysis.")
@@ -67,7 +67,11 @@ for pr in prs:
                 if len(files_data["files"]) > 0:
                     print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
                 else:
-                    print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
+                    body_lower = pr.get("body", "").lower()
+                    if "#" not in body_lower and "pr " not in body_lower and "jules/" not in body_lower:
+                        print(f"  [!] INCOMPLETE NO-CHANGE PR: No changed files, but body fails to list exact overlapping PR numbers or branches.")
+                    else:
+                        print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
         except Exception:
             pass
 
