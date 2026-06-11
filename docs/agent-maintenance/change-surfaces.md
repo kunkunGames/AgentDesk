@@ -770,19 +770,21 @@
     `finalize_stale_streaming_footer` / `text_ends_with_streaming_footer` shared
     terminal-idle reconciliation helpers + their unit tests).
   - `src/services/discord/prompt_builder/` (directory, refactored).
-  - `src/services/discord/runtime_bootstrap.rs` (524 production lines after
-    #3038 run_bot S0/S3; characterization tests pin the startup-doctor barrier,
+  - `src/services/discord/runtime_bootstrap.rs` (369 production lines after
+    #3038 run_bot S0/S4; characterization tests pin the startup-doctor barrier,
     restored settings filters, queued-placeholder filtering/deletion, and
     gateway intents, then the low-risk clusters moved verbatim into
     `runtime_bootstrap/`: `restored_state.rs` (124), `queued_placeholders.rs`
     (193), `startup_doctor.rs` (156), `orphan_recovery.rs` (337),
     `session_gc.rs` (102 prod / 69 test), `framework_setup.rs` (287),
     `spawns.rs` (218), `recovery_flush.rs` (356), `voice.rs` (140),
-    `gateway_lease.rs` (187), `shutdown.rs` (203), and `intake.rs` (63).
+    `gateway_lease.rs` (187), `shutdown.rs` (203), `intake.rs` (63), and —
+    once the SharedData S1-S3 slices merged — `shared_data.rs` (176, the
+    `run_bot_build_shared_data` builder plus its side-effect-order doc).
     The namespace is capped at 700 prod lines per child module in
     `audit_maintainability_config.toml`; the root is no longer a prod giant and
-    was removed from `giant_file_registry.toml`, while S4
-    (`run_bot_build_shared_data`) stays gated on the SharedData slice).
+    was removed from `giant_file_registry.toml`; only the S5 accounting
+    cleanup slice remains).
   - `src/services/discord/session_runtime.rs` (1753 lines).
   - `src/services/discord/voice_barge_in.rs` (4657 lines; net +0 from #3034
     scoped dead-code allows on the test-only runtime API
@@ -1046,7 +1048,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
 - `src/services/platform/binary_resolver.rs` (1221).
-- `src/services/discord/mod.rs` (4980; +34 from #3019 added the
+- `src/services/discord/mod.rs` (4965; +34 from #3019 added the
   single-authority `increment_global_active` helper + doc mirroring the
   existing decrement helper — offset by removing 6 inline raw `fetch_add`
   blocks across the relay turn-start sites that now route through it; +12 from
@@ -1064,7 +1066,10 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   root, no baseline raise; -7 from #3038 S2 lifting cluster D — the eight
   session-override fields — into `shared_state::SessionOverrideState`, leaving
   a single `overrides: SessionOverrideState` group field on `SharedData` with
-  the type re-exported for surface freeze),
+  the type re-exported for surface freeze; -15 from #3038 S3 lifting cluster E
+  — the thirteen restart-lifecycle fields — into
+  `shared_state::RestartLifecycle`, leaving a single `restart: RestartLifecycle`
+  group field on `SharedData` with the type re-exported for surface freeze),
   `src/services/discord_config_audit.rs` (1273).
 - `src/services/turn_orchestrator.rs` (3089; +3 from #3293 declaring the
   `registry_purge` child module — the non-creating `peek` lookup and the

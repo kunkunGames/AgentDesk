@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-11 (against #3038 run_bot S2/S3 runtime_bootstrap directory split).
+> Last refreshed: 2026-06-12 (against #3038 run_bot S4 shared-data builder move).
 
 ## Read This First
 
@@ -383,6 +383,36 @@
 
 ### Audited touches
 
+- #3038 run_bot S4: `run_bot_build_shared_data` (and its side-effect-order
+  doc comment) moved verbatim from `runtime_bootstrap.rs` into
+  `runtime_bootstrap/shared_data.rs`, unblocked by the merged SharedData
+  S1-S3 slices. This is a **behavior-preserving module split**: the builder
+  body is token-identical apart from the documented `super::` →
+  `crate::services::discord::` path substitutions (8) and the `pub(super)`
+  visibility needed by the root re-import; the `run_bot` body, the builder's
+  side-effecting initializer order (`load_queue_exit_placeholder_clears` ↔
+  `load_generation` ↔ `TurnFinalizer::spawn` ↔ `StatusPanelController::spawn`
+  ↔ `broadcast::channel`), and the standby-before-lease call order are
+  unchanged. Worker-local module move only: no multinode ownership,
+  singleton, or lease assumption changes.
+- #3038 SharedData S3: `runtime_bootstrap.rs` gained restart-lifecycle
+  characterization tests that pin the deferred-restart marker quick-exit path
+  (`run_bot_spawn_deferred_restart_poller`) and the
+  `shutdown_counted`/`shutdown_remaining` exactly-once protocol through the
+  `run_bot_build_shared_data` injection seam, observed via the test's own
+  handle on the injected counter. The thirteen restart-lifecycle fields are
+  now initialized through the `RestartLifecycle` group literal wrapped at the
+  first member's original position (member expressions byte-identical; the
+  three trailing members hoisted above the actor-spawn calls are
+  side-effect-free, so every side-effecting initializer keeps its relative
+  order). `run_bot` body changes are two single-token field-path renames (one
+  comment, one tracing argument); the SIGTERM handler, poller, and
+  gateway-lease/recovery helpers received the same mechanical
+  `shared.<field>` → `shared.restart.<field>` substitution with no
+  statement, ordering, or lock-span changes. The process-global
+  `global_active`/`global_finalizing`/`shutdown_remaining` counters remain
+  injected `Arc` handles (no flattening), so worker-local state grouping
+  only: no multinode ownership, singleton, or lease assumption changes.
 - #3038 SharedData S2: `runtime_bootstrap.rs` changed only inside
   `run_bot_build_shared_data` — the eight session-override fields are now
   initialized through the `SessionOverrideState` group literal wrapped at the
