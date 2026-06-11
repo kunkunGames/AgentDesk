@@ -198,6 +198,15 @@ src/
 │   │   │   ├── ops.rs
 │   │   │   └── reviews.rs
 │   │   ├── review_verdict/
+│   │   │   ├── decision_route/
+│   │   │   │   ├── accept.rs
+│   │   │   │   ├── adapters.rs
+│   │   │   │   ├── dismiss_finalize.rs
+│   │   │   │   ├── dispute.rs
+│   │   │   │   ├── pending.rs
+│   │   │   │   ├── repo_card.rs
+│   │   │   │   ├── repo_dispatch.rs
+│   │   │   │   └── worktree_stale.rs
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── review_state_repo.rs
@@ -326,9 +335,12 @@ src/
 │   │   ├── hook_bundle.rs
 │   │   ├── hook_relay.rs
 │   │   ├── hook_server.rs
+│   │   ├── hook_server_memento_tests.rs
 │   │   ├── input.rs
+│   │   ├── memento_feedback.rs
 │   │   ├── mod.rs
 │   │   ├── session.rs
+│   │   ├── startup_dialog.rs
 │   │   ├── transcript_tail.rs
 │   │   └── tui_relay.rs
 │   ├── cluster/
@@ -383,12 +395,20 @@ src/
 │   │   │   ├── tui_passthrough.rs
 │   │   │   └── voice.rs
 │   │   ├── health/
+│   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
+│   │   │   ├── manual_delivery.rs
 │   │   │   ├── provider_probe.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── redaction.rs
+│   │   │   ├── runtime_resolve.rs
+│   │   │   ├── send_api.rs
+│   │   │   ├── send_gate.rs
+│   │   │   ├── send_target.rs
 │   │   │   ├── session_enrichment.rs
 │   │   │   └── snapshot.rs
+│   │   ├── inflight/
+│   │   │   └── budget.rs
 │   │   ├── outbound/
 │   │   │   ├── confirmation.rs
 │   │   │   ├── decision.rs
@@ -422,6 +442,7 @@ src/
 │   │   │   └── section_dedupe.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── mod.rs
+│   │   │   ├── restart.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
 │   │   │   ├── message_handler/
@@ -443,12 +464,38 @@ src/
 │   │   │   ├── response_format.rs
 │   │   │   ├── thread_binding.rs
 │   │   │   └── turn_start.rs
+│   │   ├── runtime_bootstrap/
+│   │   │   ├── framework_setup.rs
+│   │   │   ├── gateway_lease.rs
+│   │   │   ├── intake.rs
+│   │   │   ├── orphan_recovery.rs
+│   │   │   ├── queued_placeholders.rs
+│   │   │   ├── recovery_flush.rs
+│   │   │   ├── restored_state.rs
+│   │   │   ├── session_gc.rs
+│   │   │   ├── shutdown.rs
+│   │   │   ├── spawns.rs
+│   │   │   ├── startup_doctor.rs
+│   │   │   └── voice.rs
 │   │   ├── settings/
 │   │   │   ├── content.rs
 │   │   │   ├── memory.rs
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
+│   │   ├── tmux_watcher/
+│   │   │   ├── commit_decisions.rs
+│   │   │   ├── completion_gate.rs
+│   │   │   ├── completion_gate_tests.rs
+│   │   │   ├── liveness.rs
+│   │   │   ├── panel_decisions.rs
+│   │   │   ├── prompt_observe.rs
+│   │   │   ├── turn_identity.rs
+│   │   │   └── turn_identity_tests.rs
+│   │   ├── tui_direct_abort_marker/
+│   │   │   ├── deferred_claim.rs
+│   │   │   ├── mod.rs
+│   │   │   └── store.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
@@ -464,6 +511,8 @@ src/
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
 │   │   │   └── watcher_handoff.rs
+│   │   ├── turn_finalizer/
+│   │   │   └── cleanup.rs
 │   │   ├── watchers/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
@@ -479,6 +528,7 @@ src/
 │   │   ├── idle_detector.rs
 │   │   ├── idle_recap.rs
 │   │   ├── idle_recap_interaction.rs
+│   │   ├── idle_relay_drift.rs
 │   │   ├── inflight.rs
 │   │   ├── inflight_heartbeat_sweeper.rs
 │   │   ├── internal_api.rs
@@ -499,6 +549,7 @@ src/
 │   │   ├── placeholder_sweeper.rs
 │   │   ├── queue_io.rs
 │   │   ├── queued_placeholders_store.rs
+│   │   ├── reaction_cleanup.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_recovery.rs
@@ -515,6 +566,7 @@ src/
 │   │   ├── settings.rs
 │   │   ├── shadow_parity_warn.rs
 │   │   ├── shared_memory.rs
+│   │   ├── shared_state.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
 │   │   ├── status_panel_controller.rs
@@ -634,6 +686,8 @@ src/
 │   │   └── store.rs
 │   ├── slo/
 │   │   └── mod.rs
+│   ├── turn_orchestrator/
+│   │   └── registry_purge.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
 │   ├── auto_queue.rs

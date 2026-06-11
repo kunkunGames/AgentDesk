@@ -20,11 +20,11 @@ use crate::services::provider::{
 use crate::services::provider_hosting::ProviderSessionDriver;
 use crate::services::remote::RemoteProfile;
 use crate::services::session_backend::{
-    StreamLineState, emit_status_events_from_stream_json, insert_process_session,
+    ReadHarvestStats, StreamLineState, emit_status_events_from_stream_json, insert_process_session,
     observe_stream_context, parse_assistant_extra_tool_uses, parse_stream_message_with_state,
     process_session_is_alive, process_session_pid, process_session_probe,
-    read_output_file_until_result, remove_process_session, send_process_session_input,
-    terminate_process_handle,
+    read_output_file_until_result, read_output_file_until_result_with_harvest,
+    remove_process_session, send_process_session_input, terminate_process_handle,
 };
 #[cfg(unix)]
 use crate::services::tmux_diagnostics::{
@@ -237,205 +237,6 @@ fn log_producer_exit(
         line_count,
         extra
     );
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
-pub struct ClaudeResponse {
-    pub success: bool,
-    pub response: Option<String>,
-    #[allow(dead_code)]
-    pub session_id: Option<String>,
-    pub error: Option<String>,
-}
-
-/// Execute a command using Claude CLI
-#[allow(dead_code)]
-pub fn execute_command(
-    prompt: &str,
-    session_id: Option<&str>,
-    working_dir: &str,
-    _allowed_tools: Option<&[String]>,
-) -> ClaudeResponse {
-    let session_selection =
-        crate::services::provider_hosting::resolve_provider_session_selection_with_capability(
-            &ProviderKind::Claude,
-            false,
-        );
-    session_selection.log_start("claude.execute_command");
-
-    // Tool whitelist policy deprecated (#794): Claude CLI is invoked without
-    // `--allowed-tools` so all currently-available tools are exposed. The
-    // `_allowed_tools` parameter is kept for ABI stability with existing call sites.
-    let mut args = vec![
-        "-p".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "--output-format".to_string(),
-        "json".to_string(),
-        "--append-system-prompt".to_string(),
-        r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
-
-SECURITY RULES (MUST FOLLOW):
-- NEVER execute destructive commands like rm -rf, format, mkfs, dd, etc.
-- NEVER modify system files in /etc, /sys, /proc, /boot
-- NEVER access or modify files outside the current working directory without explicit user path
-- NEVER execute commands that could harm the system or compromise security
-- ONLY suggest safe file operations: copy, move, rename, create directory, view, edit
-- If a request seems dangerous, explain the risk and suggest a safer alternative
-
-BASH EXECUTION RULES (MUST FOLLOW):
-- All commands MUST run non-interactively without user input
-- Use -y, --yes, or --non-interactive flags (e.g., apt install -y, npm init -y)
-- Use -m flag for commit messages (e.g., git commit -m "message")
-- Disable pagers with --no-pager or pipe to cat (e.g., git --no-pager log)
-- NEVER use commands that open editors (vim, nano, etc.)
-- NEVER use commands that wait for stdin without arguments
-- NEVER use interactive flags like -i
-
-IMPORTANT: Format your responses using Markdown for better readability:
-- Use **bold** for important terms or commands
-- Use `code` for file paths, commands, and technical terms
-- Use bullet lists (- item) for multiple items
-- Use numbered lists (1. item) for sequential steps
-- Use code blocks (```language) for multi-line code or command examples
-- Use headers (## Title) to organize longer responses
-- Keep formatting minimal and terminal-friendly"#.to_string(),
-    ];
-    append_claude_mcp_config_arg(&mut args, None);
-
-    // Resume session if available
-    if let Some(sid) = session_id {
-        if !is_valid_session_id(sid) {
-            return ClaudeResponse {
-                success: false,
-                response: None,
-                session_id: None,
-                error: Some("Invalid session ID format".to_string()),
-            };
-        }
-        args.push("--resume".to_string());
-        args.push(sid.to_string());
-    }
-
-    let resolution = resolve_claude_binary();
-    let claude_bin = match resolution.resolved_path.clone() {
-        Some(path) => path,
-        None => {
-            return ClaudeResponse {
-                success: false,
-                response: None,
-                session_id: None,
-                error: Some("Claude CLI not found. Is Claude CLI installed?".to_string()),
-            };
-        }
-    };
-
-    let mut bootstrap = Command::new(&claude_bin);
-    crate::services::platform::apply_binary_resolution(&mut bootstrap, &resolution);
-    let mut child = match bootstrap
-        .args(&args)
-        .current_dir(working_dir)
-        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
-        .env("BASH_DEFAULT_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
-        .env("BASH_MAX_TIMEOUT_MS", "86400000") // 24 hours (no practical timeout)
-        .env_remove("CLAUDECODE") // Allow running from within Claude Code sessions
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            return ClaudeResponse {
-                success: false,
-                response: None,
-                session_id: None,
-                error: Some(format!(
-                    "Failed to start Claude: {}. Is Claude CLI installed?",
-                    e
-                )),
-            };
-        }
-    };
-
-    // Write prompt to stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(prompt.as_bytes());
-    }
-
-    // Wait for output
-    match child.wait_with_output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                parse_claude_output(&stdout)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                ClaudeResponse {
-                    success: false,
-                    response: None,
-                    session_id: None,
-                    error: Some(if stderr.is_empty() {
-                        format!("Process exited with code {:?}", output.status.code())
-                    } else {
-                        stderr
-                    }),
-                }
-            }
-        }
-        Err(e) => ClaudeResponse {
-            success: false,
-            response: None,
-            session_id: None,
-            error: Some(format!("Failed to read output: {}", e)),
-        },
-    }
-}
-
-/// Parse Claude CLI JSON output
-#[cfg_attr(not(test), allow(dead_code))]
-fn parse_claude_output(output: &str) -> ClaudeResponse {
-    let mut session_id: Option<String> = None;
-    let mut response_text = String::new();
-
-    for line in output.trim().lines() {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
-            // Extract session ID
-            if let Some(sid) = json.get("session_id").and_then(|v| v.as_str()) {
-                session_id = Some(sid.to_string());
-            }
-
-            // Extract response text
-            if let Some(result) = json.get("result").and_then(|v| v.as_str()) {
-                response_text = result.to_string();
-            } else if let Some(message) = json.get("message").and_then(|v| v.as_str()) {
-                response_text = message.to_string();
-            } else if let Some(content) = json.get("content").and_then(|v| v.as_str()) {
-                response_text = content.to_string();
-            }
-        } else if !line.trim().is_empty() && !line.starts_with('{') {
-            response_text.push_str(line);
-            response_text.push('\n');
-        }
-    }
-
-    // If no structured response, use raw output
-    if response_text.is_empty() {
-        response_text = output.trim().to_string();
-    }
-
-    ClaudeResponse {
-        success: true,
-        response: Some(response_text.trim().to_string()),
-        session_id,
-        error: None,
-    }
-}
-
-/// Check if platform supports local AI CLI execution.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn is_ai_supported() -> bool {
-    cfg!(any(unix, windows))
 }
 
 /// Execute a simple Claude CLI call with `--print` flag (no tools, text-only response).
@@ -936,6 +737,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 return execute_streaming_local_tmux(
                     &args,
                     prompt,
+                    session_id,
                     working_dir,
                     sender,
                     cancel_token,
@@ -1591,6 +1393,61 @@ fn classify_followup_result(
     }
 }
 
+/// Stable string tag for producer-exit / zero-harvest observability (#3281).
+#[cfg(unix)]
+fn read_output_result_kind(read_result: &ReadOutputResult) -> &'static str {
+    match read_result {
+        ReadOutputResult::Completed { .. } => "completed",
+        ReadOutputResult::SessionDied { .. } => "session_died",
+        ReadOutputResult::Cancelled { .. } => "cancelled",
+    }
+}
+
+/// #3281: a DELIVERED TUI turn that `Completed` without forwarding a single
+/// parsed `StreamMessage` harvested nothing from its transcript window — the
+/// turn's response text never entered the bridge. `Cancelled` is excluded:
+/// `classify_followup_result` maps it to `Delivered` too, and a cancelled turn
+/// legitimately forwards nothing.
+#[cfg(unix)]
+fn tui_delivered_zero_harvest(read_result: &ReadOutputResult, harvest: &ReadHarvestStats) -> bool {
+    matches!(read_result, ReadOutputResult::Completed { .. }) && harvest.forwarded_messages == 0
+}
+
+/// #3281 health signal: one observability event per zero-harvest delivered TUI
+/// turn, so the residual loss window (e.g. a fallback start offset pointing
+/// past the response bytes) is measured in production instead of inferred.
+#[cfg(unix)]
+fn emit_claude_tui_zero_harvest(
+    kind: &str,
+    report_channel_id: Option<u64>,
+    tmux_session_name: &str,
+    transcript_path: &str,
+    start_offset: u64,
+    transcript_len: u64,
+) {
+    tracing::warn!(
+        tmux_session_name,
+        transcript_path,
+        start_offset,
+        transcript_len,
+        "claude_tui delivered turn harvested ZERO stream messages — the turn's response text never entered the bridge ({kind})"
+    );
+    crate::services::observability::emit_inflight_lifecycle_event(
+        "claude",
+        report_channel_id.unwrap_or(0),
+        None,
+        None,
+        None,
+        kind,
+        serde_json::json!({
+            "tmux_session_name": tmux_session_name,
+            "transcript_path": transcript_path,
+            "start_offset": start_offset,
+            "transcript_len": transcript_len,
+        }),
+    );
+}
+
 fn emit_followup_restart_suppressed_notice(sender: &Sender<StreamMessage>, notice: &str) {
     let _ = sender.send(StreamMessage::Text {
         content: format!("\n\n{}", notice),
@@ -2157,6 +2014,22 @@ fn classify_local_tmux_startup_plan(
     }
 }
 
+/// Decide whether a stale-classified tmux session must be preserved rather than
+/// killed-and-recreated. Mirrors the Codex (`codex.rs`) and Qwen (`qwen.rs`)
+/// guards: a pane that is still live (`has_live_pane`) AND was selected for
+/// provider-session reuse (a non-empty resume id) is carrying an active
+/// conversation, so missing wrapper I/O files alone must not trigger a kill.
+#[cfg(unix)]
+fn should_preserve_live_reused_provider_session(
+    resume_session_id: Option<&str>,
+    has_live_pane: bool,
+) -> bool {
+    resume_session_id
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        && has_live_pane
+}
+
 #[cfg(unix)]
 fn emit_fresh_session_watcher_handoff(
     sender: &Sender<StreamMessage>,
@@ -2381,7 +2254,7 @@ fn run_claude_tui_fresh_turn_and_finalize(
         resolved_session_id,
         prompt,
     );
-    let read_result = match fresh_turn_result {
+    let (read_result, harvest, turn_read_start_offset) = match fresh_turn_result {
         Ok(result) => result,
         Err(error) => {
             crate::services::termination_audit::record_termination_for_tmux(
@@ -2430,14 +2303,32 @@ fn run_claude_tui_fresh_turn_and_finalize(
         tmux_session_name,
         transcript_path,
     );
+    let transcript_len = std::fs::metadata(transcript_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    if tui_delivered_zero_harvest(&read_result, &harvest) {
+        emit_claude_tui_zero_harvest(
+            "claude_tui_zero_harvest_turn_delivered",
+            report_channel_id,
+            tmux_session_name,
+            transcript_path_string,
+            turn_read_start_offset,
+            transcript_len,
+        );
+    }
     log_producer_exit(
         "tui_turn_delivered",
         Some(resolved_session_id),
         report_channel_id,
-        0,
+        // #3281: real forwarded-message count (was a hardcoded 0).
+        usize::try_from(harvest.forwarded_messages).unwrap_or(usize::MAX),
         serde_json::json!({
             "tmux_session_name": tmux_session_name,
             "transcript_path": transcript_path_string,
+            "assistant_text_bytes": harvest.assistant_text_bytes,
+            "start_offset": turn_read_start_offset,
+            "transcript_len": transcript_len,
+            "read_result_kind": read_output_result_kind(&read_result),
         }),
     );
     Ok(())
@@ -2453,6 +2344,34 @@ struct ClaudeTuiRecreateState {
     resume: bool,
 }
 
+/// Outcome of the stranded prompt-draft recovery probe that runs before a warm
+/// follow-up submit.
+///
+/// `Terminal` carries the original early-return `Result` verbatim — the warm
+/// follow-up orchestrator must surface it immediately (the recovery block's
+/// `return Ok(())` cancellation exits and `Err(..)` fresh-resolution failures
+/// short-circuit before any submit-phase side-effect). `Proceed` carries the
+/// (possibly recreated) session resolution plus the three submit-gating flags
+/// exactly as the inline locals held them at the original fall-through point.
+#[cfg(unix)]
+#[must_use]
+enum ClaudeTuiDraftRecoveryOutcome {
+    /// Recovery completed and the follow-up may continue to submit-plan
+    /// computation. `state` carries the session quartet (recreated when a
+    /// draft-recovery kill ladder ran), and the three flags reflect whether a
+    /// busy wait occurred, whether the session was recreated before submit, and
+    /// whether a stranded prompt draft was cleared before submit.
+    Proceed {
+        state: ClaudeTuiRecreateState,
+        busy_waited: bool,
+        recreate_before_submit: bool,
+        prompt_draft_cleared_before_submit: bool,
+    },
+    /// Recovery hit an original early return; `Result` is forwarded verbatim to
+    /// the orchestrator's caller.
+    Terminal(Result<(), String>),
+}
+
 /// Outcome of an attempted warm follow-up against a live Claude TUI session.
 #[cfg(unix)]
 enum ClaudeTuiWarmFollowupOutcome {
@@ -2464,37 +2383,33 @@ enum ClaudeTuiWarmFollowupOutcome {
     Recreate(ClaudeTuiRecreateState),
 }
 
-/// Attempt a warm follow-up against an existing live Claude TUI tmux session.
+/// Recover from a stranded prompt draft left in the composer before a warm
+/// follow-up submit.
 ///
-/// Mirrors the pre-refactor inline `if session_exists && has_live_pane && resume`
-/// block verbatim: stranded prompt-draft recovery, busy-wait, prompt submission,
-/// transcript read, and the follow-up result classification. Every original
-/// `return Ok(())` / `return Err(..)` / `?` short-circuit is preserved as a
-/// `Terminal(..)` outcome (so the orchestrator returns immediately with the same
-/// value, before any fresh-launch side-effect). When the block originally fell
-/// through to a fresh launch — `submit_existing_session == false`, the
-/// `RecreateSession` classification, or a draft-recovery recreate — this returns
-/// `Recreate(..)` carrying the session resolution exactly as the inline locals
-/// held it at that point.
+/// Verbatim extraction of the stranded prompt-draft recovery block from
+/// `try_claude_tui_warm_followup` (#3196/#3228 extraction convention): the
+/// session quartet enters via [`ClaudeTuiRecreateState`] and is destructured
+/// into the same mutable locals the inline block used, so the body is preserved
+/// token-for-token. Every original early return is forwarded as
+/// `ClaudeTuiDraftRecoveryOutcome::Terminal(..)` carrying the same `Result` (the
+/// draft-clear cancellation exit returns `Ok(())`; the two
+/// `fresh_claude_tui_session_resolution` failures return `Err(..)`). The
+/// original fall-through is `Proceed` carrying the (possibly recreated) quartet
+/// and the three submit-gating flags exactly as the inline locals held them.
 #[cfg(unix)]
-fn try_claude_tui_warm_followup(
-    mut resolved_session_id: String,
-    mut transcript_path: std::path::PathBuf,
-    mut transcript_path_string: String,
-    mut resume: bool,
+fn recover_claude_tui_stranded_prompt_draft(
+    state: ClaudeTuiRecreateState,
     working_dir_path: &std::path::Path,
-    prompt: &str,
-    sender: Sender<StreamMessage>,
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    cancel_token: &Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
     report_channel_id: Option<u64>,
-) -> ClaudeTuiWarmFollowupOutcome {
-    debug_log("Existing Claude TUI tmux session found — sending follow-up");
-    if let Some(ref token) = cancel_token {
-        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(tmux_session_name.to_string());
-    }
-    let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
+) -> ClaudeTuiDraftRecoveryOutcome {
+    let ClaudeTuiRecreateState {
+        mut resolved_session_id,
+        mut transcript_path,
+        mut transcript_path_string,
+        mut resume,
+    } = state;
     // #2416: a single busy_waited flag tells the offset-capture site below
     // that we need to re-read transcript length after the wait succeeded,
     // because the previous TUI turn may have appended bytes while we were
@@ -2611,7 +2526,7 @@ fn try_claude_tui_warm_followup(
                             match fresh_claude_tui_session_resolution(working_dir_path, None) {
                                 Ok(resolution) => resolution,
                                 Err(error) => {
-                                    return ClaudeTuiWarmFollowupOutcome::Terminal(Err(error));
+                                    return ClaudeTuiDraftRecoveryOutcome::Terminal(Err(error));
                                 }
                             };
                         resolved_session_id = fresh_resolution.session_id;
@@ -2640,7 +2555,7 @@ fn try_claude_tui_warm_followup(
                             "transcript_path": transcript_path_string,
                         }),
                     );
-                    return ClaudeTuiWarmFollowupOutcome::Terminal(Ok(()));
+                    return ClaudeTuiDraftRecoveryOutcome::Terminal(Ok(()));
                 }
                 Err(error) => {
                     let recreate_after_clear_error = allow_recreate
@@ -2687,7 +2602,7 @@ fn try_claude_tui_warm_followup(
                             match fresh_claude_tui_session_resolution(working_dir_path, None) {
                                 Ok(resolution) => resolution,
                                 Err(error) => {
-                                    return ClaudeTuiWarmFollowupOutcome::Terminal(Err(error));
+                                    return ClaudeTuiDraftRecoveryOutcome::Terminal(Err(error));
                                 }
                             };
                         resolved_session_id = fresh_resolution.session_id;
@@ -2700,6 +2615,83 @@ fn try_claude_tui_warm_followup(
             }
         }
     }
+    ClaudeTuiDraftRecoveryOutcome::Proceed {
+        state: ClaudeTuiRecreateState {
+            resolved_session_id,
+            transcript_path,
+            transcript_path_string,
+            resume,
+        },
+        busy_waited,
+        recreate_before_submit,
+        prompt_draft_cleared_before_submit,
+    }
+}
+
+/// Attempt a warm follow-up against an existing live Claude TUI tmux session.
+///
+/// Mirrors the pre-refactor inline `if session_exists && has_live_pane && resume`
+/// block verbatim: stranded prompt-draft recovery, busy-wait, prompt submission,
+/// transcript read, and the follow-up result classification. Every original
+/// `return Ok(())` / `return Err(..)` / `?` short-circuit is preserved as a
+/// `Terminal(..)` outcome (so the orchestrator returns immediately with the same
+/// value, before any fresh-launch side-effect). When the block originally fell
+/// through to a fresh launch — `submit_existing_session == false`, the
+/// `RecreateSession` classification, or a draft-recovery recreate — this returns
+/// `Recreate(..)` carrying the session resolution exactly as the inline locals
+/// held it at that point.
+#[cfg(unix)]
+fn try_claude_tui_warm_followup(
+    mut resolved_session_id: String,
+    mut transcript_path: std::path::PathBuf,
+    mut transcript_path_string: String,
+    mut resume: bool,
+    working_dir_path: &std::path::Path,
+    prompt: &str,
+    sender: Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+    tmux_session_name: &str,
+    report_channel_id: Option<u64>,
+) -> ClaudeTuiWarmFollowupOutcome {
+    debug_log("Existing Claude TUI tmux session found — sending follow-up");
+    if let Some(ref token) = cancel_token {
+        *token.tmux_session.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(tmux_session_name.to_string());
+    }
+    let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
+    let (mut busy_waited, recreate_before_submit, prompt_draft_cleared_before_submit) =
+        match recover_claude_tui_stranded_prompt_draft(
+            ClaudeTuiRecreateState {
+                resolved_session_id,
+                transcript_path,
+                transcript_path_string,
+                resume,
+            },
+            working_dir_path,
+            &cancel_token,
+            tmux_session_name,
+            report_channel_id,
+        ) {
+            ClaudeTuiDraftRecoveryOutcome::Proceed {
+                state,
+                busy_waited,
+                recreate_before_submit,
+                prompt_draft_cleared_before_submit,
+            } => {
+                resolved_session_id = state.resolved_session_id;
+                transcript_path = state.transcript_path;
+                transcript_path_string = state.transcript_path_string;
+                resume = state.resume;
+                (
+                    busy_waited,
+                    recreate_before_submit,
+                    prompt_draft_cleared_before_submit,
+                )
+            }
+            ClaudeTuiDraftRecoveryOutcome::Terminal(r) => {
+                return ClaudeTuiWarmFollowupOutcome::Terminal(r);
+            }
+        };
     let submit_plan = claude_tui_warm_followup_submit_plan(
         recreate_before_submit,
         prompt_draft_cleared_before_submit,
@@ -2845,7 +2837,7 @@ fn try_claude_tui_warm_followup(
             turn_started_at,
             fallback_start_offset,
         );
-        let read_result = match read_claude_tui_transcript_until_done(
+        let (read_result, harvest) = match read_claude_tui_transcript_until_done(
             &transcript_path_string,
             start_offset,
             sender.clone(),
@@ -2860,6 +2852,12 @@ fn try_claude_tui_warm_followup(
                 return ClaudeTuiWarmFollowupOutcome::Terminal(Err(error));
             }
         };
+        // #3281: capture BEFORE `classify_followup_result` consumes the read
+        // result. The zero-harvest gate is `Completed`-only: classify maps
+        // `Cancelled` to `Delivered` too, and a cancelled turn legitimately
+        // forwards nothing.
+        let read_result_kind = read_output_result_kind(&read_result);
+        let delivered_zero_harvest = tui_delivered_zero_harvest(&read_result, &harvest);
         let zero_advance_terminal_result = match &read_result {
             ReadOutputResult::Completed { offset } | ReadOutputResult::Cancelled { offset } => {
                 *offset <= start_offset
@@ -2892,14 +2890,32 @@ fn try_claude_tui_warm_followup(
                     tmux_session_name,
                     &transcript_path,
                 );
+                let transcript_len = std::fs::metadata(&transcript_path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0);
+                if delivered_zero_harvest {
+                    emit_claude_tui_zero_harvest(
+                        "claude_tui_zero_harvest_warm_followup_delivered",
+                        report_channel_id,
+                        tmux_session_name,
+                        &transcript_path_string,
+                        start_offset,
+                        transcript_len,
+                    );
+                }
                 log_producer_exit(
                     "tui_warm_followup_delivered",
                     Some(&resolved_session_id),
                     report_channel_id,
-                    0,
+                    // #3281: real forwarded-message count (was a hardcoded 0).
+                    usize::try_from(harvest.forwarded_messages).unwrap_or(usize::MAX),
                     serde_json::json!({
                         "tmux_session_name": tmux_session_name,
                         "transcript_path": transcript_path_string,
+                        "assistant_text_bytes": harvest.assistant_text_bytes,
+                        "start_offset": start_offset,
+                        "transcript_len": transcript_len,
+                        "read_result_kind": read_result_kind,
                     }),
                 );
                 return ClaudeTuiWarmFollowupOutcome::Terminal(Ok(()));
@@ -3074,6 +3090,9 @@ fn prepare_and_create_claude_tui_session(
     Ok(owner_path)
 }
 
+/// On success returns the read result, the harvest counters, and the actual
+/// turn-read start offset (the timestamp-scan adjusted offset, #3281) so the
+/// producer-exit log can report real values instead of a hardcoded `lines=0`.
 #[cfg(unix)]
 fn run_claude_tui_fresh_turn_with_ready_retry(
     transcript_path_string: &str,
@@ -3083,7 +3102,7 @@ fn run_claude_tui_fresh_turn_with_ready_retry(
     tmux_session_name: &str,
     resolved_session_id: &str,
     prompt: &str,
-) -> Result<ReadOutputResult, String> {
+) -> Result<(ReadOutputResult, ReadHarvestStats, u64), String> {
     for attempt in 1..=CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS {
         let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
         let turn_started_at = chrono::Utc::now();
@@ -3108,7 +3127,8 @@ fn run_claude_tui_fresh_turn_with_ready_retry(
                     resolved_session_id,
                     hook_rx,
                     hook_events_after,
-                );
+                )
+                .map(|(read_result, harvest)| (read_result, harvest, start_offset));
             }
             Err(error) if should_retry_claude_tui_fresh_prompt_ready(&error, attempt) => {
                 let backoff = claude_tui_fresh_prompt_ready_backoff(attempt);
@@ -3199,7 +3219,7 @@ fn read_claude_tui_transcript_until_done(
     session_id: &str,
     hook_rx: tokio::sync::broadcast::Receiver<crate::services::claude_tui::hook_server::HookEvent>,
     hook_events_after: chrono::DateTime<chrono::Utc>,
-) -> Result<ReadOutputResult, String> {
+) -> Result<(ReadOutputResult, ReadHarvestStats), String> {
     let stop_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_seen_for_probe = stop_seen.clone();
     let hook_rx = std::sync::Arc::new(std::sync::Mutex::new(hook_rx));
@@ -3227,10 +3247,17 @@ fn read_claude_tui_transcript_until_done(
         cancel_token.as_deref(),
         tmux_session_name,
     )? {
-        return Ok(early_result);
+        // No transcript read happened — nothing was harvested (#3281).
+        return Ok((early_result, ReadHarvestStats::default()));
     }
-    let result =
-        read_output_file_until_result(transcript_path, start_offset, sender, cancel_token, probe);
+    let result = read_output_file_until_result_with_harvest(
+        transcript_path,
+        start_offset,
+        sender,
+        cancel_token,
+        probe,
+    )
+    .map_err(|failure| failure.error);
     log_claude_tui_hook_relay_failures(&expected_session_id_for_result);
     result
 }
@@ -3405,6 +3432,35 @@ mod claude_tui_ready_probe_tests {
         assert!(!stop_seen.load(Ordering::Relaxed));
     }
 
+    /// #3281 truth table: zero-harvest fires ONLY for a `Completed` read that
+    /// forwarded nothing. Any forwarded message or a non-`Completed` read
+    /// (`Cancelled` is also classified `Delivered` by
+    /// `classify_followup_result`) must NOT fire.
+    #[test]
+    fn tui_delivered_zero_harvest_truth_table() {
+        let zero = ReadHarvestStats::default();
+        let harvested = ReadHarvestStats {
+            forwarded_messages: 3,
+            assistant_text_bytes: 42,
+        };
+        assert!(tui_delivered_zero_harvest(
+            &ReadOutputResult::Completed { offset: 100 },
+            &zero,
+        ));
+        assert!(!tui_delivered_zero_harvest(
+            &ReadOutputResult::Completed { offset: 100 },
+            &harvested,
+        ));
+        assert!(!tui_delivered_zero_harvest(
+            &ReadOutputResult::Cancelled { offset: 100 },
+            &zero,
+        ));
+        assert!(!tui_delivered_zero_harvest(
+            &ReadOutputResult::SessionDied { offset: 100 },
+            &zero,
+        ));
+    }
+
     #[test]
     fn claude_tui_transcript_idle_helper_uses_jsonl_turn_state() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -3507,6 +3563,7 @@ mod claude_tui_ready_probe_tests {
 fn execute_streaming_local_tmux(
     args: &[String],
     prompt: &str,
+    session_id: Option<&str>,
     working_dir: &str,
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
@@ -3533,13 +3590,18 @@ fn execute_streaming_local_tmux(
     // that older wrappers still hold open fds to — so a dcserver restart
     // that lost its /tmp files does not invalidate a still-alive tmux pane.
     let session_exists = tmux_session_exists(tmux_session_name);
+    let has_live_pane = tmux_session_has_live_pane(tmux_session_name);
     let resolved_output =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "input");
+    // Resume id selected for this turn (`--resume <sid>` was pushed by the
+    // caller when `session_id` is a valid id). Used to recognise a live pane
+    // that was deliberately reused for provider-session continuity.
+    let resume_session_id = session_id.filter(|sid| is_valid_session_id(sid));
     let startup_plan = classify_local_tmux_startup_plan(
         session_exists,
-        tmux_session_has_live_pane(tmux_session_name),
+        has_live_pane,
         resolved_output.is_some(),
         resolved_input.is_some(),
     );
@@ -3659,6 +3721,26 @@ fn execute_streaming_local_tmux(
                 return Ok(());
             }
         }
+    } else if startup_plan == LocalTmuxStartupPlan::RecreateStaleSession
+        && should_preserve_live_reused_provider_session(resume_session_id, has_live_pane)
+    {
+        // Parity with the Codex (codex.rs) and Qwen (qwen.rs) guards: refuse to
+        // kill a still-live pane that was deliberately selected for provider-
+        // session reuse just because its wrapper I/O files are momentarily
+        // missing (e.g. a dcserver restart lost /tmp, or runtime files were GC'd).
+        // The classifier still labels this `RecreateStaleSession`, but a live
+        // pane carrying an active `--resume` conversation must be preserved, not
+        // recreated. Fail safely with an operator-visible message instead.
+        tracing::warn!(
+            tmux_session_name,
+            session_id = resume_session_id.unwrap_or_default(),
+            output_path_present = resolved_output.is_some(),
+            input_path_present = resolved_input.is_some(),
+            "refusing to kill live Claude tmux selected for provider-session reuse"
+        );
+        return Err(format!(
+            "live Claude tmux session {tmux_session_name} was selected for reuse but wrapper I/O is unavailable; refusing stale cleanup/recreate"
+        ));
     } else if startup_plan == LocalTmuxStartupPlan::RecreateStaleSession {
         debug_log("Stale tmux session found — recreating");
         crate::services::termination_audit::record_termination_for_tmux(
@@ -4195,6 +4277,34 @@ mod local_tmux_lifecycle_tests {
                 "existing tmux sessions missing live ownership evidence must be killed and recreated"
             );
         }
+    }
+
+    #[test]
+    fn live_reused_provider_session_is_preserved_when_wrapper_io_is_missing() {
+        // Parity with codex.rs / qwen.rs: a live pane selected for reuse (valid,
+        // non-empty resume id) must be preserved even though the classifier
+        // labels it RecreateStaleSession because its wrapper I/O files are gone.
+        assert!(should_preserve_live_reused_provider_session(
+            Some("claude-session-1"),
+            true,
+        ));
+        // A genuinely dead pane (no live pane) is still recreated, even with a
+        // resume id — preservation must never over-protect a stale session.
+        assert!(!should_preserve_live_reused_provider_session(
+            Some("claude-session-1"),
+            false,
+        ));
+        // A live pane that was NOT selected for reuse (no/blank resume id) has
+        // no conversation to protect, so the normal recreate path applies.
+        assert!(!should_preserve_live_reused_provider_session(None, true));
+        assert!(!should_preserve_live_reused_provider_session(
+            Some("  "),
+            true
+        ));
+        assert!(!should_preserve_live_reused_provider_session(
+            Some(""),
+            true
+        ));
     }
 
     #[test]
@@ -4911,5 +5021,67 @@ mod claude_tui_session_resolution_tests {
         let recreate = claude_tui_warm_followup_submit_plan(true, false);
         assert!(!recreate.submit_existing_session);
         assert!(recreate.recheck_busy_before_submit);
+    }
+
+    /// Seed for the #3038 S1 extraction: the session quartet carried into and
+    /// back out of `recover_claude_tui_stranded_prompt_draft` via the `Proceed`
+    /// arm must be the identity on the no-op fall-through path (no recreate
+    /// ladder, all flags `false`). This guards the move-in/move-out contract the
+    /// orchestrator relies on to rebind its session locals.
+    #[test]
+    fn draft_recovery_proceed_round_trips_session_quartet() {
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let transcript_path = std::path::PathBuf::from("/tmp/agentdesk-3038-seed.jsonl");
+        let transcript_path_string = transcript_path.display().to_string();
+        let outcome = ClaudeTuiDraftRecoveryOutcome::Proceed {
+            state: ClaudeTuiRecreateState {
+                resolved_session_id: session_id.clone(),
+                transcript_path: transcript_path.clone(),
+                transcript_path_string: transcript_path_string.clone(),
+                resume: true,
+            },
+            busy_waited: false,
+            recreate_before_submit: false,
+            prompt_draft_cleared_before_submit: false,
+        };
+
+        match outcome {
+            ClaudeTuiDraftRecoveryOutcome::Proceed {
+                state,
+                busy_waited,
+                recreate_before_submit,
+                prompt_draft_cleared_before_submit,
+            } => {
+                assert_eq!(state.resolved_session_id, session_id);
+                assert_eq!(state.transcript_path, transcript_path);
+                assert_eq!(state.transcript_path_string, transcript_path_string);
+                assert!(state.resume);
+                assert!(!busy_waited);
+                assert!(!recreate_before_submit);
+                assert!(!prompt_draft_cleared_before_submit);
+            }
+            ClaudeTuiDraftRecoveryOutcome::Terminal(_) => {
+                panic!("Proceed outcome must not destructure as Terminal");
+            }
+        }
+    }
+
+    /// The `Terminal` arm must forward the original early-return `Result`
+    /// verbatim (the recovery block's cancellation exit returns `Ok(())`, fresh
+    /// resolution failures return `Err(..)`). This pins the payload-passthrough
+    /// contract the orchestrator depends on to surface the same value its
+    /// inline early returns produced.
+    #[test]
+    fn draft_recovery_terminal_forwards_result_verbatim() {
+        match ClaudeTuiDraftRecoveryOutcome::Terminal(Ok(())) {
+            ClaudeTuiDraftRecoveryOutcome::Terminal(r) => assert_eq!(r, Ok(())),
+            ClaudeTuiDraftRecoveryOutcome::Proceed { .. } => panic!("expected Terminal(Ok)"),
+        }
+        match ClaudeTuiDraftRecoveryOutcome::Terminal(Err("boom".to_string())) {
+            ClaudeTuiDraftRecoveryOutcome::Terminal(r) => {
+                assert_eq!(r, Err("boom".to_string()));
+            }
+            ClaudeTuiDraftRecoveryOutcome::Proceed { .. } => panic!("expected Terminal(Err)"),
+        }
     }
 }

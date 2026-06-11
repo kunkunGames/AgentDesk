@@ -24,15 +24,46 @@
 # #3262/#3272, which extracted the inline completed-panel backfill block into
 # `adk_session::backfill_completed_panel_usage_and_maybe_inject_compact` (−16
 # prod lines), so the frozen true production LoC settles at 9583. KEPT surfaces.
-"src/services/discord/tmux_watcher.rs" = 9583
+# #3296: the aborted-anchor reconcile chokepoint — one guarded block recording
+# the `tui_direct_abort_marker::record_commit_tombstone` commit evidence and
+# calling `drain_on_terminal_commit`, sited BEFORE `clear_inflight_state`
+# (codex r2: tombstone → drain → clear, so a racing sweep that observes "no
+# live row" always sees the commit evidence) and passing the committed turn's
+# identity (codex r1 positive correlation; the marker logic lives in the
+# non-giant `tui_direct_abort_marker/` directory module — decomposed by #3303
+# into mod.rs + store.rs + deferred_claim.rs) — offset in the same change by
+# compressing the #3016-S3 finalize/TOCTOU and #1670/#1708 decoupling comment
+# blocks (issue references and rationale preserved), so the file lands at
+# 9580 under the unchanged frozen baseline (no raise).
+# #3038 tmux_watcher S1: lowered 9583 -> 8122 by moving top-level decision
+# clusters A/B/C/E/F/I/J/K into tmux_watcher/ child modules. The relay loop,
+# D/H clusters, and relay path remain in the root.
+"src/services/discord/tmux_watcher.rs" = 8122
+# #3038 tmux_watcher S1 child modules, frozen at landed production LoC.
+"src/services/discord/tmux_watcher/commit_decisions.rs" = 140
+"src/services/discord/tmux_watcher/completion_gate.rs" = 275
+"src/services/discord/tmux_watcher/liveness.rs" = 301
+"src/services/discord/tmux_watcher/panel_decisions.rs" = 372
+"src/services/discord/tmux_watcher/prompt_observe.rs" = 109
+"src/services/discord/tmux_watcher/turn_identity.rs" = 327
 # Frozen at its true production LoC once #3028 fixed the prod/test splitter
 # (lifetime/char-literal brace miscount): the first inline `#[cfg(test)] mod`
 # block was over-extended to EOF, so `spawn_turn_bridge` and ~9000 lines of the
 # turn-lifecycle surface were mislabeled test. This is the actual #3028 guard;
 # decompose lands separately after #3016 settles.
 "src/services/discord/turn_bridge/mod.rs" = 8417
-"src/services/discord/mod.rs" = 5188
-"src/services/discord/tui_prompt_relay.rs" = 5438
+# #3038 S1: lowered 5188 -> 4987 (-201) as `QueuedPlaceholderState` (cluster C:
+# 3 fields + 9 inherent methods) moved to the `shared_state` sibling module.
+# Locks in the shrink win (ratchet down only).
+# #3293: the +13 closed-retry rewires (`mailbox_peek` + routing the recovery
+# kickoff / intervention enqueue through `*_with_closed_retry`) are offset by
+# queue-exit comment dedup in the same root, so the frozen baseline stays at
+# 4987 (no raise; #3028 ratchet).
+"src/services/discord/mod.rs" = 4987
+# #3305: the local-only pass-through lifecycle-skip (kind hoist + note-only return
+# branch + idle-loop skip) is offset by comment dedup in the same root, lowering the
+# frozen baseline 5438 -> 5429 (-9). Locks in the shrink win (#3028 ratchet).
+"src/services/discord/tui_prompt_relay.rs" = 5429
 # #3038: lowered 4728 -> 4657 (-71) as `SensitivityState` (definition + impl)
 # moved to the `voice_sensitivity` sibling module. Locks in the shrink win.
 "src/services/discord/voice_barge_in.rs" = 4657
@@ -47,16 +78,37 @@
 # #3034 batch-8: lowered 3771 -> 3770 (dead-code removal).
 "src/services/discord/router/message_handler/intake_turn.rs" = 3808
 "src/services/discord/meeting_orchestrator.rs" = 3227
-"src/services/turn_orchestrator.rs" = 3090
+# #3293: +3 for the `registry_purge` child-module declaration (peek +
+# operator-gated idle-entry purge live outside the frozen root); lowered
+# 3090 -> 3089 to lock the net position.
+# #3297 r2 (codex TOCTOU fix): the +15 actor-root pieces of the purge
+# `CloseIfIdle` tombstone (msg variant + state flag + dispatch arm +
+# `TryStartTurn` guard — the enum/state/loop can only live in the root)
+# are offset by #2374 actor-arm comment dedup in the same root, so the
+# frozen baseline stays at 3089 (no raise; #3028 ratchet).
+"src/services/turn_orchestrator.rs" = 3089
 # #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
 # `thread_guard_inflight_is_stale` (#1446 Layer-2 classifier, pinned by tests).
 "src/services/discord/router/intake_gate.rs" = 2967
 "src/services/discord/formatting.rs" = 2802
-"src/services/discord/runtime_bootstrap.rs" = 2800
+# #3038 run_bot S0/S1: lowered 2802 -> 1918 by adding characterization tests and
+# moving restored_state, queued_placeholders, startup_doctor, orphan_recovery,
+# and session_gc into sub-700 `runtime_bootstrap/` modules.
+# #3038 run_bot S2/S3: lowered 1918 -> 524 by moving framework_setup,
+# spawns, recovery_flush, voice, gateway_lease, shutdown, and intake into
+# sub-700 `runtime_bootstrap/` modules. S4 shared-data builder remains gated.
+"src/services/discord/runtime_bootstrap.rs" = 524
 # #3034 batch-8: lowered 2655 -> 2645 (dead-code removal: `stop_provider_channel_runtime`).
-"src/services/discord/health/recovery.rs" = 2645
-"src/services/discord/inflight.rs" = 2466
-"src/services/discord/health.rs" = 2293
+# #3293: lowered 2645 -> 2641 (mailbox probe routed through the non-creating
+# `health/mailbox.rs::peeked_provider_mailbox_state`).
+"src/services/discord/health/recovery.rs" = 2641
+# #3293: +11 for the additive `recovery_relay_attempts` restart-budget counter
+# (field + `RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET`), lowered 2466 -> 2465 to
+# lock the net position.
+"src/services/discord/inflight.rs" = 2465
+# #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
+# prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
+# its ratchet entry is deleted (win; no baseline raises).
 # #3034 batch-8: lowered 2333 -> 2332 (dropped `assistant_turns` construction site).
 "src/services/discord/watchers/lifecycle.rs" = 2332
 # #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
@@ -85,3 +137,18 @@
 "src/services/discord/router/message_handler/headless_turn.rs" = 1316
 "src/services/discord/commands/config.rs" = 1054
 "src/services/discord/commands/diagnostics.rs" = 1026
+
+# #3038 slice 1: decision_route.rs (4392 prod LoC) was decomposed into a 139-line
+# module root + 8 directory modules. Each split output is frozen at its landed
+# production LoC so the win is locked in — re-inflation past the giant threshold
+# AND the frozen value fails the ratchet. Lower these as the planned slice-2
+# services relocation lands.
+"src/server/routes/review_verdict/decision_route.rs" = 139
+"src/server/routes/review_verdict/decision_route/accept.rs" = 703
+"src/server/routes/review_verdict/decision_route/adapters.rs" = 227
+"src/server/routes/review_verdict/decision_route/dismiss_finalize.rs" = 182
+"src/server/routes/review_verdict/decision_route/dispute.rs" = 746
+"src/server/routes/review_verdict/decision_route/pending.rs" = 636
+"src/server/routes/review_verdict/decision_route/repo_card.rs" = 748
+"src/server/routes/review_verdict/decision_route/repo_dispatch.rs" = 650
+"src/server/routes/review_verdict/decision_route/worktree_stale.rs" = 553

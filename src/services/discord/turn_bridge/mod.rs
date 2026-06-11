@@ -7006,14 +7006,15 @@ pub(super) fn spawn_turn_bridge(
                 && watcher_owns_assistant_relay
                 && watcher_relay_available_for_turn
                 && !terminal_error_path;
+        let response_unsent =
+            response_portion_after_offset(&full_response, response_sent_offset);
+        let response_pending_trimmed_empty = response_unsent.trim().is_empty();
         // #3268: `mut` so the post-gate self-healing handoff (below) can promote it.
         let mut bridge_relay_delegated_to_watcher = recovered_watcher_owns_output
             || should_delegate_bridge_relay_to_watcher(
                 watcher_owns_assistant_relay,
                 watcher_relay_available_for_turn,
-                !response_portion_after_offset(&full_response, response_sent_offset)
-                    .trim()
-                    .is_empty(),
+                !response_pending_trimmed_empty,
                 cancelled,
                 is_prompt_too_long,
                 transport_error,
@@ -7029,39 +7030,31 @@ pub(super) fn spawn_turn_bridge(
                 && !recovery_retry,
             bridge_relay_delegated_to_watcher,
         );
-        if bridge_output_owner.is_none()
-            && !cancelled
-            && !is_prompt_too_long
-            && !transport_error
-            && !recovery_retry
-            && current_msg_id.get() != 0
-            && response_portion_after_offset(&full_response, response_sent_offset)
-                .trim()
-                .is_empty()
-        {
-            crate::services::observability::emit_inflight_lifecycle_event(
-                provider.as_str(),
-                channel_id.get(),
-                dispatch_id.as_deref(),
-                adk_session_key.as_deref(),
-                Some(turn_id.as_str()),
-                "bridge_output_owner_none_empty_response",
-                serde_json::json!({
-                    "current_msg_id": current_msg_id.get(),
-                    "watcher_owns_assistant_relay": watcher_owns_assistant_relay,
-                    "watcher_relay_available_for_turn": watcher_relay_available_for_turn,
-                    "live_watcher_registered": live_watcher_registered_for_relay(
-                        shared_owned.as_ref(),
-                        watcher_owner_channel_id,
-                    ),
-                    "standby_relay_owns_output": standby_relay_owns_output,
-                    "rx_disconnected": rx_disconnected,
-                    "tmux_handed_off": tmux_handed_off,
-                    "response_sent_offset": response_sent_offset,
-                    "full_response_len": full_response.len(),
-                }),
-            );
-        }
+        // #3281: empty-terminal-response visibility (owner-`None` kind/payload
+        // preserved verbatim; adds the delegated-watcher quadrant) — see
+        // `watcher_handoff::emit_bridge_empty_terminal_response_visibility`.
+        watcher_handoff::emit_bridge_empty_terminal_response_visibility(
+            shared_owned.as_ref(),
+            watcher_owner_channel_id,
+            bridge_output_owner,
+            terminal_error_path,
+            &provider,
+            channel_id,
+            dispatch_id.as_deref(),
+            adk_session_key.as_deref(),
+            turn_id.as_str(),
+            current_msg_id.get(),
+            response_pending_trimmed_empty,
+            watcher_owns_assistant_relay,
+            watcher_relay_available_for_turn,
+            standby_relay_owns_output,
+            rx_disconnected,
+            tmux_handed_off,
+            response_sent_offset,
+            full_response.len(),
+            tmux_last_offset,
+            inflight_state.turn_start_offset,
+        );
 
         // Explicitly complete implementation/rework dispatches only after the
         // terminal Discord delivery commits. Completing here used to let
@@ -7181,7 +7174,12 @@ pub(super) fn spawn_turn_bridge(
             watcher_owner_channel_id,
             channel_id,
             &provider,
+            dispatch_id.as_deref(),
+            adk_session_key.as_deref(),
+            turn_id.as_str(),
+            current_msg_id.get(),
             tmux_last_offset,
+            response_unsent,
             &mut inflight_state,
             &mut bridge_relay_delegated_to_watcher,
             &mut bridge_output_owner,

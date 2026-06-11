@@ -25,6 +25,8 @@ test("00-escalation loadCardMetadata handles pre-parsed object metadata", () => 
   );
 
   var mockAgentdesk = {
+    // #3335: 00-escalation.js now registers a hook-less helper policy
+    registerPolicy: function() {},
     cards: {
       get: function(id) {
         if (id === "parsed") {
@@ -72,6 +74,8 @@ test("00-escalation loadManualInterventionState handles missing cards and parses
   );
 
   var mockAgentdesk = {
+    // #3335: 00-escalation.js now registers a hook-less helper policy
+    registerPolicy: function() {},
     cards: {
       get: function(id) {
         if (id === "valid") {
@@ -123,6 +127,8 @@ test("00-escalation escalationCardTitle uses github issue number", () => {
   );
 
   var mockAgentdesk = {
+    // #3335: 00-escalation.js now registers a hook-less helper policy
+    registerPolicy: function() {},
     cards: {
       get: function(id) {
         if (id === "with_issue") {

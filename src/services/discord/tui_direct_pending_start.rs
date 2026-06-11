@@ -149,6 +149,13 @@ pub(super) fn channel_lock(provider: &str, channel_id: u64) -> Arc<tokio::sync::
 static PRESENT: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static ACTIVE_WORKERS: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PRECLAIMED_ACTIVE_WORKERS: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static PRESENCE_RECONCILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 fn mark_present(provider: &str, channel_id: u64) {
     let mut map = PRESENT.lock().unwrap_or_else(|e| e.into_inner());
     *map.entry((provider.to_string(), channel_id)).or_insert(0) += 1;
@@ -162,6 +169,92 @@ fn mark_absent(provider: &str, channel_id: u64) {
             map.remove(&(provider.to_string(), channel_id));
         }
     }
+}
+
+fn clear_present(provider: &str, channel_id: u64) {
+    PRESENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(provider.to_string(), channel_id));
+}
+
+struct ActiveWorkerGuard {
+    provider: String,
+    channel_id: u64,
+}
+
+impl ActiveWorkerGuard {
+    fn new(provider: &str, channel_id: u64) -> Self {
+        let mut workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        *workers
+            .entry((provider.to_string(), channel_id))
+            .or_insert(0) += 1;
+        Self {
+            provider: provider.to_string(),
+            channel_id,
+        }
+    }
+
+    fn from_preclaimed(provider: &str, channel_id: u64) -> Self {
+        Self {
+            provider: provider.to_string(),
+            channel_id,
+        }
+    }
+}
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        let mut workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = workers.get_mut(&(self.provider.clone(), self.channel_id)) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                workers.remove(&(self.provider.clone(), self.channel_id));
+            }
+        }
+    }
+}
+
+fn active_worker_present(provider: &str, channel_id: u64) -> bool {
+    ACTIVE_WORKERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(provider.to_string(), channel_id))
+        .copied()
+        .unwrap_or(0)
+        > 0
+}
+
+fn preclaim_active_worker(provider: &str, channel_id: u64) {
+    {
+        let mut workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+        *workers
+            .entry((provider.to_string(), channel_id))
+            .or_insert(0) += 1;
+    }
+    let mut preclaimed = PRECLAIMED_ACTIVE_WORKERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *preclaimed
+        .entry((provider.to_string(), channel_id))
+        .or_insert(0) += 1;
+}
+
+fn take_preclaimed_active_worker(provider: &str, channel_id: u64) -> Option<ActiveWorkerGuard> {
+    let mut preclaimed = PRECLAIMED_ACTIVE_WORKERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let count = preclaimed.get_mut(&(provider.to_string(), channel_id))?;
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+        preclaimed.remove(&(provider.to_string(), channel_id));
+    }
+    Some(ActiveWorkerGuard::from_preclaimed(provider, channel_id))
+}
+
+fn active_worker_guard_for_spawn(provider: &str, channel_id: u64) -> ActiveWorkerGuard {
+    take_preclaimed_active_worker(provider, channel_id)
+        .unwrap_or_else(|| ActiveWorkerGuard::new(provider, channel_id))
 }
 
 /// GATE probe consulted by the watcher no-inflight suppression and the idle
@@ -185,12 +278,24 @@ pub(super) fn pending_synthetic_start_present(provider: &str, channel_id: u64) -
 /// state before the respawned worker's first poll. The worker's terminal
 /// [`delete`] balances it.
 pub(super) fn mark_present_on_restore(provider: &str, channel_id: u64) {
+    let _guard = PRESENCE_RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     mark_present(provider, channel_id);
+    preclaim_active_worker(provider, channel_id);
 }
 
 #[cfg(test)]
 pub(super) fn reset_present_for_tests() {
     PRESENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    ACTIVE_WORKERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    PRECLAIMED_ACTIVE_WORKERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -201,14 +306,8 @@ fn root() -> Option<std::path::PathBuf> {
     super::runtime_store::tui_direct_pending_start_root()
 }
 
-/// Persist (or update) a pending-start record and mark it present in the
-/// in-memory index. Called BEFORE any wait, immediately after the anchor/lease
-/// are created.
-pub(super) fn persist(record: &TuiDirectPendingStart) -> Result<(), String> {
-    mark_present(&record.provider, record.channel_id);
+fn write_record(record: &TuiDirectPendingStart) -> Result<(), String> {
     let Some(root) = root() else {
-        // No runtime root (tests / unconfigured): the in-memory presence index
-        // still gates the watcher / idle queue for this process lifetime.
         return Ok(());
     };
     let path = root.join(format!("{}.json", record.file_stem()));
@@ -222,13 +321,45 @@ pub(super) fn persist(record: &TuiDirectPendingStart) -> Result<(), String> {
     )
 }
 
+/// Persist (or update) a pending-start record and mark it present in the
+/// in-memory index. Called BEFORE any wait, immediately after the anchor/lease
+/// are created.
+pub(super) fn persist(record: &TuiDirectPendingStart) -> Result<(), String> {
+    let _guard = PRESENCE_RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    mark_present(&record.provider, record.channel_id);
+    write_record(record)?;
+    Ok(())
+}
+
 /// Delete a pending-start record AFTER the inflight save succeeds (or when the
 /// worker gives up). Idempotent.
 pub(super) fn delete(record: &TuiDirectPendingStart) {
+    let _guard = PRESENCE_RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     mark_absent(&record.provider, record.channel_id);
     if let Some(root) = root() {
         let path = root.join(format!("{}.json", record.file_stem()));
         let _ = std::fs::remove_file(path);
+    }
+}
+
+fn update_claim_attempt_count(record: &mut TuiDirectPendingStart, claim_attempts: u32) {
+    record.attempt_count = claim_attempts;
+    let _guard = PRESENCE_RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Err(error) = write_record(record) {
+        tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            anchor_message_id = record.anchor_message_id,
+            claim_attempts,
+            error = %error,
+            "tui_direct_pending_start: failed to persist claim attempt count; retaining in-memory retry budget"
+        );
     }
 }
 
@@ -266,6 +397,42 @@ pub(super) fn load_all() -> Vec<TuiDirectPendingStart> {
             .then(a.anchor_message_id.cmp(&b.anchor_message_id))
     });
     out
+}
+
+fn records_for_channel(provider: &str, channel_id: u64) -> Vec<TuiDirectPendingStart> {
+    load_all()
+        .into_iter()
+        .filter(|record| record.provider == provider && record.channel_id == channel_id)
+        .collect()
+}
+
+fn channel_records_are_abandoned_locked(provider: &str, channel_id: u64) -> bool {
+    if active_worker_present(provider, channel_id) {
+        return false;
+    }
+    let records = records_for_channel(provider, channel_id);
+    !records.is_empty()
+        && records
+            .iter()
+            .all(|record| record.attempt_count >= PENDING_START_MAX_CLAIM_ATTEMPTS)
+}
+
+pub(super) fn pending_synthetic_start_abandoned(provider: &str, channel_id: u64) -> bool {
+    let _guard = PRESENCE_RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    channel_records_are_abandoned_locked(provider, channel_id)
+}
+
+pub(super) fn clear_abandoned_synthetic_start_presence(provider: &str, channel_id: u64) -> bool {
+    let _guard = PRESENCE_RECONCILE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !channel_records_are_abandoned_locked(provider, channel_id) {
+        return false;
+    }
+    clear_present(provider, channel_id);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -357,32 +524,91 @@ pub(super) type ClaimFn = Box<
         + Sync,
 >;
 
-/// Build the per-poll [`PriorTurnView`]. Provided by [`super::tui_prompt_relay`]
-/// (it owns inflight/mailbox/runtime-binding access). Returns `None` when the
-/// view cannot be computed yet (e.g. mailbox unavailable) — treated as "not
-/// finalized" so the worker keeps waiting.
+/// One worker poll's observation: the pure decision [`PriorTurnView`] plus the
+/// live FOREIGN prior inflight's identity at the read instant (`None` when no
+/// row exists or the row is our own anchor). The worker threads the LATEST
+/// observed identity into the ABORT cleanup as the marker's last-view identity
+/// — the PRIMARY pin since #3296 codex r3 ([`pin_abort_foreign_identity`]):
+/// it survives the row vanishing before the cleanup's own read AND it cannot
+/// be repointed by a successor row that took the slot in that gap, so the
+/// commit-tombstone 대조 decides `✅` vs `⚠` for the RIGHT turn.
+pub(super) struct PriorTurnObservation {
+    pub view: PriorTurnView,
+    pub foreign_inflight_identity: Option<(u64, String)>,
+}
+
+/// Build the per-poll [`PriorTurnObservation`]. Provided by
+/// [`super::tui_prompt_relay`] (it owns inflight/mailbox/runtime-binding
+/// access). Returns `None` when the view cannot be computed yet (e.g. mailbox
+/// unavailable) — treated as "not finalized" so the worker keeps waiting.
 pub(super) type ViewFn = Box<
     dyn for<'a> Fn(
             &'a Arc<SharedData>,
             &'a TuiDirectPendingStart,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Option<PriorTurnView>> + Send + 'a>,
+            Box<dyn std::future::Future<Output = Option<PriorTurnObservation>> + Send + 'a>,
         > + Send
         + Sync,
 >;
 
+/// #3282/#3296: Discord-side reconcile hook the worker runs on the terminal
+/// backstop ABORT (`backstop_abort_foreign_inflight_live`). The input was
+/// already provider-submitted by this point, so the anchor KEEPS its `⏳`; the
+/// hook records a durable aborted-anchor marker
+/// ([`super::tui_direct_abort_marker`]) so a later prior-owner terminal commit
+/// flips it `⏳ → ✅`, or the TTL'd sweep flips it `⏳ → ⚠` when nothing ever
+/// covered it. The third argument is the worker's LAST-VIEW foreign inflight
+/// identity (codex r2 — see [`PriorTurnObservation`]). Provided by
+/// [`super::tui_prompt_relay`].
+pub(super) type AbortCleanupFn = Box<
+    dyn for<'a> Fn(
+            &'a Arc<SharedData>,
+            &'a TuiDirectPendingStart,
+            Option<(u64, String)>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
+/// #3296 codex r3: choose the foreign identity an aborted-anchor marker pins.
+/// The worker's LAST-VIEW identity is PRIMARY — that row was observed LIVE
+/// during the backstop window, so it is definitionally the turn the ABORT
+/// deferred on. The cleanup-instant inflight row is read (lazily) ONLY when
+/// no poll ever captured an identity: between the final backstop view and the
+/// cleanup's read, the foreign row may terminal-commit (tombstone + clear)
+/// and a SUCCESSOR row may already hold the `(provider, channel)` slot —
+/// preferring the current row pinned that WRONG turn (the genuine prior
+/// commit's tombstone then never matched the marker, and the successor's own
+/// commit could false-`✅` a possibly-unanswered anchor). The no-view fallback
+/// is deliberately kept conservative-best-effort: with no observed identity
+/// the cleanup-instant row is the only evidence available (a successor there
+/// would need the never-observed prior row to clear AND a new claim to land
+/// inside the same µs window), while pinning nothing forfeits drain coverage
+/// outright — a guaranteed bounded `⚠` even on an answered anchor.
+pub(super) fn pin_abort_foreign_identity(
+    last_view_foreign: Option<(u64, String)>,
+    read_cleanup_instant_row: impl FnOnce() -> Option<(u64, String)>,
+) -> Option<(u64, String)> {
+    last_view_foreign.or_else(read_cleanup_instant_row)
+}
+
 /// Spawn the DETACHED per-channel worker. Acquires the channel lock (FIFO
 /// serialization), polls the wait predicate until the prior turn finalizes (or
-/// the 8s backstop fires), runs the claim, and deletes the record. Returns
-/// immediately so the observer loop is never blocked.
+/// the 8s backstop fires), runs the claim, and deletes the record. On the
+/// terminal backstop ABORT it runs `abort_cleanup_fn` (the aborted-anchor
+/// marker record — #3282/#3296) before dropping the record. Returns immediately
+/// so the observer loop is never blocked.
 pub(super) fn spawn_worker(
     shared: Arc<SharedData>,
     record: TuiDirectPendingStart,
     view_fn: ViewFn,
     claim_fn: ClaimFn,
+    abort_cleanup_fn: AbortCleanupFn,
 ) {
+    let active_guard = active_worker_guard_for_spawn(&record.provider, record.channel_id);
     super::task_supervisor::spawn_observed("tui_direct_pending_start_worker", async move {
-        run_worker(shared, record, view_fn, claim_fn).await;
+        let _active_guard = active_guard;
+        run_worker_inner(shared, record, view_fn, claim_fn, abort_cleanup_fn).await;
     });
 }
 
@@ -399,11 +625,24 @@ enum WaitOutcome {
     BackstopForeignInflightLive,
 }
 
+#[cfg(test)]
 async fn run_worker(
     shared: Arc<SharedData>,
     record: TuiDirectPendingStart,
     view_fn: ViewFn,
     claim_fn: ClaimFn,
+    abort_cleanup_fn: AbortCleanupFn,
+) {
+    let _active_guard = ActiveWorkerGuard::new(&record.provider, record.channel_id);
+    run_worker_inner(shared, record, view_fn, claim_fn, abort_cleanup_fn).await;
+}
+
+async fn run_worker_inner(
+    shared: Arc<SharedData>,
+    mut record: TuiDirectPendingStart,
+    view_fn: ViewFn,
+    claim_fn: ClaimFn,
+    abort_cleanup_fn: AbortCleanupFn,
 ) {
     let lock = channel_lock(&record.provider, record.channel_id);
     let _guard = lock.lock().await;
@@ -411,21 +650,36 @@ async fn run_worker(
     let mut backstop_cycles: u32 = 0;
     let mut claim_attempts: u32 = 0;
     let worker_start = tokio::time::Instant::now();
+    // codex r2: the most recent poll's live FOREIGN inflight identity. Handed
+    // to the ABORT cleanup so the aborted-anchor marker pins WHICH turn it was
+    // deferring on even when that row vanishes before the cleanup's own read.
+    let mut last_foreign_identity: Option<(u64, String)> = None;
 
     loop {
         // ---- Wait window: poll until finalized or backstop expiry. ----
         let cycle_start = tokio::time::Instant::now();
         let outcome = loop {
-            if let Some(view) = view_fn(&shared, &record).await
-                && prior_turn_finalized(view)
-            {
-                break WaitOutcome::Finalized;
+            if let Some(obs) = view_fn(&shared, &record).await {
+                if obs.foreign_inflight_identity.is_some() {
+                    last_foreign_identity = obs.foreign_inflight_identity;
+                }
+                if prior_turn_finalized(obs.view) {
+                    break WaitOutcome::Finalized;
+                }
             }
             if cycle_start.elapsed() >= PENDING_START_BACKSTOP {
-                let view = view_fn(&shared, &record).await;
-                break match view {
-                    Some(view) if backstop_claim_is_safe(view) => WaitOutcome::BackstopClaimSafe,
-                    _ => WaitOutcome::BackstopForeignInflightLive,
+                break match view_fn(&shared, &record).await {
+                    Some(obs) => {
+                        if obs.foreign_inflight_identity.is_some() {
+                            last_foreign_identity = obs.foreign_inflight_identity;
+                        }
+                        if backstop_claim_is_safe(obs.view) {
+                            WaitOutcome::BackstopClaimSafe
+                        } else {
+                            WaitOutcome::BackstopForeignInflightLive
+                        }
+                    }
+                    None => WaitOutcome::BackstopForeignInflightLive,
                 };
             }
             tokio::time::sleep(PENDING_START_POLL).await;
@@ -452,7 +706,12 @@ async fn run_worker(
                     // Surface an observability event and drop only the synthetic
                     // OWNERSHIP claim (the provider prompt was already submitted;
                     // the watcher/bridge still relays its output).
-                    tracing::error!(
+                    // #3296: WARN, not ERROR — this branch fires by definition
+                    // only when a FOREIGN inflight is live on the SAME channel,
+                    // i.e. the input was already submitted and usually merges
+                    // into the prior owner's turn (a normal outcome, not a
+                    // failure). The event key is load-bearing — never change it.
+                    tracing::warn!(
                         provider = %record.provider,
                         channel_id = record.channel_id,
                         tmux_session_name = %record.tmux_session_name,
@@ -460,8 +719,14 @@ async fn run_worker(
                         backstop_cycles,
                         waited_ms = worker_start.elapsed().as_millis(),
                         event = "tui_direct_pending_start.backstop_abort_foreign_inflight_live",
-                        "tui_direct_pending_start: prior inflight stayed LIVE across the backstop escalation budget; ABORTING the synthetic turn-start claim without overwriting the live prior turn (provider output still relays via the prior turn's owner)"
+                        "tui_direct_pending_start: prior inflight stayed LIVE across the backstop escalation budget; ABORTING the synthetic turn-start claim without overwriting the live prior turn — input already submitted; abort marker recorded, reconcile lands ✅ via prior-owner completion or ⚠ via TTL fallback (#3296)"
                     );
+                    // #3282/#3296: no claim will ever run for this anchor, so
+                    // the normal `⏳ → ✅` completion never fires — record the
+                    // durable aborted-anchor marker here (the anchor keeps its
+                    // ⏳; the watcher drain / TTL sweep own the reconcile),
+                    // pinning the last-view foreign identity (codex r2).
+                    abort_cleanup_fn(&shared, &record, last_foreign_identity.clone()).await;
                     delete(&record);
                     return;
                 }
@@ -492,6 +757,11 @@ async fn run_worker(
                 claim_attempts,
                 "tui_direct_pending_start: deferred synthetic turn-start claimed after prior turn finalized"
             );
+            // #3303: record the own-identity DeferredClaim marker BEFORE the
+            // durable record delete (a crash between the two re-claims on
+            // restart and re-records idempotently — the marker stem
+            // overwrites). Fail-open: nothing in there can fail the claim.
+            record_deferred_claim_marker_if_watcher_owned(&record);
             // Delete only AFTER a successful claim (P1-2). A crash between the
             // inflight save and this delete is healed on restart: the worker
             // re-runs and the claim adopts the matching anchor's existing
@@ -502,6 +772,7 @@ async fn run_worker(
 
         // Transient claim failure: do NOT delete (P1-2). Retry, bounded.
         claim_attempts = claim_attempts.saturating_add(1);
+        update_claim_attempt_count(&mut record, claim_attempts);
         if claim_attempts >= PENDING_START_MAX_CLAIM_ATTEMPTS {
             tracing::error!(
                 provider = %record.provider,
@@ -531,6 +802,113 @@ async fn run_worker(
     }
 }
 
+/// #3303 — after a SUCCESSFUL deferred claim, record a
+/// [`super::tui_direct_abort_marker`] marker of kind `DeferredClaim` pinned to
+/// the worker's OWN synthetic turn identity (`user_msg_id == anchor`, the
+/// freshly-claimed row's `started_at`).
+///
+/// Why: the claim hands the turn to the watcher, but the observed #3303
+/// failure modes (the claim seeded the relay cursor at EOF after a prior
+/// drain already consumed the response bytes, or the relay fails and a
+/// watchdog clears the row) mean NO terminal-commit pass ever flips the
+/// anchor's `⏳ → ✅` — an eternal hourglass with no reconcile owner. With the
+/// marker, the watcher chokepoint's drain covers it on the own turn's commit
+/// (`✅`, idempotent next to the normal completion), and the sweep bounds the
+/// never-committed case with the TTL `⚠`.
+///
+/// Guards (in order):
+/// * **SC3 scope gate** — record ONLY when the post-claim lease says the
+///   `TmuxWatcher` owns the relay: a BridgeAdapter-owned turn finalizes via
+///   the bridge WITHOUT the watcher chokepoint tombstone, so a marker would
+///   contradict its normal completion with a TTL `⚠`.
+/// * **Own-row guard** — the inflight row re-read at the record instant must
+///   BE this claim's synthetic turn (anchor + tmux session match); its
+///   `started_at` is the identity the marker pins (#3303 SC1: never the
+///   foreign prior turn — that tombstone is already durable at claim time and
+///   would false-`✅` instantly).
+/// * **Fail-open** — every miss above (and a failed marker write) only warns:
+///   the claim, the durable-record delete, and the turn proceed exactly as
+///   before #3303.
+fn record_deferred_claim_marker_if_watcher_owned(record: &TuiDirectPendingStart) {
+    if record.anchor_message_id == 0 {
+        return; // I5: a zero anchor id could never be reconciled (record() rejects it too)
+    }
+    let lease = crate::services::tui_prompt_dedupe::external_input_relay_lease(
+        &record.provider,
+        &record.tmux_session_name,
+        record.channel_id,
+    );
+    let relay_owner = lease.map(|lease| lease.relay_owner);
+    if relay_owner != Some(crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::TmuxWatcher)
+    {
+        tracing::debug!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            tmux_session_name = %record.tmux_session_name,
+            anchor_message_id = record.anchor_message_id,
+            relay_owner = ?relay_owner,
+            "tui_direct_pending_start: deferred-claim marker skipped — turn is not watcher-owned, the watcher chokepoint will never tombstone it (#3303 SC3)"
+        );
+        return;
+    }
+    let Some(provider) = crate::services::provider::ProviderKind::from_str(&record.provider) else {
+        tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            anchor_message_id = record.anchor_message_id,
+            "tui_direct_pending_start: unparseable provider; deferred-claim marker skipped (fail-open, #3303)"
+        );
+        return;
+    };
+    let Some(row) = super::inflight::load_inflight_state(&provider, record.channel_id) else {
+        tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            anchor_message_id = record.anchor_message_id,
+            "tui_direct_pending_start: no inflight row at the record instant after a successful claim; deferred-claim marker skipped (fail-open, #3303)"
+        );
+        return;
+    };
+    let row_is_own_turn = row.user_msg_id == record.anchor_message_id
+        && row.tmux_session_name.as_deref() == Some(record.tmux_session_name.as_str());
+    if !row_is_own_turn {
+        tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            tmux_session_name = %record.tmux_session_name,
+            anchor_message_id = record.anchor_message_id,
+            row_user_msg_id = row.user_msg_id,
+            row_tmux_session_name = ?row.tmux_session_name,
+            "tui_direct_pending_start: inflight row is not this claim's own synthetic turn; deferred-claim marker skipped (fail-open, #3303)"
+        );
+        return;
+    }
+    match super::tui_direct_abort_marker::record_for_deferred_claim(
+        record.provider.clone(),
+        record.channel_id,
+        record.anchor_message_id,
+        record.tmux_session_name.clone(),
+        (record.anchor_message_id, row.started_at),
+    ) {
+        Ok(marker) => tracing::info!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            tmux_session_name = %record.tmux_session_name,
+            anchor_message_id = record.anchor_message_id,
+            own_started_at = ?marker.foreign_started_at,
+            tombstone_covered = marker.covered_at_ms.is_some(),
+            "tui_direct_pending_start: deferred-claim marker recorded pinning the OWN synthetic turn — its commit drains ⏳ → ✅, a never-committed turn converges to the bounded sweep ⚠ (#3303)"
+        ),
+        Err(error) => tracing::warn!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            anchor_message_id = record.anchor_message_id,
+            error = %error,
+            "tui_direct_pending_start: failed to persist the deferred-claim marker; claim proceeds without it (fail-open — pre-#3303 behavior, the anchor ⏳ may linger) (#3303)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +921,26 @@ mod tests {
     fn worker_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
         LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    struct EnvReset(Option<std::ffi::OsString>);
+
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    /// Wrap a pure view into the worker's per-poll observation (no foreign
+    /// identity — the common already-finalized case).
+    fn obs(view: PriorTurnView) -> PriorTurnObservation {
+        PriorTurnObservation {
+            view,
+            foreign_inflight_identity: None,
+        }
     }
 
     fn base_view() -> PriorTurnView {
@@ -585,6 +983,46 @@ mod tests {
             prior_turn_finalized(view),
             "a crash-restored inflight for OUR OWN anchor is adopted, not waited on"
         );
+    }
+
+    /// #3296 codex r3 (RED ③ — pure): the ABORT cleanup pins the worker's
+    /// LAST-VIEW identity, never the cleanup-instant row, when both exist.
+    /// RED pre-r3: the relay hook preferred the live row — when the final
+    /// poll's foreign row terminal-committed (tombstone + clear) and a
+    /// SUCCESSOR row appeared before the cleanup's read, the marker pinned
+    /// the successor: the genuine prior commit's tombstone never matched (no
+    /// `✅` from the real answer, bounded `⚠` instead) and the successor's own
+    /// commit could false-`✅` the possibly-unanswered anchor.
+    #[test]
+    fn abort_pin_prefers_last_view_identity_over_successor_row() {
+        let last_view = Some((777_u64, "2026-06-10 12:00:00".to_string()));
+        let successor = Some((888_u64, "2026-06-10 12:01:00".to_string()));
+        assert_eq!(
+            pin_abort_foreign_identity(last_view.clone(), || successor.clone()),
+            last_view,
+            "last-view is PRIMARY: a successor row must never repoint the pin (RED ③)"
+        );
+        // The primary path must not even READ the current row — the
+        // cleanup-instant read is exactly what races the successor.
+        let row_read = std::cell::Cell::new(false);
+        assert_eq!(
+            pin_abort_foreign_identity(last_view.clone(), || {
+                row_read.set(true);
+                successor.clone()
+            }),
+            last_view
+        );
+        assert!(
+            !row_read.get(),
+            "the row read must be skipped when a last-view identity exists"
+        );
+        // No-view fallback: the cleanup-instant row is the only evidence left
+        // (conservative best-effort — see `pin_abort_foreign_identity`).
+        assert_eq!(
+            pin_abort_foreign_identity(None, || successor.clone()),
+            successor
+        );
+        assert_eq!(pin_abort_foreign_identity(None, || None), None);
     }
 
     #[test]
@@ -640,6 +1078,43 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_presence_clear_keeps_durable_record() {
+        let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        reset_present_for_tests();
+        let mut rec = record("claude", 70, 700);
+        rec.attempt_count = PENDING_START_MAX_CLAIM_ATTEMPTS;
+        persist(&rec).unwrap();
+
+        assert!(pending_synthetic_start_present("claude", 70));
+        assert!(
+            pending_synthetic_start_abandoned("claude", 70),
+            "a capped durable attempt_count with no active worker is an abandoned claim"
+        );
+        assert!(clear_abandoned_synthetic_start_presence("claude", 70));
+        assert!(
+            !pending_synthetic_start_present("claude", 70),
+            "the #3333 clear removes only the in-memory gate"
+        );
+        assert_eq!(
+            load_all()
+                .into_iter()
+                .filter(|record| record.provider == "claude" && record.channel_id == 70)
+                .count(),
+            1,
+            "the durable record must remain for restart retry"
+        );
+
+        reset_present_for_tests();
+    }
+
+    #[test]
     fn record_roundtrips_through_json() {
         let record = TuiDirectPendingStart {
             provider: "claude".to_string(),
@@ -660,6 +1135,35 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         let back: TuiDirectPendingStart = serde_json::from_str(&json).unwrap();
         assert_eq!(record, back);
+    }
+
+    /// #3282 test double for the ABORT-path anchor `⏳` cleanup, following the
+    /// `ViewFn`/`ClaimFn` boxed-closure convention. Records each invocation —
+    /// and the last-view foreign identity it received (codex r2) — so a test
+    /// can pin WHEN the cleanup fires (terminal backstop ABORT only) and what
+    /// identity the worker threaded, and when it must NOT fire (successful
+    /// claim — the normal `⏳ → ✅` completion owns the anchor; retry
+    /// exhaustion — the record is retained for restart).
+    type RecordedForeignIdentity = Arc<Mutex<Option<Option<(u64, String)>>>>;
+    fn recording_abort_cleanup() -> (
+        AbortCleanupFn,
+        Arc<std::sync::atomic::AtomicU32>,
+        RecordedForeignIdentity,
+    ) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = Arc::new(AtomicU32::new(0));
+        let identity: RecordedForeignIdentity = Arc::new(Mutex::new(None));
+        let calls_for_fn = calls.clone();
+        let identity_for_fn = identity.clone();
+        let cleanup: AbortCleanupFn = Box::new(move |_shared, _record, foreign| {
+            let calls = calls_for_fn.clone();
+            let identity = identity_for_fn.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                *identity.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(foreign);
+            })
+        });
+        (cleanup, calls, identity)
     }
 
     fn record(provider: &str, channel_id: u64, anchor: u64) -> TuiDirectPendingStart {
@@ -714,14 +1218,14 @@ mod tests {
         let a_view: ViewFn = Box::new(move |_shared, _record| {
             let undrained = a_undrained_for_view.clone();
             Box::pin(async move {
-                Some(PriorTurnView {
+                Some(obs(PriorTurnView {
                     // turn1 inflight present until drained.
                     inflight_present: undrained.load(Ordering::SeqCst),
                     inflight_is_own_anchor: false,
                     mailbox_blocking_turn_present: false,
                     mailbox_turn_is_own_anchor: false,
                     runtime_binding_present: true,
-                })
+                }))
             })
         });
         let a_undrained_for_claim = a_prior_undrained.clone();
@@ -748,19 +1252,26 @@ mod tests {
             pending_synthetic_start_present("claude", 1),
             "A's pending start gates the watcher/idle-queue immediately"
         );
-        let a_handle = tokio::spawn(run_worker(shared.clone(), rec_a, a_view, a_claim));
+        let (a_cleanup, a_cleanup_calls, _) = recording_abort_cleanup();
+        let a_handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec_a,
+            a_view,
+            a_claim,
+            a_cleanup,
+        ));
 
         // ---- Channel B: prior turn already finalized → relays immediately. ----
         let b_claimed = Arc::new(AtomicBool::new(false));
         let b_view: ViewFn = Box::new(move |_shared, _record| {
             Box::pin(async move {
-                Some(PriorTurnView {
+                Some(obs(PriorTurnView {
                     inflight_present: false,
                     inflight_is_own_anchor: false,
                     mailbox_blocking_turn_present: false,
                     mailbox_turn_is_own_anchor: false,
                     runtime_binding_present: true,
-                })
+                }))
             })
         });
         let b_claimed_for_claim = b_claimed.clone();
@@ -773,7 +1284,14 @@ mod tests {
         });
         let rec_b = record("claude", 2, 22);
         persist(&rec_b).unwrap();
-        let b_handle = tokio::spawn(run_worker(shared.clone(), rec_b, b_view, b_claim));
+        let (b_cleanup, b_cleanup_calls, _) = recording_abort_cleanup();
+        let b_handle = tokio::spawn(run_worker(
+            shared.clone(),
+            rec_b,
+            b_view,
+            b_claim,
+            b_cleanup,
+        ));
 
         // B is on a DIFFERENT channel lock; it must finish without waiting for A.
         b_handle.await.unwrap();
@@ -806,6 +1324,12 @@ mod tests {
         assert!(
             !pending_synthetic_start_present("claude", 1),
             "A's pending start cleared after the claim (gate releases)"
+        );
+        assert_eq!(
+            a_cleanup_calls.load(Ordering::SeqCst) + b_cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "#3282: a SUCCESSFUL claim must never run the abort reaction cleanup — \
+             the normal watcher/recovery ⏳ → ✅ completion owns these anchors"
         );
         reset_present_for_tests();
     }
@@ -875,14 +1399,19 @@ mod tests {
         let shared = super::super::make_shared_data_for_tests();
 
         // A foreign prior inflight is live FOREVER (never drains, never ours).
+        // Every poll observes its identity — the worker must thread the
+        // LAST-VIEW identity into the abort cleanup (codex r2).
         let view: ViewFn = Box::new(move |_shared, _record| {
             Box::pin(async move {
-                Some(PriorTurnView {
-                    inflight_present: true,
-                    inflight_is_own_anchor: false,
-                    mailbox_blocking_turn_present: true,
-                    mailbox_turn_is_own_anchor: false,
-                    runtime_binding_present: true,
+                Some(PriorTurnObservation {
+                    view: PriorTurnView {
+                        inflight_present: true,
+                        inflight_is_own_anchor: false,
+                        mailbox_blocking_turn_present: true,
+                        mailbox_turn_is_own_anchor: false,
+                        runtime_binding_present: true,
+                    },
+                    foreign_inflight_identity: Some((777, "2026-06-10 12:00:00".to_string())),
                 })
             })
         });
@@ -901,7 +1430,9 @@ mod tests {
         persist(&rec).unwrap();
         assert!(pending_synthetic_start_present("claude", 10));
 
-        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim));
+        let (abort_cleanup, abort_cleanup_calls, abort_cleanup_identity) =
+            recording_abort_cleanup();
+        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
 
         // Advance through the full escalation budget of backstop windows.
         for _ in 0..(PENDING_START_MAX_BACKSTOP_CYCLES + 1) {
@@ -922,6 +1453,27 @@ mod tests {
             "after the escalation budget the worker ABORTS and drops only the \
              ownership record (no prompt resubmit). RED if abort leaks the record \
              or never fires."
+        );
+        assert_eq!(
+            abort_cleanup_calls.load(Ordering::SeqCst),
+            1,
+            "#3282/#3296: the terminal backstop ABORT must run the abort \
+             reconcile hook EXACTLY ONCE (records the aborted-anchor marker — \
+             no claim will ever drive the normal ⏳ → ✅ completion for this \
+             anchor). RED if the ABORT branch skips abort_cleanup_fn (the \
+             hourglass would linger with no reconcile owner)."
+        );
+        assert_eq!(
+            abort_cleanup_identity
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+            Some(Some((777, "2026-06-10 12:00:00".to_string()))),
+            "codex r2: the worker must thread the LAST-VIEW foreign inflight \
+             identity into the cleanup, so a row that vanishes before the \
+             cleanup's own read still yields an identity-pinned marker — RED \
+             if the hook receives None (the marker would be sweep-only and \
+             tombstone 대조 could never ✅ it)"
         );
         reset_present_for_tests();
     }
@@ -946,7 +1498,7 @@ mod tests {
 
         // Prior turn is finalized immediately — the wait window is not the point.
         let view: ViewFn =
-            Box::new(move |_shared, _record| Box::pin(async move { Some(base_view()) }));
+            Box::new(move |_shared, _record| Box::pin(async move { Some(obs(base_view())) }));
 
         // First two claims fail (transient), the third succeeds.
         let attempts = Arc::new(AtomicU32::new(0));
@@ -961,7 +1513,8 @@ mod tests {
 
         let rec = record("claude", 11, 111);
         persist(&rec).unwrap();
-        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim));
+        let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
+        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
 
         // Drive the retry backoffs. After the first false, assert the record is
         // STILL present (RETAINED) before the eventual success deletes it.
@@ -989,6 +1542,12 @@ mod tests {
             !pending_synthetic_start_present("claude", 11),
             "after the claim finally succeeded the record is deleted (gate releases)"
         );
+        assert_eq!(
+            abort_cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "#3282: transient claim retries that eventually SUCCEED must not run \
+             the abort reaction cleanup — the anchor's ⏳ → ✅ completes normally"
+        );
         reset_present_for_tests();
     }
 
@@ -1006,10 +1565,17 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
         reset_present_for_tests();
         let shared = super::super::make_shared_data_for_tests();
         let view: ViewFn =
-            Box::new(move |_shared, _record| Box::pin(async move { Some(base_view()) }));
+            Box::new(move |_shared, _record| Box::pin(async move { Some(obs(base_view())) }));
 
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_for_fn = attempts.clone();
@@ -1023,7 +1589,8 @@ mod tests {
 
         let rec = record("claude", 12, 122);
         persist(&rec).unwrap();
-        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim));
+        let (abort_cleanup, abort_cleanup_calls, _) = recording_abort_cleanup();
+        let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
 
         for _ in 0..(PENDING_START_MAX_CLAIM_ATTEMPTS + 2) {
             tokio::time::advance(PENDING_START_CLAIM_RETRY_BACKOFF + PENDING_START_POLL).await;
@@ -1041,6 +1608,100 @@ mod tests {
             "on retry exhaustion the record is RETAINED for restart re-attempt — \
              RED if the worker deletes after exhausting claims (turn-loss)."
         );
+        assert!(
+            pending_synthetic_start_abandoned("claude", 12),
+            "after the worker exits with retry exhaustion, the durable capped \
+             attempt_count plus no active worker identifies the record as abandoned"
+        );
+        let retained = records_for_channel("claude", 12);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            retained[0].attempt_count, PENDING_START_MAX_CLAIM_ATTEMPTS,
+            "retry exhaustion must be persisted so queue_io can distinguish \
+             abandoned claims from live workers"
+        );
+        assert_eq!(
+            abort_cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "#3282: claim-retry exhaustion RETAINS the record for a restart \
+             re-attempt — the anchor's ⏳ must stay (the restored worker may still \
+             claim and complete it normally), so the abort cleanup must NOT fire"
+        );
+        reset_present_for_tests();
+    }
+
+    // Sync test + explicit block_on: the std-mutex test-env guards live only in
+    // this sync scope and never span an await, so no await_holding_lock allow is
+    // needed (#3034 ratchet stays frozen at its baseline).
+    #[test]
+    fn live_worker_with_capped_attempt_count_is_not_abandoned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _guard = worker_test_lock();
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _env = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        reset_present_for_tests();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("test runtime");
+        rt.block_on(async {
+            let shared = super::super::make_shared_data_for_tests();
+            let finalized = Arc::new(AtomicBool::new(false));
+            let finalized_for_view = finalized.clone();
+            let view: ViewFn = Box::new(move |_shared, _record| {
+                let finalized = finalized_for_view.clone();
+                Box::pin(async move {
+                    let view = if finalized.load(Ordering::SeqCst) {
+                        base_view()
+                    } else {
+                        PriorTurnView {
+                            inflight_present: true,
+                            inflight_is_own_anchor: false,
+                            mailbox_blocking_turn_present: true,
+                            mailbox_turn_is_own_anchor: false,
+                            runtime_binding_present: true,
+                        }
+                    };
+                    Some(obs(view))
+                })
+            });
+            let claim: ClaimFn = Box::new(move |_shared, _record| Box::pin(async move { true }));
+
+            let mut rec = record("claude", 13, 133);
+            rec.attempt_count = PENDING_START_MAX_CLAIM_ATTEMPTS;
+            persist(&rec).unwrap();
+            let (abort_cleanup, _, _) = recording_abort_cleanup();
+            let handle = tokio::spawn(run_worker(shared.clone(), rec, view, claim, abort_cleanup));
+
+            tokio::task::yield_now().await;
+            assert!(
+                !pending_synthetic_start_abandoned("claude", 13),
+                "a live worker must protect a capped durable record from being \
+                 treated as abandoned during restart re-claim"
+            );
+            assert!(
+                !clear_abandoned_synthetic_start_presence("claude", 13),
+                "presence clear must refuse while a worker is active"
+            );
+
+            finalized.store(true, Ordering::SeqCst);
+            tokio::time::advance(PENDING_START_POLL * 2).await;
+            tokio::task::yield_now().await;
+            handle.await.unwrap();
+            assert!(
+                !pending_synthetic_start_present("claude", 13),
+                "the live worker's successful claim clears the presence through the normal delete path"
+            );
+        });
+
         reset_present_for_tests();
     }
 
@@ -1109,6 +1770,277 @@ mod tests {
         assert_eq!(restored_first.prompt_text, first.prompt_text);
         assert_eq!(restored_first.channel_id, 50);
 
+        reset_present_for_tests();
+    }
+
+    // ====================================================================
+    // #3303 — DeferredClaim marker hook on the SUCCESSFUL claim path.
+    // Each test drives the REAL `run_worker` on a current-thread runtime via
+    // `block_on` on THIS thread (so the marker store's thread-local test root
+    // resolves inside the worker, and no lock guard is held across an await
+    // point — the await_holding_lock ratchet stays frozen), against a REAL
+    // on-disk inflight row under a temp AGENTDESK_ROOT_DIR and a REAL
+    // in-memory relay lease.
+    // ====================================================================
+
+    /// RAII rig: AGENTDESK_ROOT_DIR → tempdir (real inflight store) + the
+    /// marker store's thread-local root override. Construct ONLY while
+    /// holding `worker_test_lock()` AND the crate env lock (in that order —
+    /// the `durable_restore_roundtrip_loads_fifo_order` convention).
+    struct DeferredClaimMarkerRig {
+        _temp: tempfile::TempDir,
+        prev_env: Option<std::ffi::OsString>,
+    }
+
+    impl DeferredClaimMarkerRig {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let prev_env = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+            super::super::tui_direct_abort_marker::set_test_root_override(Some(
+                temp.path().to_path_buf(),
+            ));
+            Self {
+                _temp: temp,
+                prev_env,
+            }
+        }
+    }
+
+    impl Drop for DeferredClaimMarkerRig {
+        fn drop(&mut self) {
+            super::super::tui_direct_abort_marker::set_test_root_override(None);
+            match self.prev_env.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    fn finalized_view() -> ViewFn {
+        Box::new(|_shared, _record| Box::pin(async move { Some(obs(base_view())) }))
+    }
+
+    fn claim_succeeds() -> ClaimFn {
+        Box::new(|_shared, _record| Box::pin(async move { true }))
+    }
+
+    fn record_lease(
+        provider: &str,
+        tmux: &str,
+        channel_id: u64,
+        owner: crate::services::tui_prompt_dedupe::ExternalInputRelayOwner,
+    ) {
+        let mut lease = crate::services::tui_prompt_dedupe::ExternalInputRelayLease::unassigned(
+            Some(channel_id),
+        );
+        lease.relay_owner = owner;
+        let _ = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
+            provider, tmux, lease,
+        );
+    }
+
+    /// Save the freshly-claimed OWN synthetic inflight row (the state the
+    /// claim leaves behind: `user_msg_id == anchor`). Returns its
+    /// `started_at` — the identity component the marker must pin.
+    fn save_own_inflight_row(channel_id: u64, anchor: u64, tmux: &str) -> String {
+        let state = super::super::inflight::InflightTurnState::new(
+            crate::services::provider::ProviderKind::Claude,
+            channel_id,
+            None,
+            0,
+            anchor,
+            0,
+            "/loop tick".to_string(),
+            None,
+            Some(tmux.to_string()),
+            None,
+            None,
+            0,
+        );
+        super::super::inflight::save_inflight_state(&state).unwrap();
+        state.started_at
+    }
+
+    fn current_thread_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// #3303 R1 (the bug): a SUCCESSFUL watcher-owned deferred claim must
+    /// record a `DeferredClaim` marker pinned to the OWN synthetic turn
+    /// identity (anchor id + the claimed row's `started_at`) before the
+    /// durable record is deleted. RED pre-#3303: the success path recorded
+    /// NOTHING — a claimed turn whose commit pass never ran (EOF-seeded
+    /// cursor after a prior drain consumed the bytes, or relay failure +
+    /// watchdog clear) kept its `⏳` forever with no reconcile owner. The
+    /// success path must STILL never run the abort cleanup (#3282 contract).
+    #[test]
+    fn successful_watcher_owned_claim_records_own_identity_marker() {
+        use std::sync::atomic::Ordering;
+
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _rig = DeferredClaimMarkerRig::new();
+        reset_present_for_tests();
+        let shared = super::super::make_shared_data_for_tests();
+
+        let rec = record("claude", 21, 2100);
+        record_lease(
+            "claude",
+            &rec.tmux_session_name,
+            21,
+            crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::TmuxWatcher,
+        );
+        let own_started_at = save_own_inflight_row(21, 2100, &rec.tmux_session_name);
+        persist(&rec).unwrap();
+
+        let (cleanup, cleanup_calls, _) = recording_abort_cleanup();
+        current_thread_rt().block_on(run_worker(
+            shared,
+            rec,
+            finalized_view(),
+            claim_succeeds(),
+            cleanup,
+        ));
+
+        let markers = super::super::tui_direct_abort_marker::load_for_channel("claude", 21);
+        assert_eq!(
+            markers.len(),
+            1,
+            "RED pre-#3303: the success path recorded no marker — the anchor's \
+             ⏳ had no reconcile owner when the commit pass never ran"
+        );
+        let marker = &markers[0];
+        assert_eq!(
+            marker.origin,
+            super::super::tui_direct_abort_marker::MarkerOrigin::DeferredClaim
+        );
+        assert_eq!(marker.anchor_message_id, 2100);
+        assert_eq!(
+            marker.foreign_user_msg_id,
+            Some(2100),
+            "the pin is the OWN synthetic turn — never the foreign prior (SC1)"
+        );
+        assert_eq!(
+            marker.foreign_started_at.as_deref(),
+            Some(own_started_at.as_str()),
+            "started_at must be re-read from the freshly-claimed row"
+        );
+        assert_eq!(marker.tmux_session_name, "tmux-21");
+        assert_eq!(marker.covered_at_ms, None);
+        assert_eq!(
+            cleanup_calls.load(Ordering::SeqCst),
+            0,
+            "#3282: a successful claim must never run the abort cleanup"
+        );
+        assert!(
+            !pending_synthetic_start_present("claude", 21),
+            "the durable record is still deleted after the marker hook (fail-open ordering)"
+        );
+        reset_present_for_tests();
+    }
+
+    /// #3303 R7 (SC3 scope gate): a successful claim whose post-claim lease
+    /// resolved to the BridgeAdapter records NO marker — bridge-owned turns
+    /// finalize via `turn_bridge` WITHOUT the watcher chokepoint tombstone,
+    /// so a marker would contradict a normally-completed turn with a TTL `⚠`.
+    /// RED if the hook records unconditionally.
+    #[test]
+    fn bridge_owned_claim_records_no_marker() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _rig = DeferredClaimMarkerRig::new();
+        reset_present_for_tests();
+        let shared = super::super::make_shared_data_for_tests();
+
+        let rec = record("claude", 22, 2200);
+        record_lease(
+            "claude",
+            &rec.tmux_session_name,
+            22,
+            crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::BridgeAdapter,
+        );
+        // Even with a perfectly matching own row, the owner gate must win.
+        let _ = save_own_inflight_row(22, 2200, &rec.tmux_session_name);
+        persist(&rec).unwrap();
+
+        let (cleanup, _calls, _) = recording_abort_cleanup();
+        current_thread_rt().block_on(run_worker(
+            shared,
+            rec,
+            finalized_view(),
+            claim_succeeds(),
+            cleanup,
+        ));
+
+        assert!(
+            super::super::tui_direct_abort_marker::load_for_channel("claude", 22).is_empty(),
+            "bridge-owned turns must record no DeferredClaim marker (SC3)"
+        );
+        assert!(!pending_synthetic_start_present("claude", 22));
+        reset_present_for_tests();
+    }
+
+    /// #3303 R8 (restart idempotence, SC2): an abnormal restart can leave a
+    /// stale ABORT marker on this anchor's stem; the successful re-claim must
+    /// OVERWRITE it with the refreshed own-identity DeferredClaim marker (the
+    /// turn is adopted and live — one stem can never hold two markers).
+    #[test]
+    fn reclaim_overwrites_stale_abort_marker_with_own_identity() {
+        let _guard = worker_test_lock();
+        let _env_lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _rig = DeferredClaimMarkerRig::new();
+        reset_present_for_tests();
+        let shared = super::super::make_shared_data_for_tests();
+
+        let rec = record("claude", 23, 2300);
+        super::super::tui_direct_abort_marker::record_for_abort(
+            "claude".into(),
+            23,
+            2300,
+            rec.tmux_session_name.clone(),
+            Some((999, "2026-06-10 12:00:00".into())),
+        )
+        .unwrap();
+        record_lease(
+            "claude",
+            &rec.tmux_session_name,
+            23,
+            crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::TmuxWatcher,
+        );
+        let own_started_at = save_own_inflight_row(23, 2300, &rec.tmux_session_name);
+        persist(&rec).unwrap();
+
+        let (cleanup, _calls, _) = recording_abort_cleanup();
+        current_thread_rt().block_on(run_worker(
+            shared,
+            rec,
+            finalized_view(),
+            claim_succeeds(),
+            cleanup,
+        ));
+
+        let markers = super::super::tui_direct_abort_marker::load_for_channel("claude", 23);
+        assert_eq!(markers.len(), 1, "one stem, one marker (SC2)");
+        assert_eq!(
+            markers[0].origin,
+            super::super::tui_direct_abort_marker::MarkerOrigin::DeferredClaim,
+            "the re-claim must replace the stale abort marker"
+        );
+        assert_eq!(markers[0].foreign_user_msg_id, Some(2300));
+        assert_eq!(
+            markers[0].foreign_started_at.as_deref(),
+            Some(own_started_at.as_str())
+        );
         reset_present_for_tests();
     }
 }
