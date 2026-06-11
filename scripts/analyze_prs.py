@@ -26,7 +26,7 @@ def head_commit_timestamp(pr):
     return parse_github_timestamp(timestamp)
 
 print("Fetching PRs...")
-prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid")
+prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
 
 if gh_code != 0 or not prs_json:
     print("Warning: `gh` CLI not available or failed. Skipping PR analysis.")
@@ -39,13 +39,15 @@ except Exception as e:
     print(prs_json)
     exit(1)
 
-inventory_refresh_count = 0
+inventory_refresh_prs = []
 now = datetime.now(timezone.utc)
 
 for pr in prs:
     num = pr['number']
     title = pr['title']
+    body = pr.get('body', '')
     head_commit_at = head_commit_timestamp(pr)
+    head_ref = pr.get('headRefName', 'unknown')
     print(f"\n# {num} - {title}")
 
     # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
@@ -58,6 +60,15 @@ for pr in prs:
     if is_stale:
         print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
 
+    # Check for missing required sections
+    has_fingerprint = "WorkFingerprint" in body
+    has_verification = "Verification commands" in body or "verification" in body.lower()
+
+    if not has_fingerprint:
+        print(f"  [!] MISSING FINGERPRINT: PR body is missing 'WorkFingerprint' section.")
+    if not has_verification:
+        print(f"  [!] MISSING VERIFICATION: PR body is missing verification commands/results.")
+
     # PR #214/#215 lesson: no-change PRs must have 0 changed files
     if "no-change" in title.lower():
         files_json, _ = run(f"gh pr view {num} --repo kunkunGames/AgentDesk --json files")
@@ -68,13 +79,18 @@ for pr in prs:
                     print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
                 else:
                     print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
+
+                    # Verify it mentions the overlap
+                    if "overlap" not in body.lower() and "duplicate" not in body.lower():
+                        print(f"  [!] INCOMPLETE NO-CHANGE PR: Empty no-change PR must explicitly list the exact overlapping PR numbers and branches in the body.")
         except Exception:
             pass
 
     # PR #199/#200/#201 lesson: check for multiple inventory refreshes
     if "inventory" in title.lower() and "refresh" in title.lower():
-        inventory_refresh_count += 1
+        inventory_refresh_prs.append(f"PR #{num} (branch: {head_ref})")
 
-if inventory_refresh_count > 1:
-    print("\n[!] WARNING: Multiple open inventory refresh PRs detected. Ensure strict duplicate-PR guard is followed.")
+if len(inventory_refresh_prs) > 1:
+    print(f"\n[!] WARNING: Multiple open inventory refresh PRs detected: {', '.join(inventory_refresh_prs)}")
+    print("Ensure strict duplicate-PR guard is followed.")
     exit(1)
