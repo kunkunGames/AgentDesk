@@ -1143,26 +1143,40 @@ async fn finalize_activate_run_and_build_response(
     run_log_ctx: &AutoQueueLogContext<'_>,
     dispatched: Vec<serde_json::Value>,
 ) -> Result<ActivateResponse, ActivateResponse> {
-    let remaining = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*)::BIGINT
+    let row = match sqlx::query(
+        "SELECT
+             COUNT(*)::BIGINT AS remaining,
+             COUNT(CASE WHEN status = 'dispatched' THEN 1 END)::BIGINT AS still_dispatched,
+             COUNT(DISTINCT CASE WHEN status = 'dispatched' THEN COALESCE(thread_group, 0) END)::BIGINT AS active_groups,
+             COUNT(DISTINCT CASE WHEN status = 'pending' THEN COALESCE(thread_group, 0) END)::BIGINT AS pending_groups
          FROM auto_queue_entries
          WHERE run_id = $1
-           AND status IN ('pending', 'dispatched')",
+           AND status IN ('pending', 'dispatched')"
     )
     .bind(run_id)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     {
-        Ok(value) => value,
+        Ok(Some(row)) => row,
+        Ok(None) => return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("postgres returned no rows when counting run {}", run_id)})),
+        )),
         Err(error) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
-                    json!({"error": format!("count postgres remaining entries for {run_id}: {error}")}),
+                    json!({"error": format!("count postgres entries for {run_id}: {error}")}),
                 ),
             ));
         }
     };
+
+    let remaining: i64 = sqlx::Row::try_get(&row, "remaining").unwrap_or(0);
+    let still_dispatched: i64 = sqlx::Row::try_get(&row, "still_dispatched").unwrap_or(0);
+    let active_group_count: i64 = sqlx::Row::try_get(&row, "active_groups").unwrap_or(0);
+    let pending_group_count: i64 = sqlx::Row::try_get(&row, "pending_groups").unwrap_or(0);
+
     if remaining == 0 {
         if let Err(error) = crate::db::auto_queue::release_run_slots_pg(pool, run_id).await {
             crate::auto_queue_log!(
@@ -1174,26 +1188,6 @@ async fn finalize_activate_run_and_build_response(
                 error
             );
         }
-        let still_dispatched = match sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)::BIGINT
-             FROM auto_queue_entries
-             WHERE run_id = $1
-               AND status = 'dispatched'",
-        )
-        .bind(run_id)
-        .fetch_one(pool)
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({"error": format!("count postgres dispatched entries for {run_id}: {error}")}),
-                    ),
-                ));
-            }
-        };
         if still_dispatched == 0
             && let Err(error) = sqlx::query(
                 "UPDATE auto_queue_runs
@@ -1216,47 +1210,6 @@ async fn finalize_activate_run_and_build_response(
             );
         }
     }
-
-    let active_group_count = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT COALESCE(thread_group, 0))::BIGINT
-         FROM auto_queue_entries
-         WHERE run_id = $1
-           AND status = 'dispatched'",
-    )
-    .bind(run_id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"error": format!("count postgres active groups for {run_id}: {error}")}),
-                ),
-            ));
-        }
-    };
-    let pending_group_count = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(DISTINCT COALESCE(thread_group, 0))::BIGINT
-         FROM auto_queue_entries
-         WHERE run_id = $1
-           AND status = 'pending'",
-    )
-    .bind(run_id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"error": format!("count postgres pending groups for {run_id}: {error}")}),
-                ),
-            ));
-        }
-    };
 
     // #2034: surface active_turn_count (impl + review + rework + create-pr,
     // excluding phase-gate sidecar dispatches) so the dashboard and ops
