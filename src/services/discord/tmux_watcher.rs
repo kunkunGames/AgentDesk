@@ -32,9 +32,14 @@ use self::completion_gate::*;
 mod commit_decisions;
 
 use self::commit_decisions::*;
+
+#[path = "tmux_watcher/placeholder_reclaim.rs"]
+mod placeholder_reclaim;
+
 pub(in crate::services::discord) use self::completion_gate::{
     TuiCompletionGateOutcome, run_tui_completion_gate,
 };
+use self::placeholder_reclaim::*;
 
 fn adopt_watcher_terminal_message_ids_from_inflight(
     placeholder_msg_id: &mut Option<serenity::MessageId>,
@@ -2986,8 +2991,16 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     // guard can skip it — the recurring orphan source. Committed turns
                     // null out `status_panel_msg_id` right after completion, so a
                     // finalized panel is never deleted here.
+                    // #3351: reclaim the turn's stuck relay placeholder alongside the
+                    // panel (still-placeholder gated; real responses never deleted).
+                    let tick_placeholder_reclaim = watcher_should_reclaim_orphan_turn_placeholder(
+                        turn_is_external_input_for_session,
+                        placeholder_msg_id,
+                        !full_response.trim().is_empty(),
+                        &last_edit_text,
+                    );
                     if turn_is_external_input_for_session
-                        && status_panel_msg_id.is_some()
+                        && (status_panel_msg_id.is_some() || tick_placeholder_reclaim)
                         && watcher_external_input_turn_abandoned(
                             &watcher_provider,
                             channel_id,
@@ -3007,6 +3020,19 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             turn_is_external_input_for_session,
                         )
                         .await;
+                        if tick_placeholder_reclaim {
+                            reclaim_orphan_external_input_placeholder(
+                                &http,
+                                &shared,
+                                channel_id,
+                                &mut placeholder_msg_id,
+                                &mut placeholder_from_restored_inflight,
+                                &mut last_edit_text,
+                                &watcher_provider,
+                                &tmux_session_name,
+                            )
+                            .await;
+                        }
                     }
 
                     // Headless silent trigger (metadata.silent=true): skip both
@@ -3830,6 +3856,26 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             );
                             false
                         }
+                    } else if watcher_should_reclaim_orphan_turn_placeholder(
+                        turn_is_external_input_for_session,
+                        placeholder_msg_id,
+                        !full_response.trim().is_empty(),
+                        &last_edit_text,
+                    ) {
+                        // #3351 (codex r2 #1): route the restored placeholder through the
+                        // gated reclaim instead of stranding it; transient failure defers
+                        // finalization like the panel guard above.
+                        reclaim_orphan_external_input_placeholder(
+                            &http,
+                            &shared,
+                            channel_id,
+                            &mut placeholder_msg_id,
+                            &mut placeholder_from_restored_inflight,
+                            &mut last_edit_text,
+                            &watcher_provider,
+                            &tmux_session_name,
+                        )
+                        .await
                     } else {
                         let _ = placeholder_msg_id.take();
                         placeholder_from_restored_inflight = false;
@@ -5095,8 +5141,18 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         // its panel — deleting it here would erase a panel that is about to
         // complete. Stopped/abandoned such turns are still reclaimed via the
         // abandon arm.
-        let terminal_panel_reclaim_committed = if turn_is_external_input_for_session
-            && status_panel_msg_id.is_some()
+        // #3351: same-turn relay placeholder reclaim rides the identical orphan
+        // context; gated so a placeholder already edited into a real response (or
+        // a turn with assistant text — owned by the recent-stop/stale-clear arms)
+        // is never deleted here.
+        let terminal_placeholder_reclaim = watcher_should_reclaim_orphan_turn_placeholder(
+            turn_is_external_input_for_session,
+            placeholder_msg_id,
+            has_assistant_response,
+            &last_edit_text,
+        );
+        let terminal_orphan_context = turn_is_external_input_for_session
+            && (status_panel_msg_id.is_some() || terminal_placeholder_reclaim)
             && ((!has_assistant_response && task_notification_kind.is_none())
                 || watcher_external_input_turn_abandoned(
                     &watcher_provider,
@@ -5105,20 +5161,35 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     &output_path,
                     data_start_offset,
                     turn_identity_for_panel.as_ref(),
-                )) {
-            cleanup_orphan_external_input_status_panel(
+                ));
+        let terminal_panel_reclaim_committed =
+            if terminal_orphan_context && status_panel_msg_id.is_some() {
+                cleanup_orphan_external_input_status_panel(
+                    &http,
+                    &shared,
+                    channel_id,
+                    &mut status_panel_msg_id,
+                    &watcher_provider,
+                    &tmux_session_name,
+                    turn_is_external_input_for_session,
+                )
+                .await
+            } else {
+                true
+            };
+        if terminal_orphan_context && terminal_placeholder_reclaim {
+            reclaim_orphan_external_input_placeholder(
                 &http,
                 &shared,
                 channel_id,
-                &mut status_panel_msg_id,
+                &mut placeholder_msg_id,
+                &mut placeholder_from_restored_inflight,
+                &mut last_edit_text,
                 &watcher_provider,
                 &tmux_session_name,
-                turn_is_external_input_for_session,
             )
-            .await
-        } else {
-            true
-        };
+            .await;
+        }
         let inflight_silent_turn = inflight_before_relay
             .as_ref()
             .map(|state| state.silent_turn)
@@ -6024,6 +6095,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         placeholder_msg_id = None;
                                         placeholder_from_restored_inflight = false;
                                         last_edit_text.clear();
+                                        // #3351 r21 mirror: delete committed.
+                                        drop_placeholder_orphan_record(
+                                            &watcher_provider,
+                                            &shared,
+                                            channel_id,
+                                            msg_id,
+                                        );
                                     }
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     tracing::info!(
@@ -6061,6 +6139,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                     placeholder_msg_id = None;
                                     placeholder_from_restored_inflight = false;
                                     last_edit_text.clear();
+                                    // #3351 r21 mirror: edited into the final response —
+                                    // a stale record must not let a drain delete it.
+                                    drop_placeholder_orphan_record(
+                                        &watcher_provider,
+                                        &shared,
+                                        channel_id,
+                                        msg_id,
+                                    );
                                     let ts = chrono::Local::now().format("%H:%M:%S");
                                     tracing::info!(
                                         "  [{ts}] 👁 ✓ relayed terminal response (edit) channel {} msg {} ({} chars)",
@@ -6124,6 +6210,13 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                                 placeholder_msg_id = None;
                                                 placeholder_from_restored_inflight = false;
                                                 last_edit_text.clear();
+                                                // #3351 r21 mirror: delete committed.
+                                                drop_placeholder_orphan_record(
+                                                    &watcher_provider,
+                                                    &shared,
+                                                    channel_id,
+                                                    msg_id,
+                                                );
                                             }
                                             FallbackPlaceholderCleanupDecision::PreserveInflightForCleanupRetry => {
                                                 relay_ok = false;
@@ -6140,6 +6233,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         placeholder_msg_id = None;
                                         placeholder_from_restored_inflight = false;
                                         last_edit_text.clear();
+                                        // #3351 (codex r2 #2): message intentionally preserved
+                                        // (#2757) — a stale record must not let a drain delete it.
+                                        drop_placeholder_orphan_record(
+                                            &watcher_provider,
+                                            &shared,
+                                            channel_id,
+                                            msg_id,
+                                        );
                                         let ts = chrono::Local::now().format("%H:%M:%S");
                                         tracing::warn!(
                                             "  [{ts}] ⚠ watcher: terminal response delivered via fallback send; preserving original msg {} in channel {} because it may contain streamed response content (#2757)",
@@ -8137,6 +8238,7 @@ mod tests {
         watcher_inflight_represents_external_input, watcher_jsonl_turn_state_ready_for_input,
         watcher_output_progressed_recently, watcher_should_clear_stale_terminal_message_ids,
         watcher_should_delete_suppressed_placeholder,
+        watcher_should_reclaim_orphan_turn_placeholder,
         watcher_should_suppress_streaming_after_bridge_delivery,
         watcher_terminal_commit_side_effects_for_test, watcher_terminal_edit_consumes_placeholder,
         watcher_terminal_token_update_status,
@@ -9922,6 +10024,50 @@ TUI-E2E-marker ssh-direct
         ));
         assert!(!watcher_should_clear_stale_terminal_message_ids(
             false, true, None
+        ));
+    }
+
+    /// #3351: orphan-reclaim decision for the same turn's relay placeholder.
+    #[test]
+    fn orphan_turn_placeholder_reclaim_decision() {
+        let id = Some(MessageId::new(42));
+        // The leaked-spinner case from the issue: reclaim.
+        assert!(watcher_should_reclaim_orphan_turn_placeholder(
+            true,
+            id,
+            false,
+            "⠸ 계속 처리 중"
+        ));
+        // Empty body = still-placeholder (sweeper semantics inherited).
+        assert!(watcher_should_reclaim_orphan_turn_placeholder(
+            true, id, false, ""
+        ));
+        // Already edited into a real response body: never delete.
+        assert!(!watcher_should_reclaim_orphan_turn_placeholder(
+            true,
+            id,
+            false,
+            "실제 응답 본문"
+        ));
+        // Turn produced assistant text: owned by the existing arms.
+        assert!(!watcher_should_reclaim_orphan_turn_placeholder(
+            true,
+            id,
+            true,
+            "⠸ 계속 처리 중"
+        ));
+        // Bridge-owned turn: hands off.
+        assert!(!watcher_should_reclaim_orphan_turn_placeholder(
+            false,
+            id,
+            false,
+            "⠸ 계속 처리 중"
+        ));
+        assert!(!watcher_should_reclaim_orphan_turn_placeholder(
+            true,
+            None,
+            false,
+            "⠸ 계속 처리 중"
         ));
     }
 
