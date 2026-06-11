@@ -1,6 +1,9 @@
 import subprocess
 import json
+import re
 from datetime import datetime, timedelta, timezone
+
+OVERLAP_MARKER_RE = re.compile(r"(#\d+|\bpr\s+#?\d+\b|\bjules/[a-z0-9._/-]+)", re.IGNORECASE)
 
 def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
@@ -24,6 +27,9 @@ def head_commit_timestamp(pr):
     if code != 0:
         return None
     return parse_github_timestamp(timestamp)
+
+def has_specific_overlap_marker(body):
+    return bool(OVERLAP_MARKER_RE.search(body or ""))
 
 print("Fetching PRs...")
 prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
@@ -67,8 +73,7 @@ for pr in prs:
                 if len(files_data["files"]) > 0:
                     print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
                 else:
-                    body_lower = pr.get("body", "").lower()
-                    if "#" not in body_lower and "pr " not in body_lower and "jules/" not in body_lower:
+                    if not has_specific_overlap_marker(pr.get("body", "")):
                         print(f"  [!] INCOMPLETE NO-CHANGE PR: No changed files, but body fails to list exact overlapping PR numbers or branches.")
                     else:
                         print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
