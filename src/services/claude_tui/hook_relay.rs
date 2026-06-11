@@ -114,32 +114,52 @@ fn hook_success_stdout(provider: &str) -> &'static str {
 
 /// Stdout returned to the provider TUI for a relayed hook event.
 ///
-/// Defaults to the observational `hook_success_stdout`, but for a Claude
-/// `PostToolUse` event firing on a memento `recall`/`context` call it injects a
+/// Defaults to the observational `hook_success_stdout`, but for a memento
+/// `PostToolUse` search (`recall`/`context`) it injects an immediate
 /// `tool_feedback` nudge via `hookSpecificOutput.additionalContext`. The
 /// memory search→feedback ratio was effectively zero because models ignore the
 /// advisory `_meta.hints`; surfacing the ask in the model-visible PostToolUse
 /// context closes that loop without touching the Memento server or the prompt.
 ///
-/// Codex keeps the observational `{}` — its hook overrides are disabled by
-/// default and its `additionalContext` injection is unverified on the current
-/// CLI, so the nudge is Claude-only by design.
+/// Claude and Codex use different hook stdout contracts: Claude keeps
+/// `suppressOutput: true`, while Codex CLI 0.137.0 expects only the
+/// `hookSpecificOutput` block. Codex non-nudge events, including `Stop`, remain
+/// observational `{}`.
+///
+/// Session-end feedback flushing is not implemented in the hook relay; that
+/// path is deferred to #3332 for a server-side design.
 fn hook_stdout(provider: &str, event: &str, payload: &Value) -> String {
-    if !provider.trim().eq_ignore_ascii_case("codex")
-        && event.trim().eq_ignore_ascii_case("PostToolUse")
-        && memento_search_tool_name(payload).is_some()
-    {
+    let provider_key = provider.trim().to_ascii_lowercase();
+    let event_is_post_tool_use = event.trim().eq_ignore_ascii_case("PostToolUse");
+    if event_is_post_tool_use && memento_search_tool_name(payload).is_some() {
         let additional_context = memento_feedback_instruction(extract_search_event_id(payload));
+        return hook_specific_stdout(&provider_key, "PostToolUse", additional_context);
+    }
+    hook_success_stdout(provider).to_string()
+}
+
+fn hook_specific_stdout(
+    provider_key: &str,
+    event_name: &str,
+    additional_context: String,
+) -> String {
+    if provider_key == "codex" {
         return json!({
-            "suppressOutput": true,
             "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
+                "hookEventName": event_name,
                 "additionalContext": additional_context,
             }
         })
         .to_string();
     }
-    hook_success_stdout(provider).to_string()
+    json!({
+        "suppressOutput": true,
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": additional_context,
+        }
+    })
+    .to_string()
 }
 
 /// Returns the lowercased tool name when the PostToolUse payload is a memento
@@ -222,13 +242,12 @@ fn memento_feedback_instruction(search_event_id: Option<String>) -> String {
         None => "the search_event_id shown under `_meta.searchEventId` in that result".to_string(),
     };
     format!(
-        "Action required: you just received a memento search result. Before your next memento \
-recall/context/search call, submit one `mcp__memento__tool_feedback` call for THIS result with \
+        "Action required: you just received a memento search result. Submit one \
+`mcp__memento__tool_feedback` call immediately for THIS result with \
 {target}, `relevant` = whether any returned fragment was on-topic, and `sufficient` = whether the \
 results were enough to proceed. If `mcp__memento__tool_feedback` is not in your active tools \
 (memento tools are deferred), first load it with ToolSearch query \
-`select:mcp__memento__tool_feedback`, then make the call. This is a single quick step — do it now, \
-then continue."
+`select:mcp__memento__tool_feedback`, then make the call. Do this now, then continue."
     )
 }
 
@@ -504,9 +523,33 @@ mod tests {
         assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PostToolUse");
         assert!(ctx.contains("search_event_id=22752"));
         assert!(ctx.contains("mcp__memento__tool_feedback"));
+        assert!(ctx.contains("immediately"));
+        let delayed_framing = ["Before", " your next"].concat();
+        assert!(!ctx.contains(&delayed_framing));
         // Deferred-tool friction hint: tell the model how to load the tool.
         assert!(ctx.contains("select:mcp__memento__tool_feedback"));
         assert_eq!(value["suppressOutput"], true);
+    }
+
+    #[test]
+    fn codex_posttooluse_memento_recall_injects_feedback_nudge_without_suppress_output() {
+        let payload = serde_json::json!({
+            "tool_name": "mcp__memento__recall",
+            "tool_response": [{
+                "type": "text",
+                "text": "{\"fragments\":[],\"_meta\":{\"searchEventId\":\"3300\"}}"
+            }]
+        });
+        let out = hook_stdout("codex", "PostToolUse", &payload);
+        let value: Value = serde_json::from_str(&out).unwrap();
+        let ctx = value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert!(ctx.contains("search_event_id=3300"));
+        assert!(ctx.contains("mcp__memento__tool_feedback"));
+        assert!(ctx.contains("immediately"));
+        assert!(value.get("suppressOutput").is_none());
     }
 
     #[test]
@@ -521,6 +564,15 @@ mod tests {
             .unwrap();
         assert!(ctx.contains("_meta.searchEventId"));
         assert!(ctx.contains("mcp__memento__tool_feedback"));
+        assert!(!ctx.contains("search_event_id="));
+    }
+
+    #[test]
+    fn claude_stop_stays_observational_with_suppress_output() {
+        assert_eq!(
+            hook_stdout("claude", "Stop", &serde_json::json!({})),
+            r#"{"suppressOutput":true}"#
+        );
     }
 
     #[test]
@@ -537,8 +589,9 @@ mod tests {
             hook_stdout("claude", "PostToolUse", &forget),
             r#"{"suppressOutput":true}"#
         );
-        // Right event + search tool, but Codex stays observational.
-        assert_eq!(hook_stdout("codex", "PostToolUse", &recall), "{}");
+        // Codex non-nudge events keep the established empty success object.
+        assert_eq!(hook_stdout("codex", "PreToolUse", &recall), "{}");
+        assert_eq!(hook_stdout("codex", "Stop", &serde_json::json!({})), "{}");
     }
 
     #[test]
