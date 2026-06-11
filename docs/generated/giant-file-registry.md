@@ -28,7 +28,7 @@
 | `src/cli/client.rs` | 2378 |
 | `src/cli/dcserver.rs` | 1611 |
 | `src/cli/direct.rs` | 1778 |
-| `src/cli/doctor/orchestrator.rs` | 4373 |
+| `src/cli/doctor/orchestrator.rs` | 4375 |
 | `src/cli/init.rs` | 1444 |
 | `src/cli/migrate/apply.rs` | 3230 |
 | `src/cli/migrate/plan.rs` | 1513 |

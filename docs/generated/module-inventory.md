@@ -60,7 +60,7 @@
 | `cli::doctor::contract` | `src/cli/doctor/contract.rs` | 100 | 100 | 0 |  |
 | `cli::doctor::health` | `src/cli/doctor/health.rs` | 275 | 228 | 47 |  |
 | `cli::doctor::mailbox` | `src/cli/doctor/mailbox.rs` | 215 | 215 | 0 |  |
-| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4490 | 4373 | 117 | giant-file |
+| `cli::doctor::orchestrator` | `src/cli/doctor/orchestrator.rs` | 4492 | 4375 | 117 | giant-file |
 | `cli::doctor::startup` | `src/cli/doctor/startup.rs` | 624 | 553 | 71 |  |
 | `cli::init` | `src/cli/init.rs` | 1520 | 1444 | 76 | giant-file |
 | `cli::migrate` | `src/cli/migrate.rs` | 346 | 346 | 0 |  |
@@ -616,7 +616,7 @@
 | `services::pr_summary` | `src/services/pr_summary.rs` | 542 | 321 | 221 |  |
 | `services::process` | `src/services/process.rs` | 1119 | 638 | 481 |  |
 | `services::provider` | `src/services/provider.rs` | 2800 | 1818 | 982 | giant-file |
-| `services::provider_auth` | `src/services/provider_auth.rs` | 536 | 364 | 172 |  |
+| `services::provider_auth` | `src/services/provider_auth.rs` | 541 | 366 | 175 |  |
 | `services::provider_cli` | `src/services/provider_cli/mod.rs` | 21 | 21 | 0 |  |
 | `services::provider_cli::canary` | `src/services/provider_cli/canary.rs` | 86 | 86 | 0 |  |
 | `services::provider_cli::context` | `src/services/provider_cli/context.rs` | 28 | 28 | 0 |  |

@@ -804,7 +804,7 @@
 - do_not_edit_without_migration_plan (giant-file):
   - `src/cli/migrate.rs` is the retired postgres-cutover facade (now below the
     giant-file threshold; bugfix only).
-  - `src/cli/doctor/orchestrator.rs` (4373 lines).
+  - `src/cli/doctor/orchestrator.rs` (4375 lines).
   - `src/cli/migrate/apply.rs` (3230 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
