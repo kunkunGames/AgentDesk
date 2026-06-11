@@ -208,7 +208,7 @@ mod deferred_claim;
 mod store;
 
 pub(in crate::services::discord) use deferred_claim::{
-    LiveInflightProbe, record_for_deferred_claim,
+    LiveInflightProbe, ensure_marker_for_own_synthetic_turn, record_for_deferred_claim,
 };
 use store::reload;
 #[cfg(test)]
@@ -598,6 +598,61 @@ pub(super) async fn drain_on_terminal_commit_with_applier(
         }
     }
     drained
+}
+
+/// #3350 issue-1 (lease-gated row-absent commit): a VISIBLE `⏳ → ✅` was just
+/// delivered on `anchor_message_id`, but the committed row was already gone,
+/// so the watcher chokepoint has no row identity to tombstone. Source it from
+/// the marker instead: every DeferredClaim marker pinned to ITS OWN anchor
+/// (#3303 SC1) gets its pinned identity recorded as a commit tombstone FIRST
+/// (write-before-discard — a sweep claiming the marker mid-pass still 대조s
+/// `✅`, never `⚠`), then is discarded under the claim mutex. Reaction-free by
+/// design (#3350 I1): the `✅` is already on the message, so the marker's
+/// whole job — bounding the `⏳` — is done. Abort-kind markers (foreign pin)
+/// are left untouched: this commit proves nothing about the foreign prior
+/// turn, so their #3296 convergence (drain / sweep / hard cap) is preserved.
+pub(super) fn resolve_own_claim_markers_for_visibly_completed_anchor(
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: u64,
+    anchor_message_id: u64,
+) -> usize {
+    let mut resolved = 0usize;
+    for marker in load_for_channel(provider, channel_id) {
+        if marker.tmux_session_name != tmux_session_name
+            || marker.anchor_message_id != anchor_message_id
+            || marker.origin != MarkerOrigin::DeferredClaim
+            || marker.foreign_user_msg_id != Some(anchor_message_id)
+        {
+            continue; // SC1: own-pin DeferredClaim markers of THIS anchor only
+        }
+        let Some(own_started_at) = marker.foreign_started_at.clone() else {
+            continue; // identity-absent marker — the sweep bound alone resolves it
+        };
+        record_commit_tombstone(
+            provider,
+            tmux_session_name,
+            channel_id,
+            anchor_message_id,
+            &own_started_at,
+        );
+        let Some(_claim) = try_claim_marker(&marker) else {
+            continue; // a reconciler owns it; the durable tombstone keeps its verdict ✅
+        };
+        let Some(marker) = reload(&marker) else {
+            continue; // resolved while unclaimed
+        };
+        delete(&marker);
+        resolved += 1;
+        tracing::info!(
+            provider = %marker.provider,
+            channel_id = marker.channel_id,
+            tmux_session_name = %marker.tmux_session_name,
+            anchor_message_id = marker.anchor_message_id,
+            "tui_direct_abort_marker: own-pin marker discarded after a visible lease-gated ✅ (row-absent commit); tombstone recorded first so a racing sweep still lands ✅ (#3350)"
+        );
+    }
+    resolved
 }
 
 /// Placeholder-sweeper pass: retry `✅` for covered markers; apply the TTL'd
@@ -2242,5 +2297,157 @@ mod tests {
         let back: AbortedAnchorMarker =
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back, m, "DeferredClaim markers must round-trip losslessly");
+    }
+
+    // ====================================================================
+    // #3350 issue-1 — lease-gated row-absent commit resolution: the visible
+    // `⏳ → ✅` path with NO committed row must still resolve the own-pin
+    // DeferredClaim marker (tombstone-first + claimed discard, reaction-free).
+    // ====================================================================
+
+    /// RED pre-#3350-issue-1: a lease-gated visible ✅ left the own-pin marker
+    /// behind, so the TTL sweep stacked a ⚠ next to the delivered ✅. The
+    /// resolver must discard the marker AND leave a durable own-identity
+    /// tombstone — with ZERO reaction traffic of its own.
+    #[test]
+    fn lease_gated_completion_discards_own_pin_marker_and_records_tombstone() {
+        let _root = test_root();
+        let m = deferred_marker("claude", 100, 910, 10_000);
+        record(&m).unwrap();
+
+        let resolved =
+            resolve_own_claim_markers_for_visibly_completed_anchor("claude", "tmux-100", 100, 910);
+
+        assert_eq!(resolved, 1);
+        assert!(
+            load_for_channel("claude", 100).is_empty(),
+            "RED pre-#3350: the marker survived the visible ✅ and TTL-⚠'d it"
+        );
+        let tombstones = load_commit_tombstones("claude", 100);
+        assert_eq!(
+            tombstones.len(),
+            1,
+            "own-identity tombstone must be durable"
+        );
+        assert_eq!(tombstones[0].committed_user_msg_id, 910);
+        assert_eq!(tombstones[0].committed_started_at, OWN_STARTED_AT);
+        assert_eq!(tombstones[0].tmux_session_name, "tmux-100");
+    }
+
+    /// Scope pins: an Abort-kind marker on the SAME anchor (foreign pin — this
+    /// commit proves nothing about the foreign turn, #3296) and an own-pin
+    /// marker for a DIFFERENT anchor must both survive untouched, with no
+    /// tombstone fabricated for either.
+    #[test]
+    fn lease_gated_completion_leaves_abort_and_other_anchor_markers() {
+        let _root = test_root();
+        record(&marker("claude", 100, 911, 10_000)).unwrap(); // Abort, same anchor
+        record(&deferred_marker("claude", 100, 912, 10_000)).unwrap(); // other anchor
+
+        let resolved =
+            resolve_own_claim_markers_for_visibly_completed_anchor("claude", "tmux-100", 100, 911);
+
+        assert_eq!(resolved, 0);
+        assert_eq!(
+            load_for_channel("claude", 100).len(),
+            2,
+            "foreign-pin and other-anchor markers are out of the resolver's scope"
+        );
+        assert!(
+            load_commit_tombstones("claude", 100).is_empty(),
+            "no tombstone may be fabricated for a turn this ✅ does not prove"
+        );
+    }
+
+    /// Claim contention (write-before-discard): with the marker claimed by a
+    /// concurrent reconciler the resolver must SKIP the discard but still
+    /// persist the tombstone — the later sweep then 대조s ✅ (Complete), never
+    /// the hard-cap ⚠ it would otherwise deliver.
+    #[test]
+    fn claim_contended_lease_gated_resolution_converges_to_sweep_completion() {
+        let _root = test_root();
+        let m = deferred_marker("claude", 100, 913, 10_000);
+        record(&m).unwrap();
+        let held_claim = try_claim_marker(&m).expect("test holds the claim");
+
+        let resolved =
+            resolve_own_claim_markers_for_visibly_completed_anchor("claude", "tmux-100", 100, 913);
+        assert_eq!(resolved, 0, "claimed marker must not be discarded");
+        assert_eq!(load_for_channel("claude", 100).len(), 1);
+        assert_eq!(
+            load_commit_tombstones("claude", 100).len(),
+            1,
+            "tombstone must land even when the discard loses the claim race"
+        );
+
+        drop(held_claim);
+        let (applier, calls) = recording_applier(ReactionDelivery::Delivered);
+        let swept = test_rt().block_on(sweep_expired_with_applier(
+            "claude",
+            10_000 + TTL_MS * ABORT_MARKER_HARD_CAP_TTL_MULTIPLIER + 1,
+            true,
+            &|_marker: &AbortedAnchorMarker| false,
+            &applier,
+        ));
+        assert_eq!(swept, 1);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(913, ReactionOp::Complete)],
+            "the durable tombstone keeps the contended marker's verdict ✅ — \
+             without it this past-hard-cap sweep delivers the false ⚠"
+        );
+        assert!(load_for_channel("claude", 100).is_empty());
+    }
+
+    /// #3350 codex r1-2 (tombstone-BEFORE-deliver): the watcher now runs the
+    /// resolver before awaiting the visible `⏳ → ✅` delivery. Race legs:
+    ///
+    /// * OLD order (RED contrast) — the sweep preempts while the watcher is
+    ///   still inside the delivery await, i.e. BEFORE any tombstone landed:
+    ///   the row-absent, TTL-expired, uncovered marker degrades to the `⚠`
+    ///   that then stacks next to the just-delivered `✅`.
+    /// * NEW order — the resolver (tombstone + claimed discard) runs first;
+    ///   the same sweep finds nothing to claim and delivers NOTHING.
+    #[test]
+    fn sweep_preempting_delivery_await_warns_only_under_the_old_order() {
+        let _root = test_root();
+        // OLD order: no tombstone yet when the sweep fires mid-await.
+        record(&deferred_marker("claude", 100, 914, 10_000)).unwrap();
+        let (warn_applier, warn_calls) = recording_applier(ReactionDelivery::Delivered);
+        let swept = test_rt().block_on(sweep_expired_with_applier(
+            "claude",
+            10_000 + TTL_MS,
+            true,
+            &|_marker: &AbortedAnchorMarker| false,
+            &warn_applier,
+        ));
+        assert_eq!(swept, 1);
+        assert_eq!(
+            warn_calls.lock().unwrap().as_slice(),
+            &[(914, ReactionOp::FailureWarn)],
+            "deliver-then-resolve let the mid-await sweep stack ⚠ next to the ✅"
+        );
+
+        // NEW order: resolver first (as the watcher call site now does), then
+        // the identical sweep — no ⚠, no duplicate ✅, store empty.
+        record(&deferred_marker("claude", 100, 915, 10_000)).unwrap();
+        assert_eq!(
+            resolve_own_claim_markers_for_visibly_completed_anchor("claude", "tmux-100", 100, 915),
+            1
+        );
+        let (applier, calls) = recording_applier(ReactionDelivery::Delivered);
+        let swept = test_rt().block_on(sweep_expired_with_applier(
+            "claude",
+            10_000 + TTL_MS,
+            true,
+            &|_marker: &AbortedAnchorMarker| false,
+            &applier,
+        ));
+        assert_eq!(swept, 0, "nothing left for the preempting sweep to claim");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "tombstone-first: the about-to-be-✅'d anchor sees no sweep reaction at all"
+        );
+        assert!(load_for_channel("claude", 100).is_empty());
     }
 }
