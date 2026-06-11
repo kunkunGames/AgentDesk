@@ -1,0 +1,30 @@
+What changed:
+Updated `docs/storage-retention.md` to point to `src/server/maintenance.rs` for the `prompt_manifest_retention` job source location.
+
+Why:
+The documentation had drifted. The retention job logic was previously claimed to be purely in the routes and DB layer, but the maintenance job itself that executes the policy is actually registered and defined in `src/server/maintenance.rs` as `PromptManifestRetentionJob`. This aligns the docs with the current code layout.
+
+WorkFingerprint:
+Agent: MemoryCustodian
+Boundary: docs/storage-retention.md
+Invariant protected: Documentation accuracy for memory retention paths.
+Public API impact: None.
+Docs impact: Corrects the source location of the storage maintenance job.
+Verification plan: `git diff --check` to ensure no trailing whitespace and that only the targeted doc was edited.
+Related PRs/issues: Fixes drift similar to lessons learned in #197.
+
+Duplicate/Overlap check:
+Ran `git branch -r` and found no open `jules/memory-custodian/` branches modifying this specific documentation string without being a no-change report or closed PR.
+
+Verification commands and results:
+`git diff --check` - clean
+`git diff --stat` - verified only `docs/storage-retention.md` was touched.
+
+Skipped checks:
+Skipped Cargo and NPM checks because this is a docs-only change.
+
+Risk:
+Zero runtime risk. Docs-only update.
+
+Rollback notes:
+Revert the commit.
