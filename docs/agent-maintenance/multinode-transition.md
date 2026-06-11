@@ -383,6 +383,13 @@
 
 ### Audited touches
 
+- #3038 SharedData S2: `runtime_bootstrap.rs` changed only inside
+  `run_bot_build_shared_data` — the eight session-override fields are now
+  initialized through the `SessionOverrideState` group literal wrapped at the
+  first member's original position (member expressions byte-identical,
+  evaluation order preserved; `run_bot` body byte-identical). Worker-local
+  state grouping only: no multinode ownership, singleton, or lease assumption
+  changes.
 - #3038 run_bot S0/S1: `runtime_bootstrap.rs` gained characterization tests and
   moved restored-state, queued-placeholder, startup-doctor, orphan-recovery, and
   session-GC helpers into `runtime_bootstrap/` submodules. This is a
@@ -656,3 +663,17 @@
   `serenity_http_or_token_fallback()` bot identity — no PG lease, no cross-node
   reads, no leader-only side effect. No new multinode ownership/singleton/lease
   assumption is introduced.
+- #3350 (synthetic-anchor hourglass bound for inline claims): the INLINE
+  synthetic claim (`tui_prompt_relay.rs`) now records the same #3303
+  `DeferredClaim` marker as the deferred worker (shared helper generalized in
+  `tui_direct_pending_start.rs`), and `turn_finalizer.rs::do_finalize` calls a
+  new `turn_finalizer/cleanup.rs` hook that idempotently ENSURES the marker
+  (`tui_direct_abort_marker/deferred_claim.rs::ensure_marker_for_own_synthetic_turn`)
+  for watcher-owned TUI-direct synthetic rows before the inflight clear. Both
+  are WRITES into the existing node-local
+  `runtime/discord_tui_direct_abort_marker/` store from the same node's own
+  relay observer / finalizer actor; reconcile/delivery stays with the existing
+  #3303 drain/sweep owners unchanged (zero new reaction call sites).
+  **Worker-local**: no PG lease, no cross-node reads, no leader-only side
+  effect. No new multinode ownership, singleton, or lease assumption is
+  introduced.

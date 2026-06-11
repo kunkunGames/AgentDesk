@@ -38,20 +38,31 @@
 # #3038 tmux_watcher S1: lowered 9583 -> 8122 by moving top-level decision
 # clusters A/B/C/E/F/I/J/K into tmux_watcher/ child modules. The relay loop,
 # D/H clusters, and relay path remain in the root.
-"src/services/discord/tmux_watcher.rs" = 8122
+# #3351: +101 for placeholder-reclaim wiring in the relay loop (tick/terminal/
+# fresh-idle reclaim sites + r21 durable-record drops); the helper bodies live
+# in tmux_watcher/placeholder_reclaim.rs. tmux_watcher S2 re-lowers this root.
+"src/services/discord/tmux_watcher.rs" = 8223
 # #3038 tmux_watcher S1 child modules, frozen at landed production LoC.
 "src/services/discord/tmux_watcher/commit_decisions.rs" = 140
 "src/services/discord/tmux_watcher/completion_gate.rs" = 275
 "src/services/discord/tmux_watcher/liveness.rs" = 301
 "src/services/discord/tmux_watcher/panel_decisions.rs" = 372
+"src/services/discord/tmux_watcher/placeholder_reclaim.rs" = 106
 "src/services/discord/tmux_watcher/prompt_observe.rs" = 109
 "src/services/discord/tmux_watcher/turn_identity.rs" = 327
 # Frozen at its true production LoC once #3028 fixed the prod/test splitter
 # (lifetime/char-literal brace miscount): the first inline `#[cfg(test)] mod`
 # block was over-extended to EOF, so `spawn_turn_bridge` and ~9000 lines of the
-# turn-lifecycle surface were mislabeled test. This is the actual #3028 guard;
-# decompose lands separately after #3016 settles.
-"src/services/discord/turn_bridge/mod.rs" = 8417
+# turn-lifecycle surface were mislabeled test. This is the actual #3028 guard.
+# #3038 turn_bridge S1: lowered 8417 -> 6778 by moving the helper-zone
+# status-panel, voice-completion, headless-delivery, memory-observation,
+# analytics, and confirmed-end clusters out of the root while leaving the
+# `spawn_turn_bridge` async body byte-identical.
+"src/services/discord/turn_bridge/mod.rs" = 6778
+# #3038 turn_bridge S1 child modules, frozen at landed production LoC.
+"src/services/discord/turn_bridge/headless_delivery.rs" = 415
+"src/services/discord/turn_bridge/status_panel.rs" = 437
+"src/services/discord/turn_bridge/voice_completion.rs" = 385
 # #3038 S1: lowered 5188 -> 4987 (-201) as `QueuedPlaceholderState` (cluster C:
 # 3 fields + 9 inherent methods) moved to the `shared_state` sibling module.
 # Locks in the shrink win (ratchet down only).
@@ -59,7 +70,9 @@
 # kickoff / intervention enqueue through `*_with_closed_retry`) are offset by
 # queue-exit comment dedup in the same root, so the frozen baseline stays at
 # 4987 (no raise; #3028 ratchet).
-"src/services/discord/mod.rs" = 4987
+# #3038 S2: lowered 4987 -> 4980 (-7) as the cluster-D field block (8 fields)
+# moved into `shared_state::SessionOverrideState`. Locks in the shrink win.
+"src/services/discord/mod.rs" = 4980
 # #3305: the local-only pass-through lifecycle-skip (kind hoist + note-only return
 # branch + idle-loop skip) is offset by comment dedup in the same root, lowering the
 # frozen baseline 5438 -> 5429 (-9). Locks in the shrink win (#3028 ratchet).
@@ -105,7 +118,10 @@
 # #3293: +11 for the additive `recovery_relay_attempts` restart-budget counter
 # (field + `RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET`), lowered 2466 -> 2465 to
 # lock the net position.
-"src/services/discord/inflight.rs" = 2465
+# #3351: +58 for `clear_current_msg_if_matches(_in_root)` — the relay-placeholder
+# compare-and-clear needs the file-private lock/load/persist internals, so it
+# lives here until the inflight split.
+"src/services/discord/inflight.rs" = 2523
 # #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
 # prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
 # its ratchet entry is deleted (win; no baseline raises).
@@ -135,7 +151,13 @@
 # in prod; rustfmt keeps the attribute and the comment on separate lines).
 "src/services/discord/turn_finalizer.rs" = 1528
 "src/services/discord/router/message_handler/headless_turn.rs" = 1316
-"src/services/discord/commands/config.rs" = 1054
+# #3038 S2: lowered 1054 -> 954 (-100) as the session-override bookkeeping
+# helpers (fast-mode reset-entry codec + reset-pending probes/clears +
+# enablement probes + sync_session_reset_pending) moved verbatim to the
+# `shared_state` sibling module alongside `SessionOverrideState`. config.rs is
+# no longer a prod-giant; the entry stays ratcheted at the landed value so a
+# re-expansion past it fails the gate (runtime_bootstrap.rs precedent, #3038).
+"src/services/discord/commands/config.rs" = 954
 "src/services/discord/commands/diagnostics.rs" = 1026
 
 # #3038 slice 1: decision_route.rs (4392 prod LoC) was decomposed into a 139-line

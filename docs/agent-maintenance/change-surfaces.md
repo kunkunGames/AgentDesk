@@ -724,22 +724,30 @@
     stop-token/tmux binding runtime + PID-exit observation helper (#2426),
     split before adding non-bugfix behavior. #3169: added the
     claude-anonymous-teardown SIGINT suppression guard (death #3)).
-  - `src/services/discord/turn_bridge/mod.rs` (8417 prod lines; the BRIDGE
+  - `src/services/discord/turn_bridge/mod.rs` (6778 prod lines; the BRIDGE
     spawn/turn-lifecycle surface — `spawn_turn_bridge` and the per-channel
-    turn loop. Registered giant-file (#3016 decompose target — see
+    turn loop. Registered giant-file (#3038 decompose target — see
     `giant-file-registry.md`, owner `discord-relay`, deadline 2026-08-31).
     It surfaced as a giant only after #3028 fixed the prod/test splitter: an
     unterminated char-literal scan on a Rust lifetime (`&'a self`) inside the
     first inline `#[cfg(test)] mod` block over-extended the block to EOF, so
     most of the production code was mislabeled test and the file reported only
-    626 prod LoC. Hotfile — bugfix only outside the #3016/#3028 decompose plan).
+    626 prod LoC. #3038 turn_bridge S1 moved six helper-zone clusters out of
+    the root while leaving the `spawn_turn_bridge` async body byte-identical:
+    `status_panel.rs` (437 prod; tests split to `status_panel_tests.rs`),
+    `voice_completion.rs` (385 prod; tests split to
+    `voice_completion_tests.rs`), `headless_delivery.rs` (415 prod),
+    `memory_lifecycle.rs` background-memory observation, `turn_analytics.rs`
+    analytics persistence, and `terminal_delivery.rs` confirmed-end advance.
+    Hotfile — bugfix only outside the #3038 decompose plan).
   - `src/services/discord/turn_bridge/completion_guard.rs` (1834 lines).
   - `src/services/discord/turn_bridge/tmux_runtime.rs` (1545 lines).
-  - `src/services/discord/turn_bridge/terminal_delivery.rs` (504 prod lines;
+  - `src/services/discord/turn_bridge/terminal_delivery.rs` (604 prod lines;
     no longer a giant-file after the #3028 splitter fix corrected its inline
     `#[cfg(test)] mod` accounting (previously miscounted as 1341 prod). Its
-    giant-file-registry [[entry]] was removed. Split the lease wiring vs the
-    delivery helpers before adding behavior).
+    giant-file-registry [[entry]] was removed. #3038 turn_bridge S1 moved
+    `advance_tmux_relay_confirmed_end` here; split the remaining lease wiring
+    vs delivery helpers before adding behavior).
   - `src/services/discord/turn_finalizer.rs` (1526 prod lines; single-authority
     turn-finalize state machine — ledger/actor-loop/reconciler. Crossed the
     giant-file threshold when #3041 P1-0 added the dormant `DeliveryLeaseCell`
@@ -800,7 +808,6 @@
     iteration-loop helpers; tracked decompose target — see
     `giant-file-registry.md` (owner `automation-pipeline`, deadline
     2026-08-31, #3036)).
-  - `src/services/discord/commands/config.rs` (1054 lines).
   - `src/services/discord/{commands/text_commands.rs, commands/diagnostics.rs,
     discord_config_audit.rs, router/intake_gate.rs, inflight.rs}`
     (all 1000+ production lines).
@@ -1039,7 +1046,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
 - `src/services/platform/binary_resolver.rs` (1221).
-- `src/services/discord/mod.rs` (4987; +34 from #3019 added the
+- `src/services/discord/mod.rs` (4980; +34 from #3019 added the
   single-authority `increment_global_active` helper + doc mirroring the
   existing decrement helper — offset by removing 6 inline raw `fetch_add`
   blocks across the relay turn-start sites that now route through it; +12 from
@@ -1054,7 +1061,10 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   the type for surface freeze; ±0 from #3293 — the +13 closed-retry rewires
   (`mailbox_peek` + `*_with_closed_retry` routing for recovery kickoff and
   intervention enqueue) are offset by queue-exit comment dedup in the same
-  root, no baseline raise),
+  root, no baseline raise; -7 from #3038 S2 lifting cluster D — the eight
+  session-override fields — into `shared_state::SessionOverrideState`, leaving
+  a single `overrides: SessionOverrideState` group field on `SharedData` with
+  the type re-exported for surface freeze),
   `src/services/discord_config_audit.rs` (1273).
 - `src/services/turn_orchestrator.rs` (3089; +3 from #3293 declaring the
   `registry_purge` child module — the non-creating `peek` lookup and the
@@ -1070,7 +1080,10 @@ normal test growth is allowed): `src/services/analytics.rs`,
 `src/services/process.rs`, `src/services/discord/tmux_lifecycle.rs`,
 `src/services/qwen_tmux_wrapper.rs`, `src/services/discord/session_relay_sink.rs`,
 `src/services/tui_turn_state.rs`, `src/services/session_backend.rs`,
-`src/voice/turn_link.rs`.
+`src/voice/turn_link.rs`, `src/services/discord/commands/config.rs`
+(#3038 S2: 1054 -> 954 after the session-override bookkeeping helpers
+moved verbatim to `discord/shared_state.rs` next to
+`SessionOverrideState`; still ratcheted at 954 in the frozen baseline).
 
 Same rule: `bugfix` only without a split issue.
 

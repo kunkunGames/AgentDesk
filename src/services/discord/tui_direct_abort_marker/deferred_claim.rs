@@ -159,6 +159,110 @@ pub(super) fn decide_deferred_claim_marker_disposition(
     MarkerDisposition::DeliverFailureWarn
 }
 
+/// Outcome of [`ensure_marker_for_own_synthetic_turn`] (#3350 ②). Purely
+/// informational for the caller — every variant is fail-open (the finalize
+/// proceeds identically).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::services::discord) enum EnsureClaimMarkerOutcome {
+    /// An own-pin `DeferredClaim` marker — or ANY already-covered (tombstoned)
+    /// marker — exists for this anchor. NEVER overwritten: a stamped
+    /// `covered_at_ms` or the original TTL clock must survive (I6 — an
+    /// overwrite would demote a covered anchor to the TTL `⚠`). An UNCOVERED
+    /// stale Abort marker does NOT yield this variant (#3350 codex r1-3): the
+    /// #3303 contract replaces it with the own pin, see the ensure docs.
+    AlreadyPresent,
+    /// No marker existed; one was recorded. `covered: true` means the
+    /// record-instant tombstone 대조 found the own turn already committed, so
+    /// the sweep delivers an idempotent `✅`.
+    Recorded { covered: bool },
+    /// I5: a zero anchor id could never be reconciled.
+    SkippedZeroAnchor,
+    /// The durable write failed — warn only (I6 fail-open).
+    Failed,
+}
+
+/// #3350 ②: idempotent marker guarantee at TERMINAL FINALIZE time. Whatever
+/// submitter (watcher / bridge / monitor / backstop) finalizes a watcher-owned
+/// TUI-direct synthetic turn, a durable `DeferredClaim` marker must exist for
+/// its anchor — this is the forward-fix for turns claimed before the #3350
+/// inline-claim record existed, and the safety net when that record failed.
+///
+/// * An existing own-pin `DeferredClaim` marker — or ANY already-covered
+///   (tombstoned) marker — is NEVER overwritten
+///   ([`EnsureClaimMarkerOutcome::AlreadyPresent`]): the `covered_at_ms`
+///   stamp / TTL clock are preserved.
+/// * An existing UNCOVERED stale Abort marker is REPLACED (#3350 codex r1-3),
+///   exactly like the claim-time record (#3303 contract: `record()`'s stem
+///   overwrite — see the module docs at [`record_for_deferred_claim`] and the
+///   `tui_direct_pending_start` R8 reclaim test). Left in place it would block
+///   the own pin forever: no commit can cover the foreign pin, so the TTL
+///   would false-`⚠` the successfully claimed anchor.
+/// * Otherwise [`record_for_deferred_claim`] is reused unchanged, including
+///   the record-instant tombstone 대조: a turn that already terminal-committed
+///   yields a `covered` marker the sweep resolves with an idempotent `✅`.
+/// * NO reaction is performed here — delivery belongs exclusively to the
+///   #3303 reconcilers (drain `✅` / sweep TTL `⚠`), so there is no false-`⚠`
+///   race against output that commits late after a Stopped event.
+pub(in crate::services::discord) fn ensure_marker_for_own_synthetic_turn(
+    provider: &str,
+    channel_id: u64,
+    anchor_message_id: u64,
+    tmux_session_name: &str,
+    own_started_at: &str,
+) -> EnsureClaimMarkerOutcome {
+    if anchor_message_id == 0 {
+        return EnsureClaimMarkerOutcome::SkippedZeroAnchor; // I5
+    }
+    let replaces_stale_abort = match super::load_for_channel(provider, channel_id)
+        .into_iter()
+        .find(|m| m.anchor_message_id == anchor_message_id)
+    {
+        Some(existing)
+            if existing.covered_at_ms.is_some()
+                || (existing.origin == MarkerOrigin::DeferredClaim
+                    && existing.foreign_user_msg_id == Some(anchor_message_id)) =>
+        {
+            return EnsureClaimMarkerOutcome::AlreadyPresent;
+        }
+        // Uncovered non-own-pin marker (stale Abort): fall through and let
+        // `record()`'s stem overwrite replace it with the own pin (r1-3).
+        Some(_) => true,
+        None => false,
+    };
+    match record_for_deferred_claim(
+        provider.to_string(),
+        channel_id,
+        anchor_message_id,
+        tmux_session_name.to_string(),
+        (anchor_message_id, own_started_at.to_string()),
+    ) {
+        Ok(marker) => {
+            tracing::info!(
+                provider = %provider,
+                channel_id,
+                tmux_session_name = %tmux_session_name,
+                anchor_message_id,
+                tombstone_covered = marker.covered_at_ms.is_some(),
+                replaces_stale_abort,
+                "tui_direct_abort_marker: finalize-time ensure recorded the missing DeferredClaim marker — the anchor ⏳ now converges via drain ✅ / sweep TTL ⚠ (#3350)"
+            );
+            EnsureClaimMarkerOutcome::Recorded {
+                covered: marker.covered_at_ms.is_some(),
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider,
+                channel_id,
+                anchor_message_id,
+                error = %error,
+                "tui_direct_abort_marker: finalize-time ensure failed to persist the DeferredClaim marker; finalize proceeds without it (I6 fail-open — the anchor ⏳ may linger) (#3350)"
+            );
+            EnsureClaimMarkerOutcome::Failed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{ABORT_MARKER_HARD_CAP_TTL_MULTIPLIER, ABORT_MARKER_TTL};
@@ -326,6 +430,221 @@ mod tests {
                 MarkerDisposition::LeftIntactHttpUnavailable,
             );
         }
+    }
+
+    // ====================================================================
+    // #3350 ② — `ensure_marker_for_own_synthetic_turn` (finalize-time
+    // idempotent ensure). Durable-store tests use the mod.rs `TestRoot`
+    // pattern: a per-test tempdir via the THREAD-LOCAL store override.
+    // ====================================================================
+
+    struct TestRoot {
+        _temp: tempfile::TempDir,
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            super::super::set_test_root_override(None);
+        }
+    }
+
+    fn test_root() -> TestRoot {
+        let temp = tempfile::tempdir().unwrap();
+        super::super::set_test_root_override(Some(temp.path().to_path_buf()));
+        TestRoot { _temp: temp }
+    }
+
+    fn test_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// (a) #3350: with no marker present the ensure records one — uncovered,
+    /// pinned to the OWN identity, kind `DeferredClaim` (exactly what the
+    /// claim-time record would have written).
+    #[test]
+    fn ensure_records_uncovered_own_pin_when_absent() {
+        let _root = test_root();
+        let outcome =
+            ensure_marker_for_own_synthetic_turn("claude", 1, 900, "tmux-1", OWN_STARTED_AT);
+        assert_eq!(
+            outcome,
+            EnsureClaimMarkerOutcome::Recorded { covered: false }
+        );
+        let loaded = super::super::load_for_channel("claude", 1);
+        assert_eq!(loaded.len(), 1);
+        let m = &loaded[0];
+        assert_eq!(m.origin, MarkerOrigin::DeferredClaim);
+        assert_eq!(m.anchor_message_id, 900);
+        assert_eq!(m.foreign_user_msg_id, Some(900), "OWN pin only (SC1)");
+        assert_eq!(m.foreign_started_at.as_deref(), Some(OWN_STARTED_AT));
+        assert_eq!(m.covered_at_ms, None);
+    }
+
+    /// (b) #3350 / I6: an EXISTING marker is never overwritten — RED if the
+    /// ensure re-records (the covered_at stamp would vanish, demoting an
+    /// answered anchor to the TTL `⚠`, and the aborted_at TTL clock would
+    /// reset, deferring the bounded `⚠` forever under repeated finalizes).
+    #[test]
+    fn ensure_never_overwrites_existing_marker() {
+        let _root = test_root();
+        let mut existing = deferred_marker(1_000);
+        existing.covered_at_ms = Some(2_000);
+        super::super::record(&existing).unwrap();
+        let outcome = ensure_marker_for_own_synthetic_turn(
+            "claude",
+            1,
+            10,
+            "tmux-1",
+            "2026-06-11 09:00:00", // a DIFFERENT started_at must not re-pin
+        );
+        assert_eq!(outcome, EnsureClaimMarkerOutcome::AlreadyPresent);
+        assert_eq!(
+            super::super::load_for_channel("claude", 1),
+            vec![existing],
+            "covered_at / aborted_at / pin must survive the ensure untouched"
+        );
+    }
+
+    /// (b2) #3350 codex r1-3: an existing UNCOVERED own-pin DeferredClaim
+    /// marker also blocks the ensure — its TTL clock must not reset under
+    /// repeated finalizes (the bounded `⚠` would otherwise defer forever).
+    #[test]
+    fn ensure_keeps_uncovered_own_pin_deferred_claim_marker() {
+        let _root = test_root();
+        let existing = deferred_marker(1_000);
+        super::super::record(&existing).unwrap();
+        let outcome = ensure_marker_for_own_synthetic_turn(
+            "claude",
+            1,
+            10,
+            "tmux-1",
+            "2026-06-11 09:00:00", // a DIFFERENT started_at must not re-pin
+        );
+        assert_eq!(outcome, EnsureClaimMarkerOutcome::AlreadyPresent);
+        assert_eq!(
+            super::super::load_for_channel("claude", 1),
+            vec![existing],
+            "the aborted_at TTL clock and own pin survive untouched"
+        );
+    }
+
+    /// (b3) #3350 codex r1-3: an UNCOVERED stale Abort marker (foreign pin,
+    /// e.g. left by an abnormal restart) is REPLACED with the own-pin
+    /// DeferredClaim marker, mirroring the claim-time `record()` stem
+    /// overwrite (#3303 contract / the pending-start R8 reclaim test). RED
+    /// pre-fix: `AlreadyPresent` left the foreign pin in place — no commit
+    /// could ever cover it, so the TTL false-`⚠`'d the claimed anchor.
+    #[test]
+    fn ensure_replaces_uncovered_stale_abort_marker_with_own_pin() {
+        let _root = test_root();
+        super::super::record_for_abort(
+            "claude".into(),
+            1,
+            10,
+            "tmux-1".into(),
+            Some((999, "2026-06-09 08:00:00".into())),
+        )
+        .unwrap();
+        let outcome =
+            ensure_marker_for_own_synthetic_turn("claude", 1, 10, "tmux-1", OWN_STARTED_AT);
+        assert_eq!(
+            outcome,
+            EnsureClaimMarkerOutcome::Recorded { covered: false },
+            "RED pre-r1-3: the stale Abort marker blocked the ensure as AlreadyPresent"
+        );
+        let loaded = super::super::load_for_channel("claude", 1);
+        assert_eq!(loaded.len(), 1, "one stem, one marker (SC2)");
+        let m = &loaded[0];
+        assert_eq!(m.origin, MarkerOrigin::DeferredClaim);
+        assert_eq!(
+            m.foreign_user_msg_id,
+            Some(10),
+            "OWN pin replaces the foreign pin"
+        );
+        assert_eq!(m.foreign_started_at.as_deref(), Some(OWN_STARTED_AT));
+        assert_eq!(m.covered_at_ms, None);
+    }
+
+    /// (b4) #3350 codex r1-3 boundary: a COVERED (tombstoned) Abort marker is
+    /// never overwritten — its `✅` evidence must survive (I6: an overwrite
+    /// would demote the covered anchor back to the TTL `⚠`).
+    #[test]
+    fn ensure_preserves_covered_abort_marker() {
+        let _root = test_root();
+        let mut covered_abort = super::super::record_for_abort(
+            "claude".into(),
+            1,
+            10,
+            "tmux-1".into(),
+            Some((999, "2026-06-09 08:00:00".into())),
+        )
+        .unwrap();
+        covered_abort.covered_at_ms = Some(2_000);
+        super::super::record(&covered_abort).unwrap();
+        assert_eq!(
+            ensure_marker_for_own_synthetic_turn("claude", 1, 10, "tmux-1", OWN_STARTED_AT),
+            EnsureClaimMarkerOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            super::super::load_for_channel("claude", 1),
+            vec![covered_abort],
+            "tombstoned (covered) evidence survives — never overwritten"
+        );
+    }
+
+    /// (c) #3350: when the own turn already terminal-committed (durable
+    /// tombstone), the ensure records a COVERED marker and the sweep delivers
+    /// the idempotent `✅` — never the TTL `⚠`.
+    #[test]
+    fn ensure_covers_from_own_tombstone_and_sweep_delivers_completion() {
+        let _root = test_root();
+        super::super::record_commit_tombstone_at(5_000, "claude", "tmux-1", 1, 901, OWN_STARTED_AT);
+        let outcome =
+            ensure_marker_for_own_synthetic_turn("claude", 1, 901, "tmux-1", OWN_STARTED_AT);
+        assert_eq!(
+            outcome,
+            EnsureClaimMarkerOutcome::Recorded { covered: true }
+        );
+
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<(u64, super::super::ReactionOp)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_fn = calls.clone();
+        let applier: super::super::ReactionApplierFn = Box::new(move |marker, op| {
+            let calls = calls_for_fn.clone();
+            let anchor = marker.anchor_message_id;
+            Box::pin(async move {
+                calls.lock().unwrap().push((anchor, op));
+                super::super::ReactionDelivery::Delivered
+            })
+        });
+        let resolved = test_rt().block_on(super::super::sweep_expired_with_applier(
+            "claude",
+            5_001,
+            true,
+            &|_| false,
+            &applier,
+        ));
+        assert_eq!(resolved, 1);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(901, super::super::ReactionOp::Complete)],
+            "an already-committed turn converges to the idempotent ✅ (never ⚠)"
+        );
+        assert!(super::super::load_for_channel("claude", 1).is_empty());
+    }
+
+    /// (d) #3350 / I5: a zero anchor id is rejected and nothing is persisted.
+    #[test]
+    fn ensure_skips_zero_anchor() {
+        let _root = test_root();
+        assert_eq!(
+            ensure_marker_for_own_synthetic_turn("claude", 1, 0, "tmux-1", OWN_STARTED_AT),
+            EnsureClaimMarkerOutcome::SkippedZeroAnchor
+        );
+        assert!(super::super::load_for_channel("claude", 1).is_empty());
     }
 
     /// The bool shorthand (existing test closures) maps to a probe that can

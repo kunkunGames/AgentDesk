@@ -62,6 +62,10 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:d2a63e6f1c91c479",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:c4f1e0c4fddb4380",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9b9526b38f0691a8",
+  # #3038 turn_bridge S1: status-panel completion direct gateway calls moved
+  # verbatim from turn_bridge/mod.rs to turn_bridge/status_panel.rs.
+  "src/services/discord/turn_bridge/status_panel.rs#direct_discord_sends:8806b21b9432ae8a",
+  "src/services/discord/turn_bridge/status_panel.rs#direct_discord_sends:c4f1e0c4fddb4380",
   # #3016 msg_id==0 recovery: bridge creates a fresh placeholder / posts a recovery
   # notice for turns with no anchored Discord message. Consistent with the bridge's
   # existing pre-migration direct sends; retire with the #1436 outbound v3 extraction.
