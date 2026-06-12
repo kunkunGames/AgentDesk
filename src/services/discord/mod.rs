@@ -69,6 +69,7 @@ pub(crate) mod shared_memory;
 // dedicated inherent impls). See `shared_state::QueuedPlaceholderState` and
 // `shared_state::SessionOverrideState`.
 mod shared_state;
+mod single_message_panel;
 mod stall_recovery;
 mod status_panel_orphan_store;
 pub(in crate::services::discord) mod streaming_finalizer;
@@ -115,7 +116,11 @@ pub(crate) use restart_mode::InflightRestartMode;
 pub(crate) use router::HeadlessTurnStartError;
 #[cfg(unix)]
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
+// #3038 S4: re-export the live-placeholder cluster type so `SharedData`
+// declarations/constructors keep the S1/S2/S3 unqualified surface.
+pub(in crate::services::discord) use shared_state::PlaceholderState;
 pub(in crate::services::discord) use shared_state::QueuedPlaceholderState;
+pub(in crate::services::discord) use shared_state::RuntimeHttpCache;
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
 // to `crate::services`), so the group type is re-exported with that same scope.
 pub(in crate::services) use shared_state::SessionOverrideState;
@@ -676,8 +681,12 @@ pub(in crate::services::discord) fn advance_last_message_checkpoint(
     checkpoint
 }
 
-pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff;
-pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff_immediate;
+pub(in crate::services::discord) use queue_io::{
+    schedule_deferred_idle_queue_kickoff, schedule_deferred_idle_queue_kickoff_immediate,
+};
+pub(super) fn single_message_panel_enabled() -> bool {
+    single_message_panel::enabled()
+}
 /// Minimum interval between Discord placeholder edits for progress status.
 /// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
 pub(super) fn status_update_interval() -> Duration {
@@ -2221,24 +2230,10 @@ pub(crate) struct SharedData {
     /// watcher and an incoming watcher share the same emission-slot atomic
     /// and confirmed-offset watermark. See `TmuxRelayCoord`.
     pub(super) tmux_relay_coords: dashmap::DashMap<ChannelId, Arc<TmuxRelayCoord>>,
-    /// Last known placeholder cleanup outcome keyed by provider/channel/message.
-    /// This local tombstone lets watcher finalization reason about cleanup
-    /// even after the inflight file has already been cleared.
-    pub(in crate::services::discord) placeholder_cleanup:
-        Arc<placeholder_cleanup::PlaceholderCleanupRegistry>,
-    /// Lifecycle FSM + edit coalescer for live-turn placeholder cards (#1255).
-    /// Both the `tmux_handed_off` async-dispatch path and the new Monitor /
-    /// `Bash run_in_background` live-turn path go through this controller so
-    /// that concurrent edits to the same placeholder message_id serialize
-    /// instead of racing.
-    pub(in crate::services::discord) placeholder_controller:
-        Arc<placeholder_controller::PlaceholderController>,
-    /// Per-channel recent tool/system events rendered in Active placeholder
-    /// cards when `placeholder.live_events_enabled` is enabled.
-    pub(in crate::services::discord) placeholder_live_events:
-        Arc<placeholder_live_events::PlaceholderLiveEvents>,
-    pub(in crate::services::discord) placeholder_live_events_enabled: bool,
-    pub(in crate::services::discord) status_panel_v2_enabled: bool,
+    /// #3038 cluster F — live-placeholder/status-panel state: cleanup tombstones,
+    /// edit controller, live-event feed, and live-event/status-panel gates.
+    /// Field docs live on `shared_state::PlaceholderState`; call sites use `shared.ui.*`.
+    pub(in crate::services::discord) ui: PlaceholderState,
     /// #3038 cluster C — queued-placeholder handoff state (the
     /// `queued_placeholders` mapping, the `queue_exit_placeholder_clears`
     /// sidecar mirror, and the per-channel `queued_placeholders_persist_locks`).
@@ -2326,10 +2321,12 @@ pub(crate) struct SharedData {
     pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Per-channel known speakers collected lazily from incoming messages.
     pub(super) channel_rosters: dashmap::DashMap<ChannelId, Vec<UserRecord>>,
-    /// Cached serenity context for deferred queue drain (set once during ready event).
-    pub(super) cached_serenity_ctx: tokio::sync::OnceCell<serenity::Context>,
-    /// Cached bot token for deferred queue drain.
-    pub(super) cached_bot_token: tokio::sync::OnceCell<String>,
+    /// #3038 cluster G — cached Discord HTTP runtime state: the gateway
+    /// serenity context plus the bot-token fallback for standby REST sends.
+    /// Field docs live on `shared_state::RuntimeHttpCache`; call sites use
+    /// `shared.http.*` for direct cache reads and keep
+    /// `shared.serenity_http_or_token_fallback()` for the accessor.
+    pub(in crate::services::discord) http: RuntimeHttpCache,
     /// SHA-256 hash of the bot token — used to namespace the pending-queue directory
     /// so that multiple bots sharing the same runtime root cannot steal each other's queues.
     pub(super) token_hash: String,
@@ -2364,34 +2361,6 @@ pub(crate) struct SharedData {
 impl SharedData {
     pub(super) fn has_runtime_storage(&self) -> bool {
         self.pg_pool.is_some()
-    }
-
-    /// Phase 5.2 of intake-node-routing (issue #2009): return an `Arc<Http>`
-    /// that the response path (tmux watcher, placeholder updates, message
-    /// edits) can use to call Discord. On the leader the gateway-attached
-    /// runtime caches `cached_serenity_ctx`, and `ctx.http` is preferred so
-    /// the Http instance shares the same application_id and connection
-    /// pool the gateway already owns. On cluster-standby nodes the
-    /// OnceCell is empty (no gateway runtime ever ran), so we fall back to
-    /// a freshly constructed `serenity::http::Http` built from the bot
-    /// token cached in `cached_bot_token`. Returns `None` only when both
-    /// caches are empty — that means the runtime never reached the
-    /// "token known" milestone in `run_bot()`, which today only happens
-    /// before `bot_settings` finishes loading.
-    ///
-    /// Callers should treat `None` as a hard failure: they cannot post
-    /// to Discord without an Http instance. The current call sites
-    /// either propagate the failure (skip the work + warn) or have
-    /// their own panic-on-None invariant tied to `cached_bot_token`
-    /// being populated at `run_bot()` startup.
-    pub(super) fn serenity_http_or_token_fallback(&self) -> Option<Arc<serenity::http::Http>> {
-        if let Some(ctx) = self.cached_serenity_ctx.get() {
-            return Some(ctx.http.clone());
-        }
-        if let Some(token) = self.cached_bot_token.get() {
-            return Some(Arc::new(serenity::http::Http::new(token)));
-        }
-        None
     }
 
     fn mailbox(&self, channel_id: ChannelId) -> ChannelMailboxHandle {
@@ -2581,11 +2550,19 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         skills_cache: tokio::sync::RwLock::new(Vec::new()),
         tmux_watchers: TmuxWatcherRegistry::new(),
         tmux_relay_coords: dashmap::DashMap::new(),
-        placeholder_cleanup: Arc::new(placeholder_cleanup::PlaceholderCleanupRegistry::default()),
-        placeholder_controller: Arc::new(placeholder_controller::PlaceholderController::default()),
-        placeholder_live_events: Arc::new(placeholder_live_events::PlaceholderLiveEvents::default()),
-        placeholder_live_events_enabled: false,
-        status_panel_v2_enabled: false,
+        ui: PlaceholderState {
+            placeholder_cleanup: Arc::new(
+                placeholder_cleanup::PlaceholderCleanupRegistry::default(),
+            ),
+            placeholder_controller: Arc::new(
+                placeholder_controller::PlaceholderController::default(),
+            ),
+            placeholder_live_events: Arc::new(
+                placeholder_live_events::PlaceholderLiveEvents::default(),
+            ),
+            placeholder_live_events_enabled: false,
+            status_panel_v2_enabled: false,
+        },
         queued: QueuedPlaceholderState {
             queued_placeholders: dashmap::DashMap::new(),
             queue_exit_placeholder_clears: dashmap::DashMap::new(),
@@ -2633,8 +2610,10 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         catch_up_retry_pending: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
         channel_rosters: dashmap::DashMap::new(),
-        cached_serenity_ctx: tokio::sync::OnceCell::new(),
-        cached_bot_token: tokio::sync::OnceCell::new(),
+        http: RuntimeHttpCache {
+            cached_serenity_ctx: tokio::sync::OnceCell::new(),
+            cached_bot_token: tokio::sync::OnceCell::new(),
+        },
         token_hash: "test-token-hash".to_string(),
         provider: ProviderKind::Claude,
         api_port: 9,
@@ -2843,11 +2822,10 @@ fn cleanup_retry_inflight_blocks_idle_kickoff(
         return false;
     }
 
-    shared.placeholder_cleanup.terminal_cleanup_retry_pending(
-        provider,
-        channel_id,
-        MessageId::new(state.current_msg_id),
-    )
+    shared
+        .ui
+        .placeholder_cleanup
+        .terminal_cleanup_retry_pending(provider, channel_id, MessageId::new(state.current_msg_id))
 }
 
 fn idle_queue_snapshot_has_kickable_backlog(
@@ -3225,6 +3203,7 @@ async fn queue_exit_drain_queued_placeholders(
                 .remove(&(channel_id, *message_id))
             {
                 shared
+                    .ui
                     .placeholder_controller
                     .detach_by_message(channel_id, placeholder_msg_id);
                 visible_cards_to_clear.push(QueueExitVisibleCard {

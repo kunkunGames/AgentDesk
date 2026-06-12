@@ -42,17 +42,22 @@ pub(super) fn run_bot_build_shared_data(
         skills_cache: tokio::sync::RwLock::new(initial_skills),
         tmux_watchers: crate::services::discord::TmuxWatcherRegistry::new(),
         tmux_relay_coords: dashmap::DashMap::new(),
-        placeholder_cleanup: Arc::new(
-            crate::services::discord::placeholder_cleanup::PlaceholderCleanupRegistry::default(),
-        ),
-        placeholder_controller: Arc::new(
-            crate::services::discord::placeholder_controller::PlaceholderController::default(),
-        ),
-        placeholder_live_events: Arc::new(
-            crate::services::discord::placeholder_live_events::PlaceholderLiveEvents::default(),
-        ),
-        placeholder_live_events_enabled,
-        status_panel_v2_enabled,
+        // #3038 S4: wrapped verbatim at the first-member position
+        // (evaluation-order preserved).
+        ui: PlaceholderState {
+            placeholder_cleanup: Arc::new(
+                crate::services::discord::placeholder_cleanup::PlaceholderCleanupRegistry::default(
+                ),
+            ),
+            placeholder_controller: Arc::new(
+                crate::services::discord::placeholder_controller::PlaceholderController::default(),
+            ),
+            placeholder_live_events: Arc::new(
+                crate::services::discord::placeholder_live_events::PlaceholderLiveEvents::default(),
+            ),
+            placeholder_live_events_enabled,
+            status_panel_v2_enabled,
+        },
         // #3038 S1: wrapped verbatim at the first-member position (evaluation-order preserved).
         queued: QueuedPlaceholderState {
             queued_placeholders: dashmap::DashMap::new(),
@@ -159,8 +164,10 @@ pub(super) fn run_bot_build_shared_data(
         catch_up_retry_pending: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
         channel_rosters: dashmap::DashMap::new(),
-        cached_serenity_ctx: tokio::sync::OnceCell::new(),
-        cached_bot_token: tokio::sync::OnceCell::new(),
+        http: RuntimeHttpCache {
+            cached_serenity_ctx: tokio::sync::OnceCell::new(),
+            cached_bot_token: tokio::sync::OnceCell::new(),
+        },
         token_hash: token_hash.to_string(),
         provider: provider.clone(),
         api_port,

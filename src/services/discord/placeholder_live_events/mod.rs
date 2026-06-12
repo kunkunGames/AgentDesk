@@ -7,7 +7,9 @@ use serde_json::Value;
 use crate::services::agent_protocol::StatusEvent;
 use crate::services::provider::ProviderKind;
 
+mod background_task_events;
 mod common;
+mod completion_footer;
 mod context_panel;
 mod recent_events;
 mod session_panel;
@@ -22,6 +24,8 @@ mod workflow_panel;
 mod tests;
 
 use common::CHANNEL_EVENT_CAPACITY;
+pub(in crate::services::discord) use completion_footer::TerminalSlotId;
+use completion_footer::{CompletionFooterRender, render_completion_footer};
 use context_panel::ContextPanelSnapshot;
 use recent_events::render_events;
 use session_panel::SessionPanelSnapshot;
@@ -41,7 +45,8 @@ use status_panel::{
 
 pub(in crate::services::discord) use recent_events::RecentPlaceholderEvent;
 pub(in crate::services::discord) use status_events::{
-    status_events_from_task_notification, status_events_from_tool_result_with_id,
+    status_events_from_task_notification_with_tool_use_id,
+    status_events_from_task_notification_xml, status_events_from_tool_result_with_id,
     status_events_from_tool_use_with_id,
 };
 // #3034: the bare (no-id) variants are consumed only by the `tests` submodule
@@ -50,7 +55,9 @@ pub(in crate::services::discord) use status_events::{
 // build.
 #[cfg(test)]
 pub(in crate::services::discord) use status_events::{
-    status_events_from_tool_result, status_events_from_tool_use,
+    status_events_from_json_for_footer_mode, status_events_from_task_notification,
+    status_events_from_task_notification_xml_for_footer_mode, status_events_from_tool_result,
+    status_events_from_tool_use, status_events_from_tool_use_with_id_for_footer_mode,
 };
 
 pub(in crate::services::discord) use recent_events::events_from_json;
@@ -73,6 +80,25 @@ impl PlaceholderLiveEvents {
     pub(in crate::services::discord) fn clear_channel(&self, channel_id: ChannelId) {
         self.by_channel.remove(&channel_id);
         self.status_by_channel.remove(&channel_id);
+    }
+
+    pub(in crate::services::discord) fn clear_channel_preserving_footer_residuals(
+        &self,
+        channel_id: ChannelId,
+    ) {
+        self.by_channel.remove(&channel_id);
+        let has_residuals = self
+            .status_by_channel
+            .get(&channel_id)
+            .is_some_and(|entry| {
+                entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .reset_turn_content_preserving_unfinished_footer_residuals()
+            });
+        if !has_residuals {
+            self.status_by_channel.remove(&channel_id);
+        }
     }
 
     pub(in crate::services::discord) fn push_event(
@@ -409,5 +435,24 @@ impl PlaceholderLiveEvents {
             started_at_unix,
             heartbeat_at_unix,
         )
+    }
+
+    pub(in crate::services::discord) fn render_completion_footer(
+        &self,
+        channel_id: ChannelId,
+        provider: &ProviderKind,
+        indicator: &str,
+    ) -> CompletionFooterRender {
+        let snapshot = self
+            .status_by_channel
+            .get(&channel_id)
+            .map(|entry| {
+                entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .unwrap_or_default();
+        render_completion_footer(snapshot, provider, indicator)
     }
 }

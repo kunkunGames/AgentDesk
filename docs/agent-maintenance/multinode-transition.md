@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-12 (against #3038 run_bot S4 shared-data builder move).
+> Last refreshed: 2026-06-12 (against #3038 run_bot S5 closing pass).
 
 ## Read This First
 
@@ -22,16 +22,19 @@
 ### `multinode / discord_gateway_singleton`
 
 - feature: `multinode / discord_gateway_singleton`
-- canonical_modules: `src/services/discord/runtime_bootstrap.rs` builds the
-  Serenity client and preserves the call order; `runtime_bootstrap/gateway_lease.rs`
-  owns gateway lease acquisition, keepalive, and self-fencing;
-  `runtime_bootstrap/shutdown.rs` owns SIGTERM persistence and gateway backend
-  execution; `runtime_bootstrap/intake.rs` owns the standby intake-worker spawn.
+- canonical_modules: `src/services/discord/runtime_bootstrap.rs` preserves the
+  bootstrap call order; `runtime_bootstrap/gateway_runtime.rs` builds the
+  Serenity client and enters the leader gateway event loop;
+  `runtime_bootstrap/gateway_lease.rs` owns gateway lease acquisition,
+  keepalive, and self-fencing; `runtime_bootstrap/shutdown.rs` owns SIGTERM
+  persistence and gateway backend execution; `runtime_bootstrap/intake.rs` owns
+  the standby intake-worker spawn.
 - legacy_modules: none. The current gateway owner is the active dcserver process
   for that provider.
 - do_not_edit_without_migration_plan:
   `src/services/discord/runtime_bootstrap.rs` gateway startup order plus
-  `src/services/discord/runtime_bootstrap/gateway_lease.rs` and
+  `src/services/discord/runtime_bootstrap/gateway_runtime.rs`,
+  `src/services/discord/runtime_bootstrap/gateway_lease.rs`, and
   `src/services/discord/runtime_bootstrap/shutdown.rs` lease/shutdown paths,
   especially watcher cancellation on gateway lease loss.
 - active_callsite_coverage: single-node runtime with an existing gateway lease.
@@ -42,6 +45,9 @@
   instead of looping back through the internal HTTP cleanup route. The singleton
   assumption remains unchanged: the task is still spawned from the leased
   gateway runtime.
+- 2026-06-12 audit note (#3089 S0): `runtime_bootstrap` only initializes the
+  default-off `single_message_panel` flag for startup logging. Gateway lease,
+  startup order, worker ownership, and singleton assumptions are unchanged.
 - invariants: `singleton_on_leader`,
   `heartbeat_capability_registry_routing`.
 - allowed_changes: `bugfix` only before #876/#877. New gateway, reconnect,
@@ -383,6 +389,13 @@
 
 ### Audited touches
 
+- #3038 run_bot S5: the leader gateway runtime tail moved verbatim from
+  `runtime_bootstrap.rs` into `runtime_bootstrap/gateway_runtime.rs`: restored
+  generation/model/fast-mode logging, health registry registration,
+  slash-command/framework/client construction, gateway lease keepalive spawn,
+  SIGTERM handler spawn, and backend event-loop entry remain in the same order.
+  The root `run_bot` body now delegates that tail after the lease succeeds; no
+  gateway ownership, worker routing, singleton, or lease semantics changed.
 - #3038 run_bot S4: `run_bot_build_shared_data` (and its side-effect-order
   doc comment) moved verbatim from `runtime_bootstrap.rs` into
   `runtime_bootstrap/shared_data.rs`, unblocked by the merged SharedData
@@ -707,3 +720,13 @@
   **Worker-local**: no PG lease, no cross-node reads, no leader-only side
   effect. No new multinode ownership, singleton, or lease assumption is
   introduced.
+- #3038 S5 (SharedData cluster G — `RuntimeHttpCache`): pure field relocation;
+  `cached_serenity_ctx` / `cached_bot_token` and the
+  `serenity_http_or_token_fallback()` accessor moved verbatim from
+  `discord/mod.rs` into `shared_state.rs::RuntimeHttpCache`, with call sites
+  (including `runtime_bootstrap*` init and 2 single-token sites in the frozen
+  `turn_bridge/mod.rs`) rerouted `shared.cached_*` → `shared.http.cached_*`.
+  The leader-vs-standby semantics of the accessor (gateway ctx preferred,
+  token-built Http fallback on standby nodes) are byte-identical and stay
+  process-local. No new multinode ownership, singleton, or lease assumption
+  is introduced.

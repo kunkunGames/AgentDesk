@@ -8,7 +8,7 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-06-11 (against #3306 idle-relay registry/dedupe-mirror drift self-heal — new non-giant `src/services/discord/idle_relay_drift.rs` rate-limits the per-session drift WARN and one-shot self-heals the authoritative registry from a DURABLE source — the settings binding or the `sessions.channel_id` durable column via the new `load_session_channel_id_pg` — guarded by live-pane + instance-id + mirror-agreement so #3018's single-authority / never-route-from-mirror invariant holds; `tui_prompt_relay.rs` net 0-line at the 5429 freeze, `mod.rs` +1 to the 4987 freeze, `db/dispatched_sessions.rs` +48; on top of #3303 deferred-claim anchor reconcile — the `tui_direct_abort_marker` module is decomposed into a directory module of `mod.rs` + `store.rs` + `deferred_claim.rs`, all non-giant, and a successful watcher-owned deferred claim now records an own-identity `DeferredClaim` marker so the anchor's `⏳` converges to `✅` on the own commit or a bounded sweep `⚠`; tmux_watcher / tui_prompt_relay / health recovery / placeholder_sweeper are 0-line changes; on top of #3216 resume-protection residual gaps on top of #3207 — session_runtime now adds a SAFE legacy NULL-channel_id fallback to the channel-scoped cwd resolves via resolve_cwd_for_session_key honored only for a single legacy row, plus a live-tmux recovery-cwd reconcile in auto_restore_session_force via reconcile_recovery_cwd and correct_session_cwd_to_tmux that adopts the live pane cwd over a divergent DB cwd and self-heals the row; #3207 comprehensive channel_id scoping of session-cwd DB resolves — auto_restore_session_force restart restore via restore_session_cwd_from_db and watcher recovery via load_restored_session_cwd require channel_id = $2; on top of #3105 dead/orphaned TUI-session mirror eviction made flake-resistant and run off the Tokio executor).
+> Last refreshed: 2026-06-12 (against #3089 completion-footer slice — `tmux.rs` suppression exposure tests now strip completion-only footer blocks so internal turns still delete cleanly; generated inventory includes the new `placeholder_live_events/completion_footer.rs` renderer module, and round 2 adds idle-animation TTL/failure-eviction/recovery-takeover forget; on top of #3038 run_bot S5 closing pass).
 
 ## Read This First
 
@@ -31,9 +31,10 @@
 
 ### `discord_outbound`
 
-- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery,transport}.rs`
-  (#1006 v3 domain types, pure planner, delivery implementation, and shared
-  transport/dedup primitives).
+- canonical_modules: `src/services/discord/outbound/{message,policy,result,decision,delivery,transport,send_to_agent,send_target,send_gate,send_api,manual_delivery}.rs`
+  (#1006 v3 domain types, pure planner, delivery implementation, shared
+  transport/dedup primitives, and the #3038 send-to-agent/manual outbound
+  dispatch surface).
 - legacy_modules: none; `src/services/discord/outbound/legacy.rs` was removed
   in #2535.
 - do_not_edit_without_migration_plan:
@@ -117,7 +118,10 @@
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior; #3016 phase-5b2 dropped the `mailbox_finalize_owed`
     construction from the watcher-spawn handle).
-  - `src/services/discord/tmux.rs` (2012 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2050 lines after #2558 dead-code sweep;
+    +1 from #3384 restored-seed undelivered-body discard guard;
+    +38 for suppressed-label noise, user report 2026-06-12: provider-aware
+    status/footer stripping in the placeholder suppression decisions;
     +4 from #3167: the monitor-auto-turn start passes `ActiveTurnKind::Background`
     so a queued user message can supersede the low-priority monitor/loop turn;
     failover guard; #3087 `session_panel_instance_key`/`write_spawn_nonce`
@@ -130,7 +134,8 @@
     monotonic-CAS offset INLINE (synchronously) on a `Delivered` outcome; the
     finalizer actor's `CommitDelivery`/`ReleaseDelivery` handlers are DORMANT
     (retained for a later phase, not the live watcher path after the R2 revert);
-    still giant-file territory).
+    -1 from #3038 S4 after routing the placeholder/status-panel cluster
+    through `shared.ui`; still giant-file territory).
   - `src/services/discord/tmux_watcher.rs` (8122 production lines after
     #3038 tmux_watcher S1 moved top-level decision clusters A/B/C/E/F/I/J/K
     into `tmux_watcher/` child modules: `liveness.rs` (301),
@@ -665,7 +670,7 @@
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`;
     +62 from #3304: slash-command canonical prompt keys for `<command-*>` XML vs
     `/command args` dedupe, plus focused loop skill-expansion regressions).
-  - `src/services/discord/recovery_engine.rs` (4090 lines; #3016 phase-5b2
+  - `src/services/discord/recovery_engine.rs` (4083 lines; #3016 phase-5b2
     dropped the `mailbox_finalize_owed` construction from the three recovery
     watcher-spawn handles; +9 from #3166
     fetching real context thresholds for the recovered-turn status panel; +36 from #3099
@@ -686,25 +691,34 @@
     `RecoveryRelayOutcome` — the five notice branches route through
     `recovery_paths/restart.rs::dispose_recovery_relay_outcome` (permanent
     Discord 404/403/410 force-clear + 3-restart transient budget); the pure
-    decision matrix lives in `recovery_paths/shared.rs`).
-  - `src/services/discord/health.rs` (402 prod lines after the #3038 Phase A
+    decision matrix lives in `recovery_paths/shared.rs`; -13 from #3089 S4
+    moving single-message status-panel completion targeting into
+    `recovery_engine/status_panel.rs`; +6 from #3089 completion-footer round 2
+    forgetting registered completion-footer targets when recovery takes ownership
+    of a channel's terminal message).
+  - `src/services/discord/health.rs` (417 prod lines after the #3038 Phase A
     directory decomposition; module root keeps the `HealthRegistry` core +
-    re-export surface, and the former monolith body lives in six flat
+    re-export surface, and the former monolith body lives in flat
     `health/` submodules, all sub-1000 prod LoC: `runtime_resolve.rs` (321),
-    `headless_turn.rs` (297), `send_target.rs` (150), `send_gate.rs` (374),
-    `manual_delivery.rs` (580), `send_api.rs` (259). Previously 2240 after
-    the #3034 dead-code sweep, 2292 after #3038 send-to-agent dispatch
-    extraction to `outbound/send_to_agent.rs`, #1879 snapshot/mailbox
-    extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2641 lines; health recovery
+    `headless_turn.rs` (297), `relay_auto_heal.rs` (123),
+    `stall_liveness.rs` (527). Previously 2240 after the #3034 dead-code
+    sweep, 2292 after #3038 send-to-agent dispatch extraction to
+    `outbound/send_to_agent.rs`, then S1 moved the manual outbound dispatch
+    children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
+    `outbound/` while preserving the `health::` re-export API; #1879
+    snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
+  - `src/services/discord/health/recovery.rs` (2615 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests; +88
     from #3169 stall-watchdog jsonl-mtime liveness guard + tests, closing the
     Death #1 force-clean false-positive on loop mid-write sessions; -4 from
     #3293 routing the mailbox probe through the non-creating
     `health/mailbox.rs::peeked_provider_mailbox_state` so repair probes stop
-    minting permanent registry entries for non-existent channels).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3809 lines;
+    minting permanent registry entries for non-existent channels; -4 from
+    #3360 moving orphan pending-token auto-heal out to
+    `health/relay_auto_heal.rs`; #3361 moved positive stall-watchdog liveness
+    guard state/logging to `health/stall_liveness.rs`).
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3807 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -714,7 +728,8 @@
     `remove_reaction_raw` at the `started==true` promotion point, removing the
     stranded `📬`/`➕` so a processed message no longer shows `📬`+`✅`); +1 from
     #3038 S1 mechanical `.queued_placeholders` -> `.queued.queued_placeholders`
-    re-wire after lifting cluster C into `QueuedPlaceholderState`).
+    re-wire after lifting cluster C into `QueuedPlaceholderState`; -2 from #3038
+    S4 mechanical placeholder/status-panel `.ui` rewiring).
   - `src/services/discord/router/message_handler/headless_turn.rs` (1316 lines;
     headless Discord turn launch/terminal-response path split from the router
     message handler; bugfix only outside a further extraction plan).
@@ -770,32 +785,43 @@
     `finalize_stale_streaming_footer` / `text_ends_with_streaming_footer` shared
     terminal-idle reconciliation helpers + their unit tests).
   - `src/services/discord/prompt_builder/` (directory, refactored).
-  - `src/services/discord/runtime_bootstrap.rs` (369 production lines after
-    #3038 run_bot S0/S4; characterization tests pin the startup-doctor barrier,
+  - `src/services/discord/runtime_bootstrap.rs` (274 production lines after
+    #3038 run_bot S0/S5; characterization tests pin the startup-doctor barrier,
     restored settings filters, queued-placeholder filtering/deletion, and
     gateway intents, then the low-risk clusters moved verbatim into
     `runtime_bootstrap/`: `restored_state.rs` (124), `queued_placeholders.rs`
     (193), `startup_doctor.rs` (156), `orphan_recovery.rs` (337),
     `session_gc.rs` (102 prod / 69 test), `framework_setup.rs` (287),
-    `spawns.rs` (218), `recovery_flush.rs` (356), `voice.rs` (140),
-    `gateway_lease.rs` (187), `shutdown.rs` (203), `intake.rs` (63), and —
-    once the SharedData S1-S3 slices merged — `shared_data.rs` (176, the
-    `run_bot_build_shared_data` builder plus its side-effect-order doc).
+    `spawns.rs` (229), `recovery_flush.rs` (357), `voice.rs` (140),
+    `gateway_lease.rs` (190), `shutdown.rs` (207), `intake.rs` (63),
+    `shared_data.rs` (176, the `run_bot_build_shared_data` builder plus its
+    side-effect-order doc), and `gateway_runtime.rs` (147, the leader runtime
+    tail from restored logging through backend event-loop entry).
     The namespace is capped at 700 prod lines per child module in
     `audit_maintainability_config.toml`; the root is no longer a prod giant and
-    was removed from `giant_file_registry.toml`; only the S5 accounting
-    cleanup slice remains).
+    was removed from `giant_file_registry.toml`; #3038 S5 locked the final
+    root ratchet at 274 production lines).
   - `src/services/discord/session_runtime.rs` (1753 lines).
-  - `src/services/discord/voice_barge_in.rs` (4657 lines; net +0 from #3034
-    scoped dead-code allows on the test-only runtime API
-    (`disabled` / `runtime_config_snapshot` / `apply_voice_command` /
-    `reset_after_playback_start` / `clear_playback`) — the five added `#[allow]`
-    lines were offset by collapsing their reason comments to inline form and
-    rewrapping adjacent doc comments, so the file stays at its frozen baseline;
-    voice STT/TTS,
-    lobby routing, progress mirroring, and barge-in orchestration surface;
-    tracked decompose target — see `giant-file-registry.md` (owner
-    `voice-runtime`, deadline 2026-08-31, #3036)).
+  - `src/services/discord/voice_barge_in.rs` (3044 lines after #3038
+    VoiceBargeInRuntime S1 moved the STT method cluster to
+    `src/services/discord/voice_barge_in/stt.rs` (314 production lines) and
+    S2 moved the progress playback method cluster to
+    `src/services/discord/voice_barge_in/progress_playback.rs` (423 production
+    lines), and S3 moved the final-result playback cluster to
+    `src/services/discord/voice_barge_in/final_result_playback.rs` (230
+    production lines), and S4 moved the routing-resolution cluster to
+    `src/services/discord/voice_barge_in/routing.rs` (383 production lines),
+    and S5 moved the live-cut playback cluster to
+    `src/services/discord/voice_barge_in/live_cut_playback.rs` (120 production
+    lines), and S6 moved the TTS pipeline cluster to
+    `src/services/discord/voice_barge_in/tts_pipeline.rs` (86 production
+    lines), and S7 folded the agent-voice routing helper block into
+    `src/services/discord/voice_barge_in/routing.rs` (now 484 production
+    lines);
+    voice STT/TTS, lobby routing, progress mirroring, and barge-in
+    orchestration surface; tracked decompose target — see
+    `giant-file-registry.md` (owner `voice-runtime`, deadline 2026-08-31,
+    #3036)).
   - `src/voice/receiver.rs` (1052 lines; voice receive pipeline, utterance
     segmentation, artifact cleanup, and retention policy surface; split before
     adding non-bugfix behavior).
@@ -864,13 +890,14 @@
   - `src/server/routes/escalation.rs` (1376 lines).
   - `src/server/routes/meetings.rs` (1675 lines).
   - `src/server/routes/review_verdict/decision_route.rs` was decomposed in
-    #3038 slice 1 into a 139-line module root (orchestrator + shared types)
-    plus eight sub-1000-line directory modules under
-    `src/server/routes/review_verdict/decision_route/`
+    #3038 slice 1 and S1-relocated into a 26-line route shim delegating to
+    `src/services/review_decision.rs` plus sub-1000-line service modules under
+    `src/services/review_decision/`
     (`repo_card`/`repo_dispatch`/`worktree_stale`/`adapters`/`pending`/
-    `accept`/`dispute`/`dismiss_finalize`). Conservatively still bugfix-only
-    until the PG-backed characterization harness (slice 3) lands; re-inflation
-    is ratcheted in `scripts/audit_maintainability_giant_baseline.toml`.
+    `accept`/`dispute`/`dismiss_finalize` plus review-state/tuning helpers).
+    Conservatively still bugfix-only until the PG-backed characterization
+    harness (slice 3) lands; re-inflation is ratcheted in
+    `scripts/audit_maintainability_giant_baseline.toml`.
   - `src/server/routes/{agents,agents_crud,agents_setup,v1,resume}.rs` (all
     1000+ production lines). (`dispatches/thread_reuse.rs` dropped below the
     giant threshold in #3037 after its Postgres/Discord-API thread-map helpers
@@ -1000,8 +1027,8 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
 - `src/services/dispatches/outbox_route.rs` (1089) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
-- `src/services/claude.rs` (3991), `src/services/gemini.rs` (1358),
-  `src/services/qwen.rs` (2196), `src/services/codex.rs` (3001),
+- `src/services/claude.rs` (2948), `src/services/gemini.rs` (1358),
+  `src/services/qwen.rs` (2196), `src/services/codex.rs` (3002),
   `src/services/opencode.rs` (1886), `src/services/provider.rs` (1818) —
   provider adapters. (#3034 removed dead non-cancel `execute_command_simple*`
   twins from the claude/codex/gemini adapters and a superseded
@@ -1017,10 +1044,10 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   with the `#[must_use] ClaudeTuiDraftRecoveryOutcome` carrier — behaviour-
   preserving, the +101 is the new outcome enum, the two verbatim-extraction doc
   contracts, and the call-site `match` dispatch (the recovery body itself is a
-  move). claude.rs is not in the giant-file ratchet baseline; this is a
-  freshness-annotation sync, not a baseline raise. Slice S3 relocates the
-  hosting cluster to a directory and drives claude.rs back under the giant
-  threshold.)
+  move). #3038 S3 relocates the TUI warm/follow-up hosting cluster into
+  `src/services/claude_tui/hosting/` child modules, ratchets claude.rs at 2950
+  production LoC, and leaves the #3262 turn-lock machinery in the claude.rs
+  root.)
 - `src/services/codex_tui/rollout_tail.rs` (1663) — Codex TUI rollout tail
   parsing and resume identity surface; split before adding non-bugfix behavior
   beyond the #2169 session identity fix.

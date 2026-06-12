@@ -1,4 +1,4 @@
-//! #3038 S1/S2/S3 — extracted field clusters of [`SharedData`].
+//! #3038 S1/S2/S3/S4/S5 — extracted field clusters of [`SharedData`].
 //!
 //! This module hosts named sub-structs that group cohesive `SharedData` fields
 //! together with the inherent `impl SharedData` methods that exclusively own
@@ -22,7 +22,84 @@ use poise::serenity_prelude::{ChannelId, MessageId};
 
 use crate::services::provider::ProviderKind;
 
-use super::{ModelPickerPendingState, QueueExitVisibleCard, SharedData};
+use super::{
+    ModelPickerPendingState, QueueExitVisibleCard, SharedData, placeholder_cleanup,
+    placeholder_controller, placeholder_live_events,
+};
+
+/// #3038 cluster F — live-placeholder/status-panel state.
+///
+/// Groups the five contiguous fields that together own the user-visible live
+/// placeholder card surface: cleanup tombstones, serialized placeholder edits,
+/// the recent live-event/status-panel feed, and the two feature gates that
+/// decide whether those events render into placeholder cards or separate
+/// status panels. Field declarations, docs, and types moved verbatim from
+/// `discord/mod.rs`; the members keep their original
+/// `pub(in crate::services::discord)` visibility.
+pub(in crate::services::discord) struct PlaceholderState {
+    /// Last known placeholder cleanup outcome keyed by provider/channel/message.
+    /// This local tombstone lets watcher finalization reason about cleanup
+    /// even after the inflight file has already been cleared.
+    pub(in crate::services::discord) placeholder_cleanup:
+        Arc<placeholder_cleanup::PlaceholderCleanupRegistry>,
+    /// Lifecycle FSM + edit coalescer for live-turn placeholder cards (#1255).
+    /// Both the `tmux_handed_off` async-dispatch path and the new Monitor /
+    /// `Bash run_in_background` live-turn path go through this controller so
+    /// that concurrent edits to the same placeholder message_id serialize
+    /// instead of racing.
+    pub(in crate::services::discord) placeholder_controller:
+        Arc<placeholder_controller::PlaceholderController>,
+    /// Per-channel recent tool/system events rendered in Active placeholder
+    /// cards when `placeholder.live_events_enabled` is enabled.
+    pub(in crate::services::discord) placeholder_live_events:
+        Arc<placeholder_live_events::PlaceholderLiveEvents>,
+    pub(in crate::services::discord) placeholder_live_events_enabled: bool,
+    pub(in crate::services::discord) status_panel_v2_enabled: bool,
+}
+
+/// #3038 cluster G — runtime Discord HTTP cache.
+///
+/// Groups the gateway serenity context and bot-token fallback used by
+/// non-gateway Discord REST paths. Field declarations, docs, and types moved
+/// verbatim from `discord/mod.rs`; direct readers all stay inside `discord`.
+pub(in crate::services::discord) struct RuntimeHttpCache {
+    /// Cached serenity context for deferred queue drain (set once during ready event).
+    pub(in crate::services::discord) cached_serenity_ctx: tokio::sync::OnceCell<serenity::Context>,
+    /// Cached bot token for deferred queue drain.
+    pub(in crate::services::discord) cached_bot_token: tokio::sync::OnceCell<String>,
+}
+
+impl SharedData {
+    /// Phase 5.2 of intake-node-routing (issue #2009): return an `Arc<Http>`
+    /// that the response path (tmux watcher, placeholder updates, message
+    /// edits) can use to call Discord. On the leader the gateway-attached
+    /// runtime caches `cached_serenity_ctx`, and `ctx.http` is preferred so
+    /// the Http instance shares the same application_id and connection
+    /// pool the gateway already owns. On cluster-standby nodes the
+    /// OnceCell is empty (no gateway runtime ever ran), so we fall back to
+    /// a freshly constructed `serenity::http::Http` built from the bot
+    /// token cached in `cached_bot_token`. Returns `None` only when both
+    /// caches are empty — that means the runtime never reached the
+    /// "token known" milestone in `run_bot()`, which today only happens
+    /// before `bot_settings` finishes loading.
+    ///
+    /// Callers should treat `None` as a hard failure: they cannot post
+    /// to Discord without an Http instance. The current call sites
+    /// either propagate the failure (skip the work + warn) or have
+    /// their own panic-on-None invariant tied to `cached_bot_token`
+    /// being populated at `run_bot()` startup.
+    pub(in crate::services::discord) fn serenity_http_or_token_fallback(
+        &self,
+    ) -> Option<Arc<serenity::http::Http>> {
+        if let Some(ctx) = self.http.cached_serenity_ctx.get() {
+            return Some(ctx.http.clone());
+        }
+        if let Some(token) = self.http.cached_bot_token.get() {
+            return Some(Arc::new(serenity::http::Http::new(token)));
+        }
+        None
+    }
+}
 
 /// #3038 cluster C — the queued-placeholder handoff state.
 ///
