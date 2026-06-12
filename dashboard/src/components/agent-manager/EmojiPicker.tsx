@@ -36,12 +36,14 @@ export default function EmojiPicker({
   value,
   onChange,
   size = "md",
-  ariaLabel,
+  "aria-label": ariaLabel,
+  "aria-selected": ariaSelected,
 }: {
   value: string;
   onChange: (emoji: string) => void;
   size?: "sm" | "md";
-  ariaLabel?: string;
+  "aria-label"?: string;
+  "aria-selected"?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -73,12 +75,8 @@ export default function EmojiPicker({
         style={{ background: "var(--th-input-bg)", borderColor: "var(--th-input-border)" }}
         aria-haspopup="dialog"
         aria-expanded={open}
-        aria-label={
-          ariaLabel ||
-          (value
-            ? tr({ ko: `이모지 변경 (현재: ${value})`, en: `Change emoji (current: ${value})` })
-            : tr({ ko: "이모지 선택기 열기", en: "Open emoji picker" }))
-        }
+        aria-label={ariaLabel || tr({ ko: "이모지 선택", en: "Choose emoji" })}
+        aria-selected={ariaSelected}
       >
         {value || "❓"}
       </button>

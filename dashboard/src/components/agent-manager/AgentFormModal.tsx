@@ -314,6 +314,8 @@ export default function AgentFormModal({
                 <EmojiPicker
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
+                  aria-label={t({ ko: "직원 이모지", en: "Agent emoji" })}
+                  aria-selected={!!formValues.avatar_emoji}
                 />
               </div>
               <div>

@@ -41,16 +41,17 @@ describe("EmojiPicker", () => {
   });
 
   it("renders with aria-expanded and aria-label", async () => {
-    const target = await render(<EmojiPicker value="🤖" onChange={() => {}} />);
+    const target = await render(<EmojiPicker value="🤖" aria-label="Choose emoji" aria-selected={true} onChange={() => {}} />);
     const button = target.querySelector("button");
     expect(button).not.toBeNull();
     expect(button?.getAttribute("aria-expanded")).toBe("false");
-    expect(button?.getAttribute("aria-label")).toBe("Change emoji (current: 🤖)");
+    expect(button?.getAttribute("aria-label")).toBe("Choose emoji");
+    expect(button?.getAttribute("aria-selected")).toBe("true");
     expect(button?.getAttribute("aria-haspopup")).toBe("dialog");
   });
 
   it("renders the dialog with a translated accessible name", async () => {
-    const target = await render(<EmojiPicker value="🤖" onChange={() => {}} />);
+    const target = await render(<EmojiPicker value="🤖" aria-label="Choose emoji" aria-selected={true} onChange={() => {}} />);
     const button = target.querySelector("button");
 
     await act(async () => {
