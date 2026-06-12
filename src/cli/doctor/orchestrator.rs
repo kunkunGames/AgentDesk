@@ -2611,9 +2611,7 @@ fn provider_credential_summary(probe: &ProviderRuntimeProbe) -> String {
 
 fn provider_auth_check_command(provider: &ProviderKind, binary_name: &str) -> String {
     crate::services::provider_auth::auth_check_hint(
-        provider
-            .registry_entry()
-            .and_then(|entry| entry.auth.auth_check_argv),
+        provider.registry_entry().and_then(|entry| entry.auth.auth_check_argv),
         binary_name,
     )
 }

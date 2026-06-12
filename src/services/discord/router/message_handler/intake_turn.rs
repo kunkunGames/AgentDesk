@@ -1927,7 +1927,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         // through the fresh POST path.
         let existing_queued_card = if want_queued_card {
             shared
-                .queued
                 .queued_placeholders
                 .get(&(channel_id, user_msg_id))
                 .map(|entry| *entry.value())
@@ -2233,9 +2232,11 @@ pub(in crate::services::discord) async fn handle_text_message(
             // the mapping cannot change underneath this PATCH once we
             // hold the lock.
             //
-            // Invariant (round-10): the dispatch-state snapshot, mapping insert,
-            // ownership recheck, and `ensure_queued` PATCH share ONE held lock
-            // guard; any alternate order reopens the round-4 or round-9 hazard.
+            // Invariant (round-10): the dispatch-state snapshot, the
+            // mapping insert, the ownership recheck, and the
+            // `ensure_queued` PATCH all share ONE held lock guard. Any
+            // alternative ordering would reopen either the round-4 hazard
+            // or the round-9-residual hazard codex flagged in round-10.
             let persist_guard = persist_guard_for_render
                 .expect("round-10: persist guard must be held by the matching insert branch");
             if !shared.queued_placeholder_still_owned(channel_id, user_msg_id, placeholder_msg_id) {
@@ -2270,7 +2271,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                         progress_line: None,
                     };
                 let outcome = shared
-                    .ui
                     .placeholder_controller
                     .ensure_queued(&gateway, key, queued_input)
                     .await;
@@ -2286,10 +2286,14 @@ pub(in crate::services::discord) async fn handle_text_message(
                         );
                     }
                     _ => {
-                        // Edit failed — roll back the mapping and delete the raw
-                        // `...` so dispatch never matches a missing Discord
-                        // message. The lock guarantees the mapping is unchanged
-                        // since the recheck; use `_locked` to avoid reacquiring it.
+                        // Edit failed — roll back the mapping and delete the
+                        // raw `...` so the dispatch path never matches a
+                        // Discord message that no longer exists. The lock
+                        // guarantees the mapping cannot have changed since
+                        // our recheck above, so a single decision (still
+                        // owned → roll back) is sound. Use the `_locked`
+                        // variant to avoid re-acquiring the lock we
+                        // already hold (round-5 P2).
                         let still_owned_under_lock = shared.queued_placeholder_still_owned(
                             channel_id,
                             user_msg_id,
@@ -2393,7 +2397,6 @@ pub(in crate::services::discord) async fn handle_text_message(
             }),
         );
         let _ = shared
-            .ui
             .placeholder_controller
             .ensure_active(&gateway, key, active_input)
             .await;
@@ -2404,7 +2407,6 @@ pub(in crate::services::discord) async fn handle_text_message(
         // controller row. Drop the entry now — streaming owns the card past
         // this point and the controller is no longer the source of truth.
         shared
-            .ui
             .placeholder_controller
             .detach_by_message(channel_id, existing);
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3281,7 +3283,6 @@ pub(in crate::services::discord) async fn handle_text_message(
                         progress_line: None,
                     };
                 let outcome = shared
-                    .ui
                     .placeholder_controller
                     .ensure_queued(&gateway, key, queued_input)
                     .await;

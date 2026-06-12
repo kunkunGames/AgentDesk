@@ -8,14 +8,12 @@
 //!
 //! Behavior is unchanged from the prior in-`health` implementation: this
 //! is a pure move/regroup. Delivery still flows through
-//! `outbound::send_gate::send_message_with_backends` (also re-exported as
-//! `health::send_message_with_backends` for compatibility).
+//! `health::send_message_with_backends`.
 
 use sqlx::PgPool;
 
-use super::send_gate::send_message_with_backends;
 use crate::db::Db;
-use crate::services::discord::health::HealthRegistry;
+use crate::services::discord::health::{HealthRegistry, send_message_with_backends};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParsedSendToAgentRequest {

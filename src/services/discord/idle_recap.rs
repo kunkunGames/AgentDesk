@@ -267,7 +267,6 @@ pub(crate) async fn attach_live_context_usage(
         return;
     };
     let Some(live) = shared
-        .ui
         .placeholder_live_events
         .context_panel_snapshot(ChannelId::new(channel_id))
     else {
@@ -547,62 +546,69 @@ enum RecapContextDisplay {
 }
 
 fn select_recap_context(snapshot: &RecapSnapshot, now: DateTime<Utc>) -> RecapContextDisplay {
-    let known = |used, window| RecapContextDisplay::Known {
-        used: display_context_tokens(snapshot, used, window),
-        window,
-    };
-    if let Some(live) = snapshot
-        .live_context_usage
-        .filter(|live| live.used_tokens > 0 && live.context_window_tokens > 0)
-    {
-        return known(live.used_tokens, live.context_window_tokens);
+    if let Some(live) = snapshot.live_context_usage {
+        if live.used_tokens > 0 && live.context_window_tokens > 0 {
+            return RecapContextDisplay::Known {
+                used: live.used_tokens,
+                window: live.context_window_tokens,
+            };
+        }
     }
 
     let window = context_window_for(snapshot);
     if let Some(used) = latest_turn_context_tokens(snapshot) {
-        return known(used, window);
+        return RecapContextDisplay::Known { used, window };
     }
+
     if session_tokens_are_stale_or_incompatible(snapshot, now) {
         return RecapContextDisplay::Stale;
     }
-    fresh_session_tokens(snapshot, now)
-        .map_or(RecapContextDisplay::Unknown, |used| known(used, window))
-}
 
-fn display_context_tokens(snapshot: &RecapSnapshot, used: u64, window: u64) -> u64 {
-    match ProviderKind::from_str(&snapshot.provider) {
-        Some(ProviderKind::Codex) if window > 0 => used.min(window),
-        _ => used,
+    if let Some(used) = fresh_session_tokens(snapshot, now) {
+        return RecapContextDisplay::Known { used, window };
     }
+
+    RecapContextDisplay::Unknown
 }
 
 fn latest_turn_context_tokens(snapshot: &RecapSnapshot) -> Option<u64> {
-    latest_turn_matches_active_session(snapshot).then_some(())?;
+    if !latest_turn_matches_active_session(snapshot) {
+        return None;
+    }
     let input = non_negative_i64_to_u64(snapshot.latest_turn_input_tokens?)?;
+    let cache_create =
+        non_negative_i64_to_u64(snapshot.latest_turn_cache_create_tokens.unwrap_or(0))?;
+    let cache_read = non_negative_i64_to_u64(snapshot.latest_turn_cache_read_tokens.unwrap_or(0))?;
     let used = input
-        .saturating_add(non_negative_i64_to_u64(
-            snapshot.latest_turn_cache_create_tokens.unwrap_or(0),
-        )?)
-        .saturating_add(non_negative_i64_to_u64(
-            snapshot.latest_turn_cache_read_tokens.unwrap_or(0),
-        )?);
+        .saturating_add(cache_create)
+        .saturating_add(cache_read);
     (used > 0).then_some(used)
 }
 
 fn latest_turn_matches_active_session(snapshot: &RecapSnapshot) -> bool {
-    snapshot.latest_turn_finished_at.is_some()
-        && same_normalized_opt(
-            snapshot.latest_turn_provider.as_deref(),
-            Some(snapshot.provider.as_str()),
-        )
-        && (same_normalized_opt(
-            snapshot.latest_turn_session_key.as_deref(),
-            Some(snapshot.session_key.as_str()),
-        ) || snapshot
-            .latest_turn_session_id
-            .as_deref()
-            .and_then(normalized_text)
-            .is_some_and(|latest| provider_session_ids(snapshot).any(|active| active == latest)))
+    if snapshot.latest_turn_finished_at.is_none() {
+        return false;
+    }
+    if !same_normalized_opt(
+        snapshot.latest_turn_provider.as_deref(),
+        Some(snapshot.provider.as_str()),
+    ) {
+        return false;
+    }
+    if same_normalized_opt(
+        snapshot.latest_turn_session_key.as_deref(),
+        Some(snapshot.session_key.as_str()),
+    ) {
+        return true;
+    }
+    let latest_session_id = snapshot
+        .latest_turn_session_id
+        .as_deref()
+        .and_then(normalized_text);
+    let Some(latest_session_id) = latest_session_id else {
+        return false;
+    };
+    provider_session_ids(snapshot).any(|session_id| session_id == latest_session_id)
 }
 
 fn provider_session_ids(snapshot: &RecapSnapshot) -> impl Iterator<Item = &str> {
@@ -619,22 +625,29 @@ fn session_tokens_are_stale_or_incompatible(snapshot: &RecapSnapshot, now: DateT
     let Some(tokens) = snapshot.tokens.filter(|value| *value > 0) else {
         return false;
     };
-    non_negative_i64_to_u64(tokens).is_none()
-        || (snapshot.latest_turn_finished_at.is_some()
-            && !latest_turn_matches_active_session(snapshot))
-        || !session_tokens_are_fresh(snapshot, now)
+    if non_negative_i64_to_u64(tokens).is_none() {
+        return true;
+    }
+    if snapshot.latest_turn_finished_at.is_some() && !latest_turn_matches_active_session(snapshot) {
+        return true;
+    }
+    !session_tokens_are_fresh(snapshot, now)
 }
 
 fn fresh_session_tokens(snapshot: &RecapSnapshot, now: DateTime<Utc>) -> Option<u64> {
     let tokens = non_negative_i64_to_u64(snapshot.tokens?)?;
-    (tokens > 0 && session_tokens_are_fresh(snapshot, now)).then_some(tokens)
+    if tokens == 0 || !session_tokens_are_fresh(snapshot, now) {
+        return None;
+    }
+    Some(tokens)
 }
 
 fn session_tokens_are_fresh(snapshot: &RecapSnapshot, now: DateTime<Utc>) -> bool {
-    snapshot.tokens_updated_at.is_some_and(|updated_at| {
-        let age = now - updated_at;
-        age.num_seconds() >= 0 && age.num_seconds() <= SESSION_TOKEN_FRESHNESS_MAX_SECS
-    })
+    let Some(updated_at) = snapshot.tokens_updated_at else {
+        return false;
+    };
+    let age = now - updated_at;
+    age.num_seconds() >= 0 && age.num_seconds() <= SESSION_TOKEN_FRESHNESS_MAX_SECS
 }
 
 fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
@@ -642,21 +655,29 @@ fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
 }
 
 fn same_normalized_opt(left: Option<&str>, right: Option<&str>) -> bool {
-    matches!(
-        (left.and_then(normalized_text), right.and_then(normalized_text),),
-        (Some(left), Some(right)) if left.eq_ignore_ascii_case(right)
-    )
+    match (
+        left.and_then(normalized_text),
+        right.and_then(normalized_text),
+    ) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
 }
 
 fn normalized_text(value: &str) -> Option<&str> {
     let trimmed = value.trim();
-    (!trimmed.is_empty()).then_some(trimmed)
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn context_window_for(snapshot: &RecapSnapshot) -> u64 {
-    ProviderKind::from_str(&snapshot.provider).map_or(FALLBACK_CONTEXT_WINDOW_TOKENS, |provider| {
-        provider.resolve_context_window(snapshot.model.as_deref())
-    })
+    match ProviderKind::from_str(&snapshot.provider) {
+        Some(provider) => provider.resolve_context_window(snapshot.model.as_deref()),
+        _ => FALLBACK_CONTEXT_WINDOW_TOKENS,
+    }
 }
 
 fn format_korean_duration(dur: chrono::Duration) -> String {
@@ -1718,9 +1739,8 @@ mod tests {
     }
 
     #[test]
-    fn recap_keeps_claude_over_window_usage_flagged() {
-        let mut snapshot = snapshot_with_sessions(Some("claude-session-1"), None);
-        snapshot.provider = "claude".to_string();
+    fn recap_over_window_usage_is_capped_and_flagged() {
+        let mut snapshot = snapshot_with_sessions(None, Some("raw-1"));
         snapshot.live_context_usage = Some(RecapLiveContextUsage {
             used_tokens: 303_000,
             context_window_tokens: 272_000,
@@ -1729,27 +1749,6 @@ mod tests {
         let header = compose_recap_header(&snapshot);
         assert!(header.contains("303.0k / 272.0k tokens (100%+, over limit)"));
         assert!(!header.contains("(111%)"));
-    }
-
-    #[test]
-    fn recap_clamps_codex_context_display_to_window() {
-        let mut snapshot = snapshot_with_sessions(None, Some("raw-1"));
-        snapshot.live_context_usage = Some(RecapLiveContextUsage {
-            used_tokens: 2_300_000,
-            context_window_tokens: 272_000,
-        });
-
-        assert_eq!(
-            select_recap_context(&snapshot, Utc::now()),
-            RecapContextDisplay::Known {
-                used: 272_000,
-                window: 272_000
-            }
-        );
-        let header = compose_recap_header(&snapshot);
-        assert!(header.contains("272.0k / 272.0k tokens (100%)"));
-        assert!(!header.contains("2.3M"));
-        assert!(!header.contains("over limit"));
     }
 
     #[test]
@@ -2124,10 +2123,9 @@ mod tests {
     /// Process-wide mutex: `inflight_has_active_turn` resolves the inflight
     /// root from the PROCESS-WIDE `AGENTDESK_ROOT_DIR`, so the env-mutating
     /// tests must not race the rest of the suite.
-    fn lock_active_turn_env_test() -> std::sync::MutexGuard<'static, ()> {
-        crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    fn active_turn_env_test_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     struct RootEnvGuard(Option<std::ffi::OsString>);
@@ -2162,7 +2160,9 @@ mod tests {
     /// as an ACTIVE turn, so the post job will skip.
     #[test]
     fn channel_has_active_turn_true_for_fresh_inflight() {
-        let _guard = lock_active_turn_env_test();
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = tempfile::TempDir::new().unwrap();
         let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
@@ -2182,7 +2182,9 @@ mod tests {
     /// post job must still post the recap. This is the no-false-skip guard.
     #[test]
     fn channel_has_active_turn_false_when_no_inflight() {
-        let _guard = lock_active_turn_env_test();
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = tempfile::TempDir::new().unwrap();
         let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
@@ -2203,7 +2205,9 @@ mod tests {
     /// watchdog treat such rows.
     #[test]
     fn channel_has_active_turn_false_for_stale_inflight() {
-        let _guard = lock_active_turn_env_test();
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = tempfile::TempDir::new().unwrap();
         let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
@@ -2243,8 +2247,7 @@ mod tests {
     /// `save_inflight_state` in `claim_tui_direct_synthetic_turn`. We simulate
     /// it by starting a mailbox turn through the global registry WITHOUT writing
     /// any inflight sidecar, then asserting the channel reads as active.
-    // SAFETY (await_holding_lock): `lock_active_turn_env_test()` holds the
-    // crate-wide std Mutex
+    // SAFETY (await_holding_lock): `active_turn_env_test_mutex()` is a std Mutex
     // held across awaits to serialize tests that mutate the process-global
     // `AGENTDESK_ROOT_DIR`; the hold must span the awaits so a concurrent test
     // cannot clobber the env mid-flight. Test-only.
@@ -2253,7 +2256,9 @@ mod tests {
     async fn channel_has_active_turn_true_for_mailbox_active_without_inflight() {
         // Isolate the inflight root so no stray sidecar leaks in — the mailbox
         // signal alone must carry the detection.
-        let _guard = lock_active_turn_env_test();
+        let _guard = active_turn_env_test_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let temp = tempfile::TempDir::new().unwrap();
         let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };

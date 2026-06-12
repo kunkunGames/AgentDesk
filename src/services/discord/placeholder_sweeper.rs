@@ -175,9 +175,8 @@ pub(in crate::services::discord) enum PlaceholderProbe {
 /// (5xx, 429 rate-limit, no status at all) is treated as transient.
 ///
 /// Split out so the classification can be unit-tested without constructing
-/// the `#[non_exhaustive]` `serenity::http::ErrorResponse`. #3293 reuses the
-/// same allowlist for the recovery terminal-relay outcome classifier.
-pub(in crate::services::discord) fn is_permanent_message_gone_status(status: u16) -> bool {
+/// the `#[non_exhaustive]` `serenity::http::ErrorResponse`.
+fn is_permanent_message_gone_status(status: u16) -> bool {
     matches!(status, 404 | 403 | 410)
 }
 
@@ -513,7 +512,7 @@ async fn run_placeholder_sweep_pass(
                                         channel_id: serenity::ChannelId::new(state.channel_id),
                                         message_id: serenity::MessageId::new(msg_id),
                                     };
-                                    shared.ui.placeholder_controller.detach(&key);
+                                    shared.placeholder_controller.detach(&key);
                                 }
                             }
                         }
@@ -600,7 +599,7 @@ async fn run_placeholder_sweep_pass(
                                 channel_id: serenity::ChannelId::new(state.channel_id),
                                 message_id: serenity::MessageId::new(msg_id),
                             };
-                            shared.ui.placeholder_controller.detach(&key);
+                            shared.placeholder_controller.detach(&key);
                         }
                     }
                 }
@@ -816,7 +815,7 @@ async fn sweep_orphan_status_panel(
     // executing cutover needs the async `PanelSink` PR-2 deferred). The actor is
     // NOT spawned when v2 is off, so this v2 guard short-circuits the awaited
     // shadow read (whose ack would never be answered), mirroring `recovery_engine`.
-    if shared.ui.status_panel_v2_enabled {
+    if shared.status_panel_v2_enabled {
         let controller_target = shared
             .status_panel_controller
             .sweeper_reclaim_parity_id(
@@ -953,28 +952,17 @@ pub(super) fn spawn_placeholder_sweeper(
                 &shared.token_hash,
             )
             .await;
-            // #3296: reconcile durable aborted-anchor markers — retry the ✅ for
-            // markers a terminal commit already covered, and apply the TTL'd
-            // `⏳ → ⚠` fallback for anchors nothing ever covered (held while a
-            // live inflight for the session may still cover them). The sweeper
-            // owns this reclaim so an aborted anchor always converges (#3282).
-            let drained_abort_markers =
-                super::tui_direct_abort_marker::sweep_expired(&shared, &provider).await;
             sweeps_since_heartbeat = sweeps_since_heartbeat.saturating_add(1);
-            if should_log_sweep_report(report, sweeps_since_heartbeat)
-                || drained > 0
-                || drained_abort_markers > 0
-            {
+            if should_log_sweep_report(report, sweeps_since_heartbeat) || drained > 0 {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
-                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_orphans={} drained_abort_markers={}",
+                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_orphans={}",
                     provider.as_str(),
                     report.scanned,
                     report.stalled,
                     report.abandoned,
                     report.reclaimed_panels,
-                    drained,
-                    drained_abort_markers
+                    drained
                 );
                 sweeps_since_heartbeat = 0;
             }
@@ -1304,28 +1292,7 @@ mod safety_net_threshold_tests {
     //! before the sweeper does anything destructive.
     use super::{
         ABANDON_THRESHOLD_SECS, INITIAL_DELAY_SECS, STALL_THRESHOLD_SECS, SWEEP_INTERVAL_SECS,
-        panel_reclaim_target,
     };
-    use crate::services::provider::ProviderKind;
-
-    fn sweep_state_with_panel(status_message_id: Option<u64>) -> super::InflightTurnState {
-        let mut state = super::InflightTurnState::new(
-            ProviderKind::Claude,
-            4242,
-            None,
-            7,
-            9101,
-            9102,
-            "prompt".to_string(),
-            Some("session".to_string()),
-            Some("AgentDesk-claude-adk".to_string()),
-            Some("/tmp/recovery.jsonl".to_string()),
-            None,
-            0,
-        );
-        state.status_message_id = status_message_id;
-        state
-    }
 
     #[test]
     fn stall_threshold_is_at_least_five_minutes() {
@@ -1364,23 +1331,5 @@ mod safety_net_threshold_tests {
         // than one minute. 30s is the current cadence; pin the
         // upper bound.
         assert!(SWEEP_INTERVAL_SECS <= 60);
-    }
-
-    #[test]
-    fn off_to_on_stale_panel_still_reaches_sweeper_reclaim_target() {
-        let state = sweep_state_with_panel(Some(5001));
-
-        let target = panel_reclaim_target(&state, ABANDON_THRESHOLD_SECS);
-
-        assert_eq!(target.map(|id| id.get()), Some(5001));
-    }
-
-    #[test]
-    fn footer_mode_none_panel_has_no_sweeper_reclaim_target() {
-        let state = sweep_state_with_panel(None);
-
-        let target = panel_reclaim_target(&state, ABANDON_THRESHOLD_SECS);
-
-        assert_eq!(target, None);
     }
 }

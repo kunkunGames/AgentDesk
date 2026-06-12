@@ -7,12 +7,8 @@ use crate::db::prompt_manifests::{PromptContentVisibility, PromptManifest, Promp
 const SOURCE_MAX_CHARS: usize = 30;
 const PROMPT_LAYER_CONTENT_MAX_CHARS: usize = 360;
 const PROMPT_LAYER_CONTENT_MAX_LAYERS: usize = 6;
-const ADK_PROMPT_LAYER_PREVIEW_MAX_CHARS: usize = 100;
 
-pub(super) fn render_prompt_manifest_report(
-    manifest: &PromptManifest,
-    is_privileged: bool,
-) -> String {
+pub(super) fn render_prompt_manifest_report(manifest: &PromptManifest) -> String {
     let mut out = String::new();
     push_line(
         &mut out,
@@ -58,11 +54,7 @@ pub(super) fn render_prompt_manifest_report(
     push_line(&mut out, "");
     push_line(
         &mut out,
-        if is_privileged {
-            "Layer content (ADK full source, user redacted preview)"
-        } else {
-            "Layer content (ADK hash + bounded preview, user redacted preview)"
-        },
+        "Layer content (ADK full source, user redacted preview)",
     );
     for layer in manifest
         .layers
@@ -78,7 +70,7 @@ pub(super) fn render_prompt_manifest_report(
                 visibility_label(layer.content_visibility)
             ),
         );
-        for line in layer_display_body(layer, is_privileged)
+        for line in layer_display_body(layer)
             .lines()
             .flat_map(|line| wrap_line(line, REPORT_LINE_MAX - 2))
             .take(6)
@@ -133,45 +125,18 @@ fn format_prompt_manifest_storage(manifest: &PromptManifest) -> String {
     )
 }
 
-fn layer_display_body(layer: &PromptManifestLayer, is_privileged: bool) -> String {
-    match layer.content_visibility {
-        PromptContentVisibility::AdkProvided => format_adk_layer_display_body(layer, is_privileged),
-        PromptContentVisibility::UserDerived => {
-            let raw = layer
-                .redacted_preview
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("(redacted preview 없음)");
-            truncate_chars(raw.trim(), PROMPT_LAYER_CONTENT_MAX_CHARS)
-        }
-    }
-}
-
-fn format_adk_layer_display_body(layer: &PromptManifestLayer, is_privileged: bool) -> String {
-    if is_privileged {
-        let raw = layer
+fn layer_display_body(layer: &PromptManifestLayer) -> String {
+    let raw = match layer.content_visibility {
+        PromptContentVisibility::AdkProvided => layer
             .full_content
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or("(content 없음)");
-        return format!(
-            "sha256: {}\nfull source: {}",
-            layer.content_sha256,
-            truncate_chars(raw.trim(), PROMPT_LAYER_CONTENT_MAX_CHARS)
-        );
-    }
-
-    let preview = layer
-        .redacted_preview
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            layer
-                .full_content
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .map(|value| truncate_chars(value.trim(), ADK_PROMPT_LAYER_PREVIEW_MAX_CHARS))
-        .unwrap_or_else(|| "(preview 없음)".to_string());
-    format!("sha256: {}\npreview: {preview}", layer.content_sha256)
+            .unwrap_or("(content 없음)"),
+        PromptContentVisibility::UserDerived => layer
+            .redacted_preview
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("(redacted preview 없음)"),
+    };
+    truncate_chars(raw.trim(), PROMPT_LAYER_CONTENT_MAX_CHARS)
 }

@@ -198,19 +198,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
             .await;
 
     let count = pending.len();
-    for (
-        id,
-        dispatch_id,
-        action,
-        agent_id,
-        card_id,
-        title,
-        retry_count,
-        _,
-        claim_owner,
-        claimed_at,
-    ) in pending
-    {
+    for (id, dispatch_id, action, agent_id, card_id, title, retry_count, _) in pending {
         check_dispatch_outbox_retry_count_in_bounds(id, &dispatch_id, retry_count);
         if action == "notify" {
             let suppress_delivery = dispatch_notify_delivery_suppressed_pg(pool, &dispatch_id)
@@ -223,15 +211,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                     "suppressed because dispatch is already terminal",
                 );
                 let delivery_result_json = dispatch_delivery_result_json(&delivery_result);
-                let _ = mark_outbox_done_pg(
-                    pool,
-                    id,
-                    &delivery_result.status,
-                    &delivery_result_json,
-                    &claim_owner,
-                    claimed_at,
-                )
-                .await;
+                mark_outbox_done_pg(pool, id, &delivery_result.status, &delivery_result_json).await;
                 continue;
             }
         }
@@ -286,16 +266,8 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
             Ok(delivery_result) => {
                 let delivery_result_json = dispatch_delivery_result_json(&delivery_result);
                 // Mark done + transition dispatch pending → dispatched
-                let done = mark_outbox_done_pg(
-                    pool,
-                    id,
-                    &delivery_result.status,
-                    &delivery_result_json,
-                    &claim_owner,
-                    claimed_at,
-                )
-                .await;
-                if done.is_ok() && action == "notify" {
+                mark_outbox_done_pg(pool, id, &delivery_result.status, &delivery_result_json).await;
+                if action == "notify" {
                     mark_dispatch_dispatched_pg(pool, &dispatch_id).await.ok();
                 }
             }
@@ -304,16 +276,8 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                     tracing::info!(
                         "[dispatch-outbox] Slot busy for entry {id} (dispatch={dispatch_id}, action={action}); retrying in {SLOT_BUSY_RETRY_SECS}s without consuming retry budget"
                     );
-                    let _ = schedule_outbox_retry_pg(
-                        pool,
-                        id,
-                        &err,
-                        retry_count,
-                        SLOT_BUSY_RETRY_SECS,
-                        &claim_owner,
-                        claimed_at,
-                    )
-                    .await;
+                    schedule_outbox_retry_pg(pool, id, &err, retry_count, SLOT_BUSY_RETRY_SECS)
+                        .await;
                     continue;
                 }
                 let new_count = retry_count + 1;
@@ -328,15 +292,13 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                         &err,
                     );
                     let delivery_result_json = dispatch_delivery_result_json(&delivery_result);
-                    let _ = mark_outbox_failed_pg(
+                    mark_outbox_failed_pg(
                         pool,
                         id,
                         &err,
                         new_count,
                         &delivery_result.status,
                         &delivery_result_json,
-                        &claim_owner,
-                        claimed_at,
                     )
                     .await;
                 } else {
@@ -347,16 +309,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
                         "[dispatch-outbox] Retry {new_count}/{MAX_RETRY_COUNT} for entry {id} (dispatch={dispatch_id}, action={action}) \
                          in {backoff_secs}s: {err}",
                     );
-                    let _ = schedule_outbox_retry_pg(
-                        pool,
-                        id,
-                        &err,
-                        new_count,
-                        backoff_secs,
-                        &claim_owner,
-                        claimed_at,
-                    )
-                    .await;
+                    schedule_outbox_retry_pg(pool, id, &err, new_count, backoff_secs).await;
                 }
             }
         }

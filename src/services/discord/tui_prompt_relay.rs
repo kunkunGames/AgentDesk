@@ -53,7 +53,6 @@ static CLAUDE_IDLE_RESPONSE_TAILS: LazyLock<Mutex<HashSet<String>>> =
 /// created). A genuine SECOND `/loop` or `/compact` arrives seconds later, well
 /// outside this window, so it gets its own active turn (no over-suppression).
 const SLASH_COMMAND_CONTROL_DEDUPE_WINDOW: Duration = Duration::from_secs(2);
-const COMPACT_REPLAY_KIND_NOTE_SUPPRESSION_WINDOW: Duration = Duration::from_secs(30);
 /// #3178: last-seen timestamp per (tmux_session, command_kind) for the
 /// slash-command-control turn, so the two halves of the #3153 double-post create
 /// the active turn only once. Keyed by a stable string built from the REAL
@@ -61,9 +60,6 @@ const COMPACT_REPLAY_KIND_NOTE_SUPPRESSION_WINDOW: Duration = Duration::from_sec
 /// and the expanded `<command-*>` wrapper for the SAME command collapse to one
 /// entry, while two DIFFERENT commands within the window never collapse together.
 static SLASH_COMMAND_CONTROL_LAST_POSTED: LazyLock<
-    Mutex<std::collections::HashMap<String, std::time::Instant>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-static SYSTEM_CONTINUATION_LAST_RENDERED: LazyLock<
     Mutex<std::collections::HashMap<String, std::time::Instant>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -496,27 +492,29 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         );
         return;
     };
-    // #3178 (codex P1 lease-overwrite): run the slash-command-control dedupe BEFORE
-    // recording ANY external-input lease. The #3153 double-post (raw echo + expanded
-    // `<command-*>` wrapper, ~tens-of-ms apart) must not let the SECOND half record a
-    // lease: the table is one-per-(provider,session), so it would overwrite the first
-    // turn's lease and its guard would clear that generation, stranding the first
-    // bridge tail. Drop the duplicate here, before any lease/anchor/inflight exists;
-    // a genuine second /loop / /compact falls outside the 2s window → fresh turn.
+    // #3178 (codex fix — P1 lease-overwrite / the 'state tangle'): classify and
+    // run the slash-command-control DEDUPE check BEFORE recording ANY
+    // external-input lease. A machine slash-command control echo (/loop, /compact,
+    // the expanded `<command-*>` wrapper) now claims a FULL active turn (lease +
+    // ⏳ anchor + synthetic inflight, below). The #3153 double-post delivers the
+    // SAME injection as two independent observed prompts (raw echo + expanded
+    // wrapper) within ~tens-of-ms; the FIRST claims the active turn, but the
+    // SECOND must NOT — and critically must NOT record a lease, because the lease
+    // table is one-per-(provider,session): a second `record_external_input_turn_lease`
+    // would overwrite the first turn's lease and the duplicate's own guard would
+    // then clear that generation, stranding the first turn's bridge tail. So the
+    // duplicate half is dropped HERE, before the lease record on the next line, and
+    // never creates a lease/anchor/inflight at all. A genuine SECOND /loop or
+    // /compact seconds later falls outside the 2s window → fresh first sighting →
+    // its own active turn.
     let injected_class = classify_injected_prompt(&prompt.prompt);
-    // #3305: hoist the slash-command kind so the first-sighting gate AND the
-    // local-only lifecycle-skip below share one computation. `local_only_slash`
-    // is true ONLY for a LOCAL-completing pass-through (/effort /compact /cost
-    // /context) — it posts a guidance note but mints no turn (an allow-list, so
-    // /loop and any unknown command keep full lifecycle, fail-safe).
-    let mut local_only_slash = false;
     if matches!(injected_class, InjectedPromptClass::SlashCommandControl) {
         let kind = slash_command_control_kind(&prompt.prompt);
-        local_only_slash = super::commands::is_local_only_slash_command_kind(&kind)
-            || slash_command_control_prompt_is_caveat_only(&prompt.prompt);
         if !slash_command_control_turn_is_first_sighting(&prompt.tmux_session_name, &kind) {
-            // #3153 second half within the 2s window: drop before any lease/anchor/
-            // inflight exists; the first half already relays via its own bridge tail.
+            // #3153 double-post second half within the 2s window: drop BEFORE any
+            // lease/anchor/inflight is created, so the first turn's lease is never
+            // overwritten and no guard/lease leaks (none was ever recorded). The
+            // first half already relays the assistant output via its own bridge tail.
             tracing::info!(
                 provider = %prompt.provider,
                 channel_id = channel_id.get(),
@@ -529,10 +527,13 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     }
     let mut lease = record_observed_external_turn_lease(shared, &prompt, channel_id);
     // #3041 P1-4 codex: arm an early-return RAII guard the instant the lease is
-    // recorded — every failure early-return below would otherwise leave the lease set
-    // for the full TTL, blocking watcher/sink delivery ~10min. The guard clears
-    // EXACTLY the recorded generation on drop and is DISARMED on the success path
-    // before the bridge-tail ownership block (a bridge-owned turn keeps its lease).
+    // recorded & stored. Every FAILURE early-return below (registry None, notify
+    // resolve Err/503, task-card repeat, anchor POST failure) would otherwise leave
+    // this (possibly BridgeAdapter-owned) lease set for the full TTL, blocking the
+    // legitimate watcher/sink delivery for ~10 minutes. The guard clears EXACTLY the
+    // recorded generation on drop; it is DISARMED on the success path just before the
+    // bridge-tail ownership block, so a turn the bridge legitimately owns keeps its
+    // lease (no double-delivery).
     let mut observed_lease_early_return_guard = TuiDirectObservedLeaseEarlyReturnGuard::arm(
         &prompt.provider,
         &prompt.tmux_session_name,
@@ -568,14 +569,34 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             return;
         }
     };
-    // #3164 / #750 invariant: the `⏳` MUST be added by the SAME bot identity that
-    // later removes it (`remove_reaction_raw` only removes `@me`'s reaction; a
-    // different bot leaves the hourglass forever). The note BODY may be any bot
-    // (`notify_http`), but the reaction never falls back to it — on resolve failure
-    // we skip the add (warn). R2 issue-1: resolve the add-bot from the SAME source
-    // the completion removes with (this relay's `serenity_http_or_token_fallback()`,
-    // the watcher's `http`), NOT a name-only `resolve_bot_http` (which in a multi-
-    // runtime/same-provider deployment can pick a DIFFERENT account and re-break add≡remove).
+    // #3164: the `⏳` lifecycle reaction MUST be added by the SAME bot identity that
+    // later removes it. The completion path
+    // (`complete_tui_direct_prompt_anchor_lifecycle_if_present`) calls
+    // `remove_reaction_raw(http, ..., '⏳')` with the *provider/command* bot's
+    // `ctx.http` (the watcher parameter, ultimately the provider runtime's serenity
+    // ctx). `remove_reaction_raw` only removes `@me`'s reaction, so if `⏳` is added
+    // by a DIFFERENT bot (previously `notify`), removal silently no-ops and the
+    // hourglass lingers forever. #750 invariant: the command bot is the SINGLE source
+    // of the `⏳` lifecycle emoji (announce/notify bots never carry it). So resolve
+    // the provider/command bot here and use it for the add below. Note: the
+    // *notification body* itself is still posted by `notify_http` — a different bot
+    // reacting to a notify-posted message is fine (Discord lets any bot react to any
+    // message). We intentionally do NOT fall back to `notify_http` for the reaction:
+    // adding with the wrong identity reintroduces the un-removable residual, so on
+    // resolve failure we skip the `⏳` add (with a warning) rather than mis-attribute it.
+    // #3164 codex R2 issue-1: resolve the add-bot from the SAME source the
+    // completion path removes with — this relay's own `shared`
+    // `serenity_http_or_token_fallback()`, NOT a name-only registry lookup.
+    // The completion `complete_tui_direct_prompt_anchor_lifecycle_if_present`
+    // is driven by the watcher's `http`, which is exactly
+    // `shared.serenity_http_or_token_fallback()` (turn_bridge/mod.rs:2187 etc.).
+    // A name-based `resolve_bot_http(registry, provider)` returns the FIRST
+    // client matching the provider name; in a multi-runtime/same-provider
+    // deployment that can be a DIFFERENT bot account than this `shared`'s ctx
+    // http, reintroducing the add≠remove asymmetry. Using `shared`'s own http
+    // guarantees identical `@me` identity, so `remove_reaction_raw` later
+    // removes exactly this `⏳`. On unavailability we SKIP the add (warn) rather
+    // than mis-attribute it via `notify_http` (which would relinger forever).
     let command_http = shared.serenity_http_or_token_fallback();
     if command_http.is_none() {
         tracing::warn!(
@@ -589,73 +610,42 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
              (adding with a different bot would leave an un-removable hourglass)"
         );
     }
-    // #3099 / #3100: a compact/system continuation prologue is NOT a human request —
-    // it renders as a neutral note (no ⏳/anchor/synthetic turn) but must NOT short-
-    // circuit the whole relay (P1): the bridge tail below still relays its assistant
-    // output. #3178: a SlashCommandControl is NO LONGER suppressed — it takes the
-    // active-turn `else` block (anchor + ⏳ + synthetic inflight) so mid-/loop input
-    // queues cleanly. Only SystemContinuation suppresses the lifecycle here.
+    // #3099 / #3100: `injected_class` was classified at the top of this function
+    // (before the slash-command-control dedupe / lease record). A compact/system
+    // continuation prologue is NOT a human request — it is rendered as a neutral
+    // session note with no `⏳`, no prompt anchor, and no synthetic turn ownership.
+    //
+    // #3099 codex re-review (P1): SystemContinuation must NOT short-circuit the
+    // whole relay. The compact continuation IS fed to the provider and Claude
+    // produces assistant output; that output still has to reach Discord via the
+    // bridge tail. So a SystemContinuation suppresses ONLY the user-turn
+    // lifecycle (the `⏳` reaction, the prompt anchor, and the synthetic
+    // user-turn/inflight ownership) — the assistant-output delivery path (the
+    // Claude bridge tail below) still runs exactly as for any other injection.
+    //
+    // #3178 (codex fix): a SlashCommandControl is NO LONGER suppressed here — it
+    // takes the active-turn `else` block below (anchor + ⏳ + synthetic inflight)
+    // so a message injected mid-/loop queues cleanly (mailbox.has_active_turn()
+    // becomes true). Only SystemContinuation still suppresses the lifecycle.
+    // #3099 codex re-review (P1): suppressing the user-turn lifecycle (⏳ + anchor
+    // + synthetic ownership) is decoupled from output delivery. The bridge tail
+    // below runs regardless so the provider's assistant output still reaches
+    // Discord even for a SystemContinuation.
     let is_system_continuation = injected_class.suppresses_user_turn_lifecycle();
     debug_assert!(
         injected_class.still_delivers_assistant_output(),
         "every injected class must still deliver assistant output via the bridge tail",
     );
-    // #3176: anchor id of THIS turn's synthetic inflight (set only on the anchor-
-    // posting branch); the idle-tail drain-wait uses it to identity-pin our own row
-    // (no self-deadlock) while still waiting on a genuinely distinct previous turn.
+    // #3176: the anchor message id of THIS turn's TUI-direct synthetic inflight, set
+    // only on the branch that actually posts an anchor + creates the synthetic. Used
+    // by the idle-tail drain-wait to identity-pin our own inflight (so it does not
+    // self-deadlock) while still waiting on any genuinely distinct previous turn.
     let mut current_turn_anchor_id: Option<u64> = None;
-    // #3154 P1-3: function-scope so the post-block bridge-tail guard reads it; set
-    // true when the synthetic turn-start is deferred to the detached worker, so the
-    // observer skips its own BridgeAdapter tail (no duplicate relay).
+    // #3154 P1-3: declared at function scope so the post-block bridge-tail guard
+    // can read it. Set true when the synthetic turn-start is deferred to the
+    // detached worker (see the active-turn block below); the observer then skips
+    // its own BridgeAdapter idle-response tail to avoid duplicate relay.
     let mut deferred_synthetic_start = false;
-    if local_only_slash {
-        // #3305: a LOCAL-completing pass-through (/effort /compact /cost /context)
-        // renders in the TUI but starts no model turn. Post ONLY the kind-only
-        // guidance note (the operator still sees the command ran) and RETURN —
-        // before the `disarm()` below — so the armed `observed_lease_early_return
-        // _guard` clears EXACTLY the lease this observation recorded (generation-
-        // exact, #3041 infra, no new cleanup path). No anchor → no ⏳ (so the #3164
-        // add≡remove invariant holds trivially: no add, no asymmetry); no
-        // `claim_tui_direct_synthetic_turn` → no synthetic inflight → the next
-        // injection is not FOREIGN-ABORTed and the #3302 sweeper sees no fake row.
-        let kind = slash_command_control_kind(&prompt.prompt);
-        // #3388: in-session /compact rewrites can replay the local command stub
-        // seconds after the continuation banner; hide that duplicate note. The
-        // real machine-injected /compact (#3262) happens minutes before compaction
-        // completes, so it stays outside this narrow replay window.
-        if local_only_kind_note_suppressed_by_recent_continuation(&prompt.tmux_session_name, &kind)
-        {
-            tracing::info!(
-                provider = %prompt.provider,
-                channel_id = channel_id.get(),
-                session = %prompt.tmux_session_name,
-                kind = %kind,
-                "suppressed local-only slash-command kind note after recent system continuation note"
-            );
-            return;
-        }
-        let note =
-            format_slash_command_control_note(&prompt.tmux_session_name, &kind, &prompt.prompt);
-        match channel_id.say(&*notify_http, note).await {
-            Ok(message) => tracing::info!(
-                provider = %prompt.provider,
-                channel_id = channel_id.get(),
-                tmux_session_name = %prompt.tmux_session_name,
-                slash_command_kind = %kind,
-                note_message_id = message.id.get(),
-                "rendered local-only pass-through slash command as a kind-only note; no active-turn lifecycle (no ⏳/anchor/synthetic inflight), no model turn to relay"
-            ),
-            Err(error) => tracing::warn!(
-                provider = %prompt.provider,
-                channel_id = channel_id.get(),
-                tmux_session_name = %prompt.tmux_session_name,
-                slash_command_kind = %kind,
-                error = %error,
-                "failed to send local-only pass-through slash command note"
-            ),
-        }
-        return;
-    }
     if is_system_continuation {
         // #3178 (codex fix): only SystemContinuation reaches here now —
         // SlashCommandControl was removed from `suppresses_user_turn_lifecycle`
@@ -663,7 +653,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         let note = format_system_continuation_note(&prompt.tmux_session_name, &prompt.prompt);
         match channel_id.say(&*notify_http, note).await {
             Ok(message) => {
-                record_system_continuation_note_rendered(&prompt.tmux_session_name);
                 tracing::info!(
                     provider = %prompt.provider,
                     channel_id = channel_id.get(),
@@ -683,36 +672,23 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             }
         }
     } else {
-        // #3178 (codex fix): a SlashCommandControl is a FULL active turn now (anchor +
-        // ⏳ + synthetic inflight like HumanTuiDirect). Its anchor content carries the
-        // /loop directive body but never the <command-*> wrapper or Compacted stdout;
-        // the #3153 duplicate half was already dropped before the lease record above.
-        // #3075: a `<task-notification>` auto-turn is a MACHINE event — render a
-        // compact structured card and dedupe repeats by task-id (a repeat edits its
-        // live card or no-ops; the first sighting posts as the #3099 anchor).
-        // HumanTuiDirect keeps the raw render; SystemContinuation handled above (#3100).
+        // #3178 (codex fix): a SlashCommandControl (/loop, /compact, the expanded
+        // <command-*> wrapper, or the Compacted stdout) is a FULL active turn now,
+        // so it posts an anchor + ⏳ + synthetic inflight like HumanTuiDirect. Its
+        // anchor CONTENT carries the /loop directive body (the operator wants the
+        // recurring loop content visible — only the #3153 double-post is deduped,
+        // not the content) but NEVER the <command-*> wrapper boilerplate or the
+        // Compacted stdout body. (The #3153 duplicate half was already dropped
+        // before any lease record at the top of this function.)
+        // #3075: a `<task-notification>` auto-turn is a MACHINE event — render it
+        // as a compact structured card and DEDUPE repeats by task-id (a repeat
+        // edits its live card or drops as a no-op → no new ⏳/turn; the first
+        // sighting returns content to post as the #3099 anchor). HumanTuiDirect
+        // keeps the raw render; SystemContinuation is handled above (#3100).
         let content = if matches!(injected_class, InjectedPromptClass::SlashCommandControl) {
             let kind = slash_command_control_kind(&prompt.prompt);
             format_slash_command_control_note(&prompt.tmux_session_name, &kind, &prompt.prompt)
         } else if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
-            // #3393: background-task / subagent completions arrive ONLY as this
-            // `user`-record `<task-notification>` XML — never the stream-json
-            // `system` record the footer panel's `system_status_events` parses. So
-            // before the card render (which has its OWN store), bridge the SAME
-            // payload into the live-panel terminal StatusEvents so footer Tasks /
-            // Subagents flip ✓ and the #3391 delivered-ack eviction can fire. Runs
-            // for BOTH Post and Repeat outcomes (a repeat re-asserts terminal,
-            // which is idempotent at the slot). Footer-mode gated inside the
-            // bridge; an unknown/id-less notification is a slot no-op.
-            //
-            // #3393 finding 2: gate the BRIDGE (not the card) on a START-ANCHORED
-            // check — a human prompt QUOTING a notification mid-message still gets
-            // its card but pushes NO terminal events, so a quoted live tool-use-id
-            // cannot false-close a running slot. Layered with finding 1 (the XML
-            // bridge requires a tool_use_id for any terminal End).
-            if is_start_anchored_task_notification(&prompt.prompt) {
-                bridge_task_notification_to_live_panel(shared, channel_id, &prompt.prompt);
-            }
             match super::tui_task_card::resolve_task_card_content(
                 &notify_http,
                 shared,
@@ -723,11 +699,16 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             {
                 super::tui_task_card::TaskCardOutcome::Post { content } => content,
                 super::tui_task_card::TaskCardOutcome::Repeat => {
-                    // #3075 codex P1 #2: a repeat early-returns before the bridge-tail
-                    // lease-guard cleanup, but the lease recorded above would dangle and
-                    // make `session_bound_external_lease_blocks_delivery` skip legitimate
-                    // delivery. Clear exactly the lease THIS observation recorded
-                    // (exact-match preserves a newer turn's lease).
+                    // #3075 codex P1 #2: a repeat edited the live card (or dropped
+                    // as a no-op) and early-returns BEFORE the bridge-tail /
+                    // lease-guard cleanup block below. But `record_observed_external_turn_lease`
+                    // (above) already recorded a fresh external-input turn lease for
+                    // THIS observation, overwriting any prior one. If we returned now
+                    // without clearing it, that dangling non-Unassigned lease would
+                    // make `session_bound_external_lease_blocks_delivery` skip a
+                    // legitimate session-bound / bridge-tail delivery. Clear exactly
+                    // the lease this observation recorded (exact-match, so a newer
+                    // turn that reused this provider/session/channel is preserved).
                     clear_observed_external_turn_lease_if_current(&prompt, channel_id, &lease);
                     return;
                 }
@@ -742,11 +723,19 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         let anchor_message = match channel_id.say(&*notify_http, content).await {
             Ok(message) => message,
             Err(error) => {
-                // #3075 codex P2: the `Post` outcome reserved a placeholder card slot
-                // (message_id == 0) before this post; on post failure release the
-                // reservation we own so the next same-task notification reserves fresh
-                // (a lingering placeholder would force later ones to `Pending` no-ops
-                // until the 1h stale purge; the NEXT reservation alone is affected).
+                // #3075 codex P2: for a TaskNotificationEvent the `Post` outcome
+                // above reserved a placeholder card slot (message_id == 0) BEFORE
+                // this post. If the post fails we early-return without ever calling
+                // `record_posted_card`, so the placeholder would linger and force
+                // every later same-task notification to resolve to `Pending`
+                // (`TaskCardOutcome::Repeat` → no-op), silently suppressing that
+                // task-id until the 1h stale purge. Release the reservation we own
+                // (exact-match: only while message_id is still 0) so the NEXT
+                // same-task notification reserves fresh and reposts. A racing
+                // repeat that legitimately saw `Pending` is still a safe no-op:
+                // its slot read happened against this same placeholder, and clearing
+                // it only changes the *next* reservation's outcome — it never turns
+                // an already-dropped repeat into a double-post.
                 if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
                     let task_id =
                         super::tui_task_card::parse_task_notification(&prompt.prompt).task_id;
@@ -773,8 +762,10 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         current_turn_anchor_id = Some(anchor_message.id.get());
         // #3075: remember this card so a repeat completion edits it. #3164 codex R3
         // issue-2: keep this IMMEDIATELY after the successful post (before the awaited
-        // `⏳` add) — deferring it behind the reaction await widens the task-card
-        // `Pending` no-op window and can drop the only repeat/update.
+        // `⏳` add) — `record_posted_card` is NOT used by lifecycle completion, and
+        // deferring it behind the reaction await widens the task-card `Pending` no-op
+        // window (a repeat `<task-notification>` arriving while message_id is still 0
+        // is dropped as `Pending`, losing the only repeat/update).
         if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
             super::tui_task_card::record_posted_card(
                 channel_id.get(),
@@ -783,10 +774,17 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             );
         }
         // #3164: add `⏳` with the command(provider) bot so it matches the bot that
-        // removes it in `complete_tui_direct_prompt_anchor_lifecycle_if_present`; on
-        // unavailable http skip the add (warned above). codex R2 issue-2: add BEFORE
-        // the anchor becomes findable (`record_prompt_anchor`) — anchor-first lets a
-        // fast watcher complete first and the delayed add re-leaves `⏳ + ✅`.
+        // removes it in `complete_tui_direct_prompt_anchor_lifecycle_if_present`
+        // (watcher provider ctx.http via `shared.serenity_http_or_token_fallback()`).
+        // If that http was unavailable we skip the add entirely (warned above)
+        // rather than add with the wrong identity and strand the hourglass.
+        //
+        // #3164 codex R2 issue-2: add the `⏳` BEFORE the anchor becomes findable
+        // (`record_prompt_anchor` below). The completion path locates this turn via
+        // the dedupe anchor; if the anchor were recorded first, a fast watcher could
+        // complete (remove a not-yet-added `⏳`, post `✅`, clear the anchor) and THEN
+        // this delayed add would land — re-leaving `⏳ + ✅`. Adding first guarantees
+        // the `⏳` exists before any anchor-based completion can observe the turn.
         if let Some(command_http) = command_http.as_ref() {
             super::formatting::add_reaction_raw(command_http, channel_id, anchor_message.id, '⏳')
                 .await;
@@ -797,12 +795,35 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             channel_id.get(),
             anchor_message.id.get(),
         );
-        // #3174: turn-identity guard on the ⏳ lifecycle. A lease-gated completion
-        // firing inside the sub-second notify+⏳-add window left a deferred marker;
-        // now that THIS turn's anchor exists, drain it (⏳ → ✅ swap). P1: drain ONLY
-        // the `lease.generation` match (never cross-consume a newer turn). P2: PEEK
-        // first, consume only with `command_http`, else leave it within its TTL.
-        // Pure decision: [`decide_deferred_anchor_completion_drain`]; no-marker no-op.
+        // #3174: turn-identity guard on the ⏳ lifecycle vs the watcher's
+        // lease-gated completion. If the provider committed terminal output
+        // inside the sub-second `notify-post + ⏳-add` window above, the watcher's
+        // lease-gated completion already fired BEFORE this `record_prompt_anchor`
+        // landed — it found no anchor, was a no-op, and recorded a deferred-
+        // completion marker (the lease it gated on is cleared after that
+        // delivery, so no later watcher pass would reconcile the ⏳). Now that
+        // THIS turn's anchor exists, drain that marker and finish the
+        // ⏳ → ✅ swap against the just-recorded anchor.
+        //
+        // #3174 codex P1 (turn identity): the marker is stamped with the
+        // `generation` of the lease the watcher completion gated on; drain ONLY
+        // the marker matching THIS relay invocation's lease generation
+        // (`lease.generation`), so a NEWER same-(provider,tmux) turn's marker is
+        // never cross-consumed and the wrong turn's ⏳ is never completed.
+        //
+        // #3174 codex P2 (HTTP fail-open): PEEK the marker first, then only
+        // consume (`take_...`) once we have a `command_http` to actually deliver
+        // the ⏳ → ✅ swap. If command_http is unavailable we leave the marker in
+        // place rather than silently dropping it — mirrors the #3164 ⏳-add
+        // fail-open (skip rather than strand worse than before); a later anchor
+        // record / watcher pass can still reconcile it within the marker TTL.
+        // No-op on the common path (no terminal output yet → no marker). The
+        // peek + consume/fail-open DECISION is in
+        // [`decide_deferred_anchor_completion_drain`] (pure, against the real
+        // dedupe state) so it is integration-testable: a test that records a
+        // matching marker and drives this block must see the marker consumed and
+        // the completion delivered; neutralizing the decision (or the consume)
+        // makes that test fail.
         match decide_deferred_anchor_completion_drain(
             &prompt.provider,
             &prompt.tmux_session_name,
@@ -837,25 +858,41 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             }
             DeferredAnchorCompletionDrain::NoMarker => {}
         }
-        // #3099: a `<task-notification>` auto-turn earns the same synthetic ownership
-        // as human direct input (its ⏳ cleanup anchors on its own id), so it does NOT
-        // short-circuit here. Only SystemContinuation skips this active-turn block.
+        // #3099: a `<task-notification>` auto-turn is still a real provider turn
+        // that earns the same synthetic ownership as human direct input — the
+        // difference is purely that its `⏳` completion cleanup must be anchored on
+        // this injected message's own id (handled in the watcher/recovery
+        // completion paths), so it does NOT short-circuit here. Only
+        // SystemContinuation skips this active-turn block (but still relays output
+        // via the bridge tail below).
         debug_assert!(
             injected_class.is_human_active_turn()
                 || matches!(injected_class, InjectedPromptClass::TaskNotificationEvent),
             "system-continuation injections must not reach active-turn handling",
         );
-        // #3154 P1-3: set when the synthetic turn-start is DEFERRED to the detached
-        // per-channel worker; the observer then must NOT spawn its own BridgeAdapter
-        // tail below (a second observer tail would relay the SAME output twice — the
-        // original bug). The worker owns the relay-owner handoff.
+        // #3154 P1-3: set when the synthetic turn-start is DEFERRED to the
+        // detached per-channel worker. In that case the observer must NOT spawn
+        // its own BridgeAdapter idle-response tail below: the deferred worker
+        // claims the turn (often as the WATCHER owner) only after the prior turn
+        // drains, and re-records the lease accordingly. Letting the observer
+        // spawn a bridge tail here on the (stale, pre-claim) BridgeAdapter lease
+        // would run a second relay of the SAME output once the watcher claims →
+        // duplicate relay (the original bug). The deferred worker owns the
+        // relay-owner handoff end-to-end.
         if let Some(provider) = ProviderKind::from_str(&prompt.provider) {
-            // #3154 — TEMPORAL fix for turn-interleaving. An INLINE claim while the
-            // PRIOR turn's tail still drains seeds `turn_start_offset` from the prior
-            // cursor (duplicate relay), and an inline wait starves OTHER channels. So
-            // an un-finalized prior turn persists a DURABLE pending-start and hands
-            // the claim to a DETACHED per-channel worker (fresh EOF offset); the
-            // common no-interleave case stays on the inline fast path.
+            // #3154 — TEMPORAL fix for turn-interleaving. If the PRIOR turn on
+            // this channel has not finalized (its relay tail is still draining),
+            // claiming the synthetic turn-start INLINE here (on the shared
+            // per-provider observer loop) seeds `turn_start_offset` from the
+            // prior relay cursor while that tail is undrained → the
+            // `response_sent_offset_monotonic` collision / duplicate relay this
+            // issue tracks. AND any inline wait here starves OTHER channels'
+            // relays (single observer loop). So: when the prior turn is not
+            // finalized, persist a DURABLE pending-start record and hand the
+            // claim to a DETACHED per-channel worker, then return to the loop.
+            // The worker waits for the prior turn to finalize, then claims with
+            // a FRESH EOF `turn_start_offset`. The common no-interleave case
+            // (prior turn already finalized) stays on the inline fast path.
             let prior = synthetic_start_prior_turn_view(
                 shared,
                 &provider,
@@ -864,7 +901,7 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
                 anchor_message.id.get(),
             )
             .await;
-            if super::tui_direct_pending_start::should_defer_synthetic_turn_start(prior.view) {
+            if super::tui_direct_pending_start::should_defer_synthetic_turn_start(prior) {
                 deferred_synthetic_start = true;
                 defer_synthetic_turn_start(
                     shared,
@@ -900,25 +937,14 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
                     lease.relay_owner = claim.relay_owner;
                     // Re-record overwrites the lease with a FRESH generation; adopt it
                     // back into `lease` so the bridge-tail guard below captures the
-                    // exact stored identity (a stale generation's Drop would clear
-                    // nothing / the wrong lease).
+                    // exact stored identity (otherwise the guard would hold the stale
+                    // generation and its Drop would clear nothing / the wrong lease).
                     lease = crate::services::tui_prompt_dedupe::record_external_input_turn_lease(
                         provider.as_str(),
                         &prompt.tmux_session_name,
                         lease,
                     );
                 }
-                // #3350: the INLINE claim records the same #3303 DeferredClaim marker
-                // as the deferred worker (drain ✅ / sweep TTL ⚠). SC3/own-row/I5 gates
-                // live in the recorder; a pending_start test pins this wiring.
-                super::tui_direct_pending_start::record_inline_claim_marker_if_claimed(
-                    claim.claimed,
-                    &prompt.provider,
-                    channel_id.get(),
-                    anchor_message.id.get(),
-                    &prompt.tmux_session_name,
-                    super::tui_direct_pending_start::record_claim_marker_if_watcher_owned,
-                );
             }
         }
         tracing::info!(
@@ -1224,14 +1250,29 @@ fn bridge_adapter_owns_external_turn(owner: ExternalInputRelayOwner) -> bool {
     matches!(owner, ExternalInputRelayOwner::BridgeAdapter)
 }
 
-/// #3154 P1-3 no-relay-GAP guard: may the OBSERVER loop spawn its own BridgeAdapter
-/// idle-response tail? The output must come from EXACTLY ONE owner (never a GAP, never
-/// a DUPLICATE). DEFERRED ⇒ the observer cannot yet know the RESOLVED owner (the claim
-/// runs later in the detached worker), so it STANDS DOWN unconditionally and the worker
-/// re-runs [`deferred_claim_requires_bridge_tail_relayer`] against the resolved owner.
-/// NOT deferred ⇒ spawn iff the lease still owns as BridgeAdapter (the inline claim
-/// already adopted any watcher handoff, so a watcher-owned lease means the observer
-/// stands down). Pairing this with the worker's owner-kind-aware spawn is the proof.
+/// #3154 P1-3 no-relay-GAP guard. Decides whether the OBSERVER loop may spawn its
+/// own BridgeAdapter idle-response tail for this turn.
+///
+/// The relay of a turn's output must come from EXACTLY ONE owner — never zero (a
+/// GAP: the output is silently dropped) and never two (a DUPLICATE relay).
+///
+/// * When the synthetic turn-start was DEFERRED, the OBSERVER cannot yet know the
+///   RESOLVED relay owner: the claim runs LATER in the detached worker (it reads
+///   the runtime binding FRESH, post-drain, and only then resolves TmuxWatcher vs
+///   BridgeAdapter — see `claim_tui_direct_synthetic_turn`). Spawning here on the
+///   stale, pre-claim lease would either double-relay (watcher case) or relay the
+///   wrong (undrained) offset. So the observer STANDS DOWN unconditionally on the
+///   deferred path and hands the bridge-tail decision to the worker, which re-runs
+///   the OWNER-KIND-AWARE [`deferred_claim_requires_bridge_tail_relayer`] against
+///   the RESOLVED owner.
+/// * When NOT deferred, the observer spawns the bridge tail iff the lease's owner
+///   is still the BridgeAdapter (the inline claim already adopted any watcher
+///   handoff into `lease.relay_owner`, so a watcher-owned lease means the watcher
+///   relays and the observer stands down).
+///
+/// Pairing this with the deferred worker's owner-kind-aware bridge-tail spawn
+/// (which guarantees EXACTLY ONE relayer for EITHER resolved owner) is what proves
+/// there is no GAP and no duplicate on the deferred path.
 fn observer_should_spawn_bridge_tail(
     deferred_synthetic_start: bool,
     lease_owner: ExternalInputRelayOwner,
@@ -1240,22 +1281,33 @@ fn observer_should_spawn_bridge_tail(
 }
 
 /// #3154 P1 (BridgeAdapter-GAP fix). The OWNER-KIND-AWARE decision the deferred
-/// worker runs AFTER its claim resolves the relay owner, mirroring the inline path:
-/// TmuxWatcher ⇒ the watcher relays so the bridge tail STANDS DOWN (else DUPLICATE);
-/// BridgeAdapter ⇒ no watcher relays and the observer already stood down, so the
-/// bridge tail MUST run exactly once here (else `relayer_count == 0`, the GAP). The
-/// downstream [`maybe_spawn_claude_idle_response_tail`] re-checks
-/// `bridge_adapter_owns_external_turn`, so a stale/watcher lease can never spawn a
-/// second relayer even if this predicate were called too eagerly.
+/// worker runs AFTER its claim resolves the relay owner. It mirrors the inline
+/// (non-deferred) observer path exactly:
+///
+/// * Resolved owner == TmuxWatcher ⇒ the watcher relays the turn's output, so the
+///   bridge tail must STAND DOWN (else DUPLICATE relay — the original P1-3 bug).
+/// * Resolved owner == BridgeAdapter ⇒ NO watcher will relay this turn, and the
+///   observer already stood down (deferred). The bridge tail MUST run exactly once
+///   here, or the synthetic turn's output is never relayed (the BridgeAdapter-GAP:
+///   `relayer_count == 0`). The observer's unconditional deferred skip in
+///   [`observer_should_spawn_bridge_tail`] is only correct BECAUSE this worker-side
+///   fallback closes the BridgeAdapter case.
+///
+/// The downstream [`maybe_spawn_claude_idle_response_tail`] independently re-checks
+/// `bridge_adapter_owns_external_turn` before spawning, so a stale/watcher lease can
+/// never produce a second relayer even if this predicate were called too eagerly.
 fn deferred_claim_requires_bridge_tail_relayer(resolved_owner: ExternalInputRelayOwner) -> bool {
     bridge_adapter_owns_external_turn(resolved_owner)
 }
 
-/// #3154 P1-3 relay-owner adoption decision. The in-memory lease adopts the claim's
-/// `relay_owner` iff the claim SUCCEEDED and the owner changed; re-recording with
-/// the claimed (watcher) owner makes [`observer_should_spawn_bridge_tail`] read a
-/// watcher-owned lease and stand down (the claimed owner is the SINGLE relayer, no
-/// GAP/dup). Shared by the inline and deferred paths so both adopt identically.
+/// #3154 P1-3 relay-owner adoption decision. After a synthetic claim resolves,
+/// the in-memory lease must adopt the claim's `relay_owner` iff the claim
+/// SUCCEEDED and the owner actually changed. Re-recording the lease with the
+/// claimed (watcher) owner is what makes [`observer_should_spawn_bridge_tail`]
+/// (and the bridge-tail guard) read a watcher-owned lease and stand down — so
+/// the deferred worker's claimed owner is the SINGLE relayer (no GAP, no dup).
+/// Shared by the inline (non-deferred) path and the deferred worker so both
+/// adopt identically.
 fn claim_should_adopt_relay_owner(
     claimed: bool,
     current_owner: ExternalInputRelayOwner,
@@ -1268,10 +1320,12 @@ fn claim_should_adopt_relay_owner(
 struct TuiDirectSyntheticTurnClaim {
     relay_owner: ExternalInputRelayOwner,
     claimed: bool,
-    // #3154 P1 (timestamp-anchor output loss): the post-drain EOF offset the claim
-    // seeded into this turn's inflight `turn_start_offset`. The deferred-BridgeAdapter
-    // worker anchors its bridge tail to THIS byte boundary instead of a `Utc::now()`
-    // scan, which can skip bytes written during the deferred-claim wait window.
+    // #3154 P1 (timestamp-anchor output loss): the post-drain EOF offset
+    // (`relay_last_offset()`) the claim seeded into this turn's inflight
+    // `turn_start_offset`. The deferred-BridgeAdapter worker must anchor its
+    // bridge tail to THIS offset (the authoritative byte boundary for this
+    // synthetic turn) instead of a `Utc::now()` timestamp scan, which can skip
+    // bytes written to the transcript during the deferred-claim wait window.
     turn_start_offset: u64,
 }
 
@@ -1505,19 +1559,16 @@ async fn claim_tui_direct_synthetic_turn(
 // #3154 — deferred synthetic turn-start (off the observer loop)
 // ===========================================================================
 
-/// Build the
-/// [`PriorTurnObservation`](super::tui_direct_pending_start::PriorTurnObservation)
+/// Build the [`PriorTurnView`](super::tui_direct_pending_start::PriorTurnView)
 /// for the synthetic-start deferral decision: read inflight, mailbox, and the
-/// fresh runtime binding. Besides the pure decision view it carries the live
-/// FOREIGN inflight's identity (codex r2) so the worker can pin it on the
-/// aborted-anchor marker even when the row vanishes before the ABORT cleanup.
+/// fresh runtime binding for this provider/channel/session.
 async fn synthetic_start_prior_turn_view(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
     tmux_session_name: &str,
     own_anchor_id: u64,
-) -> super::tui_direct_pending_start::PriorTurnObservation {
+) -> super::tui_direct_pending_start::PriorTurnView {
     let inflight = super::inflight::load_inflight_state(provider, channel_id.get());
     let inflight_present = inflight.is_some();
     let inflight_is_own_anchor = inflight
@@ -1528,10 +1579,6 @@ async fn synthetic_start_prior_turn_view(
                 && state.user_msg_id == own_anchor_id
         })
         .unwrap_or(false);
-    let foreign_inflight_identity = inflight
-        .as_ref()
-        .filter(|_| !inflight_is_own_anchor)
-        .map(|state| (state.user_msg_id, state.started_at.clone()));
 
     let snapshot = super::mailbox_snapshot(shared, channel_id).await;
     // A BACKGROUND turn (monitor relay / self-paced loop) does not block — only a
@@ -1546,15 +1593,12 @@ async fn synthetic_start_prior_turn_view(
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name)
             .is_some();
 
-    super::tui_direct_pending_start::PriorTurnObservation {
-        view: super::tui_direct_pending_start::PriorTurnView {
-            inflight_present,
-            inflight_is_own_anchor,
-            mailbox_blocking_turn_present,
-            mailbox_turn_is_own_anchor,
-            runtime_binding_present,
-        },
-        foreign_inflight_identity,
+    super::tui_direct_pending_start::PriorTurnView {
+        inflight_present,
+        inflight_is_own_anchor,
+        mailbox_blocking_turn_present,
+        mailbox_turn_is_own_anchor,
+        runtime_binding_present,
     }
 }
 
@@ -1579,7 +1623,7 @@ fn defer_synthetic_turn_start(
         lease_runtime_kind: lease.runtime_kind.map(|k| k.as_str().to_string()),
         lease_turn_id: lease.turn_id.clone(),
         lease_session_key: lease.session_key.clone(),
-        generation: shared.restart.current_generation,
+        generation: shared.current_generation,
         created_at_ms: now_ms,
         observed_at_ms: prompt.observed_at.timestamp_millis().max(0) as u64,
         state: super::tui_direct_pending_start::PendingStartState::Waiting,
@@ -1599,7 +1643,6 @@ fn defer_synthetic_turn_start(
         record,
         pending_start_view_fn(),
         pending_start_claim_fn(),
-        pending_start_abort_cleanup_fn(),
     );
 }
 
@@ -1661,7 +1704,7 @@ fn pending_start_claim_fn() -> super::tui_direct_pending_start::ClaimFn {
                 super::turn_finalizer::TurnKey::new(
                     channel_id,
                     record.anchor_message_id,
-                    shared.restart.current_generation,
+                    shared.current_generation,
                 ),
                 provider.clone(),
                 super::inflight::RelayOwnerKind::Watcher,
@@ -1772,69 +1815,6 @@ fn pending_start_claim_fn() -> super::tui_direct_pending_start::ClaimFn {
     })
 }
 
-/// #3296 (supersedes the #3282 `⏳ → ⚠` swap): the worker's terminal-ABORT
-/// reconcile hook. The input was ALREADY provider-submitted by ABORT time (the
-/// abort drops only the synthetic OWNERSHIP claim), so the anchor's `⏳` is
-/// still TRUE — the old `⚠` swap branded ANSWERED messages as failures. So:
-/// KEEP the `⏳` and record a durable aborted-anchor marker pinning the
-/// FOREIGN prior inflight's identity — the worker's LAST-VIEW identity first,
-/// the cleanup-instant row only as the no-view fallback (codex r3,
-/// `pin_abort_foreign_identity`). The marker stays uncovered unless a commit
-/// tombstone proves the prior owner committed (`record_for_abort`'s 대조;
-/// force-clear/stop/recovery deletions stay uncovered). The watcher drain
-/// flips it `⏳ → ✅` ONLY when THAT turn commits; the sweeper flips it
-/// `⏳ → ⚠` after the TTL with no holding inflight (hard-cap bounded).
-/// Recorded even when http is unavailable; every later reaction op resolves
-/// the shared http INSIDE the marker module — the add≡remove identity (#3164).
-fn pending_start_abort_cleanup_fn() -> super::tui_direct_pending_start::AbortCleanupFn {
-    Box::new(|_shared, record, last_view_foreign| {
-        Box::pin(async move {
-            // Defensive (I5): a corrupted durable record could carry a zero
-            // anchor id — `MessageId::new(0)` panics and a zero-id marker could
-            // never be reconciled. `record()` rejects it too; skip outright.
-            if record.anchor_message_id == 0 {
-                return;
-            }
-            // codex r3: LAST-VIEW first — a SUCCESSOR row may hold the slot by
-            // now (prior row committed); the row read is a lazy fallback only.
-            let foreign = super::tui_direct_pending_start::pin_abort_foreign_identity(
-                last_view_foreign,
-                || {
-                    ProviderKind::from_str(&record.provider)
-                        .and_then(|provider| {
-                            super::inflight::load_inflight_state(&provider, record.channel_id)
-                        })
-                        .map(|state| (state.user_msg_id, state.started_at))
-                },
-            );
-            match super::tui_direct_abort_marker::record_for_abort(
-                record.provider.clone(),
-                record.channel_id,
-                record.anchor_message_id,
-                record.tmux_session_name.clone(),
-                foreign,
-            ) {
-                Ok(marker) => tracing::info!(
-                    provider = %record.provider,
-                    channel_id = record.channel_id,
-                    tmux_session_name = %record.tmux_session_name,
-                    anchor_message_id = record.anchor_message_id,
-                    foreign_user_msg_id = ?marker.foreign_user_msg_id,
-                    tombstone_covered = marker.covered_at_ms.is_some(),
-                    "tui_direct_pending_start: synthetic turn-start ABORTed; anchor keeps ⏳ and a durable aborted-anchor marker was recorded — reconcile lands ✅ on the recorded foreign turn's commit (tombstone-covered when it already committed) or ⚠ via the sweep bound (#3296)"
-                ),
-                Err(error) => tracing::warn!(
-                    provider = %record.provider,
-                    channel_id = record.channel_id,
-                    anchor_message_id = record.anchor_message_id,
-                    error = %error,
-                    "tui_direct_pending_start: failed to persist the aborted-anchor marker; anchor ⏳ may linger until manual cleanup (#3296)"
-                ),
-            }
-        })
-    })
-}
-
 fn parse_external_input_relay_owner(value: &str) -> ExternalInputRelayOwner {
     match value {
         "bridge_adapter" => ExternalInputRelayOwner::BridgeAdapter,
@@ -1872,7 +1852,6 @@ fn restore_pending_starts(shared: &Arc<SharedData>, provider: &ProviderKind) {
             record,
             pending_start_view_fn(),
             pending_start_claim_fn(),
-            pending_start_abort_cleanup_fn(),
         );
     }
 }
@@ -2400,11 +2379,16 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
             let now = tokio::time::Instant::now();
             if now >= next_rehydrate {
                 // #3105 (codex P2): `rehydrate_existing_claude_tui_bindings` is a
-                // fully BLOCKING pass (synchronous `tmux` subprocess calls + a
-                // `std::thread::sleep` between multi-sample pane probes); running it
-                // inline would stall the executor for samples×delay plus tmux latency.
-                // Move it onto the blocking pool via `spawn_blocking` (the sync core
-                // and its unit-testable logic are unchanged).
+                // fully BLOCKING pass — it issues synchronous `tmux` subprocess
+                // calls (`list-sessions`, `has-session`, `has-live-pane`) and, via
+                // `pane_is_confirmed_dead_orphaned`, a `std::thread::sleep` between
+                // multi-sample pane probes. Running it inline on this Tokio worker
+                // would stall the executor (and every other async task scheduled on
+                // the same worker) for samples×delay PLUS the tmux subprocess
+                // latency on each pass. Move ALL of that blocking work onto the
+                // blocking pool with `spawn_blocking` so the executor stays free;
+                // the sync core (and its unit-testable multi-sample logic) is
+                // unchanged.
                 let shared_for_rehydrate = shared.clone();
                 let rehydrate_result = tokio::task::spawn_blocking(move || {
                     rehydrate_existing_claude_tui_bindings(&shared_for_rehydrate);
@@ -2425,12 +2409,14 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
             {
                 let Some(channel_id) = owner_channel_for_tmux_session(&shared, &tmux_session_name)
                 else {
-                    // #3018/#3306: registry miss ⇒ drop. The drift handler
-                    // rate-limits the WARN and self-heals from a durable source.
-                    super::idle_relay_drift::on_idle_relay_drift(
-                        &shared,
-                        ProviderKind::Claude,
-                        &tmux_session_name,
+                    // #3018: registry has no owner channel for this active Claude
+                    // TUI binding — the idle relay cannot route, so it skips. Make
+                    // the skip visible (was a silent continue) so missing mappings
+                    // are diagnosable instead of silently dropping relay output.
+                    tracing::warn!(
+                        tmux_session_name = %tmux_session_name,
+                        provider = "claude",
+                        "Claude idle relay skipped: no authoritative owner channel for tmux session"
                     );
                     continue;
                 };
@@ -2523,24 +2509,6 @@ fn spawn_claude_idle_transcript_relay(shared: Arc<SharedData>) {
                             &transcript_path,
                             line_end_offset,
                         );
-                        // #3305: a LOCAL-completing pass-through command's
-                        // `<command-*>` transcript echo (/effort /compact /cost
-                        // /context) never starts a model turn, so do NOT select an
-                        // external turn owner / wait for a synthetic claim / spawn a
-                        // response tail for it. Skipping here (after advancing the
-                        // offset so it is not re-scanned) keeps the inflight table
-                        // empty so the next injection is not FOREIGN-ABORTed; the
-                        // broadcast relay still posts the kind-only guidance note. A
-                        // /loop echo is off the allow-list and keeps full lifecycle.
-                        if is_local_only_slash_command_prompt(&prompt) {
-                            tracing::info!(
-                                tmux_session_name = %tmux_session_name,
-                                channel_id = channel_id.get(),
-                                slash_command_kind = %slash_command_control_kind(&prompt),
-                                "Claude idle transcript relay skipped local-only pass-through slash command (no external turn owner / synthetic claim / response tail)"
-                            );
-                            continue;
-                        }
                         if !claude_idle_prompt_observation_should_tail_response(observation) {
                             continue;
                         }
@@ -2636,16 +2604,27 @@ const DEAD_ORPHANED_PANE_PROBE_SAMPLES: usize = 3;
 const DEAD_ORPHANED_PANE_PROBE_DELAY: Duration = Duration::from_millis(75);
 
 /// #3105 (codex P1 sub-case B): a tmux session whose dedupe mirror still holds a
-/// stale ClaudeTui binding but which is genuinely dead/orphaned — pane gone AND no
-/// LIVE watcher handle owns it — under which it is safe to drop the restored-owner
-/// binding and tombstone the mirror. EXCLUDES sub-case A (a live session whose
-/// registry entry was transiently evicted: pane still live → returns false →
-/// self-heals via `restore_owner_channel_for_tmux_session`). A
-/// `restored_owner_by_tmux_session` entry is NOT proof of life — it is the stale
-/// residue this eviction reclaims. P2: eviction is destructive, so the dead verdict
-/// resists a flake — the pane must read dead across `DEAD_ORPHANED_PANE_PROBE_
-/// SAMPLES` consecutive samples AND the hard `tmux_session_exists` must confirm the
-/// session is gone (a single soft "no live pane" read can NEVER evict).
+/// stale ClaudeTui binding but which is genuinely dead/orphaned — its pane is
+/// gone AND no LIVE watcher handle owns it. This is the precise gate under which
+/// it is safe to drop any leftover restored-owner binding and tombstone the
+/// mirror; it deliberately EXCLUDES a live session whose authoritative registry
+/// entry was transiently evicted (sub-case A — pane is still live there, so this
+/// returns false and that path self-heals via
+/// `restore_owner_channel_for_tmux_session`).
+///
+/// The pane-liveness check is what distinguishes "pane dead/gone" (evict) from
+/// "pane alive but registry missing" (self-heal). A `restored_owner_by_tmux_session`
+/// entry is NOT treated as proof of life here, because that map is precisely the
+/// stale residue we must reclaim for a session that has since died; it is
+/// cleared as part of the eviction.
+///
+/// #3105 (codex P2): because eviction is destructive, the dead verdict is made
+/// resistant to a transient pane-probe flake (sub-case A false-positive risk for a
+/// LIVE thread-suffixed session that has not yet been claimed): the pane must read
+/// dead across `DEAD_ORPHANED_PANE_PROBE_SAMPLES` consecutive samples, AND — since
+/// "no watcher handle" is the weakest possible signal — the hard
+/// `tmux_session_exists` (`tmux has-session`) check must confirm the session truly
+/// does not exist on this host. A single soft "no live pane" read can NEVER evict.
 #[cfg(unix)]
 fn claude_tui_session_is_dead_orphaned(shared: &Arc<SharedData>, tmux_session_name: &str) -> bool {
     // A live watcher handle is conclusive proof of life: never evict, never probe.
@@ -2663,13 +2642,22 @@ fn claude_tui_session_is_dead_orphaned(shared: &Arc<SharedData>, tmux_session_na
     )
 }
 
-/// #3105 (codex P2): pure, testable core of the dead/orphaned pane decision (the
-/// caller short-circuits on a live watcher handle first). Conservative so a LIVE
-/// session is NEVER classified dead from a flake: (1) ANY of up to `samples`
-/// `has_live_pane` reads being live ⇒ NOT dead (self-heal preserved); only all-dead
-/// proceeds. (2) Even then the hard `session_exists` (`tmux has-session`) must
-/// confirm the session is gone. Sub-case B (a genuinely-gone session) reads dead on
-/// every sample AND `session_exists` is false ⇒ true ⇒ the WARN spam stops.
+/// #3105 (codex P2): pure, testable core of the dead/orphaned pane decision (no
+/// watcher-handle dependency — the caller short-circuits on a live handle first).
+///
+/// Conservative by construction so a LIVE session is NEVER classified dead from a
+/// transient flake:
+///   1. `has_live_pane` is sampled up to `samples` times; the moment ANY sample
+///      reports a live pane the session is declared NOT dead (self-heal preserved).
+///      Only if ALL `samples` agree the pane is dead do we proceed.
+///   2. Even then, the hard `session_exists` (`tmux has-session`) check must
+///      confirm the session is truly gone from this host. "No watcher handle" is
+///      the weakest signal, so a soft "no live pane" alone never evicts; the
+///      session must be confirmed absent.
+///
+/// Sub-case B (the production `AgentDesk-claude-adk-cc-t1504468805772902471` case)
+/// still evicts: a genuinely-gone session reports no live pane on every sample AND
+/// `session_exists` is false, so this returns true and the WARN spam stops.
 #[cfg(unix)]
 fn pane_is_confirmed_dead_orphaned(
     mut has_live_pane: impl FnMut() -> bool,
@@ -3155,7 +3143,7 @@ fn resolve_idle_relay_transcript(
 }
 
 #[cfg(unix)]
-pub(super) fn resolve_rehydrated_claude_tmux_channel_id(tmux_session_name: &str) -> Option<u64> {
+fn resolve_rehydrated_claude_tmux_channel_id(tmux_session_name: &str) -> Option<u64> {
     let mut matched: Option<u64> = None;
     for binding in super::settings::list_registered_channel_bindings() {
         if binding.owner_provider != ProviderKind::Claude {
@@ -3360,12 +3348,13 @@ fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                 }
                 let Some(channel_id) = owner_channel_for_tmux_session(&shared, &tmux_session_name)
                 else {
-                    // #3018/#3306: registry miss ⇒ drop. Codex gets the
-                    // rate-limited drift WARN only (no settings/DB self-heal).
-                    super::idle_relay_drift::on_idle_relay_drift(
-                        &shared,
-                        ProviderKind::Codex,
-                        &tmux_session_name,
+                    // #3018: registry has no owner channel for this active Codex
+                    // TUI binding — surface the relay skip (was a silent continue)
+                    // so missing mappings are diagnosable.
+                    tracing::warn!(
+                        tmux_session_name = %tmux_session_name,
+                        provider = "codex",
+                        "Codex idle relay skipped: no authoritative owner channel for tmux session"
                     );
                     continue;
                 };
@@ -4965,7 +4954,8 @@ fn owner_channel_for_tmux_session(
 }
 
 /// Pure decision core for [`owner_channel_for_tmux_session`], split out so the
-/// registry-single-authority + drift-alert behaviour is unit-testable.
+/// registry-as-single-authority and drift-alert behaviour can be unit tested
+/// without constructing a full `SharedData`.
 fn resolve_owner_channel_authoritatively(
     tmux_session_name: &str,
     registry_owner: Option<ChannelId>,
@@ -4974,28 +4964,56 @@ fn resolve_owner_channel_authoritatively(
     match (registry_owner, dedupe_owner) {
         (Some(registry_channel), _) => Some(registry_channel),
         (None, Some(dedupe_channel)) => {
-            // #3018: registry miss + mirror hit == drift; never route from the mirror
-            // (not a reverse authority). #3306: rate-limit this single drift-alert WARN.
-            let warn_decision = super::idle_relay_drift::should_emit_drift_warn(tmux_session_name);
-            if warn_decision.emit {
-                tracing::warn!(
-                    tmux_session_name = %tmux_session_name,
-                    dedupe_channel_id = dedupe_channel,
-                    suppressed_count = warn_decision.suppressed_count,
-                    drift_age_secs = warn_decision.drift_age_secs,
-                    "tmux-session→channel registry miss while dedupe mirror has a mapping; \
-                     treating registry as single authority and dropping (drift alert)"
-                );
-            }
+            // #3018: registry miss + dedupe mirror hit == observable drift.
+            // Do NOT fall back to the mirror (it is not a reverse authority);
+            // surface the drift so it is visible instead of routing on stale state.
+            tracing::warn!(
+                tmux_session_name = %tmux_session_name,
+                dedupe_channel_id = dedupe_channel,
+                "tmux-session→channel registry miss while dedupe mirror has a mapping; \
+                 treating registry as single authority and dropping (drift alert)"
+            );
             None
         }
         (None, None) => None,
     }
 }
 
-/// Classification of TUI-injected prompt text. Each class drives different
-/// lifecycle handling: human/task turns get active-turn ownership, continuation
-/// banners stay passive, and slash-control echoes use command-kind rendering.
+/// Classification of TUI-injected prompt text (#3099, #3100).
+///
+/// Injected terminal input arrives through a single observation path
+/// (`relay_observed_prompt`) regardless of origin, but the three origins must
+/// drive different ⏳/turn-lifecycle behaviour:
+///
+/// * [`HumanTuiDirect`](InjectedPromptClass::HumanTuiDirect) — a person typed
+///   into the TUI. This is a real active turn: it earns a `⏳` reaction, claims
+///   queue/inflight ownership, and cleans `⏳ → ✅` on completion.
+/// * [`TaskNotificationEvent`](InjectedPromptClass::TaskNotificationEvent) — a
+///   `<task-notification>` auto-turn (e.g. a background `run_in_background`
+///   completing) that Claude Code / Codex inject into their own session. These
+///   ARE real Discord messages with their own id, so they get a `⏳`, but the
+///   completion of that auto-turn must remove the `⏳` from the injected
+///   message itself (#3099) — not from a synthetic `user_msg_id == 0`.
+/// * [`SystemContinuation`](InjectedPromptClass::SystemContinuation) — a
+///   compact / "this session is being continued from a previous conversation"
+///   system prologue. This is NOT a human request and must not occupy the
+///   user-turn lifecycle: no `⏳`, no queue/inflight ownership, no
+///   cancel-on-hourglass semantics (#3100). It is rendered as a neutral
+///   session note if visible at all.
+/// * [`SlashCommandControl`](InjectedPromptClass::SlashCommandControl) — a
+///   MACHINE slash-command control echo (#3153): the raw `/loop …` / `/compact`
+///   text a `ScheduleWakeup` writes into the terminal, the Claude Code expanded
+///   `<command-message>…</command-message>` wrapper for that slash command, and
+///   the `<local-command-stdout>Compacted …` stdout line. Like
+///   [`SystemContinuation`] it is NOT a human request and must not occupy the
+///   user-turn lifecycle (no `⏳`, no anchor, no synthetic turn). #3178: it posts
+///   a SINGLE neutral note showing only the command KIND (`/loop` / `/compact`),
+///   never the raw prompt body, so the following completion card has a visible
+///   anchor — and the #3153 DOUBLE-post (the raw echo AND the expanded
+///   `<command-*>` wrapper arrive as two independent observed prompts) is
+///   collapsed by a (tmux_session + command_kind) dedupe window so the trigger
+///   shows exactly once. The resulting provider assistant output STILL flows via
+///   the bridge tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InjectedPromptClass {
     HumanTuiDirect,
@@ -5011,20 +5029,52 @@ impl InjectedPromptClass {
         matches!(self, InjectedPromptClass::HumanTuiDirect)
     }
 
-    /// Only continuation banners suppress the active-turn lifecycle. Slash
-    /// control echoes are not human turns, but keep the full synthetic lifecycle.
+    /// #3099 codex re-review (P1): whether this class must SKIP the user-turn
+    /// lifecycle — the `⏳` reaction, the prompt anchor, and the synthetic
+    /// user-turn/inflight ownership. Only [`SystemContinuation`] (a system
+    /// continuation banner) does; it is not a human request and earns no active
+    /// turn. Routing it through the `is_system_continuation` branch makes it skip
+    /// the active-turn `else` block (anchor post + `⏳` + record_prompt_anchor +
+    /// synthetic-turn claim).
+    ///
+    /// #3178 (codex fix): [`SlashCommandControl`] (#3153, a machine slash-command
+    /// control echo: /loop, /compact, the expanded `<command-*>` wrapper) is NO
+    /// LONGER suppressed. A machine slash turn is a FULL active turn so a message
+    /// injected mid-/loop registers the mailbox active turn and queues cleanly
+    /// (📬) instead of colliding with the busy pane; it gets the kind-only anchor +
+    /// `⏳` + synthetic inflight + `✅` lifecycle. The #3153 near-simultaneous
+    /// duplicate half is collapsed by the 2s dedupe gate at the top of
+    /// `relay_observed_prompt`, BEFORE any lease is recorded.
     pub(super) fn suppresses_user_turn_lifecycle(self) -> bool {
         matches!(self, InjectedPromptClass::SystemContinuation)
     }
 
-    /// Every injected class still delivers provider output via the bridge tail.
+    /// #3099 codex re-review (P1): whether the provider turn's assistant OUTPUT
+    /// must still be delivered (via the Claude bridge tail / transcript path)
+    /// for this class. This is true for EVERY class — a `SystemContinuation`
+    /// suppresses the user-turn lifecycle but the compact continuation is still
+    /// fed to Claude, which produces assistant output that MUST reach Discord.
+    /// The original early-return regressed this by orphaning that output.
     pub(super) fn still_delivers_assistant_output(self) -> bool {
         true
     }
 }
 
-/// Pure classifier for injected TUI prompt text. Order is load-bearing:
-/// continuation banners win before task notifications and slash-control echoes.
+/// Pure classifier for injected TUI prompt text (#3099, #3100).
+///
+/// Order matters: a compact-continuation prologue can itself embed an
+/// arbitrary summary, so the system-continuation predicate is checked first
+/// (it is the most specific "not a human turn" signal), then the
+/// task-notification tag, then (#3153) the machine slash-command control echo
+/// (`/loop` / `/compact` / the `<command-*>` wrapper / `Compacted` stdout),
+/// otherwise it is treated as human direct input.
+///
+/// The slash-command-control check is placed AFTER the continuation check so the
+/// compact CONTINUATION banner (which opens with "This session is being
+/// continued…" / "Please continue…", never with "/compact" or
+/// "<local-command-stdout>") is still caught as [`SystemContinuation`] and left
+/// untouched — the `/compact` COMMAND echo and the `Compacted` stdout are
+/// textually disjoint from that banner opening, so there is no overlap.
 pub(super) fn classify_injected_prompt(prompt: &str) -> InjectedPromptClass {
     if is_system_continuation_prompt(prompt) {
         InjectedPromptClass::SystemContinuation
@@ -5037,15 +5087,33 @@ pub(super) fn classify_injected_prompt(prompt: &str) -> InjectedPromptClass {
     }
 }
 
-/// Detects machine slash-control echoes, start-anchored after terminal controls,
-/// SSH-direct wrapper, and one complete leading local-command caveat.
+/// #3153: detects a MACHINE slash-command control echo that must skip the
+/// active-turn lifecycle (no `⏳`, no anchor, no synthetic turn). #3178: it is
+/// rendered as a SINGLE neutral kind-only note (deduped across the double-post),
+/// not fully suppressed.
+///
+/// Covers both halves of the #3153 `/loop` ScheduleWakeup double-post plus the
+/// `/compact` echo leak, all START-ANCHORED (mirroring
+/// [`is_system_continuation_prompt`]'s normalization pipeline) so a human merely
+/// quoting a "/loop" / "/compact" / `<command-*>` string mid-message is NEVER
+/// misclassified:
+///   * the raw `/loop …` echo a `ScheduleWakeup` writes into the terminal,
+///   * the Claude Code expanded `<command-message>…</command-message>` wrapper
+///     for that slash command,
+///   * the raw `/compact` echo (whole slash-token, so `/compactX` does not trip),
+///   * the `<local-command-stdout>Compacted …` stdout line.
+///
+/// Normalization peels a leading terminal-control prefix and a leading SSH-direct
+/// injection envelope (reusing [`strip_leading_injection_wrapper`]) so a
+/// round-tripped echo is still anchored, exactly as the continuation classifier
+/// relies on. Because each form is an independent OR-branch, both halves of the
+/// double-post are classified independently — neither relies on dedupe.
 fn is_slash_command_control_prompt(prompt: &str) -> bool {
-    let (normalized, peeled_caveat) = normalize_slash_command_control_prompt(prompt);
-    if peeled_caveat && normalized.is_empty() {
-        return true;
-    }
+    let normalized = strip_terminal_controls(prompt);
+    let normalized = normalized.trim_start();
+    let normalized = strip_leading_injection_wrapper(normalized);
+    let normalized = normalized.trim_start();
     if normalized.starts_with("<command-message>")
-        || normalized.starts_with("<command-name>")
         || normalized.starts_with("<local-command-stdout>Compacted")
         || normalized.starts_with("/loop ")
     {
@@ -5060,60 +5128,8 @@ fn is_slash_command_control_prompt(prompt: &str) -> bool {
     false
 }
 
-fn normalize_slash_command_control_prompt(prompt: &str) -> (String, bool) {
-    let normalized = strip_terminal_controls(prompt);
-    let normalized = normalized.trim_start();
-    let normalized = strip_leading_injection_wrapper(normalized);
-    let normalized = normalized.trim_start();
-    let (normalized, peeled_caveat) = strip_leading_local_command_caveat(normalized);
-    (normalized.trim_start().to_string(), peeled_caveat)
-}
-
-fn strip_leading_local_command_caveat(text: &str) -> (&str, bool) {
-    const OPEN: &str = "<local-command-caveat>";
-    const CLOSE: &str = "</local-command-caveat>";
-    if !text.starts_with(OPEN) {
-        return (text, false);
-    }
-    let Some(end) = text.find(CLOSE) else {
-        return (text, false);
-    };
-    (&text[end + CLOSE.len()..], true)
-}
-
-/// #3393: bridge an observed `<task-notification>` XML user-record into the live
-/// footer panel's terminal StatusEvents for `channel_id`. Background-task and
-/// subagent completions reach the transcript ONLY as this XML; the panel's own
-/// `system_status_events` parses a stream-json `system` record that never
-/// occurs, so without this bridge footer Tasks/Subagents never flip ✓ from real
-/// traffic and the #3391 delivered-ack eviction never triggers. The bridge is
-/// footer-mode gated INSIDE `status_events_from_task_notification_xml` (empty vec
-/// in legacy mode), and a terminal End for an unknown/id-less tool-use-id is a
-/// slot no-op, so a double notification cannot flip a slot back.
-fn bridge_task_notification_to_live_panel(shared: &SharedData, channel_id: ChannelId, raw: &str) {
-    let events = super::placeholder_live_events::status_events_from_task_notification_xml(raw);
-    if events.is_empty() {
-        return;
-    }
-    let parsed = super::tui_task_card::parse_task_notification(raw);
-    tracing::info!(
-        channel_id = channel_id.get(),
-        kind = parsed.kind(),
-        tool_use_id = parsed.tool_use_id.as_deref().unwrap_or(""),
-        status = parsed.status.as_deref().unwrap_or(""),
-        "#3393: bridged user-record <task-notification> XML to live panel terminal StatusEvents"
-    );
-    shared
-        .ui
-        .placeholder_live_events
-        .push_status_events(channel_id, events);
-}
-
 /// Detects the `<task-notification>` auto-turn tag injected by Claude Code /
-/// Codex when a background task reaches a terminal state. Deliberately
-/// CONTAINS-based: the CARD render must fire even for a human prompt that quotes
-/// a notification (it is still classified + rendered, never lost). The terminal
-/// BRIDGE uses the stricter `is_start_anchored_task_notification` instead.
+/// Codex when a background task reaches a terminal state.
 fn is_task_notification_prompt(prompt: &str) -> bool {
     let trimmed = prompt.trim_start();
     // Skip a leading terminal-control prefix some injectors prepend before the
@@ -5123,28 +5139,46 @@ fn is_task_notification_prompt(prompt: &str) -> bool {
     normalized.contains("<task-notification>") || normalized.contains("<task-notification ")
 }
 
-/// #3393 finding 2: START-ANCHORED gate for the live-panel terminal BRIDGE only.
-/// A REAL machine `<task-notification>` user-record begins with the tag after the
-/// shared normalization pipeline (strip_terminal_controls → trim →
-/// strip_leading_injection_wrapper → trim, mirroring #3100/#3388). A human direct
-/// prompt that merely QUOTES a notification mid-message keeps its CARD render (the
-/// contains-based classifier) but must NOT push terminal StatusEvents — combined
-/// with finding 1's id requirement this closes the false-close attack where a
-/// quoted live tool-use-id would otherwise finalize a real running slot.
-fn is_start_anchored_task_notification(prompt: &str) -> bool {
-    let normalized = strip_terminal_controls(prompt);
-    let normalized = normalized.trim_start();
-    let normalized = strip_leading_injection_wrapper(normalized);
-    let normalized = normalized.trim_start();
-    normalized.starts_with("<task-notification>") || normalized.starts_with("<task-notification ")
-}
-
-/// Detects start-anchored compact/session-continuation banners.
+/// Detects compact / system-injected continuation prologues that resume a
+/// session from a previous conversation. These are system events, never human
+/// requests, so they must not occupy the user-turn lifecycle (#3100).
+///
+/// #3100 codex re-review (P2): the compact continuation banner is *machine
+/// injected* — Claude Code emits it as the ENTIRE prompt body when a session
+/// resumes after a context compaction, and it always BEGINS with the canonical
+/// opening sentence. The previous implementation used unanchored case-sensitive
+/// `contains()` on three free-text fragments, which:
+///   * false-positives on a human message that merely *quotes* the banner mid
+///     sentence (the human then silently loses its `⏳`/turn), and
+///   * false-negatives on a banner with slightly different trailing summary text
+///     or newline layout.
+/// We instead anchor on provenance: a real continuation banner is the whole
+/// injected text and STARTS with the canonical opening. A human quoting the
+/// banner inside a normal request will not have it at the very start, so it can
+/// never trip the classifier. The opening sentence is the stable machine
+/// envelope; everything after it (the summary body) is free-form and is NOT
+/// matched, so trailing/newline variation cannot cause a false negative.
 fn is_system_continuation_prompt(prompt: &str) -> bool {
     let normalized = strip_terminal_controls(prompt);
     let normalized = normalized.trim_start();
+    // #3100 codex P2: a real continuation banner can arrive WRAPPED with the
+    // SSH-direct injection envelope (`format_ssh_direct_prompt_notification`),
+    // e.g. when a previously-rendered notification round-trips back into the
+    // terminal and is re-observed. The observed text then begins with
+    // `터미널에 직접 주입된 입력 (tmux : <session>):` followed by a newline (and a
+    // ```text fence) before the actual continuation body. `strip_terminal_controls`
+    // does NOT remove that wrapper, so the canonical `starts_with` below would
+    // fail and the banner would be mis-classified as `HumanTuiDirect` (gaining a
+    // spurious ⏳/anchor/synthetic turn). Strip a LEADING wrapper line — and the
+    // immediately following ```text fence line, if present — so the check runs
+    // against the real banner body. This is anchored to the start: a human merely
+    // quoting the wrapper mid-message keeps its wrapper text deeper in the body
+    // and is not affected.
     let normalized = strip_leading_injection_wrapper(normalized);
     let normalized = normalized.trim_start();
+    // Canonical opening sentences of the system-injected continuation banner.
+    // These are anchored to start-of-prompt (the injection envelope), never
+    // matched as an embedded substring.
     const SYSTEM_CONTINUATION_OPENINGS: &[&str] = &[
         "This session is being continued from a previous conversation",
         "Please continue the conversation from where we left it off",
@@ -5154,17 +5188,33 @@ fn is_system_continuation_prompt(prompt: &str) -> bool {
         .any(|opening| normalized.starts_with(opening))
 }
 
-/// Removes a leading SSH-direct wrapper line/fence; mid-body quotes are untouched.
+/// #3100 codex P2: removes a LEADING SSH-direct injection wrapper line so the
+/// continuation classifier can inspect the real banner body.
+///
+/// The wrapper is produced by [`format_ssh_direct_prompt_notification`] and
+/// looks like `터미널에 직접 주입된 입력 (tmux : `<session>`):\n```text\n<body>...`.
+/// Only a wrapper at the very START of `text` is stripped (anchored), so a human
+/// message that merely quotes the marker mid-body is never unwrapped. When the
+/// first line is the wrapper, that line (up to and including its newline) is
+/// dropped; if the next line opens a ```text / ``` code fence it is dropped too,
+/// exposing the banner body that follows. Returns the original slice unchanged
+/// when there is no leading wrapper.
 fn strip_leading_injection_wrapper(text: &str) -> &str {
     const WRAPPER_MARKER: &str = "터미널에 직접 주입된 입력";
     if !text.starts_with(WRAPPER_MARKER) {
         return text;
     }
+    // Drop the wrapper line (through its newline). Without a newline the wrapper
+    // is the whole text and there is no banner body to expose.
     let Some(after_wrapper_line) = text.find('\n').map(|idx| &text[idx + 1..]) else {
         return text;
     };
+    // The wrapper renders the body inside a ```text fence; skip a leading fence
+    // line so the canonical opening (the fence's first content line) is exposed.
     let trimmed = after_wrapper_line.trim_start_matches(['\r', '\n']);
     if let Some(rest) = trimmed.strip_prefix("```") {
+        // Drop the rest of the fence-opening line (e.g. ```text) through its
+        // newline; if the fence opener has no newline there is no body to check.
         if let Some(idx) = rest.find('\n') {
             return &rest[idx + 1..];
         }
@@ -5188,14 +5238,46 @@ pub(super) fn format_ssh_direct_prompt_notification(
     )
 }
 
-/// Canonical command kind for slash-control dedupe and kind-only notes.
+/// Neutral session note for a system/compact continuation injection (#3100).
+///
+/// Unlike [`format_ssh_direct_prompt_notification`], this does NOT present the
+/// text as "터미널에 직접 주입된 입력" (an active-turn marker); it is a passive
+/// session event so a reader does not mistake it for a pending human request.
+/// #3178: canonical command kind of a machine slash-command control echo, used
+/// BOTH as the dedupe key suffix and to render the neutral note WITHOUT exposing
+/// the raw prompt body. The raw `/loop …` echo and the expanded
+/// `<command-message>…<command-name>/loop</command-name>…` wrapper for the SAME
+/// command both map to `"/loop"`, so the two halves of the #3153 double-post
+/// collapse to one dedupe entry and the trigger is shown exactly once.
+///
+/// Mirrors [`is_slash_command_control_prompt`]'s normalization pipeline (peel a
+/// terminal-control prefix and the SSH-direct injection envelope) so a
+/// round-tripped echo still resolves to the same kind. The bare slash token
+/// (e.g. `/loop`, `/compact`, or any other command NAME) is returned — never any
+/// argument body — so the note shows only WHICH machine command ran, not its
+/// payload.
+///
+/// #3178 (codex fix): the kind is the REAL command name, not a single collapsed
+/// `"slash"`. An unknown `<command-message>` wrapper resolves to its actual
+/// `<command-name>` (e.g. `/foo`), so two DIFFERENT commands seen in the same
+/// session within the dedupe window are NOT collapsed into one turn. The note
+/// body still shows the command name only (no args), preserving kind-only
+/// disclosure.
 fn slash_command_control_kind(prompt: &str) -> String {
-    let (normalized, _peeled_caveat) = normalize_slash_command_control_prompt(prompt);
+    let normalized = strip_terminal_controls(prompt);
+    let normalized = normalized.trim_start();
+    let normalized = strip_leading_injection_wrapper(normalized);
+    let normalized = normalized.trim_start();
+    // The expanded Claude Code wrapper carries the canonical command in
+    // `<command-name>/loop</command-name>`; prefer that when present so the raw
+    // echo and the wrapper for the same command share a kind.
     if let Some(after) = normalized
         .find("<command-name>")
         .map(|idx| &normalized[idx + "<command-name>".len()..])
     {
         let name = after.split('<').next().unwrap_or("").trim();
+        // The command NAME is the first whitespace-delimited token (drop any
+        // argument body so only the kind, never the payload, is disclosed).
         let name = name.split_whitespace().next().unwrap_or("");
         if !name.is_empty() {
             return name.to_string();
@@ -5212,6 +5294,10 @@ fn slash_command_control_kind(prompt: &str) -> String {
     if normalized.starts_with("<local-command-stdout>Compacted") {
         return "/compact".to_string();
     }
+    // A raw slash-command echo whose command token we can read directly: return
+    // the first whitespace-delimited token (the command name) so distinct
+    // commands are distinguished. Fall back to a generic marker only when no
+    // token is recoverable.
     if normalized.starts_with('/') {
         let name = normalized.split_whitespace().next().unwrap_or("");
         if name.len() > 1 {
@@ -5221,7 +5307,16 @@ fn slash_command_control_kind(prompt: &str) -> String {
     "slash".to_string()
 }
 
-/// Kind-only slash-control note; `/loop` may include its directive body.
+/// #3178: neutral note for a machine slash-command control echo (#3153 trigger).
+///
+/// `/loop` is special: the recurring directive body IS the human-authored content
+/// the operator wants to see (only the #3153 double-post is deduped, NOT the
+/// content), so its note carries a preview of the loop body via
+/// [`extract_loop_body`]. Every OTHER machine command (`/compact`, the expanded
+/// `<command-*>` wrapper of a non-loop command, the `Compacted …` stdout) keeps a
+/// kind-only note — its payload is machine noise, not an operator directive — so
+/// the following `✅ 응답 완료` card still has a visible anchor without leaking it.
+/// It is a passive session event, not an active human turn.
 fn format_slash_command_control_note(
     tmux_session_name: &str,
     kind: &str,
@@ -5249,27 +5344,23 @@ fn format_slash_command_control_note(
     header
 }
 
-/// Local-completing slash-control prompts skip synthetic turn ownership.
-fn is_local_only_slash_command_prompt(prompt: &str) -> bool {
-    if !is_slash_command_control_prompt(prompt) {
-        return false;
-    }
-    let kind = slash_command_control_kind(prompt);
-    super::commands::is_local_only_slash_command_kind(&kind)
-        || slash_command_control_prompt_is_caveat_only(prompt)
-}
-
-fn slash_command_control_prompt_is_caveat_only(prompt: &str) -> bool {
-    let (normalized, peeled_caveat) = normalize_slash_command_control_prompt(prompt);
-    peeled_caveat && normalized.is_empty()
-}
-
-/// Pull the human-facing `/loop` directive body from raw echo or command args.
+/// Pull the human-facing `/loop` directive body from either injection half — the
+/// raw echo (`/loop <body>`) or the expanded Claude Code wrapper
+/// (`<command-args>…</command-args>`). Returns `None` when no body is recoverable
+/// so [`format_slash_command_control_note`] falls back to the kind-only header.
+/// Only the loop ARGS are returned — never the trailing skill markdown the
+/// wrapper appends after `</command-args>`.
 fn extract_loop_body(prompt: &str) -> Option<String> {
     let normalized = strip_terminal_controls(prompt);
     let normalized = normalized.trim_start();
     let normalized = strip_leading_injection_wrapper(normalized);
     let normalized = normalized.trim_start();
+    // Expanded wrapper: the directive lives in <command-args>…</command-args>;
+    // take only that block so the appended skill body never reaches the note.
+    // The CLOSING tag is REQUIRED: an unterminated `<command-args>` (no
+    // `</command-args>`) must NOT spill the trailing skill markdown into the note,
+    // so fall through to the raw-echo / kind-only path instead of returning the
+    // whole tail.
     if let Some(start) = normalized.find("<command-args>") {
         let after = &normalized[start + "<command-args>".len()..];
         if let Some((body, _rest)) = after.split_once("</command-args>") {
@@ -5279,6 +5370,7 @@ fn extract_loop_body(prompt: &str) -> Option<String> {
             }
         }
     }
+    // Raw echo: `/loop <body>`.
     for prefix in ["/loop ", "/loop\t"] {
         if let Some(rest) = normalized.strip_prefix(prefix) {
             let body = rest.trim();
@@ -5290,7 +5382,22 @@ fn extract_loop_body(prompt: &str) -> Option<String> {
     None
 }
 
-/// Dedupe the two slash-control halves before lease/anchor/synthetic ownership.
+/// #3178 (codex fix): the slash-command-control DEDUPE gate, evaluated BEFORE any
+/// external-input lease / anchor / synthetic inflight is created.
+///
+/// Returns `true` if THIS observation is the FIRST sighting of
+/// (tmux_session, command_kind) — meaning it should proceed to claim a full
+/// active turn (lease + ⏳ anchor + synthetic inflight). Returns `false` if a
+/// matching sighting was seen within [`SLASH_COMMAND_CONTROL_DEDUPE_WINDOW`] —
+/// i.e. this is the SECOND half of the #3153 double-post (raw echo + expanded
+/// `<command-*>` wrapper of the SAME injection) — so the caller must early-return
+/// WITHOUT recording a lease (the critical fix: a duplicate half can never
+/// overwrite the first turn's lease, because it never reaches the lease record).
+///
+/// On `true` the timestamp is recorded so the matching second half collapses;
+/// a genuine SECOND command seconds later falls outside the 2s window and is a
+/// fresh first sighting (its own active turn). Stale entries (older than the
+/// window) are pruned opportunistically so the map cannot grow unbounded.
 fn slash_command_control_turn_is_first_sighting(tmux_session_name: &str, kind: &str) -> bool {
     let now = std::time::Instant::now();
     let key = format!("{tmux_session_name}\u{0}{kind}");
@@ -5309,71 +5416,15 @@ fn slash_command_control_turn_is_first_sighting(tmux_session_name: &str, kind: &
     true
 }
 
-fn record_system_continuation_note_rendered(tmux_session_name: &str) {
-    let now = std::time::Instant::now();
-    let mut guard = SYSTEM_CONTINUATION_LAST_RENDERED
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    guard.retain(|_, rendered_at| {
-        now.checked_duration_since(*rendered_at)
-            .is_none_or(|age| age < COMPACT_REPLAY_KIND_NOTE_SUPPRESSION_WINDOW)
-    });
-    guard.insert(tmux_session_name.to_string(), now);
-}
-
-fn local_only_kind_note_suppressed_by_recent_continuation(
-    tmux_session_name: &str,
-    kind: &str,
-) -> bool {
-    let now = std::time::Instant::now();
-    let mut guard = SYSTEM_CONTINUATION_LAST_RENDERED
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    guard.retain(|_, rendered_at| {
-        now.checked_duration_since(*rendered_at)
-            .is_none_or(|age| age < COMPACT_REPLAY_KIND_NOTE_SUPPRESSION_WINDOW)
-    });
-    should_suppress_local_only_kind_note_after_continuation(
-        kind,
-        guard.get(tmux_session_name).copied(),
-        now,
-    )
-}
-
-fn should_suppress_local_only_kind_note_after_continuation(
-    kind: &str,
-    last_continuation_at: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> bool {
-    if !matches!(kind, "/compact" | "slash") {
-        return false;
-    }
-    last_continuation_at.is_some_and(|rendered_at| {
-        now.checked_duration_since(rendered_at)
-            .is_none_or(|age| age < COMPACT_REPLAY_KIND_NOTE_SUPPRESSION_WINDOW)
-    })
-}
-
 pub(super) fn format_system_continuation_note(tmux_session_name: &str, prompt: &str) -> String {
     let prompt = strip_terminal_controls(prompt);
-    let omitted_chars = format_count_with_commas(prompt.trim().chars().count());
+    let preview =
+        truncate_chars(prompt.trim(), SSH_DIRECT_PROMPT_PREVIEW_LIMIT).replace("```", "` ` `");
     format!(
-        "🧩 세션 컨텍스트 이어가기 (tmux : `{}`) — 시스템 주입 (활성 턴 아님) (요약 {}자 생략 — 채널 기록과 동일 내용)",
+        "🧩 세션 컨텍스트 이어가기 (tmux : `{}`) — 시스템 주입 (활성 턴 아님):\n```text\n{}\n```",
         sanitize_inline_code(tmux_session_name),
-        omitted_chars,
+        preview,
     )
-}
-
-fn format_count_with_commas(count: usize) -> String {
-    let digits = count.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (idx, ch) in digits.chars().enumerate() {
-        if idx > 0 && (digits.len() - idx) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 fn sanitize_inline_code(value: &str) -> String {
@@ -5388,10 +5439,6 @@ use super::tui_task_card::{strip_terminal_controls, truncate_chars_ascii as trun
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn compact_command_name_first_stub() -> &'static str {
-        "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"
-    }
 
     // ====================================================================
     // #3154 P2-2 (c) — the KEY residual risk: prove there is NO relay GAP
@@ -5595,127 +5642,6 @@ mod tests {
         ));
     }
 
-    /// #3296 (RED-3): the ABORT cleanup hook records a durable aborted-anchor
-    /// marker and NO LONGER applies any reaction itself — the old #3282 path
-    /// swapped `⏳ → ⚠` here, branding answered messages as failures. RED on
-    /// the pre-#3296 code: no marker module/store exists and a `⚠` is added.
-    /// codex r2 reverses the r1 tail: with the foreign row gone at the record
-    /// instant the marker must pin the worker's LAST-VIEW identity and stay
-    /// UNCOVERED unless a commit tombstone proves the deletion was a commit —
-    /// RED on the r1 code (row-absence alone pre-covered the marker, false-✅
-    /// ing force-cleared unanswered anchors).
-    /// (Reaction-op accounting lives in `tui_direct_abort_marker`'s own tests;
-    /// this hook performs Discord IO only through that module, never directly.)
-    #[test]
-    fn abort_cleanup_records_marker_and_keeps_hourglass() {
-        // Durable BASE-root injection via the marker module's THREAD-LOCAL
-        // test seam (never the process-global `AGENTDESK_ROOT_DIR` env —
-        // mutating it races env-reading tests that hold no lock, e.g. the
-        // pending-start worker tests' `persist()`). The current-thread
-        // `block_on` below keeps the cleanup future on this thread so the
-        // override resolves inside it.
-        struct RootReset;
-        impl Drop for RootReset {
-            fn drop(&mut self) {
-                super::super::tui_direct_abort_marker::set_test_root_override(None);
-            }
-        }
-        let _root_reset = RootReset;
-        let temp = tempfile::tempdir().unwrap();
-        super::super::tui_direct_abort_marker::set_test_root_override(Some(
-            temp.path().to_path_buf(),
-        ));
-
-        let shared = super::super::make_shared_data_for_tests();
-        let record = super::super::tui_direct_pending_start::TuiDirectPendingStart {
-            provider: "claude".to_string(),
-            channel_id: 4242,
-            tmux_session_name: "tmux-4242".to_string(),
-            prompt_text: "/loop tick".to_string(),
-            anchor_message_id: 777_001,
-            lease_relay_owner: "bridge_adapter".to_string(),
-            lease_runtime_kind: Some("claude_tui".to_string()),
-            lease_turn_id: None,
-            lease_session_key: None,
-            generation: 0,
-            created_at_ms: 0,
-            observed_at_ms: 0,
-            state: super::super::tui_direct_pending_start::PendingStartState::Waiting,
-            attempt_count: 0,
-        };
-        let cleanup = pending_start_abort_cleanup_fn();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        // No inflight row exists for this channel in the test env (the row
-        // vanished post-final-view); the worker's last-view identity is what
-        // the marker must pin (codex r2).
-        let last_view = Some((888_777_u64, "2026-06-10 12:00:00".to_string()));
-        rt.block_on(cleanup(&shared, &record, last_view.clone()));
-
-        let markers = super::super::tui_direct_abort_marker::load_for_channel("claude", 4242);
-        assert_eq!(
-            markers.len(),
-            1,
-            "the ABORT hook must persist exactly one durable aborted-anchor \
-             marker — RED on the old ⚠-swap path (no marker store existed)"
-        );
-        assert_eq!(
-            markers[0].anchor_message_id, 777_001,
-            "identity-pinned (I4)"
-        );
-        assert_eq!(
-            markers[0].foreign_user_msg_id,
-            Some(888_777),
-            "row gone at the record instant ⇒ the LAST-VIEW identity is pinned \
-             (codex r2) — RED if None (the marker would be sweep-only)"
-        );
-        assert_eq!(
-            markers[0].covered_at_ms, None,
-            "no commit tombstone ⇒ UNCOVERED (codex r2 — RED on the r1 \
-             pre-covered promotion: bare row-absence is not commit evidence)"
-        );
-
-        // With a commit tombstone matching the last-view identity, the same
-        // row-gone abort records COVERED (evidence-backed — the deletion WAS
-        // the prior owner's terminal commit).
-        super::super::tui_direct_abort_marker::record_commit_tombstone_at(
-            55_000,
-            "claude",
-            "tmux-4242",
-            4242,
-            888_777,
-            "2026-06-10 12:00:00",
-        );
-        let record_b = super::super::tui_direct_pending_start::TuiDirectPendingStart {
-            anchor_message_id: 777_002,
-            ..record.clone()
-        };
-        rt.block_on(cleanup(&shared, &record_b, last_view));
-        let covered = super::super::tui_direct_abort_marker::load_for_channel("claude", 4242)
-            .into_iter()
-            .find(|m| m.anchor_message_id == 777_002)
-            .expect("second marker recorded");
-        assert_eq!(
-            covered.covered_at_ms,
-            Some(55_000),
-            "matching tombstone at record time ⇒ evidence-backed cover (r2)"
-        );
-
-        // Zero anchor id (I5): nothing recorded, nothing panics.
-        let zero = super::super::tui_direct_pending_start::TuiDirectPendingStart {
-            anchor_message_id: 0,
-            ..record
-        };
-        rt.block_on(cleanup(&shared, &zero, None));
-        assert_eq!(
-            super::super::tui_direct_abort_marker::load_for_channel("claude", 4242).len(),
-            2,
-            "a zero anchor id must never be recorded (I5)"
-        );
-    }
-
     // #3018: the tmux_watchers registry is the SINGLE authority for
     // tmux-session→channel resolution. When the registry has a mapping it wins
     // outright (the dedupe mirror is never consulted as a reverse authority).
@@ -5805,62 +5731,6 @@ mod tests {
         );
 
         // Cleanup shared global dedupe state for cross-test isolation.
-        crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(tmux);
-    }
-
-    // #3306: a drift-triggered self-heal (the new path for ROUTINE sessions that
-    // have NO settings binding) must promote a durable channel via the SAME
-    // authoritative `restore_owner_channel_for_tmux_session` registry path the
-    // #3105 rehydrate uses — proving the registry stays the single authority and
-    // the resolver routes again after the drift WARN drop. The decision-core
-    // tests (`idle_relay_drift`) prove WHICH durable source is chosen and the
-    // mis-delivery guards; this end-to-end test pins the registry promotion +
-    // resolver hand-off.
-    #[test]
-    fn drift_triggered_restore_makes_routine_session_route_again() {
-        let shared = super::super::make_shared_data_for_tests();
-        // A routine tmux name that matches no settings channel binding (the
-        // exact class that drifts permanently before #3306).
-        let tmux = "AgentDesk-claude-routine-token-daily-report---token-manager";
-        let owner = ChannelId::new(1_512_635_194_124_013_681);
-
-        // Drift precondition: mirror holds a mapping, registry misses ⇒ drop.
-        crate::services::tui_prompt_dedupe::register_tmux_channel(tmux, owner.get());
-        assert_eq!(
-            owner_channel_for_tmux_session(&shared, tmux),
-            None,
-            "registry miss + mirror hit must drop (drift), never route from mirror"
-        );
-
-        // The drift repair (durable source promotion) re-registers the owner via
-        // the authoritative restore path — exactly what `attempt_drift_repair`
-        // does on a passing `RepairDecision::Promote`.
-        let repaired = shared
-            .tmux_watchers
-            .restore_owner_channel_for_tmux_session(tmux, owner);
-        assert!(repaired, "first drift-triggered restore reports a change");
-        assert_eq!(
-            owner_channel_for_tmux_session(&shared, tmux),
-            Some(owner),
-            "after the drift-triggered authoritative restore the session routes again"
-        );
-
-        // Live truth wins: a real watcher claim for the session must own it
-        // authoritatively, so a subsequent restore no-ops (the restored entry
-        // can never shadow a live watcher).
-        shared.tmux_watchers.insert(
-            owner,
-            test_watcher_handle(tmux, Path::new("/tmp/nope.jsonl")),
-        );
-        assert!(
-            !shared
-                .tmux_watchers
-                .restore_owner_channel_for_tmux_session(tmux, owner),
-            "restore must no-op while a live watcher owns the session (live truth wins)"
-        );
-
-        // Cleanup shared global state for cross-test isolation.
-        shared.tmux_watchers.remove(&owner);
         crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(tmux);
     }
 
@@ -6162,61 +6032,6 @@ mod tests {
         );
     }
 
-    // #3393 finding 2: the live-panel terminal BRIDGE is gated on a START-ANCHORED
-    // check, distinct from the contains-based CARD classifier. A human direct
-    // prompt that QUOTES a notification (embedding a LIVE tool-use-id) still earns
-    // its card but must NOT push terminal StatusEvents — so a quoted id cannot
-    // false-close a real running slot. A bare real-shape record (incl. a leading
-    // injection-wrapper round-trip) still bridges.
-    #[test]
-    fn bridge_guard_is_start_anchored_not_contains() {
-        // Human prompt quoting a notification mid-message, with a LIVE tool-use-id
-        // that matches a real running slot: NOT start-anchored → no bridge.
-        let quoted = "please re-run this, it printed:\n\
-            <task-notification><tool-use-id>toolu_live_slot</tool-use-id>\
-            <status>completed</status>\
-            <summary>Agent \"x\" completed</summary></task-notification>";
-        assert!(
-            !is_start_anchored_task_notification(quoted),
-            "a mid-message quoted notification must NOT pass the bridge guard"
-        );
-        // …yet the contains-based classifier still routes it to the CARD (the
-        // card behavior is preserved; only the terminal bridge is suppressed).
-        assert_eq!(
-            classify_injected_prompt(quoted),
-            InjectedPromptClass::TaskNotificationEvent,
-        );
-
-        // A bare, start-anchored real-shape record bridges.
-        let bare = "<task-notification><tool-use-id>toolu_live_slot</tool-use-id>\
-            <status>completed</status>\
-            <summary>Agent \"x\" completed</summary></task-notification>";
-        assert!(
-            is_start_anchored_task_notification(bare),
-            "a bare start-anchored notification must pass the bridge guard"
-        );
-
-        // Leading terminal-control prefix is tolerated (stripped by the pipeline).
-        let ansi_prefixed = "\u{1b}[0m<task-notification><status>completed</status>\
-            </task-notification>";
-        assert!(
-            is_start_anchored_task_notification(ansi_prefixed),
-            "an ANSI-prefixed notification must still pass the bridge guard"
-        );
-
-        // SSH-direct injection-wrapper round-trip variant: the wrapper line + code
-        // fence are peeled by `strip_leading_injection_wrapper`, leaving the tag
-        // start-anchored → still bridges (mirrors the #3153 wrapper coverage).
-        let wrapped = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n\
-            <task-notification><tool-use-id>toolu_live_slot</tool-use-id>\
-            <status>completed</status>\
-            <summary>Agent \"x\" completed</summary></task-notification>\n```";
-        assert!(
-            is_start_anchored_task_notification(wrapped),
-            "an injection-wrapper round-trip notification must pass the bridge guard"
-        );
-    }
-
     // #3100: a compact/system continuation prologue is NOT a human request and
     // must classify away from the active-turn lifecycle.
     #[test]
@@ -6276,14 +6091,6 @@ mod tests {
             classify_injected_prompt("<local-command-stdout>Compacted (12.3k tokens)"),
             InjectedPromptClass::SlashCommandControl,
         );
-        let command_name_first = compact_command_name_first_stub();
-        assert_eq!(command_name_first.chars().count(), 134);
-        assert_eq!(
-            classify_injected_prompt(command_name_first),
-            InjectedPromptClass::SlashCommandControl,
-        );
-        assert_eq!(slash_command_control_kind(command_name_first), "/compact");
-        assert!(is_local_only_slash_command_prompt(command_name_first));
 
         // #3178 (codex fix): a machine slash turn is a FULL active turn — NOT
         // suppressed from the user-turn lifecycle (so concurrent input queues),
@@ -6315,25 +6122,6 @@ mod tests {
             classify_injected_prompt(wrapped_wrapper),
             InjectedPromptClass::SlashCommandControl,
         );
-        let caveat_wrapped = format!(
-            "<local-command-caveat>local commands are synthetic</local-command-caveat>\n{}",
-            compact_command_name_first_stub(),
-        );
-        assert_eq!(
-            classify_injected_prompt(&caveat_wrapped),
-            InjectedPromptClass::SlashCommandControl,
-        );
-        assert_eq!(slash_command_control_kind(&caveat_wrapped), "/compact");
-        assert!(is_local_only_slash_command_prompt(&caveat_wrapped));
-
-        let caveat_only =
-            "<local-command-caveat>local commands are synthetic</local-command-caveat>";
-        assert_eq!(
-            classify_injected_prompt(caveat_only),
-            InjectedPromptClass::SlashCommandControl,
-        );
-        assert_eq!(slash_command_control_kind(caveat_only), "slash");
-        assert!(is_local_only_slash_command_prompt(caveat_only));
     }
 
     // #3153 FALSE-POSITIVE GUARD: a human merely quoting "/loop" / "/compact"
@@ -6363,119 +6151,6 @@ mod tests {
             classify_injected_prompt(wrapped_human),
             InjectedPromptClass::HumanTuiDirect,
         );
-        let quoted_command_name =
-            "Why did the transcript include <command-name>/compact</command-name>?";
-        assert_eq!(
-            classify_injected_prompt(quoted_command_name),
-            InjectedPromptClass::HumanTuiDirect,
-        );
-        let quoted_caveat =
-            "The log contains <local-command-caveat>x</local-command-caveat> before XML.";
-        assert_eq!(
-            classify_injected_prompt(quoted_caveat),
-            InjectedPromptClass::HumanTuiDirect,
-        );
-    }
-
-    // #3305: a local-completing pass-through command's `<command-*>` echo (or its
-    // raw `/compact` echo) must be detected as local-only so the idle relay skips
-    // the synthetic-turn lifecycle (no ⏳ anchor, no inflight) while still posting
-    // the kind-only guidance note. Covers all four pass-throughs across the
-    // wrapper, the SSH-direct envelope round-trip, the leading terminal-control
-    // prefix, the `/compact` raw echo, and the `Compacted` stdout.
-    #[test]
-    fn local_only_slash_prompt_detects_passthrough_command_xml() {
-        for name in ["/effort", "/compact", "/cost", "/context"] {
-            let wrapper = format!(
-                "<command-message>{name} is running…</command-message>\n\
-                 <command-name>{name}</command-name>\n<command-args></command-args>"
-            );
-            assert!(
-                is_local_only_slash_command_prompt(&wrapper),
-                "expanded wrapper for {name} must be local-only",
-            );
-            // SSH-direct envelope round-trip of the wrapper.
-            let wrapped =
-                format!("터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n{wrapper}\n```");
-            assert!(
-                is_local_only_slash_command_prompt(&wrapped),
-                "envelope-wrapped {name} wrapper must still be local-only",
-            );
-            // Leading terminal-control prefix before the wrapper.
-            let with_controls = format!("\u{1b}[2K\r{wrapper}");
-            assert!(
-                is_local_only_slash_command_prompt(&with_controls),
-                "terminal-control-prefixed {name} wrapper must still be local-only",
-            );
-        }
-        // `<command-name>` with an argument body — the first token (`/effort`) is
-        // the canonical kind, so it still matches the allow-list.
-        let effort_with_args =
-            "<command-message>x</command-message>\n<command-name>/effort high</command-name>";
-        assert!(is_local_only_slash_command_prompt(effort_with_args));
-        // Raw `/compact` echo (no wrapper) and the `Compacted` stdout line.
-        assert!(is_local_only_slash_command_prompt("/compact"));
-        assert!(is_local_only_slash_command_prompt(
-            "/compact focus on the relay"
-        ));
-        assert!(is_local_only_slash_command_prompt(
-            "<local-command-stdout>Compacted (12.3k tokens)"
-        ));
-    }
-
-    // #3305 (REQUIRED REGRESSION GUARD): `/loop` STARTS a real model turn, so it
-    // must remain a full active turn (#3178) — classified as SlashCommandControl
-    // yet NOT local-only. This double-assertion pins /loop on the anchor+⏳+
-    // synthetic-inflight path at the classification level so the local-only skip
-    // can never over-suppress it.
-    #[test]
-    fn local_only_slash_prompt_preserves_loop_wakeup_lifecycle() {
-        let raw = "/loop 5m /foo";
-        let wrapper = "<command-message>loop is running…</command-message>\n\
-                       <command-name>/loop</command-name>\n<command-args>5m /foo</command-args>";
-        for form in [raw, wrapper] {
-            assert_eq!(
-                classify_injected_prompt(form),
-                InjectedPromptClass::SlashCommandControl,
-                "/loop stays a SlashCommandControl active turn",
-            );
-            assert!(
-                !is_local_only_slash_command_prompt(form),
-                "/loop must NOT be local-only (it starts a model turn) — over-suppression guard",
-            );
-        }
-    }
-
-    // #3305: non-command text, the system-continuation banner, task notifications,
-    // a token-boundary near-miss, and an UNLISTED command must all be rejected so
-    // the local-only skip never fires for a real turn (fail-safe = lifecycle kept).
-    #[test]
-    fn local_only_slash_prompt_rejects_non_command_text() {
-        // A plain human prompt.
-        assert!(!is_local_only_slash_command_prompt(
-            "please summarize the relay design"
-        ));
-        // SystemContinuation banner wins (handled by its own neutral-note path).
-        assert!(!is_local_only_slash_command_prompt(
-            "This session is being continued from a previous conversation…"
-        ));
-        // Task-notification tag is not a slash control echo.
-        assert!(!is_local_only_slash_command_prompt(
-            "<task-notification>done</task-notification>"
-        ));
-        // Token-boundary near-miss: `/compactX` is not the whole `/compact` token.
-        assert!(!is_local_only_slash_command_prompt(
-            "/compactX do the thing"
-        ));
-        // An UNLISTED command's wrapper — `/model` is a SlashCommandControl but is
-        // NOT on the allow-list, so lifecycle is preserved (fail-safe default).
-        let model_wrapper =
-            "<command-message>x</command-message>\n<command-name>/model</command-name>";
-        assert!(matches!(
-            classify_injected_prompt(model_wrapper),
-            InjectedPromptClass::SlashCommandControl
-        ));
-        assert!(!is_local_only_slash_command_prompt(model_wrapper));
     }
 
     // #3178: the machine slash-command control trigger now resolves to a stable
@@ -6623,38 +6298,6 @@ mod tests {
         let other = format!("{sess}-other");
         assert!(slash_command_control_turn_is_first_sighting(
             &other, "/loop"
-        ));
-    }
-
-    #[test]
-    fn compact_replay_kind_note_suppression_is_session_scoped_and_expires() {
-        let now = std::time::Instant::now();
-        let recent = now - Duration::from_secs(29);
-        let expired = now - Duration::from_secs(31);
-
-        assert!(should_suppress_local_only_kind_note_after_continuation(
-            "/compact",
-            Some(recent),
-            now,
-        ));
-        assert!(should_suppress_local_only_kind_note_after_continuation(
-            "slash",
-            Some(recent),
-            now,
-        ));
-        assert!(
-            !should_suppress_local_only_kind_note_after_continuation("/compact", None, now),
-            "a different session with no continuation timestamp must not suppress",
-        );
-        assert!(!should_suppress_local_only_kind_note_after_continuation(
-            "/compact",
-            Some(expired),
-            now,
-        ));
-        assert!(!should_suppress_local_only_kind_note_after_continuation(
-            "/cost",
-            Some(recent),
-            now,
         ));
     }
 
@@ -6833,16 +6476,14 @@ mod tests {
     // as "터미널에 직접 주입된 입력" (an active-turn marker).
     #[test]
     fn system_continuation_note_is_neutral_not_active_turn() {
-        let prompt = "This session is being continued from a previous conversation. Summary: ...";
-        let note = format_system_continuation_note("AgentDesk-claude-adk-cc", prompt);
+        let note = format_system_continuation_note(
+            "AgentDesk-claude-adk-cc",
+            "This session is being continued from a previous conversation. Summary: ...",
+        );
         assert!(!note.contains("터미널에 직접 주입된 입력"));
         assert!(note.contains("세션 컨텍스트 이어가기"));
         assert!(note.contains("활성 턴 아님"));
         assert!(note.contains("(tmux : `AgentDesk-claude-adk-cc`)"));
-        assert!(!note.contains("```text"));
-        assert!(!note.contains("Summary:"));
-        assert!(note.contains(&format!("요약 {}자 생략", prompt.chars().count())));
-        assert!(note.contains("채널 기록과 동일 내용"));
     }
 
     // #3099 codex re-review (P2): the `user_msg_id == 0` completion cleanup must
@@ -7946,11 +7587,11 @@ mod tests {
         .await;
         assert!(started, "test precondition: synthetic mailbox turn starts");
 
-        shared.restart.global_active.store(3, Ordering::Relaxed);
+        shared.global_active.store(3, Ordering::Relaxed);
         finish_tui_direct_synthetic_pre_save_failure(&shared, &provider, channel_id).await;
 
         assert_eq!(
-            shared.restart.global_active.load(Ordering::Relaxed),
+            shared.global_active.load(Ordering::Relaxed),
             3,
             "pre-save cleanup must not decrement a counter it has not incremented"
         );

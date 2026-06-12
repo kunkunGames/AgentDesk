@@ -5,16 +5,15 @@ use super::common::{
     EVENT_LINE_MAX_CHARS, STATUS_PANEL_MAX_CHARS, STATUS_PANEL_SUBAGENT_LIMIT,
     STATUS_PANEL_TASK_LIMIT, STATUS_PANEL_TODO_LIMIT, STATUS_PANEL_WORKFLOW_LIMIT,
     escape_status_panel_markdown, normalize_summary, sanitized_tool_name, tool_prefix,
-    truncate_chars, truncate_chars_with_marker,
+    truncate_chars,
 };
 use super::context_panel::{ContextPanelSnapshot, render_context_panel_line};
 use super::session_panel::{SessionPanelSnapshot, render_session_panel_line};
 use super::status_events::{is_schedule_wakeup_tool, parse_eta_secs};
 use super::subagent_summary::render_subagent_done_summary;
 use super::task_panel::{
-    TaskPanelSnapshot, TaskToolSlot, finish_background_task_tool_slot, render_task_panel_line,
-    render_task_tool_slot, take_slot_ordinal, task_tool_slot_is_unfinished_background,
-    upsert_background_task_tool_slot, upsert_task_tool_slot,
+    TaskPanelSnapshot, TaskToolSlot, clean_task_tool_value, render_task_panel_line,
+    render_task_tool_slot,
 };
 use super::workflow_panel::{
     WorkflowAgentSlot, WorkflowSlot, render_workflow_slot, trim_workflow_slot, trim_workflows,
@@ -26,20 +25,21 @@ pub(super) struct SubagentSlot {
     subagent_type: String,
     pub(super) desc: String,
     recent: Option<String>,
-    pub(super) finished: Option<bool>,
-    /// #3084: Task tool-use id that opened this slot, so `SubagentEnd` closes the
-    /// exact slot among parallels instead of the first unfinished one.
+    finished: Option<bool>,
+    /// Task tool-use id that opened this slot. Lets `SubagentEnd` close the
+    /// exact slot it belongs to (#3084) instead of the first unfinished one,
+    /// which mis-attributes completion across parallel subagents.
     tool_use_id: Option<String>,
-    /// #3086: TUI-parity accounting from the finishing `SubagentEnd`; drives the
-    /// `Done (N tools · M tokens · Xs)` summary on the render line.
+    /// TUI-parity accounting (tool count / tokens / duration) populated from the
+    /// finishing `SubagentEnd` (#3086). Drives the `Done (N tools · M tokens ·
+    /// Xs)` summary on the slot's render line.
     summary: Option<SubagentSummary>,
-    /// `true` when launched with `run_in_background`. Its immediate Task result is
-    /// only a launch ack (slot keeps running), so an ack-only `SubagentEnd` must
-    /// NOT mark it ✓ — only a genuine completion finalizes it.
+    /// `true` when this subagent was launched with `run_in_background`. Such a
+    /// subagent's immediate Task `tool_result` is only a launch ack and the
+    /// subagent keeps running (often outliving the launching turn), so an
+    /// ack-only `SubagentEnd` must NOT mark it ✓ — only a genuine completion
+    /// (summary-bearing end or a terminal task_notification) finalizes it.
     background: bool,
-    /// #3391: monotonic, never-reused per-entry slot id (mirrors
-    /// `TaskToolSlot::ordinal`) backing slot-identity subagent eviction.
-    ordinal: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DerivedStatus {
@@ -93,45 +93,21 @@ pub(super) struct StatusPanelState {
     pub(super) tasks: Vec<TaskToolSlot>,
     pub(super) subagents: Vec<SubagentSlot>,
     pub(super) workflows: Vec<WorkflowSlot>,
-    // #3391: only-advancing counter minting never-reused task/subagent ordinals.
-    next_slot_ordinal: u64,
 }
 
 impl StatusPanelState {
-    /// #3087: on a true session boundary (provider session id delta), clears the
-    /// per-session content slots (subagents/tasks/todos/workflows) and resets the
-    /// status to `Running`, PRESERVING context/token usage + session snapshots and
-    /// the ordinal counter (never cleared).
+    /// Clears the content slots that accumulate within a single provider
+    /// session (subagents/tasks/todos/workflows) and resets the derived status
+    /// back to `Running`, while PRESERVING the context/token usage snapshot and
+    /// the session panel snapshot itself. Invoked on a true session boundary
+    /// (a provider session id delta) so a freshly started session does not
+    /// inherit the previous session's stale subagent/task list (#3087).
     pub(super) fn reset_session_content(&mut self) {
         self.status = DerivedStatus::Running;
         self.todos.clear();
         self.tasks.clear();
         self.subagents.clear();
         self.workflows.clear();
-    }
-
-    pub(super) fn reset_turn_content_preserving_unfinished_footer_residuals(&mut self) -> bool {
-        let tasks = self
-            .tasks
-            .iter()
-            .filter(|slot| task_tool_slot_is_unfinished_background(slot))
-            .cloned()
-            .collect::<Vec<_>>();
-        let subagents = self
-            .subagents
-            .iter()
-            .filter(|slot| slot.is_unfinished_background())
-            .cloned()
-            .collect::<Vec<_>>();
-        let has_residuals = !tasks.is_empty() || !subagents.is_empty();
-        *self = StatusPanelState {
-            tasks,
-            subagents,
-            // #3391: carry the counter so a residual ordinal is never reissued.
-            next_slot_ordinal: self.next_slot_ordinal,
-            ..StatusPanelState::default()
-        };
-        has_residuals
     }
 
     pub(super) fn apply(&mut self, event: StatusEvent) {
@@ -162,20 +138,6 @@ impl StatusPanelState {
                 let subagent_type = subagent_type
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| "Task".to_string());
-                if background
-                    && let Some(id) = tool_use_id.as_deref().filter(|id| !id.trim().is_empty())
-                    && let Some(slot) = self.subagents.iter_mut().rev().find(|slot| {
-                        slot.background
-                            && slot.finished.is_none()
-                            && slot.tool_use_id.as_deref() == Some(id)
-                    })
-                {
-                    slot.subagent_type = subagent_type;
-                    slot.desc = desc.clone();
-                    self.status = DerivedStatus::SubagentRunning { desc };
-                    return;
-                }
-                let ordinal = take_slot_ordinal(&mut self.next_slot_ordinal);
                 self.subagents.push(SubagentSlot {
                     subagent_type,
                     desc: desc.clone(),
@@ -184,7 +146,6 @@ impl StatusPanelState {
                     tool_use_id,
                     summary: None,
                     background,
-                    ordinal,
                 });
                 self.status = DerivedStatus::SubagentRunning { desc };
                 trim_subagents(&mut self.subagents);
@@ -212,26 +173,29 @@ impl StatusPanelState {
                 summary,
                 ack_only,
             } => {
-                // #3084: close the slot whose Task tool-use id matches the result
-                // (pairs a long-running subagent to its own result among
-                // parallels); fall back to first-unfinished only without an id.
+                // #3084: prefer closing the slot whose Task tool-use id matches
+                // the result. This pairs a long-running subagent to its own
+                // result even when shorter foreground tools resolved in
+                // between, and attributes completion to the correct slot among
+                // parallel subagents. Fall back to the first unfinished slot
+                // only when no id is available or no slot matches (e.g.
+                // backends that cannot surface a tool-use id).
                 let id = tool_use_id.as_deref();
                 let matched = id.and_then(|id| {
                     self.subagents.iter().rposition(|slot| {
                         slot.finished.is_none() && slot.tool_use_id.as_deref() == Some(id)
                     })
                 });
-                // #3086 P1 / #3359: a summary- OR id-bearing ack-only end is safe
-                // only on an exact id match (else mis-marks a running/background
-                // subagent); id-less legacy acks may close only id-less slots.
+                // #3086 P1: a summary-bearing end carries accounting for ONE
+                // specific subagent (identified by its `tool_use_id`). If that
+                // id does not match a tracked slot, the end MUST NOT fall back
+                // to the last-unfinished slot — doing so would mark an unrelated
+                // running subagent Done with the wrong summary. Drop the unmatched
+                // summary-bearing end entirely. A plain (no-summary) end keeps the
+                // legacy fallback so #3084 id-less backends still close a slot.
                 let has_summary = summary.as_ref().is_some_and(|s| !s.is_empty());
                 let target = match matched {
                     Some(index) => Some(index),
-                    None if id.is_some() => None,
-                    None if ack_only => self
-                        .subagents
-                        .iter()
-                        .rposition(|slot| slot.finished.is_none() && slot.tool_use_id.is_none()),
                     None if has_summary && id.is_some() => None,
                     None => self
                         .subagents
@@ -240,15 +204,20 @@ impl StatusPanelState {
                 };
                 let slot = target.map(|index| &mut self.subagents[index]);
                 if let Some(slot) = slot {
-                    // A background ack-only end is just a launch ack (the slot
-                    // keeps running), so skip finalizing it; a genuine completion
-                    // (`ack_only == false`) and any foreground end still close it.
+                    // A background subagent's ack-only end is just a launch ack
+                    // (it keeps running, often past the launching turn), so
+                    // finalizing here would render a premature ✓. Skip it for
+                    // background slots on ack-only ends; a genuine completion
+                    // (`ack_only == false`) still closes it. Foreground finalizes
+                    // on the ack as before.
                     let finalize = !(ack_only && slot.background);
                     if finalize {
                         slot.finished = Some(success);
                     }
-                    // #3086: attach the TUI-parity Done summary, only when the
-                    // event carries accounting (don't wipe a richer one).
+                    // #3086: attach the TUI-parity Done summary to the closing
+                    // slot. Only overwrite when the event actually carries
+                    // accounting, so an id-less terminal notification does not
+                    // wipe a richer summary already present on the slot.
                     if let Some(summary) = summary.filter(|summary| !summary.is_empty()) {
                         slot.summary = Some(summary);
                     }
@@ -261,33 +230,7 @@ impl StatusPanelState {
                 summary,
                 status,
             } => {
-                upsert_task_tool_slot(
-                    &mut self.tasks,
-                    &mut self.next_slot_ordinal,
-                    name,
-                    task_id,
-                    summary,
-                    status,
-                );
-            }
-            StatusEvent::BackgroundTaskStart {
-                name,
-                summary,
-                tool_use_id,
-            } => {
-                upsert_background_task_tool_slot(
-                    &mut self.tasks,
-                    &mut self.next_slot_ordinal,
-                    name,
-                    summary,
-                    tool_use_id,
-                );
-            }
-            StatusEvent::BackgroundTaskEnd {
-                tool_use_id,
-                success,
-            } => {
-                finish_background_task_tool_slot(&mut self.tasks, &tool_use_id, success);
+                self.upsert_task_tool(name, task_id, summary, status);
             }
             StatusEvent::TodoUpdate { items } => {
                 self.todos = items
@@ -396,9 +339,12 @@ impl StatusPanelState {
         }
     }
 
-    /// #3204/#3198: routes a running subagent's live step onto its slot's recent
-    /// line. Prefers the UNFINISHED id-matching slot; an id-bearing no-match is
-    /// dropped (never mis-routed/resurrected).
+    /// Routes a still-running subagent's live step (#3204) onto its slot's
+    /// recent line. Prefers the UNFINISHED slot whose Task id matches the
+    /// nested record's `parent_tool_use_id`; an id-bearing activity that matches
+    /// no slot is dropped (never mis-routed). Only unfinished slots are touched,
+    /// so a finished/background-finalized slot is never resurrected (#3198). The
+    /// panel header is left unchanged — the subagent is already on its own line.
     fn set_subagent_activity(&mut self, tool_use_id: Option<String>, summary: String) {
         let id = tool_use_id.as_deref();
         let target =
@@ -418,6 +364,42 @@ impl StatusPanelState {
                 slot.recent = Some(summary);
             }
         }
+    }
+
+    fn upsert_task_tool(
+        &mut self,
+        name: String,
+        task_id: Option<String>,
+        summary: Option<String>,
+        status: Option<String>,
+    ) {
+        let task_id = task_id.and_then(clean_task_tool_value);
+        let summary = summary.and_then(clean_task_tool_value);
+        let status = status.and_then(clean_task_tool_value);
+        if let Some(task_id_value) = task_id.as_deref()
+            && let Some(slot) = self
+                .tasks
+                .iter_mut()
+                .rev()
+                .find(|slot| slot.task_id.as_deref() == Some(task_id_value))
+        {
+            slot.name = name;
+            if summary.is_some() {
+                slot.summary = summary;
+            }
+            if status.is_some() {
+                slot.status = status;
+            }
+            return;
+        }
+
+        self.tasks.push(TaskToolSlot {
+            name,
+            task_id,
+            summary,
+            status,
+        });
+        trim_tasks(&mut self.tasks);
     }
 
     fn workflow_slot_mut(&mut self, task_id: Option<String>) -> &mut WorkflowSlot {
@@ -475,7 +457,7 @@ pub(super) fn render_status_panel(
     if let Some(context_line) = snapshot
         .context
         .as_ref()
-        .and_then(|context| render_context_panel_line(context, provider))
+        .and_then(render_context_panel_line)
     {
         sections.push(context_line);
     }
@@ -540,13 +522,22 @@ pub(super) fn render_status_panel(
         cluster_enabled,
         local_instance_id.as_deref(),
     );
-    // #3394: append the fence-balanced Recent block as a trailing section so the
-    // protected truncation path drops it whole on overflow (never chops its ```).
-    if !matches!(header_status, DerivedStatus::Completed { .. })
-        && let Some(block) = live_block.filter(|block| !block.trim().is_empty())
-    {
-        sections.push(format!("{recent_header}\n{block}"));
+    let recent_section = if matches!(header_status, DerivedStatus::Completed { .. }) {
+        None
+    } else {
+        live_block
+            .filter(|block| !block.trim().is_empty())
+            .map(|block| format!("{recent_header}\n{block}"))
+    };
+    if let Some(recent) = recent_section.as_ref() {
+        let mut with_recent = sections.clone();
+        with_recent.push(recent.clone());
+        let joined = join_status_panel_sections(&with_recent);
+        if joined.chars().count() <= STATUS_PANEL_MAX_CHARS {
+            return joined;
+        }
     }
+
     truncate_status_panel_sections(sections)
 }
 
@@ -554,24 +545,12 @@ fn join_status_panel_sections(sections: &[String]) -> String {
     sections.join("\n\n")
 }
 
-/// #3394: section-wise degradation. A blind char cut of the JOINED panel chops
-/// the trailing fenced section's closing ``` and Discord renders the dangling
-/// fence as literal text. So when the join overflows, DROP whole sections from
-/// the END (Recent first) — never cut inside one; only a lone surviving section
-/// that alone overflows is fence-safe-truncated. The shared `repair_fence_parity`
-/// backstop re-balances every return path.
-pub(super) fn truncate_status_panel_sections(mut sections: Vec<String>) -> String {
-    use crate::services::discord::single_message_panel::repair_fence_parity;
-    while sections.len() > 1
-        && join_status_panel_sections(&sections).chars().count() > STATUS_PANEL_MAX_CHARS
-    {
-        sections.pop();
-    }
+pub(super) fn truncate_status_panel_sections(sections: Vec<String>) -> String {
     let joined = join_status_panel_sections(&sections);
     if joined.chars().count() <= STATUS_PANEL_MAX_CHARS {
-        return repair_fence_parity(&joined);
+        return joined;
     }
-    repair_fence_parity(&truncate_chars(&joined, STATUS_PANEL_MAX_CHARS))
+    truncate_chars(&joined, STATUS_PANEL_MAX_CHARS)
 }
 
 pub(super) fn render_recent_section_header(
@@ -630,7 +609,12 @@ fn render_derived_status(status: &DerivedStatus) -> String {
     }
 }
 
-pub(super) fn render_subagent_slot(slot: &SubagentSlot) -> String {
+fn render_subagent_slot(slot: &SubagentSlot) -> String {
+    let marker = match slot.finished {
+        Some(true) => "✓",
+        Some(false) => "✗",
+        None => "",
+    };
     let mut line = format!(
         "└ {} {}",
         sanitize_label(&slot.subagent_type),
@@ -651,41 +635,17 @@ pub(super) fn render_subagent_slot(slot: &SubagentSlot) -> String {
         .as_ref()
         .filter(|_| matches!(slot.finished, Some(true)))
         .filter(|summary| !summary.is_empty())
-        && let Some(done) = render_subagent_done_summary(summary)
     {
-        line.push_str(" — ");
-        line.push_str(&done);
-    }
-    // #3391: reserve marker width then append so a finished line always ENDS WITH
-    // its ✓/✗ (a long desc/summary can no longer swallow it).
-    match slot.terminal_marker() {
-        Some(marker) => truncate_chars_with_marker(&line, marker, EVENT_LINE_MAX_CHARS),
-        None => truncate_chars(&line, EVENT_LINE_MAX_CHARS),
-    }
-}
-
-impl SubagentSlot {
-    fn is_unfinished_background(&self) -> bool {
-        self.background && self.finished.is_none()
-    }
-
-    pub(super) fn is_terminal(&self) -> bool {
-        self.finished.is_some() // #3391: terminal (✓/✗) once `finished` is set.
-    }
-
-    /// #3391: the ✓/✗ this slot renders (`None` while unfinished); single source for both render and the footer honesty gate.
-    pub(super) fn terminal_marker(&self) -> Option<&'static str> {
-        self.finished.map(|ok| if ok { "✓" } else { "✗" })
-    }
-
-    // #3391: eviction identity — launching `tool_use_id`, else `ordinal`.
-    pub(super) fn identity(&self) -> super::completion_footer::SlotKey {
-        use super::completion_footer::SlotKey;
-        match self.tool_use_id.as_deref() {
-            Some(id) => SlotKey::ToolUseId(id.to_string()),
-            None => SlotKey::Ordinal(self.ordinal),
+        if let Some(done) = render_subagent_done_summary(summary) {
+            line.push_str(" — ");
+            line.push_str(&done);
         }
     }
+    if !marker.is_empty() {
+        line.push(' ');
+        line.push_str(marker);
+    }
+    truncate_chars(&line, EVENT_LINE_MAX_CHARS)
 }
 
 fn sanitize_label(raw: &str) -> String {
@@ -695,6 +655,13 @@ fn sanitize_label(raw: &str) -> String {
 fn trim_subagents(slots: &mut Vec<SubagentSlot>) {
     if slots.len() > STATUS_PANEL_SUBAGENT_LIMIT {
         let excess = slots.len() - STATUS_PANEL_SUBAGENT_LIMIT;
+        slots.drain(0..excess);
+    }
+}
+
+fn trim_tasks(slots: &mut Vec<TaskToolSlot>) {
+    if slots.len() > STATUS_PANEL_TASK_LIMIT {
+        let excess = slots.len() - STATUS_PANEL_TASK_LIMIT;
         slots.drain(0..excess);
     }
 }

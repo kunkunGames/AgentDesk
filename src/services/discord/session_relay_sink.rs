@@ -748,7 +748,7 @@ impl SessionBoundDiscordRelaySink {
             ))
         })?;
 
-        let formatted = if shared.ui.status_panel_v2_enabled {
+        let formatted = if shared.status_panel_v2_enabled {
             formatting::format_for_discord_with_status_panel(&delivery.response_text, &provider)
         } else {
             formatting::format_for_discord_with_provider(&delivery.response_text, &provider)
@@ -785,7 +785,7 @@ impl SessionBoundDiscordRelaySink {
                 let sink_turn = super::turn_finalizer::TurnKey::new(
                     channel,
                     delivery.frame_turn_user_msg_id,
-                    shared.restart.current_generation,
+                    shared.current_generation,
                 );
                 let cell = shared.delivery_lease(channel);
                 SinkDeliveryLeaseGuard::acquire(&cell, sink_turn, start, end)

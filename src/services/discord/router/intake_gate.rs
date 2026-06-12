@@ -924,7 +924,6 @@ async fn reuse_merged_queued_placeholder(
     let existing =
         pick_reusable_merged_placeholder(&merged_head.source_message_ids, user_msg_id, |id| {
             data.shared
-                .queued
                 .queued_placeholders
                 .get(&(channel_id, id))
                 .map(|entry| *entry.value())
@@ -945,8 +944,8 @@ async fn reuse_merged_queued_placeholder(
     data.shared
         .insert_queued_placeholder_locked(channel_id, user_msg_id, placeholder_msg_id);
 
-    // Refresh the card body with merged request text; unchanged renders
-    // coalesce, changed ones edit.
+    // Refresh the card body with the merged request text. `ensure_queued` is
+    // idempotent: an unchanged render coalesces, a changed one edits.
     let gateway = super::super::gateway::DiscordGateway::new(
         ctx.http.clone(),
         data.shared.clone(),
@@ -970,15 +969,17 @@ async fn reuse_merged_queued_placeholder(
     };
     let outcome = data
         .shared
-        .ui
         .placeholder_controller
         .ensure_queued(&gateway, key, queued_input)
         .await;
 
-    // codex round-1 P2 (edit-failure rollback): only commit the re-key after
-    // `Edited`/`Coalesced`. On `EditFailed`/`Rejected`, restore the prior source
-    // id and let the caller fall back to fresh POST, with the persistence lock
-    // held so no drain observes the half-applied re-key.
+    // codex round-1 P2 (edit-failure rollback): only commit the re-key when the
+    // card actually renders (`Edited`/`Coalesced`). On `EditFailed`/`Rejected`
+    // the card on Discord may be gone or invalid, so restore the mapping to the
+    // prior source id and report failure — the caller then falls back to the
+    // fresh-card POST path, mirroring how `render_visible_queued_ack` treats a
+    // failed `ensure_queued`. The persistence lock is held across the rollback
+    // so no concurrent drain observes the half-applied re-key.
     if !matches!(
         outcome,
         super::super::placeholder_controller::PlaceholderControllerOutcome::Edited
@@ -1103,7 +1104,6 @@ async fn reuse_any_queued_placeholder_for_channel(
 
     let channel_cards: Vec<(serenity::MessageId, serenity::MessageId)> = data
         .shared
-        .queued
         .queued_placeholders
         .iter()
         .filter_map(|entry| {
@@ -1148,7 +1148,6 @@ async fn reuse_any_queued_placeholder_for_channel(
     };
     let outcome = data
         .shared
-        .ui
         .placeholder_controller
         .ensure_queued(&gateway, key, queued_input)
         .await;
@@ -1349,7 +1348,6 @@ async fn render_visible_queued_ack(
     };
     let outcome = data
         .shared
-        .ui
         .placeholder_controller
         .ensure_queued(&gateway, key, queued_input)
         .await;
@@ -2455,16 +2453,16 @@ pub(in crate::services::discord) async fn handle_event(
                     has_reply_boundary,
                     merge_consecutive,
                     upload_records.clone(),
-                    // #2266: main busy-active-turn queue path — voice transcripts that
-                    // arrive while a previous turn is running flow through here. Embed the
-                    // announcement so the queued dispatch reinserts it into the store even
-                    // if the >30s in-memory TTL expires first.
+                    // #2266: main busy-active-turn queue path — voice
+                    // transcripts that arrive while a previous turn is
+                    // running flow through here. Embed the announcement
+                    // so the queued dispatch reinserts it into the store
+                    // even if the >30s in-memory TTL expires first.
                     resolved_voice_announcement.clone(),
                 )
                 .await;
                 let is_shutting_down = data
                     .shared
-                    .restart
                     .shutting_down
                     .load(std::sync::atomic::Ordering::Relaxed);
 
@@ -2522,7 +2520,6 @@ pub(in crate::services::discord) async fn handle_event(
             // Reconcile gate (#122): until startup recovery is complete, queue messages.
             if !data
                 .shared
-                .restart
                 .reconcile_done
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
@@ -2548,8 +2545,9 @@ pub(in crate::services::discord) async fn handle_event(
                     has_reply_boundary,
                     merge_consecutive,
                     upload_records.clone(),
-                    // #2266: reconcile gate — startup-recovery queue path. Voice transcripts
-                    // that arrive before recovery completes need the embedded payload too.
+                    // #2266: reconcile gate — startup-recovery queue path.
+                    // Voice transcripts that arrive before recovery
+                    // completes need the embedded payload too.
                     resolved_voice_announcement.clone(),
                 )
                 .await;
@@ -2568,13 +2566,11 @@ pub(in crate::services::discord) async fn handle_event(
             // starting new turns. This ensures only existing turns drain to completion.
             if data
                 .shared
-                .restart
                 .restart_pending
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 let is_shutting_down = data
                     .shared
-                    .restart
                     .shutting_down
                     .load(std::sync::atomic::Ordering::Relaxed);
 
@@ -2600,8 +2596,9 @@ pub(in crate::services::discord) async fn handle_event(
                     has_reply_boundary,
                     merge_consecutive,
                     upload_records.clone(),
-                    // #2266: drain-mode queue path (restart pending) — pass the embedded voice
-                    // payload so the post-restart dispatch path can reinsert it into the store.
+                    // #2266: drain-mode queue path (restart pending) —
+                    // pass the embedded voice payload so the post-restart
+                    // dispatch path can reinsert it into the store.
                     resolved_voice_announcement.clone(),
                 )
                 .await;
@@ -2622,7 +2619,8 @@ pub(in crate::services::discord) async fn handle_event(
                 )
                 .await;
 
-                // Checkpoint: message successfully queued in drain mode (#2044 F12 — monotonic).
+                // Checkpoint: message successfully queued in drain mode
+                // (#2044 F12 — monotonic).
                 super::super::advance_last_message_checkpoint(
                     &data.shared,
                     &data.provider,

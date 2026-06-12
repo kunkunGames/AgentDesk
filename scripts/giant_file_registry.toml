@@ -83,20 +83,11 @@ grandfathered_baseline_paths = [
   "src/services/codex_tmux_wrapper.rs",
   "src/services/codex_tui/input.rs",
   "src/services/codex_tui/rollout_tail.rs",
-  # commands/config.rs dropped to 954 prod LoC in #3038 S2 (session-override
-  # bookkeeping helpers moved to discord/shared_state.rs); no longer a
-  # prod-giant, so it is removed from `grandfathered` and from the baseline
-  # guard here (win-locked: a re-expanded config.rs cannot be
-  # re-grandfathered — it would have to land as a full [[entry]] or shrink).
+  "src/services/discord/commands/config.rs",
   "src/services/discord/commands/diagnostics.rs",
   "src/services/discord/commands/text_commands.rs",
   "src/services/discord/formatting.rs",
-  # health.rs was decomposed in #3038 Phase A (2293 prod LoC -> 402-line module
-  # root + 6 sub-1000-LoC directory modules under health/); no longer a
-  # prod-giant. Removed from the frozen baseline as well as `grandfathered`
-  # below so a re-expansion can never be re-grandfathered — it would have to
-  # land as a full [[entry]] (owner + deadline + decompose_issue) or fail the
-  # generation gate.
+  "src/services/discord/health.rs",
   "src/services/discord/health/recovery.rs",
   "src/services/discord/inflight.rs",
   "src/services/discord/meeting_orchestrator.rs",
@@ -105,6 +96,7 @@ grandfathered_baseline_paths = [
   "src/services/discord/router/intake_gate.rs",
   "src/services/discord/router/message_handler/headless_turn.rs",
   "src/services/discord/router/message_handler/intake_turn.rs",
+  "src/services/discord/runtime_bootstrap.rs",
   "src/services/discord/session_runtime.rs",
   "src/services/discord/settings.rs",
   "src/services/discord/tmux.rs",
@@ -174,12 +166,7 @@ grandfathered = [
   "src/server/routes/kanban.rs",
   "src/server/routes/meetings.rs",
   "src/server/routes/resume.rs",
-  # decision_route.rs was decomposed in #3038 slice 1 and then S1-relocated in
-  # #3038 review-decision S1 (4392 prod LoC -> 26-line route shim +
-  # sub-1000-LoC modules under services/review_decision/); no longer a
-  # prod-giant, so it is removed from `grandfathered` (kept in the frozen
-  # baseline above) and the split outputs are ratcheted in
-  # scripts/audit_maintainability_giant_baseline.toml.
+  "src/server/routes/review_verdict/decision_route.rs",
   "src/server/routes/v1.rs",
   "src/services/auto_queue.rs",
   "src/services/auto_queue/activate_command.rs",
@@ -190,19 +177,11 @@ grandfathered = [
   "src/services/codex_tmux_wrapper.rs",
   "src/services/codex_tui/input.rs",
   "src/services/codex_tui/rollout_tail.rs",
-  # commands/config.rs dropped to 954 prod LoC in #3038 S2 (session-override
-  # bookkeeping helpers moved to discord/shared_state.rs); no longer a
-  # prod-giant, so it is removed from `grandfathered` and from the baseline
-  # guard here (win-locked: a re-expanded config.rs cannot be
-  # re-grandfathered — it would have to land as a full [[entry]] or shrink).
+  "src/services/discord/commands/config.rs",
   "src/services/discord/commands/diagnostics.rs",
   "src/services/discord/commands/text_commands.rs",
   "src/services/discord/formatting.rs",
-  # health.rs was decomposed in #3038 Phase A (2293 prod LoC -> 402-line
-  # module root + 6 sub-1000-LoC directory modules under health/); no longer
-  # a prod-giant, so it is removed here AND from the frozen baseline above
-  # (win-locked: a re-expanded health.rs cannot be re-grandfathered). The
-  # split outputs stay sub-threshold and are not ratcheted.
+  "src/services/discord/health.rs",
   "src/services/discord/health/recovery.rs",
   "src/services/discord/inflight.rs",
   "src/services/discord/meeting_orchestrator.rs",
@@ -211,6 +190,7 @@ grandfathered = [
   "src/services/discord/router/intake_gate.rs",
   "src/services/discord/router/message_handler/headless_turn.rs",
   "src/services/discord/router/message_handler/intake_turn.rs",
+  "src/services/discord/runtime_bootstrap.rs",
   "src/services/discord/session_runtime.rs",
   "src/services/discord/tmux.rs",
   "src/services/discord/tmux_watcher.rs",
@@ -307,10 +287,9 @@ deadline = "2026-08-31"
 decompose_issue = "#3036"
 
 # NOTE: src/services/discord/turn_bridge/terminal_delivery.rs previously had an
-# [[entry]] here; the #3028 splitter fix dropped its production LoC below the
-# giant threshold (its inline test mod was being miscounted as production), so it
-# is no longer a prod-giant and its entry was removed to avoid a ghost
-# registration.
+# [[entry]] here; the #3028 splitter fix dropped its production LoC to 504 (its
+# inline test mod was being miscounted as production), so it is no longer a
+# prod-giant and its entry was removed to avoid a ghost registration.
 
 [[entry]]
 # Surfaced as an 8417-prod-LoC giant only after #3028 fixed the prod/test
@@ -319,11 +298,9 @@ decompose_issue = "#3036"
 # `spawn_turn_bridge` and ~9000 lines of the turn-lifecycle surface were
 # mislabeled as test (the file reported only 626 prod). This entry is the
 # accounting correction; the production LoC is also frozen in
-# scripts/audit_maintainability_giant_baseline.toml (#3028 ratchet). #3038 S1
-# moved the helper-zone clusters out of the root while leaving the
-# `spawn_turn_bridge` async body byte-identical; remaining spawn/lifecycle
-# decomposition is tracked under #3038.
+# scripts/audit_maintainability_giant_baseline.toml (#3028 ratchet). Decompose
+# the turn-bridge spawn/lifecycle surface once #3016 settles.
 file = "src/services/discord/turn_bridge/mod.rs"
 owner = "discord-relay"
 deadline = "2026-08-31"
-decompose_issue = "#3038"
+decompose_issue = "#3016"

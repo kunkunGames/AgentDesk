@@ -26,5 +26,4 @@
 //! recovery code should add helpers here if they are cross-path, and in the
 //! path-specific module otherwise.
 
-pub(super) mod restart;
 pub(super) mod shared;

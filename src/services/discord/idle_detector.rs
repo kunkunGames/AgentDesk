@@ -178,7 +178,6 @@ pub(super) fn spawn_idle_detector(shared: Arc<SharedData>, provider: ProviderKin
         loop {
             interval.tick().await;
             if shared
-                .restart
                 .shutting_down
                 .load(std::sync::atomic::Ordering::SeqCst)
             {

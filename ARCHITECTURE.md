@@ -200,6 +200,7 @@ src/
 │   │   ├── review_verdict/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
+│   │   │   ├── review_state_repo.rs
 │   │   │   ├── tuning_aggregate.rs
 │   │   │   └── verdict_route.rs
 │   │   ├── agents.rs
@@ -322,19 +323,12 @@ src/
 │   │   ├── process.rs
 │   │   └── spawn_queue.rs
 │   ├── claude_tui/
-│   │   ├── hosting/
-│   │   │   ├── followup_support.rs
-│   │   │   ├── mod.rs
-│   │   │   └── warm_followup.rs
 │   │   ├── hook_bundle.rs
 │   │   ├── hook_relay.rs
 │   │   ├── hook_server.rs
-│   │   ├── hook_server_memento_tests.rs
 │   │   ├── input.rs
-│   │   ├── memento_feedback.rs
 │   │   ├── mod.rs
 │   │   ├── session.rs
-│   │   ├── startup_dialog.rs
 │   │   ├── transcript_tail.rs
 │   │   └── tui_relay.rs
 │   ├── cluster/
@@ -389,36 +383,24 @@ src/
 │   │   │   ├── tui_passthrough.rs
 │   │   │   └── voice.rs
 │   │   ├── health/
-│   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
 │   │   │   ├── provider_probe.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── redaction.rs
-│   │   │   ├── relay_auto_heal.rs
-│   │   │   ├── runtime_resolve.rs
 │   │   │   ├── session_enrichment.rs
-│   │   │   ├── snapshot.rs
-│   │   │   └── stall_liveness.rs
-│   │   ├── inflight/
-│   │   │   └── budget.rs
+│   │   │   └── snapshot.rs
 │   │   ├── outbound/
 │   │   │   ├── confirmation.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── delivery.rs
-│   │   │   ├── manual_delivery.rs
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
 │   │   │   ├── result.rs
-│   │   │   ├── send_api.rs
-│   │   │   ├── send_gate.rs
-│   │   │   ├── send_target.rs
 │   │   │   ├── send_to_agent.rs
 │   │   │   └── transport.rs
 │   │   ├── placeholder_live_events/
-│   │   │   ├── background_task_events.rs
 │   │   │   ├── common.rs
-│   │   │   ├── completion_footer.rs
 │   │   │   ├── context_panel.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── recent_events.rs
@@ -438,11 +420,8 @@ src/
 │   │   │   ├── memory_guidance.rs
 │   │   │   ├── mod.rs
 │   │   │   └── section_dedupe.rs
-│   │   ├── recovery_engine/
-│   │   │   └── status_panel.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── mod.rs
-│   │   │   ├── restart.rs
 │   │   │   └── shared.rs
 │   │   ├── router/
 │   │   │   ├── message_handler/
@@ -464,72 +443,27 @@ src/
 │   │   │   ├── response_format.rs
 │   │   │   ├── thread_binding.rs
 │   │   │   └── turn_start.rs
-│   │   ├── runtime_bootstrap/
-│   │   │   ├── framework_setup.rs
-│   │   │   ├── gateway_lease.rs
-│   │   │   ├── gateway_runtime.rs
-│   │   │   ├── intake.rs
-│   │   │   ├── orphan_recovery.rs
-│   │   │   ├── queued_placeholders.rs
-│   │   │   ├── recovery_flush.rs
-│   │   │   ├── restored_state.rs
-│   │   │   ├── session_gc.rs
-│   │   │   ├── shared_data.rs
-│   │   │   ├── shutdown.rs
-│   │   │   ├── spawns.rs
-│   │   │   ├── startup_doctor.rs
-│   │   │   └── voice.rs
 │   │   ├── settings/
 │   │   │   ├── content.rs
 │   │   │   ├── memory.rs
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
-│   │   ├── tmux_watcher/
-│   │   │   ├── commit_decisions.rs
-│   │   │   ├── completion_gate.rs
-│   │   │   ├── completion_gate_tests.rs
-│   │   │   ├── liveness.rs
-│   │   │   ├── panel_decisions.rs
-│   │   │   ├── placeholder_reclaim.rs
-│   │   │   ├── prompt_observe.rs
-│   │   │   ├── single_message_footer.rs
-│   │   │   ├── turn_identity.rs
-│   │   │   └── turn_identity_tests.rs
-│   │   ├── tui_direct_abort_marker/
-│   │   │   ├── deferred_claim.rs
-│   │   │   ├── mod.rs
-│   │   │   └── store.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
-│   │   │   ├── headless_delivery.rs
 │   │   │   ├── memory_lifecycle.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── output_lifecycle.rs
 │   │   │   ├── recall_feedback.rs
 │   │   │   ├── recovery_text.rs
 │   │   │   ├── retry_state.rs
-│   │   │   ├── single_message_footer.rs
 │   │   │   ├── skill_usage.rs
 │   │   │   ├── stale_resume.rs
-│   │   │   ├── status_panel.rs
-│   │   │   ├── status_panel_tests.rs
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
-│   │   │   ├── voice_completion.rs
-│   │   │   ├── voice_completion_tests.rs
 │   │   │   └── watcher_handoff.rs
-│   │   ├── turn_finalizer/
-│   │   │   └── cleanup.rs
-│   │   ├── voice_barge_in/
-│   │   │   ├── final_result_playback.rs
-│   │   │   ├── live_cut_playback.rs
-│   │   │   ├── progress_playback.rs
-│   │   │   ├── routing.rs
-│   │   │   ├── stt.rs
-│   │   │   └── tts_pipeline.rs
 │   │   ├── watchers/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
@@ -545,7 +479,6 @@ src/
 │   │   ├── idle_detector.rs
 │   │   ├── idle_recap.rs
 │   │   ├── idle_recap_interaction.rs
-│   │   ├── idle_relay_drift.rs
 │   │   ├── inflight.rs
 │   │   ├── inflight_heartbeat_sweeper.rs
 │   │   ├── internal_api.rs
@@ -566,7 +499,6 @@ src/
 │   │   ├── placeholder_sweeper.rs
 │   │   ├── queue_io.rs
 │   │   ├── queued_placeholders_store.rs
-│   │   ├── reaction_cleanup.rs
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_recovery.rs
@@ -583,8 +515,6 @@ src/
 │   │   ├── settings.rs
 │   │   ├── shadow_parity_warn.rs
 │   │   ├── shared_memory.rs
-│   │   ├── shared_state.rs
-│   │   ├── single_message_panel.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
 │   │   ├── status_panel_controller.rs
@@ -691,17 +621,6 @@ src/
 │   │   ├── smoke.rs
 │   │   ├── snapshot.rs
 │   │   └── upgrade.rs
-│   ├── review_decision/
-│   │   ├── accept.rs
-│   │   ├── adapters.rs
-│   │   ├── dismiss_finalize.rs
-│   │   ├── dispute.rs
-│   │   ├── pending.rs
-│   │   ├── repo_card.rs
-│   │   ├── repo_dispatch.rs
-│   │   ├── review_state_repo.rs
-│   │   ├── tuning_aggregate.rs
-│   │   └── worktree_stale.rs
 │   ├── routines/
 │   │   ├── action.rs
 │   │   ├── agent_executor.rs
@@ -715,8 +634,6 @@ src/
 │   │   └── store.rs
 │   ├── slo/
 │   │   └── mod.rs
-│   ├── turn_orchestrator/
-│   │   └── registry_purge.rs
 │   ├── agent_protocol.rs
 │   ├── analytics.rs
 │   ├── auto_queue.rs

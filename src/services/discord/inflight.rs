@@ -1,11 +1,10 @@
 //! Inflight turn state persistence.
 //!
-//! `response_sent_offset`, `current_msg_id`, and `last_watcher_relayed_offset`
-//! participate in the relay state contract documented in
-//! `docs/relay-state-contract.md` (#1222 / #1224). Any change that touches
-//! relay producers/consumers must keep the invariants there satisfied.
-
-pub(in crate::services::discord) mod budget;
+//! `response_sent_offset`, `current_msg_id`, and
+//! `last_watcher_relayed_offset` participate in the relay state contract
+//! documented in `docs/relay-state-contract.md` (#1222 / #1224).
+//! Any change that touches relay producers/consumers must keep the
+//! invariants enumerated there satisfied.
 
 use std::collections::HashMap;
 use std::fs;
@@ -21,20 +20,17 @@ use crate::services::agent_protocol::{RuntimeHandoffKind, TaskNotificationKind};
 use crate::services::provider::ProviderKind;
 
 // #2235 (follow-up to #2213): bump v7→v8. v7 added `runtime_kind` without a
-// version change, so new→old rollbacks could read rows whose FIFO synthesis
-// was elided for ClaudeTui and reject recovery with a misleading "input fifo
-// path missing" notice. v8 marks the shape shipping the compat-fixed
-// `input_fifo_path` alongside ClaudeTui plus the silent-skip recovery branch;
-// old binaries deserialize v8 rows via `#[serde(default)]` (compat window:
-// one release each direction).
+// version change, so rolling back from new→old binaries could read rows whose
+// FIFO synthesis was elided for ClaudeTui and reject recovery with a misleading
+// "input fifo path missing" notice. v8 marks the on-disk shape that ships the
+// compat-fixed `input_fifo_path` alongside ClaudeTui plus the silent-skip
+// recovery branch; old binaries continue to deserialize v8 rows via
+// `#[serde(default)]` and treat the new `runtime_kind` as legacy, so the
+// compat window is one release in each direction.
 const INFLIGHT_STATE_VERSION: u32 = 8;
 const INFLIGHT_MAX_AGE_SECS: u64 = 300; // 5 minutes
 const DRAIN_RESTART_MAX_AGE_SECS: u64 = 1800; // 30 minutes
 const HOT_SWAP_HANDOFF_MAX_AGE_SECS: u64 = 900; // 15 minutes
-/// #3293: restarts-with-failed-terminal-relay budget. `recovery_relay_attempts`
-/// grows at most once per boot (recovery runs once per boot), so this is a
-/// "3 consecutive restarts" budget, not a per-process retry cap.
-pub(super) const RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET: u32 = 3;
 
 /// #1446 stall-deadlock recovery: an inflight state is treated as "stale"
 /// (i.e. the dispatch that wrote it almost certainly already terminated
@@ -168,11 +164,6 @@ pub(super) struct InflightTurnState {
     /// Restart generation at which this turn was born.
     #[serde(default)]
     pub born_generation: u64,
-    /// #3293: count of restarts whose recovery terminal relay failed
-    /// transiently for this row. Additive `#[serde(default)]` field —
-    /// no `INFLIGHT_STATE_VERSION` bump per the #2235 compat convention.
-    #[serde(default)]
-    pub recovery_relay_attempts: u32,
     /// Whether any tool_use was seen during this turn (persisted for restart recovery).
     #[serde(default)]
     pub any_tool_used: bool,
@@ -586,7 +577,6 @@ impl InflightTurnState {
             started_at: now.clone(),
             updated_at: now,
             born_generation: super::runtime_store::load_generation(),
-            recovery_relay_attempts: 0,
             any_tool_used: false,
             has_post_tool_text: false,
             session_key: None,
@@ -1573,64 +1563,6 @@ fn clear_status_panel_if_current_in_root(
         &path,
         &state,
         "src/services/discord/inflight.rs:clear_status_panel_if_current_in_root",
-    )
-    .is_ok()
-}
-
-/// #3351: compare-and-clear for the persisted relay-placeholder id, mirroring
-/// `clear_status_panel_if_current` (#3077): exact `msg_id` only, placeholderless
-/// turns (`current_msg_id == user_msg_id`) untouched, optional tmux-session guard.
-pub(in crate::services::discord) fn clear_current_msg_if_matches(
-    provider: &ProviderKind,
-    channel_id: u64,
-    msg_id: u64,
-    require_tmux_session_name: Option<&str>,
-) -> bool {
-    let Some(root) = inflight_runtime_root() else {
-        return false;
-    };
-    clear_current_msg_if_matches_in_root(
-        &root,
-        provider,
-        channel_id,
-        msg_id,
-        require_tmux_session_name,
-    )
-}
-
-fn clear_current_msg_if_matches_in_root(
-    root: &Path,
-    provider: &ProviderKind,
-    channel_id: u64,
-    msg_id: u64,
-    require_tmux_session_name: Option<&str>,
-) -> bool {
-    let path = inflight_state_path(root, provider, channel_id);
-    let Ok(_lock) = lock_inflight_state_path(&path) else {
-        return false;
-    };
-    let Some(mut state) = load_inflight_state_unlocked(&path) else {
-        return false;
-    };
-    if msg_id == 0 || state.current_msg_id != msg_id {
-        // A newer turn already advanced the anchor — never wipe it.
-        return false;
-    }
-    if state.user_msg_id != 0 && state.current_msg_id == state.user_msg_id {
-        // Placeholderless turn: anchor mirrors the user's own message id.
-        return false;
-    }
-    if let Some(expected) = require_tmux_session_name
-        && state.tmux_session_name.as_deref() != Some(expected)
-    {
-        return false;
-    }
-    state.current_msg_id = 0;
-    persist_under_lock(
-        root,
-        &path,
-        &state,
-        "src/services/discord/inflight.rs:clear_current_msg_if_matches_in_root",
     )
     .is_ok()
 }
@@ -2708,8 +2640,7 @@ mod stall_recovery_tests {
         GuardedClearOutcome, GuardedSaveOutcome, INFLIGHT_STALENESS_THRESHOLD_SECS,
         InflightRestartMode, InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
         StatusPanelBindGuard, StatusPanelBindOutcome, StatusPanelClearGuard,
-        bind_status_panel_in_root, clear_current_msg_if_matches_in_root,
-        clear_inflight_state_if_matches_identity_after_delivery_in_root,
+        bind_status_panel_in_root, clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
         clear_inflight_state_if_matches_zero_owned_in_root, clear_status_panel_if_current_in_root,
@@ -3200,116 +3131,6 @@ mod stall_recovery_tests {
         );
         assert!(cleared);
         assert_eq!(loaded_status_message_id(temp.path(), 7103), None);
-    }
-
-    // ---- #3351: relay-placeholder (`current_msg_id`) compare-and-clear ----
-
-    fn loaded_current_msg_id(root: &Path, channel_id: u64) -> Option<u64> {
-        load_inflight_states_from_root(root, &ProviderKind::Claude)
-            .into_iter()
-            .find(|s| s.channel_id == channel_id)
-            .map(|s| s.current_msg_id)
-    }
-
-    #[test]
-    fn clear_current_msg_if_matches_clears_on_match() {
-        let temp = TempDir::new().unwrap();
-        seed_status_panel_state(
-            temp.path(),
-            7201,
-            10,
-            5555,
-            Some("AgentDesk-claude-a"),
-            None,
-        );
-
-        let cleared = clear_current_msg_if_matches_in_root(
-            temp.path(),
-            &ProviderKind::Claude,
-            7201,
-            5555,
-            Some("AgentDesk-claude-a"),
-        );
-
-        assert!(cleared);
-        assert_eq!(loaded_current_msg_id(temp.path(), 7201), Some(0));
-    }
-
-    #[test]
-    fn clear_current_msg_if_matches_preserves_newer_turn_on_mismatch() {
-        let temp = TempDir::new().unwrap();
-        // A newer turn already advanced `current_msg_id` to 9999; a stale actor
-        // asking to clear 5555 must not touch it. A zero msg_id never matches.
-        seed_status_panel_state(
-            temp.path(),
-            7202,
-            10,
-            9999,
-            Some("AgentDesk-claude-a"),
-            None,
-        );
-
-        assert!(!clear_current_msg_if_matches_in_root(
-            temp.path(),
-            &ProviderKind::Claude,
-            7202,
-            5555,
-            None,
-        ));
-        assert!(!clear_current_msg_if_matches_in_root(
-            temp.path(),
-            &ProviderKind::Claude,
-            7202,
-            0,
-            None,
-        ));
-        assert_eq!(loaded_current_msg_id(temp.path(), 7202), Some(9999));
-    }
-
-    #[test]
-    fn clear_current_msg_if_matches_respects_tmux_guard() {
-        let temp = TempDir::new().unwrap();
-        seed_status_panel_state(
-            temp.path(),
-            7203,
-            10,
-            5555,
-            Some("AgentDesk-claude-a"),
-            None,
-        );
-
-        assert!(!clear_current_msg_if_matches_in_root(
-            temp.path(),
-            &ProviderKind::Claude,
-            7203,
-            5555,
-            Some("AgentDesk-claude-other"),
-        ));
-        assert_eq!(loaded_current_msg_id(temp.path(), 7203), Some(5555));
-    }
-
-    #[test]
-    fn clear_current_msg_if_matches_preserves_placeholderless_turn() {
-        let temp = TempDir::new().unwrap();
-        // Placeholderless Discord turn: `current_msg_id` mirrors the user's own
-        // message id — never clear it (adopt-guard mirror).
-        seed_status_panel_state(
-            temp.path(),
-            7204,
-            5555,
-            5555,
-            Some("AgentDesk-claude-a"),
-            None,
-        );
-
-        assert!(!clear_current_msg_if_matches_in_root(
-            temp.path(),
-            &ProviderKind::Claude,
-            7204,
-            5555,
-            Some("AgentDesk-claude-a"),
-        ));
-        assert_eq!(loaded_current_msg_id(temp.path(), 7204), Some(5555));
     }
 
     #[test]
@@ -4603,9 +4424,8 @@ mod stall_recovery_tests {
 
     /// Process-wide mutex so the two halves of the alive/dead override
     /// regression do not race against each other when cargo test runs them
-    /// in parallel (the override is global state). `pub(super)` so the
-    /// #3293 `recovery_relay_attempts_tests` module serializes on it too.
-    pub(super) fn stale_override_test_mutex() -> &'static std::sync::Mutex<()> {
+    /// in parallel (the override is global state).
+    fn stale_override_test_mutex() -> &'static std::sync::Mutex<()> {
         static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         M.get_or_init(|| std::sync::Mutex::new(()))
     }
@@ -4968,170 +4788,5 @@ mod wave_a_cleanup_tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].restart_generation, Some(2));
         assert_eq!(after[0].user_msg_id, 78);
-    }
-}
-
-#[cfg(test)]
-mod recovery_relay_attempts_tests {
-    //! #3293: the `recovery_relay_attempts` restart-budget counter.
-    //!
-    //! The field is an additive `#[serde(default)]` column (NO
-    //! `INFLIGHT_STATE_VERSION` bump, #2235 convention): legacy rows must
-    //! deserialize with `0`, the value must round-trip, survive the
-    //! boot-time `mark_all_inflight_states_restart_mode` re-marking pass
-    //! (the infinite-WARN-loop carrier), and never weaken the pane-alive
-    //! stale-removal guard.
-    use super::{
-        InflightTurnState, RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET, load_inflight_states_from_root,
-        save_inflight_state_in_root,
-    };
-    use crate::services::discord::InflightRestartMode;
-    use crate::services::provider::ProviderKind;
-    use tempfile::TempDir;
-
-    fn make_state(channel_id: u64) -> InflightTurnState {
-        InflightTurnState::new(
-            ProviderKind::Codex,
-            channel_id,
-            Some("adk-cdx".to_string()),
-            7,
-            42,
-            43,
-            "hello".to_string(),
-            Some("session-3293".to_string()),
-            Some(format!("AgentDesk-codex-adk-cdx-{channel_id}")),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
-        )
-    }
-
-    #[test]
-    fn budget_is_three_restarts() {
-        assert_eq!(RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET, 3);
-    }
-
-    #[test]
-    fn legacy_row_without_field_deserializes_to_zero() {
-        // A pre-#3293 on-disk row has no `recovery_relay_attempts` key; the
-        // additive field must default to 0 instead of failing the parse
-        // (which would GC the row as malformed).
-        let state: InflightTurnState = serde_json::from_value(serde_json::json!({
-            "version": 8,
-            "provider": "codex",
-            "channel_id": 42,
-            "channel_name": "adk-cdx",
-            "request_owner_user_id": 7,
-            "user_msg_id": 8,
-            "current_msg_id": 9,
-            "current_msg_len": 0,
-            "user_text": "hello",
-            "source": "text",
-            "session_id": null,
-            "tmux_session_name": "AgentDesk-codex-adk-cdx",
-            "output_path": "/tmp/out.jsonl",
-            "input_fifo_path": null,
-            "last_offset": 0,
-            "full_response": "",
-            "response_sent_offset": 0,
-            "started_at": "2026-05-17 10:00:00",
-            "updated_at": "2026-05-17 10:00:00"
-        }))
-        .expect("legacy row without recovery_relay_attempts must deserialize");
-        assert_eq!(state.recovery_relay_attempts, 0);
-    }
-
-    #[test]
-    fn counter_round_trips_through_serde() {
-        let mut state = make_state(3293);
-        state.recovery_relay_attempts = 2;
-        let json = serde_json::to_string(&state).expect("serialize");
-        let parsed: InflightTurnState = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.recovery_relay_attempts, 2);
-    }
-
-    #[test]
-    fn counter_survives_disk_round_trip_in_isolated_root() {
-        let temp = TempDir::new().unwrap();
-        let mut state = make_state(932_931);
-        state.recovery_relay_attempts = 2;
-        save_inflight_state_in_root(temp.path(), &state).expect("save");
-
-        let loaded = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].recovery_relay_attempts, 2);
-    }
-
-    /// The boot-time `mark_all_inflight_states_restart_mode` pass rewrites
-    /// every row (the carrier of the pre-#3293 infinite WARN loop). The
-    /// counter must survive that rewrite or the budget could never trip.
-    #[test]
-    fn counter_survives_restart_mode_remarking() {
-        // `mark_all_inflight_states_restart_mode` resolves the root from the
-        // process-global `AGENTDESK_ROOT_DIR`; serialize against every other
-        // env-touching test and restore the previous value on exit.
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let previous_root = std::env::var("AGENTDESK_ROOT_DIR").ok();
-        let temp = TempDir::new().unwrap();
-        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
-
-        struct EnvRestore(Option<String>);
-        impl Drop for EnvRestore {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
-                    None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
-                }
-            }
-        }
-        let _restore = EnvRestore(previous_root);
-
-        // `mark_all_…` scans `$AGENTDESK_ROOT_DIR/runtime/discord_inflight`;
-        // seed the row under that exact root.
-        let inflight_root = super::inflight_runtime_root().expect("env root must resolve");
-        let mut state = make_state(932_932);
-        state.recovery_relay_attempts = 2;
-        save_inflight_state_in_root(&inflight_root, &state).expect("save");
-
-        let updated = super::mark_all_inflight_states_restart_mode(
-            &ProviderKind::Codex,
-            InflightRestartMode::DrainRestart,
-        );
-        assert_eq!(updated, 1, "the seeded row must be re-marked");
-
-        let loaded = load_inflight_states_from_root(&inflight_root, &ProviderKind::Codex);
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(
-            loaded[0].restart_mode,
-            Some(InflightRestartMode::DrainRestart)
-        );
-        assert_eq!(
-            loaded[0].recovery_relay_attempts, 2,
-            "re-marking must not reset the restart-relay budget counter"
-        );
-    }
-
-    /// #3293 invariant: the counter must not interact with the pane-alive
-    /// stale-removal guard — a row carrying a saturated counter whose tmux
-    /// pane is still alive is preserved by `stale_removal_reason`.
-    #[test]
-    fn saturated_counter_does_not_weaken_pane_alive_stale_guard() {
-        let _guard = super::stall_recovery_tests::stale_override_test_mutex()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        super::set_test_tmux_alive_override(Some(&["AgentDesk-codex-adk-cdx-932933"]));
-
-        let mut state = make_state(932_933);
-        state.tmux_session_name = Some("AgentDesk-codex-adk-cdx-932933".to_string());
-        state.recovery_relay_attempts = 99;
-
-        let result = super::stale_removal_reason(&state, super::INFLIGHT_MAX_AGE_SECS + 1, 7);
-        super::set_test_tmux_alive_override(None);
-        assert!(
-            result.is_none(),
-            "alive tmux pane must preserve the row regardless of the relay counter; got {result:?}"
-        );
     }
 }

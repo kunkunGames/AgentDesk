@@ -154,8 +154,6 @@ fn load_pending_in_root(root: &Path, provider: &ProviderKind, token_hash: &str) 
 
 /// Record a panel id for durable delete-retry. Idempotent (set semantics) so a
 /// sweeper that re-observes the same orphan every pass does not grow the file.
-/// #3351: also accepts watcher relay-placeholder ids (not only v2 panel ids) —
-/// the drain semantics (delete or forget) are identical for both.
 pub(in crate::services::discord) fn enqueue(
     provider: &ProviderKind,
     token_hash: &str,
@@ -166,59 +164,6 @@ pub(in crate::services::discord) fn enqueue(
         return;
     };
     enqueue_in_root(&root, provider, token_hash, channel_id, panel_msg_id);
-}
-
-fn should_record_separate_status_panel_orphan_for_flags(
-    single_message_panel_enabled: bool,
-    status_panel_v2_enabled: bool,
-) -> bool {
-    super::single_message_panel::separate_status_panel_enabled_for_flags(
-        single_message_panel_enabled,
-        status_panel_v2_enabled,
-    )
-}
-
-fn enqueue_separate_status_panel_orphan_in_root_for_flags(
-    root: &Path,
-    single_message_panel_enabled: bool,
-    status_panel_v2_enabled: bool,
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: u64,
-    panel_msg_id: u64,
-) {
-    if !should_record_separate_status_panel_orphan_for_flags(
-        single_message_panel_enabled,
-        status_panel_v2_enabled,
-    ) {
-        return;
-    }
-    enqueue_in_root(root, provider, token_hash, channel_id, panel_msg_id);
-}
-
-/// Record a same-run separate status-panel orphan. Footer-mode turns never own a
-/// separate status panel, so they must not grow this store. Transition cleanup
-/// for stale flag-off panels uses the raw [`enqueue`] after an attempted sweeper
-/// delete, because those are real legacy panel messages that still need retry.
-pub(in crate::services::discord) fn enqueue_separate_status_panel_orphan(
-    status_panel_v2_enabled: bool,
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: u64,
-    panel_msg_id: u64,
-) {
-    let Some(root) = runtime_store::discord_status_panel_orphans_root() else {
-        return;
-    };
-    enqueue_separate_status_panel_orphan_in_root_for_flags(
-        &root,
-        super::single_message_panel_enabled(),
-        status_panel_v2_enabled,
-        provider,
-        token_hash,
-        channel_id,
-        panel_msg_id,
-    );
 }
 
 /// All pending `(channel_id, panel_msg_id)` records for this bot.
@@ -315,12 +260,6 @@ fn assert_orphan_gate_parity(
     );
 }
 
-/// #3351: pure drain-defer decision for relay-placeholder records — `true` when
-/// the live inflight row still anchors `candidate` as its `current_msg_id`.
-fn orphan_drain_placeholder_is_live(current_msg_id: Option<u64>, candidate: u64) -> bool {
-    candidate != 0 && current_msg_id == Some(candidate)
-}
-
 /// Retry every pending panel delete once. A committed delete, or a permanent
 /// "message gone" (404/403/410), drops the record; a transient failure keeps it
 /// for the next pass. Returns the number of records cleared this pass.
@@ -356,11 +295,9 @@ pub(in crate::services::discord) async fn drain(
         // tmux pane — would defer an OLD turn's orphan forever (the store is its only
         // reclaim path). A different/absent `status_message_id` means the live turn
         // does not own this orphan, so it is safe to delete now.
-        let inflight_state =
-            crate::services::discord::inflight::load_inflight_state(provider, channel_id);
-        let inflight_panel_id = inflight_state
-            .as_ref()
-            .and_then(|state| state.status_message_id);
+        let inflight_panel_id =
+            crate::services::discord::inflight::load_inflight_state(provider, channel_id)
+                .and_then(|state| state.status_message_id);
         let legacy_owns = inflight_panel_id == Some(panel_msg_id);
         // EPIC #3078 PR-3 — route this turn-aware defer gate through the
         // `StatusPanelController` behind a SHADOW parity check. The controller
@@ -375,7 +312,7 @@ pub(in crate::services::discord) async fn drain(
         // when v2 is off. The controller actor task is NOT spawned when v2 is off,
         // so we MUST skip the awaited shadow read (its ack oneshot would never be
         // answered) — this guard is the v2-off short-circuit.
-        if shared.ui.status_panel_v2_enabled {
+        if shared.status_panel_v2_enabled {
             let controller_owns = shared
                 .status_panel_controller
                 .orphan_gate_owns_panel(
@@ -391,15 +328,7 @@ pub(in crate::services::discord) async fn drain(
                 .await;
             assert_orphan_gate_parity(controller_owns, legacy_owns, channel_id, panel_msg_id);
         }
-        // #3351: the store also holds watcher relay-placeholder ids. Defer while
-        // the live inflight row still anchors this id as `current_msg_id` (the
-        // watcher's in-turn retry may be editing it). Kept SEPARATE from
-        // `legacy_owns` so the #3078 controller parity assert above is untouched.
-        let live_placeholder_owns = orphan_drain_placeholder_is_live(
-            inflight_state.as_ref().map(|state| state.current_msg_id),
-            panel_msg_id,
-        );
-        if legacy_owns || live_placeholder_owns {
+        if legacy_owns {
             continue;
         }
         let channel = serenity::ChannelId::new(channel_id);
@@ -450,16 +379,6 @@ mod tests {
         // Removing the last id deletes the channel file → empty pending.
         remove_in_root(root, &provider, token, 100, 5002);
         assert!(load_pending_in_root(root, &provider, token).is_empty());
-    }
-
-    /// #3351: the drain defers a record only while the live inflight row still
-    /// anchors that exact id as its relay placeholder.
-    #[test]
-    fn orphan_drain_placeholder_is_live_defers_only_exact_live_anchor() {
-        assert!(orphan_drain_placeholder_is_live(Some(5555), 5555));
-        assert!(!orphan_drain_placeholder_is_live(Some(0), 0));
-        assert!(!orphan_drain_placeholder_is_live(Some(9999), 5555));
-        assert!(!orphan_drain_placeholder_is_live(None, 5555));
     }
 
     /// EPIC #3078 PR-3: for representative drain-gate inputs, the
@@ -597,38 +516,6 @@ mod tests {
         assert_eq!(
             load_pending_in_root(root, &provider, "bot_b"),
             vec![(100, 6001)]
-        );
-    }
-
-    #[test]
-    fn footer_mode_status_panel_orphan_enqueue_is_noop_at_store_api() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let root = root.path();
-        let provider = ProviderKind::Claude;
-
-        enqueue_separate_status_panel_orphan_in_root_for_flags(
-            root, true, true, &provider, "tok", 100, 5001,
-        );
-
-        assert!(
-            load_pending_in_root(root, &provider, "tok").is_empty(),
-            "flag-on footer-mode turns must not create panel orphan records"
-        );
-    }
-
-    #[test]
-    fn flag_off_status_panel_orphan_enqueue_preserves_original_store_behavior() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let root = root.path();
-        let provider = ProviderKind::Claude;
-
-        enqueue_separate_status_panel_orphan_in_root_for_flags(
-            root, false, true, &provider, "tok", 100, 5001,
-        );
-
-        assert_eq!(
-            load_pending_in_root(root, &provider, "tok"),
-            vec![(100, 5001)]
         );
     }
 }

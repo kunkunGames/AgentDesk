@@ -33,6 +33,7 @@ use crate::voice::tts::{
 };
 use crate::voice::{CompletedUtterance, VoiceConfig, VoiceReceiveHook};
 
+use super::SharedData;
 use super::voice_acknowledgement::AcknowledgementConfig;
 #[cfg(test)]
 use super::voice_background_driver::{VoiceBackgroundDriverKind, VoiceBackgroundStartOutcome};
@@ -43,27 +44,6 @@ use super::voice_background_driver::{
 use super::voice_config_cache::ConfigSnapshotCache;
 use super::voice_id_sequences::VoiceIdSequences;
 use super::voice_sensitivity::SensitivityState;
-use super::{SharedData, http, mailbox_has_active_turn, rate_limit_wait, settings};
-
-#[path = "voice_barge_in/final_result_playback.rs"]
-mod final_result_playback;
-#[path = "voice_barge_in/live_cut_playback.rs"]
-mod live_cut_playback;
-#[path = "voice_barge_in/progress_playback.rs"]
-mod progress_playback;
-#[path = "voice_barge_in/routing.rs"]
-mod routing;
-// S7 (#3038): the agent-voice routing helper block moved into the `routing`
-// child; re-import the root-prod-consumed members so call sites resolve them
-// unqualified (the test-only members are re-imported inside `mod tests`).
-use routing::{
-    agent_voice_background_channel, agent_voice_matches_channel, effective_voice_source_channel,
-};
-#[path = "voice_barge_in/stt.rs"]
-mod stt;
-#[path = "voice_barge_in/tts_pipeline.rs"]
-mod tts_pipeline;
-
 pub(in crate::services::discord) const INTERNAL_VOICE_MESSAGE_ID_START: u64 =
     9_000_000_000_000_000_000;
 
@@ -399,6 +379,104 @@ fn normalized_foreground_timeout_ms(value: u64) -> u64 {
     } else {
         value
     }
+}
+
+fn agent_voice_matches_channel(agent: &crate::config::AgentDef, channel_id: ChannelId) -> bool {
+    agent
+        .voice
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        == Some(channel_id.get())
+}
+
+fn agent_voice_channel(agent: &crate::config::AgentDef) -> Option<ChannelId> {
+    agent
+        .voice
+        .channel_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(ChannelId::new)
+}
+
+fn agent_voice_background_channel(agent: &crate::config::AgentDef) -> Option<ChannelId> {
+    let preferred_provider = agent.provider.trim();
+    if !preferred_provider.is_empty()
+        && let Some((_, Some(channel))) = agent
+            .channels
+            .iter()
+            .into_iter()
+            .find(|(provider, channel)| *provider == preferred_provider && channel.is_some())
+        && let Some(channel_id) = channel
+            .channel_id()
+            .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(ChannelId::new(channel_id));
+    }
+
+    agent
+        .channels
+        .iter()
+        .into_iter()
+        .filter_map(|(_, channel)| channel)
+        .find_map(|channel| {
+            channel
+                .channel_id()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(ChannelId::new)
+        })
+}
+
+fn agent_voice_background_channel_for(
+    agent: &crate::config::AgentDef,
+    voice_channel_id: ChannelId,
+) -> Option<ChannelId> {
+    agent_voice_matches_channel(agent, voice_channel_id)
+        .then(|| agent_voice_background_channel(agent))
+        .flatten()
+}
+
+fn agent_voice_channel_for_background(
+    agent: &crate::config::AgentDef,
+    background_channel_id: ChannelId,
+) -> Option<ChannelId> {
+    let voice_channel_id = agent_voice_channel(agent)?;
+    (agent_voice_background_channel(agent) == Some(background_channel_id))
+        .then_some(voice_channel_id)
+}
+
+fn agent_voice_source_channel_for_background(
+    config: &crate::config::Config,
+    background_channel_id: ChannelId,
+) -> Option<ChannelId> {
+    let mut matches = config
+        .agents
+        .iter()
+        .filter_map(|agent| agent_voice_channel_for_background(agent, background_channel_id));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn effective_voice_source_channel(
+    config: &crate::config::Config,
+    channel_id: ChannelId,
+) -> ChannelId {
+    agent_voice_source_channel_for_background(config, channel_id).unwrap_or(channel_id)
+}
+
+fn agent_text_channel_matches(agent: &crate::config::AgentDef, channel_id: ChannelId) -> bool {
+    let channel_id = channel_id.get().to_string();
+    agent
+        .channels
+        .iter()
+        // AgentChannels::iter returns a fixed array, so into_iter is required.
+        .into_iter()
+        .filter_map(|(_, channel)| channel)
+        .any(|channel| channel.channel_id().as_deref() == Some(channel_id.as_str()))
 }
 
 fn foreground_ack_text(transcript: &str, language: &str) -> String {
@@ -1523,6 +1601,30 @@ impl VoiceBargeInRuntime {
         }
     }
 
+    async fn set_runtime_tts_voice(&self, voice: String) {
+        let config = {
+            let mut config = self.voice_config_state.write().await;
+            config.tts.edge.voice = voice.clone();
+            config.clone()
+        };
+        if self.enabled {
+            // F10 (#2046): `.ok()` 가 Err 를 사일런트로 삼켜 TTS 가 통째로 꺼지던
+            // 회귀를 방지. 실패 시 경고 로그만 남기고 기존 TTS 인스턴스를 보존.
+            match TtsRuntime::from_voice_config(&config) {
+                Ok(rt) => {
+                    *self.tts.write().await = Some(rt);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        voice = %voice,
+                        "voice change ignored: TtsRuntime build failed, keeping previous TTS"
+                    );
+                }
+            }
+        }
+    }
+
     async fn apply_wake_word_command(&self, command: WakeWordCommand) -> Vec<String> {
         let mut config = self.voice_config_state.write().await;
         match command {
@@ -1543,6 +1645,37 @@ impl VoiceBargeInRuntime {
             }
         }
         config.wake_words.clone()
+    }
+
+    pub(in crate::services::discord) fn subscribe_progress(
+        &self,
+    ) -> broadcast::Receiver<VoiceProgressEvent> {
+        self.progress_tx.subscribe()
+    }
+
+    pub(in crate::services::discord) fn publish_progress(
+        &self,
+        channel_id: ChannelId,
+        label: impl Into<String>,
+    ) {
+        self.publish_progress_for_playback(channel_id, None, label);
+    }
+
+    pub(in crate::services::discord) fn publish_progress_for_playback(
+        &self,
+        channel_id: ChannelId,
+        playback_channel_id: Option<ChannelId>,
+        label: impl Into<String>,
+    ) {
+        let label = label.into();
+        if label.trim().is_empty() {
+            return;
+        }
+        let _ = self.progress_tx.send(VoiceProgressEvent {
+            channel_id: channel_id.get(),
+            playback_channel_id: playback_channel_id.map(|id| id.get()),
+            label,
+        });
     }
 
     pub(in crate::services::discord) fn register_voice_context(
@@ -1635,6 +1768,365 @@ impl VoiceBargeInRuntime {
         });
     }
 
+    pub(in crate::services::discord) fn spawn_progress_worker(
+        self: &Arc<Self>,
+        shared: Arc<SharedData>,
+        shutdown_flag: Arc<AtomicBool>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+
+        let runtime = self.clone();
+        let mut rx = self.subscribe_progress();
+        tokio::spawn(async move {
+            let mut states: HashMap<u64, VoiceProgressChannelState> = HashMap::new();
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        if shutdown_flag.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        runtime.flush_due_progress_summaries(&shared, &mut states).await;
+                        runtime.emit_due_idle_notices(&shared, &mut states).await;
+                    }
+                    event = rx.recv() => {
+                        match event {
+                            Ok(event) => {
+                                runtime.handle_progress_event(&shared, &mut states, event).await;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(
+                                    skipped,
+                                    "voice progress worker lagged behind broadcast events"
+                                );
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn handle_progress_event(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        states: &mut HashMap<u64, VoiceProgressChannelState>,
+        event: VoiceProgressEvent,
+    ) {
+        let label = event.label.trim().to_string();
+        if label.is_empty() {
+            return;
+        }
+
+        let channel_id = ChannelId::new(event.channel_id);
+        let playback_channel_id = event
+            .playback_channel_id
+            .map(ChannelId::new)
+            .unwrap_or(channel_id);
+        if progress::is_turn_done_event(&label) {
+            if let Some(state) = states.get_mut(&event.channel_id) {
+                state.mark_done();
+            }
+            self.play_processing_chime(
+                shared,
+                ChannelId::new(progress_feedback_channel_id(
+                    event.channel_id,
+                    event.playback_channel_id,
+                )),
+            )
+            .await;
+            return;
+        }
+
+        let now = Instant::now();
+        states
+            .entry(event.channel_id)
+            .or_insert_with(|| VoiceProgressChannelState::new(now))
+            .mark_active(now);
+        if let Some(state) = states.get_mut(&event.channel_id) {
+            state.set_playback_channel_id(event.playback_channel_id);
+        }
+
+        if !self.verbose_progress_enabled() {
+            return;
+        }
+
+        self.mirror_progress_line(shared, channel_id, &label).await;
+
+        let summary_events = if let Some(state) = states.get_mut(&event.channel_id) {
+            state.pending_events.push(label);
+            if state.pending_events.len() >= progress::PROGRESS_BATCH_MAX_EVENTS {
+                let events = std::mem::take(&mut state.pending_events);
+                state.next_summary_at = None;
+                Some(events)
+            } else {
+                if state.next_summary_at.is_none() {
+                    state.next_summary_at = Some(now + Duration::from_millis(1200));
+                }
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(events) = summary_events {
+            self.speak_progress_summary(shared, playback_channel_id, events)
+                .await;
+        }
+    }
+
+    async fn flush_due_progress_summaries(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        states: &mut HashMap<u64, VoiceProgressChannelState>,
+    ) {
+        if !self.verbose_progress_enabled() {
+            return;
+        }
+
+        let now = Instant::now();
+        let due_channels = states
+            .iter()
+            .filter_map(|(channel_id, state)| {
+                state
+                    .next_summary_at
+                    .filter(|deadline| *deadline <= now && !state.pending_events.is_empty())
+                    .map(|_| *channel_id)
+            })
+            .collect::<Vec<_>>();
+
+        for raw_channel_id in due_channels {
+            let events = if let Some(state) = states.get_mut(&raw_channel_id) {
+                state.next_summary_at = None;
+                std::mem::take(&mut state.pending_events)
+            } else {
+                Vec::new()
+            };
+            if !events.is_empty() {
+                self.speak_progress_summary(shared, ChannelId::new(raw_channel_id), events)
+                    .await;
+            }
+        }
+    }
+
+    async fn emit_due_idle_notices(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        states: &mut HashMap<u64, VoiceProgressChannelState>,
+    ) {
+        let now = Instant::now();
+        let due_channels = states
+            .iter()
+            .filter(|(_, state)| {
+                state.active && now.duration_since(state.last_activity_at) >= state.next_idle_delay
+            })
+            .map(|(channel_id, _)| *channel_id)
+            .collect::<Vec<_>>();
+
+        for raw_channel_id in due_channels {
+            let (channel_id, playback_channel_id) = if let Some(state) = states.get(&raw_channel_id)
+            {
+                (
+                    ChannelId::new(raw_channel_id),
+                    state
+                        .playback_channel_id
+                        .map(ChannelId::new)
+                        .unwrap_or_else(|| ChannelId::new(raw_channel_id)),
+                )
+            } else {
+                (
+                    ChannelId::new(raw_channel_id),
+                    ChannelId::new(raw_channel_id),
+                )
+            };
+            if !super::mailbox_has_active_turn(shared, channel_id).await {
+                if let Some(state) = states.get_mut(&raw_channel_id) {
+                    state.mark_done();
+                }
+                continue;
+            }
+
+            let language = self.spoken_result_language().await;
+            self.speak_progress_text(
+                shared,
+                playback_channel_id,
+                progress::idle_notice(&language),
+                "voice progress idle notice",
+            )
+            .await;
+
+            if let Some(state) = states.get_mut(&raw_channel_id) {
+                state.last_activity_at = Instant::now();
+                state.next_idle_delay = progress::next_idle_notice_delay(state.next_idle_delay);
+            }
+        }
+
+        states.retain(|_, state| state.active || !state.pending_events.is_empty());
+    }
+
+    async fn mirror_progress_line(
+        &self,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+        label: &str,
+    ) {
+        let Some(http) = shared.serenity_http_or_token_fallback() else {
+            tracing::warn!(
+                channel_id = channel_id.get(),
+                "voice progress text mirror skipped: no Discord HTTP client"
+            );
+            return;
+        };
+        let language = self.spoken_result_language().await;
+        let content = progress::format_progress_message(label, &language);
+        if content.trim().is_empty() {
+            return;
+        }
+
+        super::rate_limit_wait(shared, channel_id).await;
+        if let Err(error) = super::http::send_channel_message(&http, channel_id, &content).await {
+            tracing::warn!(
+                error = %error,
+                channel_id = channel_id.get(),
+                "voice progress text mirror failed"
+            );
+        }
+    }
+
+    async fn speak_progress_summary(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+        events: Vec<String>,
+    ) {
+        let language = self.spoken_result_language().await;
+        let summary = progress::summarize_progress_events(&events, &language);
+        self.speak_progress_text(shared, channel_id, &summary, "voice progress summary")
+            .await;
+    }
+
+    async fn speak_progress_text(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+        text: &str,
+        context: &'static str,
+    ) {
+        let Some(path) = self
+            .synthesize_progress_tts(text, channel_id, context)
+            .await
+        else {
+            return;
+        };
+        self.play_progress_audio(shared, channel_id, path, context)
+            .await;
+    }
+
+    pub(in crate::services::discord) async fn speak_voice_background_completion_summary(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        voice_channel_id: ChannelId,
+        background_channel_id: ChannelId,
+        background_result: &str,
+        failed: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let language = self.spoken_result_language().await;
+        let foreground = self
+            .resolve_effective_foreground_config(voice_channel_id, background_channel_id)
+            .await;
+        let cancel_token = Arc::new(crate::services::provider::CancelToken::new());
+        self.register_inflight_foreground_cancel(voice_channel_id, cancel_token.clone());
+        let summary_result = self
+            .generate_voice_background_result_summary_for_runtime(
+                background_result,
+                &language,
+                &foreground,
+                cancel_token.clone(),
+            )
+            .await;
+        self.unregister_inflight_foreground_cancel(voice_channel_id, &cancel_token);
+        // #2250: if cancel won the race (e.g. user barge-in or guild
+        // teardown), suppress fallback speech and skip TTS entirely.
+        // Otherwise the user would still hear the completion summary
+        // after they explicitly stopped.
+        if cancel_token.cancelled.load(Ordering::Relaxed) {
+            tracing::info!(
+                voice_channel_id = voice_channel_id.get(),
+                background_channel_id = background_channel_id.get(),
+                cancel_source = ?cancel_token.cancel_source(),
+                "voice background completion summary suppressed because cancel won the race (#2250)"
+            );
+            return;
+        }
+        let summary = summary_result.unwrap_or_else(|| {
+            fallback_voice_background_result_summary(
+                background_result,
+                &language,
+                foreground.max_chars,
+                failed,
+            )
+        });
+        if summary.trim().is_empty() {
+            return;
+        }
+        tracing::info!(
+            voice_channel_id = voice_channel_id.get(),
+            background_channel_id = background_channel_id.get(),
+            foreground_provider = %foreground.provider,
+            foreground_model = %foreground.model,
+            failed,
+            summary_chars = summary.chars().count(),
+            "voice background completion summary queued"
+        );
+        self.speak_progress_text(
+            shared,
+            voice_channel_id,
+            &summary,
+            "voice background result summary",
+        )
+        .await;
+    }
+
+    async fn play_processing_chime(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+    ) {
+        let Some(path) = self.processing_chime_path().await else {
+            return;
+        };
+        self.play_progress_audio(shared, channel_id, path, "voice processing chime")
+            .await;
+    }
+
+    async fn processing_chime_path(&self) -> Option<PathBuf> {
+        let config = self.cached_config().await;
+        let path = crate::voice::utils::expand_tilde(&config.voice.audio.temp_dir)
+            .join(PROCESSING_CHIME_FILE_NAME);
+        let path_for_task = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            ensure_processing_chime_file(&path_for_task).map(|_| path_for_task)
+        })
+        .await
+        {
+            Ok(Ok(path)) => Some(path),
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "voice processing chime generation failed");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "voice processing chime generation task failed");
+                None
+            }
+        }
+    }
+
     pub(in crate::services::discord) async fn set_sensitivity(
         &self,
         sensitivity: BargeInSensitivity,
@@ -1654,6 +2146,257 @@ impl VoiceBargeInRuntime {
         let sensitivity = self.sensitivity.apply_voice_command(transcript).await?;
         self.update_existing_monitor_sensitivity(sensitivity);
         Some(sensitivity)
+    }
+
+    #[allow(dead_code)] // #3034: test-only playback-reset; prod uses reset_after_playback_start_with_owner
+    pub(in crate::services::discord) fn reset_after_playback_start<P>(
+        &self,
+        channel_id: ChannelId,
+        player: Arc<P>,
+        cancellation: CancellationToken,
+    ) where
+        P: BargeInPlayerStop + 'static,
+    {
+        self.reset_after_playback_start_with_owner(channel_id, player, cancellation, None);
+    }
+
+    fn reset_after_playback_start_with_owner<P>(
+        &self,
+        channel_id: ChannelId,
+        player: Arc<P>,
+        cancellation: CancellationToken,
+        owner: Option<u64>,
+    ) where
+        P: BargeInPlayerStop + 'static,
+    {
+        if !self.barge_in_enabled {
+            return;
+        }
+
+        let sensitivity = self.current_sensitivity();
+        let monitor = self.monitor_for_channel(channel_id, sensitivity);
+        {
+            let mut monitor = lock_monitor(&monitor);
+            monitor.set_sensitivity(sensitivity);
+            monitor.reset_after_playback_start();
+        }
+
+        let player: Arc<dyn BargeInPlayerStop> = player;
+        self.playbacks.insert(
+            channel_id.get(),
+            Arc::new(LivePlaybackSession {
+                player,
+                cancellation,
+                owner,
+            }),
+        );
+    }
+
+    #[allow(dead_code)] // #3034: test-only playback clear; prod uses clear_playback_if_owner
+    pub(in crate::services::discord) fn clear_playback(&self, channel_id: ChannelId) {
+        self.playbacks.remove(&channel_id.get());
+    }
+
+    fn clear_playback_if_owner(&self, channel_id: ChannelId, owner: u64) {
+        self.playbacks
+            .remove_if(&channel_id.get(), |_, session| session.owner == Some(owner));
+    }
+
+    fn start_spoken_result_playback(&self, channel_id: ChannelId) -> (u64, CancellationToken) {
+        let id = self.id_sequences.next_spoken_result_playback_id();
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = self.spoken_result_playbacks.insert(
+            channel_id.get(),
+            SpokenResultPlaybackSession {
+                id,
+                cancellation: cancellation.clone(),
+            },
+        ) {
+            previous.cancellation.cancel();
+        }
+        (id, cancellation)
+    }
+
+    fn clear_spoken_result_playback_if_current(&self, channel_id: ChannelId, id: u64) {
+        self.spoken_result_playbacks
+            .remove_if(&channel_id.get(), |_, session| session.id == id);
+    }
+
+    pub(in crate::services::discord) fn observe_live_pcm_i16(
+        &self,
+        channel_id: ChannelId,
+        samples: &[i16],
+    ) -> Option<LiveBargeInCut> {
+        if !self.barge_in_enabled || samples.is_empty() {
+            return None;
+        }
+
+        let playback = self
+            .playbacks
+            .get(&channel_id.get())
+            .map(|entry| entry.value().clone())?;
+        let sensitivity = self.current_sensitivity();
+        let monitor = self.monitor_for_channel(channel_id, sensitivity);
+        let mut monitor = lock_monitor(&monitor);
+        monitor.set_sensitivity(sensitivity);
+
+        let pcm = pcm_i16_to_le_bytes(samples);
+        match monitor.observe_pcm(&pcm, playback.player.as_ref(), &playback.cancellation) {
+            Ok(Some(cut)) => {
+                self.playbacks.remove(&channel_id.get());
+                Some(cut)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    channel_id = channel_id.get(),
+                    "voice live barge-in stop failed"
+                );
+                None
+            }
+        }
+    }
+
+    pub(in crate::services::discord) fn observe_streaming_stt_pcm_i16(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        user_id: u64,
+        samples: &[i16],
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        let pcm = discord_pcm_i16_stereo_48k_to_mono_f32_16k(samples);
+        if pcm.is_empty() {
+            return;
+        }
+        let runtime = self.clone();
+        let key = StreamingSttKey {
+            channel_id: channel_id.get(),
+            user_id,
+        };
+        let task_bucket = self
+            .streaming_stt
+            .feed_tasks()
+            .entry(key)
+            .or_insert_with(|| Arc::new(StdMutex::new(Vec::new())))
+            .clone();
+        let handle = tokio::spawn(async move {
+            runtime
+                .feed_streaming_stt_pcm(channel_id, user_id, pcm)
+                .await;
+        });
+        if let Ok(mut tasks) = task_bucket.lock() {
+            tasks.push(handle);
+        } else {
+            handle.abort();
+        }
+    }
+
+    async fn feed_streaming_stt_pcm(
+        self: &Arc<Self>,
+        channel_id: ChannelId,
+        user_id: u64,
+        pcm: Vec<f32>,
+    ) {
+        let Some(stt) = self.stt.read().await.clone() else {
+            return;
+        };
+        if !stt.is_streaming() {
+            return;
+        }
+
+        let key = StreamingSttKey {
+            channel_id: channel_id.get(),
+            user_id,
+        };
+        let session = match self.streaming_stt.sessions().get(&key) {
+            Some(entry) => entry.value().clone(),
+            None => {
+                let language = self.spoken_result_language().await;
+                let new_session = match stt.start_session(&language).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            channel_id = channel_id.get(),
+                            user_id,
+                            "voice streaming STT session start failed"
+                        );
+                        return;
+                    }
+                };
+                match self.streaming_stt.sessions().entry(key) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => {
+                        let existing = entry.get().clone();
+                        if let Err(error) = stt.finalize(new_session).await {
+                            tracing::debug!(
+                                error = %error,
+                                channel_id = channel_id.get(),
+                                user_id,
+                                "discarding duplicate voice streaming STT session failed"
+                            );
+                        }
+                        existing
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(new_session.clone());
+                        new_session
+                    }
+                }
+            }
+        };
+
+        if let Err(error) = stt.feed(&session, &pcm).await {
+            tracing::warn!(
+                error = %error,
+                channel_id = channel_id.get(),
+                user_id,
+                "voice streaming STT feed failed"
+            );
+            return;
+        }
+
+        match stt.poll_partial(&session).await {
+            Ok(Some(partial)) => {
+                tracing::debug!(
+                    channel_id = channel_id.get(),
+                    user_id,
+                    sequence = partial.window.as_ref().map(|window| window.sequence),
+                    chars = partial.text.chars().count(),
+                    "voice streaming STT partial updated"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    channel_id = channel_id.get(),
+                    user_id,
+                    "voice streaming STT partial poll failed"
+                );
+            }
+        }
+    }
+
+    async fn drain_streaming_stt_feed_tasks(&self, key: StreamingSttKey) {
+        let Some((_, task_bucket)) = self.streaming_stt.feed_tasks().remove(&key) else {
+            return;
+        };
+        let tasks = match task_bucket.lock() {
+            Ok(mut tasks) => tasks.drain(..).collect::<Vec<_>>(),
+            Err(error) => error.into_inner().drain(..).collect::<Vec<_>>(),
+        };
+        for task in tasks {
+            if let Err(error) = task.await {
+                tracing::debug!(
+                    ?key,
+                    %error,
+                    "voice streaming STT feed task finished with join error before finalization"
+                );
+            }
+        }
     }
 
     pub(in crate::services::discord) async fn handle_processing_transcript(
@@ -2638,6 +3381,386 @@ impl VoiceBargeInRuntime {
         arc
     }
 
+    async fn resolve_effective_foreground_config(
+        &self,
+        source_channel_id: ChannelId,
+        target_channel_id: ChannelId,
+    ) -> EffectiveVoiceForegroundConfig {
+        let config = self.cached_config().await;
+        let mut provider = config.voice.foreground.provider.trim().to_string();
+        if provider.is_empty() {
+            provider = crate::voice::config::DEFAULT_FOREGROUND_PROVIDER.to_string();
+        }
+        let mut model = config.voice.foreground.model.trim().to_string();
+        if model.is_empty() {
+            model = crate::voice::config::DEFAULT_FOREGROUND_MODEL.to_string();
+        }
+        let mut max_chars = normalized_foreground_max_chars(config.voice.foreground.max_chars);
+        let mut timeout_ms = normalized_foreground_timeout_ms(config.voice.foreground.timeout_ms);
+
+        if let Some(agent) = config.agents.iter().find(|agent| {
+            agent_voice_matches_channel(agent, source_channel_id)
+                || agent_text_channel_matches(agent, target_channel_id)
+                || agent_text_channel_matches(agent, source_channel_id)
+        }) {
+            if let Some(value) = agent
+                .voice
+                .foreground
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                provider = value.to_string();
+            }
+            if let Some(value) = agent
+                .voice
+                .foreground
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                model = value.to_string();
+            }
+            if let Some(value) = agent.voice.foreground.max_chars {
+                max_chars = normalized_foreground_max_chars(value);
+            }
+            if let Some(value) = agent.voice.foreground.timeout_ms {
+                timeout_ms = normalized_foreground_timeout_ms(value);
+            }
+        }
+
+        EffectiveVoiceForegroundConfig {
+            provider,
+            model,
+            max_chars,
+            timeout_ms,
+        }
+    }
+
+    async fn resolve_voice_background_channel_for_source(
+        &self,
+        source_channel_id: ChannelId,
+    ) -> Option<ChannelId> {
+        if let Some(route) = self.active_voice_routes.get(&source_channel_id.get()) {
+            return Some(route.channel_id);
+        }
+        let config = self.cached_config().await;
+        config
+            .agents
+            .iter()
+            .find_map(|agent| agent_voice_background_channel_for(agent, source_channel_id))
+    }
+
+    async fn active_barge_in_mailbox_channel(
+        &self,
+        shared: &Arc<SharedData>,
+        source_channel_id: ChannelId,
+    ) -> Option<ChannelId> {
+        let routed_channel_id = self
+            .active_voice_routes
+            .get(&source_channel_id.get())
+            .map(|entry| entry.value().channel_id);
+        if let Some(channel_id) = routed_channel_id {
+            if super::mailbox_has_active_turn(shared, channel_id).await {
+                return Some(channel_id);
+            }
+        }
+        if super::mailbox_has_active_turn(shared, source_channel_id).await {
+            return Some(source_channel_id);
+        }
+        None
+    }
+
+    /// Reverse lookup: given a background text channel, find the foreground
+    /// voice channel that should hear the spoken summary.
+    ///
+    /// #2236: in multi-agent setups, multiple `AgentDef` entries can map the
+    /// same background channel (either intentionally — shared workspace — or
+    /// by misconfiguration). The previous implementation silently picked the
+    /// FIRST matching agent. This is a fail-closed reverse lookup:
+    ///
+    /// 1. If a current active voice route matches the background channel,
+    ///    that route wins (runtime state is always more specific than
+    ///    config). When `expected_agent_id` is provided, prefer an active
+    ///    route whose agent matches.
+    /// 2. Otherwise, scan the config for agents whose
+    ///    `agent_voice_channel_for_background` resolves the background
+    ///    channel. If exactly one matches, return it. If multiple match,
+    ///    require `expected_agent_id` to disambiguate; if absent or no
+    ///    config agent matches by id, log a warn and return None
+    ///    (fail-closed — rather than speak into the wrong agent's voice
+    ///    channel).
+    pub(in crate::services::discord) async fn voice_channel_for_background(
+        &self,
+        background_channel_id: ChannelId,
+        expected_agent_id: Option<&str>,
+    ) -> Option<ChannelId> {
+        let active_matches: Vec<(u64, String)> = self
+            .active_voice_routes
+            .iter()
+            .filter(|entry| entry.value().channel_id == background_channel_id)
+            .map(|entry| (*entry.key(), entry.value().agent_id.clone()))
+            .collect();
+        match active_matches.len() {
+            0 => {}
+            1 => return Some(ChannelId::new(active_matches[0].0)),
+            _ => {
+                if let Some(agent_id) = expected_agent_id {
+                    if let Some((source, _)) = active_matches
+                        .iter()
+                        .find(|(_, route_agent)| route_agent == agent_id)
+                    {
+                        return Some(ChannelId::new(*source));
+                    }
+                    tracing::warn!(
+                        event = "voice_background_active_route_agent_mismatch",
+                        background_channel_id = background_channel_id.get(),
+                        expected_agent_id = %agent_id,
+                        candidate_agents = ?active_matches
+                            .iter()
+                            .map(|(_, agent)| agent.as_str())
+                            .collect::<Vec<_>>(),
+                        "multiple active voice routes share the same background channel but none match the expected agent_id; refusing to pick silently"
+                    );
+                    return None;
+                }
+                tracing::warn!(
+                    event = "voice_background_multi_active_route_no_disambiguator",
+                    background_channel_id = background_channel_id.get(),
+                    candidate_agents = ?active_matches
+                        .iter()
+                        .map(|(_, agent)| agent.as_str())
+                        .collect::<Vec<_>>(),
+                    "multiple active voice routes share the same background channel and dispatch carried no agent_id; refusing to pick silently"
+                );
+                return None;
+            }
+        }
+        let config = self.cached_config().await;
+        let mut matches: Vec<(String, ChannelId)> = config
+            .agents
+            .iter()
+            .filter_map(|agent| {
+                agent_voice_channel_for_background(agent, background_channel_id)
+                    .map(|voice_channel| (agent.id.clone(), voice_channel))
+            })
+            .collect();
+        match matches.len() {
+            0 => None,
+            1 => Some(matches.remove(0).1),
+            _ => {
+                let candidate_agents: Vec<&str> = matches
+                    .iter()
+                    .map(|(agent_id, _)| agent_id.as_str())
+                    .collect();
+                if let Some(expected) = expected_agent_id {
+                    if let Some((_, voice_channel)) =
+                        matches.iter().find(|(agent_id, _)| agent_id == expected)
+                    {
+                        tracing::warn!(
+                            event = "voice_background_multi_agent_disambiguated",
+                            background_channel_id = background_channel_id.get(),
+                            expected_agent_id = %expected,
+                            candidate_agents = ?candidate_agents,
+                            "multiple config agents share the same background channel; disambiguated by dispatch agent_id"
+                        );
+                        return Some(*voice_channel);
+                    }
+                    tracing::warn!(
+                        event = "voice_background_multi_agent_unknown_id",
+                        background_channel_id = background_channel_id.get(),
+                        expected_agent_id = %expected,
+                        candidate_agents = ?candidate_agents,
+                        "dispatch agent_id does not match any config agent claiming this background channel; refusing to pick silently"
+                    );
+                    None
+                } else {
+                    tracing::warn!(
+                        event = "voice_background_multi_agent_no_disambiguator",
+                        background_channel_id = background_channel_id.get(),
+                        candidate_agents = ?candidate_agents,
+                        "multiple config agents claim the same background channel and dispatch carried no agent_id; refusing to pick silently (#2236 fail-closed)"
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    async fn resolve_voice_turn_target(
+        &self,
+        _shared: &Arc<SharedData>,
+        source_channel_id: ChannelId,
+        transcript: &str,
+    ) -> VoiceTurnTargetResolution {
+        let config = self.cached_config().await;
+        if let Some((agent_id, target_channel_id)) = config.agents.iter().find_map(|agent| {
+            agent_voice_background_channel_for(agent, source_channel_id)
+                .map(|channel_id| (agent.id.clone(), channel_id))
+        }) {
+            self.bind_routed_voice_context(source_channel_id, target_channel_id);
+            self.active_voice_routes.insert(
+                source_channel_id.get(),
+                ActiveVoiceRoute {
+                    agent_id,
+                    channel_id: target_channel_id,
+                    updated_at: Instant::now(),
+                },
+            );
+            return VoiceTurnTargetResolution::Target {
+                channel_id: target_channel_id,
+                transcript: transcript.trim().to_string(),
+            };
+        }
+
+        if super::settings::resolve_role_binding(source_channel_id, None).is_some() {
+            return VoiceTurnTargetResolution::Target {
+                channel_id: source_channel_id,
+                transcript: transcript.trim().to_string(),
+            };
+        }
+
+        if !voice_lobby_accepts_source_channel(&config.voice, source_channel_id) {
+            tracing::debug!(
+                source_channel_id = source_channel_id.get(),
+                lobby_channel_id = config.voice.lobby_channel_id.as_deref(),
+                "voice source channel is not role-bound or configured as voice lobby"
+            );
+            return VoiceTurnTargetResolution::Ignored;
+        }
+
+        let active_context = self
+            .active_voice_routes
+            .get(&source_channel_id.get())
+            .map(|entry| VoiceActiveAgentContext {
+                agent_id: entry.agent_id.clone(),
+                channel_id: entry.channel_id.get(),
+                updated_at: entry.updated_at,
+            });
+        let now = Instant::now();
+        match resolve_voice_lobby_route(&config, transcript, active_context.as_ref(), now) {
+            Ok(VoiceLobbyRouteDecision::Routed(route)) => {
+                let remaining = route.remaining_transcript.trim();
+                if remaining.is_empty() {
+                    return VoiceTurnTargetResolution::NeedsAgent;
+                }
+                let target_channel_id = ChannelId::new(route.channel_id);
+                self.bind_routed_voice_context(source_channel_id, target_channel_id);
+                self.active_voice_routes.insert(
+                    source_channel_id.get(),
+                    ActiveVoiceRoute {
+                        agent_id: route.agent_id,
+                        channel_id: target_channel_id,
+                        updated_at: now,
+                    },
+                );
+                VoiceTurnTargetResolution::Target {
+                    channel_id: target_channel_id,
+                    transcript: remaining.to_string(),
+                }
+            }
+            Ok(VoiceLobbyRouteDecision::ContinueActive {
+                agent_id,
+                channel_id,
+                transcript,
+            }) => {
+                let target_channel_id = ChannelId::new(channel_id);
+                self.bind_routed_voice_context(source_channel_id, target_channel_id);
+                self.active_voice_routes.insert(
+                    source_channel_id.get(),
+                    ActiveVoiceRoute {
+                        agent_id,
+                        channel_id: target_channel_id,
+                        updated_at: now,
+                    },
+                );
+                VoiceTurnTargetResolution::Target {
+                    channel_id: target_channel_id,
+                    transcript,
+                }
+            }
+            Ok(VoiceLobbyRouteDecision::NeedAgent) => VoiceTurnTargetResolution::NeedsAgent,
+            Err(error) => {
+                // F12 (#2046): 매 utterance 마다 같은 collision 으로 warn 이
+                // 쏟아지는 것을 막기 위해 normalized signature 단위로 1회만 warn.
+                let signature = error.normalized.clone();
+                let first_time = if let Ok(mut guard) = self.alias_collision_signature.lock() {
+                    if guard.as_deref() == Some(&signature) {
+                        false
+                    } else {
+                        *guard = Some(signature.clone());
+                        true
+                    }
+                } else {
+                    true
+                };
+                if first_time {
+                    tracing::warn!(
+                        error = %error,
+                        source_channel_id = source_channel_id.get(),
+                        normalized = %signature,
+                        "voice lobby routing disabled: alias collision detected (suppressed until alias changes)"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %error,
+                        source_channel_id = source_channel_id.get(),
+                        "voice lobby routing still blocked by previously logged alias collision"
+                    );
+                }
+                VoiceTurnTargetResolution::NeedsAgent
+            }
+        }
+    }
+
+    fn bind_routed_voice_context(
+        &self,
+        source_channel_id: ChannelId,
+        target_channel_id: ChannelId,
+    ) {
+        let Some(guild_id) = self
+            .voice_guilds
+            .get(&source_channel_id.get())
+            .map(|entry| *entry.value())
+        else {
+            return;
+        };
+        self.voice_guilds.insert(target_channel_id.get(), guild_id);
+    }
+
+    fn voice_turn_guild_id(
+        &self,
+        source_channel_id: ChannelId,
+        target_channel_id: ChannelId,
+    ) -> Option<GuildId> {
+        self.voice_guilds
+            .get(&source_channel_id.get())
+            .map(|entry| *entry.value())
+            .or_else(|| {
+                self.voice_guilds
+                    .get(&target_channel_id.get())
+                    .map(|entry| *entry.value())
+            })
+    }
+
+    async fn ask_for_agent(&self, shared: &Arc<SharedData>, channel_id: ChannelId) {
+        let Some(http) = shared.serenity_http_or_token_fallback() else {
+            return;
+        };
+        super::rate_limit_wait(shared, channel_id).await;
+        if let Err(error) =
+            super::http::send_channel_message(&http, channel_id, "어느 에이전트?").await
+        {
+            tracing::warn!(
+                error = %error,
+                channel_id = channel_id.get(),
+                "failed to send voice lobby routing prompt"
+            );
+        }
+    }
+
     pub(in crate::services::discord) async fn process_completed_utterance(
         self: &Arc<Self>,
         shared: &Arc<SharedData>,
@@ -2853,11 +3976,501 @@ impl VoiceBargeInRuntime {
         })
     }
 
+    async fn synthesize_acknowledgement(
+        &self,
+        text: &str,
+        channel_id: ChannelId,
+    ) -> Option<PathBuf> {
+        self.synthesize_progress_tts(text, channel_id, "voice barge-in acknowledgement")
+            .await
+    }
+
+    async fn synthesize_progress_tts(
+        &self,
+        text: &str,
+        channel_id: ChannelId,
+        context: &'static str,
+    ) -> Option<PathBuf> {
+        #[cfg(test)]
+        {
+            let request_index = {
+                let mut requests = self
+                    .test_state
+                    .synth_requests
+                    .lock()
+                    .expect("voice test synth requests lock");
+                requests.push((channel_id.get(), text.to_string(), context));
+                requests.len()
+            };
+            if self.test_state.force_synth_success.load(Ordering::Relaxed) {
+                return Some(
+                    std::env::temp_dir()
+                        .join(format!("agentdesk-test-voice-progress-{request_index}.wav")),
+                );
+            }
+        }
+        let Some(tts) = self.tts.read().await.clone() else {
+            return None;
+        };
+        match tts.synthesize(text, TtsSynthesisKind::Progress).await {
+            Ok(output) => {
+                tracing::info!(
+                    channel_id = channel_id.get(),
+                    path = %output.path.display(),
+                    cache_status = ?output.cache_status,
+                    context,
+                    "voice progress TTS synthesized"
+                );
+                Some(output.path)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    channel_id = channel_id.get(),
+                    context,
+                    "voice progress TTS synthesis failed"
+                );
+                None
+            }
+        }
+    }
+
+    async fn play_acknowledgement(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+        path: PathBuf,
+    ) {
+        self.play_progress_audio(shared, channel_id, path, "voice barge-in acknowledgement")
+            .await;
+    }
+
+    async fn play_progress_audio(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+        path: PathBuf,
+        context: &'static str,
+    ) {
+        #[cfg(test)]
+        self.test_state
+            .play_requests
+            .lock()
+            .expect("voice test play requests lock")
+            .push((channel_id.get(), context));
+
+        let Some(guild_id) = self
+            .voice_guilds
+            .get(&channel_id.get())
+            .map(|entry| *entry.value())
+        else {
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                path = %path.display(),
+                context,
+                "voice progress playback skipped: no registered voice guild"
+            );
+            return;
+        };
+        let Some(ctx) = shared.cached_serenity_ctx.get() else {
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                guild_id = guild_id.get(),
+                path = %path.display(),
+                context,
+                "voice progress playback skipped: no serenity context"
+            );
+            return;
+        };
+        let Some(manager) = songbird::get(ctx).await else {
+            tracing::warn!(
+                channel_id = channel_id.get(),
+                guild_id = guild_id.get(),
+                context,
+                "voice progress playback skipped: songbird manager missing"
+            );
+            return;
+        };
+        let Some(call_lock) = manager.get(guild_id) else {
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                guild_id = guild_id.get(),
+                path = %path.display(),
+                context,
+                "voice progress playback skipped: no active songbird call"
+            );
+            return;
+        };
+
+        let input = songbird::input::File::new(path.clone()).into();
+        let track = {
+            let mut call = call_lock.lock().await;
+            call.play_input(input)
+        };
+        // F4 (#2046): owner id 발급 + reset_after_playback_start_with_owner 로 등록.
+        // 30s 만료 타이머는 `clear_playback_if_owner` 로 동일 owner 일 때만 정리.
+        // 후속 progress/spoken_result playback 이 entry 를 덮어쓰면 mismatch 로
+        // no-op → 후속 playback 의 barge-in 이 깨지지 않는다.
+        let playback_id = self.id_sequences.next_progress_playback_id();
+        self.reset_after_playback_start_with_owner(
+            channel_id,
+            Arc::new(track),
+            CancellationToken::new(),
+            Some(playback_id),
+        );
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            runtime.clear_playback_if_owner(channel_id, playback_id);
+        });
+        tracing::info!(
+            channel_id = channel_id.get(),
+            guild_id = guild_id.get(),
+            path = %path.display(),
+            context,
+            playback_id,
+            "voice progress playback started"
+        );
+    }
+
+    pub(in crate::services::discord) async fn spawn_spoken_result_playback(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        channel_id: ChannelId,
+        answer: &str,
+    ) {
+        // Voice #10: agent stage ends when the answer is ready for TTS.
+        // Record even if TTS bails below — keeps the partial latency state
+        // monotonic with the agent timeline.
+        crate::voice::metrics::finish_agent_start(channel_id.get());
+
+        let Some(tts) = self.tts.read().await.clone() else {
+            // Voice #10: drop the partial latency record so the next turn
+            // doesn't inherit stale stt/agent ms.
+            crate::voice::metrics::discard(channel_id.get());
+            return;
+        };
+        let language = self.spoken_result_language().await;
+        let spoken_result_max_chars = self.cached_config().await.voice.spoken_result.max_chars;
+        let spoken_result_max_chars = if spoken_result_max_chars == 0 {
+            crate::voice::sanitizer::DEFAULT_SPOKEN_RESULT_CHAR_LIMIT
+        } else {
+            spoken_result_max_chars
+        };
+        let spoken = spoken_result_only_with_limit(answer, &language, spoken_result_max_chars);
+        if spoken.trim().is_empty() {
+            crate::voice::metrics::discard(channel_id.get());
+            return;
+        }
+
+        let Some(guild_id) = self
+            .voice_guilds
+            .get(&channel_id.get())
+            .map(|entry| *entry.value())
+        else {
+            crate::voice::metrics::discard(channel_id.get());
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                "voice final TTS playback skipped: no registered voice guild"
+            );
+            return;
+        };
+        let Some(ctx) = shared.cached_serenity_ctx.get() else {
+            crate::voice::metrics::discard(channel_id.get());
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                guild_id = guild_id.get(),
+                "voice final TTS playback skipped: no serenity context"
+            );
+            return;
+        };
+        let Some(manager) = songbird::get(ctx).await else {
+            crate::voice::metrics::discard(channel_id.get());
+            tracing::warn!(
+                channel_id = channel_id.get(),
+                guild_id = guild_id.get(),
+                "voice final TTS playback skipped: songbird manager missing"
+            );
+            return;
+        };
+        let Some(call_lock) = manager.get(guild_id) else {
+            crate::voice::metrics::discard(channel_id.get());
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                guild_id = guild_id.get(),
+                "voice final TTS playback skipped: no active songbird call"
+            );
+            return;
+        };
+
+        let runtime = self.clone();
+        let (playback_id, cancellation) = self.start_spoken_result_playback(channel_id);
+        let playback_cancellation = cancellation.clone();
+        let register_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            let runtime_for_track = runtime.clone();
+            let register_track = move |track| {
+                runtime_for_track.reset_after_playback_start_with_owner(
+                    channel_id,
+                    Arc::new(track),
+                    register_cancellation.clone(),
+                    Some(playback_id),
+                );
+            };
+
+            let result = play_chunked_with_prefetch(
+                call_lock,
+                tts,
+                spoken,
+                DEFAULT_TTS_CHUNK_MAX_CHARS,
+                playback_cancellation,
+                register_track,
+            )
+            .await;
+
+            runtime.clear_playback_if_owner(channel_id, playback_id);
+            runtime.clear_spoken_result_playback_if_current(channel_id, playback_id);
+            match result {
+                Ok(report) => {
+                    let synth_ms = report
+                        .first_chunk_synthesis_ms
+                        .unwrap_or(0)
+                        .min(u64::MAX as u128) as u64;
+                    let first_audio_out_ms = report
+                        .first_audio_start_ms
+                        .unwrap_or(0)
+                        .min(u64::MAX as u128) as u64;
+                    crate::voice::metrics::record_tts(
+                        channel_id.get(),
+                        synth_ms,
+                        first_audio_out_ms,
+                    );
+                    tracing::info!(
+                        channel_id = channel_id.get(),
+                        guild_id = guild_id.get(),
+                        chunks = report.chunk_count,
+                        played_chunks = report.played_chunks,
+                        first_chunk_synthesis_ms = ?report.first_chunk_synthesis_ms,
+                        first_audio_out_ms,
+                        first_audio_start_ms = ?report.first_audio_start_ms,
+                        "voice final TTS chunked playback finished"
+                    );
+                }
+                Err(error) => {
+                    crate::voice::metrics::discard(channel_id.get());
+                    tracing::warn!(
+                        error = %error,
+                        channel_id = channel_id.get(),
+                        guild_id = guild_id.get(),
+                        "voice final TTS chunked playback failed"
+                    );
+                }
+            }
+        });
+    }
+
+    async fn transcribe_completed_utterance(
+        &self,
+        channel_id: ChannelId,
+        utterance: &CompletedUtterance,
+    ) -> Option<TranscribedVoiceUtterance> {
+        let stt_started_at = std::time::Instant::now();
+        if let Some(stt) = self.stt.read().await.clone() {
+            if stt.is_streaming() {
+                let key = StreamingSttKey {
+                    channel_id: channel_id.get(),
+                    user_id: utterance.user_id,
+                };
+                self.drain_streaming_stt_feed_tasks(key).await;
+                if let Some((_, session)) = self.streaming_stt.sessions().remove(&key) {
+                    match stt.finalize(session).await {
+                        Ok(transcript) if !transcript.text.trim().is_empty() => {
+                            let stt_latency_ms =
+                                stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            crate::voice::metrics::record_stt(
+                                channel_id.get(),
+                                Some(&utterance.utterance_id),
+                                stt_latency_ms,
+                            );
+                            return Some(TranscribedVoiceUtterance {
+                                text: transcript.text,
+                                stt_mode: "stream",
+                                stt_latency_ms,
+                            });
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                channel_id = channel_id.get(),
+                                utterance_id = %utterance.utterance_id,
+                                "voice streaming STT finalized empty transcript; falling back to file STT"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                channel_id = channel_id.get(),
+                                utterance_id = %utterance.utterance_id,
+                                "voice streaming STT finalize failed; falling back to file STT"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        channel_id = channel_id.get(),
+                        utterance_id = %utterance.utterance_id,
+                        "voice streaming STT had no live session for utterance; falling back to file STT"
+                    );
+                }
+            }
+
+            match stt.transcribe_file(&utterance.path).await {
+                Ok(transcript) => {
+                    let stt_latency_ms =
+                        stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    crate::voice::metrics::record_stt(
+                        channel_id.get(),
+                        Some(&utterance.utterance_id),
+                        stt_latency_ms,
+                    );
+                    return Some(TranscribedVoiceUtterance {
+                        text: transcript,
+                        stt_mode: if stt.is_streaming() {
+                            "file_fallback"
+                        } else {
+                            "file"
+                        },
+                        stt_latency_ms,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        channel_id = channel_id.get(),
+                        utterance_id = %utterance.utterance_id,
+                        path = %utterance.path.display(),
+                        "voice STT transcription failed; falling back to transcript sidecar"
+                    );
+                }
+            }
+        }
+
+        let Some(transcript) = self.wait_for_stt_transcript(utterance).await else {
+            tracing::debug!(
+                channel_id = channel_id.get(),
+                utterance_id = %utterance.utterance_id,
+                path = %utterance.path.display(),
+                "voice barge-in skipped utterance because no STT transcript sidecar appeared"
+            );
+            return None;
+        };
+        let stt_latency_ms = stt_started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        crate::voice::metrics::record_stt(
+            channel_id.get(),
+            Some(&utterance.utterance_id),
+            stt_latency_ms,
+        );
+        Some(TranscribedVoiceUtterance {
+            text: transcript,
+            stt_mode: "sidecar",
+            stt_latency_ms,
+        })
+    }
+
+    async fn wait_for_stt_transcript(&self, utterance: &CompletedUtterance) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + STT_TRANSCRIPT_POLL_TIMEOUT;
+        let candidates = self.transcript_path_candidates(utterance);
+        loop {
+            for path in &candidates {
+                match tokio::fs::read_to_string(path).await {
+                    Ok(text) if !text.trim().is_empty() => return Some(text),
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            path = %path.display(),
+                            utterance_id = %utterance.utterance_id,
+                            "failed to read voice STT transcript sidecar"
+                        );
+                    }
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(STT_TRANSCRIPT_POLL_INTERVAL).await;
+        }
+    }
+
+    fn transcript_path_candidates(&self, utterance: &CompletedUtterance) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        candidates.push(utterance.path.with_extension("txt"));
+        for dir in &self.transcript_dirs {
+            candidates.push(
+                dir.join(format!("user_{}", utterance.user_id))
+                    .join(format!("{}.txt", utterance.utterance_id)),
+            );
+            candidates.push(dir.join(format!("{}.txt", utterance.utterance_id)));
+        }
+        candidates
+    }
+
+    /// #2156: process_completed_utterance 가 끝나면 utterance wav / segment wav /
+    /// transcript sidecar 를 삭제한다. config `voice.keep_recordings` 가 true 거나
+    /// 환경변수 `ADK_VOICE_KEEP_WAV=1` 이면 보존한다.
+    ///
+    /// Race 노트: 외부 STT subprocess 가 sidecar `.txt` 를 비동기로 쓰는 경로에서,
+    /// `wait_for_stt_transcript` 의 polling 이 timeout 으로 끝난 직후 cleanup 이
+    /// 돌면 sidecar 가 늦게 도착해 즉시 삭제될 수 있다. 이미 polling 단계에서
+    /// 충분히 기다린 뒤이므로 손실은 운영자 관점에서 "이 utterance 는 STT 가
+    /// 끝내 실패한 것" 과 동치다. 보존이 필요하면 `keep_recordings=true` 로 두면
+    /// sidecar 가 그대로 남는다.
+    async fn cleanup_utterance_artifacts(&self, utterance: &CompletedUtterance) {
+        if self.voice_config_state.read().await.keep_voice_recordings() {
+            return;
+        }
+        remove_file_quietly(&utterance.path).await;
+        for segment in &utterance.segment_paths {
+            remove_file_quietly(segment).await;
+        }
+        for candidate in self.transcript_path_candidates(utterance) {
+            remove_file_quietly_silent(&candidate).await;
+        }
+    }
+
     fn buffer_for_channel(&self, channel_id: ChannelId) -> Arc<Mutex<DeferredBargeInBuffer>> {
         self.deferred_buffers
             .entry(channel_id.get())
             .or_insert_with(|| Arc::new(Mutex::new(DeferredBargeInBuffer::new())))
             .clone()
+    }
+
+    fn monitor_for_channel(
+        &self,
+        channel_id: ChannelId,
+        sensitivity: BargeInSensitivity,
+    ) -> Arc<std::sync::Mutex<LiveBargeInMonitor>> {
+        self.monitors
+            .entry(channel_id.get())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(LiveBargeInMonitor::new(sensitivity)))
+            })
+            .clone()
+    }
+
+    fn current_sensitivity(&self) -> BargeInSensitivity {
+        // F18 (#2046): try_read 실패 시 boot-time default 가 아닌 가장 최근에
+        // 설정된 sensitivity 를 반환하도록 atomic mirror 로 폴백한다. TTL reset
+        // 이 일어나는 짧은 윈도우라도 사용자가 설정한 Conservative 가 잠깐
+        // Normal 로 평가되는 회귀를 막는다.
+        self.sensitivity.current()
+    }
+
+    fn update_existing_monitor_sensitivity(&self, sensitivity: BargeInSensitivity) {
+        for monitor in &self.monitors {
+            lock_monitor(monitor.value()).set_sensitivity(sensitivity);
+        }
     }
 }
 
@@ -3045,12 +4658,6 @@ fn lock_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // S7 (#3038): test-only agent-voice routing helpers now live in the
-    // `routing` child (the prod-consumed ones arrive via `use super::*`).
-    use super::routing::{
-        agent_voice_background_channel_for, agent_voice_channel_for_background,
-        agent_voice_source_channel_for_background,
-    };
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Default)]
@@ -3165,50 +4772,39 @@ mod tests {
             skills_cache: tokio::sync::RwLock::new(Vec::new()),
             tmux_watchers: super::super::TmuxWatcherRegistry::new(),
             tmux_relay_coords: dashmap::DashMap::new(),
-            // #3038 S4: wrapped verbatim at the first-member position
-            // (evaluation-order preserved).
-            ui: super::super::PlaceholderState {
-                placeholder_cleanup: Arc::new(
-                    super::super::placeholder_cleanup::PlaceholderCleanupRegistry::default(),
-                ),
-                placeholder_controller: Arc::new(
-                    super::super::placeholder_controller::PlaceholderController::default(),
-                ),
-                placeholder_live_events: Arc::new(
-                    super::super::placeholder_live_events::PlaceholderLiveEvents::default(),
-                ),
-                placeholder_live_events_enabled: false,
-                status_panel_v2_enabled: false,
-            },
-            queued: super::super::QueuedPlaceholderState {
-                queued_placeholders: dashmap::DashMap::new(),
-                queue_exit_placeholder_clears: dashmap::DashMap::new(),
-                queued_placeholders_persist_locks: dashmap::DashMap::new(),
-            },
+            placeholder_cleanup: Arc::new(
+                super::super::placeholder_cleanup::PlaceholderCleanupRegistry::default(),
+            ),
+            placeholder_controller: Arc::new(
+                super::super::placeholder_controller::PlaceholderController::default(),
+            ),
+            placeholder_live_events: Arc::new(
+                super::super::placeholder_live_events::PlaceholderLiveEvents::default(),
+            ),
+            placeholder_live_events_enabled: false,
+            status_panel_v2_enabled: false,
+            queued_placeholders: dashmap::DashMap::new(),
+            queue_exit_placeholder_clears: dashmap::DashMap::new(),
+            queued_placeholders_persist_locks: dashmap::DashMap::new(),
             answer_flush_barrier: std::sync::Arc::new(
                 super::super::answer_flush_barrier::AnswerFlushBarrier::default(),
             ),
-            // #3038 S3: wrapped at the first-member position (evaluation-order
-            // preserved — the three members hoisted above the spawn calls are
-            // side-effect-free constructors; see run_bot_build_shared_data).
-            restart: super::super::RestartLifecycle {
-                recovering_channels: dashmap::DashMap::new(),
-                shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                current_generation: 0,
-                restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
-                recovery_started_at: std::time::Instant::now(),
-                recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
-                global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                shutdown_counted: std::sync::atomic::AtomicBool::new(false),
-            },
+            recovering_channels: dashmap::DashMap::new(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            current_generation: 0,
+            restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
+            recovery_started_at: std::time::Instant::now(),
+            recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
+            global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             turn_finalizer: super::super::turn_finalizer::TurnFinalizer::spawn(),
             status_panel_controller:
                 super::super::status_panel_controller::StatusPanelController::spawn(false),
+            global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_counted: std::sync::atomic::AtomicBool::new(false),
             intake_dedup: dashmap::DashMap::new(),
             dispatch_thread_parents: dashmap::DashMap::new(),
             voice_barge_in: Arc::new(VoiceBargeInRuntime::disabled()),
@@ -3217,25 +4813,21 @@ mod tests {
             ),
             bot_connected: std::sync::atomic::AtomicBool::new(false),
             last_turn_at: std::sync::Mutex::new(None),
-            overrides: super::super::SessionOverrideState {
-                model_overrides: dashmap::DashMap::new(),
-                fast_mode_channels: dashmap::DashSet::new(),
-                fast_mode_session_reset_pending: dashmap::DashSet::new(),
-                codex_goals_channels: dashmap::DashSet::new(),
-                codex_goals_session_reset_pending: dashmap::DashSet::new(),
-                model_session_reset_pending: dashmap::DashSet::new(),
-                session_reset_pending: dashmap::DashSet::new(),
-                model_picker_pending: dashmap::DashMap::new(),
-            },
+            model_overrides: dashmap::DashMap::new(),
+            fast_mode_channels: dashmap::DashSet::new(),
+            fast_mode_session_reset_pending: dashmap::DashSet::new(),
+            codex_goals_channels: dashmap::DashSet::new(),
+            codex_goals_session_reset_pending: dashmap::DashSet::new(),
+            model_session_reset_pending: dashmap::DashSet::new(),
+            session_reset_pending: dashmap::DashSet::new(),
+            model_picker_pending: dashmap::DashMap::new(),
             dispatch_role_overrides: dashmap::DashMap::new(),
             last_message_ids: dashmap::DashMap::new(),
             catch_up_retry_pending: dashmap::DashMap::new(),
             turn_start_times: dashmap::DashMap::new(),
             channel_rosters: dashmap::DashMap::new(),
-            http: super::super::RuntimeHttpCache {
-                cached_serenity_ctx: tokio::sync::OnceCell::new(),
-                cached_bot_token: tokio::sync::OnceCell::new(),
-            },
+            cached_serenity_ctx: tokio::sync::OnceCell::new(),
+            cached_bot_token: tokio::sync::OnceCell::new(),
             token_hash: "voice-handoff-test-token-hash".to_string(),
             provider: ProviderKind::Claude,
             api_port: 9,

@@ -289,13 +289,9 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
         fast_mode_reset_pending_for_provider(shared, fast_mode_channel_id, provider);
     let codex_goals_reset_pending = matches!(provider, ProviderKind::Codex)
         && shared
-            .overrides
             .codex_goals_session_reset_pending
             .contains(&fast_mode_channel_id);
-    let model_reset_pending = shared
-        .overrides
-        .model_session_reset_pending
-        .contains(&channel_id);
+    let model_reset_pending = shared.model_session_reset_pending.contains(&channel_id);
 
     let Some(plan) = pending_session_reset_plan(
         provider,
@@ -331,10 +327,7 @@ pub(in crate::services::discord) async fn reset_provider_session_if_pending(
         persist_codex_goals_reset_marker(shared, fast_mode_channel_id, false).await;
     }
     if model_reset_pending {
-        shared
-            .overrides
-            .model_session_reset_pending
-            .remove(&channel_id);
+        shared.model_session_reset_pending.remove(&channel_id);
     }
     sync_session_reset_pending(shared, channel_id);
     if fast_mode_channel_id != channel_id {
@@ -377,11 +370,8 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
 
     clear_fast_mode_reset_pending_for_channel(shared, channel_id);
     clear_codex_goals_reset_pending_for_channel(shared, channel_id);
-    shared
-        .overrides
-        .model_session_reset_pending
-        .remove(&channel_id);
-    shared.overrides.session_reset_pending.remove(&channel_id);
+    shared.model_session_reset_pending.remove(&channel_id);
+    shared.session_reset_pending.remove(&channel_id);
     clear_all_fast_mode_reset_markers(shared, channel_id).await;
     persist_codex_goals_reset_marker(shared, channel_id, false).await;
 
@@ -683,7 +673,7 @@ async fn persist_fast_mode_reset_marker(
     provider: &ProviderKind,
     pending: bool,
 ) {
-    let Some(token) = shared.http.cached_bot_token.get() else {
+    let Some(token) = shared.cached_bot_token.get() else {
         return;
     };
 
@@ -713,7 +703,7 @@ async fn persist_codex_goals_reset_marker(
     channel_id: serenity::ChannelId,
     pending: bool,
 ) {
-    let Some(token) = shared.http.cached_bot_token.get() else {
+    let Some(token) = shared.cached_bot_token.get() else {
         return;
     };
 
@@ -735,7 +725,7 @@ async fn clear_all_fast_mode_reset_markers(
     shared: &Arc<SharedData>,
     channel_id: serenity::ChannelId,
 ) {
-    let Some(token) = shared.http.cached_bot_token.get() else {
+    let Some(token) = shared.cached_bot_token.get() else {
         return;
     };
 

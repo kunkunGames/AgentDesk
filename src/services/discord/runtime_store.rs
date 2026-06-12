@@ -3,43 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub(super) fn agentdesk_root() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        test_agentdesk_root()
-    }
-    #[cfg(not(test))]
-    {
-        crate::config::runtime_root()
-    }
-}
-
-#[cfg(test)]
-fn test_agentdesk_root() -> Option<PathBuf> {
-    if let Ok(override_root) = std::env::var("AGENTDESK_ROOT_DIR") {
-        let trimmed = override_root.trim();
-        if !trimmed.is_empty() {
-            let root = PathBuf::from(trimmed);
-            assert_not_live_release_runtime_root(&root);
-            return Some(root);
-        }
-    }
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    Some(
-        ROOT.get_or_init(|| tempfile::tempdir().expect("create isolated test runtime root"))
-            .path()
-            .to_path_buf(),
-    )
-}
-
-#[cfg(test)]
-fn assert_not_live_release_runtime_root(root: &Path) {
-    if let Some(home) = dirs::home_dir() {
-        let live = home.join(".adk").join("release");
-        assert!(
-            root != live,
-            "#3293: test must set AGENTDESK_ROOT_DIR via tempdir before resolving AgentDesk runtime store root"
-        );
-    }
+    crate::config::runtime_root()
 }
 
 pub(super) fn runtime_root() -> Option<PathBuf> {
@@ -82,14 +46,6 @@ pub(super) fn discord_restart_reports_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_restart_reports"))
 }
 
-/// #3293 verify r1 (finding 3): durable preservation of the full assistant
-/// response + row metadata for every recovery force-clear. Kept OUT of
-/// `discord_restart_reports/` because that store is flushed-and-deleted on
-/// boot; these files are operator-recovery artifacts and are never GC'd.
-pub(super) fn discord_recovery_force_clear_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_recovery_force_clear"))
-}
-
 pub(crate) fn discord_pending_queue_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_pending_queue"))
 }
@@ -101,25 +57,6 @@ pub(crate) fn discord_pending_queue_root() -> Option<PathBuf> {
 /// dcserver restart mid-wait neither loses the turn nor resubmits the prompt.
 pub(crate) fn tui_direct_pending_start_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_tui_direct_pending_start"))
-}
-
-/// #3296: durable aborted-anchor markers for TUI-direct synthetic turn-starts
-/// that ABORTed after the input was already provider-submitted. The anchor
-/// keeps its `⏳`; the watcher terminal-commit drain flips it to `✅` when the
-/// prior owner covers it, and the placeholder sweeper flips it to `⚠` after
-/// the TTL when nothing did. See `tui_direct_abort_marker`.
-pub(crate) fn tui_direct_abort_marker_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_tui_direct_abort_marker"))
-}
-
-/// #3296 codex r2: durable terminal-commit tombstones for `(provider, tmux,
-/// channel)`. The tmux watcher's terminal-commit chokepoint records one BEFORE
-/// it clears the inflight row, so the aborted-anchor reconcilers can
-/// distinguish "the foreign row vanished because its owner committed" (`✅`)
-/// from a non-commit deletion (force-clear/stop/recovery → bounded `⚠`).
-/// Short-lived: the marker sweep GC's tombstones past the marker hard cap.
-pub(crate) fn tui_direct_commit_tombstone_root() -> Option<PathBuf> {
-    runtime_root().map(|root| root.join("discord_tui_direct_commit_tombstone"))
 }
 
 /// #3003: durable retry store for orphaned status-panel-v2 message deletes that

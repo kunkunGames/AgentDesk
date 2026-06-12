@@ -4,7 +4,7 @@
 > moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
-> Last refreshed: 2026-06-12 (against #3038 run_bot S5 closing pass).
+> Last refreshed: 2026-06-10 (against #3278 merge-automation tick git-exec fallback cache + bridge-deadline WARN downgrade; cache is tick-local and step list/order is unchanged, so ownership, singleton, and lease assumptions are unaffected).
 
 ## Read This First
 
@@ -22,21 +22,16 @@
 ### `multinode / discord_gateway_singleton`
 
 - feature: `multinode / discord_gateway_singleton`
-- canonical_modules: `src/services/discord/runtime_bootstrap.rs` preserves the
-  bootstrap call order; `runtime_bootstrap/gateway_runtime.rs` builds the
-  Serenity client and enters the leader gateway event loop;
-  `runtime_bootstrap/gateway_lease.rs` owns gateway lease acquisition,
-  keepalive, and self-fencing; `runtime_bootstrap/shutdown.rs` owns SIGTERM
-  persistence and gateway backend execution; `runtime_bootstrap/intake.rs` owns
-  the standby intake-worker spawn.
+- canonical_modules: `src/services/discord/runtime_bootstrap.rs:1526` builds the
+  Serenity client, `src/services/discord/runtime_bootstrap.rs:1531` starts the
+  gateway lease keepalive task, `src/services/discord/runtime_bootstrap.rs:1549`
+  self-fences on lease loss, and `src/services/discord/runtime_bootstrap.rs:1730`
+  starts the gateway client.
 - legacy_modules: none. The current gateway owner is the active dcserver process
   for that provider.
 - do_not_edit_without_migration_plan:
-  `src/services/discord/runtime_bootstrap.rs` gateway startup order plus
-  `src/services/discord/runtime_bootstrap/gateway_runtime.rs`,
-  `src/services/discord/runtime_bootstrap/gateway_lease.rs`, and
-  `src/services/discord/runtime_bootstrap/shutdown.rs` lease/shutdown paths,
-  especially watcher cancellation on gateway lease loss.
+  `src/services/discord/runtime_bootstrap.rs` gateway startup and shutdown paths,
+  especially watcher cancellation at `src/services/discord/runtime_bootstrap.rs:1622`.
 - active_callsite_coverage: single-node runtime with an existing gateway lease.
   It does not yet define cluster role discovery, worker heartbeats, or a
   capability registry for non-gateway workers.
@@ -45,9 +40,6 @@
   instead of looping back through the internal HTTP cleanup route. The singleton
   assumption remains unchanged: the task is still spawned from the leased
   gateway runtime.
-- 2026-06-12 audit note (#3089 S0): `runtime_bootstrap` only initializes the
-  default-off `single_message_panel` flag for startup logging. Gateway lease,
-  startup order, worker ownership, and singleton assumptions are unchanged.
 - invariants: `singleton_on_leader`,
   `heartbeat_capability_registry_routing`.
 - allowed_changes: `bugfix` only before #876/#877. New gateway, reconnect,
@@ -220,7 +212,7 @@
 
 | assumption | owning module | current risk |
 | --- | --- | --- |
-| Discord gateway singleton | `src/services/discord/runtime_bootstrap.rs`, `src/services/discord/runtime_bootstrap/gateway_lease.rs`, `src/services/discord/runtime_bootstrap/shutdown.rs` | Two nodes starting a gateway for the same provider can duplicate command intake, watcher startup, and shutdown cleanup unless #877 fences gateway ownership to the leader. |
+| Discord gateway singleton | `src/services/discord/runtime_bootstrap.rs:1526`, `src/services/discord/runtime_bootstrap.rs:1531`, `src/services/discord/runtime_bootstrap.rs:1730` | Two nodes starting a gateway for the same provider can duplicate command intake, watcher startup, and shutdown cleanup unless #877 fences gateway ownership to the leader. |
 | Supervised workers singleton | `src/server/worker_registry.rs:151`, `src/server/mod.rs:202`, `src/server/mod.rs:209` | Cluster-enabled worker nodes skip `leader_only` supervised workers unless they hold the startup leader lease; lease-loss self-fencing for already-running loops remains follow-up work. |
 | Merge/review side effects local | `policies/merge-automation.js:46`, `policies/merge-automation.js:522`, `policies/merge-automation.js:1761` | Duplicate policy runners can race direct pushes, PR auto-merge, review notifications, and worktree cleanup. |
 | GitHub issue/body mutation local | `src/github/mod.rs:166`, `src/github/mod.rs:218`, `src/github/dod.rs:122`, `src/server/routes/github.rs:275` | Multiple nodes can create, close, comment, or edit issue bodies unless calls are leader-only or idempotent. |
@@ -282,7 +274,7 @@
   gateway, GitHub merge/issue mutation, singleton policy ticks, global cleanup,
   and any unleased outbox delivery.
 - Current anchors: gateway lease keepalive at
-  `src/services/discord/runtime_bootstrap/gateway_lease.rs`, policy tick advisory lock at
+  `src/services/discord/runtime_bootstrap.rs:1531`, policy tick advisory lock at
   `src/server/mod.rs:301`, GitHub sync advisory lock at `src/server/mod.rs:2818`,
   server cluster leader lease bootstrap at `src/server/cluster.rs`, and
   leader-only worker self-fence at `src/server/worker_registry.rs:522`.
@@ -389,86 +381,6 @@
 
 ### Audited touches
 
-- #3038 run_bot S5: the leader gateway runtime tail moved verbatim from
-  `runtime_bootstrap.rs` into `runtime_bootstrap/gateway_runtime.rs`: restored
-  generation/model/fast-mode logging, health registry registration,
-  slash-command/framework/client construction, gateway lease keepalive spawn,
-  SIGTERM handler spawn, and backend event-loop entry remain in the same order.
-  The root `run_bot` body now delegates that tail after the lease succeeds; no
-  gateway ownership, worker routing, singleton, or lease semantics changed.
-- #3038 run_bot S4: `run_bot_build_shared_data` (and its side-effect-order
-  doc comment) moved verbatim from `runtime_bootstrap.rs` into
-  `runtime_bootstrap/shared_data.rs`, unblocked by the merged SharedData
-  S1-S3 slices. This is a **behavior-preserving module split**: the builder
-  body is token-identical apart from the documented `super::` →
-  `crate::services::discord::` path substitutions (8) and the `pub(super)`
-  visibility needed by the root re-import; the `run_bot` body, the builder's
-  side-effecting initializer order (`load_queue_exit_placeholder_clears` ↔
-  `load_generation` ↔ `TurnFinalizer::spawn` ↔ `StatusPanelController::spawn`
-  ↔ `broadcast::channel`), and the standby-before-lease call order are
-  unchanged. Worker-local module move only: no multinode ownership,
-  singleton, or lease assumption changes.
-- #3038 SharedData S3: `runtime_bootstrap.rs` gained restart-lifecycle
-  characterization tests that pin the deferred-restart marker quick-exit path
-  (`run_bot_spawn_deferred_restart_poller`) and the
-  `shutdown_counted`/`shutdown_remaining` exactly-once protocol through the
-  `run_bot_build_shared_data` injection seam, observed via the test's own
-  handle on the injected counter. The thirteen restart-lifecycle fields are
-  now initialized through the `RestartLifecycle` group literal wrapped at the
-  first member's original position (member expressions byte-identical; the
-  three trailing members hoisted above the actor-spawn calls are
-  side-effect-free, so every side-effecting initializer keeps its relative
-  order). `run_bot` body changes are two single-token field-path renames (one
-  comment, one tracing argument); the SIGTERM handler, poller, and
-  gateway-lease/recovery helpers received the same mechanical
-  `shared.<field>` → `shared.restart.<field>` substitution with no
-  statement, ordering, or lock-span changes. The process-global
-  `global_active`/`global_finalizing`/`shutdown_remaining` counters remain
-  injected `Arc` handles (no flattening), so worker-local state grouping
-  only: no multinode ownership, singleton, or lease assumption changes.
-- #3038 SharedData S2: `runtime_bootstrap.rs` changed only inside
-  `run_bot_build_shared_data` — the eight session-override fields are now
-  initialized through the `SessionOverrideState` group literal wrapped at the
-  first member's original position (member expressions byte-identical,
-  evaluation order preserved; `run_bot` body byte-identical). Worker-local
-  state grouping only: no multinode ownership, singleton, or lease assumption
-  changes.
-- #3038 run_bot S0/S1: `runtime_bootstrap.rs` gained characterization tests and
-  moved restored-state, queued-placeholder, startup-doctor, orphan-recovery, and
-  session-GC helpers into `runtime_bootstrap/` submodules. This is a
-  **behavior-preserving module split**: `run_bot` body, gateway lease acquisition,
-  keepalive self-fence, shutdown ordering, and the recovery/spawn callsites remain
-  in their original order. Multinode classification is unchanged: gateway
-  ownership remains leader-only under the existing lease, while thread/session GC
-  and queued-placeholder cleanup retain their previous worker-local/runtime-local
-  assumptions.
-- #3038 run_bot S2/S3: setup/spawn/recovery/voice helpers moved into
-  `framework_setup.rs`, `spawns.rs`, `recovery_flush.rs`, and `voice.rs`; gateway
-  lease, shutdown/backend, and intake-worker helpers moved into
-  `gateway_lease.rs`, `shutdown.rs`, and `intake.rs`. This is a
-  **behavior-preserving module split**: the `run_bot` call order, gateway
-  acquisition before client startup, keepalive self-fence, SIGTERM
-  persist-before-I/O ordering, and standby intake-worker placement are unchanged.
-  S4 (`run_bot_build_shared_data`) remains gated on the SharedData slice.
-- #3274 residual cleanup: `turn_finalizer.rs` now invokes a small
-  `turn_finalizer/cleanup.rs` helper when a terminal loser receives
-  `AlreadyFinalized`, clearing only same-`user_msg_id` mailbox/inflight
-  active-state. This is **worker-local**: it runs in the same process that owns
-  the channel mailbox, finalizer actor, and local inflight file, and it adds no
-  leader-only side effect, durable queue authority, or PG lease assumption.
-- #3334 reaction lifecycle cleanup: abnormal finalizer backstops and restart
-  catch-up now run idempotent same-message reaction cleanup through local Discord
-  HTTP helpers. This is **worker-local**: it touches only the recovered/finalized
-  Discord message id on the worker processing that channel and adds no shared
-  scheduling authority or cross-node lease dependency.
-- #3038 S1 (SharedData `QueuedPlaceholderState` extraction): `runtime_bootstrap.rs`
-  changed in two helpers only — `run_bot_build_shared_data` (three consecutive
-  queued-placeholder members wrapped into the new `queued:` group field;
-  initialization expressions and their evaluation order byte-identical) and
-  `run_bot_spawn_recovery_and_flush_restart_reports` (mechanical `.queued.`
-  field-path rewrite). Pure behavior-preserving extraction. **Worker-local**:
-  no leader-only side effect, no durable queue, no PG lease — multinode
-  assumptions unchanged.
 - #3082 (queued-card / answer-flush barrier): `runtime_bootstrap.rs` changed
   only to initialize the new in-process `answer_flush_barrier` field on
   `SharedData`. The barrier is **worker-local** (a per-process, per-channel
@@ -689,44 +601,3 @@
   (`~/.codex/models_cache.json`) on the node that owns the session — it owns no
   global state, no durable queue, and no lease, and touches no PG-lease/leader
   path. No new multinode ownership, singleton, or lease assumption is introduced.
-- #3296 (aborted-anchor reaction reconcile): the synthetic turn-start ABORT path
-  (`tui_prompt_relay.rs` / `tui_direct_pending_start.rs`) now records a durable
-  `AbortedAnchorMarker` under the new node-local
-  `runtime/discord_tui_direct_abort_marker/` root instead of swapping `⏳ → ⚠`;
-  the watcher terminal-commit chokepoint (`tmux_watcher.rs`) drains it `⏳ → ✅`
-  on a covering commit and the placeholder sweeper applies the TTL'd `⏳ → ⚠`
-  fallback (`tui_direct_abort_marker.rs`). Codex r2 adds a sibling node-local
-  `runtime/discord_tui_direct_commit_tombstone/` root (`CommitTombstone`):
-  written only by the same node's watcher chokepoint BEFORE its inflight-row
-  clear, read only by that node's ABORT path / sweeper 대조, GC'd by the same
-  sweeper — the same worker-local surfaces. **Worker-local**: both stores live
-  on the SAME node's filesystem as the pending-start store they mirror, are
-  written and drained only by that node's own relay worker / watcher loop /
-  sweeper task, and the reaction ops resolve the process-local
-  `serenity_http_or_token_fallback()` bot identity — no PG lease, no cross-node
-  reads, no leader-only side effect. No new multinode ownership/singleton/lease
-  assumption is introduced.
-- #3350 (synthetic-anchor hourglass bound for inline claims): the INLINE
-  synthetic claim (`tui_prompt_relay.rs`) now records the same #3303
-  `DeferredClaim` marker as the deferred worker (shared helper generalized in
-  `tui_direct_pending_start.rs`), and `turn_finalizer.rs::do_finalize` calls a
-  new `turn_finalizer/cleanup.rs` hook that idempotently ENSURES the marker
-  (`tui_direct_abort_marker/deferred_claim.rs::ensure_marker_for_own_synthetic_turn`)
-  for watcher-owned TUI-direct synthetic rows before the inflight clear. Both
-  are WRITES into the existing node-local
-  `runtime/discord_tui_direct_abort_marker/` store from the same node's own
-  relay observer / finalizer actor; reconcile/delivery stays with the existing
-  #3303 drain/sweep owners unchanged (zero new reaction call sites).
-  **Worker-local**: no PG lease, no cross-node reads, no leader-only side
-  effect. No new multinode ownership, singleton, or lease assumption is
-  introduced.
-- #3038 S5 (SharedData cluster G — `RuntimeHttpCache`): pure field relocation;
-  `cached_serenity_ctx` / `cached_bot_token` and the
-  `serenity_http_or_token_fallback()` accessor moved verbatim from
-  `discord/mod.rs` into `shared_state.rs::RuntimeHttpCache`, with call sites
-  (including `runtime_bootstrap*` init and 2 single-token sites in the frozen
-  `turn_bridge/mod.rs`) rerouted `shared.cached_*` → `shared.http.cached_*`.
-  The leader-vs-standby semantics of the accessor (gateway ctx preferred,
-  token-built Http fallback on standby nodes) are byte-identical and stay
-  process-local. No new multinode ownership, singleton, or lease assumption
-  is introduced.

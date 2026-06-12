@@ -1,7 +1,5 @@
 use super::gateway::DiscordGateway;
 use super::inflight::optional_message_id;
-use super::recovery_paths::restart::dispose_recovery_relay_outcome;
-use super::recovery_paths::shared::RecoveryRelayOutcome;
 use super::settings::{
     load_last_remote_profile, load_last_session_path, resolve_role_binding,
     validate_bot_channel_routing_with_provider_channel,
@@ -25,23 +23,31 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 
-#[path = "recovery_engine/status_panel.rs"]
-mod recovery_status_panel;
-
 #[cfg(not(unix))]
 fn tmux_session_has_live_pane(_name: &str) -> bool {
     false
 }
 
 /// #2428 H5: exponential backoff (+ jitter) for the 3-attempt recovery retry
-/// loops in this module. Budget contract (Codex pass-1 review): the old fixed
-/// schedule waited 1000+1000 = 2000ms total; the new gap schedule
-/// `[700, 1300, 2000]`ms + 0..=100ms jitter preserves that wall-clock budget
-/// (callers sleep on attempts 1 and 2: 700+1300 = 2000ms, jitter only adds)
-/// while waking ~300ms earlier on average for sub-second transients. The
-/// third slot is reachable only if a future change adds attempts; it caps the
-/// per-gap wait. `attempt` is 1-indexed = the attempt that *just failed*;
-/// call only when another attempt will actually run (`if attempt < 3`).
+/// loops in this module. Replaces the previous fixed `1s` gap with an
+/// exponential schedule that *preserves the old wall-clock budget*.
+///
+/// Budget contract (Codex pass-1 review):
+/// - Old: 3 attempts × 1000ms gap → wait between attempts = 1000ms + 1000ms = **2000ms**
+///   total grace window before declaring tmux/finalize recovery failed.
+/// - New: gap schedule = `[700, 1300, 2000]` ms + 0..=100ms jitter, callers
+///   sleep on attempt 1 and 2 (`if attempt < 3`). Wait between attempts =
+///   `700 + 1300 = 2000ms +0..=200ms` (jitter only adds). **Total budget preserved** while
+///   distributing the gaps exponentially so a transient failure that resolves
+///   in <1s wakes ~300ms earlier on average.
+/// - The third slot (`2000ms`) is reachable only if a future change bumps
+///   the loop past 3 attempts; it caps the per-gap wait without exploding the
+///   total when more attempts are added.
+///
+/// `attempt` is 1-indexed and matches the loop variable: it is the attempt
+/// that *just failed*, and the returned duration is how long to wait before
+/// the next attempt. Callers should only invoke this when another attempt
+/// will actually be tried (typically `if attempt < 3`).
 pub(super) fn recovery_retry_backoff(attempt: u32) -> std::time::Duration {
     // Gap schedule between attempts 1→2, 2→3, 3→4, …: 700ms, 1300ms, 2000ms.
     // The 700 + 1300 = 2000ms sum is what makes the 3-attempt total grace
@@ -243,16 +249,12 @@ fn should_advance_recovery_dispatch_after_relay(relay_ok: bool) -> bool {
     relay_ok
 }
 
-fn forget_completion_footer_for_recovery_takeover(channel_id: ChannelId) {
-    super::single_message_panel::completion_footer_forget_registered_target(channel_id);
-}
-
 async fn relay_recovery_terminal_notice(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     state: &super::inflight::InflightTurnState,
     text: &str,
-) -> RecoveryRelayOutcome {
+) -> bool {
     relay_recovered_terminal_text_to_placeholder(
         http,
         shared,
@@ -263,39 +265,31 @@ async fn relay_recovery_terminal_notice(
     .await
 }
 
-/// Deliver the recovered terminal text to Discord: edit the placeholder in
-/// place when one was anchored, else (`placeholder == None`, e.g. TUI-direct —
-/// `MessageId::new(0)` would panic) send a NEW message. Only `Delivered` lets
-/// callers advance recovery (Codex P1); #3293 classifies failures so a
-/// permanent Discord rejection (404/403/410) can end the retry loop. #3297
-/// finding 2: the anchored path flattens errors into Strings, so a transient
-/// classification gets a second opinion from an active channel probe.
+/// Deliver the recovered terminal text to Discord. When the turn anchored a
+/// placeholder (`current_msg_id != 0`) the placeholder is edited in place;
+/// when it did NOT (a TUI-direct / recovery turn with `current_msg_id == 0`,
+/// surfaced here as `placeholder == None`) the text is delivered as a NEW
+/// channel message instead. Either way `true` means the assistant response
+/// actually reached Discord, so the caller can safely advance recovery
+/// (release mailbox/inflight, complete the dispatch). Reporting success
+/// WITHOUT delivering would silently drop the answer (Codex P1). `MessageId::new(0)`
+/// would panic, hence the `Option`.
 async fn relay_recovered_terminal_text_to_placeholder(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
     placeholder: Option<MessageId>,
     text: &str,
-) -> RecoveryRelayOutcome {
-    forget_completion_footer_for_recovery_takeover(channel_id);
-    let delivery = match placeholder {
+) -> bool {
+    match placeholder {
         Some(placeholder) => {
             super::formatting::replace_long_message_raw(http, channel_id, placeholder, text, shared)
                 .await
+                .is_ok()
         }
-        None => super::formatting::send_long_message_raw(http, channel_id, text, shared).await,
-    };
-    match delivery {
-        Ok(()) => RecoveryRelayOutcome::Delivered,
-        Err(error) => {
-            let classified =
-                super::recovery_paths::shared::classify_recovery_relay_error(error.as_ref());
-            super::recovery_paths::shared::escalate_transient_relay_outcome_with_probe(
-                classified,
-                || super::recovery_paths::restart::probe_channel_liveness(http, channel_id),
-            )
+        None => super::formatting::send_long_message_raw(http, channel_id, text, shared)
             .await
-        }
+            .is_ok(),
     }
 }
 
@@ -421,7 +415,7 @@ async fn complete_recovery_visible_turn(
         }
     }
 
-    if !shared.ui.status_panel_v2_enabled {
+    if !shared.status_panel_v2_enabled {
         return RecoveryCompletionOutcome::Emitted;
     }
     // #2427 D wire: explicit completion signal — most recovery paths
@@ -437,14 +431,9 @@ async fn complete_recovery_visible_turn(
     );
     let started_at_unix = super::inflight::parse_started_at_unix(&state.started_at)
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
-    let Some(status_msg_id) = recovery_status_panel::completion_target(
-        shared.ui.status_panel_v2_enabled,
-        state,
-        provider,
-        channel_id,
-    ) else {
-        return RecoveryCompletionOutcome::Emitted;
-    };
+    let persisted_inflight = super::inflight::load_inflight_state(provider, channel_id.get());
+    let status_msg_id =
+        recovery_status_panel_message_id_for_completion(state, persisted_inflight.as_ref());
 
     // EPIC #3078 PR-2 — route recovery completion through the
     // `StatusPanelController` behind a parity check (shadow mode). The
@@ -485,6 +474,27 @@ async fn complete_recovery_visible_turn(
     )
     .await;
     RecoveryCompletionOutcome::Emitted
+}
+
+fn recovery_status_panel_message_id_for_completion(
+    state: &super::inflight::InflightTurnState,
+    persisted: Option<&super::inflight::InflightTurnState>,
+) -> Option<MessageId> {
+    persisted
+        .and_then(|inflight| {
+            if inflight.user_msg_id == state.user_msg_id {
+                super::turn_bridge::normalize_status_panel_message_id(
+                    inflight.status_message_id.map(MessageId::new),
+                )
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            super::turn_bridge::normalize_status_panel_message_id(
+                state.status_message_id.map(MessageId::new),
+            )
+        })
 }
 
 /// EPIC #3078 PR-2 — the parity gate between the legacy recovery
@@ -529,10 +539,10 @@ mod recovery_dispatch_gate_tests {
 #[cfg(test)]
 mod recovery_completion_outcome_tests {
     use super::{
-        RecoveryCompletionOutcome, assert_recovery_completion_parity, recovery_status_panel,
+        RecoveryCompletionOutcome, assert_recovery_completion_parity,
+        recovery_status_panel_message_id_for_completion,
     };
     use crate::services::provider::ProviderKind;
-    use poise::serenity_prelude::{ChannelId, MessageId};
 
     fn state_for_recovery(user_msg_id: u64) -> super::inflight::InflightTurnState {
         super::inflight::InflightTurnState::new(
@@ -572,7 +582,7 @@ mod recovery_completion_outcome_tests {
         persisted.status_message_id = Some(4004);
 
         let status_msg_id =
-            recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
+            recovery_status_panel_message_id_for_completion(&snapshot, Some(&persisted));
 
         assert_eq!(status_msg_id, Some(super::MessageId::new(4004)));
     }
@@ -585,88 +595,9 @@ mod recovery_completion_outcome_tests {
         persisted.status_message_id = Some(4004);
 
         let status_msg_id =
-            recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
+            recovery_status_panel_message_id_for_completion(&snapshot, Some(&persisted));
 
         assert_eq!(status_msg_id, Some(super::MessageId::new(3003)));
-    }
-
-    #[test]
-    fn footer_mode_skips_recovery_status_panel_completion_for_stale_persisted_id() {
-        let mut snapshot = state_for_recovery(9101);
-        snapshot.status_message_id = Some(3003);
-        let mut persisted = state_for_recovery(9101);
-        persisted.status_message_id = Some(4004);
-
-        let target = recovery_status_panel::completion_target_for_flags(
-            true,
-            true,
-            &snapshot,
-            Some(&persisted),
-        );
-
-        assert_eq!(
-            target, None,
-            "footer mode must not edit or SendFallback a separate recovery panel; the stale id is left for sweeper reclaim"
-        );
-    }
-
-    #[test]
-    fn flag_off_recovery_status_panel_completion_keeps_original_target() {
-        let mut snapshot = state_for_recovery(9101);
-        snapshot.status_message_id = Some(3003);
-        let mut persisted = state_for_recovery(9101);
-        persisted.status_message_id = Some(4004);
-
-        let target = recovery_status_panel::completion_target_for_flags(
-            false,
-            true,
-            &snapshot,
-            Some(&persisted),
-        );
-
-        assert_eq!(target, Some(Some(super::MessageId::new(4004))));
-    }
-
-    #[test]
-    fn flag_off_recovery_none_target_still_requests_send_fallback() {
-        let snapshot = state_for_recovery(9101);
-
-        let target =
-            recovery_status_panel::completion_target_for_flags(false, true, &snapshot, None);
-
-        assert_eq!(
-            target,
-            Some(None),
-            "flag-off v2 recovery preserves the SendFallback rollback behavior when no status_message_id was persisted"
-        );
-    }
-
-    #[test]
-    fn recovery_takeover_forgets_registered_completion_footer_target() {
-        let channel_id = ChannelId::new(3_089_201);
-        let shared = super::super::make_shared_data_for_tests();
-        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
-        let _ = super::super::single_message_panel::register_completion_footer_target(
-            channel_id,
-            MessageId::new(3_089_301),
-            &ProviderKind::Claude,
-            1_800_000_000,
-            "Final answer",
-            None,
-            true,
-        );
-
-        super::forget_completion_footer_for_recovery_takeover(channel_id);
-
-        assert_eq!(
-            super::super::single_message_panel::completion_footer_edit_for_registered_target_at(
-                shared.as_ref(),
-                channel_id,
-                "⠸",
-                1_800_000_005,
-            ),
-            None
-        );
     }
 
     // EPIC #3078 PR-2: for representative recovery-completion inputs, the
@@ -686,7 +617,7 @@ mod recovery_completion_outcome_tests {
         snapshot.status_message_id = Some(3003);
         let mut persisted = state_for_recovery(9101);
         persisted.status_message_id = Some(4004);
-        let legacy = recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
+        let legacy = recovery_status_panel_message_id_for_completion(&snapshot, Some(&persisted));
         assert_eq!(legacy, Some(super::MessageId::new(4004)));
 
         let ctl = StatusPanelController::spawn(true);
@@ -703,7 +634,7 @@ mod recovery_completion_outcome_tests {
         // collapses onto the single live entry it adopted, choosing the same id.
         let mut snapshot0 = state_for_recovery(0);
         snapshot0.status_message_id = Some(5005);
-        let legacy0 = recovery_status_panel::message_id_for_completion(&snapshot0, None);
+        let legacy0 = recovery_status_panel_message_id_for_completion(&snapshot0, None);
         assert_eq!(legacy0, Some(super::MessageId::new(5005)));
 
         let ctl0 = StatusPanelController::spawn(true);
@@ -718,7 +649,7 @@ mod recovery_completion_outcome_tests {
 
         // Case C: no panel id at all (None) — both agree on None.
         let snapshot_none = state_for_recovery(9300);
-        let legacy_none = recovery_status_panel::message_id_for_completion(&snapshot_none, None);
+        let legacy_none = recovery_status_panel_message_id_for_completion(&snapshot_none, None);
         assert_eq!(legacy_none, None);
 
         let ctl_none = StatusPanelController::spawn(true);
@@ -1010,10 +941,7 @@ fn interrupted_recovery_message(
         .unwrap_or_else(|| stale_inflight_message(saved_response))
 }
 
-/// WARN-only trace (160-char response tail) — writes NOTHING to disk. The
-/// durable full-response artifact for force-clears is
-/// `recovery_paths::restart::persist_force_clear_report` (#3297 finding 3).
-pub(super) fn save_missing_session_handoff(
+fn save_missing_session_handoff(
     provider: &ProviderKind,
     state: &inflight::InflightTurnState,
     best_response: &str,
@@ -1300,7 +1228,7 @@ fn recovery_spawn_adk_cwd(
     Ok(persisted_session_path)
 }
 
-pub(super) async fn finish_recovered_turn_mailbox(
+async fn finish_recovered_turn_mailbox(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -1327,7 +1255,7 @@ pub(super) async fn finish_recovered_turn_mailbox(
     let _ = shared
         .turn_finalizer
         .submit_terminal(
-            super::turn_finalizer::TurnKey::new(channel_id, 0, shared.restart.current_generation),
+            super::turn_finalizer::TurnKey::new(channel_id, 0, shared.current_generation),
             provider.clone(),
             super::turn_finalizer::TerminalEvent::Complete,
             super::turn_finalizer::FinalizeContext::monitor(),
@@ -1368,7 +1296,7 @@ fn reseed_watcher_owned_finalizer_ledger(
         super::turn_finalizer::TurnKey::new(
             channel_id,
             user_msg_id.get(),
-            shared.restart.current_generation,
+            shared.current_generation,
         ),
         provider.clone(),
         super::inflight::RelayOwnerKind::Watcher,
@@ -2222,8 +2150,7 @@ pub(super) async fn restore_inflight_turns(
                     optional_message_id(state.current_msg_id),
                     &final_text,
                 )
-                .await
-                .delivered();
+                .await;
                 if !should_advance_recovery_dispatch_after_relay(relay_ok) {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::warn!(
@@ -2857,8 +2784,7 @@ pub(super) async fn restore_inflight_turns(
                 current_msg_id,
                 &final_text,
             )
-            .await
-            .delivered();
+            .await;
 
             if !should_advance_recovery_dispatch_after_relay(relay_ok) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3110,8 +3036,7 @@ pub(super) async fn restore_inflight_turns(
                 current_msg_id,
                 &final_text,
             )
-            .await
-            .delivered();
+            .await;
 
             if !should_advance_recovery_dispatch_after_relay(relay_ok) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3374,22 +3299,21 @@ pub(super) async fn restore_inflight_turns(
                     &state.full_response,
                     provider,
                 );
-                let outcome =
-                    relay_recovery_terminal_notice(http, shared, &state, &final_text).await;
-                // #3293: tmux_alive=true — budget force-clear forbidden here
-                // (pane-alive invariant); only a permanent verdict clears.
-                dispose_recovery_relay_outcome(
-                    shared,
-                    provider,
-                    &state,
-                    outcome,
-                    true,
-                    "recovery_ready_without_output",
-                    "ready_without_output",
-                    &state.full_response,
-                    false,
-                )
-                .await;
+                if relay_recovery_terminal_notice(http, shared, &state, &final_text).await {
+                    finish_recovered_turn_mailbox(
+                        shared,
+                        provider,
+                        channel_id,
+                        "recovery_ready_without_output",
+                    )
+                    .await;
+                    clear_inflight_state(provider, state.channel_id);
+                } else {
+                    let ts = chrono::Local::now().format("%H:%M:%S");
+                    tracing::warn!(
+                        "  [{ts}] ⚠ recovery: ready-without-output notice failed — preserving inflight for retry"
+                    );
+                }
                 continue;
             }
             tracing::warn!(
@@ -3436,7 +3360,7 @@ pub(super) async fn restore_inflight_turns(
                     best_response.len()
                 );
             }
-            let outcome = relay_recovery_terminal_notice(http, shared, &state, &stale_text).await;
+            let relay_ok = relay_recovery_terminal_notice(http, shared, &state, &stale_text).await;
             if let Some(ref sk) = state.session_key {
                 crate::services::termination_audit::record_termination_with_handles(
                     None::<&crate::db::Db>,
@@ -3452,19 +3376,21 @@ pub(super) async fn restore_inflight_turns(
                 );
             }
             save_missing_session_handoff(provider, &state, &best_response);
-            // Handoff already saved above for every outcome (last arg).
-            dispose_recovery_relay_outcome(
-                shared,
-                provider,
-                &state,
-                outcome,
-                false,
-                "recovery_missing_tmux",
-                "missing_tmux",
-                &best_response,
-                true,
-            )
-            .await;
+            if relay_ok {
+                finish_recovered_turn_mailbox(
+                    shared,
+                    provider,
+                    channel_id,
+                    "recovery_missing_tmux",
+                )
+                .await;
+                clear_inflight_state(provider, state.channel_id);
+            } else {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ recovery: missing-tmux notice failed — preserving inflight for retry"
+                );
+            }
             continue;
         }
 
@@ -3475,21 +3401,20 @@ pub(super) async fn restore_inflight_turns(
                 state.channel_id
             );
             let text = stale_inflight_message("tmux session name missing during recovery");
-            let outcome = relay_recovery_terminal_notice(http, shared, &state, &text).await;
-            // #3297 finding 4: past the can_recover gate tmux absence is NOT
-            // established — tmux_alive=true forbids budget force-clear here.
-            dispose_recovery_relay_outcome(
-                shared,
-                provider,
-                &state,
-                outcome,
-                true,
-                "recovery_missing_tmux_name",
-                "missing_tmux_name",
-                &state.full_response,
-                false,
-            )
-            .await;
+            if relay_recovery_terminal_notice(http, shared, &state, &text).await {
+                finish_recovered_turn_mailbox(
+                    shared,
+                    provider,
+                    channel_id,
+                    "recovery_missing_tmux_name",
+                )
+                .await;
+                clear_inflight_state(provider, state.channel_id);
+            } else {
+                tracing::warn!(
+                    "  [{ts}] ⚠ recovery: missing-tmux-name notice failed — preserving inflight for retry"
+                );
+            }
             continue;
         };
         let Some(output_path) = output_path else {
@@ -3499,22 +3424,20 @@ pub(super) async fn restore_inflight_turns(
                 state.channel_id
             );
             let text = stale_inflight_message("output path missing during recovery");
-            let outcome = relay_recovery_terminal_notice(http, shared, &state, &text).await;
-            // #3297 finding 4: tmux session existence was confirmed above
-            // (can_recover consumed the missing-tmux rows) — tmux_alive=true,
-            // so the budget can never clear a possibly-live pane here.
-            dispose_recovery_relay_outcome(
-                shared,
-                provider,
-                &state,
-                outcome,
-                true,
-                "recovery_missing_output_path",
-                "missing_output_path",
-                &state.full_response,
-                false,
-            )
-            .await;
+            if relay_recovery_terminal_notice(http, shared, &state, &text).await {
+                finish_recovered_turn_mailbox(
+                    shared,
+                    provider,
+                    channel_id,
+                    "recovery_missing_output_path",
+                )
+                .await;
+                clear_inflight_state(provider, state.channel_id);
+            } else {
+                tracing::warn!(
+                    "  [{ts}] ⚠ recovery: missing-output-path notice failed — preserving inflight for retry"
+                );
+            }
             continue;
         };
         let input_fifo_path = match recovery_input_fifo_for_runtime(runtime_kind, input_fifo_path) {
@@ -3552,21 +3475,20 @@ pub(super) async fn restore_inflight_turns(
                     runtime_kind.as_str()
                 );
                 let text = stale_inflight_message(reason);
-                let outcome = relay_recovery_terminal_notice(http, shared, &state, &text).await;
-                // #3297 finding 4: tmux existence already confirmed —
-                // tmux_alive=true (budget clear forbidden; permanent only).
-                dispose_recovery_relay_outcome(
-                    shared,
-                    provider,
-                    &state,
-                    outcome,
-                    true,
-                    "recovery_missing_input_fifo",
-                    "missing_input_fifo",
-                    &state.full_response,
-                    false,
-                )
-                .await;
+                if relay_recovery_terminal_notice(http, shared, &state, &text).await {
+                    finish_recovered_turn_mailbox(
+                        shared,
+                        provider,
+                        channel_id,
+                        "recovery_missing_input_fifo",
+                    )
+                    .await;
+                    clear_inflight_state(provider, state.channel_id);
+                } else {
+                    tracing::warn!(
+                        "  [{ts}] ⚠ recovery: missing-input-fifo notice failed — preserving inflight for retry"
+                    );
+                }
                 continue;
             }
         };
@@ -3649,8 +3571,7 @@ pub(super) async fn restore_inflight_turns(
                             current_msg_id,
                             &format!("❌ {error}\nmain workspace fallback blocked."),
                         )
-                        .await
-                        .delivered();
+                        .await;
                         if should_advance_recovery_dispatch_after_relay(relay_ok) {
                             super::turn_bridge::fail_dispatch_with_retry(
                                 shared.api_port,
@@ -3834,14 +3755,14 @@ pub(super) async fn restore_inflight_turns(
                 }
             }
 
-            // Keep the inflight state until the watcher either relays the final response or
-            // triggers watcher-death handoff. Clearing it here breaks the handoff path if the
-            // recovered tmux session dies before producing a result.
+            // Keep the inflight state until the watcher either relays the
+            // final response or triggers watcher-death handoff. Clearing it
+            // here breaks the handoff path if the recovered tmux session
+            // dies before producing a result.
             continue;
         }
 
         shared
-            .restart
             .recovering_channels
             .insert(channel_id, std::time::Instant::now());
 
@@ -3880,8 +3801,7 @@ pub(super) async fn restore_inflight_turns(
                     current_msg_id,
                     &format!("❌ {error}\nmain workspace fallback blocked."),
                 )
-                .await
-                .delivered();
+                .await;
                 if should_advance_recovery_dispatch_after_relay(relay_ok) {
                     super::turn_bridge::fail_dispatch_with_retry(
                         shared.api_port,
@@ -4217,19 +4137,28 @@ impl std::fmt::Display for RebindError {
 }
 
 /// #896: Rebind a live tmux session to a freshly-created inflight state and
-/// (re)spawn the output watcher — recovers orphan states whose tmux is alive
-/// but whose inflight JSON was cleared, leaving output with no relay path.
+/// (re)spawn the output watcher. Used to recover from orphan states where
+/// the tmux session is alive but the inflight JSON was cleared by a prior
+/// turn's cleanup, leaving subsequent output with no relay path.
 ///
-/// Preconditions (enforced, typed error on violation): tmux session alive
-/// (absent ⇒ force-kill + restart instead); no existing inflight for the
-/// channel (caller clears first); channel role-map-bound to the provider.
+/// Preconditions (enforced — caller gets a typed error on violation):
+/// * Tmux session must be alive. Absent session ⇒ nothing to rebind; the
+///   caller should force-kill + restart instead.
+/// * No existing inflight must exist for the channel. Caller clears first
+///   to avoid racing with a live turn's state.
+/// * Channel must be bound to the requested provider in the role-map.
 ///
-/// Side effects on success: writes the provider/channel inflight JSON with
-/// `last_offset` = current output size (only NEW output is relayed —
-/// retroactive emission is out of scope); registers/refreshes the
-/// `DiscordSession`; spawns a `tmux_output_watcher` via the single-watcher
-/// claim policy (an existing live owner is reused, `watcher_spawned=false`,
-/// and still picks up the new inflight — not an error).
+/// Side effects on success:
+/// * Writes `~/.adk/release/runtime/discord_inflight/{provider}/{channel}.json`
+///   with `last_offset` set to the tmux output file's current size, so the
+///   watcher only picks up output produced *after* this call. Retroactive
+///   emission of already-dropped output is intentionally out of scope.
+/// * Registers / refreshes the `DiscordSession` entry in `shared.core.sessions`.
+/// * Spawns a `tmux_output_watcher` via the single-watcher claim policy. If
+///   a live watcher already owns the tmux session, the existing owner is
+///   reused and `watcher_spawned=false` is returned — the inflight we just
+///   created will still be picked up by the existing watcher, so this is not
+///   an error.
 pub(crate) async fn rebind_inflight_for_channel(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -4453,7 +4382,6 @@ pub(crate) async fn rebind_inflight_for_channel(
         }
         state
     };
-    forget_completion_footer_for_recovery_takeover(discord_channel_id);
 
     // Register / refresh the in-memory session so downstream handlers can
     // locate this channel after the rebind.
@@ -4700,7 +4628,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             !shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.restart.current_generation)
+                .has_live_watcher_pending(ch, shared.current_generation)
                 .await,
             "ledger must start empty (simulating a post-restart in-memory ledger)"
         );
@@ -4716,7 +4644,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.restart.current_generation)
+                .has_live_watcher_pending(ch, shared.current_generation)
                 .await,
             "#3248 gap-1: reattach must register_start the turn as Watcher-owned"
         );
@@ -4745,7 +4673,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.restart.current_generation)
+                .has_live_watcher_pending(ch, shared.current_generation)
                 .await,
             "repeated reattach keeps a single live Watcher-pending entry"
         );
@@ -4769,7 +4697,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             !shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.restart.current_generation)
+                .has_live_watcher_pending(ch, shared.current_generation)
                 .await,
             "a zero user_msg_id turn must NOT seed an orphan ledger entry"
         );

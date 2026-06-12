@@ -83,7 +83,7 @@ impl StandbyRelayTurnBinding {
 }
 
 /// Spawned per-turn on cluster-standby nodes. Returns when:
-/// - `cancel` or `shared.restart.shutting_down` flips to true,
+/// - `cancel` or `shared.shutting_down` flips to true,
 /// - the JSONL emits a `{"type":"result"}` event and we deliver the response,
 /// - or `timeout` elapses.
 pub(super) async fn run_standby_relay(
@@ -123,7 +123,7 @@ pub(super) async fn run_standby_relay(
     );
 
     loop {
-        if cancel.load(Ordering::Relaxed) || shared.restart.shutting_down.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || shared.shutting_down.load(Ordering::Relaxed) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
                 "  [{ts}] 👁 standby_relay cancelled for channel {} (offset={})",
@@ -612,7 +612,7 @@ async fn deliver_response(
     provider: &ProviderKind,
     response_text: &str,
 ) -> bool {
-    let formatted = if shared.ui.status_panel_v2_enabled {
+    let formatted = if shared.status_panel_v2_enabled {
         formatting::format_for_discord_with_status_panel(response_text, provider)
     } else {
         formatting::format_for_discord_with_provider(response_text, provider)

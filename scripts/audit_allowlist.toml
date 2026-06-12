@@ -37,6 +37,8 @@ direct_discord_sends = [
   "src/services/discord/gateway.rs#direct_discord_sends:b61365ed28b915b2",
   "src/services/discord/gateway.rs#direct_discord_sends:0a20f86f0471df2b",
   "src/services/discord/gateway.rs#direct_discord_sends:a78022596f453395",
+  "src/services/discord/health.rs#direct_discord_sends:fc0d3cc16af4bca7",
+  "src/services/discord/health.rs#direct_discord_sends:9a1e5bc39f554d40",
   "src/services/discord/meeting_orchestrator.rs#direct_discord_sends:64c7fa00eace25a9",
   "src/services/discord/meeting_orchestrator.rs#direct_discord_sends:5e0310b8b9e373ff",
   "src/services/discord/monitoring_status.rs#direct_discord_sends:6911fe26869c481d",
@@ -57,13 +59,6 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:d2a63e6f1c91c479",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:c4f1e0c4fddb4380",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9b9526b38f0691a8",
-  # #3089 S2: existing status-panel-v2 response-placeholder send moved out of
-  # turn_bridge/mod.rs into the bridge footer helper while preserving behavior.
-  "src/services/discord/turn_bridge/single_message_footer.rs#direct_discord_sends:d2d9f46d97bfa069",
-  # #3038 turn_bridge S1: status-panel completion direct gateway calls moved
-  # verbatim from turn_bridge/mod.rs to turn_bridge/status_panel.rs.
-  "src/services/discord/turn_bridge/status_panel.rs#direct_discord_sends:8806b21b9432ae8a",
-  "src/services/discord/turn_bridge/status_panel.rs#direct_discord_sends:c4f1e0c4fddb4380",
   # #3016 msg_id==0 recovery: bridge creates a fresh placeholder / posts a recovery
   # notice for turns with no anchored Discord message. Consistent with the bridge's
   # existing pre-migration direct sends; retire with the #1436 outbound v3 extraction.

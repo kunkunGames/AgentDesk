@@ -17,10 +17,7 @@ pub(super) fn claude_tui_busy_followup_refusal_notice(
         Some(crate::services::turn_orchestrator::EnqueueRefusalReason::LastItemDedup) => {
             CLAUDE_TUI_BUSY_FOLLOWUP_DEDUP_NOTICE
         }
-        // #3297 r3 — a post-retry purge-tombstone refusal is user-actionable
-        // the same way as an unreachable actor: resend shortly.
-        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::ActorUnreachable)
-        | Some(crate::services::turn_orchestrator::EnqueueRefusalReason::MailboxClosed) => {
+        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::ActorUnreachable) => {
             CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE
         }
         None => CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,

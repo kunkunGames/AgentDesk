@@ -125,7 +125,6 @@ pub(super) async fn handle_model_picker_interaction(
     let message_id = component.message.id;
     let Some(state_snapshot) = data
         .shared
-        .overrides
         .model_picker_pending
         .get(&message_id)
         .map(|entry| entry.clone())
@@ -144,10 +143,7 @@ pub(super) async fn handle_model_picker_interaction(
     };
 
     if Instant::now().duration_since(state_snapshot.updated_at) > Duration::from_secs(30 * 60) {
-        data.shared
-            .overrides
-            .model_picker_pending
-            .remove(&message_id);
+        data.shared.model_picker_pending.remove(&message_id);
         component
             .create_response(
                 ctx,
@@ -240,12 +236,7 @@ pub(super) async fn handle_model_picker_interaction(
                 Some(validated)
             };
 
-            if let Some(mut state) = data
-                .shared
-                .overrides
-                .model_picker_pending
-                .get_mut(&message_id)
-            {
+            if let Some(mut state) = data.shared.model_picker_pending.get_mut(&message_id) {
                 state.pending_model = pending_model;
                 state.updated_at = Instant::now();
             }
@@ -254,7 +245,6 @@ pub(super) async fn handle_model_picker_interaction(
         super::commands::ModelPickerAction::Submit => {
             let pending_model = data
                 .shared
-                .overrides
                 .model_picker_pending
                 .get(&message_id)
                 .and_then(|state| state.pending_model.clone());
@@ -335,7 +325,6 @@ pub(super) async fn handle_model_picker_interaction(
     // Only Select reaches here — update the picker embed in-place.
     let pending_model = data
         .shared
-        .overrides
         .model_picker_pending
         .get(&message_id)
         .and_then(|state| state.pending_model.clone());
