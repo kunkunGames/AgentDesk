@@ -134,7 +134,7 @@ impl VoiceBargeInRuntime {
             );
             return;
         };
-        let Some(ctx) = shared.cached_serenity_ctx.get() else {
+        let Some(ctx) = shared.http.cached_serenity_ctx.get() else {
             crate::voice::metrics::discard(channel_id.get());
             tracing::debug!(
                 channel_id = channel_id.get(),

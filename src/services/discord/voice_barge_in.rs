@@ -3892,8 +3892,10 @@ mod tests {
             catch_up_retry_pending: dashmap::DashMap::new(),
             turn_start_times: dashmap::DashMap::new(),
             channel_rosters: dashmap::DashMap::new(),
-            cached_serenity_ctx: tokio::sync::OnceCell::new(),
-            cached_bot_token: tokio::sync::OnceCell::new(),
+            http: super::super::RuntimeHttpCache {
+                cached_serenity_ctx: tokio::sync::OnceCell::new(),
+                cached_bot_token: tokio::sync::OnceCell::new(),
+            },
             token_hash: "voice-handoff-test-token-hash".to_string(),
             provider: ProviderKind::Claude,
             api_port: 9,
