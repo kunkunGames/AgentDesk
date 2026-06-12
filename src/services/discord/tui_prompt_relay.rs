@@ -695,6 +695,24 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             let kind = slash_command_control_kind(&prompt.prompt);
             format_slash_command_control_note(&prompt.tmux_session_name, &kind, &prompt.prompt)
         } else if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
+            // #3393: background-task / subagent completions arrive ONLY as this
+            // `user`-record `<task-notification>` XML — never the stream-json
+            // `system` record the footer panel's `system_status_events` parses. So
+            // before the card render (which has its OWN store), bridge the SAME
+            // payload into the live-panel terminal StatusEvents so footer Tasks /
+            // Subagents flip ✓ and the #3391 delivered-ack eviction can fire. Runs
+            // for BOTH Post and Repeat outcomes (a repeat re-asserts terminal,
+            // which is idempotent at the slot). Footer-mode gated inside the
+            // bridge; an unknown/id-less notification is a slot no-op.
+            //
+            // #3393 finding 2: gate the BRIDGE (not the card) on a START-ANCHORED
+            // check — a human prompt QUOTING a notification mid-message still gets
+            // its card but pushes NO terminal events, so a quoted live tool-use-id
+            // cannot false-close a running slot. Layered with finding 1 (the XML
+            // bridge requires a tool_use_id for any terminal End).
+            if is_start_anchored_task_notification(&prompt.prompt) {
+                bridge_task_notification_to_live_panel(shared, channel_id, &prompt.prompt);
+            }
             match super::tui_task_card::resolve_task_card_content(
                 &notify_http,
                 shared,
@@ -5063,8 +5081,39 @@ fn strip_leading_local_command_caveat(text: &str) -> (&str, bool) {
     (&text[end + CLOSE.len()..], true)
 }
 
+/// #3393: bridge an observed `<task-notification>` XML user-record into the live
+/// footer panel's terminal StatusEvents for `channel_id`. Background-task and
+/// subagent completions reach the transcript ONLY as this XML; the panel's own
+/// `system_status_events` parses a stream-json `system` record that never
+/// occurs, so without this bridge footer Tasks/Subagents never flip ✓ from real
+/// traffic and the #3391 delivered-ack eviction never triggers. The bridge is
+/// footer-mode gated INSIDE `status_events_from_task_notification_xml` (empty vec
+/// in legacy mode), and a terminal End for an unknown/id-less tool-use-id is a
+/// slot no-op, so a double notification cannot flip a slot back.
+fn bridge_task_notification_to_live_panel(shared: &SharedData, channel_id: ChannelId, raw: &str) {
+    let events = super::placeholder_live_events::status_events_from_task_notification_xml(raw);
+    if events.is_empty() {
+        return;
+    }
+    let parsed = super::tui_task_card::parse_task_notification(raw);
+    tracing::info!(
+        channel_id = channel_id.get(),
+        kind = parsed.kind(),
+        tool_use_id = parsed.tool_use_id.as_deref().unwrap_or(""),
+        status = parsed.status.as_deref().unwrap_or(""),
+        "#3393: bridged user-record <task-notification> XML to live panel terminal StatusEvents"
+    );
+    shared
+        .ui
+        .placeholder_live_events
+        .push_status_events(channel_id, events);
+}
+
 /// Detects the `<task-notification>` auto-turn tag injected by Claude Code /
-/// Codex when a background task reaches a terminal state.
+/// Codex when a background task reaches a terminal state. Deliberately
+/// CONTAINS-based: the CARD render must fire even for a human prompt that quotes
+/// a notification (it is still classified + rendered, never lost). The terminal
+/// BRIDGE uses the stricter `is_start_anchored_task_notification` instead.
 fn is_task_notification_prompt(prompt: &str) -> bool {
     let trimmed = prompt.trim_start();
     // Skip a leading terminal-control prefix some injectors prepend before the
@@ -5072,6 +5121,22 @@ fn is_task_notification_prompt(prompt: &str) -> bool {
     let normalized = strip_terminal_controls(trimmed);
     let normalized = normalized.trim_start();
     normalized.contains("<task-notification>") || normalized.contains("<task-notification ")
+}
+
+/// #3393 finding 2: START-ANCHORED gate for the live-panel terminal BRIDGE only.
+/// A REAL machine `<task-notification>` user-record begins with the tag after the
+/// shared normalization pipeline (strip_terminal_controls → trim →
+/// strip_leading_injection_wrapper → trim, mirroring #3100/#3388). A human direct
+/// prompt that merely QUOTES a notification mid-message keeps its CARD render (the
+/// contains-based classifier) but must NOT push terminal StatusEvents — combined
+/// with finding 1's id requirement this closes the false-close attack where a
+/// quoted live tool-use-id would otherwise finalize a real running slot.
+fn is_start_anchored_task_notification(prompt: &str) -> bool {
+    let normalized = strip_terminal_controls(prompt);
+    let normalized = normalized.trim_start();
+    let normalized = strip_leading_injection_wrapper(normalized);
+    let normalized = normalized.trim_start();
+    normalized.starts_with("<task-notification>") || normalized.starts_with("<task-notification ")
 }
 
 /// Detects start-anchored compact/session-continuation banners.
@@ -6094,6 +6159,61 @@ mod tests {
                 "<task-notification><status>completed</status></task-notification>"
             )
             .is_human_active_turn()
+        );
+    }
+
+    // #3393 finding 2: the live-panel terminal BRIDGE is gated on a START-ANCHORED
+    // check, distinct from the contains-based CARD classifier. A human direct
+    // prompt that QUOTES a notification (embedding a LIVE tool-use-id) still earns
+    // its card but must NOT push terminal StatusEvents — so a quoted id cannot
+    // false-close a real running slot. A bare real-shape record (incl. a leading
+    // injection-wrapper round-trip) still bridges.
+    #[test]
+    fn bridge_guard_is_start_anchored_not_contains() {
+        // Human prompt quoting a notification mid-message, with a LIVE tool-use-id
+        // that matches a real running slot: NOT start-anchored → no bridge.
+        let quoted = "please re-run this, it printed:\n\
+            <task-notification><tool-use-id>toolu_live_slot</tool-use-id>\
+            <status>completed</status>\
+            <summary>Agent \"x\" completed</summary></task-notification>";
+        assert!(
+            !is_start_anchored_task_notification(quoted),
+            "a mid-message quoted notification must NOT pass the bridge guard"
+        );
+        // …yet the contains-based classifier still routes it to the CARD (the
+        // card behavior is preserved; only the terminal bridge is suppressed).
+        assert_eq!(
+            classify_injected_prompt(quoted),
+            InjectedPromptClass::TaskNotificationEvent,
+        );
+
+        // A bare, start-anchored real-shape record bridges.
+        let bare = "<task-notification><tool-use-id>toolu_live_slot</tool-use-id>\
+            <status>completed</status>\
+            <summary>Agent \"x\" completed</summary></task-notification>";
+        assert!(
+            is_start_anchored_task_notification(bare),
+            "a bare start-anchored notification must pass the bridge guard"
+        );
+
+        // Leading terminal-control prefix is tolerated (stripped by the pipeline).
+        let ansi_prefixed = "\u{1b}[0m<task-notification><status>completed</status>\
+            </task-notification>";
+        assert!(
+            is_start_anchored_task_notification(ansi_prefixed),
+            "an ANSI-prefixed notification must still pass the bridge guard"
+        );
+
+        // SSH-direct injection-wrapper round-trip variant: the wrapper line + code
+        // fence are peeled by `strip_leading_injection_wrapper`, leaving the tag
+        // start-anchored → still bridges (mirrors the #3153 wrapper coverage).
+        let wrapped = "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\n\
+            <task-notification><tool-use-id>toolu_live_slot</tool-use-id>\
+            <status>completed</status>\
+            <summary>Agent \"x\" completed</summary></task-notification>\n```";
+        assert!(
+            is_start_anchored_task_notification(wrapped),
+            "an injection-wrapper round-trip notification must pass the bridge guard"
         );
     }
 

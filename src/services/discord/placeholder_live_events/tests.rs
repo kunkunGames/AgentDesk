@@ -4737,3 +4737,341 @@ fn status_events_toolsearch_pretty_json_args_summary_not_bare_brace() {
     assert_ne!(summary.trim(), "{");
     assert!(!summary.trim_end().ends_with('{'), "got: {summary}");
 }
+
+// ---------------------------------------------------------------------------
+// #3393: user-record `<task-notification>` XML → live panel terminal StatusEvents.
+//
+// Background-task / subagent completions reach the transcript ONLY as this XML
+// (never the stream-json `system` record the panel's `system_status_events`
+// parses). These tests drive the FULL ingestion: real-shape XML text (incl. the
+// hyphenated `<tool-use-id>` from the live transcript) → bridge parse → push →
+// `render_completion_footer` shows ✓. State-machine-only proof is explicitly
+// forbidden by the issue, so every assertion goes through the panel render.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_notification_xml_background_bash_flips_footer_slot_to_done() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_001);
+    // A running background Bash slot keyed by the launch tool-use id.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "gh run watch",
+                "description": "Wait until PR 3392 CI settles",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_01Ls2svfdnzcn9uGwA7aHjHW"),
+            true,
+        ),
+    );
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running
+        .block
+        .expect("running background Bash should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Bash Wait until PR 3392 CI settles ⠸"));
+    assert!(!running_block.contains('✓'));
+
+    // Real-shape XML user-record text (background Bash variant, hyphenated
+    // `<tool-use-id>` child tag, status `completed`) — copied from a live
+    // transcript notification.
+    let raw = "<task-notification>\n\
+        <task-id>b5gr0v9xj</task-id>\n\
+        <tool-use-id>toolu_01Ls2svfdnzcn9uGwA7aHjHW</tool-use-id>\n\
+        <output-file>/private/tmp/claude-501/sess/tasks/b5gr0v9xj.output</output-file>\n\
+        <status>completed</status>\n\
+        <summary>Background command \"Wait until PR 3392 CI settles\" completed (exit code 0)</summary>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
+    assert!(
+        bridged
+            .iter()
+            .any(|e| matches!(e, StatusEvent::BackgroundTaskEnd { .. })),
+        "background XML must bridge to BackgroundTaskEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done
+        .block
+        .expect("finished background Bash should stay visible");
+    assert!(!done.has_unfinished_entries);
+    assert!(
+        done_block.contains("Bash Wait until PR 3392 CI settles ✓"),
+        "matching XML notification must flip ✓: {done_block}"
+    );
+    assert!(!done_block.contains('⠼'));
+}
+
+#[test]
+fn task_notification_xml_subagent_flips_footer_slot_to_done() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_002);
+    // A running Task subagent slot keyed by its launch tool-use id.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "scout",
+                "description": "Scout issues #3275 #3276",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_018F3HtbweDDNEbi44HKAhhi"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(
+            Some("Task"),
+            false,
+            Some("toolu_018F3HtbweDDNEbi44HKAhhi"),
+        ),
+    );
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running.block.expect("running subagent should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Subagents"));
+    assert!(!running_block.contains('✓'));
+
+    // Real-shape subagent variant: summary prefix `Agent "…" completed`, the
+    // SAME hyphenated `<tool-use-id>` as the launch — bridges to `SubagentEnd`.
+    let raw = "<task-notification>\n\
+        <task-id>a09e45d12a68015a5</task-id>\n\
+        <tool-use-id>toolu_018F3HtbweDDNEbi44HKAhhi</tool-use-id>\n\
+        <output-file>/private/tmp/claude-501/sess/tasks/a09e45d12a68015a5.output</output-file>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"Scout issues #3275 #3276\" completed</summary>\n\
+        <result>Done.</result>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
+    assert!(
+        bridged.iter().any(|e| matches!(
+            e,
+            StatusEvent::SubagentEnd {
+                ack_only: false,
+                ..
+            }
+        )),
+        "subagent XML must bridge to a finalizing SubagentEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done.block.expect("finished subagent should stay visible");
+    assert!(!done.has_unfinished_entries);
+    assert!(
+        done_block.contains("Scout issues #3275 #3276") && done_block.contains('✓'),
+        "matching subagent XML notification must flip ✓: {done_block}"
+    );
+}
+
+#[test]
+fn task_notification_xml_unknown_id_and_duplicate_and_nonterminal_are_safe() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_003);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "deploy.sh",
+                "description": "Deploy runtime",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_known"),
+            true,
+        ),
+    );
+
+    // (a) Unknown tool-use-id: terminal End for a slot we never opened — no-op.
+    let unknown = "<task-notification><task-id>x1</task-id>\
+        <tool-use-id>toolu_unknown</tool-use-id><status>completed</status>\
+        <summary>Background command \"Other\" completed (exit code 0)</summary></task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(unknown, true),
+    );
+    let after_unknown = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = after_unknown.block.expect("known slot still renders");
+    assert!(
+        block.contains("Bash Deploy runtime ⠸") && !block.contains('✓'),
+        "unknown-id notification must not flip the known slot: {block}"
+    );
+
+    // (b) Non-terminal status: produces NO terminal End event.
+    let nonterminal = "<task-notification><task-id>x2</task-id>\
+        <tool-use-id>toolu_known</tool-use-id><status>running</status>\
+        <summary>Background command \"Deploy runtime\" running</summary></task-notification>";
+    let nonterminal_events =
+        status_events_from_task_notification_xml_for_footer_mode(nonterminal, true);
+    assert!(
+        !nonterminal_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::BackgroundTaskEnd { .. })),
+        "non-terminal status must not bridge a BackgroundTaskEnd: {nonterminal_events:?}"
+    );
+    events.push_status_events(channel_id, nonterminal_events);
+    let still_running = events
+        .render_completion_footer(channel_id, &ProviderKind::Claude, "⠸")
+        .block
+        .expect("slot still renders");
+    assert!(
+        !still_running.contains('✓'),
+        "non-terminal must not flip ✓: {still_running}"
+    );
+
+    // (c) Terminal match flips ✓; a DUPLICATE terminal notification must not flip
+    // the slot back to running.
+    let done_xml = "<task-notification><task-id>x3</task-id>\
+        <tool-use-id>toolu_known</tool-use-id><status>completed</status>\
+        <summary>Background command \"Deploy runtime\" completed (exit code 0)</summary></task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(done_xml, true),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(done_xml, true),
+    );
+    let done = events
+        .render_completion_footer(channel_id, &ProviderKind::Claude, "⠼")
+        .block
+        .expect("done slot renders");
+    assert!(
+        done.contains("Bash Deploy runtime ✓") && !done.contains('⠼'),
+        "duplicate terminal notification must stay ✓, not flip back: {done}"
+    );
+}
+
+#[test]
+fn task_notification_xml_bridge_inert_when_footer_mode_off() {
+    // Footer-mode OFF → the bridge yields no events so the legacy separate-panel
+    // render path is untouched.
+    let raw = "<task-notification><task-id>off1</task-id>\
+        <tool-use-id>toolu_off</tool-use-id><status>completed</status>\
+        <summary>Background command \"x\" completed (exit code 0)</summary></task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, false);
+    assert!(
+        bridged.is_empty(),
+        "footer-mode-off bridge must be inert: {bridged:?}"
+    );
+}
+
+// #3393 finding 1: an id-LESS subagent `<task-notification>` XML (no
+// `<tool-use-id>` child) must produce NO terminal effect. Before the fix the XML
+// bridge emitted `SubagentEnd { tool_use_id: None }`, the panel fell back to "the
+// last unfinished subagent slot", and the WRONG slot was finalized (and, with
+// #3391, evicted on delivery). The bridge now drops id-less terminal ends.
+#[test]
+fn task_notification_xml_idless_subagent_does_not_flip_or_evict_a_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_004);
+    // A running FOREGROUND Task subagent slot keyed by its launch tool-use id.
+    // Foreground (not background) so an id-less ack-only fallback WOULD finalize
+    // it pre-fix — the strongest exposure of the bug.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "scout",
+                "description": "Scout issue #3393"
+            })
+            .to_string(),
+            Some("toolu_live_slot"),
+        ),
+    );
+
+    // Real-shape subagent variant WITHOUT a `<tool-use-id>` child (some repeats /
+    // lost-process notifications omit it). Terminal status `completed`.
+    let idless = "<task-notification>\n\
+        <task-id>idless1</task-id>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"some other agent\" completed</summary>\n\
+        <result>Done.</result>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(idless, true);
+    assert!(
+        !bridged
+            .iter()
+            .any(|e| matches!(e, StatusEvent::SubagentEnd { .. })),
+        "id-less subagent XML must NOT bridge a SubagentEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    // The slot is untouched: still present and still unfinished (no eviction, no
+    // ✓/✗ flip onto the wrong slot).
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.subagents.len(),
+            1,
+            "id-less subagent notification must not evict the slot"
+        );
+        assert!(
+            guard.subagents[0].finished.is_none(),
+            "id-less subagent notification must leave the slot unfinished"
+        );
+    }
+
+    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    assert!(
+        footer.has_unfinished_entries,
+        "the running subagent slot must remain unfinished"
+    );
+    let block = footer.block.expect("running subagent should render");
+    assert!(
+        !block.contains('✓'),
+        "id-less subagent notification must not flip ✓: {block}"
+    );
+}
+
+// #3393 finding 3: a workflow `<task-notification>` XML with a NON-terminal
+// status (e.g. running) must NOT emit `WorkflowEnd`; terminal statuses still map
+// success via `!is_error`, consistent with the subagent/background arms.
+#[test]
+fn task_notification_xml_workflow_gates_workflow_end_on_terminal_status() {
+    let running = "<task-notification><task-id>wf1</task-id><status>running</status>\
+        <summary>Dynamic workflow \"probe\" running</summary></task-notification>";
+    let running_events = status_events_from_task_notification_xml_for_footer_mode(running, true);
+    assert!(
+        !running_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkflowEnd { .. })),
+        "status=running workflow XML must NOT emit WorkflowEnd: {running_events:?}"
+    );
+
+    let completed = "<task-notification><task-id>wf2</task-id><status>completed</status>\
+        <summary>Dynamic workflow \"probe\" completed</summary></task-notification>";
+    let completed_events =
+        status_events_from_task_notification_xml_for_footer_mode(completed, true);
+    assert!(
+        completed_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkflowEnd { success: true, .. })),
+        "status=completed workflow XML must emit WorkflowEnd{{success:true}}: {completed_events:?}"
+    );
+
+    let failed = "<task-notification><task-id>wf3</task-id><status>failed</status>\
+        <summary>Dynamic workflow \"probe\" failed</summary></task-notification>";
+    let failed_events = status_events_from_task_notification_xml_for_footer_mode(failed, true);
+    assert!(
+        failed_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkflowEnd { success: false, .. })),
+        "status=failed workflow XML must emit WorkflowEnd{{success:false}}: {failed_events:?}"
+    );
+}
