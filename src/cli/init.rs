@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
 use super::{
-    args::{EmitLaunchdPlistArgs, LaunchdPlistFlavorArg},
+    args::EmitLaunchdPlistArgs,
     dcserver,
 };
 use crate::services::provider::ProviderKind;
