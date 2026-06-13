@@ -29,19 +29,32 @@ print("Fetching PRs...")
 prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid")
 
 inventory_refresh_count = 0
+inventory_refresh_state_verified = False
 
 if gh_code != 0 or not prs_json:
-    print("Warning: `gh` CLI not available or failed. Falling back to `git branch -r` for duplicate PR check.")
-    # Fallback: scan remote branches
-    branches_out, branch_code = run("git branch -r")
+    print("Warning: `gh` CLI not available or failed. Falling back to a warning-only remote branch scan.")
+    branches_out, branch_code = run("git ls-remote --heads origin")
     if branch_code == 0:
+        inventory_branch_names = []
         for line in branches_out.splitlines():
-            branch_name = line.strip().lower()
-            if "inventory" in branch_name and "refresh" in branch_name:
-                inventory_refresh_count += 1
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            branch_name = parts[1].removeprefix("refs/heads/")
+            normalized = branch_name.lower()
+            if "inventory" in normalized and "refresh" in normalized:
+                inventory_branch_names.append(branch_name)
+        if len(inventory_branch_names) > 1:
+            sample = ", ".join(inventory_branch_names[:5])
+            print(
+                "\n[!] WARNING: Multiple inventory-refresh-like remote branches detected, "
+                "but open PR state could not be verified without `gh`."
+            )
+            print(f"    Branch matches: {len(inventory_branch_names)}. Sample: {sample}")
     else:
-        print("Warning: `git branch -r` also failed.")
+        print("Warning: `git ls-remote --heads origin` also failed.")
 else:
+    inventory_refresh_state_verified = True
     try:
         prs = json.loads(prs_json)
     except Exception as e:
@@ -84,6 +97,6 @@ else:
         if "inventory" in title.lower() and "refresh" in title.lower():
             inventory_refresh_count += 1
 
-if inventory_refresh_count > 1:
+if inventory_refresh_state_verified and inventory_refresh_count > 1:
     print("\n[!] WARNING: Multiple open inventory refresh PRs detected. Ensure strict duplicate-PR guard is followed.")
     exit(1)
