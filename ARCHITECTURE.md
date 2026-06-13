@@ -398,7 +398,8 @@ src/
 │   │   │   ├── runtime_resolve.rs
 │   │   │   ├── session_enrichment.rs
 │   │   │   ├── snapshot.rs
-│   │   │   └── stall_liveness.rs
+│   │   │   ├── stall_liveness.rs
+│   │   │   └── watcher_respawn.rs
 │   │   ├── inflight/
 │   │   │   └── budget.rs
 │   │   ├── outbound/
@@ -423,6 +424,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── recent_events.rs
 │   │   │   ├── session_panel.rs
+│   │   │   ├── slot_rehydration.rs
 │   │   │   ├── status_events.rs
 │   │   │   ├── status_panel.rs
 │   │   │   ├── subagent_rollout.rs
@@ -525,6 +527,7 @@ src/
 │   │   │   └── cleanup.rs
 │   │   ├── voice_barge_in/
 │   │   │   ├── final_result_playback.rs
+│   │   │   ├── foreground_decision.rs
 │   │   │   ├── live_cut_playback.rs
 │   │   │   ├── progress_playback.rs
 │   │   │   ├── routing.rs
@@ -713,6 +716,9 @@ src/
 │   │   ├── runtime_config.rs
 │   │   ├── session_control.rs
 │   │   └── store.rs
+│   ├── session_backend/
+│   │   ├── stream_line.rs
+│   │   └── terminal_usage.rs
 │   ├── slo/
 │   │   └── mod.rs
 │   ├── turn_orchestrator/
