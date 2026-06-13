@@ -1,5 +1,6 @@
 use super::*;
 use crate::services::discord::InflightTurnState;
+use crate::services::discord::replace_outcome_policy::watcher_partial_continuation_retry_plan;
 
 #[path = "tmux_watcher/liveness.rs"]
 mod liveness;
@@ -6319,8 +6320,9 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                         )),
                                         "watcher_terminal_relay_partial_continuation_failure",
                                     );
-                                    relay_ok = false;
-                                    retry_terminal_delivery_from_offset = true;
+                                    let plan = watcher_partial_continuation_retry_plan();
+                                    relay_ok = plan.relay_ok;
+                                    retry_terminal_delivery_from_offset = plan.retry_offset;
                                 }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -6440,13 +6442,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         }
                     }
                     last_relayed_offset = Some(turn_data_start_offset);
-                    // #1270 codex P2: snapshot the current `.generation` mtime
-                    // on every successful relay so the local regression check
-                    // has a real baseline. Without this, normal relay paths
-                    // (which never enter the reset helper) leave the baseline
-                    // at None, and any later regression misclassifies
-                    // same-wrapper rotation as fresh-respawn — clearing the
-                    // local offset and re-relaying surviving bytes.
+                    // #1270 codex P2: snapshot the current `.generation` mtime on
+                    // every successful relay so the local regression check has a
+                    // real baseline. Without this, normal relay paths (which never
+                    // enter the reset helper) leave the baseline at None, and a
+                    // later regression misclassifies same-wrapper rotation as
+                    // fresh-respawn — clearing the offset and re-relaying bytes.
                     last_observed_generation_mtime_ns =
                         Some(read_generation_file_mtime_ns(&tmux_session_name));
                     // #1134: first successful relay for this attach. The
@@ -6482,17 +6483,16 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 clear_provider_overload_retry_state(channel_id);
             }
             if retry_terminal_delivery_from_offset {
-                // #3041 P1-1: this is a SAME-holder abandon-without-commit — the
-                // partial send failed and we are about to reset the offset and
-                // retry the SAME range on the next loop iteration. If we left the
-                // lease `Leased`, the retry's `try_acquire` would lose to our own
-                // held lease and the B2 skip arm would suppress the legitimate
-                // retry until the lease-deadline reclaim. Abandon-release the lease
-                // here (Leased→Unleased) so the retry can re-acquire. This is the
-                // sole abandon point that must not commit; it is released on the
-                // cell directly (a same-holder abandon, not a commit/release race
-                // that needs actor serialization). Identity-matched no-op if the
-                // lease was never acquired on this path.
+                // #3041 P1-1: a SAME-holder abandon-without-commit — the partial
+                // send failed and we reset the offset to retry the SAME range next
+                // loop. If we left the lease `Leased`, the retry's `try_acquire`
+                // would lose to our own held lease and the B2 skip arm would
+                // suppress the legitimate retry until the lease-deadline reclaim.
+                // Abandon-release here (Leased→Unleased) so the retry can
+                // re-acquire — the sole abandon point that must not commit,
+                // released on the cell directly (a same-holder abandon, not a
+                // commit/release race needing actor serialization). Identity-
+                // matched no-op if the lease was never acquired on this path.
                 if watcher_lease_acquired {
                     watcher_lease_cell.release(
                         watcher_lease_holder,
@@ -10762,6 +10762,49 @@ TUI-E2E-marker ssh-direct
                 END,
                 LeaseOutcome::Delivered
             ));
+        }
+    }
+
+    // #3089 A0 — characterization of the watcher terminal-fallback
+    // should-send-new-chunks predicate (design §5 A0 item 1). Its gate is
+    // `session_bound_fallback_uses_full_body && text.len() > DISCORD_MSG_LIMIT`.
+    // (The #2757 watcher edit-fail delete policy — the other watcher A0 datum —
+    // is already pinned above by
+    // `fallback_edit_failure_never_deletes_original_without_placeholder_probe`;
+    // A0 does not duplicate it.) Pinned inline in this `#[cfg(test)] mod tests`
+    // block of the FROZEN (#3016, baseline 8223) file => ZERO production LoC.
+    mod a0_characterization_tests {
+        use super::super::watcher_should_send_ordered_new_chunks_for_terminal_fallback as should_send;
+        use crate::services::discord::DISCORD_MSG_LIMIT;
+
+        #[test]
+        fn a0_watcher_fallback_predicate_gates_on_full_body_and_over_limit() {
+            let over = "y".repeat(DISCORD_MSG_LIMIT + 1); // 2001 bytes
+            let at_limit = "y".repeat(DISCORD_MSG_LIMIT); // exactly 2000 bytes
+
+            // Both required: fallback uses the FULL body AND len > 2000.
+            assert!(
+                should_send(true, &over),
+                "full-body fallback AND over-limit => send ordered new chunks"
+            );
+            assert!(
+                !should_send(false, &over),
+                "a non-full-body fallback never sends new chunks, even over-limit"
+            );
+            assert!(
+                !should_send(true, &at_limit),
+                "exactly 2000 is NOT over-limit (strict >)"
+            );
+            assert!(
+                !should_send(false, &at_limit),
+                "neither condition => no new chunks"
+            );
+        }
+
+        #[test]
+        fn a0_watcher_fallback_predicate_boundary_is_strictly_greater_than_2000() {
+            assert!(!should_send(true, &"a".repeat(2000)));
+            assert!(should_send(true, &"a".repeat(2001)));
         }
     }
 }
