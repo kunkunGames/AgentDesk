@@ -26,7 +26,7 @@ def head_commit_timestamp(pr):
     return parse_github_timestamp(timestamp)
 
 print("Fetching PRs...")
-prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid")
+prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
 
 if gh_code != 0 or not prs_json:
     print("Warning: `gh` CLI not available or failed. Skipping PR analysis.")
@@ -70,6 +70,17 @@ for pr in prs:
                     print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
         except Exception:
             pass
+
+    # PR body hygiene checks
+    body = pr.get("body", "")
+    if body:
+        body_lower = body.lower()
+        if "workfingerprint" not in body_lower:
+            print(f"  [!] MISSING WORKFINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
+        if "duplicate" not in body_lower and "overlap" not in body_lower:
+            print(f"  [!] MISSING DUPLICATE/OVERLAP CHECK: PR body does not explicitly mention a 'duplicate' or 'overlap' check.")
+    else:
+        print(f"  [!] EMPTY PR BODY: PR body is empty or could not be fetched.")
 
     # PR #199/#200/#201 lesson: check for multiple inventory refreshes
     if "inventory" in title.lower() and "refresh" in title.lower():
