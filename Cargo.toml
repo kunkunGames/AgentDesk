@@ -118,6 +118,9 @@ opt-level = "z"
 lto = true
 strip = true
 
+[features]
+legacy-sqlite-tests = []
+
 [profile.release-fast]
 inherits = "release"
 opt-level = 1
