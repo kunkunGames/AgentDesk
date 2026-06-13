@@ -26,7 +26,7 @@ def head_commit_timestamp(pr):
     return parse_github_timestamp(timestamp)
 
 print("Fetching PRs...")
-prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid")
+prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
 
 if gh_code != 0 or not prs_json:
     print("Warning: `gh` CLI not available or failed. Skipping PR analysis.")
@@ -45,8 +45,15 @@ now = datetime.now(timezone.utc)
 for pr in prs:
     num = pr['number']
     title = pr['title']
+    body = pr.get('body', '').lower()
     head_commit_at = head_commit_timestamp(pr)
     print(f"\n# {num} - {title}")
+
+    if "workfingerprint" not in body:
+        print(f"  [!] MISSING WORKFINGERPRINT: PR body does not contain a WorkFingerprint section.")
+
+    if "duplicate" not in body and "overlap" not in body:
+        print(f"  [!] MISSING DUPLICATE/OVERLAP CHECK: PR body does not explicitly mention checking for duplicates or overlap.")
 
     # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
     is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
