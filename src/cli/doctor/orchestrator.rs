@@ -1361,7 +1361,8 @@ fn check_provider_bindings(cfg: &config::Config, snapshot: &HealthSnapshot) -> C
     let has_binding_issues = !disconnected.is_empty()
         || !missing_channels.is_empty()
         || !missing_runtime_providers.is_empty()
-        || !missing_auth_hints.is_empty();
+        || !missing_auth_hints.is_empty()
+        || !duplicate_providers.is_empty();
     let detail = format!(
         "bindings={} duplicate_providers={} disconnected={} missing_channels={} missing_runtime_providers={} missing_auth_hints={}",
         bindings.len(),
