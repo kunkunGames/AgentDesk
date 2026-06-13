@@ -887,6 +887,46 @@ mod tests {
         assert!(!bridge_epilogue_marks_watcher_delivered(false, true));
     }
 
+    /// #3089 A1 r3 pin — terminal_delivery does NOT commit a fallback-after-
+    /// edit-failure. The commit predicate matches `EditedOriginal` only
+    /// (`replace_outcome_commits_terminal_delivery`, this file `:42`), and the
+    /// live path records the cleanup failure and returns `committed = false`
+    /// (this file `:143`). This characterization pins that non-commit branch
+    /// BEFORE A5 cuts turn_bridge over to the unified controller: the controller
+    /// must pass `FallbackCommitPolicy::NoCommitOnFallback` for this owner to
+    /// preserve the behavior pinned here (sink/standby pass `CommitOnFallback`).
+    /// If the predicate ever started committing the fallback variant, this test
+    /// fails and the A5 cutover would be caught.
+    #[test]
+    fn sent_fallback_after_edit_failure_does_not_commit_terminal_delivery() {
+        let outcome = ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
+            edit_error: "edit 500; fallback POST succeeded".to_string(),
+        };
+
+        // The commit predicate: a fallback-after-edit-failure is NOT a commit.
+        assert!(!replace_outcome_commits_terminal_delivery(&outcome));
+        // And so the downstream dispatch gates do not complete the work
+        // dispatch on a non-committed terminal delivery.
+        assert!(!should_complete_work_dispatch_after_terminal_delivery(
+            true,
+            replace_outcome_commits_terminal_delivery(&outcome),
+            false,
+            false,
+            false,
+            "final response delivered via fallback after edit failure",
+        ));
+        assert!(!should_fail_dispatch_after_terminal_delivery(
+            true,
+            replace_outcome_commits_terminal_delivery(&outcome),
+            false,
+        ));
+
+        // Contrast: an actual edit IS a commit (the only committing variant).
+        assert!(replace_outcome_commits_terminal_delivery(
+            &ReplaceLongMessageOutcome::EditedOriginal
+        ));
+    }
+
     #[test]
     fn partial_continuation_failure_does_not_commit_terminal_delivery() {
         let outcome = ReplaceLongMessageOutcome::PartialContinuationFailure {
@@ -1436,6 +1476,128 @@ mod tests {
                 shared.delivery_lease(ch).read(),
                 LeaseSnapshot::Unleased
             ));
+        }
+    }
+
+    // #3089 A0 — characterization of the terminal-delivery
+    // should-send-new-chunks predicate (design §5 A0 item 1, surface:
+    // turn_bridge terminal delivery). `terminal_delivery_should_send_new_chunks
+    // (can_chain_locally, body)` is one of the FOUR per-surface `len > 2000`
+    // predicates the #3089 controller unifies; its gate is
+    // `can_chain_locally && body.len() > DISCORD_MSG_LIMIT`. Pinned inline in
+    // this `#[cfg(test)] mod tests` block => ZERO production LoC.
+    mod a0_characterization_tests {
+        use super::super::terminal_delivery_should_send_new_chunks as should_send;
+        use crate::services::discord::DISCORD_MSG_LIMIT;
+
+        #[test]
+        fn a0_terminal_delivery_predicate_gates_on_can_chain_and_over_limit() {
+            let over = "x".repeat(DISCORD_MSG_LIMIT + 1); // 2001 bytes
+            let under = "x".repeat(DISCORD_MSG_LIMIT); // exactly 2000 bytes
+
+            // Both conditions required: can_chain_locally AND len > 2000.
+            assert!(
+                should_send(true, &over),
+                "chainable AND over-limit => send new chunks"
+            );
+            assert!(
+                !should_send(false, &over),
+                "not chainable suppresses new chunks even when over-limit"
+            );
+            assert!(
+                !should_send(true, &under),
+                "exactly at the 2000 limit is NOT over-limit (strict >)"
+            );
+            assert!(
+                !should_send(false, &under),
+                "neither condition => no new chunks"
+            );
+        }
+
+        #[test]
+        fn a0_terminal_delivery_predicate_boundary_is_strictly_greater_than_2000() {
+            // The cliff is strict `>`: 2000 stays single, 2001 splits.
+            assert!(!should_send(true, &"a".repeat(2000)));
+            assert!(should_send(true, &"a".repeat(2001)));
+        }
+    }
+
+    // #3089 A0 — I2 invariant (design §5 A0 item 3): the committed relay offset
+    // advances ONLY when the bridge lease commits `Delivered`; `Unknown` /
+    // `NotDelivered` must leave it pinned so the next turn re-delivers the
+    // ambiguous range. This drives the REAL production advance path
+    // (`BridgeDeliveryLease::acquire` + `commit_and_advance` against the same
+    // per-channel `DeliveryLeaseCell` the watcher uses) and reads the real
+    // `committed_relay_offset` — NOT a local closure restating the rule — so a
+    // production mutation that advanced on a non-Delivered outcome (or stopped
+    // advancing on Delivered) fails here. Zero production LoC (in `mod tests`).
+    mod a0_i2_advance_characterization_tests {
+        use super::super::{BridgeDeliveryLease, BridgeLeaseAcquire};
+        use crate::services::discord::turn_finalizer::TurnKey;
+        use crate::services::discord::{LeaseOutcome, make_shared_data_for_tests};
+        use poise::serenity_prelude::ChannelId;
+
+        const CH: u64 = 909_777;
+
+        fn held_lease(
+            shared: &std::sync::Arc<crate::services::discord::SharedData>,
+            ch: ChannelId,
+            user_msg_id: u64,
+        ) -> BridgeDeliveryLease {
+            match BridgeDeliveryLease::acquire(
+                shared,
+                ch,
+                TurnKey::new(ch, user_msg_id, 1),
+                0,
+                Some(64),
+            ) {
+                BridgeLeaseAcquire::Held(lease) => lease,
+                _ => panic!("expected Held lease on a fresh cell"),
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a0_i2_only_delivered_advances_the_committed_offset() {
+            // Delivered => advance to the leased end.
+            let shared = make_shared_data_for_tests();
+            let ch = ChannelId::new(CH);
+            assert_eq!(shared.committed_relay_offset(ch), 0);
+            assert!(held_lease(&shared, ch, 1).commit_and_advance(
+                &shared,
+                ch,
+                None,
+                LeaseOutcome::Delivered,
+            ));
+            assert_eq!(
+                shared.committed_relay_offset(ch),
+                64,
+                "Delivered commit advances the committed offset to the leased end (I2)"
+            );
+
+            // Unknown => no advance (ambiguous: must re-deliver).
+            let shared = make_shared_data_for_tests();
+            let ch = ChannelId::new(CH);
+            held_lease(&shared, ch, 2).commit_and_advance(&shared, ch, None, LeaseOutcome::Unknown);
+            assert_eq!(
+                shared.committed_relay_offset(ch),
+                0,
+                "Unknown must NOT advance the offset (I2)"
+            );
+
+            // NotDelivered => no advance.
+            let shared = make_shared_data_for_tests();
+            let ch = ChannelId::new(CH);
+            held_lease(&shared, ch, 3).commit_and_advance(
+                &shared,
+                ch,
+                None,
+                LeaseOutcome::NotDelivered,
+            );
+            assert_eq!(
+                shared.committed_relay_offset(ch),
+                0,
+                "NotDelivered must NOT advance the offset (I2)"
+            );
         }
     }
 }

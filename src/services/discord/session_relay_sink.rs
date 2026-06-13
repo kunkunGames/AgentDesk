@@ -19,6 +19,7 @@ use serenity::model::id::{ChannelId, MessageId};
 use super::formatting::{self, ReplaceLongMessageOutcome};
 use super::health::HealthRegistry;
 use super::inflight::{InflightTurnState, RelayOwnerKind, TurnSource};
+use super::replace_outcome_policy::edit_fail_fallback_disposition;
 use super::tmux::{WatcherToolState, process_watcher_lines};
 use crate::services::agent_protocol::TaskNotificationKind;
 use crate::services::cluster::stream_relay::{
@@ -903,13 +904,12 @@ impl SessionBoundDiscordRelaySink {
                     Ok(SessionRelayDeliveryOutcome::Delivered)
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure { edit_error }) => {
-                    // #2757: do not delete msg_id here. The 3e158e588 path
-                    // deleted the placeholder assuming it was stale, but
-                    // msg_id is the bridge's current_msg_id which may already
-                    // contain streamed response content. A transient edit
-                    // failure (rate limit, network) then leads to the actual
-                    // response being removed. Leave the original message in
-                    // place; the fallback copy is the redundant one.
+                    // #2757 (A0 #3089): never delete msg_id here — it is the
+                    // bridge's current_msg_id and may already hold streamed content;
+                    // a transient edit failure would then vacuum the real response.
+                    // The shared policy pins this preserve decision vs a cutover.
+                    let preserve_original = !edit_fail_fallback_disposition().deletes_original();
+                    debug_assert!(preserve_original, "#2757: must preserve original");
                     self.delivered_total.fetch_add(1, Ordering::AcqRel);
                     tracing::warn!(
                         provider = provider.as_str(),
@@ -3650,6 +3650,31 @@ mod tests {
                 other => panic!("expected Leased{{Sink}} after reclaim, got {other:?}"),
             }
             drop(guard);
+        }
+    }
+
+    // #3089 A0 — characterization of the session-bound should-send-new-chunks
+    // predicate's EXACT 2000-byte boundary (design §5 A0 item 1). The parent
+    // module already proves long-vs-short; this pins the strict-`>` cliff (2000
+    // single, 2001 splits) so the controller's single length policy must
+    // reproduce this surface's boundary. Pinned inline in this `#[cfg(test)] mod
+    // tests` block of the FROZEN (#3036, baseline 1731) file => ZERO prod LoC.
+    mod a0_characterization_tests {
+        use super::super::session_bound_should_send_new_chunks_for_placeholder as should_send;
+        use crate::services::discord::DISCORD_MSG_LIMIT;
+
+        #[test]
+        fn a0_session_bound_predicate_boundary_is_strictly_greater_than_2000() {
+            assert_eq!(DISCORD_MSG_LIMIT, 2000, "the shared length limit is 2000");
+            assert!(
+                !should_send(&"a".repeat(DISCORD_MSG_LIMIT)),
+                "exactly 2000 bytes is NOT over-limit (strict >)"
+            );
+            assert!(
+                should_send(&"a".repeat(DISCORD_MSG_LIMIT + 1)),
+                "2001 bytes is over-limit => new chunks"
+            );
+            assert!(!should_send("short"));
         }
     }
 }
