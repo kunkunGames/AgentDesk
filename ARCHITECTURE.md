@@ -497,6 +497,7 @@ src/
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── prompt_observe.rs
 │   │   │   ├── single_message_footer.rs
+│   │   │   ├── terminal_send.rs
 │   │   │   ├── turn_identity.rs
 │   │   │   └── turn_identity_tests.rs
 │   │   ├── tui_direct_abort_marker/
@@ -574,6 +575,7 @@ src/
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_recovery.rs
+│   │   ├── replace_outcome_policy.rs
 │   │   ├── response_sanitizer.rs
 │   │   ├── restart_ctrl.rs
 │   │   ├── restart_mode.rs
