@@ -168,6 +168,8 @@ test("00-escalation enqueueEscalation uses typed kv facade instead of raw db", (
   var dbCalls = [];
 
   var mockAgentdesk = {
+    // #3335: 00-escalation.js now registers a hook-less helper policy
+    registerPolicy: function() {},
     cards: { get: function(id) { return { id: id, title: "Test Card" }; } },
     db: {
       query: function(sql, params) { dbCalls.push({ sql: sql, params: params }); return []; },
@@ -208,6 +210,8 @@ test("00-escalation flushEscalations uses typed kv facade for writes/deletes", (
   var dbCalls = [];
 
   var mockAgentdesk = {
+    // #3335: 00-escalation.js now registers a hook-less helper policy
+    registerPolicy: function() {},
     cards: { get: function(id) { return { id: id, title: "Test Card", status: "review", review_status: "dilemma_pending" }; } },
     pipeline: {
       getConfig: function() { return {}; },
