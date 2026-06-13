@@ -590,6 +590,7 @@ src/
 │   │   ├── single_message_panel.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
+│   │   ├── startup_reclaim.rs
 │   │   ├── status_panel_controller.rs
 │   │   ├── status_panel_orphan_store.rs
 │   │   ├── streaming_finalizer.rs
