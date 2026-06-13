@@ -1421,6 +1421,7 @@ struct PermissionFinding {
     risk: Option<String>,
 }
 
+#[allow(unused_variables)]
 fn permission_finding(label: &'static str, path: &Path, sensitive: bool) -> PermissionFinding {
     let metadata = fs::metadata(path);
     let Ok(metadata) = metadata else {
