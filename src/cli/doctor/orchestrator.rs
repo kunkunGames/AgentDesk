@@ -1421,10 +1421,9 @@ struct PermissionFinding {
     risk: Option<String>,
 }
 
-#[allow(unused_variables)]
-fn permission_finding(label: &'static str, path: &Path, sensitive: bool) -> PermissionFinding {
+fn permission_finding(label: &'static str, path: &Path, _sensitive: bool) -> PermissionFinding {
     let metadata = fs::metadata(path);
-    let Ok(metadata) = metadata else {
+    let Ok(_metadata) = metadata else {
         return PermissionFinding {
             label,
             path: path.display().to_string(),
@@ -1438,9 +1437,9 @@ fn permission_finding(label: &'static str, path: &Path, sensitive: bool) -> Perm
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let mode = metadata.mode() & 0o777;
-        let owner_is_current = metadata.uid() == unsafe { libc::geteuid() };
-        let risk = if sensitive && mode & 0o077 != 0 {
+        let mode = _metadata.mode() & 0o777;
+        let owner_is_current = _metadata.uid() == unsafe { libc::geteuid() };
+        let risk = if _sensitive && mode & 0o077 != 0 {
             Some(format!("mode {mode:o} exposes group/other bits"))
         } else if !owner_is_current {
             Some("owner differs from current user".to_string())
