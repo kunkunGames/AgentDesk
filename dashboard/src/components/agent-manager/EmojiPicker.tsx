@@ -36,12 +36,12 @@ export default function EmojiPicker({
   value,
   onChange,
   size = "md",
-  ariaLabel,
+  "aria-label": ariaLabel,
 }: {
   value: string;
   onChange: (emoji: string) => void;
   size?: "sm" | "md";
-  ariaLabel?: string;
+  "aria-label"?: string;
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
@@ -111,6 +111,7 @@ export default function EmojiPicker({
               height={pickerHeight}
               onSelect={handleEmojiSelect}
               width={pickerWidth}
+              value={value}
             />
           </Suspense>
         </div>
