@@ -2,12 +2,14 @@ use super::*;
 
 mod framework_setup;
 mod gateway_lease;
+mod gateway_runtime;
 mod intake;
 mod orphan_recovery;
 mod queued_placeholders;
 mod recovery_flush;
 mod restored_state;
 mod session_gc;
+mod shared_data;
 mod shutdown;
 mod spawns;
 mod startup_doctor;
@@ -17,6 +19,7 @@ use self::framework_setup::{run_bot_build_slash_commands, run_bot_framework_setu
 use self::gateway_lease::{
     GatewayLeaseOutcome, run_bot_acquire_gateway_lease, run_bot_spawn_gateway_lease_keepalive,
 };
+use self::gateway_runtime::run_bot_start_gateway_runtime;
 use self::intake::run_bot_maybe_spawn_intake_worker;
 #[allow(unused_imports)]
 pub(in crate::services::discord) use self::queued_placeholders::{
@@ -24,6 +27,7 @@ pub(in crate::services::discord) use self::queued_placeholders::{
     delete_stale_queued_placeholder_cards, delete_stale_queued_placeholder_cards_with,
     filter_restored_queued_placeholders,
 };
+use self::shared_data::run_bot_build_shared_data;
 use self::shutdown::{run_bot_run_gateway_backend, run_bot_spawn_sigterm_handler};
 #[cfg(test)]
 use self::voice::voice_auto_join_provider_map;
@@ -102,6 +106,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
 
     // Initialize debug logging from environment variable
     claude::init_debug_from_env();
+    super::single_message_panel_enabled();
 
     let mut bot_settings = load_bot_settings(token);
     bot_settings.provider = provider.clone();
@@ -190,7 +195,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // setup callback — that second `set` is a no-op (`OnceCell::set`
     // returns Err on already-set), preserving the leader's existing
     // semantics.
-    let _ = shared.cached_bot_token.set(token.to_string());
+    let _ = shared.http.cached_bot_token.set(token.to_string());
 
     let voice_receiver =
         run_bot_init_voice_workers(&voice_config, &voice_barge_in, &shared, &provider);
@@ -206,7 +211,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // only touches `shared.{core, settings, pg_pool, dispatch_thread_parents}`,
     // none of which depend on a live gateway shard.
     //
-    // Cancellation rides on `shared.shutting_down`. On the leader, the
+    // Cancellation rides on `shared.restart.shutting_down`. On the leader, the
     // gateway-lease loss handler and SIGTERM handler flip that flag.
     // On standby today no signal handler is wired; the worker exits
     // when launchd kills the process during deploy. A follow-up could
@@ -237,123 +242,25 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         }
     };
 
-    {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] 🔑 dcserver generation: {}",
-            shared.current_generation
-        );
-        if !restored_model_overrides.is_empty() {
-            tracing::info!(
-                "  [{ts}] 🧩 restored model overrides: {} channel(s)",
-                restored_model_overrides.len()
-            );
-        }
-        if !restored_fast_mode_channels.is_empty() {
-            tracing::info!(
-                "  [{ts}] ⚡ restored fast mode channels: {} channel(s)",
-                restored_fast_mode_channels.len()
-            );
-        }
-    }
-
-    // Register this provider with the health check registry
-    health_registry
-        .register(provider.as_str().to_string(), shared.clone())
-        .await;
-
-    let token_owned = token.to_string();
-    let shared_clone = shared.clone();
-    let voice_config_for_setup = voice_config.clone();
-    let voice_receiver_for_setup = voice_receiver.clone();
-
-    let slash_commands = run_bot_build_slash_commands();
-
-    let framework = poise::Framework::builder()
-        .options(poise::FrameworkOptions {
-            commands: slash_commands,
-            command_check: Some(|ctx| {
-                Box::pin(async move {
-                    let settings_snapshot = { ctx.data().shared.settings.read().await.clone() };
-                    let allowed = provider_handles_channel(
-                        ctx.serenity_context(),
-                        &ctx.data().provider,
-                        &settings_snapshot,
-                        ctx.channel_id(),
-                    )
-                    .await;
-                    if !allowed {
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts}] ⏭ CMD-GUARD: skipping /{} in channel {} for provider {}",
-                            ctx.command().name,
-                            ctx.channel_id(),
-                            ctx.data().provider.as_str()
-                        );
-                    }
-                    Ok(allowed)
-                })
-            }),
-            event_handler: |ctx, event, _framework, data| Box::pin(handle_event(ctx, event, data)),
-            ..Default::default()
-        })
-        .setup(move |ctx, _ready, framework| {
-            let shared_for_migrate = shared_clone.clone();
-            let health_registry_for_setup = health_registry.clone();
-            let provider_for_setup = provider_for_framework.clone();
-            let token_for_ready = token_owned.clone();
-            let voice_config_for_setup = voice_config_for_setup.clone();
-            let voice_receiver_for_setup = voice_receiver_for_setup.clone();
-            Box::pin(run_bot_framework_setup(
-                ctx,
-                _ready,
-                framework,
-                shared_for_migrate,
-                shared_clone,
-                health_registry_for_setup,
-                provider_for_setup,
-                token_for_ready,
-                token_owned,
-                voice_config_for_setup,
-                voice_receiver_for_setup,
-                startup_reconcile_remaining,
-                startup_doctor_started,
-                api_port,
-            ))
-        })
-        .build();
-
-    let intents = discord_gateway_intents();
-
-    let client = commands::register_songbird(serenity::ClientBuilder::new(token, intents))
-        .framework(framework)
-        .await
-        .expect("Failed to create Discord client");
-
-    let gateway_lease_task = gateway_lease.map(|lease| {
-        run_bot_spawn_gateway_lease_keepalive(
-            lease,
-            &shared,
-            &provider,
-            client.shard_manager.clone(),
-        )
-    });
-
-    // Graceful shutdown: on SIGTERM, persist queue/inflight/last_message state
-    // and quick-exit. tmux/TUI processes survive — the next dcserver instance
-    // rehydrates the channel bindings (see rehydrate_existing_claude_tui_bindings;
-    // polled every CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL ≈ 5s) and resumes transcript
-    // tailing from the persisted last_offset.
-    run_bot_spawn_sigterm_handler(&shared, provider_for_shutdown);
-
-    run_bot_run_gateway_backend(
-        client,
-        &provider_for_error,
-        gateway_lease_task,
+    run_bot_start_gateway_runtime(
+        token,
+        provider,
+        provider_for_error,
+        provider_for_framework,
+        provider_for_shutdown,
+        startup_reconcile_remaining,
+        startup_doctor_started,
+        health_registry,
         startup_reconcile_remaining_for_client_start,
         startup_doctor_started_for_client_start,
         health_registry_for_client_start,
         api_port,
+        shared,
+        voice_config,
+        voice_receiver,
+        gateway_lease,
+        &restored_model_overrides,
+        &restored_fast_mode_channels,
     )
     .await;
 }
@@ -363,167 +270,6 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
 // each helper runs the exact statements it replaced, in the same order,
 // and run_bot calls them in the same order with the same threaded state.
 // INITIALIZATION/SPAWN ORDER IS LOAD-BEARING — do not reorder. ──
-
-/// Build all owned `SharedData` fields and wrap in an `Arc`. Side-effecting
-/// initializers (`TurnFinalizer::spawn`, `StatusPanelController::spawn`,
-/// `runtime_store::load_generation`, `load_queue_exit_placeholder_clears`,
-/// the `inflight_signals` broadcast channel) run here in the exact same order
-/// as the original inline struct literal. `bot_settings`, `initial_skills`,
-/// `global_active`, `global_finalizing`, `pg_pool`, and `engine` are consumed
-/// by move; the `restored_*` slices are borrowed (they are reused later in
-/// run_bot for logging and session-reset bootstrap).
-#[allow(clippy::too_many_arguments)]
-fn run_bot_build_shared_data(
-    bot_settings: DiscordBotSettings,
-    initial_skills: Vec<(String, String)>,
-    provider: &ProviderKind,
-    token_hash: &str,
-    voice_barge_in: &Arc<voice_barge_in::VoiceBargeInRuntime>,
-    global_active: Arc<std::sync::atomic::AtomicUsize>,
-    global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
-    shutdown_remaining: &Arc<std::sync::atomic::AtomicUsize>,
-    health_registry: &Arc<health::HealthRegistry>,
-    pg_pool: Option<sqlx::PgPool>,
-    engine: Option<crate::engine::PolicyEngine>,
-    api_port: u16,
-    placeholder_live_events_enabled: bool,
-    status_panel_v2_enabled: bool,
-    restored_model_overrides: &[(ChannelId, String)],
-    restored_fast_mode_channels: &[ChannelId],
-    restored_fast_mode_reset_entries: &[String],
-    restored_fast_mode_reset_channels: &[ChannelId],
-    restored_codex_goals_channels: &[ChannelId],
-    restored_codex_goals_reset_channels: &[ChannelId],
-) -> Arc<SharedData> {
-    Arc::new(SharedData {
-        core: Mutex::new(CoreState {
-            sessions: HashMap::new(),
-            active_meetings: HashMap::new(),
-        }),
-        mailboxes: ChannelMailboxRegistry::default(),
-        settings: tokio::sync::RwLock::new(bot_settings),
-        api_timestamps: dashmap::DashMap::new(),
-        skills_cache: tokio::sync::RwLock::new(initial_skills),
-        tmux_watchers: super::TmuxWatcherRegistry::new(),
-        tmux_relay_coords: dashmap::DashMap::new(),
-        placeholder_cleanup: Arc::new(
-            super::placeholder_cleanup::PlaceholderCleanupRegistry::default(),
-        ),
-        placeholder_controller: Arc::new(
-            super::placeholder_controller::PlaceholderController::default(),
-        ),
-        placeholder_live_events: Arc::new(
-            super::placeholder_live_events::PlaceholderLiveEvents::default(),
-        ),
-        placeholder_live_events_enabled,
-        status_panel_v2_enabled,
-        // #3038 S1: wrapped verbatim at the first-member position (evaluation-order preserved).
-        queued: QueuedPlaceholderState {
-            queued_placeholders: dashmap::DashMap::new(),
-            queue_exit_placeholder_clears: {
-                let map = dashmap::DashMap::new();
-                for (key, placeholder_msg_id) in
-                    super::queued_placeholders_store::load_queue_exit_placeholder_clears(
-                        provider, token_hash,
-                    )
-                {
-                    map.insert(key, placeholder_msg_id);
-                }
-                map
-            },
-            queued_placeholders_persist_locks: dashmap::DashMap::new(),
-        },
-        answer_flush_barrier: std::sync::Arc::new(
-            super::answer_flush_barrier::AnswerFlushBarrier::default(),
-        ),
-        recovering_channels: dashmap::DashMap::new(),
-        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        current_generation: runtime_store::load_generation(),
-        restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
-        recovery_started_at: std::time::Instant::now(),
-        recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
-        global_active,
-        turn_finalizer: super::turn_finalizer::TurnFinalizer::spawn(),
-        status_panel_controller: super::status_panel_controller::StatusPanelController::spawn(
-            status_panel_v2_enabled,
-        ),
-        global_finalizing,
-        shutdown_remaining: shutdown_remaining.clone(),
-        shutdown_counted: std::sync::atomic::AtomicBool::new(false),
-        intake_dedup: dashmap::DashMap::new(),
-        dispatch_thread_parents: dashmap::DashMap::new(),
-        bot_connected: std::sync::atomic::AtomicBool::new(false),
-        last_turn_at: std::sync::Mutex::new(None),
-        // #3038 S2: wrapped verbatim at the first-member position (evaluation-order preserved).
-        overrides: SessionOverrideState {
-            model_overrides: {
-                let map = dashmap::DashMap::new();
-                for (channel_id, model) in restored_model_overrides {
-                    map.insert(*channel_id, model.clone());
-                }
-                map
-            },
-            fast_mode_channels: {
-                let set = dashmap::DashSet::new();
-                for channel_id in restored_fast_mode_channels {
-                    set.insert(*channel_id);
-                }
-                set
-            },
-            fast_mode_session_reset_pending: {
-                let set = dashmap::DashSet::new();
-                for entry in restored_fast_mode_reset_entries {
-                    set.insert(entry.clone());
-                }
-                set
-            },
-            codex_goals_channels: {
-                let set = dashmap::DashSet::new();
-                for channel_id in restored_codex_goals_channels {
-                    set.insert(*channel_id);
-                }
-                set
-            },
-            codex_goals_session_reset_pending: {
-                let set = dashmap::DashSet::new();
-                for channel_id in restored_codex_goals_reset_channels {
-                    set.insert(*channel_id);
-                }
-                set
-            },
-            model_session_reset_pending: dashmap::DashSet::new(),
-            session_reset_pending: bootstrap_session_reset_pending_channels(
-                restored_model_overrides,
-                restored_fast_mode_reset_channels,
-                restored_codex_goals_reset_channels,
-            ),
-            model_picker_pending: dashmap::DashMap::new(),
-        },
-        dispatch_role_overrides: dashmap::DashMap::new(),
-        voice_barge_in: voice_barge_in.clone(),
-        voice_pairings: Arc::new(voice_routing::VoiceChannelPairingStore::load_default()),
-        last_message_ids: dashmap::DashMap::new(),
-        catch_up_retry_pending: dashmap::DashMap::new(),
-        turn_start_times: dashmap::DashMap::new(),
-        channel_rosters: dashmap::DashMap::new(),
-        cached_serenity_ctx: tokio::sync::OnceCell::new(),
-        cached_bot_token: tokio::sync::OnceCell::new(),
-        token_hash: token_hash.to_string(),
-        provider: provider.clone(),
-        api_port,
-        pg_pool,
-        engine,
-        health_registry: Arc::downgrade(health_registry),
-        known_slash_commands: tokio::sync::OnceCell::new(),
-        // #2448: capacity 256 gives ~hundreds of in-flight turns headroom
-        // before a slow listener triggers `RecvError::Lagged`. The standby
-        // relay subscriber falls back to file polling on lag.
-        inflight_signals: tokio::sync::broadcast::channel(256).0,
-    })
-}
 
 #[cfg(test)]
 mod bootstrap_tests {
@@ -912,5 +658,199 @@ agents:
             !tmp.path().join("runtime").join("discord_handoff").exists(),
             "legacy handoff JSON must be removed without being parsed or consumed"
         );
+    }
+}
+
+#[cfg(test)]
+mod restart_lifecycle_characterization_tests {
+    //! #3038 S3-0 — characterization tests for the restart-lifecycle cluster
+    //! (cluster E) BEFORE the thirteen fields are lifted into
+    //! `shared_state::RestartLifecycle`. The same tests passing unchanged
+    //! after the move is the behaviour-equivalence proof (the S1
+    //! `QueuedPlaceholderState` / S2 `SessionOverrideState` characterization
+    //! standard, #3294/#3295 lineage).
+    //!
+    //! The tests never read `SharedData` fields. State is observed through
+    //! the test's own `Arc` handle on the injected process-global
+    //! `shutdown_remaining` counter (the `run_bot_build_shared_data`
+    //! injection seam used by the real `run_bot`), and behaviour is driven
+    //! only through the production function surface:
+    //! `run_bot_spawn_deferred_restart_poller` (the deferred-restart marker
+    //! poll loop, historically the `restart_ctrl` path) and
+    //! `check_deferred_restart`. This is what lets the extraction's
+    //! field-path rewiring land without a single test edit.
+    //!
+    //! Branches that cannot be pinned here, and why:
+    //! - the final-provider `std::process::exit(0)` arms (poller,
+    //!   `check_deferred_restart`, SIGTERM handler) would kill the test
+    //!   runner — every scenario below keeps `shutdown_remaining > 1`;
+    //! - the SIGTERM handler itself needs a process signal — its
+    //!   `shutdown_counted` CAS + `shutdown_remaining` decrement protocol is
+    //!   byte-identical to the poller/`check_deferred_restart` protocol
+    //!   pinned here, and the run_bot S0 precedent (word-diff 0 + compile
+    //!   gate) covers the unseedable handler body;
+    //! - `check_deferred_restart`'s fresh-token decrement branch requires
+    //!   `restart_pending == true` with `shutdown_counted == false`, a state
+    //!   only the unseedable SIGTERM path produces without writing fields
+    //!   directly — it is pinned by a post-move regression test instead
+    //!   (`shared_state.rs` S3), where the group path may be used freely.
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
+
+    struct EnvGuard;
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(AGENTDESK_ROOT_DIR_ENV);
+            }
+        }
+    }
+
+    fn isolate_runtime_root(tmp: &std::path::Path) -> EnvGuard {
+        unsafe {
+            std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.to_str().unwrap());
+        }
+        EnvGuard
+    }
+
+    /// Build a `SharedData` through the production constructor
+    /// (`run_bot_build_shared_data`) so the test keeps its own handle on the
+    /// injected `shutdown_remaining` counter — exactly how `run_bot` shares
+    /// the counter across providers — instead of reading `SharedData` fields.
+    fn build_shared_with_injected_shutdown_remaining(
+        shutdown_remaining: &Arc<AtomicUsize>,
+    ) -> Arc<SharedData> {
+        let voice = Arc::new(voice_barge_in::VoiceBargeInRuntime::disabled());
+        let health_registry = Arc::new(health::HealthRegistry::new());
+        run_bot_build_shared_data(
+            DiscordBotSettings::default(),
+            Vec::new(),
+            &ProviderKind::Claude,
+            "s3-restart-characterization-token-hash",
+            &voice,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            shutdown_remaining,
+            &health_registry,
+            None,
+            None,
+            9,
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+    }
+
+    // Current-thread runtime driven from a synchronous `#[test]` so the
+    // `test_support` env lock is never held across an `.await` inside an
+    // async context (await_holding_lock ratchet stays flat — S1/S2 pattern).
+    // `start_paused` auto-advance fast-forwards the 10s deferred-restart
+    // poll interval instead of sleeping through it in real time.
+    fn paused_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn check_deferred_restart_is_noop_without_restart_pending() {
+        // #3167 B3: serialize process-global env mutation via the single
+        // crate-wide `test_support` lock (no local per-module Mutex).
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = isolate_runtime_root(tmp.path());
+        let rt = paused_rt();
+        rt.block_on(async {
+            let shutdown_remaining = Arc::new(AtomicUsize::new(5));
+            let shared = build_shared_with_injected_shutdown_remaining(&shutdown_remaining);
+
+            // Decision matrix row 1: no restart pending — the helper must
+            // return before touching the shutdown token or the barrier.
+            check_deferred_restart(&shared);
+            assert_eq!(
+                shutdown_remaining.load(Ordering::Acquire),
+                5,
+                "without restart_pending, check_deferred_restart must not consume the shutdown token"
+            );
+
+            // Idempotent: a second poll-loop tick is still a no-op.
+            check_deferred_restart(&shared);
+            assert_eq!(shutdown_remaining.load(Ordering::Acquire), 5);
+        });
+    }
+
+    #[test]
+    fn deferred_restart_poller_consumes_marker_token_and_decrements_exactly_once() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env_guard = isolate_runtime_root(tmp.path());
+        let rt = paused_rt();
+        rt.block_on(async {
+            // Three providers outstanding: this provider's quick-exit pass
+            // must take the count 3 → 2 and stop there (the exit(0) arm is
+            // only reachable for the LAST provider, remaining == 1).
+            let shutdown_remaining = Arc::new(AtomicUsize::new(3));
+            let shared = build_shared_with_injected_shutdown_remaining(&shutdown_remaining);
+
+            let root = crate::agentdesk_runtime_root().expect("runtime root override");
+            std::fs::create_dir_all(&root).unwrap();
+            let marker = root.join("restart_pending");
+            std::fs::write(&marker, "v0.0.0-s3-characterization").unwrap();
+
+            spawns::run_bot_spawn_deferred_restart_poller(&shared, &ProviderKind::Claude);
+
+            // Marker branch: restart_pending + shutting_down are flipped,
+            // the shutdown_counted CAS consumes this provider's token, local
+            // state is persisted, and shutdown_remaining decrements ONCE.
+            let mut decremented = false;
+            for _ in 0..400 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if shutdown_remaining.load(Ordering::Acquire) == 2 {
+                    decremented = true;
+                    break;
+                }
+            }
+            assert!(
+                decremented,
+                "deferred-restart poller must decrement the injected shutdown_remaining via the marker quick-exit path"
+            );
+
+            // Exactly-once: the consumed token blocks every later decrement
+            // attempt — give the poller several more (auto-advanced) poll
+            // intervals and re-drive the check_deferred_restart surface
+            // directly. If the CAS guard regressed, remaining would hit 1.
+            for _ in 0..400 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                shutdown_remaining.load(Ordering::Acquire),
+                2,
+                "shutdown_counted must hold the poller to a single shutdown_remaining decrement"
+            );
+            check_deferred_restart(&shared);
+            assert_eq!(
+                shutdown_remaining.load(Ordering::Acquire),
+                2,
+                "a consumed shutdown token must make check_deferred_restart a no-op (poll-loop + SIGTERM double-run guard)"
+            );
+
+            // Non-final provider must leave the marker on disk for the
+            // remaining providers' own quick-exit passes.
+            assert!(
+                marker.exists(),
+                "restart_pending marker is only removed by the final provider's exit arm"
+            );
+        });
     }
 }

@@ -513,7 +513,7 @@ async fn run_placeholder_sweep_pass(
                                         channel_id: serenity::ChannelId::new(state.channel_id),
                                         message_id: serenity::MessageId::new(msg_id),
                                     };
-                                    shared.placeholder_controller.detach(&key);
+                                    shared.ui.placeholder_controller.detach(&key);
                                 }
                             }
                         }
@@ -600,7 +600,7 @@ async fn run_placeholder_sweep_pass(
                                 channel_id: serenity::ChannelId::new(state.channel_id),
                                 message_id: serenity::MessageId::new(msg_id),
                             };
-                            shared.placeholder_controller.detach(&key);
+                            shared.ui.placeholder_controller.detach(&key);
                         }
                     }
                 }
@@ -816,7 +816,7 @@ async fn sweep_orphan_status_panel(
     // executing cutover needs the async `PanelSink` PR-2 deferred). The actor is
     // NOT spawned when v2 is off, so this v2 guard short-circuits the awaited
     // shadow read (whose ack would never be answered), mirroring `recovery_engine`.
-    if shared.status_panel_v2_enabled {
+    if shared.ui.status_panel_v2_enabled {
         let controller_target = shared
             .status_panel_controller
             .sweeper_reclaim_parity_id(
@@ -1304,7 +1304,28 @@ mod safety_net_threshold_tests {
     //! before the sweeper does anything destructive.
     use super::{
         ABANDON_THRESHOLD_SECS, INITIAL_DELAY_SECS, STALL_THRESHOLD_SECS, SWEEP_INTERVAL_SECS,
+        panel_reclaim_target,
     };
+    use crate::services::provider::ProviderKind;
+
+    fn sweep_state_with_panel(status_message_id: Option<u64>) -> super::InflightTurnState {
+        let mut state = super::InflightTurnState::new(
+            ProviderKind::Claude,
+            4242,
+            None,
+            7,
+            9101,
+            9102,
+            "prompt".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-claude-adk".to_string()),
+            Some("/tmp/recovery.jsonl".to_string()),
+            None,
+            0,
+        );
+        state.status_message_id = status_message_id;
+        state
+    }
 
     #[test]
     fn stall_threshold_is_at_least_five_minutes() {
@@ -1343,5 +1364,23 @@ mod safety_net_threshold_tests {
         // than one minute. 30s is the current cadence; pin the
         // upper bound.
         assert!(SWEEP_INTERVAL_SECS <= 60);
+    }
+
+    #[test]
+    fn off_to_on_stale_panel_still_reaches_sweeper_reclaim_target() {
+        let state = sweep_state_with_panel(Some(5001));
+
+        let target = panel_reclaim_target(&state, ABANDON_THRESHOLD_SECS);
+
+        assert_eq!(target.map(|id| id.get()), Some(5001));
+    }
+
+    #[test]
+    fn footer_mode_none_panel_has_no_sweeper_reclaim_target() {
+        let state = sweep_state_with_panel(None);
+
+        let target = panel_reclaim_target(&state, ABANDON_THRESHOLD_SECS);
+
+        assert_eq!(target, None);
     }
 }

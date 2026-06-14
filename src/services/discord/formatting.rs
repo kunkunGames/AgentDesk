@@ -851,10 +851,88 @@ pub(super) fn format_for_discord_with_status_panel(
 mod status_panel_v2_formatter_tests {
     use super::{
         MonitorHandoffReason, MonitorHandoffStatus, build_monitor_handoff_placeholder,
-        build_monitor_handoff_placeholder_with_live_events, format_for_discord,
-        format_for_discord_with_provider,
+        build_monitor_handoff_placeholder_with_live_events, build_status_panel_streaming_edit_text,
+        build_streaming_placeholder_text, format_for_discord, format_for_discord_with_provider,
+        format_for_discord_with_status_panel, plan_streaming_rollover,
     };
     use crate::services::provider::ProviderKind;
+
+    const LIVENESS_FOOTER: &str = "⠸ 계속 처리 중";
+
+    #[test]
+    fn plan_streaming_rollover_strips_liveness_footer_from_frozen_chunk_s0() {
+        let footer = format!("\n\n{LIVENESS_FOOTER}");
+        let body_budget = super::DISCORD_MSG_LIMIT
+            .saturating_sub(footer.len() + super::STREAMING_PLACEHOLDER_MARGIN)
+            .max(1);
+        let current_portion = "x".repeat(body_budget + 64);
+
+        let plan = plan_streaming_rollover(&current_portion, LIVENESS_FOOTER)
+            .expect("current portion should roll over once footer budget is reserved");
+
+        assert_eq!(plan.frozen_chunk.len(), body_budget);
+        assert_eq!(plan.frozen_chunk, &current_portion[..plan.split_at]);
+        assert!(!plan.frozen_chunk.contains(LIVENESS_FOOTER));
+        assert!(plan.display_snapshot.ends_with(&footer));
+    }
+
+    #[test]
+    fn rollover_seed_starts_as_liveness_footer_only_s0() {
+        let seed = build_streaming_placeholder_text("", LIVENESS_FOOTER);
+
+        assert_eq!(seed, LIVENESS_FOOTER);
+    }
+
+    #[test]
+    fn plan_streaming_rollover_reserves_footer_length_before_2000_byte_limit_s0() {
+        let footer = format!("\n\n{LIVENESS_FOOTER}");
+        let body_budget = super::DISCORD_MSG_LIMIT
+            .saturating_sub(footer.len() + super::STREAMING_PLACEHOLDER_MARGIN)
+            .max(1);
+        let current_portion = "x".repeat(body_budget + 1);
+        assert!(current_portion.len() < super::DISCORD_MSG_LIMIT);
+
+        let plan = plan_streaming_rollover(&current_portion, LIVENESS_FOOTER)
+            .expect("body fits raw Discord limit but not the reserved footer budget");
+
+        assert_eq!(plan.split_at, body_budget);
+        assert!(plan.display_snapshot.len() <= super::DISCORD_MSG_LIMIT);
+        assert!(plan.display_snapshot.ends_with(&footer));
+    }
+
+    #[test]
+    fn no_rollover_body_and_footer_under_limit_stays_single_message_s0() {
+        let current_portion = "short streamed body";
+        let rendered = build_streaming_placeholder_text(current_portion, LIVENESS_FOOTER);
+
+        assert!(plan_streaming_rollover(current_portion, LIVENESS_FOOTER).is_none());
+        assert_eq!(rendered, format!("{current_portion}\n\n{LIVENESS_FOOTER}"));
+        assert!(rendered.len() < super::DISCORD_MSG_LIMIT);
+    }
+
+    #[test]
+    fn empty_body_with_near_limit_footer_stays_footer_only_s0() {
+        let oversized_footer = "⠸".repeat(super::DISCORD_MSG_LIMIT);
+        let rendered = build_streaming_placeholder_text("", &oversized_footer);
+
+        assert!(plan_streaming_rollover("", &oversized_footer).is_none());
+        assert!(rendered.len() <= super::DISCORD_MSG_LIMIT);
+        assert!(rendered.starts_with('⠸'));
+        assert!(!rendered.contains("\n\n"));
+    }
+
+    #[test]
+    fn single_message_panel_s0_streaming_footer_present_and_final_body_absent() {
+        let streamed = build_status_panel_streaming_edit_text(
+            "Final answer",
+            LIVENESS_FOOTER,
+            &ProviderKind::Codex,
+        );
+        assert_eq!(streamed, "Final answer\n\n⠸ 계속 처리 중");
+
+        let finalized = format_for_discord_with_status_panel(&streamed, &ProviderKind::Codex);
+        assert_eq!(finalized, "Final answer");
+    }
 
     #[test]
     fn monitor_handoff_active_keeps_processing_tail_last() {
@@ -1018,6 +1096,18 @@ mod status_panel_v2_formatter_tests {
     }
 
     #[test]
+    fn flag_off_formatter_preserves_trailing_merged_footer_shaped_user_text() {
+        let input = "Final answer\n\n⠋ 진행 중 — user-authored line";
+        let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
+
+        assert_eq!(output, input);
+        assert_eq!(
+            super::finalize_stale_streaming_footer(input, &ProviderKind::Claude),
+            None
+        );
+    }
+
+    #[test]
     fn format_for_discord_removes_ascii_spinner_status_footer() {
         let input = "Final answer\n\n| Processing...";
         let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
@@ -1043,6 +1133,247 @@ mod status_panel_v2_formatter_tests {
         let input = "Final answer\n\n";
         let output = format_for_discord_with_provider(input, &ProviderKind::Claude);
         assert_eq!(output, "Final answer");
+    }
+
+    // #3089 A0 — characterization of the chunker + streaming-rollover splitter
+    // (design §5 A0 item 1: split_message chunk boundaries; item 4: streaming
+    // rollover split algorithm). Value-exact pins so any change to chunk
+    // boundaries/ordering, the `len > DISCORD_MSG_LIMIT` cliff, or the rollover
+    // split point fails BEFORE the #3089 controller cutover. Nested inside this
+    // `#[cfg(test)] mod` block => ZERO production LoC under the ratchet
+    // (formatting.rs baseline 2802 stays unchanged).
+    mod a0_characterization_tests {
+        use super::super::{
+            DISCORD_MSG_LIMIT, plan_streaming_rollover, split_message, streaming_split_boundary,
+        };
+
+        // -------------------------------------------------------------------
+        // split_message — the single chunker (design §5 A0 item 1)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn a0_split_message_keeps_short_body_as_a_single_verbatim_chunk() {
+            let body = "hello world\nsecond line";
+            let chunks = split_message(body);
+            assert_eq!(chunks.len(), 1, "short body must stay one chunk");
+            assert_eq!(chunks[0], body, "the single chunk must be byte-identical");
+        }
+
+        #[test]
+        fn a0_split_message_effective_limit_is_msg_limit_minus_ten_outside_code_block() {
+            let effective_limit = DISCORD_MSG_LIMIT - 10; // 1990
+            assert_eq!(effective_limit, 1990, "pins the 2000-10 effective limit");
+
+            let exactly_at_limit = "a".repeat(effective_limit);
+            let chunks = split_message(&exactly_at_limit);
+            assert_eq!(
+                chunks.len(),
+                1,
+                "a body of exactly effective_limit bytes stays a single chunk"
+            );
+
+            let one_over = "a".repeat(effective_limit + 1);
+            let chunks = split_message(&one_over);
+            assert_eq!(
+                chunks.len(),
+                2,
+                "one byte over the effective limit splits into two chunks"
+            );
+        }
+
+        #[test]
+        fn a0_split_message_hard_splits_newline_free_body_at_the_effective_limit() {
+            let body = "a".repeat(2500);
+            let chunks = split_message(&body);
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(chunks[0].len(), 1990, "hard split at effective_limit");
+            assert_eq!(chunks[1].len(), 2500 - 1990, "remainder length");
+            // Order + completeness: concatenation reproduces the input.
+            assert_eq!(format!("{}{}", chunks[0], chunks[1]), body);
+        }
+
+        #[test]
+        fn a0_split_message_prefers_last_newline_and_strips_the_boundary_newline() {
+            let head = "a".repeat(1000);
+            let tail = "b".repeat(1500);
+            let body = format!("{head}\n{tail}"); // newline at byte 1000, within 1990
+            let chunks = split_message(&body);
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(
+                chunks[0], head,
+                "first chunk ends at the last newline (excl.)"
+            );
+            assert_eq!(
+                chunks[1], tail,
+                "the boundary newline is stripped from the next chunk head"
+            );
+        }
+
+        #[test]
+        fn a0_split_message_leading_newline_does_not_emit_an_empty_chunk() {
+            // Issue #1043 guard.
+            let body = format!("\n{}", "a".repeat(2200));
+            let chunks = split_message(&body);
+            assert!(
+                chunks.iter().all(|c| !c.is_empty()),
+                "no empty chunk may be emitted (#1043)"
+            );
+            assert!(chunks.len() >= 2, "the long body still splits");
+        }
+
+        #[test]
+        fn a0_split_message_reopens_code_fence_across_a_chunk_boundary() {
+            let mut body = String::from("```rust\n");
+            body.push_str(&"x".repeat(2100)); // forces a split while the fence is open
+            let chunks = split_message(&body);
+            assert!(chunks.len() >= 2, "long fenced body splits");
+            assert!(
+                chunks[0].ends_with("\n```"),
+                "first chunk closes the open fence: {:?}",
+                &chunks[0][chunks[0].len().saturating_sub(8)..]
+            );
+            assert!(
+                chunks[1].starts_with("```rust\n"),
+                "next chunk re-opens the fence with the same language tag"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // streaming_split_boundary — rollover boundary primitive (§5 A0 item 4)
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn a0_streaming_split_boundary_is_none_when_text_fits() {
+            assert_eq!(streaming_split_boundary("short", 100), None);
+            assert_eq!(streaming_split_boundary("anything", 0), None);
+        }
+
+        #[test]
+        fn a0_streaming_split_boundary_prefers_paragraph_then_newline_then_whitespace() {
+            // Preference: "\n\n" (+2) > "\n" (+1) > whitespace > hard safe_end.
+            // safe_end = 50; each break is past safe_end/2 (=25) so the
+            // "early break => hard split" guard does not fire and the preferred
+            // boundary is used (the index INCLUDES the delimiter).
+
+            // Paragraph break at byte 30 ("\n\n") => split at 30 + 2 = 32.
+            let para = format!("{}\n\n{}", "x".repeat(30), "c".repeat(100));
+            assert_eq!(
+                streaming_split_boundary(&para, 50),
+                Some(32),
+                "splits just after the paragraph break"
+            );
+
+            // Single newline at byte 30 => split at 30 + 1 = 31.
+            let nl = format!("{}\n{}", "x".repeat(30), "e".repeat(100));
+            assert_eq!(
+                streaming_split_boundary(&nl, 50),
+                Some(31),
+                "splits just after the single newline"
+            );
+
+            // Whitespace (space) at byte 30, no newline => split at 30 + 1 = 31.
+            let ws = format!("{} {}", "x".repeat(30), "f".repeat(100));
+            assert_eq!(
+                streaming_split_boundary(&ws, 50),
+                Some(31),
+                "splits just after the last whitespace"
+            );
+        }
+
+        #[test]
+        fn a0_streaming_split_boundary_paragraph_beats_a_later_single_newline() {
+            // MIXED delimiters that DISPROVE priority (codex Medium 4): a
+            // paragraph break at byte 26 ("\n\n" => 26 + 2 = 28) precedes a LATER
+            // single newline at byte 40 (=> 41), both inside safe_end = 50 and
+            // both past safe_end/2 = 25. Production prefers paragraph
+            // (`paragraph_split.or(newline_split)`), so the split is 28. If that
+            // `.or` were reordered to newline-first, the later newline would win
+            // and the split would be 41 — a DIFFERENT value, so this pins the
+            // paragraph > single-newline priority, not just the position.
+            let body = format!(
+                "{}\n\n{}\n{}",
+                "x".repeat(26),
+                "y".repeat(12),
+                "z".repeat(100)
+            );
+            assert_eq!(
+                streaming_split_boundary(&body, 50),
+                Some(28),
+                "paragraph break wins over a later single newline"
+            );
+        }
+
+        #[test]
+        fn a0_streaming_split_boundary_single_newline_beats_a_later_space() {
+            // MIXED delimiters: a single newline at byte 30 (=> 31) precedes a
+            // LATER space at byte 42 (=> 43), no paragraph break, both past
+            // safe_end/2. Production prefers newline over whitespace
+            // (`newline_split.or(whitespace_split)`), so the split is 31. If the
+            // chain were reordered to whitespace-first, the later space would win
+            // (43) — a DIFFERENT value, pinning the single-newline > whitespace
+            // priority.
+            let body = format!("{}\n{} {}", "x".repeat(30), "y".repeat(11), "w".repeat(100));
+            assert_eq!(
+                streaming_split_boundary(&body, 50),
+                Some(31),
+                "single newline wins over a later space"
+            );
+        }
+
+        #[test]
+        fn a0_streaming_split_boundary_hard_splits_when_break_is_in_first_half() {
+            // "preferred < safe_end / 2 => use safe_end": an early break is
+            // rejected in favor of a hard split.
+            let body = format!("ab\n{}", "g".repeat(100));
+            assert_eq!(
+                streaming_split_boundary(&body, 50),
+                Some(50),
+                "an early break is rejected; hard-split at safe_end"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // plan_streaming_rollover — the rollover plan (§5 A0 item 4)
+        //
+        // Both turn_bridge and tmux_watcher call THIS single function, so
+        // "same input => same output" is the duplication-free behavior to lock.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn a0_plan_streaming_rollover_reserves_footer_and_margin_before_the_2000_cliff() {
+            // body_budget = 2000 - ((2 + status.len()) + 10). For "STATUS" (6B):
+            // footer "\n\nSTATUS" = 8; body_budget = 2000 - 18 = 1982.
+            let status = "STATUS";
+            let body = "Z".repeat(2500);
+            let plan = plan_streaming_rollover(&body, status).expect("a long body must roll over");
+            assert_eq!(
+                plan.split_at, 1982,
+                "rollover split point pins the footer+margin reservation"
+            );
+            assert_eq!(
+                plan.frozen_chunk,
+                "Z".repeat(1982),
+                "frozen chunk is body[..split_at]"
+            );
+            assert_eq!(plan.frozen_chunk.len(), plan.split_at);
+        }
+
+        #[test]
+        fn a0_plan_streaming_rollover_is_none_for_empty_or_short_body() {
+            assert_eq!(plan_streaming_rollover("", "STATUS"), None);
+            assert_eq!(plan_streaming_rollover("short body", "STATUS"), None);
+        }
+
+        #[test]
+        fn a0_plan_streaming_rollover_is_deterministic_for_both_caller_surfaces() {
+            // Identical (body, status) must yield byte-identical plans on every
+            // call, so a future per-surface re-derivation is caught.
+            let body = "line one\nline two\n".repeat(200); // > body_budget, newlines
+            let a = plan_streaming_rollover(&body, "STATUS").expect("rolls over");
+            let b = plan_streaming_rollover(&body, "STATUS").expect("rolls over");
+            assert_eq!(a, b, "same input must produce an identical rollover plan");
+            assert_eq!(a.frozen_chunk, body[..a.split_at]);
+        }
     }
 }
 

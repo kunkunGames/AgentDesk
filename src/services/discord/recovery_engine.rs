@@ -25,6 +25,9 @@ use std::path::Path;
 #[cfg(unix)]
 use std::process::Command;
 
+#[path = "recovery_engine/status_panel.rs"]
+mod recovery_status_panel;
+
 #[cfg(not(unix))]
 fn tmux_session_has_live_pane(_name: &str) -> bool {
     false
@@ -240,6 +243,10 @@ fn should_advance_recovery_dispatch_after_relay(relay_ok: bool) -> bool {
     relay_ok
 }
 
+fn forget_completion_footer_for_recovery_takeover(channel_id: ChannelId) {
+    super::single_message_panel::completion_footer_forget_registered_target(channel_id);
+}
+
 async fn relay_recovery_terminal_notice(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -270,6 +277,7 @@ async fn relay_recovered_terminal_text_to_placeholder(
     placeholder: Option<MessageId>,
     text: &str,
 ) -> RecoveryRelayOutcome {
+    forget_completion_footer_for_recovery_takeover(channel_id);
     let delivery = match placeholder {
         Some(placeholder) => {
             super::formatting::replace_long_message_raw(http, channel_id, placeholder, text, shared)
@@ -413,7 +421,7 @@ async fn complete_recovery_visible_turn(
         }
     }
 
-    if !shared.status_panel_v2_enabled {
+    if !shared.ui.status_panel_v2_enabled {
         return RecoveryCompletionOutcome::Emitted;
     }
     // #2427 D wire: explicit completion signal — most recovery paths
@@ -429,9 +437,14 @@ async fn complete_recovery_visible_turn(
     );
     let started_at_unix = super::inflight::parse_started_at_unix(&state.started_at)
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
-    let persisted_inflight = super::inflight::load_inflight_state(provider, channel_id.get());
-    let status_msg_id =
-        recovery_status_panel_message_id_for_completion(state, persisted_inflight.as_ref());
+    let Some(status_msg_id) = recovery_status_panel::completion_target(
+        shared.ui.status_panel_v2_enabled,
+        state,
+        provider,
+        channel_id,
+    ) else {
+        return RecoveryCompletionOutcome::Emitted;
+    };
 
     // EPIC #3078 PR-2 — route recovery completion through the
     // `StatusPanelController` behind a parity check (shadow mode). The
@@ -472,27 +485,6 @@ async fn complete_recovery_visible_turn(
     )
     .await;
     RecoveryCompletionOutcome::Emitted
-}
-
-fn recovery_status_panel_message_id_for_completion(
-    state: &super::inflight::InflightTurnState,
-    persisted: Option<&super::inflight::InflightTurnState>,
-) -> Option<MessageId> {
-    persisted
-        .and_then(|inflight| {
-            if inflight.user_msg_id == state.user_msg_id {
-                super::turn_bridge::normalize_status_panel_message_id(
-                    inflight.status_message_id.map(MessageId::new),
-                )
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            super::turn_bridge::normalize_status_panel_message_id(
-                state.status_message_id.map(MessageId::new),
-            )
-        })
 }
 
 /// EPIC #3078 PR-2 — the parity gate between the legacy recovery
@@ -537,10 +529,10 @@ mod recovery_dispatch_gate_tests {
 #[cfg(test)]
 mod recovery_completion_outcome_tests {
     use super::{
-        RecoveryCompletionOutcome, assert_recovery_completion_parity,
-        recovery_status_panel_message_id_for_completion,
+        RecoveryCompletionOutcome, assert_recovery_completion_parity, recovery_status_panel,
     };
     use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::{ChannelId, MessageId};
 
     fn state_for_recovery(user_msg_id: u64) -> super::inflight::InflightTurnState {
         super::inflight::InflightTurnState::new(
@@ -580,7 +572,7 @@ mod recovery_completion_outcome_tests {
         persisted.status_message_id = Some(4004);
 
         let status_msg_id =
-            recovery_status_panel_message_id_for_completion(&snapshot, Some(&persisted));
+            recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
 
         assert_eq!(status_msg_id, Some(super::MessageId::new(4004)));
     }
@@ -593,9 +585,88 @@ mod recovery_completion_outcome_tests {
         persisted.status_message_id = Some(4004);
 
         let status_msg_id =
-            recovery_status_panel_message_id_for_completion(&snapshot, Some(&persisted));
+            recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
 
         assert_eq!(status_msg_id, Some(super::MessageId::new(3003)));
+    }
+
+    #[test]
+    fn footer_mode_skips_recovery_status_panel_completion_for_stale_persisted_id() {
+        let mut snapshot = state_for_recovery(9101);
+        snapshot.status_message_id = Some(3003);
+        let mut persisted = state_for_recovery(9101);
+        persisted.status_message_id = Some(4004);
+
+        let target = recovery_status_panel::completion_target_for_flags(
+            true,
+            true,
+            &snapshot,
+            Some(&persisted),
+        );
+
+        assert_eq!(
+            target, None,
+            "footer mode must not edit or SendFallback a separate recovery panel; the stale id is left for sweeper reclaim"
+        );
+    }
+
+    #[test]
+    fn flag_off_recovery_status_panel_completion_keeps_original_target() {
+        let mut snapshot = state_for_recovery(9101);
+        snapshot.status_message_id = Some(3003);
+        let mut persisted = state_for_recovery(9101);
+        persisted.status_message_id = Some(4004);
+
+        let target = recovery_status_panel::completion_target_for_flags(
+            false,
+            true,
+            &snapshot,
+            Some(&persisted),
+        );
+
+        assert_eq!(target, Some(Some(super::MessageId::new(4004))));
+    }
+
+    #[test]
+    fn flag_off_recovery_none_target_still_requests_send_fallback() {
+        let snapshot = state_for_recovery(9101);
+
+        let target =
+            recovery_status_panel::completion_target_for_flags(false, true, &snapshot, None);
+
+        assert_eq!(
+            target,
+            Some(None),
+            "flag-off v2 recovery preserves the SendFallback rollback behavior when no status_message_id was persisted"
+        );
+    }
+
+    #[test]
+    fn recovery_takeover_forgets_registered_completion_footer_target() {
+        let channel_id = ChannelId::new(3_089_201);
+        let shared = super::super::make_shared_data_for_tests();
+        super::super::single_message_panel::completion_footer_forget_registered_target(channel_id);
+        let _ = super::super::single_message_panel::register_completion_footer_target(
+            channel_id,
+            MessageId::new(3_089_301),
+            &ProviderKind::Claude,
+            1_800_000_000,
+            "Final answer",
+            None,
+            true,
+        );
+
+        super::forget_completion_footer_for_recovery_takeover(channel_id);
+
+        assert_eq!(
+            super::super::single_message_panel::completion_footer_edit_for_registered_target_at(
+                shared.as_ref(),
+                channel_id,
+                "⠸",
+                1_800_000_005,
+            ),
+            None
+        );
     }
 
     // EPIC #3078 PR-2: for representative recovery-completion inputs, the
@@ -615,7 +686,7 @@ mod recovery_completion_outcome_tests {
         snapshot.status_message_id = Some(3003);
         let mut persisted = state_for_recovery(9101);
         persisted.status_message_id = Some(4004);
-        let legacy = recovery_status_panel_message_id_for_completion(&snapshot, Some(&persisted));
+        let legacy = recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
         assert_eq!(legacy, Some(super::MessageId::new(4004)));
 
         let ctl = StatusPanelController::spawn(true);
@@ -632,7 +703,7 @@ mod recovery_completion_outcome_tests {
         // collapses onto the single live entry it adopted, choosing the same id.
         let mut snapshot0 = state_for_recovery(0);
         snapshot0.status_message_id = Some(5005);
-        let legacy0 = recovery_status_panel_message_id_for_completion(&snapshot0, None);
+        let legacy0 = recovery_status_panel::message_id_for_completion(&snapshot0, None);
         assert_eq!(legacy0, Some(super::MessageId::new(5005)));
 
         let ctl0 = StatusPanelController::spawn(true);
@@ -647,7 +718,7 @@ mod recovery_completion_outcome_tests {
 
         // Case C: no panel id at all (None) — both agree on None.
         let snapshot_none = state_for_recovery(9300);
-        let legacy_none = recovery_status_panel_message_id_for_completion(&snapshot_none, None);
+        let legacy_none = recovery_status_panel::message_id_for_completion(&snapshot_none, None);
         assert_eq!(legacy_none, None);
 
         let ctl_none = StatusPanelController::spawn(true);
@@ -1256,7 +1327,7 @@ pub(super) async fn finish_recovered_turn_mailbox(
     let _ = shared
         .turn_finalizer
         .submit_terminal(
-            super::turn_finalizer::TurnKey::new(channel_id, 0, shared.current_generation),
+            super::turn_finalizer::TurnKey::new(channel_id, 0, shared.restart.current_generation),
             provider.clone(),
             super::turn_finalizer::TerminalEvent::Complete,
             super::turn_finalizer::FinalizeContext::monitor(),
@@ -1297,7 +1368,7 @@ fn reseed_watcher_owned_finalizer_ledger(
         super::turn_finalizer::TurnKey::new(
             channel_id,
             user_msg_id.get(),
-            shared.current_generation,
+            shared.restart.current_generation,
         ),
         provider.clone(),
         super::inflight::RelayOwnerKind::Watcher,
@@ -3763,14 +3834,14 @@ pub(super) async fn restore_inflight_turns(
                 }
             }
 
-            // Keep the inflight state until the watcher either relays the
-            // final response or triggers watcher-death handoff. Clearing it
-            // here breaks the handoff path if the recovered tmux session
-            // dies before producing a result.
+            // Keep the inflight state until the watcher either relays the final response or
+            // triggers watcher-death handoff. Clearing it here breaks the handoff path if the
+            // recovered tmux session dies before producing a result.
             continue;
         }
 
         shared
+            .restart
             .recovering_channels
             .insert(channel_id, std::time::Instant::now());
 
@@ -4382,6 +4453,7 @@ pub(crate) async fn rebind_inflight_for_channel(
         }
         state
     };
+    forget_completion_footer_for_recovery_takeover(discord_channel_id);
 
     // Register / refresh the in-memory session so downstream handlers can
     // locate this channel after the rebind.
@@ -4628,7 +4700,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             !shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.current_generation)
+                .has_live_watcher_pending(ch, shared.restart.current_generation)
                 .await,
             "ledger must start empty (simulating a post-restart in-memory ledger)"
         );
@@ -4644,7 +4716,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.current_generation)
+                .has_live_watcher_pending(ch, shared.restart.current_generation)
                 .await,
             "#3248 gap-1: reattach must register_start the turn as Watcher-owned"
         );
@@ -4673,7 +4745,7 @@ mod reregister_ledger_reseed_tests {
         assert!(
             shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.current_generation)
+                .has_live_watcher_pending(ch, shared.restart.current_generation)
                 .await,
             "repeated reattach keeps a single live Watcher-pending entry"
         );
@@ -4697,9 +4769,40 @@ mod reregister_ledger_reseed_tests {
         assert!(
             !shared
                 .turn_finalizer
-                .has_live_watcher_pending(ch, shared.current_generation)
+                .has_live_watcher_pending(ch, shared.restart.current_generation)
                 .await,
             "a zero user_msg_id turn must NOT seed an orphan ledger entry"
         );
+    }
+
+    // #3089 A0 — characterization of the recovery probe-classified outcome
+    // (design §5 A0 item 3, signal #5 of 5). `RecoveryCompletionOutcome` is the
+    // recovery engine's terminal-completion signal; BOTH arms `should_proceed()`
+    // (a suppressed visible completion is NOT a delivery failure, so callers
+    // still release mailbox/inflight ownership). Pinned inline in this
+    // `#[cfg(test)] mod` block of the FROZEN (baseline 4090) file => ZERO prod
+    // LoC.
+    mod a0_characterization_tests {
+        use super::super::RecoveryCompletionOutcome;
+
+        #[test]
+        fn a0_both_recovery_outcomes_proceed_with_cleanup() {
+            assert!(
+                RecoveryCompletionOutcome::Emitted.should_proceed(),
+                "Emitted proceeds"
+            );
+            assert!(
+                RecoveryCompletionOutcome::VisibleCompletionSuppressed.should_proceed(),
+                "VisibleCompletionSuppressed still proceeds (terminal delivery is authoritative)"
+            );
+        }
+
+        #[test]
+        fn a0_recovery_outcomes_are_two_distinct_arms() {
+            assert_ne!(
+                RecoveryCompletionOutcome::Emitted,
+                RecoveryCompletionOutcome::VisibleCompletionSuppressed
+            );
+        }
     }
 }

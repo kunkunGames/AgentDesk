@@ -37,17 +37,17 @@ mod queued_placeholders_store;
 mod reaction_cleanup;
 mod relay_health;
 mod relay_recovery;
+#[cfg(unix)] // #3089 A0: shared ReplaceLongMessageOutcome disposition policy.
+mod replace_outcome_policy;
 pub(crate) mod response_sanitizer;
 #[cfg(unix)]
 mod session_relay_sink;
-// #2011 Phase 5.3: standalone JSONL → Discord relay loop spawned by the bridge
-// on cluster-standby nodes (leader keeps using tmux_watcher's relay path).
+// #2011 Phase 5.3: standalone JSONL → Discord relay loop on cluster-standby nodes (leader uses tmux_watcher's relay path).
 #[cfg(unix)]
 mod standby_relay;
-// #1074: landing zone for the future recovery-engine module split
-// (restart / runtime / manual_rebind). See `docs/recovery-paths.md`.
-// Named `recovery_paths` to avoid shadowing the existing
-// `recovery_engine as recovery` alias below until the mechanical split lands.
+// #1074: landing zone for the future recovery-engine module split (restart /
+// runtime / manual_rebind; see `docs/recovery-paths.md`). Named `recovery_paths`
+// to avoid shadowing the `recovery_engine as recovery` alias until the split lands.
 mod recovery_engine;
 mod recovery_paths;
 mod restart_mode;
@@ -56,9 +56,8 @@ pub(crate) mod restart_report;
 mod role_map;
 mod router;
 mod runtime_bootstrap;
-// #1446 stall-deadlock recovery: shared post-clear bookkeeping for the
-// THREAD-GUARD + stall-watchdog cleanup paths so neither leaks
-// `global_active` / orphaned cancel tokens after a dead-dispatch sweep.
+// #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
+// + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
 pub mod runtime_store;
 pub(crate) mod session_identity;
 mod session_runtime;
@@ -69,7 +68,9 @@ pub(crate) mod shared_memory;
 // dedicated inherent impls). See `shared_state::QueuedPlaceholderState` and
 // `shared_state::SessionOverrideState`.
 mod shared_state;
+mod single_message_panel;
 mod stall_recovery;
+mod startup_reclaim;
 mod status_panel_orphan_store;
 pub(in crate::services::discord) mod streaming_finalizer;
 pub(in crate::services::discord) mod task_supervisor;
@@ -115,10 +116,17 @@ pub(crate) use restart_mode::InflightRestartMode;
 pub(crate) use router::HeadlessTurnStartError;
 #[cfg(unix)]
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
+// #3038 S4: re-export the live-placeholder cluster type so `SharedData`
+// declarations/constructors keep the S1/S2/S3 unqualified surface.
+pub(in crate::services::discord) use shared_state::PlaceholderState;
 pub(in crate::services::discord) use shared_state::QueuedPlaceholderState;
+pub(in crate::services::discord) use shared_state::RuntimeHttpCache;
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
 // to `crate::services`), so the group type is re-exported with that same scope.
 pub(in crate::services) use shared_state::SessionOverrideState;
+// #3038 S3: same scope rationale as S2 — the cluster-E members were
+// `pub(super)` on `SharedData` (visible up to `crate::services`).
+pub(in crate::services) use shared_state::RestartLifecycle;
 // Phase 2-pre.3 of intake-node-routing: worker entry point. Phase 3 will
 // add the worker polling loop that imports these names; until then they
 // are intentionally exposed but unused at the crate boundary.
@@ -673,43 +681,47 @@ pub(in crate::services::discord) fn advance_last_message_checkpoint(
     checkpoint
 }
 
-pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff;
-pub(in crate::services::discord) use queue_io::schedule_deferred_idle_queue_kickoff_immediate;
-/// Minimum interval between Discord placeholder edits for progress status.
-/// Configurable via AGENTDESK_STATUS_INTERVAL_SECS env var. Default: 5 seconds.
-pub(super) fn status_update_interval() -> Duration {
-    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let secs = std::env::var("AGENTDESK_STATUS_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        Duration::from_secs(secs)
-    })
+pub(in crate::services::discord) use queue_io::{
+    schedule_deferred_idle_queue_kickoff, schedule_deferred_idle_queue_kickoff_immediate,
+};
+pub(super) fn single_message_panel_enabled() -> bool {
+    single_message_panel::enabled()
+}
+/// Parse `var` as a `u64` seconds `Duration`, falling back to `default_secs`.
+fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
+    let secs = (std::env::var(var).ok()).and_then(|s| s.parse::<u64>().ok());
+    Duration::from_secs(secs.unwrap_or(default_secs))
 }
 
-/// Turn watchdog timeout. Configurable via AGENTDESK_TURN_TIMEOUT_SECS env var.
-/// Default: 3600 seconds (60 minutes).
+/// Minimum interval between Discord placeholder progress edits (AGENTDESK_STATUS_INTERVAL_SECS, default 5s).
+pub(super) fn status_update_interval() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_STATUS_INTERVAL_SECS", 5))
+}
+
+/// #3419 B: turn watchdog ABSOLUTE cap, a generous supplementary upper bound —
+/// the primary firing measure is IDLE (`turn_idle_timeout`), so a turn emitting
+/// output stays alive until it idles. Default 6h only guards an output that
+/// never stops yet never finishes. AGENTDESK_TURN_TIMEOUT_SECS.
 pub(super) fn turn_watchdog_timeout() -> Duration {
     static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let secs = std::env::var("AGENTDESK_TURN_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(3600);
-        Duration::from_secs(secs)
-    })
+    *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_TURN_TIMEOUT_SECS", 6 * 3600))
+}
+
+/// #3419 B: watcher turn IDLE window — fire only after this much silence since
+/// the last real byte (`last_output_at`, NOT empty polls). Default 3600s == the
+/// old absolute cap, so a turn must be FULLY idle for an hour (codex
+/// interactive/subagent turns emit far sooner). AGENTDESK_TURN_IDLE_TIMEOUT_SECS.
+pub(super) fn turn_idle_timeout() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_TURN_IDLE_TIMEOUT_SECS", 3600))
 }
 
 /// Extend the watchdog deadline for a channel and move the per-turn max cap
-/// with it.  Also refreshes the in-memory voice-background handoff marker
-/// TTL (if one exists for the active turn) so extended turns do not lose
-/// their routing metadata (#2352).
-///
-/// When `pg_pool` is `Some`, the durable PG row's `expires_at` is refreshed
-/// as well via `voice::announce_meta::refresh_handoff_ttl_durable`.  Durable
-/// refresh errors are logged and ignored so a PG hiccup cannot break the
-/// deadline extension.
+/// with it. Also refreshes the in-memory voice-background handoff marker TTL so
+/// extended turns keep their routing metadata (#2352). When `pg_pool` is `Some`
+/// the durable PG `expires_at` is refreshed too (`refresh_handoff_ttl_durable`);
+/// durable errors are logged and ignored so a PG hiccup cannot break extension.
 pub async fn extend_watchdog_deadline(
     channel_id: u64,
     extend_by_secs: u64,
@@ -850,6 +862,7 @@ pub(crate) async fn should_defer_thread_archive_pg(
 /// queue/checkpoint state before invoking it.
 pub(super) fn check_deferred_restart(shared: &SharedData) {
     if !shared
+        .restart
         .restart_pending
         .load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -857,6 +870,7 @@ pub(super) fn check_deferred_restart(shared: &SharedData) {
     }
     // CAS: ensure this provider only decrements once
     if shared
+        .restart
         .shutdown_counted
         .compare_exchange(
             false,
@@ -869,6 +883,7 @@ pub(super) fn check_deferred_restart(shared: &SharedData) {
         return;
     }
     if shared
+        .restart
         .shutdown_remaining
         .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
         != 1
@@ -902,7 +917,7 @@ pub(in crate::services::discord) fn saturating_decrement_counter(counter: &Atomi
 pub(in crate::services::discord) fn saturating_decrement_global_active(
     shared: &SharedData,
 ) -> bool {
-    saturating_decrement_counter(shared.global_active.as_ref())
+    saturating_decrement_counter(shared.restart.global_active.as_ref())
 }
 
 /// Single authoritative writer for the INCREMENT side of `global_active`,
@@ -925,7 +940,7 @@ pub(in crate::services::discord) fn increment_global_active(
     shared: &SharedData,
     reason: &str,
 ) -> usize {
-    increment_counter(shared.global_active.as_ref(), reason)
+    increment_counter(shared.restart.global_active.as_ref(), reason)
 }
 
 fn increment_counter(counter: &AtomicUsize, reason: &str) -> usize {
@@ -2215,24 +2230,10 @@ pub(crate) struct SharedData {
     /// watcher and an incoming watcher share the same emission-slot atomic
     /// and confirmed-offset watermark. See `TmuxRelayCoord`.
     pub(super) tmux_relay_coords: dashmap::DashMap<ChannelId, Arc<TmuxRelayCoord>>,
-    /// Last known placeholder cleanup outcome keyed by provider/channel/message.
-    /// This local tombstone lets watcher finalization reason about cleanup
-    /// even after the inflight file has already been cleared.
-    pub(in crate::services::discord) placeholder_cleanup:
-        Arc<placeholder_cleanup::PlaceholderCleanupRegistry>,
-    /// Lifecycle FSM + edit coalescer for live-turn placeholder cards (#1255).
-    /// Both the `tmux_handed_off` async-dispatch path and the new Monitor /
-    /// `Bash run_in_background` live-turn path go through this controller so
-    /// that concurrent edits to the same placeholder message_id serialize
-    /// instead of racing.
-    pub(in crate::services::discord) placeholder_controller:
-        Arc<placeholder_controller::PlaceholderController>,
-    /// Per-channel recent tool/system events rendered in Active placeholder
-    /// cards when `placeholder.live_events_enabled` is enabled.
-    pub(in crate::services::discord) placeholder_live_events:
-        Arc<placeholder_live_events::PlaceholderLiveEvents>,
-    pub(in crate::services::discord) placeholder_live_events_enabled: bool,
-    pub(in crate::services::discord) status_panel_v2_enabled: bool,
+    /// #3038 cluster F — live-placeholder/status-panel state: cleanup tombstones,
+    /// edit controller, live-event feed, and live-event/status-panel gates.
+    /// Field docs live on `shared_state::PlaceholderState`; call sites use `shared.ui.*`.
+    pub(in crate::services::discord) ui: PlaceholderState,
     /// #3038 cluster C — queued-placeholder handoff state (the
     /// `queued_placeholders` mapping, the `queue_exit_placeholder_clears`
     /// sidecar mirror, and the per-channel `queued_placeholders_persist_locks`).
@@ -2252,33 +2253,14 @@ pub(crate) struct SharedData {
     /// it never strands set.
     pub(in crate::services::discord) answer_flush_barrier:
         Arc<answer_flush_barrier::AnswerFlushBarrier>,
-    /// Per-channel in-flight turn recovery marker (restart resume in progress)
-    /// Value is the Instant when recovery started, used for stale-recovery timeout.
-    pub(super) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
-    /// Global shutdown flag — when set, watchers exit quietly via cancel path
-    pub(super) shutting_down: Arc<std::sync::atomic::AtomicBool>,
-    /// Number of turns currently in finalization phase (response sending + cleanup).
-    /// Deferred restart must wait until this reaches 0 to avoid killing mid-send turns.
-    pub(super) finalizing_turns: Arc<std::sync::atomic::AtomicUsize>,
-    /// Current restart generation — incremented on each --restart-dcserver.
-    /// Used to distinguish old (pre-restart) sessions from fresh ones.
-    pub(super) current_generation: u64,
-    /// Set when a `restart_pending` marker is detected. While true, the router
-    /// queues new messages instead of starting new turns (drain mode).
-    pub(super) restart_pending: Arc<std::sync::atomic::AtomicBool>,
-    /// Set to true after startup reconciliation + recovery is complete (#122).
-    /// Until true, the router queues all incoming messages.
-    pub(super) reconcile_done: Arc<std::sync::atomic::AtomicBool>,
-    /// Number of queued deferred idle-queue kickoffs waiting to run.
-    pub(super) deferred_hook_backlog: std::sync::atomic::AtomicUsize,
-    /// When this provider started reconcile/recovery for the current boot.
-    pub(super) recovery_started_at: std::time::Instant,
-    /// Captured reconcile/recovery duration for the current boot in milliseconds.
-    /// Remains 0 until reconcile completes, at which point it is frozen.
-    pub(super) recovery_duration_ms: std::sync::atomic::AtomicU64,
-    /// Process-global active turn counter shared across all providers.
-    /// Deferred restart checks this instead of provider-local cancel_tokens.len().
-    pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
+    /// #3038 cluster E — restart-lifecycle state (the per-channel recovery
+    /// markers and reconcile bookkeeping for the current boot, the
+    /// restart/shutdown drain flags and restart generation, and the
+    /// process-global active/finalizing/shutdown counters shared across all
+    /// providers as injected `Arc` handles). Field declarations and docs live
+    /// on `shared_state::RestartLifecycle`; call sites access the members via
+    /// `shared.restart.<original field name>`.
+    pub(super) restart: RestartLifecycle,
     /// EPIC #3016 — single-authority turn finalizer. The only code path that
     /// owns the four finalize side-effects (inflight clear, mailbox
     /// cancel_token release, `global_active` decrement, trailing terminal
@@ -2293,14 +2275,6 @@ pub(crate) struct SharedData {
     /// `finalize`/`reclaim`. The actor task is gated on `status_panel_v2_enabled`.
     pub(in crate::services::discord) status_panel_controller:
         Arc<status_panel_controller::StatusPanelController>,
-    /// Process-global finalizing turn counter shared across all providers.
-    pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
-    /// Number of providers still needing to complete shutdown.
-    /// The last provider to decrement this to 0 calls `exit(0)`.
-    pub(super) shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
-    /// Per-provider flag: ensures this provider decrements `shutdown_remaining` at most once,
-    /// even if both the deferred restart poll loop and SIGTERM handler run.
-    pub(super) shutdown_counted: std::sync::atomic::AtomicBool,
     /// Intake-level dedup cache: prevents the same message from starting two turns
     /// when duplicate bot dispatches arrive nearly simultaneously.
     /// Key: dedup key (dispatch_id or channel+author+text hash).
@@ -2347,10 +2321,12 @@ pub(crate) struct SharedData {
     pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Per-channel known speakers collected lazily from incoming messages.
     pub(super) channel_rosters: dashmap::DashMap<ChannelId, Vec<UserRecord>>,
-    /// Cached serenity context for deferred queue drain (set once during ready event).
-    pub(super) cached_serenity_ctx: tokio::sync::OnceCell<serenity::Context>,
-    /// Cached bot token for deferred queue drain.
-    pub(super) cached_bot_token: tokio::sync::OnceCell<String>,
+    /// #3038 cluster G — cached Discord HTTP runtime state: the gateway
+    /// serenity context plus the bot-token fallback for standby REST sends.
+    /// Field docs live on `shared_state::RuntimeHttpCache`; call sites use
+    /// `shared.http.*` for direct cache reads and keep
+    /// `shared.serenity_http_or_token_fallback()` for the accessor.
+    pub(in crate::services::discord) http: RuntimeHttpCache,
     /// SHA-256 hash of the bot token — used to namespace the pending-queue directory
     /// so that multiple bots sharing the same runtime root cannot steal each other's queues.
     pub(super) token_hash: String,
@@ -2385,34 +2361,6 @@ pub(crate) struct SharedData {
 impl SharedData {
     pub(super) fn has_runtime_storage(&self) -> bool {
         self.pg_pool.is_some()
-    }
-
-    /// Phase 5.2 of intake-node-routing (issue #2009): return an `Arc<Http>`
-    /// that the response path (tmux watcher, placeholder updates, message
-    /// edits) can use to call Discord. On the leader the gateway-attached
-    /// runtime caches `cached_serenity_ctx`, and `ctx.http` is preferred so
-    /// the Http instance shares the same application_id and connection
-    /// pool the gateway already owns. On cluster-standby nodes the
-    /// OnceCell is empty (no gateway runtime ever ran), so we fall back to
-    /// a freshly constructed `serenity::http::Http` built from the bot
-    /// token cached in `cached_bot_token`. Returns `None` only when both
-    /// caches are empty — that means the runtime never reached the
-    /// "token known" milestone in `run_bot()`, which today only happens
-    /// before `bot_settings` finishes loading.
-    ///
-    /// Callers should treat `None` as a hard failure: they cannot post
-    /// to Discord without an Http instance. The current call sites
-    /// either propagate the failure (skip the work + warn) or have
-    /// their own panic-on-None invariant tied to `cached_bot_token`
-    /// being populated at `run_bot()` startup.
-    pub(super) fn serenity_http_or_token_fallback(&self) -> Option<Arc<serenity::http::Http>> {
-        if let Some(ctx) = self.cached_serenity_ctx.get() {
-            return Some(ctx.http.clone());
-        }
-        if let Some(token) = self.cached_bot_token.get() {
-            return Some(Arc::new(serenity::http::Http::new(token)));
-        }
-        None
     }
 
     fn mailbox(&self, channel_id: ChannelId) -> ChannelMailboxHandle {
@@ -2602,32 +2550,45 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         skills_cache: tokio::sync::RwLock::new(Vec::new()),
         tmux_watchers: TmuxWatcherRegistry::new(),
         tmux_relay_coords: dashmap::DashMap::new(),
-        placeholder_cleanup: Arc::new(placeholder_cleanup::PlaceholderCleanupRegistry::default()),
-        placeholder_controller: Arc::new(placeholder_controller::PlaceholderController::default()),
-        placeholder_live_events: Arc::new(placeholder_live_events::PlaceholderLiveEvents::default()),
-        placeholder_live_events_enabled: false,
-        status_panel_v2_enabled: false,
+        ui: PlaceholderState {
+            placeholder_cleanup: Arc::new(
+                placeholder_cleanup::PlaceholderCleanupRegistry::default(),
+            ),
+            placeholder_controller: Arc::new(
+                placeholder_controller::PlaceholderController::default(),
+            ),
+            placeholder_live_events: Arc::new(
+                placeholder_live_events::PlaceholderLiveEvents::default(),
+            ),
+            placeholder_live_events_enabled: false,
+            status_panel_v2_enabled: false,
+        },
         queued: QueuedPlaceholderState {
             queued_placeholders: dashmap::DashMap::new(),
             queue_exit_placeholder_clears: dashmap::DashMap::new(),
             queued_placeholders_persist_locks: dashmap::DashMap::new(),
         },
         answer_flush_barrier: Arc::new(answer_flush_barrier::AnswerFlushBarrier::default()),
-        recovering_channels: dashmap::DashMap::new(),
-        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        current_generation: 0,
-        restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
-        recovery_started_at: std::time::Instant::now(),
-        recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
-        global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        // #3038 S3: wrapped at the first-member position (evaluation-order
+        // preserved — the three members hoisted above the spawn calls are
+        // side-effect-free constructors; see run_bot_build_shared_data).
+        restart: RestartLifecycle {
+            recovering_channels: dashmap::DashMap::new(),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            current_generation: 0,
+            restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconcile_done: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            deferred_hook_backlog: std::sync::atomic::AtomicUsize::new(0),
+            recovery_started_at: std::time::Instant::now(),
+            recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
+            global_active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shutdown_counted: std::sync::atomic::AtomicBool::new(false),
+        },
         turn_finalizer: turn_finalizer::TurnFinalizer::spawn(),
         status_panel_controller: status_panel_controller::StatusPanelController::spawn(false),
-        global_finalizing: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        shutdown_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        shutdown_counted: std::sync::atomic::AtomicBool::new(false),
         intake_dedup: dashmap::DashMap::new(),
         dispatch_thread_parents: dashmap::DashMap::new(),
         voice_barge_in: Arc::new(voice_barge_in::VoiceBargeInRuntime::disabled()),
@@ -2649,8 +2610,10 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         catch_up_retry_pending: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
         channel_rosters: dashmap::DashMap::new(),
-        cached_serenity_ctx: tokio::sync::OnceCell::new(),
-        cached_bot_token: tokio::sync::OnceCell::new(),
+        http: RuntimeHttpCache {
+            cached_serenity_ctx: tokio::sync::OnceCell::new(),
+            cached_bot_token: tokio::sync::OnceCell::new(),
+        },
         token_hash: "test-token-hash".to_string(),
         provider: ProviderKind::Claude,
         api_port: 9,
@@ -2859,11 +2822,10 @@ fn cleanup_retry_inflight_blocks_idle_kickoff(
         return false;
     }
 
-    shared.placeholder_cleanup.terminal_cleanup_retry_pending(
-        provider,
-        channel_id,
-        MessageId::new(state.current_msg_id),
-    )
+    shared
+        .ui
+        .placeholder_cleanup
+        .terminal_cleanup_retry_pending(provider, channel_id, MessageId::new(state.current_msg_id))
 }
 
 fn idle_queue_snapshot_has_kickable_backlog(
@@ -3241,6 +3203,7 @@ async fn queue_exit_drain_queued_placeholders(
                 .remove(&(channel_id, *message_id))
             {
                 shared
+                    .ui
                     .placeholder_controller
                     .detach_by_message(channel_id, placeholder_msg_id);
                 visible_cards_to_clear.push(QueueExitVisibleCard {
@@ -3866,15 +3829,16 @@ pub(super) struct Data {
 }
 
 pub(super) fn mark_reconcile_complete(shared: &SharedData) {
-    let duration_ms = shared.recovery_started_at.elapsed().as_millis();
+    let duration_ms = shared.restart.recovery_started_at.elapsed().as_millis();
     let duration_ms = duration_ms.min(u64::MAX as u128) as u64;
-    let _ = shared.recovery_duration_ms.compare_exchange(
+    let _ = shared.restart.recovery_duration_ms.compare_exchange(
         0,
         duration_ms,
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Relaxed,
     );
     shared
+        .restart
         .reconcile_done
         .store(true, std::sync::atomic::Ordering::Release);
 }
@@ -5714,5 +5678,89 @@ mod queued_placeholder_cluster_characterization_tests {
             !Arc::ptr_eq(&lock_a1, &lock_b),
             "different channels must get distinct locks"
         );
+    }
+
+    // #3089 A0 — characterization of the `LeaseOutcome` failure-signal
+    // representation and its I2 invariant (design §5 A0 item 3, signal #1 of 5).
+    // The dormant `DeliveryLeaseCell` state machine is already pinned by
+    // `turn_finalizer::tests::delivery_lease`; this pins the load-bearing I2
+    // datum the controller must preserve — `commit` RECORDS the three-way
+    // outcome verbatim and never collapses NotDelivered/Unknown into Delivered,
+    // so the caller can refuse to advance the offset for the ambiguous arms.
+    // Pinned inline in this `#[cfg(test)] mod` of the FROZEN (baseline 4944)
+    // file => ZERO production LoC.
+    mod a0_failure_signal_characterization_tests {
+        use super::super::turn_finalizer::TurnKey;
+        use super::super::{DeliveryLeaseCell, LeaseHolder, LeaseOutcome, LeaseSnapshot};
+        use serenity::model::id::ChannelId;
+
+        fn turn() -> TurnKey {
+            TurnKey::new(ChannelId::new(7), 11, 0)
+        }
+
+        #[test]
+        fn a0_lease_outcome_has_exactly_three_distinct_arms() {
+            assert_ne!(LeaseOutcome::Delivered, LeaseOutcome::NotDelivered);
+            assert_ne!(LeaseOutcome::Delivered, LeaseOutcome::Unknown);
+            assert_ne!(LeaseOutcome::NotDelivered, LeaseOutcome::Unknown);
+        }
+
+        #[test]
+        fn a0_commit_records_each_outcome_verbatim_without_collapsing() {
+            for outcome in [
+                LeaseOutcome::Delivered,
+                LeaseOutcome::NotDelivered,
+                LeaseOutcome::Unknown,
+            ] {
+                let cell = DeliveryLeaseCell::new(ChannelId::new(7));
+                let holder = LeaseHolder::Bridge;
+                assert!(cell.try_acquire(turn(), holder, 100, 200, 1_000));
+                assert!(
+                    cell.commit(holder, turn(), 100, 200, outcome),
+                    "identity-matched commit of {outcome:?} succeeds"
+                );
+                match cell.read() {
+                    LeaseSnapshot::Committed {
+                        outcome: got,
+                        start,
+                        end,
+                        ..
+                    } => {
+                        assert_eq!(got, outcome, "committed outcome is recorded verbatim");
+                        assert_eq!((start, end), (100, 200), "range is preserved on commit");
+                    }
+                    other => panic!("expected Committed{{{outcome:?}}}, got {other:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn a0_unknown_and_not_delivered_are_distinguishable_after_commit() {
+            // This pins ONLY that `DeliveryLeaseCell::commit` preserves each
+            // distinct outcome (so the caller can tell them apart). The I2
+            // advance rule itself — committed offset advances ONLY on Delivered
+            // — is characterized against the REAL production advance path in
+            // `turn_bridge::terminal_delivery`'s
+            // `a0_i2_advance_characterization_tests` (driving
+            // `BridgeDeliveryLease::commit_and_advance`), NOT a local closure.
+            let delivered = committed_outcome_of(LeaseOutcome::Delivered);
+            let not_delivered = committed_outcome_of(LeaseOutcome::NotDelivered);
+            let unknown = committed_outcome_of(LeaseOutcome::Unknown);
+
+            assert_eq!(delivered, LeaseOutcome::Delivered);
+            assert_eq!(not_delivered, LeaseOutcome::NotDelivered);
+            assert_eq!(unknown, LeaseOutcome::Unknown);
+        }
+
+        fn committed_outcome_of(outcome: LeaseOutcome) -> LeaseOutcome {
+            let cell = DeliveryLeaseCell::new(ChannelId::new(7));
+            let holder = LeaseHolder::Sink;
+            assert!(cell.try_acquire(turn(), holder, 0, 5, 1_000));
+            assert!(cell.commit(holder, turn(), 0, 5, outcome));
+            match cell.read() {
+                LeaseSnapshot::Committed { outcome, .. } => outcome,
+                other => panic!("expected Committed, got {other:?}"),
+            }
+        }
     }
 }

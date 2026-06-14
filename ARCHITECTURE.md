@@ -198,18 +198,8 @@ src/
 │   │   │   ├── ops.rs
 │   │   │   └── reviews.rs
 │   │   ├── review_verdict/
-│   │   │   ├── decision_route/
-│   │   │   │   ├── accept.rs
-│   │   │   │   ├── adapters.rs
-│   │   │   │   ├── dismiss_finalize.rs
-│   │   │   │   ├── dispute.rs
-│   │   │   │   ├── pending.rs
-│   │   │   │   ├── repo_card.rs
-│   │   │   │   ├── repo_dispatch.rs
-│   │   │   │   └── worktree_stale.rs
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
-│   │   │   ├── review_state_repo.rs
 │   │   │   ├── tuning_aggregate.rs
 │   │   │   └── verdict_route.rs
 │   │   ├── agents.rs
@@ -332,6 +322,10 @@ src/
 │   │   ├── process.rs
 │   │   └── spawn_queue.rs
 │   ├── claude_tui/
+│   │   ├── hosting/
+│   │   │   ├── followup_support.rs
+│   │   │   ├── mod.rs
+│   │   │   └── warm_followup.rs
 │   │   ├── hook_bundle.rs
 │   │   ├── hook_relay.rs
 │   │   ├── hook_server.rs
@@ -397,34 +391,41 @@ src/
 │   │   ├── health/
 │   │   │   ├── headless_turn.rs
 │   │   │   ├── mailbox.rs
-│   │   │   ├── manual_delivery.rs
 │   │   │   ├── provider_probe.rs
 │   │   │   ├── recovery.rs
 │   │   │   ├── redaction.rs
+│   │   │   ├── relay_auto_heal.rs
 │   │   │   ├── runtime_resolve.rs
-│   │   │   ├── send_api.rs
-│   │   │   ├── send_gate.rs
-│   │   │   ├── send_target.rs
 │   │   │   ├── session_enrichment.rs
-│   │   │   └── snapshot.rs
+│   │   │   ├── snapshot.rs
+│   │   │   ├── stall_liveness.rs
+│   │   │   └── watcher_respawn.rs
 │   │   ├── inflight/
 │   │   │   └── budget.rs
 │   │   ├── outbound/
 │   │   │   ├── confirmation.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── delivery.rs
+│   │   │   ├── manual_delivery.rs
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
 │   │   │   ├── result.rs
+│   │   │   ├── send_api.rs
+│   │   │   ├── send_gate.rs
+│   │   │   ├── send_target.rs
 │   │   │   ├── send_to_agent.rs
-│   │   │   └── transport.rs
+│   │   │   ├── transport.rs
+│   │   │   └── turn_output_controller.rs
 │   │   ├── placeholder_live_events/
+│   │   │   ├── background_task_events.rs
 │   │   │   ├── common.rs
+│   │   │   ├── completion_footer.rs
 │   │   │   ├── context_panel.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── recent_events.rs
 │   │   │   ├── session_panel.rs
+│   │   │   ├── slot_rehydration.rs
 │   │   │   ├── status_events.rs
 │   │   │   ├── status_panel.rs
 │   │   │   ├── subagent_rollout.rs
@@ -440,6 +441,8 @@ src/
 │   │   │   ├── memory_guidance.rs
 │   │   │   ├── mod.rs
 │   │   │   └── section_dedupe.rs
+│   │   ├── recovery_engine/
+│   │   │   └── status_panel.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── mod.rs
 │   │   │   ├── restart.rs
@@ -467,12 +470,14 @@ src/
 │   │   ├── runtime_bootstrap/
 │   │   │   ├── framework_setup.rs
 │   │   │   ├── gateway_lease.rs
+│   │   │   ├── gateway_runtime.rs
 │   │   │   ├── intake.rs
 │   │   │   ├── orphan_recovery.rs
 │   │   │   ├── queued_placeholders.rs
 │   │   │   ├── recovery_flush.rs
 │   │   │   ├── restored_state.rs
 │   │   │   ├── session_gc.rs
+│   │   │   ├── shared_data.rs
 │   │   │   ├── shutdown.rs
 │   │   │   ├── spawns.rs
 │   │   │   ├── startup_doctor.rs
@@ -491,6 +496,8 @@ src/
 │   │   │   ├── panel_decisions.rs
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── prompt_observe.rs
+│   │   │   ├── single_message_footer.rs
+│   │   │   ├── terminal_send.rs
 │   │   │   ├── turn_identity.rs
 │   │   │   └── turn_identity_tests.rs
 │   │   ├── tui_direct_abort_marker/
@@ -507,6 +514,7 @@ src/
 │   │   │   ├── recall_feedback.rs
 │   │   │   ├── recovery_text.rs
 │   │   │   ├── retry_state.rs
+│   │   │   ├── single_message_footer.rs
 │   │   │   ├── skill_usage.rs
 │   │   │   ├── stale_resume.rs
 │   │   │   ├── status_panel.rs
@@ -519,6 +527,14 @@ src/
 │   │   │   └── watcher_handoff.rs
 │   │   ├── turn_finalizer/
 │   │   │   └── cleanup.rs
+│   │   ├── voice_barge_in/
+│   │   │   ├── final_result_playback.rs
+│   │   │   ├── foreground_decision.rs
+│   │   │   ├── live_cut_playback.rs
+│   │   │   ├── progress_playback.rs
+│   │   │   ├── routing.rs
+│   │   │   ├── stt.rs
+│   │   │   └── tts_pipeline.rs
 │   │   ├── watchers/
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
@@ -559,6 +575,7 @@ src/
 │   │   ├── recovery_engine.rs
 │   │   ├── relay_health.rs
 │   │   ├── relay_recovery.rs
+│   │   ├── replace_outcome_policy.rs
 │   │   ├── response_sanitizer.rs
 │   │   ├── restart_ctrl.rs
 │   │   ├── restart_mode.rs
@@ -573,8 +590,10 @@ src/
 │   │   ├── shadow_parity_warn.rs
 │   │   ├── shared_memory.rs
 │   │   ├── shared_state.rs
+│   │   ├── single_message_panel.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
+│   │   ├── startup_reclaim.rs
 │   │   ├── status_panel_controller.rs
 │   │   ├── status_panel_orphan_store.rs
 │   │   ├── streaming_finalizer.rs
@@ -679,6 +698,17 @@ src/
 │   │   ├── smoke.rs
 │   │   ├── snapshot.rs
 │   │   └── upgrade.rs
+│   ├── review_decision/
+│   │   ├── accept.rs
+│   │   ├── adapters.rs
+│   │   ├── dismiss_finalize.rs
+│   │   ├── dispute.rs
+│   │   ├── pending.rs
+│   │   ├── repo_card.rs
+│   │   ├── repo_dispatch.rs
+│   │   ├── review_state_repo.rs
+│   │   ├── tuning_aggregate.rs
+│   │   └── worktree_stale.rs
 │   ├── routines/
 │   │   ├── action.rs
 │   │   ├── agent_executor.rs
@@ -690,6 +720,9 @@ src/
 │   │   ├── runtime_config.rs
 │   │   ├── session_control.rs
 │   │   └── store.rs
+│   ├── session_backend/
+│   │   ├── stream_line.rs
+│   │   └── terminal_usage.rs
 │   ├── slo/
 │   │   └── mod.rs
 │   ├── turn_orchestrator/

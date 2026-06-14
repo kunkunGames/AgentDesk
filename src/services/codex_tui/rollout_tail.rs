@@ -216,6 +216,21 @@ struct RolloutParseState {
     /// so the drain heuristic must not close the Discord turn while the pane
     /// is still alive.
     heuristic_finalize_waiting_for_completion_logged: bool,
+    /// #3343: trailing-whitespace witness of the last emitted assistant
+    /// `StreamMessage::Text` content. Codex rollout records are one distinct
+    /// assistant message per line (commentary/progress updates and final
+    /// paragraphs each get their own `response_item/message`). The frozen
+    /// watcher/bridge consumers append `StreamMessage::Text` content into
+    /// `full_response` with a raw `push_str`, so without a boundary separator
+    /// distinct messages collapse into `문장.다음문장` walls (see issue #3343).
+    /// `None` until the first text chunk of the turn is emitted (commentary or
+    /// final — both flow through `push_message_text`); afterwards `Some(true)`
+    /// when that chunk already ended on a newline (no separator needed) or
+    /// `Some(false)` when a `\n\n` boundary must be injected before the next
+    /// chunk. This witness is the single source of truth driving BOTH the
+    /// streamed `StreamMessage::Text` boundary and the `final_text` assembly, so
+    /// the two surfaces mirror each other exactly.
+    last_emitted_text_ended_with_newline: Option<bool>,
 }
 
 impl RolloutParseState {
@@ -226,6 +241,25 @@ impl RolloutParseState {
 
     fn has_pending_tool_call(&self) -> bool {
         !self.pending_tool_calls.is_empty() || self.pending_tool_calls_unkeyed > 0
+    }
+
+    /// #3343: append a single assistant text chunk to BOTH `final_text` and the
+    /// streamed surface through the one shared boundary rule, returning the
+    /// streamed chunk (with any injected `\n\n` boundary) to relay verbatim.
+    ///
+    /// This is the only writer of assistant text into `final_text` on the
+    /// streaming path and the only place `last_emitted_text_ended_with_newline`
+    /// is advanced for streamed records, so the two surfaces cannot diverge:
+    /// `final_text == streamed chunks concatenated` holds by construction (the
+    /// mirror property). Both commentary/progress fragments and final
+    /// paragraphs flow through here — commentary previously bypassed the
+    /// boundary and never updated `final_text`, which both reintroduced the
+    /// `문장.다음문장` wall for commentary and broke the mirror.
+    fn push_message_text(&mut self, text: &str) -> String {
+        let chunk = join_streamed_message_boundary(self.last_emitted_text_ended_with_newline, text);
+        self.final_text.push_str(&chunk);
+        self.last_emitted_text_ended_with_newline = Some(text.ends_with('\n'));
+        chunk
     }
 }
 
@@ -808,16 +842,14 @@ fn tail_rollout_file_until_assistant_response(
                 // is currently in flight. Otherwise the natural silence while
                 // codex waits for the tool result would trip the timer.
                 //
-                // #2453: when the tail has yet to observe ANY `event_msg`
-                // record (legacy Codex CLI fingerprint), bump the drain to
-                // `legacy_terminal_drain`. Modern CLIs emit at least one
-                // `event_msg` per message, so this branch only widens the
-                // drain for legacy writers that lack the structural signals
+                // #2453: with NO `event_msg` observed yet (legacy CLI
+                // fingerprint), bump to `legacy_terminal_drain`. Modern CLIs
+                // emit ≥1 `event_msg` per message, so this widens the drain
+                // only for legacy writers lacking the structural signals
                 // (token_count refresh, hook/envelope completion) the short
-                // default leans on. The bump is applied only when the
-                // configured legacy drain is strictly longer than the
-                // base drain — `terminal_drain.is_zero()` (replay) and
-                // shorter overrides stay verbatim.
+                // default leans on. Applied only when legacy drain is strictly
+                // longer — `terminal_drain.is_zero()` (replay) / shorter
+                // overrides stay verbatim.
                 let effective_drain = if state.seen_any_event_msg || terminal_drain.is_zero() {
                     terminal_drain
                 } else {
@@ -848,21 +880,16 @@ fn tail_rollout_file_until_assistant_response(
                         last_output_at = Some(Instant::now());
                     }
                 }
-                // #2419 follow-up (Codex review HIGH): bounded recovery for
-                // a pending tool call whose `*_output` never arrives (hung
-                // tool, malformed line, call_id skew). Without this, the
-                // drain gate stays shut forever while the pane is alive and
-                // the Discord turn hangs. After `pending_tool_call_deadline`
-                // of inactivity past the last lifecycle event we surface a
-                // terminal Done with a warning so the upstream advances.
-                //
-                // #2429 HIGH 2 (tool-first stuck calls bypass recovery):
-                // when `apply_pending_tool_deadline_without_assistant_text`
-                // is enabled (default), the deadline also fires for a tool
-                // that hangs BEFORE any assistant text has been emitted —
-                // previously such turns fell back to the 30 min global
-                // deadline. The warning copy distinguishes the no-text case
-                // so operators can spot tool-first stuck calls in logs.
+                // #2419 (Codex HIGH): bounded recovery for a pending tool call
+                // whose `*_output` never arrives (hung tool / malformed line /
+                // call_id skew) — else the drain gate stays shut forever while
+                // the pane lives and the Discord turn hangs. After
+                // `pending_tool_call_deadline` of inactivity past the last
+                // lifecycle event we surface a terminal Done. #2429 HIGH 2:
+                // with `apply_pending_tool_deadline_without_assistant_text`
+                // (default) it ALSO fires for a tool that hangs BEFORE any
+                // assistant text (previously fell to the 30 min global); the
+                // warning copy flags the no-text case for operators.
                 let tool_deadline_gate = state.has_pending_tool_call()
                     && (state.saw_assistant_text
                         || apply_pending_tool_deadline_without_assistant_text);
@@ -929,18 +956,25 @@ fn tail_rollout_file_until_assistant_response(
                     };
                     return Ok((result, outcome(&state, current_offset)));
                 }
-                // #2182 follow-up: global deadline guard. Without this, a
-                // stuck/hung Codex TUI keeps the tailer alive indefinitely
-                // and the upstream turn never sees `StreamMessage::Done`.
+                // #2182: hung-TUI guard (else the tailer lives forever, no
+                // `Done`). #3419 B: fire on IDLE, not absolute age — silence
+                // since the last rollout activity (`last_output_at`: assistant
+                // text AND tool/event lifecycle, NOT empty 100ms polls), or
+                // `started_at` while no output ever arrived. A live codex turn
+                // (write_stdin/tool/event) resets idle and survives; only a
+                // genuinely silent turn trips `deadline`. `!saw_assistant_text`
+                // keeps this the no-text branch (post-text drain owns the rest).
+                let idle_elapsed =
+                    last_output_at.map_or_else(|| started_at.elapsed(), |at| at.elapsed());
                 if !state.saw_assistant_text
                     && let Some(deadline) = assistant_response_deadline
-                    && started_at.elapsed() >= deadline
+                    && idle_elapsed >= deadline
                 {
-                    let elapsed_secs = started_at.elapsed().as_secs();
+                    let elapsed_secs = idle_elapsed.as_secs();
                     tracing::warn!(
                         rollout_path = %rollout_path.display(),
                         elapsed_secs,
-                        "Codex rollout tail timed out waiting for assistant response; emitting Done"
+                        "Codex rollout tail idle past deadline with no assistant response; emitting Done"
                     );
                     sender.send(StreamMessage::Done {
                         result: format!(
@@ -1176,15 +1210,33 @@ fn promote_task_complete_fallback_text(state: &mut RolloutParseState) {
     // Recover the assistant text from `last_agent_message` when the turn
     // produced no `response_item/message` (tool-only turns or rollouts where
     // the assistant text is only carried on `task_complete`).
+    //
+    // #3343 r2 review P2: commentary-only turns now MIRROR commentary into
+    // `final_text` without setting `saw_assistant_text`, and `last_agent_message`
+    // typically carries that same commentary body — a blind append here would
+    // duplicate it. The fallback is ALWAYS consumed and `saw_assistant_text`
+    // set (the turn has an assistant-visible body; finalize must not time out),
+    // but the text lands at most once: empty `final_text` appends, a superset
+    // replaces the mirrored commentary, an already-mirrored body (equal or a
+    // message-boundary suffix) is dropped, and anything else appends
+    // boundary-joined. #3343 r3: arbitrary substring containment is NOT a
+    // drop — a short canonical terminal body embedded mid-sentence in
+    // commentary is a genuinely new body.
     if !state.saw_assistant_text {
         let text = state
             .task_complete_fallback_text
             .take()
             .expect("task_complete fallback checked above");
-        if !state.final_text.is_empty() {
-            state.final_text.push_str("\n\n");
+        if state.final_text.is_empty() {
+            // #3343: route the fallback body through the same shared boundary
+            // writer so `final_text` follows the suppress-on-existing-newline
+            // rule here too.
+            state.push_message_text(&text);
+        } else if task_complete_fallback_supersedes_final_text(&state.final_text, &text) {
+            state.final_text = text;
+        } else if !task_complete_fallback_already_mirrored(&state.final_text, &text) {
+            state.push_message_text(&text);
         }
-        state.final_text.push_str(&text);
         state.saw_assistant_text = true;
         return;
     }
@@ -1214,6 +1266,24 @@ fn task_complete_fallback_supersedes_final_text(final_text: &str, fallback_text:
     let streamed = final_text.trim();
     let fallback = fallback_text.trim();
     !streamed.is_empty() && fallback.len() > streamed.len() && fallback.ends_with(streamed)
+}
+
+// The fallback counts as already mirrored only when it IS the final text or
+// sits at the end after a message boundary — a mid-sentence substring match
+// (e.g. commentary quoting the terminal verdict) must still append. The
+// boundary tolerates horizontal whitespace after the newline (r4 P3: an
+// indented mirrored body must still drop).
+fn task_complete_fallback_already_mirrored(final_text: &str, fallback_text: &str) -> bool {
+    let streamed = final_text.trim();
+    let fallback = fallback_text.trim();
+    if fallback.is_empty() {
+        return true;
+    }
+    let Some(prefix) = streamed.strip_suffix(fallback) else {
+        return false;
+    };
+    let boundary = prefix.trim_end_matches([' ', '\t']);
+    boundary.is_empty() || boundary.ends_with('\n')
 }
 
 fn heuristic_finalize_allowed(
@@ -1442,6 +1512,39 @@ fn response_item_messages(json: &Value, state: &mut RolloutParseState) -> Vec<St
     }
 }
 
+/// #3343: prepend a `\n\n` paragraph boundary to a new assistant message's
+/// text when it follows an earlier message in the same turn, so the frozen
+/// watcher/bridge `push_str` consumers render readable separation instead of
+/// `문장.다음문장`.
+///
+/// This is the SINGLE source of truth for the boundary decision. Both the
+/// streamed `StreamMessage::Text` surface and the parser's `final_text`
+/// assembly route every assistant text chunk (commentary AND final) through
+/// `RolloutParseState::push_message_text`, which delegates here. Keeping one
+/// rule guarantees the mirror property: a turn streamed chunk-by-chunk
+/// accumulates to EXACTLY the `final_text` the parser assembles for the same
+/// records (see `streamed_accumulation_mirrors_final_text`). The pre-#3343
+/// round-1 code diverged — `final_text` always inserted `\n\n` between records
+/// while the streamed path suppressed insertion on an existing newline — which
+/// risked a `fully_mirrored` / dedup mismatch.
+///
+/// - `prev_ended_with_newline == None`: this is the first chunk of the turn —
+///   emit untouched (never break inside the leading message).
+/// - The previous chunk already ended on a newline, or this chunk already
+///   starts on one: a single `\n` is enough — emit untouched so we never
+///   double an existing separator into `\n\n\n` (suppress-on-existing-newline
+///   is the canonical rule — no triple blank lines in the relayed body).
+/// - Otherwise both sides are mid-prose: inject `\n\n` so distinct Codex
+///   commentary/progress/final messages stay visually separated.
+fn join_streamed_message_boundary(prev_ended_with_newline: Option<bool>, text: &str) -> String {
+    match prev_ended_with_newline {
+        None => text.to_string(),
+        Some(true) => text.to_string(),
+        Some(false) if text.starts_with('\n') => text.to_string(),
+        Some(false) => format!("\n\n{text}"),
+    }
+}
+
 fn response_message_items(payload: &Value, state: &mut RolloutParseState) -> Vec<StreamMessage> {
     if payload.get("role").and_then(Value::as_str) != Some("assistant") {
         return Vec::new();
@@ -1461,16 +1564,26 @@ fn response_message_items(payload: &Value, state: &mut RolloutParseState) -> Vec
             if text.is_empty() {
                 return None;
             }
+            // #3343: every assistant text record — commentary/progress
+            // fragments AND final paragraphs — flows through the one shared
+            // boundary writer. Each Codex rollout record is a distinct
+            // assistant message, but the frozen watcher/bridge consumers append
+            // chunk content with a raw `push_str`, so without the injected
+            // `\n\n` boundary distinct messages collapse into `보겠습니다.로그`
+            // walls. The issue's primary symptom was commentary/progress text,
+            // so it must not bypass the boundary. `push_message_text` updates
+            // `final_text` and the newline witness in lockstep with the
+            // streamed chunk it returns, so the streamed surface and
+            // `final_text` mirror each other exactly.
+            let emitted = state.push_message_text(&text);
             if !commentary_phase {
                 state.saw_assistant_text = true;
-                if !state.final_text.is_empty() {
-                    state.final_text.push_str("\n\n");
-                }
-                state.final_text.push_str(&text);
             } else {
+                // Commentary still proves the turn is alive even though it is
+                // not the canonical final body; refresh the EOF drain clock.
                 state.lifecycle_activity = true;
             }
-            Some(StreamMessage::Text { content: text })
+            Some(StreamMessage::Text { content: emitted })
         })
         .collect()
 }
@@ -2257,6 +2370,161 @@ mod tests {
         ));
     }
 
+    /// #3419 B (activity-based idle): a turn that keeps emitting NON-assistant
+    /// output (here `reasoning` lifecycle records) at an interval SHORTER than
+    /// the idle deadline must NOT trip the no-assistant-response timeout — the
+    /// idle clock resets on every real rollout record. Pre-B this measured
+    /// `started_at.elapsed()` (absolute) and would have fired regardless of
+    /// activity, killing a live long/interactive codex turn. We append several
+    /// reasoning lines spaced under the deadline, then assert no timeout Done
+    /// was emitted (and the turn ends only when the pane dies, not the timer).
+    #[test]
+    fn idle_deadline_survives_continuous_nonassistant_activity() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let rollout = write_rollout(
+            dir.path(),
+            "rollout-idle-active.jsonl",
+            "session-idle-active",
+            cwd.path(),
+            "",
+        );
+        let (tx, rx) = mpsc::channel();
+        // Pane death is the ONLY non-timer exit; flip it AFTER the activity
+        // window so the test terminates deterministically without relying on
+        // the (longer) idle deadline. `alive` stays true while we append.
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_alive = alive.clone();
+        let writer_path = rollout.clone();
+        let writer = std::thread::spawn(move || {
+            // 5 reasoning records, ~60ms apart (300ms total) — each one is a
+            // rollout activity that resets the 200ms idle clock, so the gap
+            // between activities (60ms) never reaches the deadline (200ms).
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(60));
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&writer_path)
+                    .unwrap();
+                file.write_all(
+                    b"{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"}}\n",
+                )
+                .unwrap();
+            }
+            // Activity over: let the pane die so the tail exits via `is_alive`,
+            // proving it reached EOF still ALIVE without the timer firing.
+            std::thread::sleep(Duration::from_millis(60));
+            writer_alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        let is_alive_flag = alive.clone();
+        let (result, _outcome) = tail_rollout_file_until_assistant_response(
+            &rollout,
+            0,
+            None,
+            &tx,
+            None,
+            move || is_alive_flag.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::ZERO,
+            // Idle deadline (200ms) is shorter than the TOTAL active window
+            // (~360ms) but longer than the per-activity gap (60ms): an
+            // absolute-time gate would fire; an idle gate must not.
+            Some(Duration::from_millis(200)),
+            None,
+            true,
+            None,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        writer.join().unwrap();
+        drop(tx);
+        let messages: Vec<_> = rx.iter().collect();
+        // No assistant text ever arrived, so the pane-death branch surfaces
+        // SessionDied — NOT a timer-driven Completed/Done.
+        assert!(
+            matches!(result, ReadOutputResult::SessionDied { .. }),
+            "live activity must keep the idle timer from firing; got {result:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| matches!(
+                m,
+                StreamMessage::Done { result, .. }
+                    if result.contains("timed out") || result.contains("idle")
+            )),
+            "no idle/timeout Done may be emitted while activity is ongoing: {messages:?}"
+        );
+    }
+
+    /// #3419 B: once output STOPS, the idle clock (measured from the last real
+    /// record, not the tailer start) must elapse and fire the timeout Done.
+    /// Here a single reasoning record arrives, then the rollout goes silent —
+    /// after the idle window the no-assistant-response Done surfaces, which is
+    /// what the downstream C finalizer drains. Crucially the deadline is timed
+    /// from the LAST record: the early activity does not buy unlimited time.
+    #[test]
+    fn idle_deadline_fires_after_output_goes_silent() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let rollout = write_rollout(
+            dir.path(),
+            "rollout-idle-silent.jsonl",
+            "session-idle-silent",
+            cwd.path(),
+            // One reasoning record up front, then permanent silence.
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"}}\n",
+        );
+        // Append a second record after a short delay so `last_output_at` is set
+        // well after `started_at`; the deadline must still fire promptly,
+        // proving it tracks idle-since-last-record (not absolute age).
+        let writer_path = rollout.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&writer_path)
+                .unwrap();
+            file.write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"}}\n")
+                .unwrap();
+            // Then go silent forever — empty 100ms polls must NOT reset idle.
+        });
+        let (tx, rx) = mpsc::channel();
+        let (result, _outcome) = tail_rollout_file_until_assistant_response(
+            &rollout,
+            0,
+            None,
+            &tx,
+            None,
+            || true, // pane stays ALIVE — only the idle deadline rescues us
+            Duration::ZERO,
+            Some(Duration::from_millis(150)),
+            None,
+            true,
+            None,
+            true,
+            None,
+            None,
+        )
+        .unwrap();
+        writer.join().unwrap();
+        drop(tx);
+        assert!(matches!(result, ReadOutputResult::Completed { .. }));
+        let messages: Vec<_> = rx.iter().collect();
+        let done = messages
+            .iter()
+            .rev()
+            .find(|m| matches!(m, StreamMessage::Done { .. }));
+        assert!(
+            matches!(
+                done,
+                Some(StreamMessage::Done { result, .. }) if result.contains("timed out")
+            ),
+            "silence past the idle window must emit the timeout Done: {messages:?}"
+        );
+    }
+
     #[test]
     fn relay_suppression_drops_post_cancel_output() {
         // #2172 cancel boundary: once the cancel token flips, the rollout
@@ -2426,9 +2694,9 @@ mod tests {
             messages
         );
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "segment2")
+            ),
             "segment2 must be emitted after the inter-segment pause; got {:?}",
             messages
         );
@@ -2510,9 +2778,9 @@ mod tests {
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         let messages: Vec<_> = rx.iter().collect();
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "segment2")
+            ),
             "segment2 must be emitted after the tool call resolves; got {:?}",
             messages
         );
@@ -2584,9 +2852,9 @@ mod tests {
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         let messages: Vec<_> = rx.iter().collect();
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "segment2")
+            ),
             "segment2 must be emitted after the tool_search output resolves; got {:?}",
             messages
         );
@@ -2666,9 +2934,9 @@ mod tests {
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         let messages: Vec<_> = rx.iter().collect();
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "segment2")
+            ),
             "segment2 must be emitted after BOTH concurrent tool calls resolve; got {:?}",
             messages
         );
@@ -2769,9 +3037,9 @@ mod tests {
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         let messages: Vec<_> = rx.iter().collect();
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "segment2")
+            ),
             "segment2 must land after empty tool output refreshes drain clock; got {:?}",
             messages
         );
@@ -2856,9 +3124,9 @@ mod tests {
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         let messages: Vec<_> = rx.iter().collect();
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "segment2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "segment2")
+            ),
             "segment2 must be emitted after progress-only activity refreshes drain; got {:?}",
             messages
         );
@@ -3110,12 +3378,20 @@ mod tests {
         let (result, _outcome) = handle.join().unwrap().unwrap();
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         let remaining = rx.iter().collect::<Vec<_>>();
+        // #3343 round 2: commentary is now part of BOTH the streamed surface and
+        // `final_text` (the mirror property — the frozen consumer push_str's
+        // every Text chunk, commentary included, into `full_response`). The
+        // canonical body is therefore the boundary-joined commentary + final
+        // answer, which is exactly what the streamed accumulation produces. The
+        // test's core invariant — commentary must NOT finalize the turn before
+        // the final answer arrives — is still asserted by the pre-final-answer
+        // `early_messages` check above.
         assert!(
             matches!(
                 remaining.last(),
-                Some(StreamMessage::Done { result, .. }) if result == "final answer"
+                Some(StreamMessage::Done { result, .. }) if result == "working first\n\nfinal answer"
             ),
-            "final Done should use final_answer text, got {:?}",
+            "final Done must carry the boundary-joined commentary + final answer, got {:?}",
             remaining
         );
     }
@@ -3693,9 +3969,9 @@ mod tests {
             messages
         );
         assert!(
-            messages
-                .iter()
-                .any(|m| matches!(m, StreamMessage::Text { content } if content == "burst2")),
+            messages.iter().any(
+                |m| matches!(m, StreamMessage::Text { content } if content.trim() == "burst2")
+            ),
             "burst2 must be emitted after the legacy-drain-protected pause; got {:?}",
             messages
         );
@@ -4007,6 +4283,371 @@ mod tests {
             done.contains("no assistant response"),
             "with the flag off the global assistant-response deadline copy must surface; got {:?}",
             done
+        );
+    }
+
+    // #3343: collect the streamed text chunks in emission order so the
+    // boundary-separator assertions read the surface a frozen
+    // watcher/bridge `push_str(&content)` consumer would concatenate.
+    fn streamed_text_chunks(messages: &[StreamMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                StreamMessage::Text { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // #3343 (1) — pins the bug. Two DISTINCT assistant `response_item/message`
+    // records (the real Codex rollout shape) must NOT collapse into a
+    // `보겠습니다.로그` wall when their `StreamMessage::Text` content is appended
+    // with a raw `push_str`. The second chunk must carry a `\n\n` boundary so
+    // the joined surface separates the two messages. FAILS on base, where the
+    // emitted Text is the raw `text` with no separator.
+    #[test]
+    fn distinct_codex_messages_join_with_paragraph_boundary() {
+        let messages = collect_rollout(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"sep-1","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"로그 꼬리를 확인해 보겠습니다."}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"release workspace 정리를 진행합니다."}]}}"#,
+                "\n",
+            ),
+            0,
+        );
+        let chunks = streamed_text_chunks(&messages);
+        assert_eq!(chunks.len(), 2, "two distinct messages -> two chunks");
+        assert_eq!(chunks[0], "로그 꼬리를 확인해 보겠습니다.");
+        // The boundary travels with the second chunk so the frozen consumer's
+        // raw push_str renders readable separation.
+        assert_eq!(chunks[1], "\n\nrelease workspace 정리를 진행합니다.");
+
+        let joined = chunks.concat();
+        assert!(
+            joined.contains("보겠습니다.\n\nrelease workspace"),
+            "distinct Codex messages must keep a paragraph boundary, not \
+             collapse into `보겠습니다.release`; got {joined:?}"
+        );
+        assert!(
+            !joined.contains("보겠습니다.release"),
+            "the unseparated `문장.다음문장` wall must not appear; got {joined:?}"
+        );
+    }
+
+    // #3343 (2) — a single assistant message streamed as the only record must
+    // be emitted untouched: no leading separator is injected before the first
+    // chunk of the turn, so we never break inside a single message.
+    #[test]
+    fn single_codex_message_streams_without_injected_separator() {
+        let messages = collect_rollout(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"sep-2","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"단일 메시지입니다."}]}}"#,
+                "\n",
+            ),
+            0,
+        );
+        let chunks = streamed_text_chunks(&messages);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0], "단일 메시지입니다.",
+            "the sole message must stream verbatim, never gaining a leading \\n\\n"
+        );
+    }
+
+    // #3343 (3) — when a message already ends with a newline (or the next
+    // starts with one) the boundary join must NOT double the separator into
+    // `\n\n\n`. The helper is the single source of truth for the boundary
+    // decision, so assert it directly across the no-double cases.
+    #[test]
+    fn message_boundary_join_never_doubles_existing_separator() {
+        // First chunk of the turn: emitted untouched.
+        assert_eq!(
+            join_streamed_message_boundary(None, "first message"),
+            "first message"
+        );
+        // Previous chunk already ended with a newline -> no extra separator.
+        assert_eq!(
+            join_streamed_message_boundary(Some(true), "next message"),
+            "next message"
+        );
+        // New chunk already starts with a newline -> no extra separator.
+        assert_eq!(
+            join_streamed_message_boundary(Some(false), "\nnext message"),
+            "\nnext message"
+        );
+        // Both sides mid-prose -> exactly one `\n\n` boundary, never `\n\n\n`.
+        let joined = join_streamed_message_boundary(Some(false), "next message");
+        assert_eq!(joined, "\n\nnext message");
+        assert!(
+            !joined.contains("\n\n\n"),
+            "boundary join must never produce a tripled separator; got {joined:?}"
+        );
+    }
+
+    // #3343 — end-to-end across the parser: a turn that ends with a message
+    // already carrying a trailing newline must not double when the next
+    // message arrives, and final_text stays consistent with the streamed
+    // surface (both joined with a single `\n\n`).
+    #[test]
+    fn trailing_newline_message_does_not_double_at_boundary() {
+        let messages = collect_rollout(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"sep-3","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"첫 메시지\n"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"둘째 메시지"}]}}"#,
+                "\n",
+            ),
+            0,
+        );
+        let chunks = streamed_text_chunks(&messages);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "첫 메시지\n");
+        // Prior chunk ended on a newline, so only a single \n separates them —
+        // never \n\n\n.
+        assert_eq!(chunks[1], "둘째 메시지");
+        let joined = chunks.concat();
+        assert!(
+            !joined.contains("\n\n\n"),
+            "must not double an existing trailing newline; got {joined:?}"
+        );
+    }
+
+    // #3343 round 2 — extract the terminal `Done.result` (the parser's
+    // assembled `final_text`) so the mirror assertion can compare it against the
+    // streamed chunk accumulation. In replay (`terminal_drain == 0`) a turn with
+    // assistant text and no pending tool emits the heuristic Done carrying
+    // `state.final_text`.
+    fn done_result(messages: &[StreamMessage]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            StreamMessage::Done { result, .. } => Some(result.clone()),
+            _ => None,
+        })
+    }
+
+    // #3343 round 2 (1) — commentary boundary pin. Two DISTINCT
+    // `phase:"commentary"` records must NOT collapse into a `문장.다음문장` wall:
+    // the second commentary chunk must carry the `\n\n` boundary. FAILS on HEAD
+    // 1757e7520, where commentary text bypassed `join_streamed_message_boundary`
+    // entirely and streamed as the raw `text` with no separator.
+    #[test]
+    fn distinct_commentary_records_join_with_paragraph_boundary() {
+        let messages = collect_rollout(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"comm-1","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"로그를 살펴보는 중입니다."}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"workspace 상태를 확인합니다."}]}}"#,
+                "\n",
+            ),
+            0,
+        );
+        let chunks = streamed_text_chunks(&messages);
+        assert_eq!(chunks.len(), 2, "two commentary records -> two chunks");
+        assert_eq!(chunks[0], "로그를 살펴보는 중입니다.");
+        assert_eq!(
+            chunks[1], "\n\nworkspace 상태를 확인합니다.",
+            "the second commentary chunk must carry the \\n\\n boundary"
+        );
+        let joined = chunks.concat();
+        assert!(
+            joined.contains("중입니다.\n\nworkspace"),
+            "distinct commentary records must keep a paragraph boundary; got {joined:?}"
+        );
+        assert!(
+            !joined.contains("중입니다.workspace"),
+            "commentary must not collapse into a `문장.다음문장` wall; got {joined:?}"
+        );
+    }
+
+    // #3343 round 2 (2) — mixed phases: a commentary record followed by an
+    // assistant (final) record must keep the `\n\n` boundary between them, and
+    // the newline witness must carry across the phase change so the assistant
+    // chunk picks up the boundary from the prior commentary chunk. FAILS on
+    // HEAD: commentary did not advance the witness, so the following assistant
+    // chunk saw `None` and streamed without a separator.
+    #[test]
+    fn mixed_commentary_then_assistant_keeps_boundary() {
+        let messages = collect_rollout(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"comm-2","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"먼저 빌드를 돌립니다."}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"빌드가 통과했습니다."}]}}"#,
+                "\n",
+            ),
+            0,
+        );
+        let chunks = streamed_text_chunks(&messages);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], "먼저 빌드를 돌립니다.");
+        assert_eq!(
+            chunks[1], "\n\n빌드가 통과했습니다.",
+            "the assistant chunk must inherit the boundary from the prior commentary chunk"
+        );
+        // Witness consistency: final_text (Done.result) must equal the streamed
+        // accumulation — commentary is now part of both surfaces.
+        let final_text = done_result(&messages).expect("turn must finalize with Done");
+        assert_eq!(
+            final_text,
+            chunks.concat(),
+            "final_text must mirror the streamed accumulation across phases"
+        );
+    }
+
+    // #3343 r2 review P2 — commentary-only turn whose `task_complete` carries
+    // the SAME body as the mirrored commentary must not duplicate it in
+    // `final_text`. FAILS on 26fa75fd4: the `!saw_assistant_text` append path
+    // ignored the already-mirrored commentary and appended the fallback again.
+    #[test]
+    fn commentary_only_task_complete_does_not_duplicate_body() {
+        let body = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"중간 점검 코멘트입니다."}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"중간 점검 코멘트입니다."}}"#,
+            "\n",
+        );
+        let (messages, _elapsed) = run_tail_with_options(
+            body,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(60)),
+            true,
+        );
+        let Some(StreamMessage::Done { result, .. }) = messages.last() else {
+            panic!("turn must finalize with Done, got {messages:?}");
+        };
+        assert_eq!(
+            result.matches("중간 점검 코멘트입니다.").count(),
+            1,
+            "commentary-only task_complete must carry the body exactly once: {result:?}"
+        );
+        // Superset fallback still supersedes the mirrored commentary (replace,
+        // not append): the authoritative terminal body wins without doubling.
+        let body = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"코멘트 본문."}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"서문.\n\n코멘트 본문."}}"#,
+            "\n",
+        );
+        let (messages, _elapsed) = run_tail_with_options(
+            body,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(60)),
+            true,
+        );
+        let Some(StreamMessage::Done { result, .. }) = messages.last() else {
+            panic!("turn must finalize with Done, got {messages:?}");
+        };
+        assert_eq!(
+            result.matches("코멘트 본문.").count(),
+            1,
+            "superseding fallback must replace, never double: {result:?}"
+        );
+        assert!(result.starts_with("서문."), "{result:?}");
+    }
+
+    // #3343 r3 review P2 — a short canonical terminal body that appears only
+    // as a mid-sentence SUBSTRING of the mirrored commentary is genuinely new
+    // and must append, not drop. FAILS on the r2 fix: arbitrary
+    // `contains(text.trim())` treated the embedded quote as already mirrored
+    // and finalized on the commentary alone.
+    #[test]
+    fn task_complete_substring_of_commentary_still_lands() {
+        let body = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"검증이 끝나면 VERDICT: CLEAN 으로 보고하겠습니다."}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"VERDICT: CLEAN"}}"#,
+            "\n",
+        );
+        let (messages, _elapsed) = run_tail_with_options(
+            body,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(60)),
+            true,
+        );
+        let Some(StreamMessage::Done { result, .. }) = messages.last() else {
+            panic!("turn must finalize with Done, got {messages:?}");
+        };
+        assert!(
+            result.trim_end().ends_with("VERDICT: CLEAN"),
+            "terminal body embedded in commentary must still append: {result:?}"
+        );
+        // The mirrored-equality drop still holds: a fallback that ends the
+        // accumulated text at a message boundary lands exactly once.
+        assert_eq!(result.matches("검증이 끝나면").count(), 1, "{result:?}");
+
+        // r4 P3 — an INDENTED mirrored body is still "already mirrored": the
+        // boundary check tolerates horizontal whitespace after the newline.
+        let body = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"상태 보고.\n\n  VERDICT: CLEAN"}]}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"VERDICT: CLEAN"}}"#,
+            "\n",
+        );
+        let (messages, _elapsed) = run_tail_with_options(
+            body,
+            Duration::from_secs(30),
+            Some(Duration::from_secs(60)),
+            true,
+        );
+        let Some(StreamMessage::Done { result, .. }) = messages.last() else {
+            panic!("turn must finalize with Done, got {messages:?}");
+        };
+        assert_eq!(
+            result.matches("VERDICT: CLEAN").count(),
+            1,
+            "indented mirrored suffix must drop, not double: {result:?}"
+        );
+    }
+
+    // #3343 round 2 (3) — mirror property. For a multi-record fixture mixing
+    // commentary, assistant, and a trailing-newline record, the streamed chunk
+    // accumulation must equal EXACTLY the `final_text` the parser assembles
+    // (the `Done.result`). FAILS on HEAD: the streamed path suppressed the
+    // separator on an existing newline while `final_text` always inserted
+    // `\n\n`, and commentary was streamed but never written to `final_text` —
+    // both diverge the two surfaces.
+    #[test]
+    fn streamed_accumulation_mirrors_final_text() {
+        let messages = collect_rollout(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"mirror-1","cwd":"/tmp/repo"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"진행 상황을 보고합니다."}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"첫째 단락입니다.\n"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"둘째 단락입니다."}]}}"#,
+                "\n",
+            ),
+            0,
+        );
+        let chunks = streamed_text_chunks(&messages);
+        let streamed_accumulation = chunks.concat();
+        let final_text = done_result(&messages).expect("turn must finalize with Done");
+        assert_eq!(
+            streamed_accumulation, final_text,
+            "streamed chunk accumulation must equal the assembled final_text \
+             (mirror property); streamed={streamed_accumulation:?} final={final_text:?}"
+        );
+        // The trailing-newline record must not be doubled into `\n\n\n` on
+        // either surface (canonical suppress-on-existing-newline rule).
+        assert!(
+            !final_text.contains("\n\n\n"),
+            "the unified boundary must never produce a tripled separator; got {final_text:?}"
+        );
+        // Sanity: distinct records stay visually separated, not walled.
+        assert!(
+            final_text.contains("보고합니다.\n\n첫째 단락입니다.\n둘째 단락입니다."),
+            "records must keep their boundaries; got {final_text:?}"
         );
     }
 }

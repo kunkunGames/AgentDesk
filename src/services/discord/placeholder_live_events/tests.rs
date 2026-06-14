@@ -1,5 +1,6 @@
 use super::super::formatting::{
     MonitorHandoffReason, MonitorHandoffStatus, build_monitor_handoff_placeholder_with_live_events,
+    build_processing_status_block, build_streaming_placeholder_text, plan_streaming_rollover,
     redact_sensitive_for_placeholder,
 };
 use super::common::{
@@ -240,6 +241,44 @@ fn status_panel_renders_derived_tool_state_under_limit() {
     assert!(rendered.contains("도구 실행 중"));
     assert!(rendered.contains("[Bash]"));
     assert!(rendered.chars().count() <= STATUS_PANEL_MAX_CHARS);
+}
+
+#[test]
+fn characterize_rollover_seed_has_no_status_panel_content_s0() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3089);
+    let tool_args = json!({"command": "cargo test --lib placeholder_live_events"}).to_string();
+    events.push_status_events(channel_id, status_events_from_tool_use("Bash", &tool_args));
+    events.push_event(
+        channel_id,
+        RecentPlaceholderEvent::tool_use("Bash", &tool_args).unwrap(),
+    );
+
+    let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(panel.contains("도구 실행 중"));
+    assert!(panel.contains("[Bash]"));
+    assert!(panel.contains("cargo test --lib placeholder_live_events"));
+
+    let status_block = build_processing_status_block("⠸");
+    let current_portion = "relay body ".repeat(250);
+    let plan = plan_streaming_rollover(&current_portion, &status_block)
+        .expect("representative relay body should roll over");
+    let rollover_seed = build_streaming_placeholder_text("", &status_block);
+
+    assert_eq!(rollover_seed, status_block);
+    assert!(
+        plan.display_snapshot
+            .ends_with(&format!("\n\n{status_block}"))
+    );
+    for status_panel_fragment in [
+        "도구 실행 중",
+        "[Bash]",
+        "cargo test --lib placeholder_live_events",
+    ] {
+        assert!(!rollover_seed.contains(status_panel_fragment));
+        assert!(!plan.display_snapshot.contains(status_panel_fragment));
+        assert!(!plan.frozen_chunk.contains(status_panel_fragment));
+    }
 }
 
 fn status_for(events: &PlaceholderLiveEvents, channel_id: ChannelId) -> DerivedStatus {
@@ -1513,6 +1552,1233 @@ fn status_panel_clamps_codex_context_usage_display_to_window() {
 }
 
 #[test]
+fn completion_footer_context_only_has_no_spinner_and_stops_scheduling() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(190);
+    assert!(events.set_context_panel_usage(channel_id, None, 154_600, 0, 0, 1_000_000, 60));
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("context line should render");
+
+    assert!(block.contains("Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%"));
+    assert!(!block.contains('⠸'));
+    assert!(!rendered.has_unfinished_entries);
+}
+
+#[test]
+fn completion_footer_running_background_subagent_animates_until_notification_done() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(191);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Long background job",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_bg"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_bg")),
+    );
+
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running.block.expect("running subagent should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Subagents"));
+    assert!(running_block.contains("bgworker Long background job ⠸"));
+    assert!(!running_block.contains('✓'));
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification("subagent", "completed", "all done"),
+    );
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done.block.expect("finished subagent should stay visible");
+    assert!(!done.has_unfinished_entries);
+    assert!(done_block.contains("bgworker Long background job"));
+    assert!(done_block.contains("all done"));
+    assert!(done_block.contains('✓'));
+    assert!(!done_block.contains('⠼'));
+}
+
+#[test]
+fn background_bash_footer_mode_creates_running_task_slot_and_ack_stays_running() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_100);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec --skip-git-repo-check",
+                "description": "Launch codex for SharedData S4",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_bash_bg"),
+            true,
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Bash"), false, Some("toolu_bash_bg")),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for SharedData S4"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {rendered}"));
+
+    assert!(rendered.contains("Tasks"));
+    assert!(
+        !line.contains('✓') && !line.contains('✗') && !line.contains('⠸'),
+        "running background Bash slot must not show a terminal marker/spinner in live panel: {line}"
+    );
+}
+
+#[test]
+fn background_bash_notification_finalizes_only_exact_tool_use_id() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_101);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec",
+                "description": "Launch codex for voice S2",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_voice"),
+            true,
+        ),
+    );
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "Background command \"Launch codex for other\" completed (exit code 0)",
+            Some("toolu_other"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "Background command without id completed (exit code 0)",
+            None,
+        ),
+    );
+
+    let still_running =
+        events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let running_line = still_running
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for voice S2"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {still_running}"));
+    assert!(
+        !running_line.contains('✓') && !running_line.contains('✗'),
+        "non-matching or id-less notification must not finalize: {running_line}"
+    );
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "Background command \"Launch codex for voice S2\" completed (exit code 0)",
+            Some("toolu_voice"),
+        ),
+    );
+
+    let done = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let done_line = done
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for voice S2"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {done}"));
+    assert!(
+        done_line.contains('✓'),
+        "matching notification must mark ✓: {done_line}"
+    );
+}
+
+#[test]
+fn background_bash_failed_notification_marks_task_failed() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_102);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "deploy-release.sh",
+                "description": "Deploy release runtime",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_deploy"),
+            true,
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "failed",
+            "Background command \"Deploy release runtime\" failed with exit code 1",
+            Some("toolu_deploy"),
+        ),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("Bash Deploy release runtime"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {rendered}"));
+    assert!(
+        line.contains('✗'),
+        "failed notification must mark ✗: {line}"
+    );
+}
+
+#[test]
+fn background_bash_record_reconstruction_ack_does_not_finalize_then_notification_flips() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_103);
+    events.push_status_events(
+        channel_id,
+        status_events_from_json_for_footer_mode(
+            &json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_record_bash",
+                        "name": "Bash",
+                        "input": {
+                            "command": "cd /tmp/adk && codex exec",
+                            "description": "Launch codex for SharedData S4",
+                            "run_in_background": true
+                        }
+                    }]
+                }
+            }),
+            true,
+        ),
+    );
+
+    let ack_events = status_events_from_json_for_footer_mode(
+        &json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "tool_use_id": "toolu_record_bash",
+                    "type": "tool_result",
+                    "content": "Command running in background with ID: bdri3xti5. Output is being written to: /tmp/tasks/bdri3xti5.output.",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "stdout": "",
+                "stderr": "",
+                "interrupted": false,
+                "isImage": false,
+                "noOutputExpected": false,
+                "backgroundTaskId": "bdri3xti5"
+            }
+        }),
+        true,
+    );
+    assert!(
+        !ack_events
+            .iter()
+            .any(|event| matches!(event, StatusEvent::BackgroundTaskEnd { .. })),
+        "background Bash launch ACK must not synthesize BackgroundTaskEnd: {ack_events:?}"
+    );
+    events.push_status_events(channel_id, ack_events);
+
+    let running = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let running_line = running
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for SharedData S4"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {running}"));
+    assert!(
+        !running_line.contains('✓') && !running_line.contains('✗'),
+        "launch ACK must leave reconstructed slot running: {running_line}"
+    );
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_json_for_footer_mode(
+            &json!({
+                "type": "system",
+                "subtype": "task_notification",
+                "task_notification_kind": "background",
+                "task_id": "bdri3xti5",
+                "tool_use_id": "toolu_record_bash",
+                "status": "completed",
+                "summary": "Background command \"Launch codex for SharedData S4\" completed (exit code 0)"
+            }),
+            true,
+        ),
+    );
+
+    let done = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let done_line = done
+        .lines()
+        .find(|line| line.contains("Bash Launch codex for SharedData S4"))
+        .unwrap_or_else(|| panic!("background Bash task slot missing in: {done}"));
+    assert!(
+        done_line.contains('✓'),
+        "matching reconstructed notification must flip ✓: {done_line}"
+    );
+}
+
+#[test]
+fn completion_footer_background_bash_animates_and_flips_on_notification() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_104);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec --skip-git-repo-check",
+                "description": "Delegate background task slots to codex",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_delegate"),
+            true,
+        ),
+    );
+
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running
+        .block
+        .expect("running background Bash should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Tasks"));
+    assert!(running_block.contains("Bash Delegate background task slots to codex ⠸"));
+    assert!(!running_block.contains('✓'));
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "Background command \"Delegate background task slots to codex\" completed (exit code 0)",
+            Some("toolu_delegate"),
+        ),
+    );
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done
+        .block
+        .expect("finished background Bash should stay visible");
+    assert!(!done.has_unfinished_entries);
+    assert!(done_block.contains("Bash Delegate background task slots to codex ✓"));
+    assert!(!done_block.contains('⠼'));
+}
+
+fn push_background_bash_task(
+    events: &PlaceholderLiveEvents,
+    channel_id: ChannelId,
+    summary: &str,
+    tool_use_id: &str,
+) {
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "sleep 1",
+                "description": summary,
+                "run_in_background": true
+            })
+            .to_string(),
+            Some(tool_use_id),
+            true,
+        ),
+    );
+}
+
+// #3391: a background task's slot identity keys on its `tool_use_id`.
+fn bg_task_id(tool_use_id: &str) -> super::completion_footer::TerminalSlotId {
+    super::completion_footer::TerminalSlotId::Task(super::completion_footer::SlotKey::ToolUseId(
+        tool_use_id.to_string(),
+    ))
+}
+
+// #3391: a subagent slot keyed on its launching `tool_use_id`.
+fn subagent_id(tool_use_id: &str) -> super::completion_footer::TerminalSlotId {
+    super::completion_footer::TerminalSlotId::Subagent(
+        super::completion_footer::SlotKey::ToolUseId(tool_use_id.to_string()),
+    )
+}
+
+fn complete_background_bash_task(
+    events: &PlaceholderLiveEvents,
+    channel_id: ChannelId,
+    tool_use_id: &str,
+) {
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "Background command completed (exit code 0)",
+            Some(tool_use_id),
+        ),
+    );
+}
+
+#[test]
+fn completion_footer_delivered_terminal_task_evicts_from_next_render() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_001);
+    push_background_bash_task(&events, channel_id, "Keep running", "toolu_3391_run");
+    push_background_bash_task(&events, channel_id, "Evict after ack", "toolu_3391_done");
+    complete_background_bash_task(&events, channel_id, "toolu_3391_done");
+
+    let delivered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = delivered
+        .block
+        .expect("running + finished tasks should render");
+    assert!(block.contains("Bash Evict after ack ✓"));
+    assert!(block.contains("Bash Keep running ⠸"));
+    assert_eq!(
+        delivered.delivered_terminal_ids,
+        vec![bg_task_id("toolu_3391_done")]
+    );
+
+    events.evict_delivered_terminal_footer_tasks(channel_id, &delivered.delivered_terminal_ids);
+
+    let next = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let next_block = next.block.expect("running task should keep rendering");
+    assert!(!next_block.contains("Evict after ack"));
+    assert!(next_block.contains("Bash Keep running ⠼"));
+    assert!(next.has_unfinished_entries);
+    assert!(next.delivered_terminal_ids.is_empty());
+}
+
+#[test]
+fn completion_footer_undelivered_terminal_task_keeps_rendering_and_inflight_never_evicts() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_002);
+    push_background_bash_task(&events, channel_id, "Stay running", "toolu_3391_stay");
+    push_background_bash_task(
+        &events,
+        channel_id,
+        "Retry my checkmark",
+        "toolu_3391_retry",
+    );
+    complete_background_bash_task(&events, channel_id, "toolu_3391_retry");
+
+    // A failed Discord edit never acks the render, so the ✓ renders again.
+    let first = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    assert_eq!(first.delivered_terminal_ids.len(), 1);
+    let retry = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    assert!(
+        retry
+            .block
+            .expect("undelivered terminal task should re-render")
+            .contains("Bash Retry my checkmark ✓")
+    );
+    assert_eq!(retry.delivered_terminal_ids, first.delivered_terminal_ids);
+
+    // Stale/unknown identities and the in-flight slot's id never evict anything.
+    events.evict_delivered_terminal_footer_tasks(
+        channel_id,
+        &[bg_task_id("toolu_3391_stay"), bg_task_id("toolu_unknown")],
+    );
+    let after = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let after_block = after.block.expect("both tasks should still render");
+    assert!(after_block.contains("Bash Retry my checkmark ✓"));
+    assert!(after_block.contains("Bash Stay running ⠸"));
+}
+
+#[test]
+fn completion_footer_evicts_all_terminal_tasks_delivered_in_one_render() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_003);
+    push_background_bash_task(&events, channel_id, "First done", "toolu_3391_a");
+    push_background_bash_task(&events, channel_id, "Second done", "toolu_3391_b");
+    push_background_bash_task(&events, channel_id, "Still running", "toolu_3391_c");
+    complete_background_bash_task(&events, channel_id, "toolu_3391_a");
+    complete_background_bash_task(&events, channel_id, "toolu_3391_b");
+
+    let delivered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    assert_eq!(delivered.delivered_terminal_ids.len(), 2);
+
+    events.evict_delivered_terminal_footer_tasks(channel_id, &delivered.delivered_terminal_ids);
+
+    let next = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let next_block = next.block.expect("running task should keep rendering");
+    assert!(!next_block.contains("First done"));
+    assert!(!next_block.contains("Second done"));
+    assert!(next_block.contains("Bash Still running ⠼"));
+    assert!(next.has_unfinished_entries);
+}
+
+#[test]
+fn completion_footer_terminal_lines_clamped_out_of_budget_are_not_delivered() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_004);
+    for i in 0..STATUS_PANEL_TASK_LIMIT {
+        let tool_use_id = format!("toolu_3391_clamp_{i:02}");
+        push_background_bash_task(
+            &events,
+            channel_id,
+            &format!("Clamp slot {i:02} {}", "x".repeat(70)),
+            &tool_use_id,
+        );
+        complete_background_bash_task(&events, channel_id, &tool_use_id);
+    }
+
+    let first = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let _first_block = first.block.expect("clamped task section should render");
+    let first_delivered = first.delivered_terminal_ids.clone();
+    assert!(
+        !first_delivered.is_empty() && first_delivered.len() < STATUS_PANEL_TASK_LIMIT,
+        "the 600B clamp should deliver some but not all terminal slots: {}",
+        first_delivered.len()
+    );
+
+    events.evict_delivered_terminal_footer_tasks(channel_id, &first_delivered);
+
+    // The clamped-out (undelivered) slots are still terminal and re-render with
+    // their marks; the delivered ones are gone, so their identities cannot
+    // reappear in a later render's delivered set.
+    let second = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    second
+        .block
+        .expect("clamped-out terminal tasks must render on a later pass");
+    for id in &first_delivered {
+        assert!(
+            !second.delivered_terminal_ids.contains(id),
+            "an already-evicted slot id must not re-deliver: {id:?}"
+        );
+    }
+    assert!(!second.delivered_terminal_ids.is_empty());
+}
+
+// #3391 Finding 1(a) collision pin: two slots render the IDENTICAL terminal
+// line but only ONE survives the 600B clamp. Slot-identity eviction must drop
+// EXACTLY the delivered slot; the clamped-out duplicate keeps its ✓ and
+// re-renders. The old line-string eviction dropped BOTH (matched the shared
+// line), permanently swallowing the clamped-out mark, so this FAILS on HEAD.
+#[test]
+fn completion_footer_identical_terminal_lines_evict_only_the_delivered_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_201);
+    const DUP_SUMMARY: &str = "Wait until CI settles";
+
+    // Push dup_a first, then padding, then dup_b. Newest renders first (`.rev()`),
+    // so render order is [Tasks, dup_b, ...padding, dup_a]: dup_b survives the
+    // clamp while dup_a is pushed past the 600B budget.
+    push_background_bash_task(&events, channel_id, DUP_SUMMARY, "toolu_dup_a");
+    complete_background_bash_task(&events, channel_id, "toolu_dup_a");
+    for i in 0..8 {
+        let id = format!("toolu_pad_{i:02}");
+        push_background_bash_task(
+            &events,
+            channel_id,
+            &format!("Padding job {i:02} {}", "y".repeat(80)),
+            &id,
+        );
+        complete_background_bash_task(&events, channel_id, &id);
+    }
+    push_background_bash_task(&events, channel_id, DUP_SUMMARY, "toolu_dup_b");
+    complete_background_bash_task(&events, channel_id, "toolu_dup_b");
+
+    let first = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let first_block = first.block.expect("clamped task section should render");
+    let dup_line = format!("└ Bash {DUP_SUMMARY} ✓");
+    assert!(
+        first_block.contains(&dup_line),
+        "the surviving duplicate's line should render: {first_block}"
+    );
+    // dup_b survives the clamp and is delivered; dup_a was clamped out.
+    assert!(
+        first
+            .delivered_terminal_ids
+            .contains(&bg_task_id("toolu_dup_b"))
+    );
+    assert!(
+        !first
+            .delivered_terminal_ids
+            .contains(&bg_task_id("toolu_dup_a")),
+        "the clamped-out duplicate must NOT be reported delivered"
+    );
+
+    events.evict_delivered_terminal_footer_tasks(channel_id, &first.delivered_terminal_ids);
+
+    // After eviction, dup_a (never delivered) is still terminal and re-renders
+    // its identical ✓ line. With the old line-string eviction both vanished.
+    let second = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let second_block = second.block.expect("clamped-out duplicate must re-render");
+    assert!(
+        second_block.contains(&dup_line),
+        "the clamped-out duplicate's ✓ must survive eviction of its twin: {second_block}"
+    );
+    assert!(
+        second
+            .delivered_terminal_ids
+            .contains(&bg_task_id("toolu_dup_a"))
+    );
+    assert!(
+        !second
+            .delivered_terminal_ids
+            .contains(&bg_task_id("toolu_dup_b")),
+        "the already-evicted slot must not re-appear"
+    );
+}
+
+// #3391 Finding 1(b) race pin: a running slot turns terminal AFTER its render
+// snapshot but BEFORE ack, and the delivered mark belonged to a DIFFERENT slot
+// whose line is identical. The newly-terminal slot must NOT be evicted — its
+// own mark was never shown. The old line-string eviction matched the shared
+// line and dropped it, so this FAILS on HEAD.
+#[test]
+fn completion_footer_slot_turning_terminal_before_ack_is_not_evicted_on_twin_line() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_202);
+    const TWIN_SUMMARY: &str = "Bash Wait until CI settles";
+
+    // delivered: completed twin whose mark IS in this render.
+    push_background_bash_task(&events, channel_id, TWIN_SUMMARY, "toolu_delivered");
+    complete_background_bash_task(&events, channel_id, "toolu_delivered");
+    // racing: identical summary, still RUNNING at render time.
+    push_background_bash_task(&events, channel_id, TWIN_SUMMARY, "toolu_racing");
+
+    let delivered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    // Only the completed twin's id is delivered; the running slot is in-flight.
+    assert_eq!(
+        delivered.delivered_terminal_ids,
+        vec![bg_task_id("toolu_delivered")]
+    );
+
+    // The edit is in flight; before the ack lands the racing slot completes and
+    // now renders the IDENTICAL terminal line as the delivered twin.
+    complete_background_bash_task(&events, channel_id, "toolu_racing");
+
+    events.evict_delivered_terminal_footer_tasks(channel_id, &delivered.delivered_terminal_ids);
+
+    // The racing slot's ✓ was never delivered, so it must still render and be
+    // reportable on the next pass; only the delivered twin is gone.
+    let next = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    next.block.expect("racing slot's mark must still render");
+    assert_eq!(
+        next.delivered_terminal_ids,
+        vec![bg_task_id("toolu_racing")],
+        "only the racing slot's never-delivered mark should remain"
+    );
+}
+
+// #3391 Finding 2: terminal SUBAGENT slots must evict on confirmed delivery,
+// in-flight subagents are untouched, and the migration carry-over filters
+// evicted subagents. On HEAD eviction only retained over `tasks`, so subagents
+// accumulated and this FAILS for the eviction part.
+#[test]
+fn completion_footer_terminal_subagent_evicts_after_delivery_inflight_unaffected() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_203);
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("reviewer".to_string()),
+            desc: Some("Audit the diff".to_string()),
+            tool_use_id: Some("toolu_done_sub".to_string()),
+            background: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("reviewer".to_string()),
+            desc: Some("Still inspecting".to_string()),
+            tool_use_id: Some("toolu_running_sub".to_string()),
+            background: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_done_sub".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+
+    let delivered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = delivered.block.expect("subagents should render");
+    assert!(block.contains("Audit the diff ✓"));
+    assert!(block.contains("Still inspecting ⠸"));
+    assert_eq!(
+        delivered.delivered_terminal_ids,
+        vec![subagent_id("toolu_done_sub")]
+    );
+
+    events.evict_delivered_terminal_footer_tasks(channel_id, &delivered.delivered_terminal_ids);
+
+    let next = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let next_block = next.block.expect("running subagent keeps rendering");
+    assert!(
+        !next_block.contains("Audit the diff"),
+        "delivered terminal subagent must be evicted: {next_block}"
+    );
+    assert!(next_block.contains("Still inspecting ⠼"));
+    assert!(next.has_unfinished_entries);
+    assert!(next.delivered_terminal_ids.is_empty());
+}
+
+// #3391 round 3 helper: pull the single rendered footer line that contains
+// `needle` so a test can assert what its TAIL looks like after truncation.
+fn footer_line_containing<'a>(block: &'a str, needle: &str) -> &'a str {
+    block
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no footer line contains {needle:?}: {block}"))
+}
+
+// #3391 round 3 review P2: degenerate budgets must never exceed `max_chars`.
+// `truncate_chars` emits up to 3 chars ("...") below its budget, so budgets
+// under marker_reserve+3 degrade to a hard clamp (marker may be lost there —
+// the delivered-ID honesty gate then keeps the slot un-evicted).
+#[test]
+fn truncate_chars_with_marker_never_exceeds_max_chars_on_degenerate_budgets() {
+    for max_chars in [0usize, 1, 2, 3, 4, 5] {
+        let line = super::common::truncate_chars_with_marker("a long base", "✓", max_chars);
+        assert!(
+            line.chars().count() <= max_chars,
+            "budget {max_chars}: {line:?} exceeds the contract"
+        );
+    }
+    // Sound budgets keep the marker guarantee.
+    let line = super::common::truncate_chars_with_marker(&"x".repeat(200), "✓", 100);
+    assert!(
+        line.ends_with('✓') && line.chars().count() <= 100,
+        "{line:?}"
+    );
+}
+
+// #3391 round 3 finding 1 (task): a background task whose description is long
+// enough that the pre-fix append-then-truncate swallowed the mark must still
+// render a line that ENDS WITH ✓. FAILS on HEAD 95f6e2176 (the ✓ was chopped
+// off the >EVENT_LINE_MAX_CHARS line).
+#[test]
+fn completion_footer_long_background_task_line_ends_with_check_mark() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_301);
+    let long_desc = format!("Long bg task {}", "x".repeat(EVENT_LINE_MAX_CHARS));
+    push_background_bash_task(&events, channel_id, &long_desc, "toolu_3391_long_task");
+    complete_background_bash_task(&events, channel_id, "toolu_3391_long_task");
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("long terminal task should render");
+    let line = footer_line_containing(&block, "Long bg task");
+    assert!(
+        line.chars().count() > EVENT_LINE_MAX_CHARS - 2,
+        "test must exercise the truncation path: {line:?}"
+    );
+    assert!(
+        line.ends_with('✓'),
+        "long terminal background task line must end with ✓: {line:?}"
+    );
+    assert!(line.chars().count() <= EVENT_LINE_MAX_CHARS);
+}
+
+// #3391 round 3 finding 1 (subagent): same shape for a finished subagent slot
+// with a long desc — the rendered line must END WITH ✓. FAILS on HEAD.
+#[test]
+fn completion_footer_long_subagent_line_ends_with_check_mark() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_302);
+    let long_desc = format!("Audit subagent {}", "y".repeat(EVENT_LINE_MAX_CHARS));
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("reviewer".to_string()),
+            desc: Some(long_desc),
+            tool_use_id: Some("toolu_3391_long_sub".to_string()),
+            background: false,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_3391_long_sub".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered
+        .block
+        .expect("long terminal subagent should render");
+    let line = footer_line_containing(&block, "Audit subagent");
+    assert!(
+        line.chars().count() > EVENT_LINE_MAX_CHARS - 2,
+        "test must exercise the truncation path: {line:?}"
+    );
+    assert!(
+        line.ends_with('✓'),
+        "long terminal subagent line must end with ✓: {line:?}"
+    );
+    assert!(line.chars().count() <= EVENT_LINE_MAX_CHARS);
+}
+
+// #3391 round 3 finding 2/3 (honesty): a terminal slot whose mark would (pre-fix)
+// be truncated off its line must, post-fix, show the mark AND be reported in the
+// delivered set — the two are pinned together. On HEAD the ✓ is chopped, so the
+// `ends_with('✓')` assertion FAILS; post-fix the mark survives and the id ships.
+#[test]
+fn completion_footer_long_task_visible_mark_and_id_reported_together() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_303);
+    let long_desc = format!("Honesty task {}", "z".repeat(EVENT_LINE_MAX_CHARS));
+    push_background_bash_task(&events, channel_id, &long_desc, "toolu_3391_honesty");
+    complete_background_bash_task(&events, channel_id, "toolu_3391_honesty");
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("long terminal task should render");
+    let line = footer_line_containing(&block, "Honesty task");
+    let mark_visible = line.ends_with('✓');
+    let id_reported = rendered
+        .delivered_terminal_ids
+        .contains(&bg_task_id("toolu_3391_honesty"));
+    // Mark visibility and delivered-id reporting must agree: the honesty gate
+    // never reports an id whose mark the user cannot see, and fix 1 keeps the
+    // mark visible, so both are true together.
+    assert!(
+        mark_visible,
+        "post-fix the ✓ must survive truncation: {line:?}"
+    );
+    assert!(
+        id_reported,
+        "a visible terminal mark must be reported as delivered: {:?}",
+        rendered.delivered_terminal_ids
+    );
+    assert_eq!(
+        mark_visible, id_reported,
+        "mark visibility and delivered-id reporting must agree"
+    );
+}
+
+// #3391 Finding 2 migration filter: the #3386 carry-over (clear-preserving
+// residuals) must drop an EVICTED terminal subagent. A background subagent that
+// completed and was evicted on delivery must not re-appear in the carried
+// footer; an in-flight background subagent does carry over.
+#[test]
+fn completion_footer_evicted_subagent_does_not_survive_migration_carry_over() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_391_204);
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("bgworker".to_string()),
+            desc: Some("Finished bg agent".to_string()),
+            tool_use_id: Some("toolu_bg_done".to_string()),
+            background: true,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("bgworker".to_string()),
+            desc: Some("Running bg agent".to_string()),
+            tool_use_id: Some("toolu_bg_run".to_string()),
+            background: true,
+        },
+    );
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_bg_done".to_string()),
+            summary: None,
+            ack_only: false,
+        },
+    );
+
+    let delivered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    assert_eq!(
+        delivered.delivered_terminal_ids,
+        vec![subagent_id("toolu_bg_done")]
+    );
+    events.evict_delivered_terminal_footer_tasks(channel_id, &delivered.delivered_terminal_ids);
+
+    // #3386 migration carry-over: only unfinished background residuals survive.
+    events.clear_channel_preserving_footer_residuals(channel_id);
+    let carried = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let carried_block = carried
+        .block
+        .expect("running residual subagent carries over");
+    assert!(
+        !carried_block.contains("Finished bg agent"),
+        "an evicted terminal subagent must not carry over: {carried_block}"
+    );
+    assert!(carried_block.contains("Running bg agent"));
+}
+
+#[test]
+fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_107);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec carry",
+                "description": "Carry bash task",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_carry_bash"),
+            true,
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec done",
+                "description": "Finished bash task",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_done_bash"),
+            true,
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "Background command completed",
+            Some("toolu_done_bash"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Carry agent task",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_carry_agent"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_carry_agent")),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Finished agent task",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_done_agent"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_done_agent")),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "subagent",
+            "completed",
+            "finished agent done",
+            Some("toolu_done_agent"),
+        ),
+    );
+
+    events.clear_channel_preserving_footer_residuals(channel_id);
+
+    let live = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(live.contains("Bash Carry bash task"));
+    assert!(live.contains("bgworker Carry agent task"));
+    assert!(!live.contains("Finished bash task"));
+    assert!(!live.contains("Finished agent task"));
+
+    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let footer_block = footer.block.expect("carried residual footer should render");
+    assert!(footer.has_unfinished_entries);
+    assert!(footer_block.contains("Bash Carry bash task ⠸"));
+    assert!(footer_block.contains("bgworker Carry agent task ⠸"));
+    assert!(!footer_block.contains("Finished bash task"));
+    assert!(!footer_block.contains("Finished agent task"));
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec carry replay",
+                "description": "Carry bash task replay",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_carry_bash"),
+            true,
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Carry agent task replay",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_carry_agent"),
+        ),
+    );
+
+    let deduped = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let slot_lines = deduped
+        .lines()
+        .filter(|line| line.starts_with("└ "))
+        .collect::<Vec<_>>();
+    assert_eq!(deduped.matches("toolu_carry_bash").count(), 0);
+    assert_eq!(
+        slot_lines
+            .iter()
+            .filter(|line| line.contains("Carry bash task"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        slot_lines
+            .iter()
+            .filter(|line| line.contains("Carry agent task"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn carried_residual_entries_finalize_by_exact_tool_use_id_on_latest_state() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_108);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec exact",
+                "description": "Exact carried bash",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_exact_bash"),
+            true,
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Exact carried agent",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_exact_agent"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(Some("Task"), false, Some("toolu_exact_agent")),
+    );
+    events.clear_channel_preserving_footer_residuals(channel_id);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "wrong bash complete",
+            Some("toolu_other_bash"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "subagent",
+            "completed",
+            "wrong agent complete",
+            Some("toolu_other_agent"),
+        ),
+    );
+    let still_running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let still_running_block = still_running.block.expect("carried entries should render");
+    assert!(still_running.has_unfinished_entries);
+    assert!(still_running_block.contains("Exact carried bash ⠸"));
+    assert!(still_running_block.contains("Exact carried agent ⠸"));
+    assert!(!still_running_block.contains('✓'));
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "background",
+            "completed",
+            "exact bash complete",
+            Some("toolu_exact_bash"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "subagent",
+            "completed",
+            "exact agent complete",
+            Some("toolu_exact_agent"),
+        ),
+    );
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done.block.expect("finished carried entries should render");
+    assert!(!done.has_unfinished_entries);
+    assert!(done_block.contains("Exact carried bash ✓"));
+    assert!(done_block.contains("Exact carried agent — exact agent complete ✓"));
+    assert!(!done_block.contains('⠼'));
+}
+
+#[test]
+fn background_bash_slots_are_footer_flag_gated() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_105);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "codex exec",
+                "description": "Should stay hidden with footer flag off",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_hidden"),
+            false,
+        ),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(!rendered.contains("Tasks"));
+    assert!(!rendered.contains("└ Bash Should stay hidden with footer flag off"));
+}
+
+#[test]
+fn background_bash_task_slots_trim_to_task_limit() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_089_106);
+    for idx in 0..=STATUS_PANEL_TASK_LIMIT {
+        let tool_use_id = format!("toolu_bg_{idx}");
+        events.push_status_events(
+            channel_id,
+            status_events_from_tool_use_with_id_for_footer_mode(
+                "Bash",
+                &json!({
+                    "command": format!("codex exec {idx}"),
+                    "description": format!("background bash task {idx}"),
+                    "run_in_background": true
+                })
+                .to_string(),
+                Some(&tool_use_id),
+                true,
+            ),
+        );
+    }
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let status_entry = events
+        .status_by_channel
+        .get(&channel_id)
+        .expect("status panel state");
+    let guard = status_entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    assert_eq!(guard.tasks.len(), STATUS_PANEL_TASK_LIMIT);
+    assert_eq!(
+        guard.tasks.first().and_then(|slot| slot.summary.as_deref()),
+        Some("background bash task 1")
+    );
+    assert_eq!(
+        guard.tasks.last().and_then(|slot| slot.summary.as_deref()),
+        Some("background bash task 10")
+    );
+    assert!(!rendered.contains("background bash task 0"));
+    assert!(rendered.contains("background bash task 1"));
+    assert!(rendered.contains("background bash task 10"));
+}
+
+#[test]
+fn completion_footer_budget_clamps_task_section_but_keeps_context_line() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(192);
+    assert!(events.set_context_panel_usage(channel_id, None, 154_600, 0, 0, 1_000_000, 60));
+    for idx in 0..40 {
+        let tool_id = format!("toolu_{idx}");
+        events.push_status_events(
+            channel_id,
+            status_events_from_tool_use_with_id(
+                "Task",
+                &json!({
+                    "subagent_type": "reviewer",
+                    "description": format!("Inspect very long completion footer task section {idx} {}", "x".repeat(80)),
+                    "run_in_background": true
+                })
+                .to_string(),
+                Some(&tool_id),
+            ),
+        );
+    }
+
+    let rendered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = rendered.block.expect("completion footer should render");
+    let task_section = block
+        .split_once("\n\n")
+        .map(|(_, task_section)| task_section)
+        .expect("context and task sections should be separated");
+
+    assert!(block.contains("Context   📦 154.6k / 1.0M tokens (15%) · auto-compact 60%"));
+    assert!(task_section.len() <= crate::services::discord::single_message_panel::SINGLE_MESSAGE_PANEL_FOOTER_BUDGET_BYTES);
+    assert!(task_section.ends_with('…'));
+    assert!(rendered.has_unfinished_entries);
+}
+
+#[test]
 fn status_panel_tracks_todowrite_plan() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(78);
@@ -2244,6 +3510,331 @@ fn status_panel_background_subagent_not_marked_done_on_launch_ack() {
     );
 }
 
+// #3368: the raw JSONL stream may contain an async launch-ack `toolUseResult`
+// with an agentId but no accounting. That is dispatch acknowledgment, not a
+// completion, so status_events_from_json must not synthesize SubagentEnd.
+#[test]
+fn status_events_json_async_launch_ack_does_not_close_background_subagent() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(875);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Launch ack record reconstruction",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_launch_ack"),
+        ),
+    );
+
+    let reconstructed = status_events_from_json(&json!({
+        "type": "user",
+        "message": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_launch_ack",
+                "is_error": false
+            }]
+        },
+        "toolUseResult": {
+            "isAsync": true,
+            "status": "async_launched",
+            "agentId": "a31353d794c259eb9",
+            "description": "...",
+            "prompt": "...",
+            "outputFile": "...",
+            "canReadOutputFile": true
+        }
+    }));
+    assert!(
+        !reconstructed
+            .iter()
+            .any(|event| matches!(event, StatusEvent::SubagentEnd { .. })),
+        "launch ack must not synthesize SubagentEnd: {reconstructed:?}"
+    );
+
+    events.push_status_events(channel_id, reconstructed);
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("bgworker Launch ack record reconstruction"))
+        .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered}"));
+    assert!(
+        !line.contains('✓') && !line.contains('✗') && !line.contains("Done ("),
+        "background subagent must stay running on async launch ack, got: {line}"
+    );
+}
+
+#[test]
+fn status_panel_async_completion_with_accounting_still_finalizes_subagent() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(876);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "asyncworker",
+                "description": "Completion accounting"
+            })
+            .to_string(),
+            Some("toolu_async_done"),
+        ),
+    );
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_async_done",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "agentId": "aasyncdone000000",
+                "totalToolUseCount": 12,
+                "totalTokens": 5000,
+                "totalDurationMs": 30_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("asyncworker Completion accounting"))
+        .unwrap_or_else(|| panic!("async completion slot missing in: {rendered}"));
+    assert!(
+        line.contains("Done (12 tools · 5k tokens · 30s)") && line.contains('✓'),
+        "completion with accounting must still finalize, got: {line}"
+    );
+}
+
+#[test]
+fn status_panel_foreground_completion_without_agent_id_still_finalizes_subagent() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(877);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "fgworker",
+                "description": "No agent id completion"
+            })
+            .to_string(),
+            Some("toolu_fg_no_agent"),
+        ),
+    );
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_json(&json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_fg_no_agent",
+                    "is_error": false
+                }]
+            },
+            "toolUseResult": {
+                "totalToolUseCount": 3,
+                "totalTokens": 1500,
+                "totalDurationMs": 20_000
+            }
+        })),
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("fgworker No agent id completion"))
+        .unwrap_or_else(|| panic!("foreground completion slot missing in: {rendered}"));
+    assert!(
+        line.contains("Done (3 tools · 1.5k tokens · 20s)") && line.contains('✓'),
+        "foreground completion without agentId must still finalize, got: {line}"
+    );
+}
+
+// #3359: an ack-only Task result with a non-matching tool_use_id must be
+// ignored, not routed through the last-unfinished fallback. The later
+// summary-bearing completion with the matching id is the first event allowed to
+// mark the still-running background subagent done.
+#[test]
+fn status_panel_background_ack_only_unmatched_id_waits_for_matching_completion() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(874);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Background fallback guard",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_bg_real"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        vec![StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_other".to_string()),
+            summary: None,
+            ack_only: true,
+        }],
+    );
+
+    let rendered_running =
+        events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let running_line = rendered_running
+        .lines()
+        .find(|line| line.contains("bgworker Background fallback guard"))
+        .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered_running}"));
+    assert!(
+        !running_line.contains('✓') && !running_line.contains('✗'),
+        "unmatched ack-only end must leave background slot running, got: {running_line}"
+    );
+
+    events.push_status_events(
+        channel_id,
+        vec![StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_bg_real".to_string()),
+            summary: Some(crate::services::agent_protocol::SubagentSummary {
+                tool_count: Some(3),
+                tokens: Some(1_200),
+                duration_secs: Some(42),
+            }),
+            ack_only: false,
+        }],
+    );
+
+    let rendered_done =
+        events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let done_line = rendered_done
+        .lines()
+        .find(|line| line.contains("bgworker Background fallback guard"))
+        .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered_done}"));
+    assert!(
+        done_line.contains("Done (3 tools · 1.2k tokens · 42s)"),
+        "matching summary completion must attach accounting, got: {done_line}"
+    );
+    assert!(
+        done_line.contains('✓'),
+        "matching summary completion must mark the slot done, got: {done_line}"
+    );
+}
+
+// #3359 hole 2: an id-bearing ack-only end with no matching slot must not
+// finalize any unfinished slot via fallback, whether the candidate slot is
+// background or foreground.
+#[test]
+fn status_panel_ack_only_unmatched_id_does_not_fallback_to_any_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(875);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "bgworker",
+                "description": "Still background",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_bg"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "fgworker", "description": "Still foreground"}).to_string(),
+            Some("toolu_fg"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        vec![StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_wrong".to_string()),
+            summary: None,
+            ack_only: true,
+        }],
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    for expected in ["bgworker Still background", "fgworker Still foreground"] {
+        let line = rendered
+            .lines()
+            .find(|line| line.contains(expected))
+            .unwrap_or_else(|| panic!("subagent slot missing in: {rendered}"));
+        assert!(
+            !line.contains('✓') && !line.contains('✗'),
+            "unmatched ack-only end must not fallback-finalize {expected}, got: {line}"
+        );
+    }
+}
+
+// Foreground subagents still close on their genuine summary-bearing completion.
+#[test]
+fn status_panel_foreground_subagent_summary_completion_still_marks_done() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(876);
+
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({"subagent_type": "fgworker", "description": "Summary completion"}).to_string(),
+            Some("toolu_fg_summary"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        vec![StatusEvent::SubagentEnd {
+            success: true,
+            tool_use_id: Some("toolu_fg_summary".to_string()),
+            summary: Some(crate::services::agent_protocol::SubagentSummary {
+                tool_count: Some(2),
+                tokens: Some(900),
+                duration_secs: Some(11),
+            }),
+            ack_only: false,
+        }],
+    );
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("fgworker Summary completion"))
+        .unwrap_or_else(|| panic!("foreground subagent slot missing in: {rendered}"));
+    assert!(
+        line.contains("Done (2 tools · 900 tokens · 11s)"),
+        "foreground summary completion must keep Done summary, got: {line}"
+    );
+    assert!(
+        line.contains('✓'),
+        "foreground summary completion must mark the slot done, got: {line}"
+    );
+}
+
 // Edge case of the premature-✓ fix: a `run_in_background` LAUNCH that FAILS
 // (the Task `tool_result` is an error — the subagent never started) is TERMINAL,
 // not a launch ack. The slot must finalize as failed (✗) instead of being stuck
@@ -2709,6 +4300,11 @@ fn status_panel_caps_partial_workflow_state_without_start() {
         Some("wf-5")
     );
     drop(guard);
+    // Drop the DashMap shard Ref too: the pushes below target channel 2896,
+    // whose `entry()` needs the shard WRITE lock. With the per-instance random
+    // hasher, 2895/2896 sometimes share a shard — holding this read guard
+    // across the pushes then self-deadlocks the test (observed hang).
+    drop(status_entry);
 
     let channel_id = ChannelId::new(2896);
     for idx in 0..=STATUS_PANEL_WORKFLOW_PHASE_LIMIT {
@@ -3140,4 +4736,945 @@ fn status_events_toolsearch_pretty_json_args_summary_not_bare_brace() {
     assert!(summary.contains("Monitor schema"), "got: {summary}");
     assert_ne!(summary.trim(), "{");
     assert!(!summary.trim_end().ends_with('{'), "got: {summary}");
+}
+
+// ---------------------------------------------------------------------------
+// #3393: user-record `<task-notification>` XML → live panel terminal StatusEvents.
+//
+// Background-task / subagent completions reach the transcript ONLY as this XML
+// (never the stream-json `system` record the panel's `system_status_events`
+// parses). These tests drive the FULL ingestion: real-shape XML text (incl. the
+// hyphenated `<tool-use-id>` from the live transcript) → bridge parse → push →
+// `render_completion_footer` shows ✓. State-machine-only proof is explicitly
+// forbidden by the issue, so every assertion goes through the panel render.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_notification_xml_background_bash_flips_footer_slot_to_done() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_001);
+    // A running background Bash slot keyed by the launch tool-use id.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "gh run watch",
+                "description": "Wait until PR 3392 CI settles",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_01Ls2svfdnzcn9uGwA7aHjHW"),
+            true,
+        ),
+    );
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running
+        .block
+        .expect("running background Bash should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Bash Wait until PR 3392 CI settles ⠸"));
+    assert!(!running_block.contains('✓'));
+
+    // Real-shape XML user-record text (background Bash variant, hyphenated
+    // `<tool-use-id>` child tag, status `completed`) — copied from a live
+    // transcript notification.
+    let raw = "<task-notification>\n\
+        <task-id>b5gr0v9xj</task-id>\n\
+        <tool-use-id>toolu_01Ls2svfdnzcn9uGwA7aHjHW</tool-use-id>\n\
+        <output-file>/private/tmp/claude-501/sess/tasks/b5gr0v9xj.output</output-file>\n\
+        <status>completed</status>\n\
+        <summary>Background command \"Wait until PR 3392 CI settles\" completed (exit code 0)</summary>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
+    assert!(
+        bridged
+            .iter()
+            .any(|e| matches!(e, StatusEvent::BackgroundTaskEnd { .. })),
+        "background XML must bridge to BackgroundTaskEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done
+        .block
+        .expect("finished background Bash should stay visible");
+    assert!(!done.has_unfinished_entries);
+    assert!(
+        done_block.contains("Bash Wait until PR 3392 CI settles ✓"),
+        "matching XML notification must flip ✓: {done_block}"
+    );
+    assert!(!done_block.contains('⠼'));
+}
+
+#[test]
+fn task_notification_xml_subagent_flips_footer_slot_to_done() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_002);
+    // A running Task subagent slot keyed by its launch tool-use id.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "scout",
+                "description": "Scout issues #3275 #3276",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_018F3HtbweDDNEbi44HKAhhi"),
+        ),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_result_with_id(
+            Some("Task"),
+            false,
+            Some("toolu_018F3HtbweDDNEbi44HKAhhi"),
+        ),
+    );
+    let running = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let running_block = running.block.expect("running subagent should render");
+    assert!(running.has_unfinished_entries);
+    assert!(running_block.contains("Subagents"));
+    assert!(!running_block.contains('✓'));
+
+    // Real-shape subagent variant: summary prefix `Agent "…" completed`, the
+    // SAME hyphenated `<tool-use-id>` as the launch — bridges to `SubagentEnd`.
+    let raw = "<task-notification>\n\
+        <task-id>a09e45d12a68015a5</task-id>\n\
+        <tool-use-id>toolu_018F3HtbweDDNEbi44HKAhhi</tool-use-id>\n\
+        <output-file>/private/tmp/claude-501/sess/tasks/a09e45d12a68015a5.output</output-file>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"Scout issues #3275 #3276\" completed</summary>\n\
+        <result>Done.</result>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, true);
+    assert!(
+        bridged.iter().any(|e| matches!(
+            e,
+            StatusEvent::SubagentEnd {
+                ack_only: false,
+                ..
+            }
+        )),
+        "subagent XML must bridge to a finalizing SubagentEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    let done_block = done.block.expect("finished subagent should stay visible");
+    assert!(!done.has_unfinished_entries);
+    assert!(
+        done_block.contains("Scout issues #3275 #3276") && done_block.contains('✓'),
+        "matching subagent XML notification must flip ✓: {done_block}"
+    );
+}
+
+#[test]
+fn task_notification_xml_unknown_id_and_duplicate_and_nonterminal_are_safe() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_003);
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id_for_footer_mode(
+            "Bash",
+            &json!({
+                "command": "deploy.sh",
+                "description": "Deploy runtime",
+                "run_in_background": true
+            })
+            .to_string(),
+            Some("toolu_known"),
+            true,
+        ),
+    );
+
+    // (a) Unknown tool-use-id: terminal End for a slot we never opened — no-op.
+    let unknown = "<task-notification><task-id>x1</task-id>\
+        <tool-use-id>toolu_unknown</tool-use-id><status>completed</status>\
+        <summary>Background command \"Other\" completed (exit code 0)</summary></task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(unknown, true),
+    );
+    let after_unknown = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = after_unknown.block.expect("known slot still renders");
+    assert!(
+        block.contains("Bash Deploy runtime ⠸") && !block.contains('✓'),
+        "unknown-id notification must not flip the known slot: {block}"
+    );
+
+    // (b) Non-terminal status: produces NO terminal End event.
+    let nonterminal = "<task-notification><task-id>x2</task-id>\
+        <tool-use-id>toolu_known</tool-use-id><status>running</status>\
+        <summary>Background command \"Deploy runtime\" running</summary></task-notification>";
+    let nonterminal_events =
+        status_events_from_task_notification_xml_for_footer_mode(nonterminal, true);
+    assert!(
+        !nonterminal_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::BackgroundTaskEnd { .. })),
+        "non-terminal status must not bridge a BackgroundTaskEnd: {nonterminal_events:?}"
+    );
+    events.push_status_events(channel_id, nonterminal_events);
+    let still_running = events
+        .render_completion_footer(channel_id, &ProviderKind::Claude, "⠸")
+        .block
+        .expect("slot still renders");
+    assert!(
+        !still_running.contains('✓'),
+        "non-terminal must not flip ✓: {still_running}"
+    );
+
+    // (c) Terminal match flips ✓; a DUPLICATE terminal notification must not flip
+    // the slot back to running.
+    let done_xml = "<task-notification><task-id>x3</task-id>\
+        <tool-use-id>toolu_known</tool-use-id><status>completed</status>\
+        <summary>Background command \"Deploy runtime\" completed (exit code 0)</summary></task-notification>";
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(done_xml, true),
+    );
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_xml_for_footer_mode(done_xml, true),
+    );
+    let done = events
+        .render_completion_footer(channel_id, &ProviderKind::Claude, "⠼")
+        .block
+        .expect("done slot renders");
+    assert!(
+        done.contains("Bash Deploy runtime ✓") && !done.contains('⠼'),
+        "duplicate terminal notification must stay ✓, not flip back: {done}"
+    );
+}
+
+#[test]
+fn task_notification_xml_bridge_inert_when_footer_mode_off() {
+    // Footer-mode OFF → the bridge yields no events so the legacy separate-panel
+    // render path is untouched.
+    let raw = "<task-notification><task-id>off1</task-id>\
+        <tool-use-id>toolu_off</tool-use-id><status>completed</status>\
+        <summary>Background command \"x\" completed (exit code 0)</summary></task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(raw, false);
+    assert!(
+        bridged.is_empty(),
+        "footer-mode-off bridge must be inert: {bridged:?}"
+    );
+}
+
+// #3393 finding 1: an id-LESS subagent `<task-notification>` XML (no
+// `<tool-use-id>` child) must produce NO terminal effect. Before the fix the XML
+// bridge emitted `SubagentEnd { tool_use_id: None }`, the panel fell back to "the
+// last unfinished subagent slot", and the WRONG slot was finalized (and, with
+// #3391, evicted on delivery). The bridge now drops id-less terminal ends.
+#[test]
+fn task_notification_xml_idless_subagent_does_not_flip_or_evict_a_slot() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_393_004);
+    // A running FOREGROUND Task subagent slot keyed by its launch tool-use id.
+    // Foreground (not background) so an id-less ack-only fallback WOULD finalize
+    // it pre-fix — the strongest exposure of the bug.
+    events.push_status_events(
+        channel_id,
+        status_events_from_tool_use_with_id(
+            "Task",
+            &json!({
+                "subagent_type": "scout",
+                "description": "Scout issue #3393"
+            })
+            .to_string(),
+            Some("toolu_live_slot"),
+        ),
+    );
+
+    // Real-shape subagent variant WITHOUT a `<tool-use-id>` child (some repeats /
+    // lost-process notifications omit it). Terminal status `completed`.
+    let idless = "<task-notification>\n\
+        <task-id>idless1</task-id>\n\
+        <status>completed</status>\n\
+        <summary>Agent \"some other agent\" completed</summary>\n\
+        <result>Done.</result>\n\
+        </task-notification>";
+    let bridged = status_events_from_task_notification_xml_for_footer_mode(idless, true);
+    assert!(
+        !bridged
+            .iter()
+            .any(|e| matches!(e, StatusEvent::SubagentEnd { .. })),
+        "id-less subagent XML must NOT bridge a SubagentEnd: {bridged:?}"
+    );
+    events.push_status_events(channel_id, bridged);
+
+    // The slot is untouched: still present and still unfinished (no eviction, no
+    // ✓/✗ flip onto the wrong slot).
+    {
+        let entry = events
+            .status_by_channel
+            .get(&channel_id)
+            .expect("status panel state");
+        let guard = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            guard.subagents.len(),
+            1,
+            "id-less subagent notification must not evict the slot"
+        );
+        assert!(
+            guard.subagents[0].finished.is_none(),
+            "id-less subagent notification must leave the slot unfinished"
+        );
+    }
+
+    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    assert!(
+        footer.has_unfinished_entries,
+        "the running subagent slot must remain unfinished"
+    );
+    let block = footer.block.expect("running subagent should render");
+    assert!(
+        !block.contains('✓'),
+        "id-less subagent notification must not flip ✓: {block}"
+    );
+}
+
+// #3393 finding 3: a workflow `<task-notification>` XML with a NON-terminal
+// status (e.g. running) must NOT emit `WorkflowEnd`; terminal statuses still map
+// success via `!is_error`, consistent with the subagent/background arms.
+#[test]
+fn task_notification_xml_workflow_gates_workflow_end_on_terminal_status() {
+    let running = "<task-notification><task-id>wf1</task-id><status>running</status>\
+        <summary>Dynamic workflow \"probe\" running</summary></task-notification>";
+    let running_events = status_events_from_task_notification_xml_for_footer_mode(running, true);
+    assert!(
+        !running_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkflowEnd { .. })),
+        "status=running workflow XML must NOT emit WorkflowEnd: {running_events:?}"
+    );
+
+    let completed = "<task-notification><task-id>wf2</task-id><status>completed</status>\
+        <summary>Dynamic workflow \"probe\" completed</summary></task-notification>";
+    let completed_events =
+        status_events_from_task_notification_xml_for_footer_mode(completed, true);
+    assert!(
+        completed_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkflowEnd { success: true, .. })),
+        "status=completed workflow XML must emit WorkflowEnd{{success:true}}: {completed_events:?}"
+    );
+
+    let failed = "<task-notification><task-id>wf3</task-id><status>failed</status>\
+        <summary>Dynamic workflow \"probe\" failed</summary></task-notification>";
+    let failed_events = status_events_from_task_notification_xml_for_footer_mode(failed, true);
+    assert!(
+        failed_events
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkflowEnd { success: false, .. })),
+        "status=failed workflow XML must emit WorkflowEnd{{success:false}}: {failed_events:?}"
+    );
+}
+
+// #3394: fence-safe truncation regression coverage.
+
+fn fence_count(text: &str) -> usize {
+    text.matches("```").count()
+}
+
+/// #3394 (1): when the joined panel exceeds the limit, the trailing fenced
+/// Recent block must be DROPPED WHOLE — not chopped into a dangling ```text — and
+/// the earlier sections must survive intact, with an even (balanced) fence count.
+#[test]
+fn truncate_panel_drops_trailing_fenced_section_whole_when_over_limit() {
+    let tasks = format!("Tasks\n{}", "T".repeat(880));
+    let subagents = format!("Subagents\n{}", "S".repeat(880));
+    let recent = format!("🖥️ Recent\n```text\n{}\n```", "R".repeat(400));
+    let sections = vec![tasks.clone(), subagents.clone(), recent];
+    // Precondition: the full join overflows, but Tasks+Subagents alone fit — so
+    // dropping ONLY the trailing fenced Recent block is the correct degradation.
+    assert!(sections.join("\n\n").chars().count() > STATUS_PANEL_MAX_CHARS);
+    assert!(
+        format!("{tasks}\n\n{subagents}").chars().count() <= STATUS_PANEL_MAX_CHARS,
+        "fixture sizing: earlier sections must fit once Recent is dropped"
+    );
+
+    let rendered = truncate_status_panel_sections(sections);
+
+    assert!(rendered.chars().count() <= STATUS_PANEL_MAX_CHARS);
+    // No unterminated fence and no literal dangling ```text.
+    assert_eq!(fence_count(&rendered) % 2, 0, "odd fence count: {rendered}");
+    assert!(!rendered.contains("```text"), "literal ```text leaked");
+    // Degradation is visible: Recent gone, earlier sections kept verbatim.
+    assert!(!rendered.contains("🖥️ Recent"), "Recent not dropped");
+    assert!(rendered.contains(&tasks), "Tasks section was cut");
+    assert!(rendered.contains(&subagents), "Subagents section was cut");
+}
+
+/// #3394 (2): a single fenced section that ALONE exceeds the limit can't be
+/// dropped (nothing else to shed), so it is fence-safe truncated — never left
+/// with a dangling opener.
+#[test]
+fn truncate_panel_fence_safe_when_single_section_overflows() {
+    let oversized = format!(
+        "🖥️ Recent\n```text\n{}\n```",
+        "X".repeat(STATUS_PANEL_MAX_CHARS + 200)
+    );
+    let rendered = truncate_status_panel_sections(vec![oversized]);
+
+    assert!(rendered.chars().count() <= STATUS_PANEL_MAX_CHARS);
+    assert_eq!(fence_count(&rendered) % 2, 0, "odd fence count: {rendered}");
+}
+
+/// #3394 (3): parity helper — balanced/odd, exact boundary, and the Discord
+/// no-nesting semantic (a ``` INSIDE a fenced block CLOSES it).
+#[test]
+fn repair_fence_parity_unit_cases() {
+    use crate::services::discord::single_message_panel::repair_fence_parity;
+    // Balanced input is returned unchanged.
+    let balanced = "a\n```text\nbody\n```\ntail";
+    assert_eq!(repair_fence_parity(balanced), balanced);
+    // No fences at all is unchanged.
+    assert_eq!(repair_fence_parity("plain text"), "plain text");
+    // Odd (dangling opener): the opener and everything after it is removed.
+    let odd = "header\n\n```text\nchopped body";
+    let repaired = repair_fence_parity(odd);
+    assert_eq!(fence_count(&repaired) % 2, 0);
+    assert!(!repaired.contains("```"));
+    assert_eq!(repaired, "header");
+    // Fence at the exact end (closer present) stays balanced/unchanged.
+    let closed = "```text\nx\n```";
+    assert_eq!(repair_fence_parity(closed), closed);
+    // Three fences (open/close/open) — the third is a dangling opener and is
+    // dropped; the first open+close pair (no nesting) is preserved.
+    let three = "```text\nfirst\n```\nmid\n```text\nsecond";
+    let repaired_three = repair_fence_parity(three);
+    assert_eq!(fence_count(&repaired_three) % 2, 0);
+    assert_eq!(repaired_three, "```text\nfirst\n```\nmid");
+}
+
+/// #3394 (3): a fence that LOOKS nested is a closer under Discord semantics, so
+/// a four-fence sequence is balanced and must be left untouched.
+#[test]
+fn repair_fence_parity_treats_inner_fence_as_closer() {
+    use crate::services::discord::single_message_panel::repair_fence_parity;
+    let four = "```\nouter\n```\n```\nsecond\n```";
+    assert_eq!(repair_fence_parity(four), four);
+    assert_eq!(fence_count(four) % 2, 0);
+}
+
+/// #3394 (3): the in-turn LIVE panel routes through the protected truncation
+/// path. With bloated Tasks/Subagents PLUS a fenced Recent live block (the
+/// reported screenshot shape), the rendered panel stays under the limit and never
+/// exposes a dangling fence (the ``` count is always even, balanced or dropped).
+#[test]
+fn live_status_panel_never_leaks_dangling_fence_when_bloated() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3394);
+
+    for idx in 0..STATUS_PANEL_SUBAGENT_LIMIT {
+        events.push_status_events(
+            channel_id,
+            status_events_from_tool_use(
+                "Task",
+                &json!({
+                    "subagent_type": "explorer",
+                    "description": format!("subagent {idx} {}", "d".repeat(180))
+                })
+                .to_string(),
+            ),
+        );
+    }
+    // Fenced Recent live block (mirrors recent_events.rs ```text fence).
+    for idx in 0..6 {
+        events.push_event(
+            channel_id,
+            RecentPlaceholderEvent::tool_use("Bash", &format!(r#"{{"command":"echo {idx}"}}"#))
+                .unwrap(),
+        );
+    }
+
+    let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    assert!(rendered.chars().count() <= STATUS_PANEL_MAX_CHARS);
+    assert_eq!(
+        fence_count(&rendered) % 2,
+        0,
+        "live panel leaked an unterminated fence: {rendered}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #3402: transcript-driven footer-panel slot rehydration after a restart.
+// ---------------------------------------------------------------------------
+
+/// A Claude `assistant` tool_use record launching a (foreground) subagent.
+fn transcript_subagent_start(tool_use_id: &str, desc: &str) -> String {
+    json!({
+        "type": "assistant",
+        "message": {
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "Task",
+                "input": { "subagent_type": "explorer", "description": desc }
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// A Claude `assistant` tool_use record launching a background Bash task.
+fn transcript_background_bash_start(tool_use_id: &str, desc: &str) -> String {
+    json!({
+        "type": "assistant",
+        "message": {
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "Bash",
+                "input": { "command": "sleep 600", "description": desc, "run_in_background": true }
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// A `<task-notification>` `user` record (the #3393 XML path) marking a subagent
+/// completed, keyed by its launching tool-use-id.
+fn transcript_subagent_completion(tool_use_id: &str) -> String {
+    let xml = format!(
+        "<task-notification><tool-use-id>{tool_use_id}</tool-use-id>\
+         <status>completed</status><summary>Agent \"explorer\" completed</summary>\
+         </task-notification>"
+    );
+    json!({
+        "type": "user",
+        "message": { "role": "user", "content": [{ "type": "text", "text": xml }] }
+    })
+    .to_string()
+}
+
+/// A compaction boundary record (`isCompactSummary: true`).
+fn transcript_compact_boundary() -> String {
+    json!({
+        "type": "user",
+        "isCompactSummary": true,
+        "message": { "role": "user", "content": "This session is being continued from a previous conversation" }
+    })
+    .to_string()
+}
+
+fn write_transcript(lines: &[String]) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut body = lines.join("\n");
+    body.push('\n');
+    std::fs::write(file.path(), body).unwrap();
+    file
+}
+
+#[test]
+fn rehydration_restores_only_unmatched_starts_after_restart() {
+    // Slots present in the live process, then a restart wipes them.
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_402_001);
+    push_background_bash_task(&events, channel_id, "running bg", "toolu_bg_run");
+    // Simulate the restart by resetting (clearing) the channel registry.
+    events.clear_channel(channel_id);
+    assert!(
+        events
+            .render_completion_footer(channel_id, &ProviderKind::Claude, "⠸")
+            .block
+            .is_none(),
+        "post-restart footer should start empty"
+    );
+
+    // Fixture transcript: one completed subagent (matched pair), one still-running
+    // subagent (unmatched), and one still-running background Bash (unmatched).
+    let transcript = write_transcript(&[
+        transcript_subagent_start("toolu_done", "finished work"),
+        transcript_subagent_completion("toolu_done"),
+        transcript_subagent_start("toolu_live", "still exploring"),
+        transcript_background_bash_start("toolu_bg_live", "tailing logs"),
+    ]);
+
+    let outcome = events.rehydrate_slots_from_transcript_tail_for_footer_mode(
+        channel_id,
+        transcript.path(),
+        true,
+    );
+    assert_eq!(outcome.subagents, 1, "only the unmatched subagent restored");
+    assert_eq!(outcome.background_tasks, 1, "the bg task restored");
+
+    let render = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = render
+        .block
+        .expect("rehydrated slots should render a footer");
+    assert!(
+        block.contains("still exploring"),
+        "unmatched subagent present: {block}"
+    );
+    assert!(
+        block.contains("tailing logs"),
+        "unmatched bg task present: {block}"
+    );
+    assert!(
+        !block.contains("finished work"),
+        "completed pair absent: {block}"
+    );
+    assert!(render.has_unfinished_entries);
+}
+
+#[test]
+fn rehydration_end_after_rehydrate_flips_check_and_evicts() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_402_002);
+    let transcript = write_transcript(&[
+        transcript_subagent_start("toolu_sa", "long subagent"),
+        transcript_background_bash_start("toolu_bg", "bg worker"),
+    ]);
+    events.rehydrate_slots_from_transcript_tail_for_footer_mode(
+        channel_id,
+        transcript.path(),
+        true,
+    );
+
+    // The #3393 bridge delivers terminal Ends for the rehydrated ids.
+    events.push_status_events(
+        channel_id,
+        status_events_from_task_notification_with_tool_use_id(
+            "subagent",
+            "completed",
+            "Agent done",
+            Some("toolu_sa"),
+        ),
+    );
+    complete_background_bash_task(&events, channel_id, "toolu_bg");
+
+    let delivered = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    let block = delivered.block.expect("terminal slots should render");
+    assert!(block.contains("✓"), "rehydrated slots flipped ✓: {block}");
+    assert!(
+        delivered
+            .delivered_terminal_ids
+            .contains(&subagent_id("toolu_sa")),
+        "subagent terminal id delivered: {:?}",
+        delivered.delivered_terminal_ids
+    );
+    assert!(
+        delivered
+            .delivered_terminal_ids
+            .contains(&bg_task_id("toolu_bg")),
+        "bg task terminal id delivered: {:?}",
+        delivered.delivered_terminal_ids
+    );
+
+    // #3391 eviction works on rehydrated slots: after delivered-once, they drop.
+    events.evict_delivered_terminal_footer_tasks(channel_id, &delivered.delivered_terminal_ids);
+    let after = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
+    assert!(
+        after.block.is_none(),
+        "both terminal slots evicted: {after:?}"
+    );
+}
+
+#[test]
+fn rehydration_is_idempotent() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_402_003);
+    let transcript = write_transcript(&[
+        transcript_subagent_start("toolu_sa", "one subagent"),
+        transcript_background_bash_start("toolu_bg", "one bg"),
+    ]);
+
+    let first = events.rehydrate_slots_from_transcript_tail_for_footer_mode(
+        channel_id,
+        transcript.path(),
+        true,
+    );
+    assert_eq!((first.subagents, first.background_tasks), (1, 1));
+    // Re-running adds nothing (live slots already track both ids).
+    let second = events.rehydrate_slots_from_transcript_tail_for_footer_mode(
+        channel_id,
+        transcript.path(),
+        true,
+    );
+    assert_eq!(
+        (second.subagents, second.background_tasks),
+        (0, 0),
+        "no duplicate restore"
+    );
+
+    let block = events
+        .render_completion_footer(channel_id, &ProviderKind::Claude, "⠸")
+        .block
+        .expect("slots should render");
+    assert_eq!(
+        block.matches("one subagent").count(),
+        1,
+        "single subagent slot: {block}"
+    );
+    assert_eq!(
+        block.matches("one bg").count(),
+        1,
+        "single bg slot: {block}"
+    );
+}
+
+#[test]
+fn rehydration_bound_skips_records_before_compact_boundary() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_402_004);
+    // The pre-compaction subagent must NOT be scanned; only the post-boundary one.
+    let transcript = write_transcript(&[
+        transcript_subagent_start("toolu_pre", "before compaction"),
+        transcript_compact_boundary(),
+        transcript_subagent_start("toolu_post", "after compaction"),
+    ]);
+
+    let outcome = events.rehydrate_slots_from_transcript_tail_for_footer_mode(
+        channel_id,
+        transcript.path(),
+        true,
+    );
+    assert_eq!(
+        outcome.subagents, 1,
+        "only the post-boundary subagent restored"
+    );
+
+    let block = events
+        .render_completion_footer(channel_id, &ProviderKind::Claude, "⠸")
+        .block
+        .expect("post-boundary slot should render");
+    assert!(
+        block.contains("after compaction"),
+        "post-boundary present: {block}"
+    );
+    assert!(
+        !block.contains("before compaction"),
+        "pre-boundary skipped: {block}"
+    );
+}
+
+// ===========================================================================
+// #3404: live (turn-in-progress) status-panel terminal-slot compaction.
+// ===========================================================================
+
+const LIVE_CAP: usize = super::completion_footer::LIVE_PANEL_TERMINAL_RENDER_CAP;
+
+// #3404 fail-on-base: during a long turn the LIVE panel accumulated EVERY
+// completed Task forever; the running entry and even the section budget got
+// starved. Compaction keeps only the most recent `LIVE_CAP` completions plus all
+// running entries and collapses the rest into a `… (+N completed)` summary. On
+// HEAD (no compaction) all completed lines render and no summary line exists, so
+// this fails.
+#[test]
+fn live_panel_compacts_completed_tasks_keeping_running_and_header() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_404_001);
+    let completed = LIVE_CAP + 4;
+    for i in 0..completed {
+        let id = format!("toolu_3404_done_{i:02}");
+        push_background_bash_task(&events, channel_id, &format!("Completed job {i:02}"), &id);
+        complete_background_bash_task(&events, channel_id, &id);
+    }
+    push_background_bash_task(&events, channel_id, "Still running", "toolu_3404_run");
+
+    let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    let rendered_done = panel.matches('✓').count();
+    assert_eq!(
+        rendered_done, LIVE_CAP,
+        "live panel must cap rendered completions at {LIVE_CAP}: {panel}"
+    );
+    let collapsed = completed - LIVE_CAP;
+    assert!(
+        panel.contains(&format!("… (+{collapsed} completed)")),
+        "older completions must collapse into a summary: {panel}"
+    );
+    assert!(panel.contains("Tasks"), "Tasks header survives: {panel}");
+    assert!(
+        panel.contains("Still running"),
+        "the running entry is never capped: {panel}"
+    );
+    // The most recent completion stays visible; the oldest is collapsed away.
+    assert!(panel.contains(&format!("Completed job {:02}", completed - 1)));
+    assert!(!panel.contains("Completed job 00"));
+}
+
+// #3404 fail-on-base: the bug's headline symptom — a long backlog of completed
+// SUBAGENTS truncated the whole Subagents section to `…`. Compaction keeps the
+// Subagents header + running entry visible. On HEAD the running subagent and the
+// header are pushed out, so this fails.
+#[test]
+fn live_panel_compaction_keeps_subagents_section_and_running_entry() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_404_002);
+    for i in 0..(LIVE_CAP + 5) {
+        let id = format!("toolu_3404_sub_{i:02}");
+        events.push_status_event(
+            channel_id,
+            StatusEvent::SubagentStart {
+                subagent_type: Some("reviewer".to_string()),
+                desc: Some(format!("Audit chunk {i:02}")),
+                tool_use_id: Some(id.clone()),
+                background: false,
+            },
+        );
+        events.push_status_event(
+            channel_id,
+            StatusEvent::SubagentEnd {
+                success: true,
+                tool_use_id: Some(id),
+                summary: None,
+                ack_only: false,
+            },
+        );
+    }
+    events.push_status_event(
+        channel_id,
+        StatusEvent::SubagentStart {
+            subagent_type: Some("reviewer".to_string()),
+            desc: Some("Live inspection".to_string()),
+            tool_use_id: Some("toolu_3404_sub_live".to_string()),
+            background: false,
+        },
+    );
+
+    let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert!(
+        panel.contains("Subagents"),
+        "Subagents header survives compaction: {panel}"
+    );
+    assert!(
+        panel.contains("Live inspection"),
+        "the running subagent stays visible: {panel}"
+    );
+    assert_eq!(
+        panel.matches('✓').count(),
+        LIVE_CAP,
+        "completed subagents are capped: {panel}"
+    );
+}
+
+// #3404 SAFETY: the live path must NEVER mutate slot state — a ✓ that the live
+// edit dropped from the RENDER must still be in state so the Ok-gated
+// completion-footer eviction (#3391) remains authoritative and no ✓ is lost
+// unseen. After a compacted live render, the completion footer still sees and
+// can deliver every completed slot.
+#[test]
+fn live_panel_compaction_preserves_state_for_footer_eviction() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_404_003);
+    let completed = LIVE_CAP + 3;
+    let mut ids = Vec::new();
+    for i in 0..completed {
+        let id = format!("toolu_3404_state_{i:02}");
+        push_background_bash_task(&events, channel_id, &format!("Job {i:02}"), &id);
+        complete_background_bash_task(&events, channel_id, &id);
+        ids.push(id);
+    }
+
+    // Live render compacts the display but must not touch state.
+    let _ = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+
+    // The completion footer (separate render) still reports EVERY completed slot
+    // as deliverable — none were silently evicted by the live render.
+    let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
+    assert_eq!(
+        footer.delivered_terminal_ids.len(),
+        completed,
+        "live compaction must not remove slots from state: {:?}",
+        footer.delivered_terminal_ids
+    );
+}
+
+// #3404: a small backlog at or under the cap renders verbatim (no summary line,
+// no behavior change for short turns).
+#[test]
+fn live_panel_no_compaction_under_cap() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_404_004);
+    for i in 0..LIVE_CAP {
+        let id = format!("toolu_3404_small_{i:02}");
+        push_background_bash_task(&events, channel_id, &format!("Job {i:02}"), &id);
+        complete_background_bash_task(&events, channel_id, &id);
+    }
+    let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
+    assert_eq!(panel.matches('✓').count(), LIVE_CAP);
+    assert!(
+        !panel.contains("completed)"),
+        "no summary under cap: {panel}"
+    );
+}
+
+// #3404 unit: the compaction primitive keeps the newest `cap` terminal lines,
+// preserves every in-flight line in place, and emits one summary for the rest.
+#[test]
+fn compact_live_panel_terminal_lines_caps_and_preserves_inflight() {
+    use super::completion_footer::compact_live_panel_terminal_lines;
+    // Newest-first order (the live panel renders `.rev()`).
+    let lines: Vec<String> = vec![
+        "└ Bash running A ⠸".to_string(),
+        "└ Bash done 5 ✓".to_string(),
+        "└ Bash done 4 ✓".to_string(),
+        "└ Bash done 3 ✓".to_string(),
+        "└ Bash done 2 ✗".to_string(),
+        "└ Bash done 1 ✓".to_string(),
+    ];
+    let (out, collapsed) =
+        compact_live_panel_terminal_lines(&lines).expect("over-cap input must compact");
+    assert_eq!(collapsed, 5 - LIVE_CAP);
+    // Running line preserved in position.
+    assert_eq!(out[0], "└ Bash running A ⠸");
+    // Exactly `cap` terminal lines survive (the newest), plus one summary line.
+    assert_eq!(
+        out.iter()
+            .filter(|l| l.ends_with('✓') || l.ends_with('✗'))
+            .count(),
+        LIVE_CAP
+    );
+    assert_eq!(out.iter().filter(|l| l.contains("completed)")).count(), 1);
+    assert!(out.iter().any(|l| l.contains("done 5")));
+    assert!(!out.iter().any(|l| l.contains("done 1")));
+    // Under-cap input is left untouched.
+    assert!(compact_live_panel_terminal_lines(&lines[..2].to_vec()).is_none());
+}
+
+// #3404 codex r1 — the compaction INFO log is count-change gated: same counts
+// across render ticks must not re-log; zero counts re-arm the gate so the next
+// compaction episode logs again.
+#[test]
+fn compaction_log_gate_fires_on_change_only() {
+    let events = PlaceholderLiveEvents::default();
+    let channel_id = ChannelId::new(3_404_100);
+    assert!(
+        events.compaction_counts_changed(channel_id, 4, 0),
+        "first over-cap render logs"
+    );
+    assert!(
+        !events.compaction_counts_changed(channel_id, 4, 0),
+        "same counts stay silent"
+    );
+    assert!(
+        events.compaction_counts_changed(channel_id, 5, 1),
+        "count growth logs"
+    );
+    assert!(
+        !events.compaction_counts_changed(channel_id, 5, 1),
+        "steady state stays silent"
+    );
+    assert!(
+        !events.compaction_counts_changed(channel_id, 0, 0),
+        "zero never logs"
+    );
+    assert!(
+        events.compaction_counts_changed(channel_id, 5, 1),
+        "zero re-arms the next episode"
+    );
+    // codex r2: a turn reset (even residual-preserving) re-arms the gate.
+    events.clear_channel_preserving_footer_residuals(channel_id);
+    assert!(
+        events.compaction_counts_changed(channel_id, 5, 1),
+        "turn reset re-arms the gate without an interleaved zero render"
+    );
 }

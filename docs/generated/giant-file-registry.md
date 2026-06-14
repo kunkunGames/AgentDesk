@@ -11,6 +11,7 @@
 
 | Path | Prod | Owner | Deadline | Decompose Issue |
 | --- | ---: | --- | --- | --- |
+<<<<<<< HEAD
 | `src/db/automation_candidates.rs` | 1003 | automation-pipeline | 2026-08-31 | #3036 |
 | `src/services/discord/idle_recap.rs` | 1298 | discord-recap | 2026-08-31 | #3036 |
 | `src/services/discord/session_relay_sink.rs` | 1731 | discord-relay | 2026-08-31 | #3036 |
@@ -18,6 +19,15 @@
 | `src/services/discord/turn_finalizer.rs` | 1528 | discord-finalizer | 2026-08-31 | #3016 |
 | `src/services/discord/voice_barge_in.rs` | 4657 | voice-runtime | 2026-08-31 | #3036 |
 | `src/voice/announce_meta.rs` | 1001 | voice-runtime | 2026-08-31 | #3036 |
+=======
+| `src/db/automation_candidates.rs` | 1003 | automation-pipeline | 2026-08-31 | #3405 |
+| `src/services/discord/idle_recap.rs` | 1299 | discord-recap | 2026-08-31 | #3405 |
+| `src/services/discord/session_relay_sink.rs` | 1731 | discord-relay | 2026-08-31 | #3405 |
+| `src/services/discord/turn_bridge/mod.rs` | 6777 | discord-relay | 2026-08-31 | #3038 |
+| `src/services/discord/turn_finalizer.rs` | 1528 | discord-finalizer | 2026-08-31 | #3016 |
+| `src/services/discord/voice_barge_in.rs` | 2823 | voice-runtime | 2026-08-31 | #3405 |
+| `src/voice/announce_meta.rs` | 1001 | voice-runtime | 2026-08-31 | #3405 |
+>>>>>>> origin/main
 
 ## Grandfathered
 
@@ -64,11 +74,12 @@
 | `src/services/auto_queue.rs` | 1546 |
 | `src/services/auto_queue/activate_command.rs` | 1354 |
 | `src/services/auto_queue/cancel_run.rs` | 1032 |
-| `src/services/claude.rs` | 3991 |
+| `src/services/claude.rs` | 2948 |
 | `src/services/claude_tui/input.rs` | 1390 |
-| `src/services/codex.rs` | 3001 |
+| `src/services/codex.rs` | 3002 |
 | `src/services/codex_tmux_wrapper.rs` | 1289 |
 | `src/services/codex_tui/input.rs` | 1350 |
+<<<<<<< HEAD
 | `src/services/codex_tui/rollout_tail.rs` | 1663 |
 | `src/services/discord/commands/diagnostics.rs` | 1022 |
 | `src/services/discord/commands/text_commands.rs` | 1490 |
@@ -78,12 +89,28 @@
 | `src/services/discord/meeting_orchestrator.rs` | 3222 |
 | `src/services/discord/mod.rs` | 4980 |
 | `src/services/discord/recovery_engine.rs` | 4090 |
+=======
+| `src/services/codex_tui/rollout_tail.rs` | 1776 |
+| `src/services/discord/commands/diagnostics.rs` | 1022 |
+| `src/services/discord/commands/text_commands.rs` | 1490 |
+| `src/services/discord/formatting.rs` | 2802 |
+| `src/services/discord/health/recovery.rs` | 2634 |
+| `src/services/discord/inflight.rs` | 2523 |
+| `src/services/discord/meeting_orchestrator.rs` | 3222 |
+| `src/services/discord/mod.rs` | 4944 |
+| `src/services/discord/recovery_engine.rs` | 4083 |
+>>>>>>> origin/main
 | `src/services/discord/router/intake_gate.rs` | 2969 |
 | `src/services/discord/router/message_handler/headless_turn.rs` | 1316 |
-| `src/services/discord/router/message_handler/intake_turn.rs` | 3809 |
+| `src/services/discord/router/message_handler/intake_turn.rs` | 3807 |
 | `src/services/discord/session_runtime.rs` | 1753 |
+<<<<<<< HEAD
 | `src/services/discord/tmux.rs` | 2012 |
 | `src/services/discord/tmux_watcher.rs` | 8221 |
+=======
+| `src/services/discord/tmux.rs` | 2050 |
+| `src/services/discord/tmux_watcher.rs` | 8223 |
+>>>>>>> origin/main
 | `src/services/discord/tui_prompt_relay.rs` | 5429 |
 | `src/services/discord/turn_bridge/completion_guard.rs` | 1834 |
 | `src/services/discord/turn_bridge/tmux_runtime.rs` | 1545 |
@@ -99,7 +126,11 @@
 | `src/services/platform/binary_resolver.rs` | 1221 |
 | `src/services/provider.rs` | 1818 |
 | `src/services/qwen.rs` | 2196 |
+<<<<<<< HEAD
 | `src/services/routines/agent_executor.rs` | 1877 |
+=======
+| `src/services/routines/agent_executor.rs` | 1935 |
+>>>>>>> origin/main
 | `src/services/routines/discord_log.rs` | 1389 |
 | `src/services/routines/store.rs` | 3223 |
 | `src/services/settings.rs` | 1007 |

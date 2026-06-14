@@ -7,10 +7,13 @@ use serde_json::Value;
 use crate::services::agent_protocol::StatusEvent;
 use crate::services::provider::ProviderKind;
 
+mod background_task_events;
 mod common;
+mod completion_footer;
 mod context_panel;
 mod recent_events;
 mod session_panel;
+mod slot_rehydration;
 mod status_events;
 mod status_panel;
 mod subagent_rollout;
@@ -22,6 +25,8 @@ mod workflow_panel;
 mod tests;
 
 use common::CHANNEL_EVENT_CAPACITY;
+pub(in crate::services::discord) use completion_footer::TerminalSlotId;
+use completion_footer::{CompletionFooterRender, render_completion_footer};
 use context_panel::ContextPanelSnapshot;
 use recent_events::render_events;
 use session_panel::SessionPanelSnapshot;
@@ -41,7 +46,8 @@ use status_panel::{
 
 pub(in crate::services::discord) use recent_events::RecentPlaceholderEvent;
 pub(in crate::services::discord) use status_events::{
-    status_events_from_task_notification, status_events_from_tool_result_with_id,
+    status_events_from_task_notification_with_tool_use_id,
+    status_events_from_task_notification_xml, status_events_from_tool_result_with_id,
     status_events_from_tool_use_with_id,
 };
 // #3034: the bare (no-id) variants are consumed only by the `tests` submodule
@@ -50,7 +56,9 @@ pub(in crate::services::discord) use status_events::{
 // build.
 #[cfg(test)]
 pub(in crate::services::discord) use status_events::{
-    status_events_from_tool_result, status_events_from_tool_use,
+    status_events_from_json_for_footer_mode, status_events_from_task_notification,
+    status_events_from_task_notification_xml_for_footer_mode, status_events_from_tool_result,
+    status_events_from_tool_use, status_events_from_tool_use_with_id_for_footer_mode,
 };
 
 pub(in crate::services::discord) use recent_events::events_from_json;
@@ -60,6 +68,10 @@ pub(in crate::services::discord) use status_events::status_events_from_json;
 pub(in crate::services::discord) struct PlaceholderLiveEvents {
     by_channel: dashmap::DashMap<ChannelId, Mutex<VecDeque<RecentPlaceholderEvent>>>,
     status_by_channel: dashmap::DashMap<ChannelId, Mutex<StatusPanelState>>,
+    // #3404 (codex r1): last logged live-panel compaction counts per channel —
+    // the INFO line fires on count CHANGE only, not every render tick, so the
+    // log stays usable as a compaction event counter for the relay scan.
+    compaction_log_counts: dashmap::DashMap<ChannelId, (usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +85,29 @@ impl PlaceholderLiveEvents {
     pub(in crate::services::discord) fn clear_channel(&self, channel_id: ChannelId) {
         self.by_channel.remove(&channel_id);
         self.status_by_channel.remove(&channel_id);
+        self.compaction_log_counts.remove(&channel_id);
+    }
+
+    pub(in crate::services::discord) fn clear_channel_preserving_footer_residuals(
+        &self,
+        channel_id: ChannelId,
+    ) {
+        self.by_channel.remove(&channel_id);
+        // #3404 (codex r2): a turn reset starts a new compaction episode — re-arm
+        // the count-change log gate even when footer residuals survive.
+        self.compaction_log_counts.remove(&channel_id);
+        let has_residuals = self
+            .status_by_channel
+            .get(&channel_id)
+            .is_some_and(|entry| {
+                entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .reset_turn_content_preserving_unfinished_footer_residuals()
+            });
+        if !has_residuals {
+            self.status_by_channel.remove(&channel_id);
+        }
     }
 
     pub(in crate::services::discord) fn push_event(
@@ -385,6 +420,23 @@ impl PlaceholderLiveEvents {
         )
     }
 
+    // True when the live-panel compaction counts for this channel differ from
+    // the last logged pair. Zero counts re-arm the gate (the next compaction
+    // episode logs again) and never log themselves.
+    fn compaction_counts_changed(
+        &self,
+        channel_id: ChannelId,
+        evicted_tasks: usize,
+        evicted_subagents: usize,
+    ) -> bool {
+        if evicted_tasks == 0 && evicted_subagents == 0 {
+            self.compaction_log_counts.remove(&channel_id);
+            return false;
+        }
+        let counts = (evicted_tasks, evicted_subagents);
+        self.compaction_log_counts.insert(channel_id, counts) != Some(counts)
+    }
+
     fn render_status_panel_with_heartbeat(
         &self,
         channel_id: ChannelId,
@@ -402,6 +454,21 @@ impl PlaceholderLiveEvents {
                     .clone()
             })
             .unwrap_or_default();
+        // #3404: observability — log when completed Tasks/Subagents are compacted
+        // out of the live panel (the live-side analogue of the completion-footer
+        // eviction log), gated on count CHANGE so a long over-cap turn does not
+        // repeat the same line every render tick (codex r1).
+        let (evicted_tasks, evicted_subagents) =
+            completion_footer::live_panel_compaction_counts(&snapshot, provider);
+        if self.compaction_counts_changed(channel_id, evicted_tasks, evicted_subagents) {
+            tracing::info!(
+                target: "agentdesk::discord::live_panel",
+                channel_id = channel_id.get(),
+                evicted_tasks,
+                evicted_subagents,
+                "#3404: compacted delivered terminal slots from the live status panel"
+            );
+        }
         render_status_panel(
             snapshot,
             self.render_block(channel_id),
@@ -409,5 +476,24 @@ impl PlaceholderLiveEvents {
             started_at_unix,
             heartbeat_at_unix,
         )
+    }
+
+    pub(in crate::services::discord) fn render_completion_footer(
+        &self,
+        channel_id: ChannelId,
+        provider: &ProviderKind,
+        indicator: &str,
+    ) -> CompletionFooterRender {
+        let snapshot = self
+            .status_by_channel
+            .get(&channel_id)
+            .map(|entry| {
+                entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .unwrap_or_default();
+        render_completion_footer(snapshot, provider, indicator)
     }
 }

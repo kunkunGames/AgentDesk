@@ -6,6 +6,7 @@ mod output_lifecycle;
 mod recall_feedback;
 mod recovery_text;
 mod retry_state;
+mod single_message_footer;
 mod skill_usage;
 mod stale_resume;
 mod status_panel;
@@ -48,6 +49,7 @@ pub(super) use recovery_text::{
     auto_retry_with_history, build_session_retry_context_from_history, release_retry_pending,
     store_session_retry_context, take_session_retry_context_for_turn_with_audit,
 };
+use single_message_footer::*;
 pub(super) use stale_resume::result_event_has_stale_resume_error;
 pub(in crate::services::discord) use status_panel::{
     complete_status_panel_v2_with_http, normalize_status_panel_message_id,
@@ -206,9 +208,8 @@ use stale_resume::{
     stream_error_requires_terminal_session_reset,
 };
 use status_panel::{
-    bridge_epilogue_identity_guards_inflight_clear, complete_status_panel_v2,
+    bridge_epilogue_identity_guards_inflight_clear,
     should_open_long_running_placeholder_controller,
-    status_panel_completion_edit_aliases_newer_turn,
     status_panel_completion_ready_after_terminal_body, status_panel_message_id_for_turn,
 };
 use terminal_delivery::{
@@ -436,6 +437,7 @@ async fn refresh_session_panel_line_from_lifecycle(
     .await
     {
         Ok(Some(event)) => shared
+            .ui
             .placeholder_live_events
             .set_session_panel_lifecycle_event(
                 channel_id,
@@ -444,6 +446,7 @@ async fn refresh_session_panel_line_from_lifecycle(
                 &event.details_json,
             ),
         Ok(None) => shared
+            .ui
             .placeholder_live_events
             .clear_session_panel(channel_id),
         Err(error) => {
@@ -541,7 +544,7 @@ async fn refresh_task_panel_line_from_dispatch(
                 None
             }
         };
-    shared.placeholder_live_events.set_task_panel_info(
+    shared.ui.placeholder_live_events.set_task_panel_info(
         channel_id,
         crate::services::discord::placeholder_live_events::TaskPanelInfo {
             dispatch_id,
@@ -602,15 +605,20 @@ async fn ensure_active_placeholder_card<G: TurnGateway + ?Sized>(
     key: super::placeholder_controller::PlaceholderKey,
     input: super::placeholder_controller::PlaceholderActiveInput,
 ) -> super::placeholder_controller::PlaceholderControllerOutcome {
-    if shared.placeholder_live_events_enabled
-        && let Some(block) = shared.placeholder_live_events.render_block(key.channel_id)
+    if shared.ui.placeholder_live_events_enabled
+        && let Some(block) = shared
+            .ui
+            .placeholder_live_events
+            .render_block(key.channel_id)
     {
         return shared
+            .ui
             .placeholder_controller
             .ensure_active_with_live_events(gateway, key, input, block)
             .await;
     }
     shared
+        .ui
         .placeholder_controller
         .ensure_active(gateway, key, input)
         .await
@@ -621,10 +629,13 @@ fn record_placeholder_live_event(
     channel_id: ChannelId,
     event: Option<super::placeholder_live_events::RecentPlaceholderEvent>,
 ) {
-    if (shared.placeholder_live_events_enabled || shared.status_panel_v2_enabled)
+    if (shared.ui.placeholder_live_events_enabled || shared.ui.status_panel_v2_enabled)
         && let Some(event) = event
     {
-        shared.placeholder_live_events.push_event(channel_id, event);
+        shared
+            .ui
+            .placeholder_live_events
+            .push_event(channel_id, event);
     }
 }
 
@@ -633,8 +644,9 @@ fn record_status_panel_events(
     channel_id: ChannelId,
     events: Vec<StatusEvent>,
 ) -> bool {
-    if shared.status_panel_v2_enabled && !events.is_empty() {
+    if shared.ui.status_panel_v2_enabled && !events.is_empty() {
         shared
+            .ui
             .placeholder_live_events
             .push_status_events(channel_id, events);
         true
@@ -928,6 +940,103 @@ fn done_result_requires_full_terminal_replay(
         && full_response.trim() == result.trim()
 }
 
+#[cfg(test)]
+mod sentinel_overwrite_clamp_tests {
+    use super::done_result_requires_full_terminal_replay;
+
+    // #3419 R3: the existing offset-reset gate requires a >DISCORD_MSG_LIMIT
+    // (8000-byte) authoritative replay, so a short sentinel NEVER trips it —
+    // which is exactly why the SEPARATE clamp at the swap site is needed. This
+    // pins that gap so a future refactor cannot silently make the clamp dead
+    // (e.g. by assuming the replay gate already handles sentinels).
+    #[test]
+    fn replay_gate_does_not_reset_offset_for_short_sentinel() {
+        let sentinel = "⚠ tool-only turn, no assistant text"; // ~40 bytes, < 8000
+        assert!(sentinel.len() <= super::super::DISCORD_MSG_LIMIT);
+        // streamed text this turn, prior offset > 0, sentinel == full_response:
+        // the replay gate STILL returns false because of the length floor.
+        assert!(!done_result_requires_full_terminal_replay(
+            sentinel, sentinel, 900, true,
+        ));
+    }
+
+    // #3419 R3 / codex MEDIUM: drive the REAL normalizer the bridge now calls
+    // (`sync_response_delivery_state` → `normalized_response_sent_offset`), not a
+    // re-implemented clamp, so a mutation that drops the clamp OR the char-boundary
+    // walk-back is caught against actual production behaviour.
+    #[test]
+    fn sync_clamps_offset_within_replaced_body() {
+        use crate::services::discord::InflightTurnState;
+        use crate::services::provider::ProviderKind;
+
+        let replaced = "⚠ tool-only turn, no assistant text".to_string();
+        let mut offset = 900usize; // tracked the long pre-swap body
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            1,
+            Some("adk-cc".to_string()),
+            42,
+            5001,
+            5002,
+            "prompt".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-claude-adk-cc-1".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            10,
+        );
+        super::sync_response_delivery_state(&replaced, &mut offset, &mut state);
+        // Clamped to len() (out-of-bounds prior offset) and char-boundary valid.
+        assert_eq!(offset, replaced.len());
+        assert!(replaced.is_char_boundary(offset));
+        assert_eq!(state.response_sent_offset, offset);
+        assert_eq!(state.full_response, replaced);
+        // Mutation guard: the UNCLAMPED prior offset is out of bounds (the wedge).
+        assert!(replaced.get(900..).is_none());
+        assert!(replaced.get(offset..).is_some());
+    }
+
+    // #3419 R3 / codex MEDIUM (the char-boundary case the bare `.min(len)` missed):
+    // a replacement BEGINNING with a multibyte sentinel (`⚠` = 3 bytes) with a
+    // prior offset of 1. `1 < len()`, so `.min(len)` would leave it UNCHANGED at 1
+    // — but byte 1 is INSIDE `⚠`, violating the char-boundary invariant and
+    // panicking any later `full_response[offset..]` slice. The normalizer must walk
+    // BACK to the nearest valid boundary (0).
+    #[test]
+    fn sync_normalizes_prior_offset_inside_leading_multibyte_char() {
+        use crate::services::discord::InflightTurnState;
+        use crate::services::provider::ProviderKind;
+
+        let replaced = "⚠ tool-only turn, no assistant text".to_string();
+        // Precondition: byte 1 is genuinely mid-multibyte (the bug surface).
+        assert!(!replaced.is_char_boundary(1));
+        let mut offset = 1usize; // prior valid offset that now lands mid-char
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            1,
+            Some("adk-cc".to_string()),
+            42,
+            5001,
+            5002,
+            "prompt".to_string(),
+            Some("session".to_string()),
+            Some("AgentDesk-claude-adk-cc-1".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            10,
+        );
+        super::sync_response_delivery_state(&replaced, &mut offset, &mut state);
+        // Normalized back to the leading boundary (0) — NOT left at the mid-char 1.
+        assert_eq!(offset, 0);
+        assert!(replaced.is_char_boundary(offset));
+        assert_eq!(state.response_sent_offset, 0);
+        // Mutation guard: a bare `.min(len)` (no walk-back) would leave offset 1,
+        // which is NOT a char boundary and would panic on `&replaced[1..]`.
+        assert!(replaced.get(1..).is_none());
+        assert!(replaced.get(offset..).is_some());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WatcherHandoffClaimOutcome {
     None,
@@ -980,6 +1089,7 @@ fn record_watcher_orphan_spinner_cleanup(
         );
     }
     shared
+        .ui
         .placeholder_cleanup
         .record(super::placeholder_cleanup::PlaceholderCleanupRecord {
             provider: provider.clone(),
@@ -1784,7 +1894,7 @@ fn handle_watcher_runtime_handoff(
     if watcher_claimed {
         #[cfg(unix)]
         {
-            let on_standby = shared_owned.cached_serenity_ctx.get().is_none();
+            let on_standby = shared_owned.http.cached_serenity_ctx.get().is_none();
             if on_standby {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
@@ -1963,7 +2073,7 @@ fn handle_watcher_runtime_handoff(
                 super::turn_finalizer::TurnKey::new(
                     channel_id,
                     inflight_state.user_msg_id,
-                    shared_owned.current_generation,
+                    shared_owned.restart.current_generation,
                 ),
                 provider.clone(),
                 super::inflight::RelayOwnerKind::Watcher,
@@ -2126,29 +2236,17 @@ pub(super) fn spawn_turn_bridge(
                 | super::inflight::RelayOwnerKind::SessionBoundRelay
                 | super::inflight::RelayOwnerKind::Unknown
         );
-        // #1255 live-turn long-running tool placeholder card.
-        //
-        // `last_assistant_text_line` captures the last non-empty single-line
-        // assistant prose emission so we can surface it as the placeholder
-        // card's `요약` slot (the "⏳ CI 통과 신호 대기" use case from the
-        // issue). It is reset on tool result / completion so a stale line
-        // never leaks into the next tool placeholder.
-        //
-        // `long_running_placeholder_active` is `Some(...)` while a Monitor /
-        // background-Bash call is mid-flight. It records the placeholder key
-        // we are driving so the matching ToolResult / Done event can call
-        // `controller.transition(Completed)`. The cancel / abort paths use
-        // the same handle.
+        // #1255 live-turn long-running tool placeholder card. Capture the last
+        // non-empty assistant line for the placeholder `요약` slot, then reset
+        // on tool result/completion so stale text never leaks. While Monitor /
+        // background-Bash work is mid-flight, `long_running_placeholder_active`
+        // stores the key so ToolResult/Done/cancel/abort hit the same handle.
         let mut last_assistant_text_line: Option<String> = None;
         // Pair the active key with the input snapshot, close-trigger kind, and
-        // an `ack_consumed` flag.
-        //
-        // Rollover uses the snapshot to retarget the controller onto the new
-        // `current_msg_id`; the close-trigger distinguishes Monitor-style
-        // ToolResult-closes from background-dispatch ack events; and
-        // `ack_consumed` (codex round-6 P2 on #1308) prevents subsequent
-        // unrelated ToolResults — for example a failing `Read`/`Grep` later
-        // in the same turn — from closing a still-running background card.
+        // `ack_consumed`: rollover retargets to the new `current_msg_id`, the
+        // trigger separates Monitor closes from background acks, and
+        // `ack_consumed` blocks unrelated later ToolResults from closing the
+        // still-running background card (codex round-6 P2 on #1308).
         let mut long_running_placeholder_active: Option<(
             super::placeholder_controller::PlaceholderKey,
             super::placeholder_controller::PlaceholderActiveInput,
@@ -2156,8 +2254,19 @@ pub(super) fn spawn_turn_bridge(
             bool, // ack_consumed
         )> = None;
         let mut active_background_child_session_ids: Vec<i64> = Vec::new();
-        if shared_owned.placeholder_live_events_enabled || shared_owned.status_panel_v2_enabled {
-            shared_owned.placeholder_live_events.clear_channel(channel_id);
+        let single_message_panel_footer_mode =
+            bridge_single_message_panel_footer_enabled(shared_owned.ui.status_panel_v2_enabled);
+        if shared_owned.ui.placeholder_live_events_enabled || shared_owned.ui.status_panel_v2_enabled {
+            if single_message_panel_footer_mode {
+                supersede_bridge_registered_completion_footer(shared_owned.as_ref(), channel_id)
+                    .await;
+                shared_owned
+                    .ui
+                    .placeholder_live_events
+                    .clear_channel_preserving_footer_residuals(channel_id);
+            } else {
+                shared_owned.ui.placeholder_live_events.clear_channel(channel_id);
+            }
         }
         let mut transport_error = false;
         let mut api_friction_reports = Vec::new();
@@ -2356,45 +2465,34 @@ pub(super) fn spawn_turn_bridge(
             &mut inflight_state,
             bridge.reuse_status_panel_message,
         );
+        if single_message_panel_footer_mode {
+            status_panel_msg_id = None;
+            inflight_state.status_message_id = None;
+        }
         let mut last_status_panel_text = String::new();
-        let mut status_panel_dirty = shared_owned.status_panel_v2_enabled;
+        let mut status_panel_dirty = shared_owned.ui.status_panel_v2_enabled;
         let mut last_status_panel_edit = tokio::time::Instant::now() - status_interval;
         let status_panel_started_at = chrono::Utc::now().timestamp();
         let turn_start = std::time::Instant::now();
 
-        if shared_owned.status_panel_v2_enabled
-            && (status_panel_msg_id.is_none() || status_panel_msg_id == Some(current_msg_id))
-        {
-            let response_placeholder = super::formatting::build_processing_status_block(SPINNER[0]);
-            match gateway.send_message(channel_id, &response_placeholder).await {
-                Ok(response_msg_id) => {
-                    if is_synthetic_headless_message_id(current_msg_id) {
-                        status_panel_msg_id = None;
-                        inflight_state.status_message_id = None;
-                    } else {
-                        status_panel_msg_id = Some(current_msg_id);
-                        inflight_state.status_message_id = Some(current_msg_id.get());
-                    }
-                    current_msg_id = response_msg_id;
-                    bridge_created_response_placeholder_msg_id = Some(response_msg_id);
-                    last_edit_text = response_placeholder.to_string();
-                    inflight_state.current_msg_id = current_msg_id.get();
-                    inflight_state.current_msg_len = last_edit_text.len();
-                    inflight_state.response_sent_offset = response_sent_offset;
-                    inflight_state.full_response = full_response.clone();
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "[turn_bridge] failed to create status-panel-v2 response message in channel {}: {}",
-                        channel_id,
-                        error
-                    );
-                    status_panel_dirty = false;
-                }
-            }
-        }
+        maybe_create_bridge_separate_status_panel_response(
+            single_message_panel_footer_mode,
+            shared_owned.ui.status_panel_v2_enabled,
+            gateway.as_ref(),
+            channel_id,
+            SPINNER[0],
+            &mut current_msg_id,
+            &mut status_panel_msg_id,
+            &mut bridge_created_response_placeholder_msg_id,
+            &mut last_edit_text,
+            &mut inflight_state,
+            response_sent_offset,
+            &full_response,
+            &mut status_panel_dirty,
+        )
+        .await;
 
-        if shared_owned.status_panel_v2_enabled
+        if shared_owned.ui.status_panel_v2_enabled
             && let Some(dispatch_id) = dispatch_id.as_deref()
         {
             status_panel_dirty |= refresh_task_panel_line_from_dispatch(
@@ -2567,32 +2665,22 @@ pub(super) fn spawn_turn_bridge(
                 match next_message {
                     Ok(msg) => {
                         // #2289 cancel boundary: re-sample `cancel_requested`
-                        // AFTER `try_recv` returns, but ONLY for variants
-                        // that would flip `done = true` (`Done` and
-                        // `Error` today). The pre-recv guard above samples
-                        // before the receive call; if `/stop` flips the
-                        // token between that guard and `try_recv`
-                        // returning a terminal frame, letting that arm
-                        // run sets `done = true` and suppresses the outer
-                        // cancel arm — recording the turn as completed,
-                        // failed, or transport-errored when the user
-                        // actually stopped it. Drop the terminal frame
-                        // and jump to cancel-finalize so the cancel claims
-                        // the outcome.
+                        // AFTER `try_recv`, but ONLY for variants that flip
+                        // `done = true` (`Done`/`Error`). The pre-recv guard
+                        // samples before the receive; if `/stop` flips the token
+                        // in that gap, letting a terminal arm run sets `done` and
+                        // suppresses the outer cancel arm — recording a completed/
+                        // failed turn the user actually stopped. Drop the frame
+                        // and jump to cancel-finalize.
                         //
-                        // The gate is scoped to variants that set
-                        // `done = true` so non-terminal control/output
-                        // frames (`RuntimeReady`, `TmuxReady`,
-                        // `ProcessReady`, `OutputOffset`, `Text`,
-                        // `RetryBoundary`, …) are still processed: they
-                        // may carry handoff paths, offsets, watcher debt,
-                        // or session-reset decisions that the cancel
-                        // path expects to be applied. None of those
-                        // variants flip `done = true`, so the next outer
-                        // iteration's pre-recv cancel guard finalizes
-                        // cancel cleanly on the very next pass. When a
-                        // new terminal variant is added, it MUST be added
-                        // here too — see `is_done_setting_terminal_frame`.
+                        // Scoped to done-setting variants so non-terminal frames
+                        // (`RuntimeReady`, `TmuxReady`, `ProcessReady`,
+                        // `OutputOffset`, `Text`, `RetryBoundary`, …) are still
+                        // processed (they carry handoff paths, offsets, watcher
+                        // debt, session-reset that the cancel path needs); none
+                        // flip `done`, so the next pre-recv cancel guard finalizes
+                        // cancel cleanly. A new terminal variant MUST be added here
+                        // too — see `is_done_setting_terminal_frame`.
                         if is_done_setting_terminal_frame(&msg)
                             && should_finalize_cancel_after_recv(
                                 done,
@@ -2917,7 +3005,7 @@ pub(super) fn spawn_turn_bridge(
                                 }
                             }
                             if should_open_long_running_placeholder_controller(
-                                shared_owned.status_panel_v2_enabled,
+                                shared_owned.ui.status_panel_v2_enabled,
                             )
                                 && long_running_placeholder_active.is_none()
                                 && pending_long_running_open_after_state_save.is_none()
@@ -3054,20 +3142,14 @@ pub(super) fn spawn_turn_bridge(
                                     tool_use_id.as_deref(),
                                 ),
                             );
-                            // #1255: a long-running tool's ToolResult means the
-                            // background card can transition to its terminal
-                            // state.  We still keep the placeholder around for
-                            // the rest of the turn so the user can see the
-                            // status line; the controller's idempotent terminal
-                            // transition keeps duplicate edits free.
-                            // codex round-2 P1: only `Monitor`-style tools
-                            // deliver their real completion via `ToolResult`.
-                            // Background `Bash`/`Task`/`Agent` dispatches send
-                            // back a job/task id ack on `ToolResult` and the
-                            // actual work continues — terminating here would
-                            // close the card while the background job is
-                            // still running. Keep those open until `Done` /
-                            // cancel.
+                            // #1255: a long-running tool's ToolResult can move
+                            // the background card terminal while keeping the
+                            // placeholder visible for the rest of the turn; the
+                            // controller remains idempotent. codex round-2 P1:
+                            // only Monitor-style ToolResults are real
+                            // completions. Background Bash/Task/Agent results
+                            // are job/task acks, so keep those open until
+                            // Done/cancel.
                             if let Some((key, snapshot, close_trigger, ack_consumed)) =
                                 long_running_placeholder_active.take()
                             {
@@ -3113,12 +3195,12 @@ pub(super) fn spawn_turn_bridge(
                                     if pending_retarget_matches_key {
                                         let _ =
                                             pending_long_running_retarget_after_state_save.take();
-                                        shared_owned.placeholder_controller.detach(&key);
+                                        shared_owned.ui.placeholder_controller.detach(&key);
                                         inflight_state.long_running_placeholder_active = false;
                                         state_dirty = true;
                                     } else {
                                         let outcome = shared_owned
-                                            .placeholder_controller
+                                            .ui.placeholder_controller
                                             .transition(gateway.as_ref(), key.clone(), target)
                                             .await;
                                         // codex round-10 P2: only clear flag on
@@ -3212,12 +3294,7 @@ pub(super) fn spawn_turn_bridge(
                                 },
                             );
                         }
-                        StreamMessage::TaskNotification {
-                            summary,
-                            status,
-                            kind,
-                            ..
-                        } => {
+                        StreamMessage::TaskNotification { tool_use_id, summary, status, kind, .. } => {
                             inflight_state.task_notification_kind =
                                 merge_task_notification_kind(inflight_state.task_notification_kind, kind);
                             state_dirty = true;
@@ -3233,12 +3310,26 @@ pub(super) fn spawn_turn_bridge(
                             status_panel_dirty |= record_status_panel_events(
                                 shared_owned.as_ref(),
                                 channel_id,
-                                super::placeholder_live_events::status_events_from_task_notification(
+                                super::placeholder_live_events::status_events_from_task_notification_with_tool_use_id(
                                     kind.as_str(),
                                     &status,
                                     &summary,
+                                    tool_use_id.as_deref(),
                                 ),
                             );
+                            if single_message_panel_footer_mode {
+                                let indicator =
+                                    super::single_message_panel::single_message_panel_spinner_frame(
+                                        spin_idx,
+                                    );
+                                spin_idx = spin_idx.wrapping_add(1);
+                                refresh_bridge_registered_completion_footer(
+                                    shared_owned.as_ref(),
+                                    channel_id,
+                                    indicator,
+                                )
+                                .await;
+                            }
                             if task_notification_closes_background_child(kind, &status) {
                                 let close_status = if matches!(
                                     status.trim().to_ascii_lowercase().as_str(),
@@ -3296,19 +3387,17 @@ pub(super) fn spawn_turn_bridge(
                         } => {
                             let session_died_retry = result == "__session_died_retry__";
                             if session_died_retry {
-                                // Recovery reader requests the generic
-                                // Discord-history auto-retry path when the
-                                // resumed session dies before completion.
+                                // Recovery reader requests the generic Discord-history
+                                // auto-retry when the resumed session dies pre-completion.
                                 recovery_retry = true;
                             }
                             if pending_long_running_open_after_state_save.take().is_some() {
                                 inflight_state.long_running_placeholder_active = false;
                                 let _ = save_inflight_state(&inflight_state);
                             }
-                            // #1255: turn finished while a long-running
-                            // placeholder is still flagged as Active — close
-                            // it now so the user does not stare at a stale
-                            // 🔄 card forever. Idempotent if a prior
+                            // #1255: turn finished while a long-running placeholder
+                            // is still Active — close it now so the user does not
+                            // stare at a stale 🔄 card. Idempotent if a prior
                             // ToolResult already fired Completed.
                             if let Some((key, snapshot, close_trigger, ack_consumed)) =
                                 long_running_placeholder_active.take()
@@ -3326,11 +3415,11 @@ pub(super) fn spawn_turn_bridge(
                                         });
                                 if pending_retarget_matches_key {
                                     let _ = pending_long_running_retarget_after_state_save.take();
-                                    shared_owned.placeholder_controller.detach(&key);
+                                    shared_owned.ui.placeholder_controller.detach(&key);
                                     inflight_state.long_running_placeholder_active = false;
                                 } else {
                                     let outcome = shared_owned
-                                        .placeholder_controller
+                                        .ui.placeholder_controller
                                         .transition(gateway.as_ref(), key.clone(), target)
                                         .await;
                                     // codex round-10/11 P2/P3: on `EditFailed`,
@@ -3355,7 +3444,19 @@ pub(super) fn spawn_turn_bridge(
                                 has_post_tool_text,
                             ) {
                                 full_response = resolved;
-                                inflight_state.full_response = full_response.clone();
+                                // #3419 R3 (codex MEDIUM): a short sentinel/tool-only
+                                // resolved body shrinks full_response below a prior
+                                // streamed offset that the >8000-byte replay gate
+                                // (`done_result_requires_full_terminal_replay`) does not
+                                // reset → out of bounds (watcher empty-slice wedge).
+                                // `sync_response_delivery_state` clamps to len AND walks
+                                // back to a valid char boundary (a bare `.min(len())`
+                                // could land mid multibyte char) and mirrors both.
+                                sync_response_delivery_state(
+                                    &full_response,
+                                    &mut response_sent_offset,
+                                    &mut inflight_state,
+                                );
                             }
                             if done_result_requires_full_terminal_replay(
                                 &full_response,
@@ -3545,13 +3646,13 @@ pub(super) fn spawn_turn_bridge(
                             if let Some(ot) = output_tokens {
                                 accumulated_output_tokens = accumulated_output_tokens.max(ot);
                             }
-                            if shared_owned.status_panel_v2_enabled && has_context_token_data {
+                            if shared_owned.ui.status_panel_v2_enabled && has_context_token_data {
                                 let context_provider_session_id = new_raw_provider_session_id
                                     .as_deref()
                                     .or(new_session_id.as_deref())
                                     .or(inflight_state.session_id.as_deref());
                                 let context_dirty = shared_owned
-                                    .placeholder_live_events
+                                    .ui.placeholder_live_events
                                     .set_context_panel_usage(
                                         channel_id,
                                         context_provider_session_id,
@@ -3664,7 +3765,7 @@ pub(super) fn spawn_turn_bridge(
                                     // `cached_serenity_ctx` is set, spawn the
                                     // watcher as before so streaming partial
                                     // output continues to work.
-                                    let on_standby = shared_owned.cached_serenity_ctx.get().is_none();
+                                    let on_standby = shared_owned.http.cached_serenity_ctx.get().is_none();
                                     if on_standby {
                                         // Phase 5.3 of intake-node-routing (issue #2011):
                                         // skip the watcher entirely on standby and
@@ -3876,7 +3977,7 @@ pub(super) fn spawn_turn_bridge(
                                         super::turn_finalizer::TurnKey::new(
                                             channel_id,
                                             inflight_state.user_msg_id,
-                                            shared_owned.current_generation,
+                                            shared_owned.restart.current_generation,
                                         ),
                                         provider.clone(),
                                         super::inflight::RelayOwnerKind::Watcher,
@@ -4112,7 +4213,7 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
-            if shared_owned.status_panel_v2_enabled
+            if shared_owned.ui.status_panel_v2_enabled
                 && last_session_panel_lifecycle_refresh.elapsed() >= status_interval
             {
                 last_session_panel_lifecycle_refresh = tokio::time::Instant::now();
@@ -4128,12 +4229,15 @@ pub(super) fn spawn_turn_bridge(
             let indicator = SPINNER[spin_idx % SPINNER.len()];
             spin_idx += 1;
 
-            if shared_owned.status_panel_v2_enabled
-                && status_panel_dirty
+            if shared_owned.ui.status_panel_v2_enabled
+                && bridge_status_panel_dirty_should_edit_separate_panel(
+                    status_panel_dirty,
+                    single_message_panel_footer_mode,
+                )
                 && last_status_panel_edit.elapsed() >= status_interval
                 && let Some(status_msg_id) = status_panel_msg_id
             {
-                let panel_text = shared_owned.placeholder_live_events.render_status_panel(
+                let panel_text = shared_owned.ui.placeholder_live_events.render_status_panel(
                     channel_id,
                     &provider,
                     status_panel_started_at,
@@ -4161,6 +4265,19 @@ pub(super) fn spawn_turn_bridge(
                 }
                 status_panel_dirty = false;
             }
+            if single_message_panel_footer_mode
+                && status_panel_dirty
+                && last_status_panel_edit.elapsed() >= status_interval
+            {
+                refresh_bridge_registered_completion_footer(
+                    shared_owned.as_ref(),
+                    channel_id,
+                    indicator,
+                )
+                .await;
+                last_status_panel_edit = tokio::time::Instant::now();
+                status_panel_dirty = false;
+            }
 
             if !watcher_owns_assistant_relay && !standby_relay_owns_output {
                 loop {
@@ -4171,16 +4288,16 @@ pub(super) fn spawn_turn_bridge(
                     }
 
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
-                    let status_block = if shared_owned.status_panel_v2_enabled {
-                        super::formatting::build_processing_status_block(indicator)
-                    } else {
-                        super::formatting::build_placeholder_status_block(
-                            indicator,
-                            prev_tool_status.as_deref(),
-                            current_tool_line.as_deref(),
-                            &full_response,
-                        )
-                    };
+                    let status_block = build_bridge_single_message_panel_status_block(
+                        shared_owned.as_ref(),
+                        channel_id,
+                        &provider,
+                        status_panel_started_at,
+                        indicator,
+                        prev_tool_status.as_deref(),
+                        current_tool_line.as_deref(),
+                        &full_response,
+                    );
                     let Some(plan) =
                         super::formatting::plan_streaming_rollover(current_portion, &status_block)
                     else {
@@ -4290,18 +4407,18 @@ pub(super) fn spawn_turn_bridge(
 
                 let current_portion =
                     response_portion_after_offset(&full_response, response_sent_offset);
-                let status_block = if shared_owned.status_panel_v2_enabled {
-                    super::formatting::build_processing_status_block(indicator)
-                } else {
-                    super::formatting::build_placeholder_status_block(
-                        indicator,
-                        prev_tool_status.as_deref(),
-                        current_tool_line.as_deref(),
-                        &full_response,
-                    )
-                };
+                let status_block = build_bridge_single_message_panel_status_block(
+                    shared_owned.as_ref(),
+                    channel_id,
+                    &provider,
+                    status_panel_started_at,
+                    indicator,
+                    prev_tool_status.as_deref(),
+                    current_tool_line.as_deref(),
+                    &full_response,
+                );
                 let stable_display_text = build_turn_bridge_streaming_edit_text(
-                    shared_owned.status_panel_v2_enabled,
+                    shared_owned.ui.status_panel_v2_enabled,
                     current_portion,
                     &status_block,
                     &provider,
@@ -4331,13 +4448,13 @@ pub(super) fn spawn_turn_bridge(
                 }
             }
 
-            if shared_owned.placeholder_live_events_enabled
+            if shared_owned.ui.placeholder_live_events_enabled
                 && watcher_owns_assistant_relay
                 && let Some((key, input, _, _)) = long_running_placeholder_active.as_ref()
-                && let Some(block) = shared_owned.placeholder_live_events.render_block(channel_id)
+                && let Some(block) = shared_owned.ui.placeholder_live_events.render_block(channel_id)
             {
                 let outcome = shared_owned
-                    .placeholder_controller
+                    .ui.placeholder_controller
                     .ensure_active_with_live_events(
                         gateway.as_ref(),
                         key.clone(),
@@ -4433,7 +4550,7 @@ pub(super) fn spawn_turn_bridge(
                                 .as_ref()
                                 .is_some_and(|(active_key, _, _, _)| *active_key == old_key);
                             if active_still_matches_old_key {
-                                shared_owned.placeholder_controller.detach(&old_key);
+                                shared_owned.ui.placeholder_controller.detach(&old_key);
                                 let outcome = ensure_active_placeholder_card(
                                     shared_owned.as_ref(),
                                     gateway.as_ref(),
@@ -4539,7 +4656,7 @@ pub(super) fn spawn_turn_bridge(
                 && let Some((key, _, _, _)) = long_running_placeholder_active.take()
             {
                 let _ = pending_long_running_retarget_after_state_save.take();
-                shared_owned.placeholder_controller.detach(&key);
+                shared_owned.ui.placeholder_controller.detach(&key);
                 inflight_state.long_running_placeholder_active = false;
                 let _ = save_inflight_state(&inflight_state);
             }
@@ -4556,11 +4673,11 @@ pub(super) fn spawn_turn_bridge(
                     .is_some_and(|(pending_key, _, _, _, _)| *pending_key == key);
                 if pending_retarget_matches_key {
                     let _ = pending_long_running_retarget_after_state_save.take();
-                    shared_owned.placeholder_controller.detach(&key);
+                    shared_owned.ui.placeholder_controller.detach(&key);
                     inflight_state.long_running_placeholder_active = false;
                 } else {
                     let outcome = shared_owned
-                        .placeholder_controller
+                        .ui.placeholder_controller
                         .transition(gateway.as_ref(), key, target)
                         .await;
                     // codex round-10 P2: keep the persisted flag on EditFailed so
@@ -4752,10 +4869,10 @@ pub(super) fn spawn_turn_bridge(
         // Mark this turn as finalizing — deferred restart must wait until we finish
         // sending the Discord response and cleaning up state.
         shared_owned
-            .finalizing_turns
+            .restart.finalizing_turns
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         shared_owned
-            .global_finalizing
+            .restart.global_finalizing
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // #2293/#2780 — hoist the TUI completion gate BEFORE the visible
         // completion/status cleanup so we can still suppress `응답 완료` when
@@ -4856,7 +4973,7 @@ pub(super) fn spawn_turn_bridge(
             // phase-5b2).
             let handoff_recorded = shared_owned
                 .turn_finalizer
-                .has_live_watcher_pending(channel_id, shared_owned.current_generation)
+                .has_live_watcher_pending(channel_id, shared_owned.restart.current_generation)
                 .await;
             record_turn_bridge_invariant(
                 handoff_recorded,
@@ -4900,7 +5017,7 @@ pub(super) fn spawn_turn_bridge(
                             // terminal that `turn_finalizer` already supports
                             // (recovery/orphan path) instead of panicking.
                             user_msg_id.map(|id| id.get()).unwrap_or(0),
-                            shared_owned.current_generation,
+                            shared_owned.restart.current_generation,
                         ),
                         provider.clone(),
                         if cancelled {
@@ -4991,7 +5108,7 @@ pub(super) fn spawn_turn_bridge(
                         // user_msg_id == 0 → channel-only terminal key, which
                         // turn_finalizer already supports (recovery/orphan path).
                         user_msg_id.map(|id| id.get()).unwrap_or(0),
-                        shared_owned.current_generation,
+                        shared_owned.restart.current_generation,
                     ),
                     provider.clone(),
                     if cancelled {
@@ -5073,9 +5190,9 @@ pub(super) fn spawn_turn_bridge(
         // resurrecting. When the holder FAILS (does not clear), the row is still
         // present + matching, so the bridge refreshes it and retry survives.
         let mut bridge_skip_holder_owns_inflight = false;
-        let mut terminal_delivery_committed = false;
-        let mut terminal_body_visible = false;
+        let (mut terminal_delivery_committed, mut terminal_body_visible) = (false, false);
         let mut status_panel_terminal_committed = false;
+        let mut completion_footer_terminal_text: Option<String> = None;
         // #2161 (Codex round-2 H1): hoisted into the outer scope so the
         // bridge can run the TUI completion gate BEFORE dispatch completion
         // and reuse the same outcome for the visible status-panel emit
@@ -5169,12 +5286,12 @@ pub(super) fn spawn_turn_bridge(
                     .is_some_and(|(pending_key, _, _, _, _)| *pending_key == key);
                 if pending_retarget_matches_key {
                     let _ = pending_long_running_retarget_after_state_save.take();
-                    shared_owned.placeholder_controller.detach(&key);
+                    shared_owned.ui.placeholder_controller.detach(&key);
                     inflight_state.long_running_placeholder_active = false;
                     let _ = save_inflight_state(&inflight_state);
                 } else {
                     let outcome = shared_owned
-                        .placeholder_controller
+                        .ui.placeholder_controller
                         .transition(
                             gateway.as_ref(),
                             key.clone(),
@@ -5267,7 +5384,7 @@ pub(super) fn spawn_turn_bridge(
             } else if remaining_response.trim().is_empty() {
                 "[Stopped]".to_string()
             } else {
-                let formatted = if shared_owned.status_panel_v2_enabled {
+                let formatted = if shared_owned.ui.status_panel_v2_enabled {
                     super::formatting::format_for_discord_with_status_panel(
                         remaining_response,
                         &provider,
@@ -5301,7 +5418,7 @@ pub(super) fn spawn_turn_bridge(
                 super::turn_finalizer::TurnKey::new(
                     watcher_owner_channel_id,
                     inflight_state.user_msg_id,
-                    shared_owned.current_generation,
+                    shared_owned.restart.current_generation,
                 ),
                 inflight_state.turn_start_offset.unwrap_or(0),
                 tmux_last_offset,
@@ -5400,7 +5517,7 @@ pub(super) fn spawn_turn_bridge(
                 super::turn_finalizer::TurnKey::new(
                     watcher_owner_channel_id,
                     inflight_state.user_msg_id,
-                    shared_owned.current_generation,
+                    shared_owned.restart.current_generation,
                 ),
                 inflight_state.turn_start_offset.unwrap_or(0),
                 tmux_last_offset,
@@ -5475,7 +5592,7 @@ pub(super) fn spawn_turn_bridge(
                         channel_id
                     );
                     if should_delete_bridge_created_watcher_orphan_response(
-                        shared_owned.status_panel_v2_enabled,
+                        shared_owned.ui.status_panel_v2_enabled,
                         watcher_handoff_claim_outcome,
                         bridge_created_response_placeholder_msg_id,
                         current_msg_id,
@@ -5831,7 +5948,7 @@ pub(super) fn spawn_turn_bridge(
                     super::turn_finalizer::TurnKey::new(
                         watcher_owner_channel_id,
                         inflight_state.user_msg_id,
-                        shared_owned.current_generation,
+                        shared_owned.restart.current_generation,
                     ),
                     inflight_state.turn_start_offset.unwrap_or(0),
                     tmux_last_offset,
@@ -5892,7 +6009,7 @@ pub(super) fn spawn_turn_bridge(
                     terminal_body_visible = true;
                 }
             } else {
-                delivery_response = if shared_owned.status_panel_v2_enabled {
+                delivery_response = if shared_owned.ui.status_panel_v2_enabled {
                     super::formatting::format_for_discord_with_status_panel(
                         &delivery_response,
                         &provider,
@@ -5923,7 +6040,7 @@ pub(super) fn spawn_turn_bridge(
                             super::turn_finalizer::TurnKey::new(
                                 watcher_owner_channel_id,
                                 inflight_state.user_msg_id,
-                                shared_owned.current_generation,
+                                shared_owned.restart.current_generation,
                             ),
                             inflight_state.turn_start_offset.unwrap_or(0),
                             tmux_last_offset,
@@ -5965,6 +6082,10 @@ pub(super) fn spawn_turn_bridge(
                                 Ok(_) => {
                                     terminal_delivery_committed = true;
                                     terminal_body_visible = true;
+                                    if single_message_panel_footer_mode {
+                                        completion_footer_terminal_text =
+                                            Some(delivery_response.clone());
+                                    }
                                     response_sent_offset = full_response.len();
                                     inflight_state.response_sent_offset = response_sent_offset;
                                     // B6 (codex P1-b): advance ONLY via a successful
@@ -6016,7 +6137,7 @@ pub(super) fn spawn_turn_bridge(
                             super::turn_finalizer::TurnKey::new(
                                 watcher_owner_channel_id,
                                 inflight_state.user_msg_id,
-                                shared_owned.current_generation,
+                                shared_owned.restart.current_generation,
                             ),
                             inflight_state.turn_start_offset.unwrap_or(0),
                             tmux_last_offset,
@@ -6105,6 +6226,10 @@ pub(super) fn spawn_turn_bridge(
                                 if outcome {
                                     terminal_delivery_committed = true;
                                     terminal_body_visible = true;
+                                    if single_message_panel_footer_mode {
+                                        completion_footer_terminal_text =
+                                            Some(delivery_response.clone());
+                                    }
                                 } else {
                                     preserve_inflight_for_cleanup_retry = true;
                                     if fallback_delivered {
@@ -6448,7 +6573,11 @@ pub(super) fn spawn_turn_bridge(
         }
 
         let mut status_panel_completion_committed = true;
-        if status_panel_terminal_committed && bridge_should_emit_completion {
+        if status_panel_terminal_committed
+            && bridge_should_emit_completion
+            && (single_message_panel_footer_mode
+                || bridge_should_complete_separate_status_panel(shared_owned.ui.status_panel_v2_enabled))
+        {
             // #2849: before rendering the completed panel, backfill exact final
             // context usage when the live StatusUpdates never carried it (e.g.
             // silent/background turns). resolve_exact_completion_usage prefers
@@ -6457,7 +6586,7 @@ pub(super) fn spawn_turn_bridge(
             // usage exists — so we never fabricate or reuse stale numbers.
             // set_context_panel_usage is a no-op when the live path already set
             // the same values, and is gated to context_window_tokens != 0.
-            if shared_owned.status_panel_v2_enabled {
+            if shared_owned.ui.status_panel_v2_enabled {
                 let context_provider_session_id = new_raw_provider_session_id
                     .as_deref()
                     .or(new_session_id.as_deref())
@@ -6473,7 +6602,7 @@ pub(super) fn spawn_turn_bridge(
                     context_provider_session_id,
                     accumulated_usage,
                 ) {
-                    shared_owned.placeholder_live_events.set_context_panel_usage(
+                    shared_owned.ui.placeholder_live_events.set_context_panel_usage(
                         channel_id,
                         context_provider_session_id,
                         usage.input_tokens,
@@ -6484,58 +6613,25 @@ pub(super) fn spawn_turn_bridge(
                     );
                 }
             }
-            // #3161 (follow-up to #3142): re-read the CURRENT on-disk inflight
-            // and skip the panel EDIT when a NEWER turn now owns this turn's
-            // captured `status_panel_msg_id`. The bridge captured the panel id
-            // from this turn's pinned snapshot at turn start; a follow-up turn on
-            // the same channel can re-adopt that panel between start and
-            // completion, so editing it with our `응답 완료` text would alias the
-            // newer turn's live panel (the sibling of the watcher committed-output
-            // status-panel gate). Identity-based here because the bridge is
-            // turn-pinned by `user_msg_id`, not by a committed offset range. The
-            // gate keys off concrete newer-owner evidence and leaves the in-range
-            // id==0 case completing normally — see the predicate doc.
-            let this_turn_user_msg_id = user_msg_id.map(|id| id.get()).unwrap_or(0);
-            let panel_edit_aliases_newer_turn =
-                match super::inflight::load_inflight_state(&provider, channel_id.get()) {
-                    Some(on_disk) => status_panel_completion_edit_aliases_newer_turn(
-                        this_turn_user_msg_id,
-                        status_panel_msg_id,
-                        on_disk.user_msg_id,
-                        on_disk.status_message_id,
-                    ),
-                    None => false,
-                };
-            if panel_edit_aliases_newer_turn {
-                tracing::debug!(
-                    "[turn_bridge] skipping status-panel-v2 completion edit of msg {:?} in channel {}: a newer turn now owns the panel (this turn user_msg_id {})",
-                    status_panel_msg_id,
-                    channel_id,
-                    this_turn_user_msg_id
-                );
-                // The newer turn owns the panel; this turn's panel-completion
-                // step is a no-op success (its response was already delivered),
-                // so downstream session-status posting still proceeds.
-                status_panel_completion_committed = true;
-            } else {
-                // #2161 (Codex H1): the bridge-owned delivery path runs the
-                // gate ABOVE so it can also block dispatch completion on
-                // TimedOut. Here we just reuse the outcome and skip the
-                // visible `응답 완료` if the pane was still busy.
-                status_panel_completion_committed = complete_status_panel_v2(
+            let indicator = super::single_message_panel::single_message_panel_spinner_frame(
+                spin_idx,
+            );
+            status_panel_completion_committed =
+                complete_bridge_terminal_footer_or_status_panel(
                     shared_owned.as_ref(),
                     gateway.as_ref(),
                     channel_id,
+                    current_msg_id,
+                    user_msg_id,
                     status_panel_msg_id,
                     &provider,
                     status_panel_started_at,
                     &mut last_status_panel_text,
-                    false,
-                    "turn_terminal_delivery",
-                    this_turn_user_msg_id,
+                    single_message_panel_footer_mode,
+                    completion_footer_terminal_text.as_deref(),
+                    indicator,
                 )
                 .await;
-            }
         }
 
         if status_panel_terminal_committed
@@ -7284,10 +7380,10 @@ pub(super) fn spawn_turn_bridge(
 
         // Finalization complete — decrement counters
         shared_owned
-            .finalizing_turns
+            .restart.finalizing_turns
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         shared_owned
-            .global_finalizing
+            .restart.global_finalizing
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // Note: deferred restart exit is handled by the 5-second poll loop in mod.rs,
         // which saves pending queues before calling check_deferred_restart.
@@ -7303,7 +7399,7 @@ pub(super) fn spawn_turn_bridge(
                     channel_id
                 );
             } else if shared_owned
-                .restart_pending
+                .restart.restart_pending
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 let ts = chrono::Local::now().format("%H:%M:%S");

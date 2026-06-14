@@ -55,6 +55,7 @@ fn deferred_idle_queue_initial_presleep(immediate_once: bool) -> std::time::Dura
 impl Drop for DeferredHookBacklogGuard {
     fn drop(&mut self) {
         self.shared
+            .restart
             .deferred_hook_backlog
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -95,6 +96,7 @@ fn schedule_deferred_idle_queue_kickoff_inner(
     immediate_once: bool,
 ) {
     shared
+        .restart
         .deferred_hook_backlog
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     super::task_supervisor::spawn_observed("deferred_idle_queue_kickoff", async move {
@@ -113,8 +115,8 @@ fn schedule_deferred_idle_queue_kickoff_inner(
         let mut consecutive_zero_start_drains = 0usize;
         for attempt in 1..=DEFERRED_IDLE_QUEUE_KICKOFF_MAX_ATTEMPTS {
             if let (Some(ctx), Some(tok)) = (
-                shared.cached_serenity_ctx.get(),
-                shared.cached_bot_token.get(),
+                shared.http.cached_serenity_ctx.get(),
+                shared.http.cached_bot_token.get(),
             ) {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
