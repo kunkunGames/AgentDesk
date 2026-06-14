@@ -79,7 +79,7 @@
 | `src/services/discord/mod.rs` | 4981 |
 | `src/services/discord/recovery_engine.rs` | 4083 |
 | `src/services/discord/router/intake_gate.rs` | 2969 |
-| `src/services/discord/router/message_handler/headless_turn.rs` | 1434 |
+| `src/services/discord/router/message_handler/headless_turn.rs` | 1359 |
 | `src/services/discord/router/message_handler/intake_turn.rs` | 3807 |
 | `src/services/discord/session_runtime.rs` | 1753 |
 | `src/services/discord/tmux.rs` | 2050 |

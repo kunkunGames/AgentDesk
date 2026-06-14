@@ -44,6 +44,7 @@ mod attachments;
 mod control;
 mod goal_lifecycle;
 mod headless_turn;
+mod headless_turn_routine;
 mod intake_turn;
 mod provider_isolation;
 mod tui_followup;
