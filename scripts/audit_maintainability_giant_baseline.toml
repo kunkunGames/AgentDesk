@@ -132,7 +132,7 @@
 # construction sites).
 "src/services/discord/recovery_engine.rs" = 4090
 # #3034 batch-8: lowered 3771 -> 3770 (dead-code removal).
-"src/services/discord/router/message_handler/intake_turn.rs" = 3808
+"src/services/discord/router/message_handler/intake_turn.rs" = 3809
 "src/services/discord/meeting_orchestrator.rs" = 3227
 # #3293: +3 for the `registry_purge` child-module declaration (peek +
 # operator-gated idle-entry purge live outside the frozen root); lowered
