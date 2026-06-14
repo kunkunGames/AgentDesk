@@ -287,4 +287,4 @@
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:117` | `src/server/routes/domains/admin.rs:68` |
 | `POST` | `/tui/send` | `handle_send` | `src/services/claude_tui/tui_relay.rs:160` | `src/services/claude_tui/tui_relay.rs:156` |
 | `POST` | `/tui/wait` | `handle_wait` | `src/services/claude_tui/tui_relay.rs:230` | `src/services/claude_tui/tui_relay.rs:157` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:24` | `src/server/mod.rs:421` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:24` | `src/server/mod.rs:430` |
