@@ -420,8 +420,10 @@ fn infer_effective_completion_result(
     let res = result?;
     context_text
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|ctx| ctx.get("phase_gate").and_then(|v| v.as_object()).cloned())
-        .and_then(|phase_gate_ctx| infer_phase_gate_verdict(dispatch_id, &phase_gate_ctx, res))
+        .and_then(|ctx| {
+            let phase_gate_ctx = ctx.get("phase_gate")?.as_object()?;
+            infer_phase_gate_verdict(dispatch_id, phase_gate_ctx, res)
+        })
 }
 
 /// Pure decision describing which transition side effects the durable write
