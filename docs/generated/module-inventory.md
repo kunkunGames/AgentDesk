@@ -399,7 +399,7 @@
 | `services::discord::commands::restart` | `src/services/discord/commands/restart.rs` | 242 | 242 | 0 |  |
 | `services::discord::commands::session` | `src/services/discord/commands/session.rs` | 253 | 253 | 0 |  |
 | `services::discord::commands::skill` | `src/services/discord/commands/skill.rs` | 401 | 401 | 0 |  |
-| `services::discord::commands::steer` | `src/services/discord/commands/steer.rs` | 85 | 85 | 0 |  |
+| `services::discord::commands::steer` | `src/services/discord/commands/steer.rs` | 146 | 146 | 0 |  |
 | `services::discord::commands::text_commands` | `src/services/discord/commands/text_commands.rs` | 1490 | 1490 | 0 | giant-file |
 | `services::discord::commands::tui_passthrough` | `src/services/discord/commands/tui_passthrough.rs` | 379 | 340 | 39 |  |
 | `services::discord::commands::voice` | `src/services/discord/commands/voice.rs` | 1003 | 959 | 44 |  |
@@ -494,7 +494,7 @@
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 21 | 21 | 0 |  |
 | `services::discord::router::authorization` | `src/services/discord/router/authorization.rs` | 48 | 48 | 0 |  |
 | `services::discord::router::dispatch_trigger` | `src/services/discord/router/dispatch_trigger.rs` | 203 | 143 | 60 |  |
-| `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 3473 | 2969 | 504 | giant-file |
+| `services::discord::router::intake_gate` | `src/services/discord/router/intake_gate.rs` | 3479 | 2975 | 504 | giant-file |
 | `services::discord::router::message_handler` | `src/services/discord/router/message_handler.rs` | 73 | 73 | 0 |  |
 | `services::discord::router::message_handler::attachments` | `src/services/discord/router/message_handler/attachments.rs` | 142 | 114 | 28 |  |
 | `services::discord::router::message_handler::control` | `src/services/discord/router/message_handler/control.rs` | 149 | 149 | 0 |  |
@@ -543,7 +543,7 @@
 | `services::discord::startup_reclaim` | `src/services/discord/startup_reclaim.rs` | 541 | 324 | 217 |  |
 | `services::discord::status_panel_controller` | `src/services/discord/status_panel_controller.rs` | 1386 | 907 | 479 |  |
 | `services::discord::status_panel_orphan_store` | `src/services/discord/status_panel_orphan_store.rs` | 634 | 426 | 208 |  |
-| `services::discord::steering` | `src/services/discord/steering.rs` | 213 | 143 | 70 |  |
+| `services::discord::steering` | `src/services/discord/steering.rs` | 443 | 328 | 115 |  |
 | `services::discord::streaming_finalizer` | `src/services/discord/streaming_finalizer.rs` | 251 | 187 | 64 |  |
 | `services::discord::task_supervisor` | `src/services/discord/task_supervisor.rs` | 105 | 83 | 22 |  |
 | `services::discord::tmux` | `src/services/discord/tmux.rs` | 2652 | 2050 | 602 | giant-file |
