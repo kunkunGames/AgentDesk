@@ -721,7 +721,7 @@
     force-clean watcher-respawn follow-through + always-run cross-tick
     retry/dead-man (P1-a: no early return on zero candidates), delegating the
     new behaviour to `health/watcher_respawn.rs`).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3809 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3807 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -733,7 +733,7 @@
     #3038 S1 mechanical `.queued_placeholders` -> `.queued.queued_placeholders`
     re-wire after lifting cluster C into `QueuedPlaceholderState`; -2 from #3038
     S4 mechanical placeholder/status-panel `.ui` rewiring).
-  - `src/services/discord/router/message_handler/headless_turn.rs` (1316 lines;
+  - `src/services/discord/router/message_handler/headless_turn.rs` (1434 lines;
     headless Discord turn launch/terminal-response path split from the router
     message handler; bugfix only outside a further extraction plan).
   - `src/services/discord/meeting_orchestrator.rs` (3222 lines after #3034
@@ -805,7 +805,7 @@
     was removed from `giant_file_registry.toml`; #3038 S5 locked the final
     root ratchet at 274 production lines).
   - `src/services/discord/session_runtime.rs` (1753 lines).
-  - `src/services/discord/voice_barge_in.rs` (2823 lines after #3038
+  - `src/services/discord/voice_barge_in.rs` (2813 lines after #3038
     VoiceBargeInRuntime S1 moved the STT method cluster to
     `src/services/discord/voice_barge_in/stt.rs` (314 production lines) and
     S2 moved the progress playback method cluster to
@@ -929,7 +929,7 @@
 - do_not_edit_without_migration_plan (giant-file):
   - `src/cli/migrate.rs` is the retired postgres-cutover facade (now below the
     giant-file threshold; bugfix only).
-  - `src/cli/doctor/orchestrator.rs` (4375 lines).
+  - `src/cli/doctor/orchestrator.rs` (4376 lines).
   - `src/cli/migrate/apply.rs` (3230 lines).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
@@ -953,8 +953,8 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2280 lines).
-  - `src/server/mod.rs` (2413 lines; this includes both axum bootstrapping
+  - `src/config.rs` (2320 lines).
+  - `src/server/mod.rs` (2430 lines; this includes both axum bootstrapping
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1488 lines).
   - `src/reconcile.rs` (1818 lines; periodic reconcile loop covering stale
@@ -1032,7 +1032,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
 - `src/services/dispatches/outbox_route.rs` (1089) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
-- `src/services/claude.rs` (2948), `src/services/gemini.rs` (1358),
+- `src/services/claude.rs` (2963), `src/services/gemini.rs` (1358),
   `src/services/qwen.rs` (2196), `src/services/codex.rs` (3002),
   `src/services/opencode.rs` (1886), `src/services/provider.rs` (1818) —
   provider adapters. (#3034 removed dead non-cancel `execute_command_simple*`
@@ -1059,11 +1059,11 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   separator unified across the streamed `StreamMessage::Text` surface and the
   `final_text` assembly (one shared `push_message_text` boundary writer; the
   newline witness is the single source of truth so the two surfaces mirror).
-- `src/services/codex_tui/input.rs` (1350) — Codex TUI input readiness
+- `src/services/codex_tui/input.rs` (1366) — Codex TUI input readiness
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
   non-bugfix behavior beyond the readiness/cancel contract.
-- `src/services/claude_tui/input.rs` (1390) — Claude TUI input readiness
+- `src/services/claude_tui/input.rs` (1540) — Claude TUI input readiness
   detector, prompt delivery, and cancellation/offset handoff surface. Treat as
   giant-file territory; split before adding non-bugfix behavior beyond the
   readiness/cancel contract.
