@@ -21,16 +21,16 @@
 | `GET` | `/api/agents/{id}/cron` | `cron_api::agent_cron_jobs` | `src/server/routes/cron_api.rs:174` | `src/server/routes/domains/agents.rs:39` |
 | `GET` | `/api/agents/{id}/dispatched-sessions` | `agents::agent_dispatched_sessions` | `src/server/routes/agents.rs:484` | `src/server/routes/domains/agents.rs:41` |
 | `POST` | `/api/agents/{id}/duplicate` | `agents_crud::duplicate_agent` | `src/server/routes/agents_crud.rs:1620` | `src/server/routes/domains/agents.rs:35` |
-| `POST` | `/api/agents/{id}/message` | `agents::agent_message` | `src/server/routes/agents.rs:996` | `src/server/routes/domains/agents.rs:38` |
+| `POST` | `/api/agents/{id}/message` | `agents::agent_message` | `src/server/routes/agents.rs:1023` | `src/server/routes/domains/agents.rs:38` |
 | `GET` | `/api/agents/{id}/offices` | `agents::agent_offices` | `src/server/routes/agents.rs:405` | `src/server/routes/domains/agents.rs:36` |
 | `GET` | `/api/agents/{id}/quality` | `agents::agent_quality` | `src/server/routes/agents.rs:106` | `src/server/routes/domains/agents.rs:32` |
-| `POST` | `/api/agents/{id}/signal` | `agents::agent_signal` | `src/server/routes/agents.rs:955` | `src/server/routes/domains/agents.rs:37` |
+| `POST` | `/api/agents/{id}/signal` | `agents::agent_signal` | `src/server/routes/agents.rs:982` | `src/server/routes/domains/agents.rs:37` |
 | `GET` | `/api/agents/{id}/skills` | `agents::agent_skills` | `src/server/routes/agents.rs:441` | `src/server/routes/domains/agents.rs:40` |
-| `GET` | `/api/agents/{id}/timeline` | `agents::agent_timeline` | `src/server/routes/agents.rs:887` | `src/server/routes/domains/agents.rs:49` |
-| `GET` | `/api/agents/{id}/transcripts` | `agents::agent_transcripts` | `src/server/routes/agents.rs:914` | `src/server/routes/domains/agents.rs:48` |
+| `GET` | `/api/agents/{id}/timeline` | `agents::agent_timeline` | `src/server/routes/agents.rs:914` | `src/server/routes/domains/agents.rs:49` |
+| `GET` | `/api/agents/{id}/transcripts` | `agents::agent_transcripts` | `src/server/routes/agents.rs:941` | `src/server/routes/domains/agents.rs:48` |
 | `GET` | `/api/agents/{id}/turn` | `agents::agent_turn` | `src/server/routes/agents.rs:510` | `src/server/routes/domains/agents.rs:45` |
 | `POST` | `/api/agents/{id}/turn/start` | `agents::start_agent_turn` | `src/server/routes/agents.rs:531` | `src/server/routes/domains/agents.rs:46` |
-| `POST` | `/api/agents/{id}/turn/stop` | `agents::stop_agent_turn` | `src/server/routes/agents.rs:794` | `src/server/routes/domains/agents.rs:47` |
+| `POST` | `/api/agents/{id}/turn/stop` | `agents::stop_agent_turn` | `src/server/routes/agents.rs:821` | `src/server/routes/domains/agents.rs:47` |
 | `POST` | `/api/agents/{id}/unarchive` | `agents_crud::unarchive_agent` | `src/server/routes/agents_crud.rs:1485` | `src/server/routes/domains/agents.rs:34` |
 | `GET` | `/api/analytics` | `analytics::analytics` | `src/server/routes/analytics.rs:267` | `src/server/routes/domains/admin.rs:76` |
 | `GET` | `/api/analytics/invariants` | `analytics::invariants` | `src/server/routes/analytics.rs:372` | `src/server/routes/domains/admin.rs:77` |
@@ -287,4 +287,4 @@
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:117` | `src/server/routes/domains/admin.rs:68` |
 | `POST` | `/tui/send` | `handle_send` | `src/services/claude_tui/tui_relay.rs:160` | `src/services/claude_tui/tui_relay.rs:156` |
 | `POST` | `/tui/wait` | `handle_wait` | `src/services/claude_tui/tui_relay.rs:230` | `src/services/claude_tui/tui_relay.rs:157` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:24` | `src/server/mod.rs:421` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:24` | `src/server/mod.rs:430` |
