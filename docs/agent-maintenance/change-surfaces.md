@@ -721,7 +721,11 @@
     force-clean watcher-respawn follow-through + always-run cross-tick
     retry/dead-man (P1-a: no early return on zero candidates), delegating the
     new behaviour to `health/watcher_respawn.rs`).
+<<<<<<< HEAD
   - `src/services/discord/router/message_handler/intake_turn.rs` (3807 lines;
+=======
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3809 lines;
+>>>>>>> origin/main
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
