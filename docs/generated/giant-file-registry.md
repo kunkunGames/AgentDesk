@@ -16,7 +16,7 @@
 | `src/services/discord/session_relay_sink.rs` | 1731 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/turn_bridge/mod.rs` | 6811 | discord-relay | 2026-08-31 | #3038 |
 | `src/services/discord/turn_finalizer.rs` | 1528 | discord-finalizer | 2026-08-31 | #3016 |
-| `src/services/discord/voice_barge_in.rs` | 2823 | voice-runtime | 2026-08-31 | #3405 |
+| `src/services/discord/voice_barge_in.rs` | 2813 | voice-runtime | 2026-08-31 | #3405 |
 | `src/voice/announce_meta.rs` | 1001 | voice-runtime | 2026-08-31 | #3405 |
 
 ## Grandfathered
@@ -34,7 +34,7 @@
 | `src/cli/migrate/plan.rs` | 1513 |
 | `src/cli/migrate/source.rs` | 1612 |
 | `src/cli/provider_cli/mod.rs` | 1039 |
-| `src/config.rs` | 2307 |
+| `src/config.rs` | 2320 |
 | `src/db/auto_queue/entries.rs` | 1508 |
 | `src/db/auto_queue/phase_gates.rs` | 1639 |
 | `src/db/dispatched_sessions.rs` | 1610 |
@@ -65,10 +65,10 @@
 | `src/services/auto_queue/activate_command.rs` | 1354 |
 | `src/services/auto_queue/cancel_run.rs` | 1032 |
 | `src/services/claude.rs` | 2963 |
-| `src/services/claude_tui/input.rs` | 1524 |
+| `src/services/claude_tui/input.rs` | 1540 |
 | `src/services/codex.rs` | 3002 |
 | `src/services/codex_tmux_wrapper.rs` | 1289 |
-| `src/services/codex_tui/input.rs` | 1350 |
+| `src/services/codex_tui/input.rs` | 1366 |
 | `src/services/codex_tui/rollout_tail.rs` | 1776 |
 | `src/services/discord/commands/diagnostics.rs` | 1022 |
 | `src/services/discord/commands/text_commands.rs` | 1490 |
@@ -76,7 +76,7 @@
 | `src/services/discord/health/recovery.rs` | 2634 |
 | `src/services/discord/inflight.rs` | 2523 |
 | `src/services/discord/meeting_orchestrator.rs` | 3222 |
-| `src/services/discord/mod.rs` | 4980 |
+| `src/services/discord/mod.rs` | 4981 |
 | `src/services/discord/recovery_engine.rs` | 4083 |
 | `src/services/discord/router/intake_gate.rs` | 2969 |
 | `src/services/discord/router/message_handler/headless_turn.rs` | 1434 |
