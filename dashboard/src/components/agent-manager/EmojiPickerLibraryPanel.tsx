@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import EmojiPickerReact, {
   EmojiStyle,
   Theme,
@@ -8,30 +9,69 @@ interface EmojiPickerLibraryPanelProps {
   height: number;
   onSelect: (emoji: string) => void;
   width: number;
+  value?: string;
 }
 
 export default function EmojiPickerLibraryPanel({
   height,
   onSelect,
   width,
+  value,
 }: EmojiPickerLibraryPanelProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+
   const handleEmojiClick = (emojiData: EmojiClickData) => {
     onSelect(emojiData.emoji);
   };
 
+  // emoji-picker-react (v4) renders each emoji as `button.epr-emoji` whose
+  // visible text is the native emoji. The library exposes no selected state, so
+  // we mark the current value with `aria-current="true"` for screen readers.
+  // aria-current is used (not aria-selected, which is ignored on an implicit
+  // role=button) so the "current selection in the set" is actually announced.
+  // The match is exact (ignoring the FE0F variation selector) so composed
+  // sequences that merely contain the same codepoint are not tagged.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!value || !container) return;
+
+    const normalize = (text: string) => text.replace(/\uFE0F/g, "").trim();
+    const target = normalize(value);
+
+    const syncSelected = () => {
+      container.querySelectorAll("button.epr-emoji").forEach((button) => {
+        if (normalize(button.textContent ?? "") === target) {
+          button.setAttribute("aria-current", "true");
+        } else {
+          button.removeAttribute("aria-current");
+        }
+      });
+    };
+
+    // Apply once for the emojis already mounted (observers do not replay the
+    // mutations that happened before observe()), then keep in sync as the
+    // library mounts/unmounts buttons during search, scroll and lazy loading.
+    syncSelected();
+    const observer = new MutationObserver(syncSelected);
+    observer.observe(container, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [value]);
+
   return (
-    <EmojiPickerReact
-      autoFocusSearch
-      emojiStyle={EmojiStyle.NATIVE}
-      height={height}
-      lazyLoadEmojis
-      onEmojiClick={handleEmojiClick}
-      previewConfig={{ showPreview: false }}
-      searchClearButtonLabel="Clear emoji search"
-      searchPlaceholder="Search emoji"
-      skinTonesDisabled={false}
-      theme={Theme.DARK}
-      width={width}
-    />
+    <div ref={containerRef}>
+      <EmojiPickerReact
+        autoFocusSearch
+        emojiStyle={EmojiStyle.NATIVE}
+        height={height}
+        lazyLoadEmojis
+        onEmojiClick={handleEmojiClick}
+        previewConfig={{ showPreview: false }}
+        searchClearButtonLabel="Clear emoji search"
+        searchPlaceholder="Search emoji"
+        skinTonesDisabled={false}
+        theme={Theme.DARK}
+        width={width}
+      />
+    </div>
   );
 }
