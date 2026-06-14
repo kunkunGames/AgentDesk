@@ -75,7 +75,7 @@
 | `compat` | `src/compat/mod.rs` | 39 | 39 | 0 |  |
 | `compat::legacy_db_paths` | `src/compat/legacy_db_paths.rs` | 12 | 12 | 0 |  |
 | `compat::legacy_tmp_paths` | `src/compat/legacy_tmp_paths.rs` | 27 | 27 | 0 |  |
-| `config` | `src/config.rs` | 2406 | 2280 | 126 | giant-file |
+| `config` | `src/config.rs` | 2398 | 2272 | 126 | giant-file |
 | `crate` | `src/main.rs` | 7 | 7 | 0 |  |
 | `credential` | `src/credential.rs` | 212 | 59 | 153 |  |
 | `db` | `src/db/mod.rs` | 137 | 137 | 0 |  |
@@ -193,7 +193,7 @@
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 | 396 | 0 |  |
 | `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 144 | 110 | 34 |  |
 | `runtime_layout::skill_sync` | `src/runtime_layout/skill_sync.rs` | 806 | 806 | 0 |  |
-| `server` | `src/server/mod.rs` | 2804 | 2413 | 391 | giant-file |
+| `server` | `src/server/mod.rs` | 2801 | 2410 | 391 | giant-file |
 | `server::cluster` | `src/server/cluster.rs` | 9 | 9 | 0 |  |
 | `server::cluster_session_routing` | `src/server/cluster_session_routing.rs` | 9 | 9 | 0 |  |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 67 | 67 | 0 |  |
@@ -226,7 +226,7 @@
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 10 | 10 | 0 |  |
 | `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 337 | 337 | 0 |  |
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 60 | 60 | 0 |  |
-| `server::routes::docs` | `src/server/routes/docs.rs` | 6340 | 5900 | 440 | giant-file |
+| `server::routes::docs` | `src/server/routes/docs.rs` | 6324 | 5884 | 440 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 | 8 | 0 |  |
 | `server::routes::domains::access` | `src/server/routes/domains/access.rs` | 13 | 13 | 0 |  |
 | `server::routes::domains::admin` | `src/server/routes/domains/admin.rs` | 93 | 93 | 0 |  |
@@ -273,7 +273,7 @@
 | `server::routes::review_verdict::tuning_aggregate` | `src/server/routes/review_verdict/tuning_aggregate.rs` | 469 | 469 | 0 |  |
 | `server::routes::review_verdict::verdict_route` | `src/server/routes/review_verdict/verdict_route.rs` | 561 | 561 | 0 |  |
 | `server::routes::reviews` | `src/server/routes/reviews.rs` | 624 | 624 | 0 |  |
-| `server::routes::routines` | `src/server/routes/routines.rs` | 1037 | 852 | 185 |  |
+| `server::routes::routines` | `src/server/routes/routines.rs` | 932 | 759 | 173 |  |
 | `server::routes::session_activity` | `src/server/routes/session_activity.rs` | 13 | 13 | 0 |  |
 | `server::routes::settings` | `src/server/routes/settings.rs` | 93 | 93 | 0 |  |
 | `server::routes::skill_usage_analytics` | `src/server/routes/skill_usage_analytics.rs` | 425 | 425 | 0 |  |
@@ -684,14 +684,14 @@
 | `services::review_decision` | `src/services/review_decision.rs` | 207 | 207 | 0 |  |
 | `services::routines` | `src/services/routines/mod.rs` | 32 | 32 | 0 |  |
 | `services::routines::action` | `src/services/routines/action.rs` | 330 | 233 | 97 |  |
-| `services::routines::agent_executor` | `src/services/routines/agent_executor.rs` | 2217 | 1877 | 340 | giant-file |
-| `services::routines::discord_log` | `src/services/routines/discord_log.rs` | 1771 | 1389 | 382 | giant-file |
+| `services::routines::agent_executor` | `src/services/routines/agent_executor.rs` | 1568 | 1273 | 295 | giant-file |
+| `services::routines::discord_log` | `src/services/routines/discord_log.rs` | 1670 | 1344 | 326 | giant-file |
 | `services::routines::loader` | `src/services/routines/loader.rs` | 2318 | 670 | 1648 |  |
 | `services::routines::migrated` | `src/services/routines/migrated.rs` | 1286 | 883 | 403 |  |
-| `services::routines::runtime` | `src/services/routines/runtime.rs` | 1013 | 838 | 175 |  |
-| `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 133 | 64 | 69 |  |
-| `services::routines::session_control` | `src/services/routines/session_control.rs` | 1038 | 895 | 143 |  |
-| `services::routines::store` | `src/services/routines/store.rs` | 3726 | 3223 | 503 | giant-file |
+| `services::routines::runtime` | `src/services/routines/runtime.rs` | 1011 | 838 | 173 |  |
+| `services::routines::runtime_config` | `src/services/routines/runtime_config.rs` | 108 | 56 | 52 |  |
+| `services::routines::session_control` | `src/services/routines/session_control.rs` | 1036 | 895 | 141 |  |
+| `services::routines::store` | `src/services/routines/store.rs` | 3500 | 3004 | 496 | giant-file |
 | `services::service_error` | `src/services/service_error.rs` | 1 | 1 | 0 |  |
 | `services::session_activity` | `src/services/session_activity.rs` | 245 | 245 | 0 |  |
 | `services::session_backend` | `src/services/session_backend.rs` | 1361 | 999 | 362 |  |

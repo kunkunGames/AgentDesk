@@ -34,7 +34,7 @@
 | `src/cli/migrate/plan.rs` | 1513 |
 | `src/cli/migrate/source.rs` | 1612 |
 | `src/cli/provider_cli/mod.rs` | 1039 |
-| `src/config.rs` | 2280 |
+| `src/config.rs` | 2272 |
 | `src/db/auto_queue/entries.rs` | 1508 |
 | `src/db/auto_queue/phase_gates.rs` | 1639 |
 | `src/db/dispatched_sessions.rs` | 1610 |
@@ -50,11 +50,11 @@
 | `src/pipeline.rs` | 1314 |
 | `src/receipt.rs` | 1842 |
 | `src/reconcile.rs` | 1818 |
-| `src/server/mod.rs` | 2413 |
+| `src/server/mod.rs` | 2410 |
 | `src/server/routes/agents.rs` | 1032 |
 | `src/server/routes/agents_crud.rs` | 1903 |
 | `src/server/routes/agents_setup.rs` | 1365 |
-| `src/server/routes/docs.rs` | 5900 |
+| `src/server/routes/docs.rs` | 5884 |
 | `src/server/routes/escalation.rs` | 1376 |
 | `src/server/routes/health_api.rs` | 1700 |
 | `src/server/routes/kanban.rs` | 2676 |
@@ -100,9 +100,9 @@
 | `src/services/platform/binary_resolver.rs` | 1221 |
 | `src/services/provider.rs` | 1818 |
 | `src/services/qwen.rs` | 2196 |
-| `src/services/routines/agent_executor.rs` | 1877 |
-| `src/services/routines/discord_log.rs` | 1389 |
-| `src/services/routines/store.rs` | 3223 |
+| `src/services/routines/agent_executor.rs` | 1273 |
+| `src/services/routines/discord_log.rs` | 1344 |
+| `src/services/routines/store.rs` | 3004 |
 | `src/services/settings.rs` | 1007 |
 | `src/services/tui_prompt_dedupe.rs` | 1356 |
 | `src/services/turn_orchestrator.rs` | 3089 |
