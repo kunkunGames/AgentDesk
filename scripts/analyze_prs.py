@@ -54,6 +54,10 @@ for pr in prs:
         print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
     if "duplicate" not in body and "overlap" not in body:
         print("  [!] MISSING OVERLAP CHECK: PR body fails to explicitly mention a 'duplicate' or 'overlap' check.")
+    if "verification" not in body:
+        print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
+    if "skipped checks" not in body:
+        print("  [!] MISSING SKIPPED CHECKS: PR body fails to mention 'skipped checks' with reasons.")
 
     # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
     is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
