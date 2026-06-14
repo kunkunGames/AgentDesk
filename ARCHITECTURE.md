@@ -454,6 +454,7 @@ src/
 │   │   │   │   ├── control.rs
 │   │   │   │   ├── goal_lifecycle.rs
 │   │   │   │   ├── headless_turn.rs
+│   │   │   │   ├── headless_turn_routine.rs
 │   │   │   │   ├── intake_turn.rs
 │   │   │   │   ├── provider_isolation.rs
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
