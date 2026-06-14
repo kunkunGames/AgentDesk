@@ -5,8 +5,13 @@ use url::Url;
 static AUTH_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(authorization\s*:\s*(?:[a-z][a-z0-9._~+/-]*\s+)?)[^\r\n]+").unwrap()
 });
+
+static PRIVATE_KEY_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)-----BEGIN (?:[A-Z\s]+ )?PRIVATE KEY-----(?:.*?)(?:-----END (?:[A-Z\s]+ )?PRIVATE KEY-----)").unwrap()
+});
+
 static ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|DATABASE_URL|API[_-]?KEY)[A-Z0-9_]*\s*=\s*)[^\s]+")
+    Regex::new(r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|DATABASE_URL|API[_-]?KEY|PRIVATE[_-]?KEY)[A-Z0-9_]*\s*=\s*)[^\s]+")
         .unwrap()
 });
 static POSTGRES_DSN_RE: LazyLock<Regex> =
@@ -75,12 +80,14 @@ pub(crate) fn register_common_env_secrets() {
     }
 
     for (key, value) in std::env::vars() {
-        let upper = key.to_ascii_uppercase();
+        let upper = key.replace("-", "_").to_ascii_uppercase();
         if upper.contains("TOKEN")
             || upper.contains("SECRET")
             || upper.contains("PASSWORD")
             || upper.contains("API_KEY")
             || upper.contains("APIKEY")
+            || upper.contains("PRIVATE_KEY")
+            || upper.contains("PRIVATEKEY")
         {
             register_secret_or_dsn(&value);
         }
@@ -91,6 +98,7 @@ pub(crate) fn redact_known_secrets(input: &str) -> String {
     let redacted = POSTGRES_DSN_RE.replace_all(input, |captures: &regex::Captures<'_>| {
         mask_dsn_password(captures.get(0).map(|m| m.as_str()).unwrap_or_default())
     });
+    let redacted = PRIVATE_KEY_BLOCK_RE.replace_all(&redacted, "***");
     let redacted = AUTH_HEADER_RE.replace_all(&redacted, "${1}***");
     let mut redacted = ASSIGNMENT_RE.replace_all(&redacted, "${1}***").into_owned();
     let secrets = match KNOWN_SECRETS.read() {
@@ -127,7 +135,7 @@ mod tests {
     #[test]
     fn redact_known_secrets_masks_bearer_bot_and_assignments() {
         let redacted = redact_known_secrets(
-            "Authorization: Bearer live-token\nAuthorization: Bot discord-token\nAuthorization: Basic dXNlcjpwYXNz\nauthorization: Digest username=\"u\", nonce=\"nonce-secret\"\nDATABASE_URL=postgres://u:p@h/db\nOPENAI_API_KEY=sk-live",
+            "Authorization: Bearer live-token\nAuthorization: Bot discord-token\nAuthorization: Basic dXNlcjpwYXNz\nauthorization: Digest username=\"u\", nonce=\"nonce-secret\"\nDATABASE_URL=postgres://u:p@h/db\nOPENAI_API_KEY=sk-live\nGITHUB_PRIVATE_KEY=gh-priv-key-secret\nPRIVATE_KEY=pk-secret",
         );
 
         assert!(redacted.contains("Authorization: Bearer ***"));
@@ -136,11 +144,15 @@ mod tests {
         assert!(redacted.contains("authorization: Digest ***"));
         assert!(redacted.contains("DATABASE_URL=***"));
         assert!(redacted.contains("OPENAI_API_KEY=***"));
+        assert!(redacted.contains("GITHUB_PRIVATE_KEY=***"));
+        assert!(redacted.contains("PRIVATE_KEY=***"));
         assert!(!redacted.contains("live-token"));
         assert!(!redacted.contains("discord-token"));
         assert!(!redacted.contains("dXNlcjpwYXNz"));
         assert!(!redacted.contains("nonce-secret"));
         assert!(!redacted.contains("sk-live"));
+        assert!(!redacted.contains("gh-priv-key-secret"));
+        assert!(!redacted.contains("pk-secret"));
     }
 
     #[test]
@@ -164,5 +176,14 @@ mod tests {
             Some("pass")
         );
         assert_eq!(dsn_password("https://user:pass@example.test"), None);
+    }
+
+    #[test]
+    fn redact_known_secrets_masks_private_key_blocks() {
+        let redacted = redact_known_secrets(
+            "Some log data\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----\nMore log data",
+        );
+        assert!(redacted.contains("Some log data\n***\nMore log data"));
+        assert!(!redacted.contains("MIIEowIBAAKCAQEA"));
     }
 }

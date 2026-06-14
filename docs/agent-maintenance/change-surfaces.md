@@ -8,7 +8,7 @@
 > [`docs/generated/giant-file-registry.md`](../generated/giant-file-registry.md);
 > the rows below project the operational meaning of each entry.
 >
-> Last refreshed: 2026-06-12 (against #3089 completion-footer slice — `tmux.rs` suppression exposure tests now strip completion-only footer blocks so internal turns still delete cleanly; generated inventory includes the new `placeholder_live_events/completion_footer.rs` renderer module, and round 2 adds idle-animation TTL/failure-eviction/recovery-takeover forget; on top of #3038 run_bot S5 closing pass).
+> Last refreshed: 2026-06-13 (against #3358 round 2 — synthetic-inflight carry-forward now gated on same-generation evidence: `tmux.rs` re-exports the new `committed_frontier_for_current_generation` reader from `tmux_session_files.rs`, which pairs the per-channel committed watermark with the `.generation` mtime wrapper-identity signal so a stale pre-restart frontier cannot clamp a freshly-reset synthetic forward — the content-skip guard; `tui_prompt_relay.rs::synthetic_start_offset_carry_forward` now takes `Option<u64>` where `None` means no clamp. On top of #3089 completion-footer slice — `tmux.rs` suppression exposure tests strip completion-only footer blocks so internal turns still delete cleanly; generated inventory includes `placeholder_live_events/completion_footer.rs`; on top of #3038 run_bot S5 closing pass).
 
 ## Read This First
 
@@ -707,7 +707,7 @@
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2615 lines; health recovery
+  - `src/services/discord/health/recovery.rs` (2634 lines; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests; +88
     from #3169 stall-watchdog jsonl-mtime liveness guard + tests, closing the
@@ -717,8 +717,11 @@
     minting permanent registry entries for non-existent channels; -4 from
     #3360 moving orphan pending-token auto-heal out to
     `health/relay_auto_heal.rs`; #3361 moved positive stall-watchdog liveness
-    guard state/logging to `health/stall_liveness.rs`).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3807 lines;
+    guard state/logging to `health/stall_liveness.rs`; #3410 wired the
+    force-clean watcher-respawn follow-through + always-run cross-tick
+    retry/dead-man (P1-a: no early return on zero candidates), delegating the
+    new behaviour to `health/watcher_respawn.rs`).
+  - `src/services/discord/router/message_handler/intake_turn.rs` (4102 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
@@ -802,7 +805,7 @@
     was removed from `giant_file_registry.toml`; #3038 S5 locked the final
     root ratchet at 274 production lines).
   - `src/services/discord/session_runtime.rs` (1753 lines).
-  - `src/services/discord/voice_barge_in.rs` (3044 lines after #3038
+  - `src/services/discord/voice_barge_in.rs` (2823 lines after #3038
     VoiceBargeInRuntime S1 moved the STT method cluster to
     `src/services/discord/voice_barge_in/stt.rs` (314 production lines) and
     S2 moved the progress playback method cluster to
@@ -816,8 +819,10 @@
     lines), and S6 moved the TTS pipeline cluster to
     `src/services/discord/voice_barge_in/tts_pipeline.rs` (86 production
     lines), and S7 folded the agent-voice routing helper block into
-    `src/services/discord/voice_barge_in/routing.rs` (now 484 production
-    lines);
+    `src/services/discord/voice_barge_in/routing.rs` (now 500 production
+    lines), and S8 moved the foreground decision/parser cluster to
+    `src/services/discord/voice_barge_in/foreground_decision.rs` (214
+    production lines);
     voice STT/TTS, lobby routing, progress mirroring, and barge-in
     orchestration surface; tracked decompose target — see
     `giant-file-registry.md` (owner `voice-runtime`, deadline 2026-08-31,
@@ -1048,9 +1053,12 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `src/services/claude_tui/hosting/` child modules, ratchets claude.rs at 2950
   production LoC, and leaves the #3262 turn-lock machinery in the claude.rs
   root.)
-- `src/services/codex_tui/rollout_tail.rs` (1663) — Codex TUI rollout tail
+- `src/services/codex_tui/rollout_tail.rs` (1776) — Codex TUI rollout tail
   parsing and resume identity surface; split before adding non-bugfix behavior
-  beyond the #2169 session identity fix.
+  beyond the #2169 session identity fix and the #3343 message-boundary
+  separator unified across the streamed `StreamMessage::Text` surface and the
+  `final_text` assembly (one shared `push_message_text` boundary writer; the
+  newline witness is the single source of truth so the two surfaces mirror).
 - `src/services/codex_tui/input.rs` (1350) — Codex TUI input readiness
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
@@ -1111,11 +1119,21 @@ normal test growth is allowed): `src/services/analytics.rs`,
 `src/services/platform/tmux.rs`, `src/services/mcp_config.rs`,
 `src/services/process.rs`, `src/services/discord/tmux_lifecycle.rs`,
 `src/services/qwen_tmux_wrapper.rs`, `src/services/discord/session_relay_sink.rs`,
-`src/services/tui_turn_state.rs`, `src/services/session_backend.rs`,
+`src/services/tui_turn_state.rs`,
 `src/voice/turn_link.rs`, `src/services/discord/commands/config.rs`
 (#3038 S2: 1054 -> 954 after the session-override bookkeeping helpers
 moved verbatim to `discord/shared_state.rs` next to
 `SessionOverrideState`; still ratcheted at 954 in the frozen baseline).
+`src/services/session_backend.rs` left this list in #3344 (997 -> 1023 prod
+LoC after the shared terminal-usage provenance helper) but #3405 brought it
+back under the threshold (1023 -> 393 prod LoC) by splitting two verbatim
+clusters into child modules: the stream-line state machine
+(`StreamLineState`/`TaskStartInfo`, `process_stream_line`, and the synchronous
+envelope parsers) into `src/services/session_backend/stream_line.rs` (568 prod
+LoC), and the #3344 terminal-usage adoption gate plus the analytics re-parser
+(`adopt_terminal_result_usage`, `extract_turn_analytics_from_output*`) into
+`src/services/session_backend/terminal_usage.rs` (106 prod LoC). It is no
+longer registry-tracked (the giant_file_registry.toml entry was removed).
 
 Same rule: `bugfix` only without a split issue.
 
