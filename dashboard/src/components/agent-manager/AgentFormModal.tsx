@@ -314,6 +314,11 @@ export default function AgentFormModal({
                 <EmojiPicker
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
+                  aria-label={
+                    formValues.avatar_emoji
+                      ? t({ ko: `이모지 변경 (현재: ${formValues.avatar_emoji})`, en: `Change emoji (current: ${formValues.avatar_emoji})` })
+                      : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
+                  }
                 />
               </div>
               <div>
