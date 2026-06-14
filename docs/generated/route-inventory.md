@@ -122,10 +122,10 @@
 | `DELETE` | `/api/hook/session/{sessionKey}` | `hooks::disconnect_session` | `src/server/routes/hooks.rs:59` | `src/server/routes/domains/integrations.rs:43` |
 | `POST` | `/api/hook/skill-usage` | `hooks::skill_usage` | `src/server/routes/hooks.rs:42` | `src/server/routes/domains/integrations.rs:42` |
 | `POST` | `/api/inflight/rebind` | `health_api::rebind_inflight_handler` | `src/server/routes/health_api.rs:1405` | `src/server/routes/domains/ops.rs:37` |
-| `GET` | `/api/internal/card-thread` | `dispatches::get_card_thread` | `src/server/routes/dispatches/thread_reuse.rs:145` | `src/server/routes/domains/ops.rs:113` |
+| `GET` | `/api/internal/card-thread` | `dispatches::get_card_thread` | `src/server/routes/dispatches/thread_reuse.rs:163` | `src/server/routes/domains/ops.rs:113` |
 | `POST` | `/api/internal/escalation/emit` | `escalation::emit_escalation` | `src/server/routes/escalation.rs:1370` | `src/server/routes/domains/admin.rs:72` |
 | `POST` | `/api/internal/link-dispatch-thread` | `dispatches::link_dispatch_thread` | `src/server/routes/dispatches/thread_reuse.rs:30` | `src/server/routes/domains/ops.rs:109` |
-| `GET` | `/api/internal/pending-dispatch-for-thread` | `dispatches::get_pending_dispatch_for_thread` | `src/server/routes/dispatches/thread_reuse.rs:279` | `src/server/routes/domains/ops.rs:114` |
+| `GET` | `/api/internal/pending-dispatch-for-thread` | `dispatches::get_pending_dispatch_for_thread` | `src/server/routes/dispatches/thread_reuse.rs:324` | `src/server/routes/domains/ops.rs:114` |
 | `GET` | `/api/kanban-cards` | `kanban::list_cards` | `src/server/routes/kanban.rs:269` | `src/server/routes/domains/kanban.rs:15` |
 | `POST` | `/api/kanban-cards` | `kanban::create_card` | `src/server/routes/kanban.rs:310` | `src/server/routes/domains/kanban.rs:15` |
 | `POST` | `/api/kanban-cards/assign-issue` | `kanban::assign_issue` | `src/server/routes/kanban.rs:1123` | `src/server/routes/domains/kanban.rs:20` |
