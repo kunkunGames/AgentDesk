@@ -145,7 +145,7 @@ export default function AgentFormModal({
               aria-label={tr("스프라이트 번호", "Sprite Number")}
               aria-valuenow={spriteNum || 0}
               aria-valuemin={0}
-              aria-valuetext={spriteNum ? t({ ko: `스프라이트 ${spriteNum}`, en: `Sprite ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.currentTarget !== e.target) {
@@ -316,7 +316,7 @@ export default function AgentFormModal({
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
                   aria-label={
                     formValues.avatar_emoji
-                      ? t({ ko: `이모지 변경 (현재: ${formValues.avatar_emoji})`, en: `Change emoji (current: ${formValues.avatar_emoji})` })
+                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected emoji: ${formValues.avatar_emoji}, change emoji` })
                       : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
                   }
                 />
