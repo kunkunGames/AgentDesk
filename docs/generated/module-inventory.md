@@ -233,7 +233,7 @@
 | `server::routes::dispatches::crud` | `src/server/routes/dispatches/crud.rs` | 1073 | 775 | 298 |  |
 | `server::routes::dispatches::discord_delivery` | `src/server/routes/dispatches/discord_delivery.rs` | 15 | 15 | 0 |  |
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 10 | 10 | 0 |  |
-| `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 337 | 337 | 0 |  |
+| `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 382 | 382 | 0 |  |
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 60 | 60 | 0 |  |
 | `server::routes::docs` | `src/server/routes/docs.rs` | 6340 | 5900 | 440 | giant-file |
 | `server::routes::domains` | `src/server/routes/domains/mod.rs` | 8 | 8 | 0 |  |
