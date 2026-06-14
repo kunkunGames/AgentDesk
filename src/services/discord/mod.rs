@@ -72,7 +72,6 @@ mod single_message_panel;
 mod stall_recovery;
 mod startup_reclaim;
 mod status_panel_orphan_store;
-mod steer_interaction;
 mod steering;
 pub(in crate::services::discord) mod streaming_finalizer;
 pub(in crate::services::discord) mod task_supervisor;

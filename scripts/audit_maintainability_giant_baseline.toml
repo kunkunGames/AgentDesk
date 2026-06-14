@@ -145,7 +145,11 @@
 "src/services/turn_orchestrator.rs" = 3089
 # #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
 # `thread_guard_inflight_is_stale` (#1446 Layer-2 classifier, pinned by tests).
-"src/services/discord/router/intake_gate.rs" = 2969
+# /steer P1.5 (PR #740): +6 for the steer-cancel message-component routing arm
+# in `handle_event` (mirrors the model-picker / idle-recap arms — the dispatch
+# can only live in the root event handler). The cancel handler body itself lives
+# in the non-giant `steering.rs`, not here.
+"src/services/discord/router/intake_gate.rs" = 2975
 "src/services/discord/formatting.rs" = 2802
 # #3038 run_bot S0/S1: lowered 2802 -> 1918 by adding characterization tests and
 # moving restored_state, queued_placeholders, startup_doctor, orphan_recovery,
