@@ -12,7 +12,7 @@ Last refreshed: 2026-06-16 (against `main` @ `8ec7336e32eb6ef89e1143fab2543f2fc6
 > Turn-owned delivery paths can pass a `CancelToken` so post-cancel sends,
 > fallback retries, split chunks, and headless outbox enqueue are suppressed.
 >
-> Last refreshed: 2026-06-14 (against #3461 — `effective_committed_offset` in `outbound/delivery_record.rs` now `#[cfg(unix)]`-gates its tmux generation read with a behavior-preserving `0` fallback on non-unix targets, for cross-platform compile; outbound delivery semantics unchanged on unix).
+> Last refreshed: 2026-06-14 (against PR #3461 unix delivery record compile fallback).
 >
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 
