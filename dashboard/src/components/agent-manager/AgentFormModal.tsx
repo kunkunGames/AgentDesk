@@ -139,10 +139,33 @@ export default function AgentFormModal({
           >
             <div className="space-y-4">
             {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}
-            <div className="flex items-center gap-3" role="group" aria-label={tr("스프라이트 선택기", "Sprite Selector")}>
+            <div
+              className="flex items-center gap-3 rounded focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
+              role="spinbutton"
+              aria-label={tr("스프라이트 번호", "Sprite Number")}
+              aria-valuenow={spriteNum || 0}
+              aria-valuemin={0}
+              aria-valuetext={spriteNum ? t({ ko: `선택된 스프라이트: ${spriteNum}`, en: `Selected sprite: ${spriteNum}` }) : tr("선택 안됨", "Not selected")}
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.currentTarget !== e.target) {
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const next = Math.max(1, spriteNum || 0) + 1;
+                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                } else if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  const next = Math.max(1, (spriteNum || 1) - 1);
+                  setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                }
+              }}
+            >
               <div className="flex flex-col items-center gap-1">
                 <button
                   type="button"
+                  tabIndex={-1}
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
@@ -183,6 +206,7 @@ export default function AgentFormModal({
                 </div>
                 <button
                   type="button"
+                  tabIndex={-1}
                   aria-label={tr("이전 스프라이트", "Previous Sprite")}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors"
                   style={{
@@ -239,10 +263,11 @@ export default function AgentFormModal({
             {/* 로캘 기반 현지 이름 필드 */}
             {locale.startsWith("ko") && (
               <div>
-                <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <label htmlFor="agent-name-ko" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {tr("한글 이름", "Korean Name")}
                 </label>
                 <input
+                  id="agent-name-ko"
                   type="text"
                   {...register("name_ko")}
                   placeholder="도로롱"
@@ -253,10 +278,11 @@ export default function AgentFormModal({
             )}
             {locale.startsWith("ja") && (
               <div>
-                <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <label htmlFor="agent-name-ja" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {t({ ko: "일본어 이름", en: "Japanese Name", ja: "日本語名", zh: "日语名" })}
                 </label>
                 <input
+                  id="agent-name-ja"
                   type="text"
                   {...register("name_ja")}
                   placeholder="ドロロン"
@@ -267,10 +293,11 @@ export default function AgentFormModal({
             )}
             {locale.startsWith("zh") && (
               <div>
-                <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <label htmlFor="agent-name-zh" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {t({ ko: "중국어 이름", en: "Chinese Name", ja: "中国語名", zh: "中文名" })}
                 </label>
                 <input
+                  id="agent-name-zh"
                   type="text"
                   {...register("name_zh")}
                   placeholder="多罗隆"
@@ -287,13 +314,19 @@ export default function AgentFormModal({
                 <EmojiPicker
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
+                  aria-label={
+                    formValues.avatar_emoji
+                      ? t({ ko: `선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, en: `Selected emoji: ${formValues.avatar_emoji}, change emoji` })
+                      : t({ ko: "이모지 선택기 열기", en: "Open emoji picker" })
+                  }
                 />
               </div>
               <div>
-                <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+                <label htmlFor="agent-department" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                   {tr("소속 부서", "Department")}
                 </label>
                 <select
+                  id="agent-department"
                   {...register("department_id")}
                   className={`${inputCls} cursor-pointer`}
                   style={inputStyle}
@@ -319,10 +352,11 @@ export default function AgentFormModal({
             <div className="space-y-4">
             {/* 성격/프롬프트 */}
             <div>
-              <label className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
+              <label htmlFor="agent-personality" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
                 {tr("성격 / 역할 프롬프트", "Personality / Prompt")}
               </label>
               <textarea
+                id="agent-personality"
                 {...register("personality")}
                 rows={6}
                 placeholder={tr("전문 분야나 성격 설명...", "Expertise or personality...")}
