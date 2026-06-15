@@ -756,7 +756,7 @@
     #3038 S1 mechanical `.queued_placeholders` -> `.queued.queued_placeholders`
     re-wire after lifting cluster C into `QueuedPlaceholderState`; -2 from #3038
     S4 mechanical placeholder/status-panel `.ui` rewiring).
-  - `src/services/discord/router/message_handler/headless_turn.rs` (1316 lines;
+  - `src/services/discord/router/message_handler/headless_turn.rs` (1434 lines;
     headless Discord turn launch/terminal-response path split from the router
     message handler; bugfix only outside a further extraction plan).
   - `src/services/discord/meeting_orchestrator.rs` (3222 lines after #3034
@@ -1055,7 +1055,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
 - `src/services/dispatches/outbox_route.rs` (1089) — dispatch outbox route
   support extracted from the route layer; split before adding non-bugfix
   behavior.
-- `src/services/claude.rs` (2948), `src/services/gemini.rs` (1358),
+- `src/services/claude.rs` (2963), `src/services/gemini.rs` (1358),
   `src/services/qwen.rs` (2196), `src/services/codex.rs` (3011),
   `src/services/opencode.rs` (1886), `src/services/provider.rs` (1818) —
   provider adapters. (#3034 removed dead non-cancel `execute_command_simple*`
@@ -1086,7 +1086,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
   non-bugfix behavior beyond the readiness/cancel contract.
-- `src/services/claude_tui/input.rs` (1501) — Claude TUI input readiness
+- `src/services/claude_tui/input.rs` (1540) — Claude TUI input readiness
   detector, prompt delivery, and cancellation/offset handoff surface. Treat as
   giant-file territory; split before adding non-bugfix behavior beyond the
   readiness/cancel contract. (+191 from the #685/#720 reliability fixes:
