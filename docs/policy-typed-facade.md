@@ -31,6 +31,8 @@ Current typed facade entrypoints:
 | `agentdesk.autoQueue` | `updateEntryStatus(entry_id, status, source, opts)` | Updates `auto_queue_entries` status cleanly, logging the transition. |
 | `agentdesk.dispatch` | `create(...)` | Existing typed command, retained as-is. |
 | `agentdesk.kv` | `get/set/delete(...)` | Existing typed KV facade, preferred over `kv_meta` SQL. |
+| `agentdesk.config` | `get(key)` | Reads runtime configuration from `kv_meta` without exposing SQL. |
+| `agentdesk.message` | `queue(target, content, bot?, source?)` | Enqueues a message for async delivery to avoid self-referential HTTP deadlock. |
 
 ## Return Shape Conventions
 
