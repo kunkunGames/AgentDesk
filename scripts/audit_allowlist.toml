@@ -31,11 +31,13 @@ route_srp_violations = [
 # fail the hard gate because they produce different keys.
 direct_discord_sends = [
   "src/services/discord/commands/model_picker.rs#direct_discord_sends:9cf1f42bcb8abe4f",
+  "src/services/discord/commands/skill.rs#direct_discord_sends:1e8d329a7b6eeefe",
+  "src/services/discord/commands/skill.rs#direct_discord_sends:192ce5dcdad6764f",
   "src/services/discord/commands/text_commands.rs#direct_discord_sends:db5444d305a41f96",
   "src/services/discord/commands/text_commands.rs#direct_discord_sends:e1dff75fe79e7d70",
   "src/services/discord/discord_io.rs#direct_discord_sends:2f398342de1e7cd7",
   "src/services/discord/gateway.rs#direct_discord_sends:b61365ed28b915b2",
-  "src/services/discord/gateway.rs#direct_discord_sends:0a20f86f0471df2b",
+  "src/services/discord/gateway.rs#direct_discord_sends:ddb44ff4289daaf5",
   "src/services/discord/gateway.rs#direct_discord_sends:a78022596f453395",
   "src/services/discord/meeting_orchestrator.rs#direct_discord_sends:64c7fa00eace25a9",
   "src/services/discord/meeting_orchestrator.rs#direct_discord_sends:5e0310b8b9e373ff",
@@ -54,9 +56,13 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:edafac97f164fd68",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:b4849c24f5cb7d09",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:1c6f6dcd93167903",
+  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:9b9526b38f0691a8",
   # #3089 S2: existing status-panel-v2 response-placeholder send moved out of
   # turn_bridge/mod.rs into the bridge footer helper while preserving behavior.
-  "src/services/discord/turn_bridge/single_message_footer.rs#direct_discord_sends:d2d9f46d97bfa069",
+  # #3078 PR-5: re-fingerprinted (same `gateway.send_message` placeholder call;
+  # context hash shifted only by the added `shared`/`provider` params + the new
+  # `shadow_register_bridge_panel` helper above it — no new direct send).
+  "src/services/discord/turn_bridge/single_message_footer.rs#direct_discord_sends:28b96a6bc14411ce",
   # #3038 turn_bridge S1: status-panel completion direct gateway calls moved
   # verbatim from turn_bridge/mod.rs to turn_bridge/status_panel.rs.
   "src/services/discord/turn_bridge/status_panel.rs#direct_discord_sends:8806b21b9432ae8a",

@@ -15,6 +15,7 @@ use super::*;
 
 use crate::services::discord::gateway::TurnGateway;
 use crate::services::discord::inflight::RelayOwnerKind;
+use crate::services::discord::outbound::delivery_record as dr;
 use crate::services::discord::outbound::turn_output_controller as toc;
 use crate::services::discord::placeholder_controller::{PlaceholderKey, PlaceholderLifecycle};
 use crate::services::discord::turn_finalizer::TurnKey;
@@ -327,6 +328,15 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
     )
     .await;
 
+    // #3089 B2a: shadow-mirror durable delivered frontier — flag-gated, observe-only, Delivered-only (I2), OFF=no-op. Extends B1's sink coverage to the watcher (A4) before B2b's authority flip.
+    dr::shadow_mirror_delivered_frontier(
+        shared,
+        provider,
+        channel_id,
+        (start, end),
+        dr::outcome_is_shadow_delivered(&outcome),
+    );
+
     match outcome {
         // Confirmed POST (edit OR #2757 fallback): the controller already ran
         // advance + commit + release. The turn delivered. Carry the replace
@@ -353,7 +363,10 @@ pub(in crate::services::discord) async fn deliver_short_replace_via_controller<
         // Reproduce the legacy partial-failure handling: relay_ok = false + reset the
         // retry offset (the caller performs the `retry_terminal_delivery_from_offset` /
         // current_offset / all_data reset + abandon-release, tmux_watcher.rs:6546-6579).
-        toc::DeliveryOutcome::Unknown => WatcherShortReplaceResult::PartialFailureRetry,
+        // #3089 A5: the watcher uses CommitOnFallback, so `fell_back` is always
+        // false for it (a fallback send commits → Delivered, never reaching this
+        // arm) — byte-identical: the watcher ignores the field.
+        toc::DeliveryOutcome::Unknown { .. } => WatcherShortReplaceResult::PartialFailureRetry,
         // Empty body — excluded by the cut-over gate, so this is unreachable in prod.
         toc::DeliveryOutcome::Skipped => WatcherShortReplaceResult::Skipped,
     }

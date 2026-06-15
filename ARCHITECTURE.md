@@ -402,11 +402,14 @@ src/
 │   │   │   ├── stall_liveness.rs
 │   │   │   └── watcher_respawn.rs
 │   │   ├── inflight/
-│   │   │   └── budget.rs
+│   │   │   ├── budget.rs
+│   │   │   ├── model.rs
+│   │   │   └── store.rs
 │   │   ├── outbound/
 │   │   │   ├── confirmation.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── delivery.rs
+│   │   │   ├── delivery_record.rs
 │   │   │   ├── manual_delivery.rs
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs
@@ -443,8 +446,12 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── section_dedupe.rs
 │   │   ├── recovery_engine/
+│   │   │   ├── jsonl_extract.rs
+│   │   │   ├── output_path_detect.rs
+│   │   │   ├── phase_policy.rs
 │   │   │   └── status_panel.rs
 │   │   ├── recovery_paths/
+│   │   │   ├── controller_cutover.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── restart.rs
 │   │   │   └── shared.rs
@@ -454,12 +461,12 @@ src/
 │   │   │   │   ├── control.rs
 │   │   │   │   ├── goal_lifecycle.rs
 │   │   │   │   ├── headless_turn.rs
-│   │   │   │   ├── headless_turn_routine.rs
 │   │   │   │   ├── intake_turn.rs
 │   │   │   │   ├── provider_isolation.rs
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
 │   │   │   │   ├── turn_lifecycle.rs
+│   │   │   │   ├── voice_announcement_scope.rs
 │   │   │   │   └── watchdog.rs
 │   │   │   ├── authorization.rs
 │   │   │   ├── dispatch_trigger.rs
@@ -498,15 +505,28 @@ src/
 │   │   │   ├── panel_decisions.rs
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── prompt_observe.rs
+│   │   │   ├── session_bound_ack.rs
+│   │   │   ├── session_bound_ack_tests.rs
 │   │   │   ├── single_message_footer.rs
+│   │   │   ├── supervisor_relay.rs
+│   │   │   ├── supervisor_relay_tests.rs
+│   │   │   ├── terminal_readiness.rs
+│   │   │   ├── terminal_readiness_tests.rs
 │   │   │   ├── terminal_send.rs
 │   │   │   ├── turn_identity.rs
-│   │   │   └── turn_identity_tests.rs
+│   │   │   ├── turn_identity_tests.rs
+│   │   │   ├── utf8_chunk_decoder.rs
+│   │   │   └── utf8_chunk_decoder_tests.rs
 │   │   ├── tui_direct_abort_marker/
 │   │   │   ├── deferred_claim.rs
 │   │   │   ├── mod.rs
 │   │   │   └── store.rs
+│   │   ├── tui_prompt_relay/
+│   │   │   ├── idle_transcript_scan.rs
+│   │   │   ├── injected_prompt_policy.rs
+│   │   │   └── rehydration.rs
 │   │   ├── turn_bridge/
+│   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
 │   │   │   ├── headless_delivery.rs
@@ -521,14 +541,20 @@ src/
 │   │   │   ├── stale_resume.rs
 │   │   │   ├── status_panel.rs
 │   │   │   ├── status_panel_tests.rs
+│   │   │   ├── streaming_edit_text.rs
+│   │   │   ├── terminal_controller_cutover.rs
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tmux_runtime.rs
 │   │   │   ├── turn_analytics.rs
 │   │   │   ├── voice_completion.rs
 │   │   │   ├── voice_completion_tests.rs
-│   │   │   └── watcher_handoff.rs
+│   │   │   ├── watcher_handoff.rs
+│   │   │   └── watcher_orphan_cleanup.rs
 │   │   ├── turn_finalizer/
-│   │   │   └── cleanup.rs
+│   │   │   ├── cleanup.rs
+│   │   │   ├── completion_signal.rs
+│   │   │   ├── delivery_lease.rs
+│   │   │   └── watcher_backstop.rs
 │   │   ├── voice_barge_in/
 │   │   │   ├── final_result_playback.rs
 │   │   │   ├── foreground_decision.rs
@@ -614,6 +640,7 @@ src/
 │   │   ├── tmux_watcher.rs
 │   │   ├── tui_direct_pending_start.rs
 │   │   ├── tui_prompt_relay.rs
+│   │   ├── tui_prompt_relay_controller_cutover.rs
 │   │   ├── tui_task_card.rs
 │   │   ├── turn_finalizer.rs
 │   │   ├── voice_acknowledgement.rs
@@ -877,7 +904,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/app_state.rs` | Shared HTTP route-handler state (`AppState`); lives at crate root below server+services so service-layer handlers reference it without a service→server backflow. |
 | `src/bootstrap.rs` | Builds config, database, policy engine, and shared app state before launch. |
 | `src/config.rs` | `agentdesk.yaml` parsing, configuration defaults, and shared test env helpers. |
-| `src/config_live_reload.rs` | Live config file hot-reload and atomic swapping. |
+| `src/config_live_reload.rs` | Hot-reloads `agentdesk.yaml` without a restart: a debounced `notify` watcher pre-validates edits and atomically swaps a process-global config snapshot, keeping the running config on failure and reporting restart-required infra changes. |
 | `src/credential.rs` | Reads runtime credential files such as Discord bot tokens from the AgentDesk root. |
 | `src/error.rs` | Shared HTTP and policy error type with typed codes and JSON response helpers. |
 | `src/eventbus.rs` | In-process broadcast event bus (history/replay/batching) shared by the WS server layer and background services without a service→server backflow. |

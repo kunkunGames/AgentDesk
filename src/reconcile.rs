@@ -910,15 +910,13 @@ fn classify_delivery_typed_guard_mismatches(
         {
             return;
         }
-        let mismatch =
-            DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id.clone(), "reserved");
+        let mismatch = DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id, "reserved");
         stats.record_mismatch(&mismatch.kind);
         mismatches.push(mismatch);
     } else if is_completed_delivery_status(status) {
         // A completed delivery (sent/fallback/duplicate/skipped) with no guard
         // key lost its `dispatch_notified:*` dedupe guard; recovery rebuilds it.
-        let mismatch =
-            DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id.clone(), "sent");
+        let mismatch = DispatchDeliveryEventMismatch::missing_kv_meta(row.dispatch_id, "sent");
         stats.record_mismatch(&mismatch.kind);
         mismatches.push(mismatch);
     }

@@ -45,9 +45,7 @@ mod session_relay_sink;
 // #2011 Phase 5.3: standalone JSONL → Discord relay loop on cluster-standby nodes (leader uses tmux_watcher's relay path).
 #[cfg(unix)]
 mod standby_relay;
-// #1074: landing zone for the future recovery-engine module split (restart /
-// runtime / manual_rebind; see `docs/recovery-paths.md`). Named `recovery_paths`
-// to avoid shadowing the `recovery_engine as recovery` alias until the split lands.
+// #1074: landing zone for the future recovery-engine module split (restart / runtime / manual_rebind; see `docs/recovery-paths.md`). Named `recovery_paths` to avoid shadowing the `recovery_engine as recovery` alias until the split lands.
 mod recovery_engine;
 mod recovery_paths;
 mod restart_mode;
@@ -95,6 +93,7 @@ mod tmux_restart_handoff;
 mod tui_direct_abort_marker;
 mod tui_direct_pending_start;
 mod tui_prompt_relay;
+pub(super) mod tui_prompt_relay_controller_cutover; // #3089 A6b: see module doc (closes #3088)
 mod tui_task_card;
 mod turn_bridge;
 mod turn_finalizer;
@@ -120,6 +119,7 @@ pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
 // #3038 S4: re-export the live-placeholder cluster type so `SharedData`
 // declarations/constructors keep the S1/S2/S3 unqualified surface.
 pub(in crate::services::discord) use shared_state::PlaceholderState;
+pub(in crate::services::discord) use shared_state::PolicyRuntime;
 pub(in crate::services::discord) use shared_state::QueuedPlaceholderState;
 pub(in crate::services::discord) use shared_state::RuntimeHttpCache;
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
@@ -435,48 +435,14 @@ pub(in crate::services::discord) async fn resolve_notify_bot_user_id(
 
 pub(in crate::services::discord) fn is_allowed_turn_sender(
     allowed_bot_ids: &[u64],
-    announce_bot_id: Option<u64>,
     author_id: u64,
     author_is_bot: bool,
     text: &str,
 ) -> bool {
-    if announce_bot_id.is_some_and(|id| id == author_id) {
-        // Issue announcements moved to notify-bot in the #1448 follow-up,
-        // so live announce-bot traffic is dispatch / PM-decision /
-        // escalation / generic routing — all of which trigger turns.
-        // The transitional block below catches catch-up replays of
-        // pre-deploy announce-authored issue cards (📋/✅) so they
-        // don't spawn spurious turns. Remove once existing announce-bot
-        // announcement messages have aged out of catch-up scan windows
-        // (safe sunset target: 2026-06-01).
-        return !is_legacy_announce_issue_card(text);
-    }
     if allowed_bot_ids.contains(&author_id) {
         return should_process_allowed_bot_turn_text(text);
     }
     !author_is_bot
-}
-
-/// TRANSITIONAL (#1448 follow-up — sunset 2026-06-01): suppresses
-/// pre-deploy announce-bot issue-announcement / completion cards that
-/// reappear during restart catch-up. Live traffic now routes through
-/// notify-bot, which never reaches the announce-bot branch above.
-fn is_legacy_announce_issue_card(text: &str) -> bool {
-    let head = text.trim_start();
-    if head.starts_with("📋 **새 이슈 #") {
-        return true;
-    }
-    if let Some(rest) = head.strip_prefix("✅ **#") {
-        let digits_end = rest
-            .char_indices()
-            .find(|(_, ch)| !ch.is_ascii_digit())
-            .map(|(idx, _)| idx)
-            .unwrap_or(rest.len());
-        if digits_end > 0 && rest[digits_end..].starts_with(" 완료** —") {
-            return true;
-        }
-    }
-    false
 }
 
 pub(in crate::services::discord) fn should_phase2_recover_message(
@@ -2340,8 +2306,7 @@ pub(crate) struct SharedData {
     pub(super) api_port: u16,
     /// Shared PostgreSQL pool for PG-backed route and runtime helpers.
     pub(super) pg_pool: Option<sqlx::PgPool>,
-    /// Shared policy engine for direct dispatch finalization.
-    pub(super) engine: Option<crate::engine::PolicyEngine>,
+    pub(in crate::services::discord) policy: PolicyRuntime,
     /// Weak reference to the process-wide health registry so turn handlers can
     /// reach dedicated Discord bot HTTP clients without creating an Arc cycle.
     pub(super) health_registry: std::sync::Weak<health::HealthRegistry>,
@@ -2472,13 +2437,13 @@ impl SharedData {
             .load(Ordering::Acquire)
     }
 
-    /// Record that this process spawned a watcher during recovery/reattach.
-    /// This is process-local telemetry for `GET /api/channels/:id/watcher-state`
-    /// (#964), not persisted dedupe state and not counted on first-turn attach.
+    /// Record a recovery/reattach watcher spawn and purge the channel footer so the
+    /// dead prior generation's task/subagent slots don't linger as zombies (#3436, #964).
     pub(super) fn record_tmux_watcher_reconnect(&self, channel_id: ChannelId) {
         self.tmux_relay_coord(channel_id)
             .reconnect_count
             .fetch_add(1, Ordering::AcqRel);
+        self.ui.placeholder_live_events.clear_channel(channel_id);
     }
 
     pub(super) fn record_channel_speaker(
@@ -2619,7 +2584,7 @@ pub(super) fn make_shared_data_for_tests_with_storage(
         provider: ProviderKind::Claude,
         api_port: 9,
         pg_pool,
-        engine: None,
+        policy: PolicyRuntime { engine: None },
         health_registry: std::sync::Weak::new(),
         known_slash_commands: tokio::sync::OnceCell::new(),
         inflight_signals: tokio::sync::broadcast::channel(256).0,
@@ -3662,27 +3627,32 @@ pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_
     shared: &SharedData,
     provider: &ProviderKind,
     channel_id: ChannelId,
-    request_owner_user_id: u64,
-    user_msg_id: u64,
-    user_text: &str,
+    inflight_state: &InflightTurnState,
 ) {
-    if user_msg_id == 0 || user_text.trim().is_empty() {
+    let request_owner_user_id = inflight_state.request_owner_user_id;
+    let user_msg_id = inflight_state.user_msg_id;
+    if user_msg_id == 0 || inflight_state.user_text.trim().is_empty() {
         return;
     }
     let message_id = MessageId::new(user_msg_id);
+    // FIX #6 (Codex P2): rebuild the retry Intervention from the persisted
+    // follow-up requeue context instead of hardcoding empty values, so a
+    // PRE-submit busy-timeout requeue preserves the originating turn's reply
+    // context, attachments, and voice metadata. Legacy rows (pre-v9) default
+    // these to None/empty/false, matching the previous behavior exactly.
     let intervention = Intervention {
         author_id: UserId::new(request_owner_user_id),
         author_is_bot: false,
         message_id,
         source_message_ids: vec![message_id],
-        text: user_text.to_string(),
+        text: inflight_state.user_text.clone(),
         mode: crate::services::turn_orchestrator::InterventionMode::Soft,
         created_at: std::time::Instant::now(),
-        reply_context: None,
-        has_reply_boundary: false,
-        merge_consecutive: false,
-        pending_uploads: Vec::new(),
-        voice_announcement: None,
+        reply_context: inflight_state.followup_reply_context.clone(),
+        has_reply_boundary: inflight_state.followup_has_reply_boundary,
+        merge_consecutive: inflight_state.followup_merge_consecutive,
+        pending_uploads: inflight_state.followup_pending_uploads.clone(),
+        voice_announcement: inflight_state.followup_voice_announcement.clone(),
     };
     let _ = mailbox_enqueue_intervention(shared, provider, channel_id, intervention).await;
 }
@@ -3962,7 +3932,6 @@ pub(in crate::services::discord) fn classify_catch_up_message(
     existing_ids: &std::collections::HashSet<u64>,
     max_age_secs: i64,
     allowed_bot_ids: &[u64],
-    announce_bot_id: Option<u64>,
 ) -> CatchUpClassification {
     if !msg.is_processable_kind {
         return CatchUpClassification::SystemKind;
@@ -3981,7 +3950,6 @@ pub(in crate::services::discord) fn classify_catch_up_message(
     }
     if !is_allowed_turn_sender(
         allowed_bot_ids,
-        announce_bot_id,
         msg.author_id,
         msg.author_is_bot,
         &msg.trimmed_text,
@@ -4140,8 +4108,6 @@ async fn catch_up_missed_messages_inner(
             let settings = shared.settings.read().await;
             settings.allowed_bot_ids.clone()
         };
-        let announce_bot_id = resolve_announce_bot_user_id(shared).await;
-
         let mut max_recovered_id: Option<u64> = None;
         let mut stats = CatchUpScanStats::default();
         stats.returned = messages.len();
@@ -4181,7 +4147,6 @@ async fn catch_up_missed_messages_inner(
                 &existing_ids,
                 max_age.as_secs() as i64,
                 &allowed_bot_ids,
-                announce_bot_id,
             );
             // Codex P2 round 2 on #1301: check the cap BEFORE recording the
             // recover, otherwise `stats.recovered` would tally a message we
@@ -4381,7 +4346,6 @@ async fn catch_up_missed_messages_inner(
             let mid = msg.id.get();
             if !is_allowed_turn_sender(
                 &allowed_bot_ids_phase2,
-                announce_bot_id_phase2,
                 msg.author.id.get(),
                 msg.author.bot,
                 text,
@@ -5405,11 +5369,11 @@ mod catch_up_recovery_tests {
         let existing = HashSet::new();
 
         assert_eq!(
-            classify_catch_up_message(&view, Some(current_bot_id), &existing, 300, &[], None),
+            classify_catch_up_message(&view, Some(current_bot_id), &existing, 300, &[]),
             CatchUpClassification::Recover
         );
         assert_eq!(
-            classify_catch_up_message(&view, Some(owner_user_id), &existing, 300, &[], None),
+            classify_catch_up_message(&view, Some(owner_user_id), &existing, 300, &[]),
             CatchUpClassification::SelfAuthored
         );
     }

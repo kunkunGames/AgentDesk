@@ -57,6 +57,15 @@ pub fn resolve_repo_dir() -> Option<String> {
     legacy.map(|p| p.to_string_lossy().into_owned())
 }
 
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Some(expanded) = crate::runtime_layout::expand_user_path(path) {
+            return expanded.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
+
 pub(crate) fn looks_like_explicit_repo_path(raw: &str) -> bool {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -121,7 +130,8 @@ fn configured_repo_dir(repo_id: &str) -> Option<String> {
         return None;
     }
 
-    let path = crate::runtime_layout::expand_user_path(raw).unwrap_or_else(|| PathBuf::from(raw));
+    let expanded = expand_tilde(raw);
+    let path = PathBuf::from(expanded);
     let resolved = if path.is_relative() {
         base_dir.join(path)
     } else {
@@ -200,8 +210,8 @@ pub fn resolve_repo_dir_for_target(target_repo: Option<&str>) -> Result<Option<S
     };
 
     if looks_like_explicit_repo_path(requested) {
-        let path = crate::runtime_layout::expand_user_path(requested)
-            .unwrap_or_else(|| PathBuf::from(requested));
+        let expanded = expand_tilde(requested);
+        let path = PathBuf::from(expanded);
         let resolved = if path.is_relative() {
             std::env::current_dir()
                 .map_err(|e| format!("cannot resolve repo path '{}': {}", requested, e))?

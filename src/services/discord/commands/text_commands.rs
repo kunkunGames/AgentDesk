@@ -188,8 +188,8 @@ pub(in crate::services::discord) async fn handle_text_command(
                 std::fs::create_dir_all(&dir).ok();
                 dir.to_string_lossy().to_string()
             } else if path_str.starts_with('~') {
-                crate::runtime_layout::expand_user_path(path_str)
-                    .map(|p| p.to_string_lossy().to_string())
+                dirs::home_dir()
+                    .map(|h| path_str.replacen('~', &h.to_string_lossy(), 1))
                     .unwrap_or_else(|| path_str.to_string())
             } else {
                 path_str.to_string()

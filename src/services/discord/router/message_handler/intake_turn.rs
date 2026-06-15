@@ -124,23 +124,6 @@ pub(crate) struct IntakeRequest {
     pub turn_kind: TurnKind,
 }
 
-fn should_drop_unauthorized_voice_announcement(
-    has_stored_voice_announcement: bool,
-    has_legacy_voice_announcement: bool,
-    is_readable_voice_announcement: bool,
-    voice_announcement_resolved: bool,
-    announce_bot_id: Option<u64>,
-    request_owner: UserId,
-) -> bool {
-    if voice_announcement_resolved {
-        return false;
-    }
-
-    has_stored_voice_announcement
-        || (announce_bot_id == Some(request_owner.get())
-            && (has_legacy_voice_announcement || is_readable_voice_announcement))
-}
-
 /// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
 /// of intake-node-routing: this is the public surface a worker node will
 /// invoke after claiming an `intake_outbox` row from its target queue. Pass
@@ -443,43 +426,20 @@ pub(in crate::services::discord) async fn handle_text_message(
     } else {
         None
     };
-    let drop_unauthorized_voice_announcement = should_drop_unauthorized_voice_announcement(
+    // #3464: scope unauthorized voice announcements to the owning agent — a
+    // non-owning agent must not fall through to generic handling and answer
+    // (multi-agent reply storm). Decision + one-shot warn live in
+    // `voice_announcement_scope` (this file is LoC-frozen).
+    if super::voice_announcement_scope::drop_unauthorized_voice_announcement(
         has_stored_voice_announcement,
         has_legacy_voice_announcement,
         is_readable_voice_announcement,
         voice_announcement.is_some(),
         announce_bot_id,
         request_owner,
-    );
-
-    if drop_unauthorized_voice_announcement
-        && has_stored_voice_announcement
-        && announce_bot_id.is_none()
-    {
-        tracing::warn!(
-            channel_id = channel_id.get(),
-            message_id = user_msg_id.get(),
-            author_id = request_owner.get(),
-            "dropping stored voice transcript announcement because announce bot user id is unavailable"
-        );
-        // The message is an announce-bot voice transcript but we cannot
-        // authorize it. Do not fall through to generic text handling, or every
-        // voice-enabled agent that observes the announce message in the shared
-        // voice channel answers it (multi-agent reply storm). Only the owning
-        // agent, which successfully claims the durable metadata, should reply.
-        return Ok(());
-    } else if drop_unauthorized_voice_announcement {
-        tracing::warn!(
-            channel_id = channel_id.get(),
-            message_id = user_msg_id.get(),
-            author_id = request_owner.get(),
-            announce_bot_id = ?announce_bot_id,
-            "ignoring voice transcript announcement without authorized durable metadata"
-        );
-        // Same scoping guard: an unclaimed voice transcript announcement must
-        // not be answered by non-owning agents. The owning agent claims the
-        // durable metadata (`voice_announcement.is_some()`) and proceeds; all
-        // others stop here instead of emitting a generic chat reply.
+        channel_id,
+        user_msg_id,
+    ) {
         return Ok(());
     }
     let is_voice_announcement = voice_announcement.is_some();
@@ -501,8 +461,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             Some(&context),
         )
     });
-    // #2266: keep the original Discord author (the announce bot, for a
-    // voice-transcript announcement) so the race-loss enqueue path can
+    // #2266: keep the original Discord author (the announce bot, for a voice-transcript announcement) so the race-loss enqueue path can
     // attribute the queued `Intervention` to the announce bot. When the
     // queued turn later re-enters `handle_text_message` via the
     // dispatch/kickoff hooks, the same `announce_bot_id == Some(request_owner)`
@@ -2003,58 +1962,27 @@ pub(in crate::services::discord) async fn handle_text_message(
             }
         };
 
-        // Insert the mapping AFTER the POST. Round-2's "mapping before
-        // enqueue" invariant does not apply here (round-9 reorder); instead
-        // we hold the per-channel persistence mutex across the recheck +
-        // insert so a concurrent `dispatch_queued_turn` cannot take our
-        // entry between the recheck and the write.
+        // Insert the mapping AFTER the POST, holding the per-channel persist
+        // mutex across recheck+insert so a concurrent `dispatch_queued_turn`
+        // cannot take our entry between the recheck and the write (round-9
+        // reorder supersedes round-2's "mapping before enqueue").
         //
-        // Round-10 dispatch-state recheck: between our enqueue and this
-        // point, the active turn could have finished AND turn_bridge could
-        // have picked up our intervention from the queue, started its own
-        // turn for us, and POSTed its own fresh card via the dispatch
-        // fallback (no mapping → `send_intake_placeholder`). We must detect
-        // that case BEFORE inserting our mapping; if dispatch already
-        // promoted us into an active turn, our `placeholder_msg_id` is an
-        // orphan and inserting a mapping would point at a stale `...` card
-        // (and the subsequent `ensure_queued` PATCH would render `📬` on a
-        // turn that is already running).
-        //
-        // Round-9 placed the snapshot BEFORE the per-channel persist lock;
-        // codex round-10 P2 flagged the residual window: if the active
-        // turn finishes between the snapshot and the lock acquire, the
-        // dispatch path can still slip in (take the lock, see no mapping,
-        // post fresh Active placeholder, release the lock) — and THIS
-        // branch then takes the lock, observes the (now-stale) snapshot
-        // result, inserts a Queued mapping for a turn that is already
-        // running, and renders a stale `📬` card + sidecar entry that no
-        // future event will reference.
-        //
-        // Fix: take the per-channel persist lock FIRST, then snapshot the
-        // mailbox under the lock, then insert. Atomicity invariant:
-        // "ownership check + insert + ensure_queued PATCH all happen under
-        // one held lock guard." `dispatch_queued_turn`'s
-        // `remove_queued_placeholder` mutator also serializes through this
-        // same per-channel mutex (see `SharedData::remove_queued_placeholder`
-        // at mod.rs:1151), so once we hold the lock the dispatch path
-        // cannot promote our intervention to active until we release.
-        //
-        // Codex round-11 P2 broadened the recheck: the round-10 condition
-        // `active_user_message_id == user_msg_id` only catches the
-        // dispatch-promotion case. There are other queue-exit timelines
-        // (cancellation, supersede, merged-drain of a non-head
-        // source_message_id) where `user_msg_id` has left the queue but the
-        // active turn does NOT equal us — `active_user_message_id` may be
-        // `None` or a different message (e.g. the merge-head). Inserting a
-        // `📬` mapping in those cases would orphan a card that no future
-        // dispatch or queue-exit cleanup will ever reference. The expanded
-        // recheck below additionally verifies `user_msg_id` is still in the
-        // intervention queue (head `message_id` OR any `source_message_ids`
-        // entry) and bails if not.
-        //
-        // Background-trigger / thread-routed turns + reused mappings stay
-        // out of the `queued_placeholders` map by design and skip the
-        // dispatch-state recheck entirely.
+        // Dispatch-state recheck (round-10/11 codex P2): between our enqueue
+        // and here the active turn may have finished AND turn_bridge may have
+        // dequeued our intervention, started its turn, and POSTed its own fresh
+        // card (no mapping → `send_intake_placeholder`). If we then insert, our
+        // `placeholder_msg_id` is an orphan and `ensure_queued` would render
+        // `📬` on an already-running turn. Other queue-exit timelines (cancel,
+        // supersede, merged-drain of a non-head source id) likewise leave
+        // `user_msg_id` out of the queue while the active turn != us. Fix: take
+        // the persist lock FIRST, snapshot the mailbox under it, then insert —
+        // invariant "ownership check + insert + ensure_queued PATCH all run
+        // under one held guard." `remove_queued_placeholder` serializes through
+        // the same mutex (mod.rs:1151), so dispatch cannot promote us until we
+        // release. The recheck below additionally bails unless `user_msg_id` is
+        // still queued (head `message_id` or any `source_message_ids` entry).
+        // Background-trigger / thread-routed / reused-mapping turns stay out of
+        // `queued_placeholders` by design and skip this recheck entirely.
         let persist_guard_for_render = if want_queued_card && !reused_existing_mapping {
             // Use `lock_owned()` so the guard owns the `Arc` and can outlive
             // the local `persist_lock` binding when we hand it off to the
@@ -2357,68 +2285,18 @@ pub(in crate::services::discord) async fn handle_text_message(
     }
 
     let placeholder_msg_id = if let Some(existing) = queued_placeholder_handoff {
-        // Drive the controller from Queued → Active so the user sees the
-        // existing `📬 메시지 대기 중` card morph into `🔄 응답 처리 중`
-        // at the exact moment the queued turn starts. The streaming path will
-        // overwrite this Active card with response text shortly after; the
-        // brief Active beat is the visible "we picked your queued message up"
-        // signal. If the controller rejects (e.g. the entry is already
-        // terminal because of a race), we still reuse the message id so the
-        // streaming path edits the same Discord card and the user does not
-        // see a duplicate placeholder.
-        let provider_for_handoff = super::super::super::resolve_discord_bot_provider(token);
-        let key = super::super::super::placeholder_controller::PlaceholderKey {
-            provider: provider_for_handoff.clone(),
-            channel_id,
-            message_id: existing,
-        };
-        let active_input = super::super::super::placeholder_controller::PlaceholderActiveInput {
-            reason: super::super::super::formatting::MonitorHandoffReason::Queued,
-            started_at_unix: chrono::Utc::now().timestamp(),
-            tool_summary: None,
-            command_summary: None,
-            reason_detail: None,
-            context_line: None,
-            request_line: Some(user_text.to_string()),
-            progress_line: None,
-        };
-        let gateway = super::super::super::gateway::DiscordGateway::new(
-            http.clone(),
-            shared.clone(),
-            provider_for_handoff,
-            ctx_for_chained_dispatch.map(|live_ctx| LiveDiscordTurnContext {
-                ctx: live_ctx.clone(),
-                token: token.to_string(),
-                request_owner,
-            }),
-        );
-        let _ = shared
-            .ui
-            .placeholder_controller
-            .ensure_active(&gateway, key, active_input)
-            .await;
-        // codex review P2: streaming overwrites this Discord message directly
-        // and never calls `transition`/`detach` on the controller. `Active`
-        // entries are excluded from `evict_terminal_entries` so without a
-        // detach here every queued foreground turn would leave a permanent
-        // controller row. Drop the entry now — streaming owns the card past
-        // this point and the controller is no longer the source of truth.
-        shared
-            .ui
-            .placeholder_controller
-            .detach_by_message(channel_id, existing);
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] 📬➡️🔄 DISPATCH: queued placeholder transitioned to Active (channel {}, msg {})",
-            channel_id,
-            existing
-        );
-        existing
-    } else {
-        // Active turn started cleanly — POST a fresh placeholder. If the POST
-        // fails we MUST release the mailbox slot we just acquired, otherwise
-        // the channel is stuck with `current_msg_id == 0` until the cancel
-        // token times out (codex review P1).
+        // #3480: the queued `📬 대기 중` card is now BURIED under what the active
+        // turn streamed while this message waited; reusing it as the live anchor
+        // edits that buried card (looks like a relay drop / huge 2000-char gaps).
+        // Instead POST a FRESH bottom anchor like the clean-start branch below
+        // (same reply-target gating), then DELETE the stale card. The old code's
+        // `ensure_active` visual morph is obsolete once deleted, but on SUCCESS we
+        // must still `detach_by_message` its controller row (seeded Queued by
+        // intake_gate's `ensure_queued`): `remove_queued_placeholder` clears only
+        // the `queued_placeholders` map and `Queued` rows are excluded from
+        // `evict_terminal_entries`, so skipping detach leaks one controller row
+        // per dequeue — the same drop+detach invariant gateway.rs/mod.rs uphold.
+        // Streaming owns the fresh id, so the fresh anchor needs no seeding.
         match send_intake_placeholder(
             http.clone(),
             shared.clone(),
@@ -2431,10 +2309,83 @@ pub(in crate::services::discord) async fn handle_text_message(
             } else {
                 None
             },
-            // #3082 P2-3: the active turn started cleanly and we are POSTing its
-            // OWN fresh placeholder (not a queued "📬" notice). It must NOT wait
-            // behind a multi-chunk answer flush — this is the turn doing the
-            // answering, gating it would self-deadlock the active turn's card.
+            false,
+        )
+        .await
+        {
+            Ok(fresh_msg_id) => {
+                // Fresh anchor is live; tear down the buried queued card. Delete
+                // failure is NON-fatal — never abort the turn over a lingering card.
+                let deleted = channel_id.delete_message(http, existing).await;
+                // Drop the stale card's controller row (else it leaks; see above).
+                shared
+                    .ui
+                    .placeholder_controller
+                    .detach_by_message(channel_id, existing);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::info!(
+                    "  [{ts}] 📬➡️🔄 DISPATCH: queued dequeued; posted fresh anchor (channel {}, fresh_msg {}, stale {}, stale_deleted={})",
+                    channel_id,
+                    fresh_msg_id,
+                    existing,
+                    deleted.is_ok()
+                );
+                fresh_msg_id
+            }
+            Err(error) => {
+                // Mirror the clean-start branch: release the mailbox slot so the
+                // channel is not stuck at `current_msg_id == 0`. KEEP `existing`
+                // (the queued card) visible as a fallback since the fresh POST failed.
+                let bot_owner_provider = super::super::super::resolve_discord_bot_provider(token);
+                let kicked = release_mailbox_after_placeholder_post_failure(
+                    shared,
+                    &bot_owner_provider,
+                    channel_id,
+                )
+                .await;
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                tracing::warn!(
+                    "  [{ts}] ⚠ DEQUEUE: fresh anchor POST failed after mailbox slot acquired (channel {}, stale {}, error={}); released mailbox slot, kept stale card, kickoff_scheduled={}",
+                    channel_id,
+                    existing,
+                    error,
+                    kicked
+                );
+                let recovery = if kicked {
+                    "mailbox_released_kickoff_rescheduled"
+                } else {
+                    "mailbox_released_kickoff_skipped"
+                };
+                crate::services::observability::emit_intake_placeholder_post_failed(
+                    provider.as_str(),
+                    channel_id.get(),
+                    Some(user_msg_id.get()),
+                    "dequeue_after_mailbox_slot",
+                    recovery,
+                    &error.to_string(),
+                );
+                return Err::<(), Error>(error.into());
+            }
+        }
+    } else {
+        // Active turn started cleanly — POST a fresh placeholder. On POST failure
+        // we MUST release the mailbox slot we just acquired or the channel stalls
+        // at `current_msg_id == 0` until the cancel token times out (codex P1).
+        match send_intake_placeholder(
+            http.clone(),
+            shared.clone(),
+            channel_id,
+            if reply_to_user_message
+                && dispatch_id_for_thread.is_none()
+                && !super::super::super::voice_barge_in::is_synthetic_voice_message_id(user_msg_id)
+            {
+                Some((channel_id, user_msg_id))
+            } else {
+                None
+            },
+            // #3082 P2-3: this turn POSTs its OWN fresh placeholder (not a queued
+            // "📬" notice) and is the one answering, so it must NOT gate behind a
+            // multi-chunk answer flush — that would self-deadlock the active card.
             false,
         )
         .await
@@ -3493,6 +3444,17 @@ pub(in crate::services::discord) async fn handle_text_message(
             .unwrap_or((None, None, None))
     };
     inflight_state.set_worktree_context(worktree_path, worktree_branch, base_commit);
+    // FIX #6 (Codex P2): persist the originating Intervention's follow-up
+    // requeue context so a PRE-submit busy-timeout requeue
+    // (`mailbox_requeue_inflight_for_followup_retry`) can rebuild the retry
+    // Intervention without losing reply context / attachments / voice metadata.
+    inflight_state.set_followup_requeue_context(
+        reply_context.clone(),
+        has_reply_boundary,
+        merge_consecutive,
+        pending_uploads.clone(),
+        voice_announcement.clone(),
+    );
     inflight_state.logical_channel_id = Some(logical_channel_id);
     inflight_state.thread_id = thread_id;
     inflight_state.thread_title = thread_title;
@@ -3791,6 +3753,7 @@ pub(in crate::services::discord) async fn handle_text_message(
             defer_watcher_resume,
             reuse_status_panel_message: false,
             completion_tx,
+            is_external_input_tui_direct: false, // #3089 A6b: Discord-origin intake turn
             inflight_state,
         },
     );
@@ -3801,59 +3764,6 @@ pub(in crate::services::discord) async fn handle_text_message(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod unauthorized_voice_announcement_scope_tests {
-    use super::*;
-
-    #[test]
-    fn human_readable_voice_shape_is_not_dropped() {
-        assert!(!should_drop_unauthorized_voice_announcement(
-            false,
-            false,
-            true,
-            false,
-            Some(100),
-            UserId::new(42),
-        ));
-    }
-
-    #[test]
-    fn announce_bot_readable_without_metadata_is_dropped() {
-        assert!(should_drop_unauthorized_voice_announcement(
-            false,
-            false,
-            true,
-            false,
-            Some(100),
-            UserId::new(100),
-        ));
-    }
-
-    #[test]
-    fn stored_announcement_without_metadata_is_dropped() {
-        assert!(should_drop_unauthorized_voice_announcement(
-            true,
-            false,
-            false,
-            false,
-            None,
-            UserId::new(42),
-        ));
-    }
-
-    #[test]
-    fn resolved_announcement_is_not_dropped() {
-        assert!(!should_drop_unauthorized_voice_announcement(
-            true,
-            true,
-            true,
-            true,
-            Some(100),
-            UserId::new(100),
-        ));
-    }
 }
 
 #[cfg(test)]

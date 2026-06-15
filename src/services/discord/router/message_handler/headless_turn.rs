@@ -22,11 +22,13 @@ pub(in crate::services::discord) async fn start_headless_turn(
         metadata,
         channel_name_hint,
         None,
+        None,
         reserve_headless_turn(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::services::discord) async fn start_reserved_headless_turn(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -37,6 +39,9 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
     source: Option<&str>,
     metadata: Option<serde_json::Value>,
     channel_name_hint: Option<String>,
+    // #5: synthetic tmux-session label for routine turns (see
+    // `start_reserved_headless_turn_with_owner`); `None` for all other callers.
+    tmux_session_label: Option<String>,
     is_dm_hint: Option<bool>,
     reservation: HeadlessTurnReservation,
 ) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
@@ -51,10 +56,42 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn(
         source,
         metadata,
         channel_name_hint,
+        tmux_session_label,
         is_dm_hint,
         reservation,
     )
     .await
+}
+
+fn routine_metadata_role_binding(
+    metadata: Option<&serde_json::Value>,
+    provider: &ProviderKind,
+) -> Option<settings::RoleBinding> {
+    let metadata = metadata?;
+    metadata.get("routine_id")?;
+    let agent_id = metadata
+        .get("agent_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    // Resolve the agent's configured prompt path instead of hardcoding
+    // IDENTITY.md under config/agents: `default_prompt_path` reads the managed
+    // agents root and falls back to the legacy `<id>.prompt.md` layout, so
+    // agents on either layout still get their role prompt for routine turns
+    // (#3463). Falls back to the canonical IDENTITY.md path when unset.
+    let prompt_file = crate::services::discord::agentdesk_config::default_prompt_path(agent_id)
+        .unwrap_or_default();
+
+    Some(settings::RoleBinding {
+        role_id: agent_id.to_string(),
+        prompt_file,
+        provider: Some(provider.clone()),
+        model: None,
+        reasoning_effort: None,
+        peer_agents_enabled: true,
+        quality_feedback_injection_enabled: true,
+        memory: settings::resolve_memory_settings(None, None),
+    })
 }
 
 #[allow(dead_code)] // #3034: exported voice entry point, wired-but-dormant (no live dispatch yet).
@@ -80,12 +117,14 @@ pub(in crate::services::discord) async fn start_voice_headless_turn(
         Some(crate::dispatch::Source::Voice.as_str()),
         metadata,
         channel_name_hint,
+        None,
         Some(false),
         reserve_headless_turn(),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn start_reserved_headless_turn_with_owner(
     ctx: &serenity::Context,
     channel_id: ChannelId,
@@ -97,6 +136,13 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     source: Option<&str>,
     metadata: Option<serde_json::Value>,
     channel_name_hint: Option<String>,
+    // #5: When set, this synthetic label (e.g. a routine's distinct tmux session
+    // name) drives ONLY the tmux-session naming below, decoupled from
+    // `channel_name_hint`, which must stay the agent's REAL primary
+    // channel/alias so `resolve_workspace`/worktree isolation/dispatch/role and
+    // the routine-identity reset guard keep resolving against the real channel.
+    // Non-routine callers pass `None` and behave exactly as before.
+    tmux_session_label: Option<String>,
     is_dm_hint: Option<bool>,
     reservation: HeadlessTurnReservation,
 ) -> Result<HeadlessTurnStartOutcome, HeadlessTurnStartError> {
@@ -119,10 +165,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         let settings = shared.settings.read().await;
         (settings.provider.clone(), settings.allowed_tools.clone())
     };
-    let routine_role_binding = super::headless_turn_routine::routine_metadata_role_binding(
-        metadata.as_ref(),
-        &settings_provider,
-    );
+    let routine_role_binding = routine_metadata_role_binding(metadata.as_ref(), &settings_provider);
     let (early_stale_session_id, early_channel_name) = {
         let data = shared.core.lock().await;
         data.sessions
@@ -139,10 +182,13 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
     } else {
         None
     };
-    let early_role_binding = super::headless_turn_routine::role_binding_with_routine_precedence(
-        &routine_role_binding,
-        metadata.as_ref(),
-        || {
+    let early_role_binding = routine_role_binding
+        .clone()
+        .or_else(|| {
+            metadata_parent_channel_id(metadata.as_ref())
+                .and_then(|parent_channel_id| resolve_role_binding(parent_channel_id, None))
+        })
+        .or_else(|| {
             resolve_role_binding(
                 channel_id,
                 early_channel_name
@@ -150,15 +196,14 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
                     .or(channel_name_hint.as_deref())
                     .or(early_resolved_channel_name.as_deref()),
             )
-        },
-    )
-    .or_else(|| {
-        early_thread_parent
-            .as_ref()
-            .and_then(|(parent_id, parent_name)| {
-                resolve_role_binding(*parent_id, parent_name.as_deref())
-            })
-    });
+        })
+        .or_else(|| {
+            early_thread_parent
+                .as_ref()
+                .and_then(|(parent_id, parent_name)| {
+                    resolve_role_binding(*parent_id, parent_name.as_deref())
+                })
+        });
     let early_provider = early_role_binding
         .as_ref()
         .and_then(|binding| binding.provider.clone())
@@ -349,11 +394,13 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             .sessions
             .get(&channel_id)
             .and_then(|session| session.channel_name.as_deref());
-        super::headless_turn_routine::role_binding_with_routine_precedence(
-            &routine_role_binding,
-            metadata.as_ref(),
-            || resolve_role_binding(channel_id, channel_name),
-        )
+        routine_role_binding
+            .clone()
+            .or_else(|| {
+                metadata_parent_channel_id(metadata.as_ref())
+                    .and_then(|parent_channel_id| resolve_role_binding(parent_channel_id, None))
+            })
+            .or_else(|| resolve_role_binding(channel_id, channel_name))
     }
     .or_else(|| {
         early_thread_parent
@@ -366,18 +413,37 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         .as_ref()
         .and_then(|binding| binding.provider.clone())
         .unwrap_or(settings_provider);
-    if super::headless_turn_routine::maybe_refresh_routine_session_channel_name(
-        shared,
-        channel_id,
-        metadata.as_ref(),
-        role_binding.as_ref(),
-        channel_name_hint.as_ref(),
-    )
-    .await
+    let routine_metadata_agent_id = metadata
+        .as_ref()
+        .and_then(|value| value.get("agent_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if metadata
+        .as_ref()
+        .and_then(|value| value.get("routine_id"))
+        .is_some()
+        && routine_metadata_agent_id
+            .zip(
+                role_binding
+                    .as_ref()
+                    .map(|binding| binding.role_id.as_str()),
+            )
+            .is_some_and(|(metadata_agent_id, role_id)| metadata_agent_id == role_id)
+        && let Some(channel_name_hint) = channel_name_hint
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
     {
-        session_id = None;
-        memento_context_loaded = false;
-        session_strategy_reason = "routine_agent_identity_changed";
+        let mut data = shared.core.lock().await;
+        if let Some(session) = data.sessions.get_mut(&channel_id)
+            && session.channel_name.as_deref() != Some(channel_name_hint.as_str())
+        {
+            session.channel_name = Some(channel_name_hint.clone());
+            session.clear_provider_session();
+            session_id = None;
+            memento_context_loaded = false;
+            session_strategy_reason = "routine_agent_identity_changed";
+        }
     }
     {
         let channel_name_for_isolation = {
@@ -449,8 +515,13 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             .and_then(|session| session.channel_name.clone())
             .or_else(|| channel_name_hint.clone());
         let tmux_session_name = if provider.uses_managed_tmux_backend() {
-            channel_name
-                .as_ref()
+            // #5: Prefer the synthetic routine label (when supplied) so the
+            // routine keeps its DISTINCT tmux session (#3463: routine-name-first
+            // label avoids two routines on one agent colliding) while
+            // `channel_name` stays the REAL channel for workspace/dispatch/role.
+            tmux_session_label
+                .as_deref()
+                .or(channel_name.as_deref())
                 .map(|name| provider.build_tmux_session_name(name))
         } else {
             None
@@ -462,15 +533,47 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         (channel_name, tmux_session_name, category_name)
     };
     let adk_session_key = build_adk_session_key(shared, channel_id, &provider).await;
-    super::headless_turn_routine::refresh_routine_session_identity_row(
-        shared,
-        channel_id,
-        metadata.as_ref(),
-        role_binding.as_ref(),
-        &provider,
-        adk_session_key.as_deref(),
-    )
-    .await;
+    if metadata
+        .as_ref()
+        .and_then(|value| value.get("routine_id"))
+        .is_some()
+        && let (Some(pool), Some(binding), Some(session_key)) = (
+            shared.pg_pool.as_ref(),
+            role_binding.as_ref(),
+            adk_session_key.as_deref(),
+        )
+        && let Err(error) = sqlx::query(
+            // Scope to the live session row for this channel. `status` never
+            // takes the literal 'closed' (closure is tracked by `closed_at`; the
+            // 4-state column is turn_active/awaiting_*/idle/disconnected/aborted),
+            // so the old `status <> 'closed'` guard matched EVERY row for the
+            // channel and rewrote the UNIQUE `session_key` on all of them —
+            // corrupting stale rows or hitting the session_key unique constraint.
+            // Restrict to non-closed rows and never overwrite a different
+            // session's key (only stamp an unset key or refresh this same key).
+            "UPDATE sessions
+                SET agent_id = $1,
+                    provider = $2,
+                    session_key = $3
+              WHERE channel_id = $4
+                AND closed_at IS NULL
+                AND (session_key IS NULL OR session_key = $3)",
+        )
+        .bind(&binding.role_id)
+        .bind(provider.as_str())
+        .bind(session_key)
+        .bind(channel_id.get().to_string())
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            channel_id = channel_id.get(),
+            agent_id = %binding.role_id,
+            provider = %provider.as_str(),
+            error = %error,
+            "failed to refresh routine headless session identity"
+        );
+    }
     if session_reset_reason.is_some() {
         if let Some(ref key) = adk_session_key {
             super::super::super::adk_session::clear_provider_session_id(key, shared.api_port).await;
@@ -798,8 +901,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
         session_id.is_some(),
         prompt_prep_duration_ms
     );
-    // #1085: same session-reuse counter as the foreground path so headless
-    // (background-trigger) turns are reflected in the reuse-rate metric.
+    // #1085: same session-reuse counter as the foreground path so headless (background-trigger) turns are reflected in the reuse-rate metric.
     crate::services::observability::metrics::record_session_entry(
         channel_id.get(),
         provider_label,
@@ -1348,6 +1450,7 @@ pub(super) async fn start_reserved_headless_turn_with_owner(
             defer_watcher_resume: false,
             reuse_status_panel_message: false,
             completion_tx: None,
+            is_external_input_tui_direct: false, // #3089 A6b: Discord-origin (not external-input)
             inflight_state,
         },
     );

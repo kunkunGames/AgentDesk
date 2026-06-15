@@ -351,9 +351,7 @@ function flushEscalations() {
 // prefix so escalate()/flushEscalations()/escalateToManualIntervention() are
 // globals for timeouts/ci-recovery/kanban-rules/review-automation). Register
 // a hook-less policy so the loader stops logging a load failure at every boot.
-if (typeof agentdesk !== "undefined" && agentdesk && typeof agentdesk.registerPolicy === "function") {
-  agentdesk.registerPolicy({
-    name: "escalation-helpers",
-    priority: 0
-  });
-}
+agentdesk.registerPolicy({
+  name: "escalation-helpers",
+  priority: 0
+});

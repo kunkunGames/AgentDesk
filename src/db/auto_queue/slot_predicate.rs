@@ -41,31 +41,20 @@ impl DispatchSlotPolarity {
 /// key. `column` is the (optionally qualified) `context` column reference,
 /// e.g. `"d.context"` for an aliased table or `"context"` when unqualified.
 pub(crate) fn dispatch_slot_index_expr(column: &str) -> String {
-    if column == "c.ctx" {
-        "COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1)".to_string()
-    } else {
-        format!(
-            "COALESCE(NULLIF((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1)"
-        )
-    }
+    format!(
+        "COALESCE(NULLIF((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1)"
+    )
 }
 
+/// SQL boolean expression that extracts `context.<key>` as a BOOLEAN, defaulting
+/// to `FALSE`.
 fn dispatch_bool_flag_expr(column: &str, key: &str) -> String {
-    if column == "c.ctx" {
-        format!("COALESCE((c.ctx->>'{key}')::BOOLEAN, FALSE)")
-    } else {
-        format!(
-            "COALESCE(((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'{key}')::BOOLEAN, FALSE)"
-        )
-    }
+    format!("COALESCE(((COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->>'{key}')::BOOLEAN, FALSE)")
 }
 
+/// SQL expression accessing `context.<key>` as raw JSONB (for `IS NULL` tests).
 fn dispatch_json_member_expr(column: &str, key: &str) -> String {
-    if column == "c.ctx" {
-        format!("c.ctx->'{key}'")
-    } else {
-        format!("(COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->'{key}'")
-    }
+    format!("(COALESCE(NULLIF({column}, ''), '{{}}')::jsonb)->'{key}'")
 }
 
 /// Builds the `EXISTS (...)` / `NOT EXISTS (...)` predicate that tests whether
@@ -82,9 +71,9 @@ pub(crate) fn active_dispatch_on_slot_predicate(
     polarity: DispatchSlotPolarity,
     extra_clause: Option<&str>,
 ) -> String {
-    let slot_index = dispatch_slot_index_expr("c.ctx");
-    let sidecar = dispatch_bool_flag_expr("c.ctx", "sidecar_dispatch");
-    let phase_gate = dispatch_json_member_expr("c.ctx", "phase_gate");
+    let slot_index = dispatch_slot_index_expr("d.context");
+    let sidecar = dispatch_bool_flag_expr("d.context", "sidecar_dispatch");
+    let phase_gate = dispatch_json_member_expr("d.context", "phase_gate");
     let extra = match extra_clause {
         Some(clause) => format!("\n               AND ({clause})"),
         None => String::new(),
@@ -93,7 +82,6 @@ pub(crate) fn active_dispatch_on_slot_predicate(
         "{keyword} (
              SELECT 1
              FROM task_dispatches d
-             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb AS ctx) c
              WHERE d.to_agent_id = {agent_expr}
                AND d.status IN ('pending', 'dispatched')
                AND {slot_index} = {slot_expr}
@@ -128,12 +116,11 @@ mod tests {
             "{keyword} (
              SELECT 1
              FROM task_dispatches d
-             CROSS JOIN LATERAL (SELECT COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb AS ctx) c
              WHERE d.to_agent_id = {agent_expr}
                AND d.status IN ('pending', 'dispatched')
-               AND COALESCE(NULLIF(c.ctx->>'slot_index', '')::BIGINT, -1) = {slot_expr}
-               AND COALESCE((c.ctx->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
-               AND c.ctx->'phase_gate' IS NULL
+               AND COALESCE(NULLIF((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'slot_index', '')::BIGINT, -1) = {slot_expr}
+               AND COALESCE(((COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->>'sidecar_dispatch')::BOOLEAN, FALSE) = FALSE
+               AND (COALESCE(NULLIF(d.context, ''), '{{}}')::jsonb)->'phase_gate' IS NULL
                AND (
                    COALESCE(d.dispatch_type, 'implementation') NOT IN ('review', 'review-decision', 'create-pr')
                    OR d.status = 'pending'
@@ -226,10 +213,11 @@ mod tests {
             DispatchSlotPolarity::Exists,
             Some("d.id != $3"),
         );
-        let expected = legacy_claim_predicate("EXISTS", "$1", "$2").replace(
-            "AND c.ctx->'phase_gate' IS NULL\n",
-            "AND c.ctx->'phase_gate' IS NULL\n               AND (d.id != $3)\n",
-        );
+        let expected = legacy_claim_predicate("EXISTS", "$1", "$2")
+            .replace(
+                "AND (COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->'phase_gate' IS NULL\n",
+                "AND (COALESCE(NULLIF(d.context, ''), '{}')::jsonb)->'phase_gate' IS NULL\n               AND (d.id != $3)\n",
+            );
         assert_eq!(generated, expected);
         // Exclude clause is injected before the review-class guard, never after.
         let phase_gate_pos = generated.find("phase_gate' IS NULL").unwrap();

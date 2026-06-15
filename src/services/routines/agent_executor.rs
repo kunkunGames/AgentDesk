@@ -1026,7 +1026,13 @@ impl RoutineAgentExecutor {
             )
             .await
         } else {
-            let channel_name_hint = Some(routine_agent_session_name(&claimed.name, agent_id));
+            // #5: Pass the agent's REAL primary channel/alias as the workspace
+            // hint so `resolve_workspace` resolves for alias/by-name routine
+            // agents, and carry the synthetic routine session name separately as
+            // the tmux-session label so the routine still gets its DISTINCT tmux
+            // session (#3463: routine-name-first avoids cross-routine collision).
+            let channel_name_hint = Some(primary_channel.clone());
+            let tmux_session_label = Some(routine_agent_session_name(&claimed.name, agent_id));
             start_reserved_headless_agent_turn_with_owner_channel(
                 registry,
                 channel_id,
@@ -1036,6 +1042,7 @@ impl RoutineAgentExecutor {
                 Some("routine".to_string()),
                 metadata,
                 channel_name_hint,
+                tmux_session_label,
                 reservation,
             )
             .await
@@ -1459,10 +1466,16 @@ fn routine_thread_title(routine_name: &str, agent_id: &str) -> String {
 }
 
 fn routine_agent_session_name(routine_name: &str, agent_id: &str) -> String {
+    // Put the distinguishing routine name FIRST: `build_tmux_session_name`
+    // truncates to 44 chars, so leading with `agent_id` made two routines on the
+    // same agent collide to one tmux session (reusing provider/transcript state)
+    // once the shared `routine <agent_id> - ` prefix consumed the budget (#3463).
+    // Routine-name-first keeps per-routine sessions distinct after truncation and
+    // matches `routine_thread_title`'s ordering.
     let base = format!(
         "routine {} - {}",
-        compact_for_title(agent_id),
-        compact_for_title(routine_name)
+        compact_for_title(routine_name),
+        compact_for_title(agent_id)
     );
     base.chars().take(90).collect()
 }
@@ -1625,13 +1638,17 @@ fn merge_pending_result(
 }
 
 fn with_started_run_routing_metadata(mut result: Value, started_result: Option<&Value>) -> Value {
+    // #730: also propagate `provider` so a routine headless turn carries the
+    // routine agent's resolved provider identity through to the merged result,
+    // alongside the `agent_id`/`attempt_kind` routing keys that upstream now
+    // produces for the durable fallback-retry path.
     const ROUTING_KEYS: &[&str] = &[
         "channel_id",
         "parent_channel_id",
         "discord_thread_id",
         "agent_id",
-        "provider",
         "attempt_kind",
+        "provider",
     ];
 
     let Some(started_result) = started_result else {

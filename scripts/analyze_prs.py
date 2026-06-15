@@ -6,6 +6,14 @@ def run(cmd):
     result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
     return result.stdout.strip(), result.returncode
 
+def _detect_repo():
+    # Repo-agnostic: derive the owner/name from the checked-out repo so this runs
+    # against whatever fork/origin it lives in, not a hardcoded one.
+    out, code = run("gh repo view --json nameWithOwner --jq .nameWithOwner")
+    return out if code == 0 and out else "itismyfield/AgentDesk"
+
+REPO = _detect_repo()
+
 def parse_github_timestamp(value):
     if not value:
         return None
@@ -19,14 +27,14 @@ def head_commit_timestamp(pr):
     if not head_oid:
         return None
     timestamp, code = run(
-        f"gh api repos/kunkunGames/AgentDesk/commits/{head_oid} --jq .commit.committer.date"
+        f"gh api repos/{REPO}/commits/{head_oid} --jq .commit.committer.date"
     )
     if code != 0:
         return None
     return parse_github_timestamp(timestamp)
 
 print("Fetching PRs...")
-prs_json, gh_code = run("gh pr list --repo kunkunGames/AgentDesk --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
+prs_json, gh_code = run(f"gh pr list --repo {REPO} --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
 
 if gh_code != 0 or not prs_json:
     print("Warning: `gh` CLI not available or failed. Skipping PR analysis.")
@@ -63,7 +71,7 @@ for pr in prs:
     is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
 
     # Get diff stat
-    stat, _ = run(f"gh pr diff {num} --repo kunkunGames/AgentDesk --stat")
+    stat, _ = run(f"gh pr diff {num} --repo {REPO} --stat")
     print(f"Stat:\n{stat}")
 
     if is_stale:
@@ -71,7 +79,7 @@ for pr in prs:
 
     # PR #214/#215 lesson: no-change PRs must have 0 changed files
     if "no-change" in title.lower():
-        files_json, _ = run(f"gh pr view {num} --repo kunkunGames/AgentDesk --json files")
+        files_json, _ = run(f"gh pr view {num} --repo {REPO} --json files")
         try:
             files_data = json.loads(files_json)
             if files_data.get("files") is not None:

@@ -20,6 +20,7 @@ use serenity::model::id::{ChannelId, MessageId};
 use super::formatting::{self, ReplaceLongMessageOutcome};
 use super::health::HealthRegistry;
 use super::inflight::{InflightTurnState, RelayOwnerKind, TurnSource};
+use super::outbound::delivery_record as dr;
 use super::outbound::turn_output_controller as toc;
 use super::placeholder_controller::{PlaceholderKey, PlaceholderLifecycle};
 use super::replace_outcome_policy::edit_fail_fallback_disposition;
@@ -603,12 +604,11 @@ impl SessionBoundDiscordRelaySink {
     }
 
     /// #3089 A2b: short-replace via the turn-output controller, behaviourally equal to legacy
-    /// `replace_long_message_raw_with_outcome` — SAME transport, SAME cell as `LeaseHolder::Sink`
-    /// acquired/committed/released ONCE (no double-acquire: `deliver_response` skipped
-    /// `SinkDeliveryLeaseGuard` here), SAME #3151 heartbeat, #2757 `PreserveAlways` fence,
-    /// `CommitOnFallback`, SAME identity-gated advance (FRESH post-POST reload). Confirmed POST →
-    /// `Delivered`; ambiguous → `Err(Transient)` (I2). `Replace { Active }` keeps `post_send_finalize`
-    /// a no-op. `gateway` is a seam (review-fix Medium-1): live = real gateway; the test fakes it.
+    /// `replace_long_message_raw_with_outcome` — SAME transport + `LeaseHolder::Sink` cell (one
+    /// acquire/commit/release, no double-acquire), #3151 heartbeat, #2757 `PreserveAlways`,
+    /// `CommitOnFallback`, identity-gated advance (FRESH post-POST reload): confirmed POST →
+    /// `Delivered`, ambiguous → `Err(Transient)` (I2); `Replace { Active }` → `post_send_finalize`
+    /// no-op. `gateway` seam (review-fix Medium-1): live = real gateway, test fakes it.
     #[allow(clippy::too_many_arguments)]
     async fn deliver_short_replace_via_controller<G: super::gateway::TurnGateway + ?Sized>(
         &self,
@@ -630,12 +630,10 @@ impl SessionBoundDiscordRelaySink {
             shared.restart.current_generation,
         );
         let cell = shared.delivery_lease(channel);
-        // Self-heal like `SinkDeliveryLeaseGuard::acquire`: reclaim an EXPIRED prior holder
-        // before the acquire (a stale dead lease must not force a markerless POST).
+        // Self-heal (`SinkDeliveryLeaseGuard::acquire`): reclaim an EXPIRED prior holder before acquire (a stale dead lease must not force a markerless POST).
         cell.reclaim_if_expired(super::lease_now_ms());
         let heartbeat = SinkPostHeartbeat { cell: cell.clone() };
-        // Identity-gated advance: INLINE before any post-send await (I1), SAME FRESH-reload
-        // gate as `advance_after_confirmed_post` (`true`→`Delivered`, `false`→`NotDelivered`).
+        // Identity-gated advance: INLINE before any post-send await (I1), SAME FRESH-reload gate as `advance_after_confirmed_post` (`true`→`Delivered`, `false`→`NotDelivered`).
         let advance = |_range: (u64, u64)| -> bool {
             let fresh = super::inflight::load_inflight_state(provider, channel_id);
             self.advance_offset_for_confirmed_delegated_terminal(
@@ -680,10 +678,13 @@ impl SessionBoundDiscordRelaySink {
         )
         .await;
 
+        // #3089 B1: shadow-mirror durable delivered frontier — flag-gated, observe-only, Delivered-only (I2), OFF=no-op.
+        let b1_delivered = dr::outcome_is_shadow_delivered(&outcome);
+        dr::shadow_mirror_delivered_frontier(shared, provider, channel, (start, end), b1_delivered);
+
         match outcome {
-            // Confirmed POST (edit OR #2757 fallback): the controller already ran advance +
-            // commit; BOTH map to sink-local `Delivered` (the POST landed — the lease outcome
-            // only steers the watcher). Emit legacy side-effects.
+            // Confirmed POST (edit OR #2757 fallback): controller already ran advance + commit;
+            // BOTH map to sink-local `Delivered` (POST landed; lease outcome only steers the watcher). Emit legacy side-effects.
             toc::DeliveryOutcome::Delivered { .. } | toc::DeliveryOutcome::NotDelivered { .. } => {
                 self.delivered_total.fetch_add(1, Ordering::AcqRel);
                 tracing::info!(
@@ -715,10 +716,9 @@ impl SessionBoundDiscordRelaySink {
                 );
                 Ok(SessionRelayDeliveryOutcome::Delivered)
             }
-            // Ambiguous/failed (PartialContinuationFailure or transport Err): the controller
-            // released without committing (I2 — offset NOT advanced). Surface `Err(Transient)`.
+            // Ambiguous/failed (PartialContinuationFailure / transport Err): controller released without committing (I2 — offset NOT advanced). Surface `Err(Transient)`.
             toc::DeliveryOutcome::Transient { .. }
-            | toc::DeliveryOutcome::Unknown
+            | toc::DeliveryOutcome::Unknown { .. }
             | toc::DeliveryOutcome::Skipped => Err(RelaySinkError::Transient(
                 "session-bound short-replace controller delivery not confirmed".to_string(),
             )),
@@ -1310,21 +1310,19 @@ async fn run_idle_jsonl_relay_loop(
                 );
                 continue;
             };
-            // #3017 single output-offset authority: this idle path and the watcher both
-            // read the SAME JSONL (E-13: an inflight-less wake relayed twice). The watcher
-            // is PRIMARY and advances `confirmed_end_offset`; this backstop only CONSULTS
-            // it read-only (committed >= range end → skip) and does NOT advance (codex P1:
-            // `try_send_frame` only QUEUES → committing here could drop the response).
+            // #3017 single output-offset authority: this idle path and the watcher both read
+            // the SAME JSONL (E-13: an inflight-less wake relayed twice). The watcher is PRIMARY
+            // and advances `confirmed_end_offset`; this backstop only CONSULTS it read-only
+            // (committed >= range end → skip), no advance (codex P1: `try_send_frame` only QUEUES).
             let channel = ChannelId::new(channel_id);
             if let Some(shared) = health_registry
                 .shared_for_provider_on_channel(&matched.provider, channel)
                 .await
                 .or(health_registry.shared_for_provider(&matched.provider).await)
             {
-                // Codex P2: a stale-high `confirmed_end_offset` from a previous wrapper
-                // would skip the FRESH file's first bytes (dropped wake). Run the SAME
-                // generation-aware regression reset the watcher uses BEFORE reading the
-                // watermark, so a truncated/respawned JSONL resets it to 0 (fresh wrapper).
+                // Codex P2: a stale-high `confirmed_end_offset` from a previous wrapper would skip
+                // the FRESH file's first bytes (dropped wake). Run the SAME generation-aware
+                // regression reset the watcher uses, so a truncated/respawned JSONL resets to 0.
                 super::tmux::reset_stale_relay_watermark_if_output_regressed(
                     shared.as_ref(),
                     channel,
@@ -1332,18 +1330,22 @@ async fn run_idle_jsonl_relay_loop(
                     len,
                     "idle_jsonl_relay",
                 );
-                // Codex r7 P2: the EOF-regression reset above misses a respawned wrapper
-                // whose fresh JSONL already grew PAST the prior watermark. Apply the same
-                // generation-change reset so a stale watermark doesn't skip fresh output.
+                // Codex r7 P2: the EOF-regression reset misses a respawned wrapper whose fresh
+                // JSONL already grew PAST the prior watermark; the generation-change reset covers it.
                 super::tmux::reset_relay_watermark_on_generation_change(
                     shared.as_ref(),
                     channel,
                     &session_name,
                     "idle_jsonl_relay",
                 );
-                let committed = shared.committed_relay_offset(channel);
-                // Classification already passed above → `in_new_session_grace = false`
-                // here consults ONLY the offset-authority dedup branch.
+                // #3089 B2b: durable-frontier dedup authority (flag OFF → in-memory).
+                let committed = dr::effective_committed_offset(
+                    &shared,
+                    &matched.provider,
+                    channel,
+                    &session_name,
+                );
+                // Classification passed above → consults ONLY the offset-authority dedup branch.
                 match idle_relay_range_action(&payload, start, end, committed, false) {
                     IdleRelayRangeAction::SkipAlreadyRelayed => {
                         // Whole range already delivered by the watcher → skip.
@@ -1359,11 +1361,10 @@ async fn run_idle_jsonl_relay_loop(
                         continue;
                     }
                     IdleRelayRangeAction::SendSuffixFrom(from) => {
-                        // Codex r5 P2 + codex r6 P1 (black-hole): PARTIAL overlap — the
-                        // watcher delivered the `[start, committed)` prefix; deliver ONLY
-                        // the uncommitted suffix in THIS pass (bouncing to a next tick would
-                        // re-read a suffix that lost the `system/init` event → re-classified
-                        // and DROPPED). See `IdleRelayRangeAction::SendSuffixFrom`.
+                        // Codex r5 P2 + codex r6 P1 (black-hole): PARTIAL overlap — the watcher
+                        // delivered the `[start, committed)` prefix; deliver ONLY the uncommitted
+                        // suffix THIS pass (a next-tick bounce would re-read a suffix that lost the
+                        // `system/init` event → re-classified and DROPPED). See `SendSuffixFrom`.
                         let suffix =
                             match read_jsonl_range(&matched.expected_rollout_path, from, end) {
                                 Ok(suffix) => suffix,
@@ -1388,12 +1389,10 @@ async fn run_idle_jsonl_relay_loop(
                         }
                         continue;
                     }
-                    // `committed <= start` → nothing covered → fall through to the
-                    // full-range send below.
+                    // `committed <= start` → nothing covered → fall through to the full-range send.
                     IdleRelayRangeAction::SendFull => {}
-                    // Classification already happened above; this arm is
-                    // unreachable here because we pass `in_new_session_grace =
-                    // false` and the payload already passed the init gate.
+                    // Unreachable here: `in_new_session_grace = false` and the payload already
+                    // passed the init gate (classification happened above).
                     IdleRelayRangeAction::SkipClassified => {}
                 }
             }
@@ -2692,7 +2691,13 @@ mod tests {
             },
             true,
         ));
-        assert!(matches!(partial, toc::DeliveryOutcome::Unknown));
+        // #3089 A5: the sink uses CommitOnFallback, so it never reaches the
+        // fell_back=true arm; a partial continuation is fell_back=false — the
+        // controller extension is byte-identical for this owner.
+        assert!(matches!(
+            partial,
+            toc::DeliveryOutcome::Unknown { fell_back: false }
+        ));
     }
 
     // #3089 A2b (review-fix Medium-1): drive the flag-ON `deliver_response`

@@ -1,4 +1,4 @@
-//! EPIC #3078 — single-authority `StatusPanelController` (PR-1, DORMANT).
+//! EPIC #3078 (CLOSED — superseded by #3089 M1) — `StatusPanelController` substrate.
 //!
 //! Today the user-visible status panel message id
 //! (`InflightTurnState.status_message_id`) has NO single writer: five actors
@@ -26,16 +26,15 @@
 //! the controller is the single writer. `PanelPhase` gives exactly-once
 //! finalize/reclaim (mutually idempotent), mirroring the finalizer's `Phase`.
 //!
-//! ## DORMANT (PR-1)
+//! ## Status: substrate + shadow parity only — #3078 CLOSED, superseded by #3089 M1
 //!
-//! This PR ships the substrate ONLY: the full API surface, the ledger, and the
-//! actor loop, spawned next to the finalizer. NO call site routes through it
-//! yet (turn_bridge / tmux_watcher / recovery / sweeper are untouched), so
-//! there is ZERO behaviour change. The spawn is gated on
-//! `status_panel_v2_enabled`: when v2 is off the actor task is not spawned and
-//! the controller stays inert, mirroring the existing v2 short-circuits.
-//! Later PRs (#3078 staged plan) route each actor through `ensure_created` /
-//! `stream_update` / `finalize` / `reclaim` / `clear_if_current`.
+//! PR-1 shipped the substrate (API, ledger, actor loop, gated on
+//! `status_panel_v2_enabled`); PR-2..6 wired only the read-side parity and
+//! ledger-seed methods into the five legacy actors as v2-gated fire-and-forget
+//! SHADOW calls — legacy still owns all Discord IO + `status_message_id` writes
+//! (the five parity-mismatch log targets are silent in prod). The MUTATING
+//! methods and `PanelSink` stay DORMANT: cutover frozen 2026-06-12, #3078 closed
+//! 2026-06-15 superseded by #3089 M1 (single-message footer) — "one owner" met.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -269,6 +268,21 @@ enum PanelMsg {
         owner: PanelOwnerKind,
         msg_id: Option<MessageId>,
     },
+    /// EPIC #3078 PR-6 — seed/refresh the LIVE panel id for a turn whose ledger
+    /// key is REUSED across re-acquisitions (the watcher liveness self-heal mints
+    /// a synthetic `user_msg_id == 0` channel-only key). Unlike `AdoptRecovered`
+    /// (first-id-wins, for unique per-turn keys), this OVERWRITES a non-terminal
+    /// entry's `msg_id` so the ledger tracks the LATEST live panel — otherwise a
+    /// second same-generation reacquire (panel B) would leave the ledger pinned to
+    /// the earlier panel A (no controller finalize/reclaim is dispatched in the
+    /// shadow phase to terminalize it between turns). Terminal entries are never
+    /// resurrected; ledger-only (no durable write / no IO).
+    SeedLivePanel {
+        key: TurnKey,
+        provider: ProviderKind,
+        owner: PanelOwnerKind,
+        msg_id: Option<MessageId>,
+    },
 }
 
 /// The per-runtime actor, held as `Arc<StatusPanelController>` on `SharedData`.
@@ -455,6 +469,27 @@ impl StatusPanelController {
         msg_id: Option<MessageId>,
     ) {
         let _ = self.tx.send(PanelMsg::AdoptRecovered {
+            key,
+            provider,
+            owner,
+            msg_id,
+        });
+    }
+
+    /// EPIC #3078 PR-6 — seed/refresh the LIVE panel id for a turn whose ledger
+    /// key is REUSED across re-acquisitions (the watcher liveness self-heal's
+    /// synthetic `user_msg_id == 0` channel-only key). Unlike [`Self::adopt_recovered`]
+    /// (first-id-wins), this OVERWRITES a non-terminal entry's id so the ledger
+    /// tracks the LATEST live panel. Non-resurrecting (terminal entries untouched);
+    /// fire-and-forget, ledger-only. Observe with [`Self::current_panel`].
+    pub(in crate::services::discord) fn seed_live_panel(
+        &self,
+        key: TurnKey,
+        provider: ProviderKind,
+        owner: PanelOwnerKind,
+        msg_id: Option<MessageId>,
+    ) {
+        let _ = self.tx.send(PanelMsg::SeedLivePanel {
             key,
             provider,
             owner,
@@ -714,6 +749,14 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<PanelMsg>) {
             } => {
                 adopt_recovered(&mut ledger, key, provider, owner, msg_id);
             }
+            PanelMsg::SeedLivePanel {
+                key,
+                provider,
+                owner,
+                msg_id,
+            } => {
+                seed_live_panel(&mut ledger, key, provider, owner, msg_id);
+            }
         }
     }
 }
@@ -748,6 +791,46 @@ fn adopt_recovered(
     entry.provider = provider;
     if entry.msg_id.is_none() {
         entry.msg_id = msg_id;
+    }
+    if entry.phase == PanelPhase::NotCreated {
+        entry.phase = PanelPhase::Live;
+    }
+}
+
+/// EPIC #3078 PR-6 — seed/refresh the LIVE panel for a turn whose ledger key is
+/// REUSED across re-acquisitions (the watcher liveness self-heal mints a synthetic
+/// `user_msg_id == 0` channel-only key, collapsed onto the channel's single live
+/// entry). Mirrors [`adopt_recovered`] EXCEPT it OVERWRITES a non-terminal entry's
+/// `msg_id` with the supplied id: the latest liveness panel is authoritative for
+/// the live channel, so a second same-generation reacquire (panel B) must not
+/// leave the ledger pinned to an earlier panel A (no controller finalize/reclaim
+/// runs in the shadow phase to terminalize it between turns). Terminal entries are
+/// never resurrected; ledger-only (no durable write / no Discord IO).
+fn seed_live_panel(
+    ledger: &mut HashMap<LedgerKey, PanelEntry>,
+    key: TurnKey,
+    provider: ProviderKind,
+    owner: PanelOwnerKind,
+    msg_id: Option<MessageId>,
+) {
+    let lk = resolve_key(ledger, key);
+    let entry = ledger.entry(lk).or_insert_with(|| PanelEntry {
+        msg_id,
+        owner,
+        provider: provider.clone(),
+        phase: PanelPhase::Live,
+        last_text: None,
+    });
+    if entry.phase.is_terminal() {
+        // Never reopen a finalized/reclaimed panel.
+        return;
+    }
+    entry.owner = owner;
+    entry.provider = provider;
+    if let Some(id) = msg_id {
+        // Overwrite (latest live panel wins) — the reused-key fix vs the
+        // first-id-wins `adopt_recovered`.
+        entry.msg_id = Some(id);
     }
     if entry.phase == PanelPhase::NotCreated {
         entry.phase = PanelPhase::Live;

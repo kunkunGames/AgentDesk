@@ -45,7 +45,26 @@
 # #3351: +101 for placeholder-reclaim wiring in the relay loop (tick/terminal/
 # fresh-idle reclaim sites + r21 durable-record drops); the helper bodies live
 # in tmux_watcher/placeholder_reclaim.rs. tmux_watcher S2 re-lowers this root.
-"src/services/discord/tmux_watcher.rs" = 8223
+# #3479 Phase-1 rank-1: lowered 8223 -> 7485 by extracting the supervisor
+# relay-forward + session-bound terminal-ACK cluster verbatim (pure move, zero
+# logic change) into two cohesive tmux_watcher/ child modules — supervisor_relay.rs
+# (forward half + shared SessionBoundRelayAckTarget/SupervisorRelayForward types +
+# watcher_terminal_commit_fence/terminal_event_consumed_offset) and
+# session_bound_ack.rs (SessionBoundRelayAckOutcome fold, per-sequence ACK snapshot
+# resolvers, watcher-direct-send gate, WatcherTerminalResendAction + in-flight-sink
+# marker gate, RelaySlotGuard, ACK delivery wait); moved unit tests live in sibling
+# supervisor_relay_tests.rs / session_bound_ack_tests.rs. Split into two child files
+# only to keep each within the tmux_watcher/** 700-line namespace cap.
+# #3479 Phase-1 rank-2: lowered 7485 -> 7241 by extracting two more cohesive PURE
+# clusters verbatim (pure move, zero logic change) into tmux_watcher/ child modules
+# — utf8_chunk_decoder.rs (Utf8ChunkDecoder + DecodedUtf8Chunk streaming decoder)
+# and terminal_readiness.rs (synchronous terminal-readiness / inflight-classification
+# predicates + the pure buffer/message-id reconcilers). The async, shared-touching
+# commit_watcher_direct_terminal_session_idle (which sits between the two readiness
+# clusters in the root) deliberately STAYS here; moved unit tests live in sibling
+# utf8_chunk_decoder_tests.rs / terminal_readiness_tests.rs (excluded from the
+# production splitter).
+"src/services/discord/tmux_watcher.rs" = 7241
 # #3038 tmux_watcher S1 child modules, frozen at landed production LoC.
 "src/services/discord/tmux_watcher/commit_decisions.rs" = 140
 "src/services/discord/tmux_watcher/completion_gate.rs" = 275
@@ -54,6 +73,18 @@
 "src/services/discord/tmux_watcher/placeholder_reclaim.rs" = 106
 "src/services/discord/tmux_watcher/prompt_observe.rs" = 109
 "src/services/discord/tmux_watcher/turn_identity.rs" = 327
+# #3479 Phase-1 rank-1 child modules (supervisor relay-forward + session-bound
+# terminal-ACK cluster), frozen at landed production LoC. Both sit under the
+# tmux_watcher/** 700-line namespace cap; their moved unit tests live in sibling
+# *_tests.rs files (excluded from the production splitter).
+"src/services/discord/tmux_watcher/supervisor_relay.rs" = 393
+"src/services/discord/tmux_watcher/session_bound_ack.rs" = 404
+# #3479 Phase-1 rank-2 child modules (streaming UTF-8 chunk decoder + terminal-
+# readiness predicates / pure buffer reconcilers), frozen at landed production LoC.
+# Both sit under the tmux_watcher/** 700-line namespace cap; their moved unit tests
+# live in sibling *_tests.rs files (excluded from the production splitter).
+"src/services/discord/tmux_watcher/utf8_chunk_decoder.rs" = 88
+"src/services/discord/tmux_watcher/terminal_readiness.rs" = 214
 # #3089 A4 watcher short-replace controller cutover sibling, frozen at landed prod LoC.
 # A4 r2 (codex r1 [High]): +118 for the `apply_watcher_short_replace_result` split
 # + the `DeliveredFallback` write-back arm mirroring the legacy fallback cleanup.
@@ -66,7 +97,24 @@
 # status-panel, voice-completion, headless-delivery, memory-observation,
 # analytics, and confirmed-end clusters out of the root while leaving the
 # `spawn_turn_bridge` async body byte-identical.
-"src/services/discord/turn_bridge/mod.rs" = 6811
+# #3479 Phase-1 rank-3: lowered 6811 -> 6702 (-109) by moving the pure,
+# unit-tested cancel/finalize decision helpers (classify_turn_finished_dispatch_kind,
+# is_done_setting_terminal_frame, should_finalize_cancel_after_recv,
+# should_suppress_headless_delivery_for_cancel, should_record_final_turn_transcript,
+# resolve_bridge_owner_channel) + their tests into the new sibling
+# `turn_bridge/cancel_finalize_policy.rs` (re-exported, so call sites stay
+# byte-identical). Locks in the shrink win (ratchet down only).
+# #3479 Phase-1 rank-4: lowered 6702 -> 6535 (-167) by moving the pure
+# streaming-edit-text + pre-submission/transport TUI prompt-error classifiers
+# (build_turn_bridge_streaming_edit_text, bridge_pre_submission_tui_prompt_error,
+# bridge_tui_transport_error_should_skip_quiescence) into the new sibling
+# `turn_bridge/streaming_edit_text.rs`, and the watcher-orphan spinner-cleanup
+# decision + retry-spawn helpers (should_delete_bridge_created_watcher_orphan_response,
+# should_retry_watcher_orphan_spinner_cleanup, record_watcher_orphan_spinner_cleanup,
+# spawn_watcher_orphan_spinner_cleanup_retry) into
+# `turn_bridge/watcher_orphan_cleanup.rs` (both re-exported, call sites
+# byte-identical). Locks in the shrink win (ratchet down only).
+"src/services/discord/turn_bridge/mod.rs" = 6535
 # #3038 turn_bridge S1 child modules, frozen at landed production LoC.
 "src/services/discord/turn_bridge/headless_delivery.rs" = 415
 "src/services/discord/turn_bridge/status_panel.rs" = 437
@@ -91,11 +139,24 @@
 # #3038 S5: lowered 4967 -> 4944 (-23) as the cluster-G runtime HTTP cache
 # fields plus the `serenity_http_or_token_fallback` accessor moved into
 # `shared_state::RuntimeHttpCache`. Locks in the shrink win (ratchet down only).
-"src/services/discord/mod.rs" = 4981
+"src/services/discord/mod.rs" = 4979
 # #3305: the local-only pass-through lifecycle-skip (kind hoist + note-only return
 # branch + idle-loop skip) is offset by comment dedup in the same root, lowering the
 # frozen baseline 5438 -> 5429 (-9). Locks in the shrink win (#3028 ratchet).
-"src/services/discord/tui_prompt_relay.rs" = 5429
+# windows-tmux cfg fix (#3461): +5 prod LoC for the `#[cfg(not(unix))]`
+# committed-frontier carry-forward fallback (cross-platform compile). 5429 -> 5434.
+# #3479 rank-5 (behavior-preserving extraction): the pure injected-prompt
+# classification/formatting cluster moved verbatim to the capped sibling
+# `tui_prompt_relay/injected_prompt_policy.rs` (318 prod LoC). Lowers the frozen
+# baseline 5434 -> 5142 (-292). Locks in the shrink win (zero logic change).
+# #3479 rank-10 (behavior-preserving extraction): the pure transcript/rollout
+# prompt scanners moved verbatim to `tui_prompt_relay/idle_transcript_scan.rs`
+# (~278 LoC) and the Discord-IO/SharedData-coupled Claude TUI binding
+# rehydration + dead/orphaned-session eviction pass to
+# `tui_prompt_relay/rehydration.rs` (~296 LoC), both reached via re-import so the
+# call sites stay byte-identical. Lowers the frozen baseline 5142 -> 4630 (-512).
+# Locks in the shrink win (zero logic change).
+"src/services/discord/tui_prompt_relay.rs" = 4630
 # #3038: lowered 4728 -> 4657 (-71) as `SensitivityState` (definition + impl)
 # moved to the `voice_sensitivity` sibling module. Locks in the shrink win.
 # #3038 VoiceBargeInRuntime S1: lowered 4657 -> 4350 (-307) as the STT
@@ -130,9 +191,18 @@
 # caller `reregister_active_turn_from_inflight`).
 # #3034 batch-8: lowered 4094 -> 4090 (dead-code removal: dropped `assistant_turns`
 # construction sites).
-"src/services/discord/recovery_engine.rs" = 4090
+# #3479 r8: lowered 4090 -> 3718 (behavior-preserving extraction of the pure
+# output-path-detect, phase-policy, and jsonl-extract clusters into leaf modules
+# under recovery_engine/; zero logic change, call sites re-imported byte-identical).
+"src/services/discord/recovery_engine.rs" = 3718
 # #3034 batch-8: lowered 3771 -> 3770 (dead-code removal).
-"src/services/discord/router/message_handler/intake_turn.rs" = 3809
+# #3038 S1: +1 (3770 -> 3771) for the mechanical `shared.queued_placeholders` ->
+# `shared.queued.queued_placeholders` re-wire (one extra method-chain line) forced
+# by lifting cluster C into `QueuedPlaceholderState`. Net program-wide: mod.rs -201.
+# FIX #6 (Codex P2): +6 (3771 -> 3777) for the `set_followup_requeue_context`
+# call that persists the originating Intervention's reply/upload/voice context on
+# the follow-up inflight row so a PRE-submit busy-timeout requeue can rebuild it.
+"src/services/discord/router/message_handler/intake_turn.rs" = 3769
 "src/services/discord/meeting_orchestrator.rs" = 3227
 # #3293: +3 for the `registry_purge` child-module declaration (peek +
 # operator-gated idle-entry purge live outside the frozen root); lowered
@@ -145,10 +215,14 @@
 "src/services/turn_orchestrator.rs" = 3089
 # #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
 # `thread_guard_inflight_is_stale` (#1446 Layer-2 classifier, pinned by tests).
-# /steer P1.5 (PR #740): +6 for the steer-cancel message-component routing arm
-# in `handle_event` (mirrors the model-picker / idle-recap arms — the dispatch
-# can only live in the root event handler). The cancel handler body itself lives
-# in the non-giant `steering.rs`, not here.
+# #3038 S1: +2 (2958 -> 2960) for the two mechanical `.queued_placeholders` ->
+# `.queued.queued_placeholders` re-wires (two extra method-chain lines) forced by
+# the cluster-C extraction. Net program-wide: mod.rs -201.
+# intake DB-error-log elevation (#3446): 2960 -> 2969.
+# /steer P1.5 (PR #740): +6 for the steer-cancel message-component routing arm in
+# `handle_event` (mirrors the model-picker / idle-recap arms — the dispatch can
+# only live in the root event handler). The cancel handler body itself lives in
+# the non-giant `steering.rs`, not here. Combined with #3446: 2969 -> 2975.
 "src/services/discord/router/intake_gate.rs" = 2975
 "src/services/discord/formatting.rs" = 2802
 # #3038 run_bot S0/S1: lowered 2802 -> 1918 by adding characterization tests and
@@ -175,7 +249,18 @@
 # #3351: +58 for `clear_current_msg_if_matches(_in_root)` — the relay-placeholder
 # compare-and-clear needs the file-private lock/load/persist internals, so it
 # lives here until the inflight split.
-"src/services/discord/inflight.rs" = 2523
+# FIX #6 (Codex P2): +62 (2523 -> 2585) for the five `#[serde(default)]`
+# follow-up requeue context fields on `InflightTurnState` (+ doc comments), the
+# v8->v9 version bump comment, the `set_followup_requeue_context` setter, and the
+# matching defaults in `InflightTurnState::new`, so a PRE-submit busy-timeout
+# requeue rebuilds the retry Intervention without losing reply/upload/voice data.
+# #3479 Phase-2 rank-7: behaviour-preserving split — the pure domain model moved
+# to inflight/model.rs (587 prod LoC) and the FS path/flock seam to
+# inflight/store.rs (64 prod LoC). Both sub-1000 (not giants → no registry/doc
+# entry). Lowers 2585 -> 1980 (actual post-split prod LoC). The status-panel
+# guards stay in root: their compare-and-clear still needs the file-private
+# load/persist-under-lock internals, so they cannot move cleanly yet.
+"src/services/discord/inflight.rs" = 1980
 # #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
 # prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
 # its ratchet entry is deleted (win; no baseline raises).
@@ -186,10 +271,9 @@
 "src/services/discord/idle_recap.rs" = 1320
 # #3034 batch-8: lowered 2241 -> 2011 (deleted the dead #826/#897/#898 bg-trigger
 # notify-outbox subsystem — build/enqueue/reconcile/parse/rollback).
-# #3384 restored-seed undelivered-body discard guard: +1.
 # suppressed-label noise, user report 2026-06-12: +38 for provider-aware
 # status/footer stripping in the placeholder suppression decisions.
-"src/services/discord/tmux.rs" = 2050
+"src/services/discord/tmux.rs" = 2049
 # #3034 batch-8: lowered 1849 -> 1834 (deleted dead `build_verdict_payload`).
 "src/services/discord/turn_bridge/completion_guard.rs" = 1834
 # #3034 batch-8: lowered 1781 -> 1753 (deleted the dead `assistant_turns` turn-cap
@@ -206,8 +290,14 @@
 # #3034 batch-8: +2 for the `#[allow(dead_code)]` on the `RelayMiss` terminal-event
 # variant + its reason comment (handled by the finalizer + tested, not yet emitted
 # in prod; rustfmt keeps the attribute and the comment on separate lines).
-"src/services/discord/turn_finalizer.rs" = 1528
-"src/services/discord/router/message_handler/headless_turn.rs" = 1359
+# #3479 r9: 1528 -> 1337 (-191) by extracting the completion-signal enum + pure
+# derivation (turn_finalizer/completion_signal.rs), the dormant delivery-lease
+# handlers (turn_finalizer/delivery_lease.rs), and the watcher far-backstop
+# tunables + terminal-or-defer verdict pair (turn_finalizer/watcher_backstop.rs)
+# into child modules. Pure move; each child is well under the 1000-prod-LoC
+# giant threshold so no new ratchet/registry entry is needed.
+"src/services/discord/turn_finalizer.rs" = 1337
+"src/services/discord/router/message_handler/headless_turn.rs" = 1462
 # #3038 S2: lowered 1054 -> 954 (-100) as the session-override bookkeeping
 # helpers (fast-mode reset-entry codec + reset-pending probes/clears +
 # enablement probes + sync_session_reset_pending) moved verbatim to the

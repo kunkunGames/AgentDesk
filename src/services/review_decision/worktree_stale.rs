@@ -607,6 +607,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "unix git-worktree path semantics; AgentDesk runs on unix"
+    )]
     fn context_repo_dir_resolves_git_worktree_target_repo() {
         let dir = init_git_dir();
         let context = parse_context(&format!(
@@ -620,6 +624,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "unix git-worktree path semantics; AgentDesk runs on unix"
+    )]
     fn context_repo_dir_prefers_target_repo_over_worktree_path() {
         let target = init_git_dir();
         let worktree = init_git_dir();
@@ -635,6 +643,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "unix git-worktree path semantics; AgentDesk runs on unix"
+    )]
     fn context_repo_dir_falls_back_to_worktree_path() {
         let worktree = init_git_dir();
         let context = parse_context(&format!(
@@ -680,6 +692,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "unix git-worktree path semantics; AgentDesk runs on unix"
+    )]
     fn build_active_review_dispatch_worktree_path_fallback_resolves_git_dir() {
         let worktree = init_git_dir();
         let dispatch = build_active_review_dispatch(

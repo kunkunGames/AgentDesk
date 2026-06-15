@@ -20,7 +20,7 @@ ARCHITECTURE_TOP_LEVEL_MAP_START = "<!-- BEGIN GENERATED: TOP LEVEL MODULE MAP -
 ARCHITECTURE_TOP_LEVEL_MAP_END = "<!-- END GENERATED: TOP LEVEL MODULE MAP -->"
 GIANT_FILE_THRESHOLD = 1000
 HTTP_METHODS = ("delete", "get", "head", "options", "patch", "post", "put")
-TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs", "high_risk_recovery.rs"}
+TEST_FILE_NAMES = {"integration_tests.rs", "tests.rs"}
 GIANT_FILE_REGISTRY = REPO_ROOT / "scripts" / "giant_file_registry.toml"
 GIANT_FILE_REGISTRY_DOC = GENERATED_DOCS_DIR / "giant-file-registry.md"
 
@@ -105,7 +105,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "compat/": "Centralised home for compatibility/legacy/fallback shims (#1076). Each public item carries a `REMOVE_WHEN` comment so retirement is grep-driven.",
     "app_state.rs": "Shared HTTP route-handler state (`AppState`); lives at crate root below server+services so service-layer handlers reference it without a service→server backflow.",
     "config.rs": "`agentdesk.yaml` parsing, configuration defaults, and shared test env helpers.",
-    "config_live_reload.rs": "Live config file hot-reload and atomic swapping.",
+    "config_live_reload.rs": "Hot-reloads `agentdesk.yaml` without a restart: a debounced `notify` watcher pre-validates edits and atomically swaps a process-global config snapshot, keeping the running config on failure and reporting restart-required infra changes.",
     "credential.rs": "Reads runtime credential files such as Discord bot tokens from the AgentDesk root.",
     "db/": "SQLite access layer and schema authority (`src/db/schema.rs`).",
     "dispatch/": "Dispatch context construction, review metadata, and worktree targeting.",
@@ -172,7 +172,6 @@ class WorkerEntry:
     kind: str
     target: str
     source: str
-    execution_scope: str
     notes: str
 
 
@@ -230,8 +229,6 @@ def offset_to_line(text: str, offset: int) -> int:
 
 
 def is_test_file(path: Path) -> bool:
-    if "integration_tests" in path.parts:
-        return True
     return path.name.endswith("_tests.rs") or path.name in TEST_FILE_NAMES
 
 
@@ -599,7 +596,6 @@ def resolve_function_source(
     handler_expr: str,
     by_file: dict[Path, dict[str, int]],
     by_name: dict[str, list[tuple[Path, int]]],
-    current_file: Path,
 ) -> tuple[Path, int] | None:
     handler_expr = handler_expr.strip()
     if "|" in handler_expr:
@@ -610,13 +606,7 @@ def resolve_function_source(
         return None
 
     fn_name = parts[-1]
-
-    if len(parts) == 1:
-        if fn_name in by_file.get(current_file, {}):
-            return current_file, by_file[current_file][fn_name]
-
     module_parts = parts[:-1]
-
     candidates: list[Path] = []
     candidate_dirs: list[Path] = []
 
@@ -1058,7 +1048,7 @@ def parse_route_file(
         route_path = path_expr[1:-1]
         decl_line = offset_to_line(text, match.start())
         for method, handler in parse_method_chain(methods_expr):
-            resolved = resolve_function_source(handler, by_file, by_name, path)
+            resolved = resolve_function_source(handler, by_file, by_name)
             if resolved is None:
                 raise ParseError(f"could not resolve handler source for {handler!r}")
             handler_path, handler_line = resolved
@@ -1186,7 +1176,6 @@ def collect_workers() -> list[WorkerEntry]:
             )
         ]
         responsibility = capture(body, r'responsibility:\s*"([^"]+)"', "responsibility")
-        execution_scope = capture(body, r"execution_scope:\s*WorkerExecutionScope::([A-Za-z0-9_]+)", "execution_scope")
         owner = capture(body, r'owner:\s*"([^"]+)"', "owner")
         health_owner = capture(body, r'health_owner:\s*"([^"]+)"', "health_owner")
         notes = capture(body, r'notes:\s*"([^"]*)"', "notes")
@@ -1196,7 +1185,6 @@ def collect_workers() -> list[WorkerEntry]:
                 kind=kind,
                 target=f"`{target}`",
                 source=format_path_with_line(registry_path, line),
-                execution_scope=execution_scope,
                 notes=(
                     f"stage={stage}; order={start_order}; restart={restart}; shutdown={shutdown}; "
                     f"owner={owner}; health={health_owner}; responsibility={responsibility}; {notes}"
@@ -1365,12 +1353,12 @@ def render_worker_inventory(entries: list[WorkerEntry]) -> str:
         "- Scope: supervised worker specs registered in `server::worker_registry::WORKER_SPECS`.",
         f"- Workers: `{len(entries)}`",
         "",
-        "| Worker | Kind | Target | Source | Scope | Notes |",
+        "| Worker | Kind | Target | Source | Notes |",
         "| --- | --- | --- | --- | --- |",
     ]
     for entry in entries:
         lines.append(
-            f"| {entry.worker} | `{entry.kind}` | {entry.target} | {entry.source} | {entry.execution_scope} | {entry.notes} |"
+            f"| {entry.worker} | `{entry.kind}` | {entry.target} | {entry.source} | {entry.notes} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -1379,7 +1367,7 @@ def render_worker_inventory(entries: list[WorkerEntry]) -> str:
 def generated_documents() -> dict[Path, str]:
     function_paths = sorted(
         path
-        for path in (list((REPO_ROOT / "src" / "server").rglob("*.rs")) + list((REPO_ROOT / "src" / "services" / "claude_tui").rglob("*.rs")))
+        for path in (REPO_ROOT / "src" / "server").rglob("*.rs")
         if path.is_file() and not is_test_file(path)
     )
     route_paths = sorted(
@@ -1394,17 +1382,6 @@ def generated_documents() -> dict[Path, str]:
     route_entries: list[RouteEntry] = []
     for route_path in route_paths:
         route_entries.extend(parse_route_file(route_path, "/api", by_file, by_name))
-
-    # Parse /api/v1 routes
-    v1_path = REPO_ROOT / "src" / "server" / "routes" / "v1.rs"
-    if v1_path.exists():
-        route_entries.extend(parse_route_file(v1_path, "/api", by_file, by_name))
-
-    # Parse root-level tui routes
-    tui_relay_path = REPO_ROOT / "src" / "services" / "claude_tui" / "tui_relay.rs"
-    if tui_relay_path.exists():
-        route_entries.extend(parse_route_file(tui_relay_path, "", by_file, by_name))
-
     route_entries.extend(
         parse_route_file(REPO_ROOT / "src" / "server" / "mod.rs", "", by_file, by_name)
     )
