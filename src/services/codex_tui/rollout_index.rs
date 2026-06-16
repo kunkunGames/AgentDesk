@@ -18,11 +18,17 @@
 //!    therefore the signature. The signature is recomputed on **every** lookup
 //!    (cheap `O(directories)` stat calls) — invalidation is a precondition, not
 //!    a postcondition.
-//! 2. On a signature match (warm hit) reuses the cached file list AND the cached
-//!    parsed `session_meta` for each file whose `(mtime, len)` is unchanged, so
-//!    warm lookups do **not** re-read rollout headers (PRD REQ-005).
-//! 3. On a signature mismatch (cold / changed) re-walks the tree, then lazily
-//!    re-reads only headers whose `(mtime, len)` changed.
+//! 2. On a signature match (warm hit) reuses the cached file *list* directly so
+//!    the `O(directories × entries)` `read_dir` re-walk is skipped; each cached
+//!    path is still `stat`ed and its parsed `session_meta` reused unless its
+//!    `(mtime, len)` changed (catching in-place appends/rewrites that leave the
+//!    directory mtime — and thus the signature — unchanged). Warm lookups
+//!    therefore do **not** re-walk the tree and do **not** re-read unchanged
+//!    headers (PRD REQ-005).
+//! 3. On a signature mismatch (cold / changed) re-walks the tree, but still
+//!    consults the prior per-file map and re-reads only headers whose
+//!    `(mtime, len)` changed (or files never seen before). A single added rollout
+//!    therefore costs one header read, not `O(files)`.
 //!
 //! Invalidation deliberately prefers a **false miss** (an extra rescan) over a
 //! **stale hit** (resuming the wrong rollout) — see PRD risk table.
@@ -275,10 +281,12 @@ fn tree_signature(root: &Path) -> Option<u64> {
 /// Cache-backed rollout discovery returning each candidate's path + cached
 /// metadata + parsed header.
 ///
-/// On a warm hit (signature unchanged) the cached `session_meta` is reused for
-/// every file whose `(modified, len)` is unchanged, so no rollout headers are
-/// re-read. On a cold/changed lookup the tree is re-walked and only headers with
-/// a changed `(modified, len)` (or never-seen files) are re-read.
+/// On a warm hit (signature unchanged) the cached file *list* is reused so the
+/// directory subtree is NOT re-walked; each cached path is re-`stat`ed and its
+/// parsed header reused unless its `(modified, len)` changed. On a cold/changed
+/// lookup the tree is re-walked but the prior per-file map is still consulted, so
+/// only headers whose `(modified, len)` changed (or never-seen files) are
+/// re-read — a single new rollout does NOT re-read every surviving file's header.
 ///
 /// When the cache is disabled (config flag off) this still returns the full
 /// candidate set, but performs a fresh scan + header read each time — i.e. it is
@@ -300,20 +308,46 @@ fn cached_indexed_rollouts_inner(root: &Path, enabled: bool) -> Vec<IndexedRollo
         return scan_indexed_rollouts(root, None);
     };
 
-    // Snapshot the previous per-file metadata for this root so headers can be
-    // reused without holding the lock during file I/O.
-    let previous: Option<HashMap<PathBuf, CachedFile>> = {
+    // Snapshot the previous per-root state so headers (and, on a signature hit,
+    // the file list itself) can be reused without holding the lock during file
+    // I/O. The cached per-file `(mtime, len, meta)` map is reused for header
+    // reuse REGARDLESS of whether the tree signature matched: a signature change
+    // only means the *set* of files may differ (a rollout added/removed), not
+    // that every surviving file's header changed. Dropping the whole map on any
+    // signature miss made the common "one new rollout under a busy sessions
+    // root" path re-read every existing header, defeating the cache.
+    let previous: Option<RootIndex> = {
         let state = lock_cache();
-        state
-            .roots
-            .get(&canonical_root)
-            .filter(|index| index.signature == signature)
-            .map(|index| index.files.clone())
+        state.roots.get(&canonical_root).cloned()
+    };
+    let signature_hit = previous
+        .as_ref()
+        .is_some_and(|index| index.signature == signature);
+    let previous_files = previous.map(|index| index.files);
+
+    let results = match (signature_hit, previous_files) {
+        (true, Some(previous_files)) => {
+            // Warm hit: the directory subtree is unchanged (no rollout added,
+            // removed, or renamed), so the cached *file list* is authoritative —
+            // reuse it directly and skip the `O(directories × entries)`
+            // `rollout_files_under` `read_dir` re-walk. Each cached path is still
+            // re-`stat`ed and its header re-read only when its `(mtime, len)`
+            // changed, so an in-place append/rewrite (which advances the file
+            // mtime/len but NOT the parent directory mtime, leaving the signature
+            // unchanged) is still caught. This is the cheap warm path the index
+            // exists for: on a busy root it costs `O(directories)` for the
+            // signature + `O(files)` stats, with zero header reads when nothing
+            // changed and zero directory recursion.
+            scan_indexed_rollouts_from_paths(previous_files.keys(), Some(&previous_files))
+        }
+        (_, previous_files) => {
+            // Cold / changed tree: re-walk to refresh the file list, reusing each
+            // surviving file's cached header when its `(mtime, len)` is unchanged.
+            scan_indexed_rollouts(root, previous_files.as_ref())
+        }
     };
 
-    let results = scan_indexed_rollouts(root, previous.as_ref());
-
-    // Rebuild the cache entry from the fresh scan results.
+    // Rebuild the cache entry from the fresh results.
     let mut files = HashMap::with_capacity(results.len());
     for item in &results {
         files.insert(
@@ -329,27 +363,47 @@ fn cached_indexed_rollouts_inner(root: &Path, enabled: bool) -> Vec<IndexedRollo
     results
 }
 
-/// Direct scan (optionally reusing cached per-file metadata). When `previous` is
-/// `Some` and a file's `(modified, len)` are unchanged, its cached header is
-/// reused; otherwise the header is read from disk.
+/// Direct scan via the directory re-walk (optionally reusing cached per-file
+/// metadata). Used on the cold / signature-miss path where the file *set* may
+/// have changed. When `previous` is `Some` and a file's `(modified, len)` are
+/// unchanged, its cached header is reused; otherwise the header is read from
+/// disk.
 fn scan_indexed_rollouts(
     root: &Path,
     previous: Option<&HashMap<PathBuf, CachedFile>>,
 ) -> Vec<IndexedRollout> {
-    rollout_files_under(root)
+    scan_indexed_rollouts_from_paths(rollout_files_under(root).iter(), previous)
+}
+
+/// Build indexed candidates from an explicit set of candidate paths, re-`stat`ing
+/// each and reusing the cached header iff its `(modified, len)` is unchanged.
+/// The signature-hit warm path feeds the cached `RootIndex.files` keys here to
+/// avoid the directory re-walk while still revalidating each file's `(mtime,
+/// len)` (so in-place appends/rewrites are not served stale). The cold path
+/// feeds freshly-walked paths. A path that vanished between the cached snapshot
+/// and this `stat` is dropped via `metadata().ok()?`, so a deleted rollout under
+/// an otherwise-unchanged signature is not surfaced.
+fn scan_indexed_rollouts_from_paths<'a, I>(
+    paths: I,
+    previous: Option<&HashMap<PathBuf, CachedFile>>,
+) -> Vec<IndexedRollout>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    paths
         .into_iter()
         .filter_map(|path| {
-            let metadata = std::fs::metadata(&path).ok()?;
+            let metadata = std::fs::metadata(path).ok()?;
             let modified = metadata.modified().ok()?;
             let len = metadata.len();
-            let meta = match previous.and_then(|prev| prev.get(&path)) {
+            let meta = match previous.and_then(|prev| prev.get(path)) {
                 Some(cached) if cached.modified == modified && cached.len == len => {
                     cached.meta.clone()
                 }
-                _ => read_rollout_session_meta(&path),
+                _ => read_rollout_session_meta(path),
             };
             Some(IndexedRollout {
-                path,
+                path: path.clone(),
                 modified,
                 len,
                 meta,
@@ -401,22 +455,37 @@ pub fn reset_cache_for_tests() {
     state.seq = 0;
 }
 
+/// Process-global serialization lock for any test that touches the shared
+/// rollout index. The cache lives for the whole process, so two tests that
+/// populate/reset it under default parallel `cargo test` would otherwise race —
+/// e.g. a `session.rs` resolver test mutating `roots` between a `rollout_index`
+/// test's reset and its cache-state assertion. ALL test modules across this
+/// crate that exercise the index (here AND `session.rs`) must serialize through
+/// [`lock_cache_for_tests`].
+#[cfg(test)]
+static CACHE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the shared cache test lock and reset the cache, returning the guard.
+/// Holding the returned guard for the duration of a test gives that test an
+/// isolated, freshly-reset process-global index (REQ-004 / TEST-004). Exposed
+/// (not module-private) so `session.rs` tests share the exact same lock instead
+/// of running unsynchronized against the same global state.
+#[cfg(test)]
+pub fn lock_cache_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    let guard = CACHE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    reset_cache_for_tests();
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    // Serialize cache tests: the cache is process-global, so parallel tests
-    // mutating it would race. This guard plus `reset_cache_for_tests` gives each
-    // test an isolated cache (REQ-004 / TEST-004).
-    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     fn lock_test() -> MutexGuard<'static, ()> {
-        let guard = CACHE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        reset_cache_for_tests();
-        guard
+        lock_cache_for_tests()
     }
 
     fn write_rollout(root: &Path, relative: &str, id: &str, cwd: &Path) -> PathBuf {
@@ -694,6 +763,143 @@ mod tests {
             second.len(),
             2,
             "a rollout created after a warm lookup must be discovered on the next lookup"
+        );
+    }
+
+    // Finding (rollout_index.rs:310): on a signature MISS (a new rollout under a
+    // new leaf bumps the tree signature), the surviving files' cached headers must
+    // still be reused — only the genuinely new/changed file pays a header read.
+    // We prove the survivor's header is not re-read by corrupting it in place to
+    // unparseable while keeping its (mtime, len) stable: a warm reuse returns the
+    // cached id; a blanket drop would re-read and lose it.
+    #[test]
+    fn signature_miss_reuses_surviving_file_headers() {
+        let _guard = lock_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let survivor = write_rollout(
+            dir.path(),
+            "2026/05/rollout-a.jsonl",
+            "survivor",
+            cwd.path(),
+        );
+
+        // Cold lookup warms the cache with the survivor's header.
+        let cold = cached_indexed_rollouts(dir.path());
+        assert_eq!(cold.len(), 1);
+        let primed = std::fs::metadata(&survivor).unwrap();
+        let (modified, len) = (primed.modified().unwrap(), primed.len());
+
+        // Corrupt the survivor in place (same length) so a header RE-READ would
+        // yield `None`, while a cache REUSE keeps the parsed id.
+        let corrupt = "x".repeat(len as usize);
+        std::fs::write(&survivor, &corrupt).unwrap();
+        let after = std::fs::metadata(&survivor).unwrap();
+
+        // Add a brand-new rollout under a new leaf -> the tree signature changes
+        // (signature MISS), forcing a re-walk.
+        write_rollout(
+            dir.path(),
+            "2026/06/rollout-b.jsonl",
+            "newcomer",
+            cwd.path(),
+        );
+
+        let warm = cached_indexed_rollouts(dir.path());
+        assert_eq!(warm.len(), 2, "the new rollout must be discovered");
+        if after.modified().unwrap() == modified && after.len() == len {
+            let survivor_meta = warm
+                .iter()
+                .find(|item| item.path == survivor)
+                .and_then(|item| item.meta.as_ref());
+            assert_eq!(
+                survivor_meta.map(|meta| meta.id.as_str()),
+                Some("survivor"),
+                "a signature miss must reuse the surviving file's cached header, not re-read it"
+            );
+        }
+    }
+
+    // Finding (rollout_index.rs:339): on a signature HIT the warm path builds
+    // results from the cached file list and skips both the `rollout_files_under`
+    // re-walk and the header re-read for files whose `(mtime, len)` is unchanged.
+    // We prove the warm path serves the CACHED header (i.e. it did not re-read the
+    // file) by corrupting the file in place to unparseable while preserving its
+    // `(mtime, len)` AND the directory signature: a cache reuse keeps the parsed
+    // id; a re-read would yield `None`.
+    #[test]
+    fn signature_hit_reuses_cached_file_list_without_rewalk() {
+        let _guard = lock_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let path = write_rollout(
+            dir.path(),
+            "2026/05/rollout-a.jsonl",
+            "warm-list",
+            cwd.path(),
+        );
+
+        let cold = cached_indexed_rollouts(dir.path());
+        assert_eq!(cold.len(), 1);
+        let signature_after_cold = tree_signature(dir.path()).unwrap();
+        let primed = std::fs::metadata(&path).unwrap();
+        let (modified, len) = (primed.modified().unwrap(), primed.len());
+
+        // In-place same-length corruption: leaves the file `(mtime, len)` stable
+        // (common for an immediate same-size rewrite) and does not touch the
+        // parent directory mtime, so the tree signature is unchanged -> warm hit.
+        let corrupt = "x".repeat(len as usize);
+        std::fs::write(&path, &corrupt).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+
+        let warm = cached_indexed_rollouts(dir.path());
+        assert_eq!(
+            tree_signature(dir.path()).unwrap(),
+            signature_after_cold,
+            "tree signature must be stable across the warm lookup"
+        );
+        assert_eq!(warm.len(), 1, "warm hit must reuse the cached file list");
+        if after.modified().unwrap() == modified && after.len() == len {
+            assert_eq!(
+                warm[0].meta.as_ref().unwrap().id,
+                "warm-list",
+                "a signature-hit warm lookup with unchanged (mtime, len) must reuse the cached header, not re-read the corrupted file"
+            );
+        }
+    }
+
+    // Finding (rollout_index.rs:339) correctness floor: even on a signature HIT,
+    // an in-place content rewrite that DOES change `(mtime, len)` (e.g. a Codex
+    // append) must be re-read — the warm path re-`stat`s each cached path, so the
+    // append is not served stale despite the unchanged directory signature.
+    #[test]
+    fn signature_hit_still_rereads_on_mtime_len_change() {
+        let _guard = lock_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let path = write_rollout(dir.path(), "2026/05/rollout-a.jsonl", "before", cwd.path());
+
+        let cold = cached_indexed_rollouts(dir.path());
+        assert_eq!(cold[0].meta.as_ref().unwrap().id, "before");
+
+        // Rewrite the SAME file in place with a different id + length, bumping its
+        // mtime, WITHOUT adding/removing a directory entry (signature unchanged).
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":\"{}\"}}}}\n",
+                "after-longer-id",
+                cwd.path().display()
+            ),
+        )
+        .unwrap();
+
+        let warm = cached_indexed_rollouts(dir.path());
+        assert_eq!(
+            warm[0].meta.as_ref().unwrap().id,
+            "after-longer-id",
+            "a signature-hit warm lookup must re-read a file whose (mtime, len) changed"
         );
     }
 
