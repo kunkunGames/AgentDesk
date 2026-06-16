@@ -280,6 +280,17 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Every resolver test here drives `resolve_codex_tui_session`, which reads
+    /// AND writes the process-global rollout index via `cached_indexed_rollouts`.
+    /// Without serialization a `session.rs` test could mutate `roots` between a
+    /// `rollout_index` test's reset and its cache-state assertion, making the
+    /// `codex_tui` suite nondeterministic under default parallel `cargo test`.
+    /// Share the SAME lock the `rollout_index` tests use (it also resets the
+    /// cache on acquisition) so the two modules can never interleave.
+    fn lock_cache_test() -> MutexGuard<'static, ()> {
+        super::super::rollout_index::lock_cache_for_tests()
+    }
+
     #[test]
     fn cleanup_best_effort_removes_codex_tui_home() {
         let _lock = lock_test_env();
@@ -318,6 +329,7 @@ mod tests {
 
     #[test]
     fn requested_session_with_matching_rollout_resumes() {
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let rollout = write_rollout(
@@ -340,6 +352,7 @@ mod tests {
 
     #[test]
     fn forced_fresh_ignores_requested_session_and_existing_rollout() {
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         write_rollout(dir.path(), "rollout-a.jsonl", "sess-1", cwd.path(), "");
@@ -357,6 +370,7 @@ mod tests {
 
     #[test]
     fn requested_session_without_matching_rollout_resolves_fresh() {
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         write_rollout(dir.path(), "rollout-a.jsonl", "other", cwd.path(), "");
@@ -374,6 +388,7 @@ mod tests {
 
     #[test]
     fn requested_session_with_only_codex_exec_rollout_resolves_fresh() {
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         write_rollout_with_source(
@@ -398,6 +413,7 @@ mod tests {
 
     #[test]
     fn multiple_candidates_select_newest_then_path_deterministically() {
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let _first = write_rollout(dir.path(), "b/rollout-b.jsonl", "sess-1", cwd.path(), "old");
@@ -418,7 +434,7 @@ mod tests {
     // the high-severity "stale cache resumes an older rollout" risk.
     #[test]
     fn warm_lookup_picks_up_newer_rollout_after_first_resolve() {
-        super::super::rollout_index::reset_cache_for_tests();
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let first = write_rollout(
@@ -461,7 +477,7 @@ mod tests {
     // files are rollout candidates.
     #[test]
     fn shared_discovery_primitive_matches_direct_scan() {
-        super::super::rollout_index::reset_cache_for_tests();
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let a = write_rollout(dir.path(), "2026/05/rollout-a.jsonl", "s1", cwd.path(), "");
@@ -488,7 +504,7 @@ mod tests {
     // alter selection semantics.
     #[test]
     fn indexed_lookup_still_excludes_codex_exec_rollouts() {
-        super::super::rollout_index::reset_cache_for_tests();
+        let _cache = lock_cache_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         write_rollout_with_source(
