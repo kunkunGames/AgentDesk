@@ -591,6 +591,19 @@ fn wait_for_resumed_rollout_for_session(
     }
 }
 
+/// Newest rollout transcript under `sessions_dir` whose `session_meta` cwd
+/// matches `cwd` and whose mtime is at/after `modified_since`.
+///
+/// Routed through [`cached_indexed_rollouts`](super::rollout_index::cached_indexed_rollouts)
+/// so the follow-up readiness path (`tui_followup.rs`, which has no provider
+/// session id) and the launch wait loop reuse the process-lifetime index instead
+/// of re-walking `~/.codex/sessions` and re-parsing every header on every probe.
+/// Selection semantics are identical to the legacy direct scan: the index
+/// supplies the same `(mtime, len)` projection and parsed `session_meta`, and the
+/// cwd match still canonicalizes the header's raw cwd against `cwd` exactly as
+/// the former `rollout_session_cwd_matches` did. Files with no parseable
+/// `session_meta` carry `meta == None` in the index and are skipped, matching the
+/// old `false` return from the header scan.
 pub fn latest_rollout_for_cwd_since(
     cwd: &Path,
     modified_since: SystemTime,
@@ -598,24 +611,23 @@ pub fn latest_rollout_for_cwd_since(
 ) -> Option<PathBuf> {
     let canonical_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut best: Option<(SystemTime, PathBuf)> = None;
-    for path in rollout_files_under(sessions_dir) {
-        let Some(modified) = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .ok()
-        else {
-            continue;
-        };
-        if modified < modified_since {
+    for item in super::rollout_index::cached_indexed_rollouts(sessions_dir) {
+        if item.modified < modified_since {
             continue;
         }
-        if !rollout_session_cwd_matches(&path, &canonical_cwd) {
+        let Some(meta) = item.meta.as_ref() else {
+            continue;
+        };
+        let session_cwd =
+            std::fs::canonicalize(&meta.cwd).unwrap_or_else(|_| PathBuf::from(&meta.cwd));
+        if session_cwd != canonical_cwd {
             continue;
         }
         if best
             .as_ref()
-            .is_none_or(|(best_modified, _)| modified > *best_modified)
+            .is_none_or(|(best_modified, _)| item.modified > *best_modified)
         {
-            best = Some((modified, path));
+            best = Some((item.modified, item.path));
         }
     }
     best.map(|(_, path)| path)
