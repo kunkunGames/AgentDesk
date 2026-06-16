@@ -42,15 +42,14 @@ const SNAPSHOT_STARTUP_TAIL_LIMIT: usize = 256;
 
 /// REQ-006: conservative active-session leak threshold. A real fan-out can keep
 /// several concurrent leases on one warm server, so we only treat an elevated
-/// lease count as *suspicious evidence* when the server is also dead or has been
-/// idle past [`SNAPSHOT_LEAK_IDLE_SECS`]. This is evidence-only and never
-/// mutates the pool (no kill, no `active_sessions` decrement).
+/// lease count as *suspicious evidence* when the server's process is also dead —
+/// leases cannot legitimately be active on an `opencode serve` that has exited.
+/// We deliberately do NOT use an idle-window signal here: `idle_secs` is derived
+/// from `last_used`, which is not refreshed while sessions are streaming, so it
+/// would false-positive on a busy server fanning out long-running turns. This is
+/// evidence-only and never mutates the pool (no kill, no `active_sessions`
+/// decrement).
 const SNAPSHOT_ACTIVE_LEAK_THRESHOLD: u32 = 8;
-
-/// REQ-006: a warm server with an elevated lease count is only flagged once it
-/// has also been idle this long (or has a dead process). Avoids flagging normal
-/// in-use multi-session reuse.
-const SNAPSHOT_LEAK_IDLE_SECS: u64 = 300;
 
 #[derive(Debug, Default)]
 struct OpenCodeStartupOutput {
@@ -252,35 +251,72 @@ fn port_from_base_url(base_url: &str) -> Option<u32> {
         .and_then(|port| port.parse::<u32>().ok())
 }
 
+/// Whether a token key (the portion before a `=` or `:` delimiter) names a
+/// secret-bearing field whose value must be redacted.
+fn is_secret_key(key: &str) -> bool {
+    let key_lower = key.to_ascii_lowercase();
+    key_lower.contains("password")
+        || key_lower.contains("secret")
+        || key_lower.contains("token")
+        || key_lower.contains("auth")
+}
+
+fn is_auth_scheme_marker(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    lower == "basic" || lower == "bearer"
+}
+
 /// Scrub obvious credential material from a startup-output line before it is
 /// exposed in the DETAILED tail. Conservative: redacts the value portion of
-/// known secret-bearing tokens. The public payload never carries this tail at
-/// all, so this is defense-in-depth for the authenticated/local surface.
+/// known secret-bearing tokens. Handles both `key=value` and colon-delimited
+/// (`key: value` / `key:value`) forms, plus bare `Basic`/`Bearer` schemes. The
+/// public payload never carries this tail at all, so this is defense-in-depth
+/// for the authenticated/local surface.
 fn scrub_startup_secrets(raw: &str) -> String {
     let mut out: Vec<String> = Vec::new();
-    // When the previous token was an auth scheme marker (`Basic`/`Bearer`), the
-    // immediately following token is its opaque credential value and must be
-    // redacted too.
+    // When the previous token requested redaction of the following value
+    // (`Basic`/`Bearer` scheme, or a secret key with the value in the next
+    // token such as `token: abc`), redact the next token. If that redacted
+    // token is itself a scheme marker (e.g. `auth: Bearer abc`), keep redacting
+    // so the scheme's opaque value does not leak.
     let mut redact_next = false;
     for token in raw.split(' ') {
         if redact_next {
+            // Carry the redaction forward when this value is a scheme marker so
+            // the *next* token (the actual credential) is also redacted.
+            redact_next = is_auth_scheme_marker(token);
             out.push("[REDACTED]".to_string());
-            redact_next = false;
             continue;
         }
-        let lower = token.to_ascii_lowercase();
+
+        // `key=value`
         if let Some(eq) = token.find('=') {
-            let key_lower = token[..eq].to_ascii_lowercase();
-            if key_lower.contains("password")
-                || key_lower.contains("secret")
-                || key_lower.contains("token")
-                || key_lower.contains("auth")
-            {
+            if is_secret_key(&token[..eq]) {
                 out.push(format!("{}=[REDACTED]", &token[..eq]));
                 continue;
             }
         }
-        if lower == "basic" || lower == "bearer" {
+
+        // `key:value` or `key:` (colon-delimited). Only treat a leading-key
+        // colon as a delimiter (skip URLs like `http://...` and bare schemes,
+        // which are handled below / never match `is_secret_key`).
+        if let Some(colon) = token.find(':') {
+            let key = &token[..colon];
+            if is_secret_key(key) {
+                let value = &token[colon + 1..];
+                if value.is_empty() {
+                    // `token:` — value is the next whitespace-separated token.
+                    out.push(format!("{key}:"));
+                    redact_next = true;
+                } else {
+                    // `token:abc` — value is inline.
+                    out.push(format!("{key}:[REDACTED]"));
+                }
+                continue;
+            }
+        }
+
+        if is_auth_scheme_marker(token) {
             // Keep the scheme marker for readability but redact its value next.
             out.push(token.to_string());
             redact_next = true;
@@ -310,11 +346,19 @@ fn snapshot_startup_tail(
     (Some(hash), Some(tail))
 }
 
-fn compute_suspicious_active_leak(active_sessions: u32, idle_secs: u64, running: bool) -> bool {
+fn compute_suspicious_active_leak(active_sessions: u32, _idle_secs: u64, running: bool) -> bool {
     if active_sessions <= SNAPSHOT_ACTIVE_LEAK_THRESHOLD {
         return false;
     }
-    !running || idle_secs >= SNAPSHOT_LEAK_IDLE_SECS
+    // `idle_secs` (derived from `last_used`) is only refreshed when a lease is
+    // acquired or dropped — NOT while active sessions are streaming. A busy
+    // server fanning out >8 long-running turns therefore looks "idle" even
+    // though it is legitimately working, so the idle window must NOT flag a
+    // server that is still running. An elevated lease count is only treated as a
+    // suspicious leak when the process is dead: leases cannot be making progress
+    // on an `opencode serve` that has exited, so a high count there is a genuine
+    // never-released-lease leak rather than normal in-use fan-out.
+    !running
 }
 
 impl OpenCodeWarmServer {
@@ -2623,6 +2667,33 @@ mod tests {
         assert!(tail.chars().count() <= SNAPSHOT_STARTUP_TAIL_LIMIT);
     }
 
+    /// Colon-delimited secret labels (`token: x`, `auth: Bearer x`, inline
+    /// `password:x`) must also be redacted, not just `key=value` forms.
+    #[test]
+    fn scrub_startup_secrets_redacts_colon_delimited_forms() {
+        // `token: value` — value is the next whitespace-separated token.
+        let s = scrub_startup_secrets("starting token: abc123secret done");
+        assert!(!s.contains("abc123secret"), "leaked colon-space token: {s}");
+        assert!(s.contains("token: [REDACTED]"), "got: {s}");
+        assert!(s.contains("done"));
+
+        // `auth: Bearer value` — both the scheme marker's value and the
+        // credential must be redacted, leaving no plaintext credential.
+        let s = scrub_startup_secrets("auth: Bearer xyzcredential rest");
+        assert!(!s.contains("xyzcredential"), "leaked bearer value: {s}");
+        assert!(s.contains("rest"));
+
+        // Inline `password:value` (no space).
+        let s = scrub_startup_secrets("password:hunter2 ok");
+        assert!(!s.contains("hunter2"), "leaked inline colon value: {s}");
+        assert!(s.contains("password:[REDACTED]"), "got: {s}");
+        assert!(s.contains("ok"));
+
+        // A non-secret colon token (e.g. a URL) is left intact.
+        let s = scrub_startup_secrets("listening http://127.0.0.1:8080 ready");
+        assert!(s.contains("http://127.0.0.1:8080"), "mangled url: {s}");
+    }
+
     /// [TEST-006] empty pool is cold-start safe: returns empty, no panic.
     #[test]
     fn warm_server_snapshots_empty_pool_is_cold_start_safe() {
@@ -2665,10 +2736,13 @@ mod tests {
             0,
             false
         ));
-        // Above threshold AND idle past the window: flagged.
-        assert!(compute_suspicious_active_leak(
+        // Above threshold, running, but stale `idle_secs` (large value): still
+        // NOT flagged. `idle_secs` is unreliable while sessions are active
+        // because `last_used` is not refreshed mid-stream, so a busy fan-out of
+        // long-running turns must not be reported as a leak.
+        assert!(!compute_suspicious_active_leak(
             SNAPSHOT_ACTIVE_LEAK_THRESHOLD + 1,
-            SNAPSHOT_LEAK_IDLE_SECS,
+            10_000,
             true
         ));
     }
