@@ -1,5 +1,17 @@
 use super::*;
 
+/// Codex rollout-state tests below drive `observe_codex_tui_rollout_state_for_cwd_with_sessions`,
+/// whose no-session-id and provider-session-id paths now read/write the
+/// process-global rollout index (`cached_indexed_rollouts`). Share the SAME lock
+/// the `rollout_index` / `session` cache tests use so a rollout-state test cannot
+/// mutate `roots` between another cache test's reset and its empty-state
+/// assertion under default parallel `cargo test`. The guard also resets the cache
+/// on acquisition, isolating each test.
+#[cfg(unix)]
+fn lock_rollout_cache_test() -> std::sync::MutexGuard<'static, ()> {
+    crate::services::codex_tui::rollout_index::lock_cache_for_tests()
+}
+
 #[test]
 fn session_strategy_lifecycle_event_records_fresh_and_resumed_details() {
     let fresh = session_strategy_lifecycle_event(None, "no_cached_provider_session", None);
@@ -536,6 +548,7 @@ fn codex_busy_preflight_keeps_codex_readiness_wait() {
 #[cfg(unix)]
 #[test]
 fn codex_rollout_idle_state_allows_followup() {
+    let _cache = lock_rollout_cache_test();
     // observe_codex_tui_rollout_state_for_cwd_with_sessions returns Idle
     // when the most recent rollout envelope signals task_complete.
     let cwd = tempfile::tempdir().expect("create temp cwd");
@@ -602,6 +615,7 @@ fn codex_rollout_user_submitted_blocks_followup() {
 #[cfg(unix)]
 #[test]
 fn codex_rollout_no_file_treats_as_idle() {
+    let _cache = lock_rollout_cache_test();
     // When no rollout file exists for the cwd, the gate must not fire
     // (session hasn't started yet or cwd doesn't match any rollout).
     let cwd = tempfile::tempdir().expect("create temp cwd");
@@ -624,6 +638,7 @@ fn codex_rollout_no_file_treats_as_idle() {
 #[cfg(unix)]
 #[test]
 fn codex_rollout_provider_session_id_wins_over_newer_same_cwd_rollout() {
+    let _cache = lock_rollout_cache_test();
     let cwd = tempfile::tempdir().expect("create temp cwd");
     let sessions = tempfile::tempdir().expect("create temp sessions dir");
     let selected_rollout = sessions.path().join("rollout-selected-idle.jsonl");
@@ -765,6 +780,7 @@ fn codex_rollout_runtime_binding_cross_cwd_is_unknown() {
 #[cfg(unix)]
 #[test]
 fn codex_rollout_without_binding_or_session_is_unknown_when_same_cwd_rollout_exists() {
+    let _cache = lock_rollout_cache_test();
     let cwd = tempfile::tempdir().expect("create temp cwd");
     let sessions = tempfile::tempdir().expect("create temp sessions dir");
     let rollout_path = sessions.path().join("rollout-ambiguous.jsonl");
@@ -797,6 +813,7 @@ fn codex_rollout_without_binding_or_session_is_unknown_when_same_cwd_rollout_exi
 #[cfg(unix)]
 #[test]
 fn codex_rollout_without_binding_or_session_conservatively_blocks_busy_same_cwd_rollout() {
+    let _cache = lock_rollout_cache_test();
     let cwd = tempfile::tempdir().expect("create temp cwd");
     let sessions = tempfile::tempdir().expect("create temp sessions dir");
     let rollout_path = sessions.path().join("rollout-ambiguous-busy.jsonl");
