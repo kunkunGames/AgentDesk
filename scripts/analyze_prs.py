@@ -66,6 +66,10 @@ for pr in prs:
         print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
     if "skipped checks" not in body:
         print("  [!] MISSING SKIPPED CHECKS: PR body fails to mention 'skipped checks' with reasons.")
+    if "risk" not in body:
+        print("  [!] MISSING RISK: PR body fails to mention 'risk' assessment.")
+    if "rollback notes" not in body:
+        print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
 
     # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
     is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
@@ -93,6 +97,8 @@ for pr in prs:
     # PR #199/#200/#201 lesson: check for multiple inventory refreshes
     if "inventory" in title.lower() and "refresh" in title.lower():
         inventory_refresh_count += 1
+        if "duplicate-pr guard" not in body and "duplicate pr guard" not in body:
+            print("  [!] MISSING DUPLICATE PR GUARD: Inventory refresh PR body fails to mention 'duplicate-pr guard'.")
 
 if inventory_refresh_count > 1:
     print("\n[!] WARNING: Multiple open inventory refresh PRs detected. Ensure strict duplicate-PR guard is followed.")
