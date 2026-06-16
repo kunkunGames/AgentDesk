@@ -1,0 +1,30 @@
+What changed:
+Removed stale `direct_discord_sends` entries from `scripts/audit_allowlist.toml` that no longer match any findings reported by the maintainability audit.
+
+Why:
+PR #218 established that stale allowlist rows are guard debt, not harmless metadata. Cleaning these up ensures the `direct_discord_sends` hard gate accurately reflects the current codebase and catches regressions.
+
+WorkFingerprint:
+- Agent: Gatekeeper
+- Category Boundary: scripts/audit_allowlist.toml
+- Primary Files: scripts/audit_allowlist.toml
+- Invariant Protected: Stale maintainability allowlist entries are removed to ensure the hard gate remains accurate.
+- Public API Impact: None
+- Docs Impact: None
+- Verification Plan: Run `python3 scripts/audit_maintainability.py --check` and confirm 0 count for `direct_discord_sends`, ensuring that no findings remain.
+
+Duplicate/Overlap check:
+I searched for branches using `git branch -r | grep gatekeeper` and did not find any open PRs from Gatekeeper modifying `audit_allowlist.toml` or running the allowlist maintenance task on `main`. There's no open PR dealing with removing stale `direct_discord_sends`.
+
+Verification Commands & Results:
+- `python3 scripts/audit_maintainability.py --check` ran successfully. Output confirmed `direct_discord_sends` count is 0 and the audit passed without errors.
+- `git diff --check` passed.
+
+Skipped Checks:
+No checks skipped.
+
+Risk:
+Low risk. This is a cleanup of dead metadata entries in an allowlist. The maintainability audit still passes.
+
+Rollback Notes:
+Revert the commit to restore the dead allowlist entries if needed.
