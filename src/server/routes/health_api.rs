@@ -326,25 +326,52 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
         (http_status, Json(json)).into_response()
     } else {
         // Standalone mode — no Discord providers
-        let status = if server_up {
+        let mut health_state = if server_up {
+            health::HealthStatus::Healthy
+        } else {
+            health::HealthStatus::Unhealthy
+        };
+        let mut degraded_reasons: Vec<serde_json::Value> = Vec::new();
+        if !server_up {
+            degraded_reasons.push(serde_json::json!("db_unavailable"));
+        }
+
+        // Resident OpenCode warm-pool diagnostics (additive, read-only). Mirror
+        // the registry branch above so a stopped or suspicious resident server
+        // degrades standalone health too — otherwise top-level `/api/health`
+        // and `/api/health/detail` could keep reporting `status: healthy` /
+        // `ok: true` while a bad warm server is surfaced under `opencode`.
+        // Per spec C-8 the `stopped_resident` reason is intentional worsening
+        // and is kept consistent with the registry branch.
+        for reason in opencode_warm_pool_degraded_reasons() {
+            health_state = health_state.worsen(health::HealthStatus::Degraded);
+            degraded_reasons.push(reason);
+        }
+
+        let status = if health_state.is_http_ready() {
             StatusCode::OK
         } else {
             StatusCode::SERVICE_UNAVAILABLE
         };
-        let health_status = if server_up { "healthy" } else { "unhealthy" };
+        let health_status =
+            serde_json::to_value(health_state).unwrap_or_else(|_| serde_json::json!("unhealthy"));
+        // `ok`/`fully_recovered` track full health: a degraded warm pool keeps
+        // the server HTTP-ready but is not "ok".
+        let healthy = health_state == health::HealthStatus::Healthy;
         let mut json = serde_json::json!({
             "status": health_status,
-            "ok": server_up,
+            "ok": healthy,
             "version": env!("CARGO_PKG_VERSION"),
             "db": server_up,
             "dashboard": dashboard_ok,
             "server_up": server_up,
-            "fully_recovered": server_up,
+            "fully_recovered": healthy,
             "deferred_hooks": 0,
             "outbox_age": outbox_age,
             "queue_depth": 0,
             "watcher_count": 0,
-            "recovery_duration": 0.0
+            "recovery_duration": 0.0,
+            "degraded_reasons": serde_json::Value::Array(degraded_reasons),
         });
         if let Some(snapshot) = disk_snapshot {
             json["disk_free_bytes"] = serde_json::json!(snapshot.free_bytes);
@@ -1865,6 +1892,25 @@ mod tests {
         assert!(!text.contains("startup_output_tail"));
         assert!(!text.contains("base_url"));
         assert!(!text.contains("abcdef0123456789"));
+    }
+
+    /// The standalone (no-HealthRegistry) branch now mirrors the registry
+    /// branch: when `opencode_warm_pool_degraded_reasons()` reports a bad warm
+    /// server it sets `status: "degraded"`, which the public projection turns
+    /// into `ok: false` / `degraded: true` instead of leaving health "healthy".
+    #[test]
+    fn public_health_json_degraded_status_reports_not_ok() {
+        let public = public_health_json(json!({
+            "status": "degraded",
+            "version": "0.1.2",
+            "db": true,
+            "dashboard": true,
+            "server_up": true,
+            "degraded_reasons": ["opencode_warm_server:stopped_resident:1"],
+        }));
+        assert_eq!(public["status"], json!("degraded"));
+        assert_eq!(public["ok"], json!(false));
+        assert_eq!(public["degraded"], json!(true));
     }
 
     #[test]
