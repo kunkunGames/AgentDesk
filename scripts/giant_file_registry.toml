@@ -88,7 +88,11 @@ grandfathered_baseline_paths = [
   # prod-giant, so it is removed from `grandfathered` and from the baseline
   # guard here (win-locked: a re-expanded config.rs cannot be
   # re-grandfathered — it would have to land as a full [[entry]] or shrink).
-  "src/services/discord/commands/diagnostics.rs",
+  # commands/diagnostics.rs dropped to 389 prod LoC in #3479 (report builders +
+  # snapshot/labeling helpers moved to commands/diagnostics/reports.rs); no
+  # longer a prod-giant, so it is removed from the frozen baseline as well as
+  # `grandfathered` (win-locked: a re-expanded diagnostics cannot be
+  # re-grandfathered — it would have to land as a full [[entry]] or shrink).
   "src/services/discord/commands/text_commands.rs",
   "src/services/discord/formatting.rs",
   # health.rs was decomposed in #3038 Phase A (2293 prod LoC -> 402-line module
@@ -110,8 +114,15 @@ grandfathered_baseline_paths = [
   "src/services/discord/tmux.rs",
   "src/services/discord/tmux_watcher.rs",
   "src/services/discord/tui_prompt_relay.rs",
-  "src/services/discord/turn_bridge/completion_guard.rs",
-  "src/services/discord/turn_bridge/tmux_runtime.rs",
+  # completion_guard.rs decomposed in #3479 (-> 872 prod LoC); win-locked out of
+  # both `grandfathered` and this frozen baseline (see note in `grandfathered`).
+  # turn_bridge/tmux_runtime.rs dropped to 964 prod LoC in #3479 (the pure
+  # interrupt-policy decisions, the ps-backed process-table discovery, and the
+  # OS-level PID-exit observation moved verbatim into tmux_runtime/ child
+  # modules); no longer a prod-giant, so it is removed from the frozen baseline
+  # as well as `grandfathered` below (win-locked: a re-expanded tmux_runtime
+  # cannot be re-grandfathered — it would have to land as a full [[entry]] or
+  # shrink). The split outputs stay sub-threshold and are not ratcheted.
   "src/services/discord/watchers/lifecycle.rs",
   "src/services/discord_config_audit.rs",
   "src/services/dispatched_sessions.rs",
@@ -195,7 +206,12 @@ grandfathered = [
   # prod-giant, so it is removed from `grandfathered` and from the baseline
   # guard here (win-locked: a re-expanded config.rs cannot be
   # re-grandfathered — it would have to land as a full [[entry]] or shrink).
-  "src/services/discord/commands/diagnostics.rs",
+  # commands/diagnostics.rs was decomposed in #3479 (1022 prod LoC -> 389-line
+  # module root commands/diagnostics/mod.rs + sub-1000-LoC commands/diagnostics/
+  # reports.rs); no longer a prod-giant, so it is removed from `grandfathered`
+  # and from the baseline guard above (win-locked: a re-expanded diagnostics
+  # cannot be re-grandfathered — it would have to land as a full [[entry]] or
+  # shrink). The split outputs stay sub-threshold and are not ratcheted.
   "src/services/discord/commands/text_commands.rs",
   "src/services/discord/formatting.rs",
   # health.rs was decomposed in #3038 Phase A (2293 prod LoC -> 402-line
@@ -215,8 +231,18 @@ grandfathered = [
   "src/services/discord/tmux.rs",
   "src/services/discord/tmux_watcher.rs",
   "src/services/discord/tui_prompt_relay.rs",
-  "src/services/discord/turn_bridge/completion_guard.rs",
-  "src/services/discord/turn_bridge/tmux_runtime.rs",
+  # completion_guard.rs was decomposed in #3479 (1834 prod LoC -> 872-line
+  # module root + completion_guard/{completion_postgres,completion_context}.rs,
+  # both sub-1000-LoC); no longer a prod-giant, so it is removed here AND from
+  # the frozen baseline above (win-locked: a re-expanded completion_guard.rs
+  # cannot be re-grandfathered). The split outputs stay sub-threshold and are
+  # not ratcheted.
+  # turn_bridge/tmux_runtime.rs was decomposed in #3479 (1545 prod LoC -> 964-line
+  # module root + sub-1000-LoC tmux_runtime/{interrupt_policy,process_table,
+  # pid_exit}.rs); no longer a prod-giant, so it is removed from `grandfathered`
+  # and from the baseline guard above (win-locked: a re-expanded tmux_runtime
+  # cannot be re-grandfathered — it would have to land as a full [[entry]] or
+  # shrink). The split outputs stay sub-threshold and are not ratcheted.
   "src/services/discord/watchers/lifecycle.rs",
   "src/services/discord_config_audit.rs",
   "src/services/dispatched_sessions.rs",
@@ -294,17 +320,11 @@ owner = "discord-finalizer"
 deadline = "2026-08-31"
 decompose_issue = "#3016"
 
-[[entry]]
-# Crossed the 1000-prod-LoC threshold when #3146 Part 1 added the idle-recap
-# active-turn gating: the shared clear helpers (capture-at-claim + CAS), the
-# `channel_has_active_turn` mailbox/inflight probe, and the `post_recheck_action`
-# seam. The card-lifecycle helpers (compose/post/clear/CAS/probe) are cohesive
-# but sizable; decompose the recap module into compose vs lifecycle/clear
-# submodules under #3036.
-file = "src/services/discord/idle_recap.rs"
-owner = "discord-recap"
-deadline = "2026-08-31"
-decompose_issue = "#3405"
+# NOTE: src/services/discord/idle_recap.rs previously had an [[entry]] here; #3479
+# extracted the scrollback-capture/Haiku-summarizer and token-context-display
+# clusters into `idle_recap/scrollback.rs` and `idle_recap/context_display.rs`,
+# dropping its production LoC below the giant threshold. Its entry (and ratchet
+# baseline) were removed to avoid a ghost registration.
 
 # NOTE: src/services/discord/turn_bridge/terminal_delivery.rs previously had an
 # [[entry]] here; the #3028 splitter fix dropped its production LoC below the

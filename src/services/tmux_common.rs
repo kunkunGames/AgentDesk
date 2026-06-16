@@ -49,6 +49,13 @@ fn tmux_lines_after_claude_prompt_show_completed_history(lines: &[&str]) -> bool
 }
 
 fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) -> bool {
+    // POST-FINISH idle ghost chrome ONLY (see
+    // `tmux_capture_indicates_claude_tui_actively_streaming`). A `Tools: 0 done`
+    // footer is deliberately NOT treated as busy here: a turn that finished having
+    // run zero tools also prints it, and suppressing that broke idle/draft
+    // detection for 0-tool turns (#3524). The freshly-submitted-vs-idle guard
+    // (a just-submitted prompt must not read as READY) lives in the
+    // `ready_for_input` caller via `..._show_freshly_submitted_footer` (#3463).
     let busy = lines.iter().any(|line| {
         let trimmed = trim_prompt_line(line);
         let lower = trimmed.to_ascii_lowercase();
@@ -56,12 +63,6 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
             || lower.contains("processing")
             || lower.contains("thinking")
             || lower.contains("running")
-            // `Tools: 0 done` is a freshly-submitted, still-starting turn (no tools
-            // run yet), NOT idle chrome. Without this, a just-submitted prompt
-            // followed by a separator + the `bypass permissions` banner would
-            // satisfy `idle_footer` (via the banner) and read as ready, letting a
-            // follow-up inject into a turn that has not produced output yet (#3463).
-            || trimmed.contains("Tools: 0 done")
     });
     if busy {
         return false;
@@ -89,6 +90,18 @@ fn tmux_lines_after_claude_prompt_show_idle_suggestion_chrome(lines: &[&str]) ->
     separator && idle_footer
 }
 
+/// #3463/#3524: a just-submitted prompt's footer shows `Tools: 0 done` (no tools
+/// run yet) while output has not begun. For READINESS this is a RUNNING signal —
+/// a follow-up must not inject into it — but it is NOT a post-finish idle signal
+/// (a turn that finished having run zero tools also prints `Tools: 0 done`), so
+/// this guard lives only in the `ready_for_input` caller, never in the shared
+/// idle-suggestion chrome detector (which by design reports post-finish ghost).
+fn tmux_lines_after_claude_prompt_show_freshly_submitted_footer(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|line| trim_prompt_line(line).contains("Tools: 0 done"))
+}
+
 pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -> bool {
     let non_empty = capture
         .lines()
@@ -111,6 +124,29 @@ pub(crate) fn tmux_capture_indicates_claude_tui_ready_for_input(capture: &str) -
         .any(|l| tmux_line_is_claude_tui_ready_prompt(l))
     {
         return true;
+    }
+
+    // #3463/#3524: if the BOTTOM-most prompt is a just-submitted, still-running
+    // turn (footer shows `Tools: 0 done` with no produced output after it), the
+    // pane is NOT ready — even when an older completed prompt sits higher in the
+    // scrollback. Checked GLOBALLY on the latest prompt so the `.any` scan below
+    // cannot flip readiness via an earlier historical prompt whose own
+    // `after_prompt` happens to contain completed output (codex #3524). A
+    // bypass-permissions banner alone would otherwise satisfy idle chrome and let
+    // a follow-up inject into a turn that has not produced output (#3463).
+    // Empty-composer ready panes are already returned above; a finished 0-tool
+    // turn (idle suggestion) is intentionally not-ready here but is still
+    // reported by `tmux_capture_indicates_claude_tui_idle_suggestion`.
+    if let Some(last_prompt_idx) = recent_forward
+        .iter()
+        .rposition(|line| trim_prompt_line(line).starts_with(CLAUDE_TUI_PROMPT_MARKER))
+    {
+        let tail = &recent_forward[last_prompt_idx + 1..];
+        if tmux_lines_after_claude_prompt_show_freshly_submitted_footer(tail)
+            && !tmux_lines_after_claude_prompt_show_completed_history(tail)
+        {
+            return false;
+        }
     }
 
     recent_forward
@@ -212,6 +248,31 @@ pub(crate) fn tmux_capture_indicates_claude_tui_busy(capture: &str) -> bool {
         // assistant body text does NOT trip it.
         tmux_line_is_claude_tui_spinner_progress(trimmed)
     }) || tmux_recent_lines_show_claude_tui_active_work(recent)
+}
+
+/// #3521: `true` when the Claude TUI pane shows a BACKGROUND AGENT still pending — the
+/// `✻ Waiting for N background agent(s) to finish` footer, or a fresh `Backgrounded agent`
+/// spawn line. Distinct from `tmux_capture_indicates_claude_tui_busy`: a detached background
+/// agent leaves the FOREGROUND turn JSONL-idle (no `esc to interrupt`, no spinner) while it
+/// keeps running, so the completion gate must treat this as not-yet-idle to keep the live
+/// footer/turn alive — otherwise the turn finalizes and the panel vanishes mid-run (#3521).
+/// Markers are TUI chrome (`waiting for` + `background agent`, or `backgrounded agent`),
+/// anchored tightly so assistant body text that merely mentions a "background agent" (e.g.
+/// the voice handoff line) does NOT trip a false keep-alive.
+pub(crate) fn tmux_capture_indicates_claude_tui_background_agent_pending(capture: &str) -> bool {
+    let non_empty = capture
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>();
+    if non_empty.is_empty() {
+        return false;
+    }
+    let start = non_empty.len().saturating_sub(CLAUDE_TUI_ACTIVE_SCAN_LINES);
+    non_empty[start..].iter().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        (lower.contains("waiting for") && lower.contains("background agent"))
+            || lower.contains("backgrounded agent")
+    })
 }
 
 /// `true` when `line` is a Claude TUI spinner progress footer: a leading spinner
@@ -1183,6 +1244,52 @@ assistant output
     }
 
     #[test]
+    fn ready_for_input_rejects_freshly_submitted_prompt_with_bypass_banner() {
+        // #3463/#3524: the banner-present companion to
+        // `claude_prompt_draft_detector_treats_running_submitted_prompt_as_not_ready`.
+        // A just-submitted prompt (footer `Tools: 0 done`, no output produced
+        // yet) renders the `bypass permissions` banner, which on its own
+        // satisfies idle chrome. It must STILL NOT read as ready-for-input —
+        // otherwise a follow-up injects into a turn that has not produced output.
+        // This is what keeps #3524's idle-suggestion relaxation from regressing
+        // #3463; the freshly-submitted guard lives in `ready_for_input`, so a
+        // finished 0-tool turn (see `claude_idle_suggestion_prompt_is_not_prompt_draft`)
+        // is still reported as idle while this running one is not ready.
+        let capture = "\
+⏺ previous response
+✻ Brewed for 2s
+─────────────────────────────────────────────────────────────────────────────
+❯ direct prompt that has just been submitted
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ ██░░░░░░░░ │ 24%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
+  ⏵⏵ bypass permissions on";
+
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+    }
+
+    #[test]
+    fn ready_for_input_rejects_fresh_submit_below_older_completed_prompt() {
+        // codex #3524: the `.any` readiness scan must NOT let an OLDER historical
+        // prompt — whose own `after_prompt` contains completed output — flip
+        // readiness to true while the BOTTOM-most prompt is a just-submitted,
+        // still-running turn (`Tools: 0 done`, no output). Otherwise the #3463
+        // follow-up-injection race returns for multi-prompt panes.
+        let capture = "\
+❯ previous prompt
+⏺ previous response
+✻ Brewed for 2s
+─────────────────────────────────────────────────────────────────────────────
+❯ direct prompt that has just been submitted
+─────────────────────────────────────────────────────────────────────────────
+  🤖 Opus(H) │ ██░░░░░░░░ │ 24%
+  CLAUDE.md: 1, MCP: 2 │ Tools: 0 done
+  ⏵⏵ bypass permissions on";
+
+        assert!(!tmux_capture_indicates_claude_tui_ready_for_input(capture));
+    }
+
+    #[test]
     fn claude_idle_suggestion_prompt_is_not_prompt_draft() {
         let capture = "\
 ⏺ TUI-E2E marker
@@ -1351,6 +1458,26 @@ another line of prior output";
         assert!(!tmux_capture_indicates_claude_tui_busy(capture));
         assert!(!tmux_capture_indicates_claude_tui_actively_streaming(
             capture
+        ));
+    }
+
+    #[test]
+    fn background_agent_pending_detects_chrome_not_body_text() {
+        // #3521: the `✻ Waiting for N background agent to finish` footer and the
+        // `Backgrounded agent` spawn line ARE detected (keep the turn/footer alive);
+        // foreground-idle panes and assistant prose merely mentioning a background
+        // agent are NOT (no false keep-alive → no stuck turn).
+        assert!(tmux_capture_indicates_claude_tui_background_agent_pending(
+            "⏺ reading docs\n✻ Waiting for 1 background agent to finish\n❯ "
+        ));
+        assert!(tmux_capture_indicates_claude_tui_background_agent_pending(
+            "⏺ Agent(read story)\n  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n❯ "
+        ));
+        assert!(!tmux_capture_indicates_claude_tui_background_agent_pending(
+            "⏺ done.\n❯ \n  🤖 Opus"
+        ));
+        assert!(!tmux_capture_indicates_claude_tui_background_agent_pending(
+            "I will hand that to the background agent.\n❯ "
         ));
     }
 

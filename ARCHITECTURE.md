@@ -361,6 +361,9 @@ src/
 │   │   └── session.rs
 │   ├── discord/
 │   │   ├── commands/
+│   │   │   ├── diagnostics/
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── reports.rs
 │   │   │   ├── inspect/
 │   │   │   │   ├── formatting.rs
 │   │   │   │   ├── mod.rs
@@ -375,7 +378,6 @@ src/
 │   │   │   ├── command_policy.rs
 │   │   │   ├── config.rs
 │   │   │   ├── control.rs
-│   │   │   ├── diagnostics.rs
 │   │   │   ├── fast_mode.rs
 │   │   │   ├── goals.rs
 │   │   │   ├── help.rs
@@ -404,6 +406,9 @@ src/
 │   │   │   ├── snapshot.rs
 │   │   │   ├── stall_liveness.rs
 │   │   │   └── watcher_respawn.rs
+│   │   ├── idle_recap/
+│   │   │   ├── context_display.rs
+│   │   │   └── scrollback.rs
 │   │   ├── inflight/
 │   │   │   ├── budget.rs
 │   │   │   ├── model.rs
@@ -449,10 +454,13 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── section_dedupe.rs
 │   │   ├── recovery_engine/
+│   │   │   ├── analytics_transcript.rs
 │   │   │   ├── jsonl_extract.rs
 │   │   │   ├── output_path_detect.rs
 │   │   │   ├── phase_policy.rs
-│   │   │   └── status_panel.rs
+│   │   │   ├── state_extractors.rs
+│   │   │   ├── status_panel.rs
+│   │   │   └── terminal_watcher.rs
 │   │   ├── recovery_paths/
 │   │   │   ├── controller_cutover.rs
 │   │   │   ├── mod.rs
@@ -469,6 +477,7 @@ src/
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
 │   │   │   │   ├── turn_lifecycle.rs
+│   │   │   │   ├── voice_announcement_route.rs
 │   │   │   │   ├── voice_announcement_scope.rs
 │   │   │   │   └── watchdog.rs
 │   │   │   ├── authorization.rs
@@ -505,9 +514,11 @@ src/
 │   │   │   ├── completion_gate.rs
 │   │   │   ├── completion_gate_tests.rs
 │   │   │   ├── liveness.rs
+│   │   │   ├── orphan_status_panel_cleanup.rs
 │   │   │   ├── panel_decisions.rs
 │   │   │   ├── placeholder_reclaim.rs
 │   │   │   ├── prompt_observe.rs
+│   │   │   ├── provider_session_persistence.rs
 │   │   │   ├── session_bound_ack.rs
 │   │   │   ├── session_bound_ack_tests.rs
 │   │   │   ├── single_message_footer.rs
@@ -525,10 +536,20 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── store.rs
 │   │   ├── tui_prompt_relay/
+│   │   │   ├── anchor_completion.rs
+│   │   │   ├── idle_offset_resolution.rs
 │   │   │   ├── idle_transcript_scan.rs
 │   │   │   ├── injected_prompt_policy.rs
+│   │   │   ├── launch_script.rs
 │   │   │   └── rehydration.rs
 │   │   ├── turn_bridge/
+│   │   │   ├── completion_guard/
+│   │   │   │   ├── completion_context.rs
+│   │   │   │   └── completion_postgres.rs
+│   │   │   ├── tmux_runtime/
+│   │   │   │   ├── interrupt_policy.rs
+│   │   │   │   ├── pid_exit.rs
+│   │   │   │   └── process_table.rs
 │   │   │   ├── cancel_finalize_policy.rs
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
@@ -536,8 +557,10 @@ src/
 │   │   │   ├── memory_lifecycle.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── output_lifecycle.rs
+│   │   │   ├── panel_lifecycle.rs
 │   │   │   ├── recall_feedback.rs
 │   │   │   ├── recovery_text.rs
+│   │   │   ├── response_delivery.rs
 │   │   │   ├── retry_state.rs
 │   │   │   ├── single_message_footer.rs
 │   │   │   ├── skill_usage.rs
@@ -545,6 +568,7 @@ src/
 │   │   │   ├── status_panel.rs
 │   │   │   ├── status_panel_tests.rs
 │   │   │   ├── streaming_edit_text.rs
+│   │   │   ├── task_notification_lifecycle.rs
 │   │   │   ├── terminal_controller_cutover.rs
 │   │   │   ├── terminal_delivery.rs
 │   │   │   ├── tmux_runtime.rs
@@ -573,7 +597,9 @@ src/
 │   │   ├── agent_handoff.rs
 │   │   ├── agentdesk_config.rs
 │   │   ├── answer_flush_barrier.rs
+│   │   ├── catch_up.rs
 │   │   ├── discord_io.rs
+│   │   ├── dispatch_policy.rs
 │   │   ├── formatting.rs
 │   │   ├── gateway.rs
 │   │   ├── health.rs
@@ -618,14 +644,12 @@ src/
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
 │   │   ├── settings.rs
-│   │   ├── shadow_parity_warn.rs
 │   │   ├── shared_memory.rs
 │   │   ├── shared_state.rs
 │   │   ├── single_message_panel.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
 │   │   ├── startup_reclaim.rs
-│   │   ├── status_panel_controller.rs
 │   │   ├── status_panel_orphan_store.rs
 │   │   ├── steering.rs
 │   │   ├── streaming_finalizer.rs
@@ -652,8 +676,7 @@ src/
 │   │   ├── voice_config_cache.rs
 │   │   ├── voice_id_sequences.rs
 │   │   ├── voice_routing.rs
-│   │   ├── voice_sensitivity.rs
-│   │   └── watcher_panel_parity.rs
+│   │   └── voice_sensitivity.rs
 │   ├── dispatches/
 │   │   ├── discord_delivery/
 │   │   │   ├── guard.rs

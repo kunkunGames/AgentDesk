@@ -64,7 +64,10 @@
 # clusters in the root) deliberately STAYS here; moved unit tests live in sibling
 # utf8_chunk_decoder_tests.rs / terminal_readiness_tests.rs (excluded from the
 # production splitter).
-"src/services/discord/tmux_watcher.rs" = 7241
+# #3479 SPC-shadow removal: lowered 6939 -> 6922 (deleted the dead StatusPanelController
+# shadow-parity calls — 2x shadow_adopt_liveness_reacquired_panel + assert_watcher_create_parity;
+# legacy reacquire/create/edit IO unchanged).
+"src/services/discord/tmux_watcher.rs" = 6922
 # #3038 tmux_watcher S1 child modules, frozen at landed production LoC.
 "src/services/discord/tmux_watcher/commit_decisions.rs" = 140
 "src/services/discord/tmux_watcher/completion_gate.rs" = 275
@@ -114,7 +117,7 @@
 # spawn_watcher_orphan_spinner_cleanup_retry) into
 # `turn_bridge/watcher_orphan_cleanup.rs` (both re-exported, call sites
 # byte-identical). Locks in the shrink win (ratchet down only).
-"src/services/discord/turn_bridge/mod.rs" = 6535
+"src/services/discord/turn_bridge/mod.rs" = 6189
 # #3038 turn_bridge S1 child modules, frozen at landed production LoC.
 "src/services/discord/turn_bridge/headless_delivery.rs" = 415
 "src/services/discord/turn_bridge/status_panel.rs" = 437
@@ -139,7 +142,15 @@
 # #3038 S5: lowered 4967 -> 4944 (-23) as the cluster-G runtime HTTP cache
 # fields plus the `serenity_http_or_token_fallback` accessor moved into
 # `shared_state::RuntimeHttpCache`. Locks in the shrink win (ratchet down only).
-"src/services/discord/mod.rs" = 4979
+# #3479 item-2 (behavior-preserving extraction): the catch-up subsystem
+# (restart-gap message recovery — classify/scan/enqueue + its tests) moved
+# verbatim to the capped sibling `catch_up.rs`, lowering the frozen baseline
+# 4979 -> 4243 (-736). Locks in the shrink win (#3028 ratchet down only).
+# #3479: the dispatch-policy cluster (monitor-auto-turn origin marker codec,
+# stale-dispatch turn gating + its tests, allowed-turn-sender / bot-user-id
+# resolvers, phase2 recovery predicate) moved verbatim to the capped sibling
+# `dispatch_policy.rs`, lowering the frozen baseline 4243 -> 4074 (-169).
+"src/services/discord/mod.rs" = 4074
 # #3305: the local-only pass-through lifecycle-skip (kind hoist + note-only return
 # branch + idle-loop skip) is offset by comment dedup in the same root, lowering the
 # frozen baseline 5438 -> 5429 (-9). Locks in the shrink win (#3028 ratchet).
@@ -156,7 +167,20 @@
 # `tui_prompt_relay/rehydration.rs` (~296 LoC), both reached via re-import so the
 # call sites stay byte-identical. Lowers the frozen baseline 5142 -> 4630 (-512).
 # Locks in the shrink win (zero logic change).
-"src/services/discord/tui_prompt_relay.rs" = 4630
+# #3479 item-2 (behavior-preserving extraction): the live-relay TUI-direct prompt
+# anchor COMPLETION lifecycle (`⏳ → ✅`) cluster — the visibility gate, the
+# deferred `⏳`-completion drain decision, and the reaction-swap completers —
+# moved verbatim to `tui_prompt_relay/anchor_completion.rs` (213 prod LoC, below
+# the giant threshold), reached via re-import so the call sites stay
+# byte-identical. Lowers the frozen baseline 4630 -> 4458 (-172). Locks in the
+# shrink win (zero logic change).
+# #3479 launch-script (behavior-preserving extraction): the Claude TUI
+# launch-*script* parsing cluster (`ClaudeTuiLaunchInfo`, `parse_claude_tui_launch_script`
+# + `_content`, and the `shell_words_from_line` single-quote splitter) moved
+# verbatim to `tui_prompt_relay/launch_script.rs` (107 prod LoC, below the giant
+# threshold), reached via re-import so the call sites stay byte-identical. Lowers
+# the frozen baseline 4458 -> 4376 (-82). Locks in the shrink win (zero logic change).
+"src/services/discord/tui_prompt_relay.rs" = 4301
 # #3038: lowered 4728 -> 4657 (-71) as `SensitivityState` (definition + impl)
 # moved to the `voice_sensitivity` sibling module. Locks in the shrink win.
 # #3038 VoiceBargeInRuntime S1: lowered 4657 -> 4350 (-307) as the STT
@@ -194,7 +218,19 @@
 # #3479 r8: lowered 4090 -> 3718 (behavior-preserving extraction of the pure
 # output-path-detect, phase-policy, and jsonl-extract clusters into leaf modules
 # under recovery_engine/; zero logic change, call sites re-imported byte-identical).
-"src/services/discord/recovery_engine.rs" = 3718
+# #3479 item-2: lowered 3718 -> 3607 (behavior-preserving extraction of the
+# terminal-success watcher / recovery start-offset helper cluster into the leaf
+# module recovery_engine/terminal_watcher.rs; zero logic change, externally-called
+# helpers re-imported byte-identical).
+# #3479 item-2: lowered 3607 -> 3424 (behavior-preserving extraction of the
+# inflight-state derivation helper cluster — handoff message, ready-for-input
+# probes, worktree path/branch/info derivation, spawn-cwd — into the leaf module
+# recovery_engine/state_extractors.rs; zero logic change, `save_missing_session_handoff`
+# re-exported and root-called helpers re-imported byte-identical).
+# #3479 SPC-shadow removal: lowered 3330 -> 3276 (deleted the dead StatusPanelController
+# recovery-completion shadow block + assert_recovery_completion_parity fn + its dead test;
+# legacy completion_target let-else and complete_status_panel_v2_with_http IO unchanged).
+"src/services/discord/recovery_engine.rs" = 3276
 # #3034 batch-8: lowered 3771 -> 3770 (dead-code removal).
 # #3038 S1: +1 (3770 -> 3771) for the mechanical `shared.queued_placeholders` ->
 # `shared.queued.queued_placeholders` re-wire (one extra method-chain line) forced
@@ -202,7 +238,7 @@
 # FIX #6 (Codex P2): +6 (3771 -> 3777) for the `set_followup_requeue_context`
 # call that persists the originating Intervention's reply/upload/voice context on
 # the follow-up inflight row so a PRE-submit busy-timeout requeue can rebuild it.
-"src/services/discord/router/message_handler/intake_turn.rs" = 3769
+"src/services/discord/router/message_handler/intake_turn.rs" = 3671
 "src/services/discord/meeting_orchestrator.rs" = 3227
 # #3293: +3 for the `registry_purge` child-module declaration (peek +
 # operator-gated idle-entry purge live outside the frozen root); lowered
@@ -266,23 +302,26 @@
 # its ratchet entry is deleted (win; no baseline raises).
 # #3034 batch-8: lowered 2333 -> 2332 (dropped `assistant_turns` construction site).
 "src/services/discord/watchers/lifecycle.rs" = 2332
-# #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
-# `clear_idle_recap_for_channel_with` (test seam; prod wrappers removed).
-"src/services/discord/idle_recap.rs" = 1320
+# #3479: idle_recap.rs decomposed (scrollback + context_display submodules) —
+# dropped below the giant threshold, so its ratchet entry is deleted (win; no
+# baseline raises).
 # #3034 batch-8: lowered 2241 -> 2011 (deleted the dead #826/#897/#898 bg-trigger
 # notify-outbox subsystem — build/enqueue/reconcile/parse/rollback).
 # suppressed-label noise, user report 2026-06-12: +38 for provider-aware
 # status/footer stripping in the placeholder suppression decisions.
 "src/services/discord/tmux.rs" = 2049
-# #3034 batch-8: lowered 1849 -> 1834 (deleted dead `build_verdict_payload`).
-"src/services/discord/turn_bridge/completion_guard.rs" = 1834
+# completion_guard.rs decomposed in #3479 (1834 -> 872 prod LoC); dropped below
+# the giant threshold, so its ratchet baseline is retired (no longer tracked).
 # #3034 batch-8: lowered 1781 -> 1753 (deleted the dead `assistant_turns` turn-cap
 # tracker — field + 3 methods + construction sites).
 "src/services/discord/session_runtime.rs" = 1753
 # #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
 # `session_bound_terminal_delivery_route_decision` (#3041 route decision, tested).
 "src/services/discord/session_relay_sink.rs" = 1731
-"src/services/discord/turn_bridge/tmux_runtime.rs" = 1545
+# #3479: turn_bridge/tmux_runtime.rs decomposed into tmux_runtime/ directory
+# modules (root tmux_runtime.rs 964 prod LoC + sub-1000-LoC
+# tmux_runtime/{interrupt_policy,process_table,pid_exit}.rs) — dropped below the
+# giant threshold, so its ratchet entry is deleted (win; no baseline raises).
 "src/services/discord/commands/text_commands.rs" = 1493
 # terminal_delivery.rs dropped to 504 prod LoC after the #3028 splitter fix
 # (its inline test mod was previously miscounted as production), so it is no
@@ -305,7 +344,10 @@
 # no longer a prod-giant; the entry stays ratcheted at the landed value so a
 # re-expansion past it fails the gate (runtime_bootstrap.rs precedent, #3038).
 "src/services/discord/commands/config.rs" = 954
-"src/services/discord/commands/diagnostics.rs" = 1026
+# #3479: diagnostics.rs decomposed into commands/diagnostics/ directory modules
+# (root commands/diagnostics/mod.rs 389 prod LoC + sub-1000-LoC
+# commands/diagnostics/reports.rs) — dropped below the giant threshold, so its
+# ratchet entry is deleted (win; no baseline raises).
 
 # #3038 slice 1: decision_route.rs (4392 prod LoC) was decomposed into a
 # 139-line module root + 8 directory modules. #3038 review-decision S1 lowers

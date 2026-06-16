@@ -4,6 +4,7 @@ mod context_window;
 mod headless_delivery;
 mod memory_lifecycle;
 mod output_lifecycle;
+mod panel_lifecycle;
 mod recall_feedback;
 mod recovery_text;
 mod retry_state;
@@ -12,6 +13,7 @@ mod skill_usage;
 mod stale_resume;
 mod status_panel;
 mod streaming_edit_text;
+mod task_notification_lifecycle;
 mod terminal_controller_cutover;
 mod terminal_delivery;
 mod tmux_runtime;
@@ -19,6 +21,18 @@ mod turn_analytics;
 mod voice_completion;
 mod watcher_handoff;
 mod watcher_orphan_cleanup;
+// #3479: the pure response-delivery + transcript-event helpers (the transcript
+// event-recording filter, the response-after-offset slice, the terminal delivery
+// sanitization+fallback builder, and the full-terminal-replay predicate) moved
+// verbatim to a capped sibling module. All four are `pub(super)` and re-imported
+// below so this parent's call sites (and the inline test modules) stay
+// byte-identical; deps are reached via `use super::*;` (the two discord-level
+// `super::` refs become `super::super::` from the child).
+mod response_delivery;
+use response_delivery::{
+    done_result_requires_full_terminal_replay, push_transcript_event,
+    response_portion_after_offset, terminal_delivery_response_after_offset,
+};
 
 use super::gateway::TurnGateway;
 use super::restart_report::{RestartCompletionReport, clear_restart_report, save_restart_report};
@@ -40,6 +54,10 @@ use crate::services::observability::session_inventory::{
 };
 use crate::services::provider::cancel_requested;
 use output_lifecycle::{BridgeOutputOwner, classify_bridge_output_owner};
+use panel_lifecycle::{
+    child_progress_line, ensure_active_placeholder_card, first_request_line,
+    refresh_session_panel_line_from_lifecycle, refresh_task_panel_line_from_dispatch,
+};
 use std::collections::VecDeque;
 
 // Re-exports for pub(super) items used by sibling modules in the discord package
@@ -66,6 +84,11 @@ pub(in crate::services::discord) use status_panel::{
 pub(super) use streaming_edit_text::{
     bridge_pre_submission_tui_prompt_error, bridge_tui_transport_error_should_skip_quiescence,
     build_turn_bridge_streaming_edit_text,
+};
+pub(super) use task_notification_lifecycle::{
+    close_all_tracked_background_children, close_next_tracked_background_child,
+    merge_task_notification_kind, release_task_notification_kind,
+    task_notification_closes_background_child,
 };
 pub(crate) use tmux_runtime::TmuxCleanupPolicy;
 pub(super) use tmux_runtime::bind_cancel_token_tmux_runtime;
@@ -203,301 +226,6 @@ fn sync_inflight_restart_mode_from_cancel(
         None => inflight_state.clear_restart_mode(),
     }
     true
-}
-
-fn merge_task_notification_kind(
-    current: Option<TaskNotificationKind>,
-    new_kind: TaskNotificationKind,
-) -> Option<TaskNotificationKind> {
-    let priority = |kind: TaskNotificationKind| match kind {
-        TaskNotificationKind::Subagent => 0,
-        TaskNotificationKind::Background => 1,
-        TaskNotificationKind::MonitorAutoTurn => 2,
-    };
-
-    match current {
-        Some(existing) if priority(existing) >= priority(new_kind) => Some(existing),
-        _ => Some(new_kind),
-    }
-}
-
-fn release_task_notification_kind(
-    current: Option<TaskNotificationKind>,
-    closed_kind: TaskNotificationKind,
-) -> Option<TaskNotificationKind> {
-    match current {
-        Some(existing) if existing == closed_kind => None,
-        other => other,
-    }
-}
-
-async fn close_next_tracked_background_child(
-    pg_pool: Option<&sqlx::PgPool>,
-    child_session_ids: &mut Vec<i64>,
-    status: &str,
-    reason: &str,
-) {
-    let Some(pg_pool) = pg_pool else {
-        return;
-    };
-    if child_session_ids.is_empty() {
-        return;
-    }
-    let child_session_id = child_session_ids.remove(0);
-    match close_background_child_pg(pg_pool, child_session_id, status).await {
-        Ok(_) => {}
-        Err(error) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                "  [{ts}] ⚠ Failed to close background child session {child_session_id} after {reason}: {error}"
-            );
-        }
-    }
-}
-
-fn first_request_line(user_text: &str) -> Option<String> {
-    user_text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
-}
-
-async fn child_progress_line(
-    pg_pool: Option<&sqlx::PgPool>,
-    parent_session_key: Option<&str>,
-) -> Option<String> {
-    let (Some(pg_pool), Some(parent_session_key)) = (pg_pool, parent_session_key) else {
-        return None;
-    };
-    match load_child_inventory_by_parent_key_pg(pg_pool, parent_session_key).await {
-        Ok(summary) => format_child_inventory_progress(&summary, chrono::Utc::now()),
-        Err(error) => {
-            tracing::warn!(
-                "Failed to load background child inventory for {}: {}",
-                parent_session_key,
-                error
-            );
-            None
-        }
-    }
-}
-
-async fn refresh_session_panel_line_from_lifecycle(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    turn_id: &str,
-    tmux_session_name: Option<&str>,
-) -> bool {
-    let Some(pg_pool) = shared.pg_pool.as_ref() else {
-        return false;
-    };
-    // `session_panel_instance_key` lives in the unix-only `tmux` module; on
-    // non-unix targets there is no tmux session, so the instance key is None.
-    #[cfg(unix)]
-    let session_instance_key = tmux_session_name
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .and_then(super::tmux::session_panel_instance_key);
-    #[cfg(not(unix))]
-    let session_instance_key = {
-        let _ = tmux_session_name;
-        Option::<String>::None
-    };
-    let channel_id_text = channel_id.get().to_string();
-    match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
-        pg_pool,
-        &channel_id_text,
-        turn_id,
-    )
-    .await
-    {
-        Ok(Some(event)) => shared
-            .ui
-            .placeholder_live_events
-            .set_session_panel_lifecycle_event(
-                channel_id,
-                session_instance_key.as_deref(),
-                &event.kind,
-                &event.details_json,
-            ),
-        Ok(None) => shared
-            .ui
-            .placeholder_live_events
-            .clear_session_panel(channel_id),
-        Err(error) => {
-            tracing::debug!(
-                "[turn_bridge] failed to load session lifecycle line for turn {} in channel {}: {}",
-                turn_id,
-                channel_id,
-                error
-            );
-            false
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TaskPanelDispatchMetadata {
-    card_id: Option<String>,
-    dispatch_type: Option<String>,
-    claim_owner: Option<String>,
-    card_title: Option<String>,
-    dispatch_title: Option<String>,
-    github_issue_number: Option<i64>,
-}
-
-async fn load_task_panel_dispatch_metadata(
-    pg_pool: Option<&sqlx::PgPool>,
-    dispatch_id: &str,
-) -> Result<Option<TaskPanelDispatchMetadata>, String> {
-    let Some(pg_pool) = pg_pool else {
-        return Ok(None);
-    };
-    let row = sqlx::query(
-        "SELECT td.kanban_card_id,
-                td.dispatch_type,
-                td.title AS dispatch_title,
-                kc.title AS card_title,
-                kc.github_issue_number,
-                dox.claim_owner
-         FROM task_dispatches td
-         LEFT JOIN kanban_cards kc ON kc.id = td.kanban_card_id
-         LEFT JOIN dispatch_outbox dox ON dox.dispatch_id = td.id
-         WHERE td.id = $1
-         ORDER BY dox.created_at DESC NULLS LAST
-         LIMIT 1",
-    )
-    .bind(dispatch_id)
-    .fetch_optional(pg_pool)
-    .await
-    .map_err(|error| format!("load task panel dispatch metadata for {dispatch_id}: {error}"))?;
-
-    row.map(|row| {
-        Ok::<TaskPanelDispatchMetadata, String>(TaskPanelDispatchMetadata {
-            card_id: row
-                .try_get("kanban_card_id")
-                .map_err(|error| format!("decode task panel card_id for {dispatch_id}: {error}"))?,
-            dispatch_type: row.try_get("dispatch_type").map_err(|error| {
-                format!("decode task panel dispatch_type for {dispatch_id}: {error}")
-            })?,
-            claim_owner: row.try_get("claim_owner").map_err(|error| {
-                format!("decode task panel claim_owner for {dispatch_id}: {error}")
-            })?,
-            card_title: row.try_get("card_title").map_err(|error| {
-                format!("decode task panel card_title for {dispatch_id}: {error}")
-            })?,
-            dispatch_title: row.try_get("dispatch_title").map_err(|error| {
-                format!("decode task panel dispatch_title for {dispatch_id}: {error}")
-            })?,
-            github_issue_number: row.try_get("github_issue_number").map_err(|error| {
-                format!("decode task panel github_issue_number for {dispatch_id}: {error}")
-            })?,
-        })
-    })
-    .transpose()
-}
-
-async fn refresh_task_panel_line_from_dispatch(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    dispatch_id: &str,
-) -> bool {
-    let dispatch_id = dispatch_id.trim();
-    if dispatch_id.is_empty() {
-        return false;
-    }
-    let metadata =
-        match load_task_panel_dispatch_metadata(shared.pg_pool.as_ref(), dispatch_id).await {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                tracing::debug!(
-                    "[turn_bridge] failed to load task line for dispatch {} in channel {}: {}",
-                    dispatch_id,
-                    channel_id,
-                    error
-                );
-                None
-            }
-        };
-    shared.ui.placeholder_live_events.set_task_panel_info(
-        channel_id,
-        crate::services::discord::placeholder_live_events::TaskPanelInfo {
-            dispatch_id,
-            card_id: metadata.as_ref().and_then(|value| value.card_id.as_deref()),
-            dispatch_type: metadata
-                .as_ref()
-                .and_then(|value| value.dispatch_type.as_deref()),
-            owner_instance_id: metadata
-                .as_ref()
-                .and_then(|value| value.claim_owner.as_deref()),
-            card_title: metadata
-                .as_ref()
-                .and_then(|value| value.card_title.as_deref()),
-            dispatch_title: metadata
-                .as_ref()
-                .and_then(|value| value.dispatch_title.as_deref()),
-            github_issue_number: metadata
-                .as_ref()
-                .and_then(|value| value.github_issue_number),
-        },
-    )
-}
-
-async fn close_all_tracked_background_children(
-    pg_pool: Option<&sqlx::PgPool>,
-    child_session_ids: &mut Vec<i64>,
-    status: &str,
-    reason: &str,
-) {
-    while !child_session_ids.is_empty() {
-        close_next_tracked_background_child(pg_pool, child_session_ids, status, reason).await;
-    }
-}
-
-fn task_notification_closes_background_child(kind: TaskNotificationKind, status: &str) -> bool {
-    if !matches!(
-        kind,
-        TaskNotificationKind::Background | TaskNotificationKind::Subagent
-    ) {
-        return false;
-    }
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "completed"
-            | "done"
-            | "finished"
-            | "aborted"
-            | "cancelled"
-            | "canceled"
-            | "failed"
-            | "error"
-    )
-}
-
-async fn ensure_active_placeholder_card<G: TurnGateway + ?Sized>(
-    shared: &SharedData,
-    gateway: &G,
-    key: super::placeholder_controller::PlaceholderKey,
-    input: super::placeholder_controller::PlaceholderActiveInput,
-) -> super::placeholder_controller::PlaceholderControllerOutcome {
-    if shared.ui.placeholder_live_events_enabled
-        && let Some(block) = shared
-            .ui
-            .placeholder_live_events
-            .render_block(key.channel_id)
-    {
-        return shared
-            .ui
-            .placeholder_controller
-            .ensure_active_with_live_events(gateway, key, input, block)
-            .await;
-    }
-    shared
-        .ui
-        .placeholder_controller
-        .ensure_active(gateway, key, input)
-        .await
 }
 
 fn record_placeholder_live_event(
@@ -756,68 +484,6 @@ mod ready_drain_unit_tests {
 
         assert!(matches!(received, StreamMessage::TmuxReady { .. }));
     }
-}
-
-fn push_transcript_event(events: &mut Vec<SessionTranscriptEvent>, event: SessionTranscriptEvent) {
-    let has_payload = !event.content.trim().is_empty()
-        || event
-            .summary
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        || event
-            .tool_name
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty());
-    if has_payload
-        || matches!(
-            event.kind,
-            SessionTranscriptEventKind::Thinking
-                | SessionTranscriptEventKind::Result
-                | SessionTranscriptEventKind::Error
-                | SessionTranscriptEventKind::Task
-                | SessionTranscriptEventKind::System
-        )
-    {
-        events.push(event);
-    }
-}
-
-fn response_portion_after_offset(full_response: &str, response_sent_offset: usize) -> &str {
-    full_response.get(response_sent_offset..).unwrap_or("")
-}
-
-fn terminal_delivery_response_after_offset(
-    full_response: &str,
-    response_sent_offset: usize,
-    empty_response_notice: Option<&str>,
-) -> String {
-    let raw_response =
-        response_portion_after_offset(full_response, response_sent_offset).to_string();
-    let stripped_response =
-        super::response_sanitizer::strip_leading_tui_response_chrome(&raw_response);
-    if !raw_response.trim().is_empty() && stripped_response.trim().is_empty() {
-        return String::new();
-    }
-    let mut delivery_response = stripped_response;
-    if delivery_response.trim().is_empty()
-        && let Some(notice) = empty_response_notice
-    {
-        delivery_response = notice.to_string();
-    }
-    delivery_response
-}
-
-fn done_result_requires_full_terminal_replay(
-    full_response: &str,
-    result: &str,
-    response_sent_offset: usize,
-    streamed_assistant_text_this_turn: bool,
-) -> bool {
-    response_sent_offset > 0
-        && streamed_assistant_text_this_turn
-        && result.len() > super::DISCORD_MSG_LIMIT
-        && !result.trim().is_empty()
-        && full_response.trim() == result.trim()
 }
 
 #[cfg(test)]
@@ -6943,133 +6609,4 @@ pub(super) fn spawn_turn_bridge(
 
         // completion_tx is sent automatically by CompletionGuard on drop
     }.instrument(bridge_span));
-}
-
-/// codex P2 followup (#1670): unit-level coverage of the
-/// "preserve task_notification_kind while other children remain" rule.
-/// This mirrors the production logic at the
-/// `task_notification_closes_background_child` arm in
-/// `StreamMessage::TaskNotification` (search: `codex P2 followup`).
-///
-/// The existing exhaustive-status coverage lives in
-/// `tests::task_notification_kind_resets_after_terminal_status` but that
-/// module is feature-gated on `legacy-sqlite-tests`; this lighter copy is
-/// added in the non-gated mod so the regression is observable in normal
-/// `cargo test` runs.
-#[cfg(test)]
-mod task_notification_kind_lifecycle_tests {
-    use super::{
-        TaskNotificationKind, merge_task_notification_kind, release_task_notification_kind,
-        task_notification_closes_background_child,
-    };
-
-    #[test]
-    fn kind_persists_while_other_children_remain() {
-        let mut child_ids: Vec<i64> = vec![100, 101];
-        let mut kind: Option<TaskNotificationKind> = None;
-        kind = merge_task_notification_kind(kind, TaskNotificationKind::Subagent);
-
-        let new_kind = TaskNotificationKind::Subagent;
-        let status = "completed";
-        kind = merge_task_notification_kind(kind, new_kind);
-        if task_notification_closes_background_child(new_kind, status) {
-            // Mirror the single-pop behavior of
-            // `close_next_tracked_background_child` at the call site.
-            let _ = child_ids.remove(0);
-            if child_ids.is_empty() {
-                kind = release_task_notification_kind(kind, new_kind);
-            }
-        }
-
-        assert_eq!(child_ids, vec![101]);
-        assert_eq!(
-            kind,
-            Some(TaskNotificationKind::Subagent),
-            "#1670 P2: kind must persist while other tracked children remain"
-        );
-
-        // Second terminal closes the queue, kind releases.
-        let new_kind = TaskNotificationKind::Subagent;
-        let status = "completed";
-        kind = merge_task_notification_kind(kind, new_kind);
-        if task_notification_closes_background_child(new_kind, status) {
-            let _ = child_ids.remove(0);
-            if child_ids.is_empty() {
-                kind = release_task_notification_kind(kind, new_kind);
-            }
-        }
-        assert!(child_ids.is_empty());
-        assert_eq!(
-            kind, None,
-            "#1670 P2: kind must release once the last child closes"
-        );
-    }
-
-    #[test]
-    fn kind_releases_immediately_when_queue_was_already_singleton() {
-        let mut child_ids: Vec<i64> = vec![42];
-        let mut kind: Option<TaskNotificationKind> = Some(TaskNotificationKind::Background);
-
-        let new_kind = TaskNotificationKind::Background;
-        let status = "aborted";
-        kind = merge_task_notification_kind(kind, new_kind);
-        if task_notification_closes_background_child(new_kind, status) {
-            let _ = child_ids.remove(0);
-            if child_ids.is_empty() {
-                kind = release_task_notification_kind(kind, new_kind);
-            }
-        }
-
-        assert!(child_ids.is_empty());
-        assert_eq!(
-            kind, None,
-            "#1670 P2: with a single tracked child, terminal status must release the kind"
-        );
-    }
-
-    #[test]
-    fn non_terminal_status_keeps_kind_and_does_not_pop() {
-        let mut child_ids: Vec<i64> = vec![1, 2];
-        let mut kind: Option<TaskNotificationKind> = None;
-        kind = merge_task_notification_kind(kind, TaskNotificationKind::Subagent);
-
-        let new_kind = TaskNotificationKind::Subagent;
-        let status = "started";
-        kind = merge_task_notification_kind(kind, new_kind);
-        if task_notification_closes_background_child(new_kind, status) {
-            let _ = child_ids.remove(0);
-            if child_ids.is_empty() {
-                kind = release_task_notification_kind(kind, new_kind);
-            }
-        }
-
-        assert_eq!(child_ids, vec![1, 2], "non-terminal must not pop");
-        assert_eq!(
-            kind,
-            Some(TaskNotificationKind::Subagent),
-            "non-terminal must keep kind"
-        );
-    }
-
-    #[test]
-    fn lower_priority_child_close_preserves_higher_priority_kind() {
-        let mut child_ids: Vec<i64> = vec![7];
-        let mut kind: Option<TaskNotificationKind> = Some(TaskNotificationKind::MonitorAutoTurn);
-
-        let new_kind = TaskNotificationKind::Subagent;
-        kind = merge_task_notification_kind(kind, new_kind);
-        if task_notification_closes_background_child(new_kind, "completed") {
-            let _ = child_ids.remove(0);
-            if child_ids.is_empty() {
-                kind = release_task_notification_kind(kind, new_kind);
-            }
-        }
-
-        assert!(child_ids.is_empty());
-        assert_eq!(
-            kind,
-            Some(TaskNotificationKind::MonitorAutoTurn),
-            "#1683: lower-priority child terminal notification must not clear a higher-priority active kind"
-        );
-    }
 }

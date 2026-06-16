@@ -35,6 +35,17 @@ mod jsonl_extract;
 mod output_path_detect;
 #[path = "recovery_engine/phase_policy.rs"]
 mod phase_policy;
+// #3479 item-2: behavior-preserving extraction of the terminal-success watcher /
+// recovery start-offset helper cluster into a leaf module.
+#[path = "recovery_engine/terminal_watcher.rs"]
+mod terminal_watcher;
+// #3479 item-2: behavior-preserving extraction of the inflight-state derivation
+// helper cluster (handoff message, ready-for-input probes, worktree info /
+// spawn-cwd derivation) into a leaf module.
+#[path = "recovery_engine/analytics_transcript.rs"]
+mod analytics_transcript;
+#[path = "recovery_engine/state_extractors.rs"]
+mod state_extractors;
 
 // Re-import moved items so existing call sites stay byte-identical.
 use self::jsonl_extract::{extract_response_from_output, success_result_end_offset_after_offset};
@@ -54,6 +65,37 @@ use self::phase_policy::{
 // `recovery_engine::extract_response_from_output_pub` path stays valid for the
 // turn_bridge / tmux_restart_handoff external callers.
 pub(super) use self::jsonl_extract::extract_response_from_output_pub;
+// #3479 item-2: re-import the externally-called terminal-watcher helpers so the
+// existing call sites stay byte-identical. The remaining cluster members
+// (`terminal_success_watcher_stop_allowed`, `jsonl_tail_contains_terminal_end_sentinel`,
+// `TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD`) are only used inside the submodule and
+// stay private to it.
+use self::terminal_watcher::{
+    output_has_bytes_after_offset, recovery_watcher_start_offset,
+    terminal_success_output_drained_for_recovery,
+};
+// #3479 item-2: re-import the inflight-state derivation helpers used by the root
+// module so the existing call sites stay byte-identical. The cluster-internal
+// members (the worktree path/branch/info/git helpers, `recovery_dispatch_id`,
+// `recovery_requires_worktree_context` and `inflight_ready_for_input_without_tui_pane`)
+// stay private to the submodule.
+use self::state_extractors::{
+    inflight_or_legacy_tmux_ready_for_input, interrupted_recovery_message, recovery_spawn_adk_cwd,
+    recovery_tmux_session_name, restore_recovered_session_worktree,
+};
+// `save_missing_session_handoff` is re-exported (not just re-imported) so the
+// `recovery_engine::save_missing_session_handoff` path stays valid for the
+// `recovery_paths::restart` external caller.
+pub(super) use self::state_extractors::save_missing_session_handoff;
+// #3479: re-import the analytics + transcript helpers so root call sites stay
+// byte-identical. `recovered_transcript_turn_id` is gated on cfg(test) — the root
+// reaches it only from its unit test (prod calls it inside analytics_transcript).
+#[cfg(test)]
+use self::analytics_transcript::recovered_transcript_turn_id;
+use self::analytics_transcript::{
+    extract_turn_analytics_from_output, lookup_turn_finished_dispatch_kind,
+    persist_recovered_transcript, recovered_turn_duration_ms,
+};
 
 #[cfg(not(unix))]
 fn tmux_session_has_live_pane(_name: &str) -> bool {
@@ -492,30 +534,6 @@ async fn complete_recovery_visible_turn(
         return RecoveryCompletionOutcome::Emitted;
     };
 
-    // EPIC #3078 PR-2 — route recovery completion through the
-    // `StatusPanelController` behind a parity check (shadow mode). The
-    // controller adopts the recovered panel id and reports the id it WOULD
-    // finalize; it must equal the legacy `status_msg_id`. The legacy
-    // `complete_status_panel_v2_with_http` below still executes the actual
-    // Discord edit/delete, so behaviour is verifiably unchanged — only the
-    // (shadow) controller decision is observed. The real cutover (controller
-    // executes the IO) lands in a later PR. The controller actor is only
-    // spawned when v2 is enabled (we are already inside the v2-enabled branch),
-    // so this is inert and untouched when v2 is off.
-    let controller_id = shared
-        .status_panel_controller
-        .recovery_completion_parity_id(
-            super::turn_finalizer::TurnKey::new(
-                channel_id,
-                state.user_msg_id,
-                super::runtime_store::load_generation(),
-            ),
-            provider.clone(),
-            status_msg_id,
-        )
-        .await;
-    assert_recovery_completion_parity(controller_id, status_msg_id, channel_id, source);
-
     let mut last_status_panel_text = String::new();
     let _committed = super::turn_bridge::complete_status_panel_v2_with_http(
         shared,
@@ -533,36 +551,6 @@ async fn complete_recovery_visible_turn(
     RecoveryCompletionOutcome::Emitted
 }
 
-/// EPIC #3078 PR-2 — the parity gate between the legacy recovery
-/// status-panel-completion id and the id the `StatusPanelController` chooses for
-/// the same turn. They must agree: a divergence means the controller would
-/// finalize a different (or no) panel, so routing the IO through it later would
-/// change behaviour. `debug_assert` so test/dev builds fail loudly; release
-/// builds emit a bounded `warn!` (no `panic!`) so a never-before-seen recovery
-/// shape can never crash a production restart sweep over the legacy path, which
-/// continues to execute regardless.
-fn assert_recovery_completion_parity(
-    controller_id: Option<MessageId>,
-    legacy_id: Option<MessageId>,
-    channel_id: ChannelId,
-    source: &'static str,
-) {
-    if controller_id == legacy_id {
-        return;
-    }
-    debug_assert_eq!(
-        controller_id, legacy_id,
-        "#3078 PR-2 recovery status-panel completion parity mismatch (channel {channel_id}, source {source}): controller chose {controller_id:?}, legacy chose {legacy_id:?}"
-    );
-    tracing::warn!(
-        channel = channel_id.get(),
-        source = source,
-        controller_id = ?controller_id,
-        legacy_id = ?legacy_id,
-        "#3078 PR-2 recovery status-panel completion parity mismatch — StatusPanelController chose a different completion id than the legacy path; legacy path executed (no behaviour change), divergence logged for the later controller-executes cutover"
-    );
-}
-
 #[cfg(test)]
 mod recovery_dispatch_gate_tests {
     #[test]
@@ -574,9 +562,7 @@ mod recovery_dispatch_gate_tests {
 
 #[cfg(test)]
 mod recovery_completion_outcome_tests {
-    use super::{
-        RecoveryCompletionOutcome, assert_recovery_completion_parity, recovery_status_panel,
-    };
+    use super::{RecoveryCompletionOutcome, recovery_status_panel};
     use crate::services::provider::ProviderKind;
     use poise::serenity_prelude::{ChannelId, MessageId};
 
@@ -712,76 +698,6 @@ mod recovery_completion_outcome_tests {
                 1_800_000_005,
             ),
             None
-        );
-    }
-
-    // EPIC #3078 PR-2: for representative recovery-completion inputs, the
-    // `StatusPanelController`'s chosen completion id (adopt + read-back through
-    // the live actor) equals the legacy
-    // `recovery_status_panel_message_id_for_completion` result, so the parity
-    // gate passes and `complete_recovery_visible_turn` keeps executing the
-    // legacy path with no behaviour change.
-    #[tokio::test(flavor = "current_thread")]
-    async fn controller_chosen_completion_id_matches_legacy_for_representative_inputs() {
-        use super::ChannelId;
-        use super::status_panel_controller::StatusPanelController;
-        use super::turn_finalizer::TurnKey;
-
-        // Case A: real user_msg_id, persisted id from the SAME turn wins.
-        let mut snapshot = state_for_recovery(9101);
-        snapshot.status_message_id = Some(3003);
-        let mut persisted = state_for_recovery(9101);
-        persisted.status_message_id = Some(4004);
-        let legacy = recovery_status_panel::message_id_for_completion(&snapshot, Some(&persisted));
-        assert_eq!(legacy, Some(super::MessageId::new(4004)));
-
-        let ctl = StatusPanelController::spawn(true);
-        let key = TurnKey::new(ChannelId::new(4243), snapshot.user_msg_id, 0);
-        let controller = ctl
-            .recovery_completion_parity_id(key, ProviderKind::Claude, legacy)
-            .await;
-        assert_eq!(
-            controller, legacy,
-            "controller's chosen completion id must equal the legacy id (real user_msg_id case)"
-        );
-
-        // Case B: channel-only (user_msg_id == 0) recovery turn — the controller
-        // collapses onto the single live entry it adopted, choosing the same id.
-        let mut snapshot0 = state_for_recovery(0);
-        snapshot0.status_message_id = Some(5005);
-        let legacy0 = recovery_status_panel::message_id_for_completion(&snapshot0, None);
-        assert_eq!(legacy0, Some(super::MessageId::new(5005)));
-
-        let ctl0 = StatusPanelController::spawn(true);
-        let key0 = TurnKey::new(ChannelId::new(7777), 0, 0);
-        let controller0 = ctl0
-            .recovery_completion_parity_id(key0, ProviderKind::Claude, legacy0)
-            .await;
-        assert_eq!(
-            controller0, legacy0,
-            "controller's chosen completion id must equal the legacy id (channel-only case)"
-        );
-
-        // Case C: no panel id at all (None) — both agree on None.
-        let snapshot_none = state_for_recovery(9300);
-        let legacy_none = recovery_status_panel::message_id_for_completion(&snapshot_none, None);
-        assert_eq!(legacy_none, None);
-
-        let ctl_none = StatusPanelController::spawn(true);
-        let key_none = TurnKey::new(ChannelId::new(8888), 9300, 0);
-        let controller_none = ctl_none
-            .recovery_completion_parity_id(key_none, ProviderKind::Claude, legacy_none)
-            .await;
-        assert_eq!(controller_none, legacy_none);
-
-        // The parity assert itself must not fire for any of these.
-        assert_recovery_completion_parity(controller, legacy, ChannelId::new(4243), "test");
-        assert_recovery_completion_parity(controller0, legacy0, ChannelId::new(7777), "test");
-        assert_recovery_completion_parity(
-            controller_none,
-            legacy_none,
-            ChannelId::new(8888),
-            "test",
         );
     }
 }
@@ -1046,207 +962,6 @@ fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Optio
     None
 }
 
-fn interrupted_recovery_message(
-    state: &inflight::InflightTurnState,
-    saved_response: &str,
-) -> String {
-    state
-        .restart_mode
-        .map(|mode| super::turn_bridge::handoff_interrupted_message(mode, saved_response))
-        .unwrap_or_else(|| stale_inflight_message(saved_response))
-}
-
-/// WARN-only trace (160-char response tail) — writes NOTHING to disk. The
-/// durable full-response artifact for force-clears is
-/// `recovery_paths::restart::persist_force_clear_report` (#3297 finding 3).
-pub(super) fn save_missing_session_handoff(
-    provider: &ProviderKind,
-    state: &inflight::InflightTurnState,
-    best_response: &str,
-) {
-    let partial = best_response.trim();
-    let partial_summary = if partial.is_empty() {
-        "partial response unavailable".to_string()
-    } else {
-        tail_with_ellipsis(partial, 160)
-    };
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::warn!(
-        "  [{ts}] ⚠ recovery: suppressed auto post-restart handoff for channel {} (provider={}, user_msg_id={}, partial={})",
-        state.channel_id,
-        provider.as_str(),
-        state.user_msg_id,
-        partial_summary
-    );
-}
-
-fn inflight_ready_for_input_without_tui_pane(
-    provider: &ProviderKind,
-    state: &inflight::InflightTurnState,
-    require_consumed: bool,
-) -> Option<crate::services::tui_turn_state::TuiReadyState> {
-    let output_path = state
-        .output_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())?;
-    crate::services::tui_turn_state::jsonl_ready_for_input(
-        provider,
-        state.runtime_kind,
-        std::path::Path::new(output_path),
-        require_consumed.then_some(state.last_offset),
-    )
-}
-
-fn inflight_or_legacy_tmux_ready_for_input(
-    provider: &ProviderKind,
-    state: &inflight::InflightTurnState,
-    tmux_session_name: &str,
-    require_consumed: bool,
-) -> bool {
-    inflight_ready_for_input_without_tui_pane(provider, state, require_consumed)
-        .map(crate::services::tui_turn_state::TuiReadyState::is_ready)
-        .unwrap_or_else(|| {
-            crate::services::provider::tmux_session_ready_for_input(tmux_session_name, provider)
-        })
-}
-
-fn recovery_worktree_path(state: &inflight::InflightTurnState) -> Option<&str> {
-    state
-        .worktree_path
-        .as_deref()
-        .filter(|path| !path.trim().is_empty())
-}
-
-fn recovery_worktree_branch(state: &inflight::InflightTurnState) -> Option<&str> {
-    state
-        .worktree_branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|branch| !branch.is_empty())
-}
-
-fn recovery_dispatch_id(state: &inflight::InflightTurnState) -> Option<&str> {
-    state
-        .dispatch_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|dispatch_id| !dispatch_id.is_empty())
-}
-
-fn recovery_tmux_session_name(
-    provider: &ProviderKind,
-    state: &inflight::InflightTurnState,
-) -> Option<String> {
-    state
-        .tmux_session_name
-        .as_deref()
-        .or_else(|| state.channel_name.as_deref())
-        .map(|name| {
-            if name.starts_with(&format!(
-                "{}-",
-                crate::services::provider::TMUX_SESSION_PREFIX
-            )) {
-                name.to_string()
-            } else {
-                provider.build_tmux_session_name(name)
-            }
-        })
-}
-
-fn recovery_requires_worktree_context(state: &inflight::InflightTurnState) -> bool {
-    recovery_worktree_branch(state).is_some()
-        || state
-            .base_commit
-            .as_deref()
-            .is_some_and(|commit| !commit.trim().is_empty())
-}
-
-fn recovery_git_stdout(repo_path: &str, args: &[&str]) -> Option<String> {
-    let output = GitCommand::new()
-        .repo(repo_path)
-        .args(args)
-        .run_output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        return None;
-    }
-    Some(stdout)
-}
-
-fn recovery_worktree_original_path(worktree_path: &str) -> Option<String> {
-    let git_common_dir = recovery_git_stdout(worktree_path, &["rev-parse", "--git-common-dir"])?;
-    let common_dir = {
-        let candidate = std::path::PathBuf::from(&git_common_dir);
-        if candidate.is_absolute() {
-            candidate
-        } else {
-            std::path::Path::new(worktree_path).join(candidate)
-        }
-    };
-    let canonical = std::fs::canonicalize(common_dir).ok()?;
-    canonical.parent()?.to_str().map(str::to_string)
-}
-
-fn recovery_worktree_info(state: &inflight::InflightTurnState) -> Option<WorktreeInfo> {
-    let worktree_path = recovery_worktree_path(state)?;
-    if !std::path::Path::new(worktree_path).is_dir() {
-        return None;
-    }
-
-    let branch_name = recovery_worktree_branch(state)
-        .map(str::to_string)
-        .or_else(|| recovery_git_stdout(worktree_path, &["branch", "--show-current"]))?;
-    let original_path = recovery_worktree_original_path(worktree_path)?;
-
-    Some(WorktreeInfo {
-        original_path,
-        worktree_path: worktree_path.to_string(),
-        branch_name,
-    })
-}
-
-fn restore_recovered_session_worktree(
-    session: &mut DiscordSession,
-    state: &inflight::InflightTurnState,
-) {
-    if let Some(worktree) = recovery_worktree_info(state) {
-        if session.current_path.is_none() {
-            session.current_path = Some(worktree.worktree_path.clone());
-        }
-        session.worktree = Some(worktree);
-    }
-}
-
-fn recovery_spawn_adk_cwd(
-    state: &inflight::InflightTurnState,
-    persisted_session_path: Option<String>,
-) -> Result<Option<String>, String> {
-    if let Some(worktree_path) = recovery_worktree_path(state) {
-        if std::path::Path::new(worktree_path).is_dir() {
-            return Ok(Some(worktree_path.to_string()));
-        }
-        return Err(format!(
-            "recovery blocked: inflight worktree missing for channel {}: {}",
-            state.channel_id, worktree_path
-        ));
-    }
-
-    if recovery_requires_worktree_context(state) {
-        let dispatch_suffix = recovery_dispatch_id(state)
-            .map(|dispatch_id| format!(" (dispatch {dispatch_id})"))
-            .unwrap_or_default();
-        return Err(format!(
-            "recovery blocked: inflight worktree state missing for channel {}{}",
-            state.channel_id, dispatch_suffix
-        ));
-    }
-
-    Ok(persisted_session_path)
-}
-
 pub(super) async fn finish_recovered_turn_mailbox(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -1450,235 +1165,6 @@ fn detect_live_tmux_output_path(
     };
     let candidates = parse_lsof_output_candidates(&stdout);
     detect_rebind_output_path_from_candidates(fallback_path, candidates)
-}
-
-fn extract_turn_analytics_from_output(
-    output_path: &str,
-    start_offset: u64,
-) -> (Option<String>, Option<TurnTokenUsage>) {
-    crate::services::session_backend::extract_turn_analytics_from_output(output_path, start_offset)
-}
-
-fn recovered_turn_duration_ms(started_at: Option<&str>) -> Option<i64> {
-    let started_at = started_at?.trim();
-    if started_at.is_empty() {
-        return None;
-    }
-    let parsed = chrono::NaiveDateTime::parse_from_str(started_at, "%Y-%m-%d %H:%M:%S").ok()?;
-    let elapsed = chrono::Local::now().naive_local() - parsed;
-    Some(elapsed.num_milliseconds().max(0))
-}
-
-async fn lookup_turn_finished_dispatch_kind(dispatch_id: Option<&str>) -> Option<String> {
-    let dispatch_id = dispatch_id?;
-    let body = super::internal_api::lookup_dispatch_info(dispatch_id)
-        .await
-        .ok()?;
-    super::turn_bridge::classify_turn_finished_dispatch_kind(
-        body.get("dispatch_context")
-            .and_then(|value| value.as_str()),
-        body.get("dispatch_type").and_then(|value| value.as_str()),
-    )
-    .map(str::to_string)
-}
-
-/// Build the transcript turn id for a recovered turn. A message-less recovery
-/// turn (`user_msg_id == 0`, e.g. TUI-direct) must NOT key on `discord:<ch>:0`
-/// (collides across every such turn → overwrite, Codex P2 r2) NOR purely on the
-/// session (repeated message-less turns upsert-overwrite, Codex P2 r3): instead
-/// append a PER-TURN discriminator — the JSONL start offset, falling back to the
-/// `started_at` timestamp when no offset is recorded.
-fn recovered_transcript_turn_id(
-    channel_id: u64,
-    user_msg_id: u64,
-    session_key: Option<&str>,
-    turn_start_offset: Option<u64>,
-    started_at: &str,
-) -> String {
-    if user_msg_id != 0 {
-        return format!("discord:{channel_id}:{user_msg_id}");
-    }
-    // Per-turn discriminator: stable for THIS turn, distinct across turns.
-    let turn_discriminator = match turn_start_offset {
-        Some(offset) => format!("off{offset}"),
-        None => format!("at{}", started_at.replace([' ', ':'], "-")),
-    };
-    match session_key {
-        Some(key) => format!("discord:{channel_id}:session:{key}:{turn_discriminator}"),
-        None => format!("discord:{channel_id}:recovery:{turn_discriminator}"),
-    }
-}
-
-async fn persist_recovered_transcript(
-    db: Option<&crate::db::Db>,
-    pg_pool: Option<&sqlx::PgPool>,
-    provider: &ProviderKind,
-    state: &inflight::InflightTurnState,
-    dispatch_id: Option<&str>,
-    assistant_message: &str,
-) -> bool {
-    let assistant_message = assistant_message.trim();
-    if assistant_message.is_empty() {
-        return false;
-    }
-
-    let turn_id = recovered_transcript_turn_id(
-        state.channel_id,
-        state.user_msg_id,
-        state.session_key.as_deref(),
-        state.turn_start_offset,
-        &state.started_at,
-    );
-    let channel_id_text = state.channel_id.to_string();
-    match crate::db::session_transcripts::persist_turn_db(
-        db,
-        pg_pool,
-        crate::db::session_transcripts::PersistSessionTranscript {
-            turn_id: &turn_id,
-            session_key: state.session_key.as_deref(),
-            channel_id: Some(channel_id_text.as_str()),
-            agent_id: None,
-            provider: Some(provider.as_str()),
-            dispatch_id,
-            user_message: &state.user_text,
-            assistant_message,
-            events: &[],
-            duration_ms: None,
-        },
-    )
-    .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!("  [{ts}] ⚠ recovery: failed to persist session transcript: {e}");
-            false
-        }
-    }
-}
-
-fn output_has_bytes_after_offset(output_path: &str, start_offset: u64) -> bool {
-    std::fs::metadata(output_path)
-        .map(|meta| meta.len() > start_offset)
-        .unwrap_or(false)
-}
-
-const TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
-
-fn terminal_success_watcher_stop_allowed(
-    confirmed_end: u64,
-    tmux_tail_offset: u64,
-    quiet_for: std::time::Duration,
-) -> bool {
-    confirmed_end >= tmux_tail_offset && quiet_for >= TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD
-}
-
-async fn terminal_success_output_drained_for_recovery(
-    output_path: &str,
-    confirmed_end: u64,
-    tmux_session_name: Option<&str>,
-) -> bool {
-    let Ok(before_meta) = std::fs::metadata(output_path) else {
-        return false;
-    };
-    let tmux_alive = tmux_session_name
-        .map(crate::services::platform::tmux::has_session)
-        .unwrap_or(false);
-
-    if !tmux_alive {
-        return terminal_success_watcher_stop_allowed(
-            confirmed_end,
-            before_meta.len(),
-            TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD,
-        );
-    }
-
-    if !terminal_success_watcher_stop_allowed(
-        confirmed_end,
-        before_meta.len(),
-        TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD,
-    ) {
-        return false;
-    }
-
-    // #2442 (H2) — fast-path: if the wrapper has already emitted the
-    // `terminal_end` JSONL sentinel, the pane is *definitively* done
-    // writing and we can graduate the 2s drain quiet-period immediately.
-    // The wrapper writes the sentinel as one of its very last actions
-    // before kill_child_tree/cleanup, so its presence is a strict superset
-    // of the quiet-period heuristic. We still keep the legacy 2s sleep as
-    // a fallback for SIGKILL paths that bypass the sentinel write.
-    if jsonl_tail_contains_terminal_end_sentinel(output_path) {
-        return terminal_success_watcher_stop_allowed(
-            confirmed_end,
-            before_meta.len(),
-            TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD,
-        );
-    }
-
-    tokio::time::sleep(TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD).await;
-
-    let tail_after = std::fs::metadata(output_path)
-        .map(|meta| meta.len())
-        .unwrap_or(confirmed_end.saturating_add(1));
-    tail_after == confirmed_end
-        && terminal_success_watcher_stop_allowed(
-            confirmed_end,
-            tail_after,
-            TERMINAL_SUCCESS_DRAIN_QUIET_PERIOD,
-        )
-}
-
-/// #2442 — peek the JSONL tail (last ~4 KiB) for the wrapper's
-/// `terminal_end` sentinel. Reading the tail rather than the entire file
-/// keeps this O(1) regardless of jsonl size. False negatives (no sentinel
-/// detected when one is present) just fall back to the legacy 2s
-/// quiet-period sleep, so a partial-line edge case is harmless.
-fn jsonl_tail_contains_terminal_end_sentinel(output_path: &str) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-
-    const TAIL_WINDOW_BYTES: u64 = 4 * 1024;
-
-    let Ok(mut file) = std::fs::File::open(output_path) else {
-        return false;
-    };
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    let len = meta.len();
-    if len == 0 {
-        return false;
-    }
-    let start = len.saturating_sub(TAIL_WINDOW_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return false;
-    }
-    let mut buf = Vec::with_capacity(TAIL_WINDOW_BYTES as usize);
-    if file.read_to_end(&mut buf).is_err() {
-        return false;
-    }
-    // The sentinel is one JSONL line: {"type":"terminal_end",...}. We search the
-    // literal `"type":"terminal_end"` token because the wrapper writes JSON via
-    // `serde_json::Value::to_string()` (exact compact form); the contract lives in
-    // `tmux_common::emit_wrapper_sentinel` (pretty-printing would need a rework).
-    let needle = format!(
-        "\"type\":\"{}\"",
-        crate::services::tmux_common::WRAPPER_TERMINAL_END_EVENT
-    );
-    let haystack = String::from_utf8_lossy(&buf);
-    haystack.contains(&needle)
-}
-
-fn recovery_watcher_start_offset(output_path: &str, saved_last_offset: u64) -> (u64, u64, bool) {
-    let current_len = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-    if current_len >= saved_last_offset {
-        (saved_last_offset, current_len, false)
-    } else {
-        // The output file was recreated or truncated while dcserver was down.
-        // Resume from the beginning of the new file so we do not skip the
-        // entire restarted session output.
-        (0, current_len, true)
-    }
 }
 
 pub(super) async fn restore_inflight_turns(

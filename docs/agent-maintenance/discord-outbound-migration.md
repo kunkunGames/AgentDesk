@@ -12,7 +12,7 @@ Last refreshed: 2026-06-16 (against `main` @ `8ec7336e32eb6ef89e1143fab2543f2fc6
 > Turn-owned delivery paths can pass a `CancelToken` so post-cancel sends,
 > fallback retries, split chunks, and headless outbox enqueue are suppressed.
 >
-> Last refreshed: 2026-06-14 (against PR #3461 unix delivery record compile fallback).
+> Last refreshed: 2026-06-16 (against #3520 — `outbound/delivery_record.rs` adds `delivered_frontier_end_current_generation`, a generation-checked, read-authority-flag-independent durable-frontier-end reader; the watcher-direct fallback in `tmux_watcher.rs` gates `has_direct_terminal_response` on it to suppress re-mirroring already-delivered text as a duplicate message at the same prompt anchor. Outbound delivery semantics otherwise unchanged).
 >
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 

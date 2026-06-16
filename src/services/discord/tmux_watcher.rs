@@ -44,6 +44,27 @@ mod single_message_footer;
 #[path = "tmux_watcher/terminal_send.rs"]
 mod terminal_send;
 
+// #3479 item-2: the watcher-direct orphan status-panel cleanup/completion/refresh
+// cluster extracted to a sibling submodule (pure move, zero logic change). Items
+// are `pub(super)` there and re-imported below so the watcher loop's call sites —
+// and the sibling `single_message_footer.rs` completion call — stay byte-identical.
+#[path = "tmux_watcher/orphan_status_panel_cleanup.rs"]
+mod orphan_status_panel_cleanup;
+
+use self::orphan_status_panel_cleanup::{
+    cleanup_orphan_external_input_status_panel, complete_watcher_status_panel_v2,
+    refresh_watcher_session_panel_from_lifecycle,
+};
+
+// #3479 item-2: provider-session selector resolution + persistence cluster
+// extracted to a sibling submodule (pure move, zero logic change). Items are
+// `pub(super)` there and re-imported here so the watcher loop's call sites stay
+// byte-identical.
+#[path = "tmux_watcher/provider_session_persistence.rs"]
+mod provider_session_persistence;
+
+use self::provider_session_persistence::persist_watcher_provider_session_id;
+
 // #3479 Phase-1 rank-1: the supervisor relay-forward + session-bound terminal ACK
 // cluster extracted to sibling submodules (pure move, zero logic change). Split
 // into two cohesive files only to keep each within the tmux_watcher/** namespace
@@ -178,329 +199,6 @@ async fn commit_watcher_direct_terminal_session_idle(
         "watcher-direct terminal response committed session idle"
     );
     true
-}
-
-/// Resolve the provider session selector to durably persist at turn end.
-///
-/// #3095: a TUI resume turn frequently does NOT re-emit the provider session id
-/// in its pane output, so `observed_session_id` (`state.last_session_id`) is
-/// `None` on most committed turns even though resume is working off the durable
-/// in-memory selector. Falling back to the cached `session.session_id` keeps the
-/// DB selector in sync on every committed turn so resume survives an in-memory
-/// cache loss (idle-expiry / dcserver restart). The fallback is guarded against
-/// empty values so a stale/blank selector never overwrites a good DB row.
-fn resolve_persistable_provider_session_id(
-    observed_session_id: Option<&str>,
-    cached_session_id: Option<&str>,
-) -> Option<String> {
-    let nonempty = |value: Option<&str>| {
-        value
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    };
-    nonempty(observed_session_id).or_else(|| nonempty(cached_session_id))
-}
-
-async fn persist_watcher_provider_session_id(
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    session_id: Option<&str>,
-) {
-    // #3095: when the TUI did not re-emit a session id this turn, fall back to
-    // the durable in-memory selector so the DB row is refreshed on every
-    // committed turn — not only on the rare turns that print the id.
-    let session_id = {
-        let mut data = shared.core.lock().await;
-        let session = data.sessions.get_mut(&channel_id).filter(|s| !s.cleared);
-        let cached_session_id = session.as_ref().and_then(|s| s.session_id.clone());
-        let Some(session_id) =
-            resolve_persistable_provider_session_id(session_id, cached_session_id.as_deref())
-        else {
-            return;
-        };
-        if let Some(session) = session {
-            session.restore_provider_session(Some(session_id.clone()));
-        }
-        session_id
-    };
-
-    let session_key = crate::services::discord::adk_session::build_namespaced_session_key(
-        &shared.token_hash,
-        provider,
-        tmux_session_name,
-    );
-    crate::services::discord::adk_session::save_provider_session_id(
-        &session_key,
-        &session_id,
-        Some(&session_id),
-        provider,
-        channel_id,
-        shared.api_port,
-    )
-    .await;
-
-    // #3053: persisting a provider selector is live runtime activity — emit an
-    // auditable heartbeat touch so idle-kill's COALESCE(last_heartbeat,
-    // created_at) row is refreshed and the candidate-key match is logged.
-    // (hook_session already sets last_heartbeat; this adds the audit trail and
-    // covers any divergent/legacy session_key the upsert did not reach.)
-    touch_session_activity(
-        None::<&crate::db::Db>,
-        shared.pg_pool.as_ref(),
-        &shared.token_hash,
-        provider,
-        tmux_session_name,
-        crate::services::discord::adk_session::parse_thread_channel_id_from_name(
-            &crate::services::provider::parse_provider_and_channel_from_tmux_name(
-                tmux_session_name,
-            )
-            .map(|(_, channel)| channel)
-            .unwrap_or_default(),
-        ),
-        "provider_selector_persisted",
-        "tmux_watcher.rs:persist_provider_session_selector",
-    );
-
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!(
-        "  [{ts}] 👁 watcher persisted provider session selector for {} channel {}",
-        tmux_session_name,
-        channel_id.get()
-    );
-}
-
-/// #3003 (codex P2 r3): delete a watcher-created TUI-direct status panel that
-/// will never reach terminal completion — the turn was stopped or returned to
-/// idle with no committed response, so `complete_watcher_status_panel_v2` never
-/// runs and the panel would stay stuck at "계속 처리 중".
-///
-/// Ownership is decided by `turn_is_external_input` — a flag cached *while the
-/// inflight row was still present* — rather than reloading inflight here (codex
-/// P2 r4): a stopped/cancelled TUI-direct turn has already cleared its inflight,
-/// so a fresh read would miss the very panel this reclaim was added for. A
-/// bridge-owned panel never sets the flag, so it is never touched.
-///
-/// Deletion routes through `delete_nonterminal_placeholder` so the in-memory and
-/// persisted ids are dropped only on a committed delete (codex P3 r4) — a
-/// transient Discord error leaves the ids intact for a later retry. The
-/// persisted `status_message_id` is cleared only when it still points at this
-/// exact panel, so a newer turn's panel is never clobbered.
-///
-/// Returns `false` only when a delete was attempted and did not commit, so the
-/// caller can defer finalization/inflight-clearing and let a later iteration
-/// retry (codex P2 r5); `true` means nothing to clean or the delete committed.
-async fn cleanup_orphan_external_input_status_panel(
-    http: &Arc<serenity::Http>,
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    status_panel_msg_id: &mut Option<serenity::MessageId>,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    turn_is_external_input: bool,
-) -> bool {
-    if !watcher_separate_status_panel_enabled(shared.ui.status_panel_v2_enabled) {
-        *status_panel_msg_id = None;
-        return true;
-    }
-    if !turn_is_external_input {
-        return true;
-    }
-    let Some(panel_msg_id) = *status_panel_msg_id else {
-        return true;
-    };
-    // EPIC #3078 PR-4 — SHADOW parity: the controller's chosen reclaim target
-    // must equal `panel_msg_id`; legacy deletes + clears the real id below.
-    crate::services::discord::watcher_panel_parity::assert_watcher_reclaim_parity(
-        shared,
-        channel_id,
-        provider,
-        panel_msg_id,
-    )
-    .await;
-    let outcome = delete_nonterminal_placeholder(
-        http,
-        channel_id,
-        shared,
-        provider,
-        tmux_session_name,
-        panel_msg_id,
-        "watcher_orphan_external_input_status_panel_cleanup",
-    )
-    .await;
-    if !outcome.is_committed() && !outcome.is_permanent_failure() {
-        // #3003 (codex P2 r10/r11/r13): the inline delete failed transiently. The
-        // local id is kept for an in-turn retry, but a stopped/cancelled turn may
-        // clear its inflight before any retry runs, leaving no per-turn handle.
-        // Record the panel in the durable store so the sweeper drain reclaims it
-        // independent of inflight lifecycle.
-        enqueue_watcher_status_panel_orphan(shared.as_ref(), provider, channel_id, panel_msg_id);
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            "  [{ts}] ⚠ watcher: orphan status-panel-v2 delete did not commit for channel {} panel_msg {}; kept local id + enqueued durable retry",
-            channel_id.get(),
-            panel_msg_id.get()
-        );
-        return false;
-    }
-    // Committed (succeeded / already-gone) OR a permanent failure (403/410): neither
-    // is retried, so treat a permanent failure as terminal and clear the handle
-    // (codex P2 r16) rather than wedge finalization forever. Drop the durable record
-    // too, since the drain would also give up on the same permanent error.
-    if !outcome.is_committed() {
-        crate::services::discord::status_panel_orphan_store::remove(
-            provider,
-            &shared.token_hash,
-            channel_id.get(),
-            panel_msg_id.get(),
-        );
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            "  [{ts}] ⚠ watcher: orphan status-panel-v2 delete permanently failed for channel {} panel_msg {}; giving up (treated as committed)",
-            channel_id.get(),
-            panel_msg_id.get()
-        );
-    }
-    *status_panel_msg_id = None;
-    // #3077: compare-and-clear under the inflight flock so a newer turn that
-    // rebound this panel between our load and our clear is never wiped. The
-    // tmux-session guard preserves the prior precondition (only clear our own
-    // TUI-direct turn's row).
-    let _ = crate::services::discord::inflight::clear_status_panel_if_current(
-        provider,
-        channel_id.get(),
-        panel_msg_id.get(),
-        &crate::services::discord::inflight::StatusPanelClearGuard {
-            require_tmux_session_name: Some(tmux_session_name.to_string()),
-            ..Default::default()
-        },
-    );
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!(
-        "  [{ts}] 🧹 watcher: cleaned orphan status-panel-v2 for TUI-direct turn (channel {}, tmux={}, panel_msg={})",
-        channel_id.get(),
-        tmux_session_name,
-        panel_msg_id.get()
-    );
-    true
-}
-
-/// Returns whether the completion edit/send committed. `false` means the final
-/// panel edit hit a transient Discord error and the panel is still showing the
-/// processing state — the caller must preserve a retry handle (enqueue the panel
-/// for the durable drain) before clearing the inflight, or the panel orphans
-/// (codex P2 r20).
-async fn complete_watcher_status_panel_v2(
-    http: &serenity::Http,
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    status_panel_msg_id: Option<serenity::MessageId>,
-    provider: &ProviderKind,
-    started_at_unix: i64,
-    last_status_panel_text: &mut String,
-    background: bool,
-    expected_user_msg_id: Option<u64>,
-) -> bool {
-    // #2427 D wire (Codex round 2 HIGH-1): explicit-signal inflight cleanup
-    // is intentionally NOT emitted from the watcher path. The watcher is
-    // not turn-scoped, so any user_msg_id read here would be the *current*
-    // on-disk value (possibly the next turn's). The committed-output path
-    // at L~2996 already performs the unconditional `clear_inflight_state`
-    // for the turn the watcher actually finished. Recovery-driven
-    // TurnCompleted still emits the guarded signal (see recovery_engine.rs)
-    // because its state snapshot is pinned at recovery entry.
-    if !watcher_should_complete_separate_status_panel(shared.ui.status_panel_v2_enabled) {
-        return true;
-    }
-    // EPIC #3078: completion parity is DEFERRED to the controller execute-cutover
-    // PR. A faithful check must replicate the SendFallback path (legacy completes
-    // with a concrete id when `status_panel_msg_id` is None, turn_bridge/mod.rs),
-    // which requires the controller to independently compute the completion id
-    // from raw inputs — not the resolved output. PR-4 ships only the faithful
-    // RECLAIM shadow-parity (see cleanup_orphan_external_input_status_panel).
-    crate::services::discord::turn_bridge::complete_status_panel_v2_with_http(
-        shared,
-        http,
-        channel_id,
-        status_panel_msg_id,
-        provider,
-        started_at_unix,
-        last_status_panel_text,
-        background,
-        "tmux_watcher",
-        expected_user_msg_id,
-    )
-    .await
-}
-
-/// #3055 — the per-channel session lifecycle panel snapshot (`🆕 새 세션 시작`,
-/// `기존 세션 복원`, …) is set by the bridge's
-/// `refresh_session_panel_line_from_lifecycle` and is keyed only by channel,
-/// not by turn. The bridge re-derives it from the *current* turn's lifecycle
-/// row on every status tick (and clears it when the current turn has no
-/// session lifecycle event). The watcher-direct render/completion paths never
-/// performed that refresh, so a watcher-direct TUI turn would reuse a stale
-/// snapshot left behind by a prior turn's `session_fresh`/`session_resumed`
-/// event (e.g. a `(최근 대화 N개…)` recovery line from an earlier
-/// recovery/new-session turn).
-///
-/// Mirror the bridge behaviour for the watcher: load the latest session
-/// lifecycle event for *this* watcher turn and set the panel from it, or clear
-/// the panel when the current turn has no such event. Watcher-direct TUI turns
-/// carry `user_msg_id == 0` (no anchored Discord message) so they key onto the
-/// invariant-guarded `discord:<channel>:0` turn id, which by construction has
-/// no session lifecycle row — the panel is therefore cleared and the stale
-/// line is never reused.
-async fn refresh_watcher_session_panel_from_lifecycle(
-    shared: &Arc<SharedData>,
-    channel_id: ChannelId,
-    user_msg_id: u64,
-    tmux_session_name: &str,
-) {
-    if !shared.ui.status_panel_v2_enabled {
-        return;
-    }
-    let Some(pg_pool) = shared.pg_pool.as_ref() else {
-        return;
-    };
-    let turn_id = format!("discord:{}:{}", channel_id.get(), user_msg_id);
-    let session_instance_key = session_panel_instance_key(tmux_session_name);
-    let channel_id_text = channel_id.get().to_string();
-    match crate::services::observability::turn_lifecycle::load_latest_session_lifecycle_event(
-        pg_pool,
-        &channel_id_text,
-        &turn_id,
-    )
-    .await
-    {
-        Ok(Some(event)) => {
-            shared
-                .ui
-                .placeholder_live_events
-                .set_session_panel_lifecycle_event(
-                    channel_id,
-                    session_instance_key.as_deref(),
-                    &event.kind,
-                    &event.details_json,
-                );
-        }
-        Ok(None) => {
-            shared
-                .ui
-                .placeholder_live_events
-                .clear_session_panel(channel_id);
-        }
-        Err(error) => {
-            tracing::debug!(
-                "[tmux_watcher] failed to load session lifecycle line for turn {} in channel {}: {}",
-                turn_id,
-                channel_id,
-                error
-            );
-        }
-    }
 }
 
 pub(in crate::services::discord) async fn tmux_output_watcher(
@@ -1113,14 +811,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 restored_panel,
                 restored_placeholder,
                 restored_injected_prompt_message_id,
-            );
-            // #3078 PR-6: ledger-seed the liveness-reacquired watcher panel.
-            crate::services::discord::watcher_panel_parity::shadow_adopt_liveness_reacquired_panel(
-                &shared,
-                channel_id,
-                &watcher_provider,
-                restored_panel,
-                reacquired,
             );
             if reacquired && !active_stream_inflight_reacquire_logged {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -2212,10 +1902,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             // mid-stream inflight loss keeps the `⏳ → ✅` cleanup anchor.
                             restored_injected_prompt_message_id,
                         );
-                        // #3078 PR-6: ledger-seed the liveness-reacquired watcher panel.
-                        crate::services::discord::watcher_panel_parity::shadow_adopt_liveness_reacquired_panel(
-                            &shared, channel_id, &watcher_provider, status_panel_msg_id, reacquired,
-                        );
                         if reacquired && !active_stream_inflight_reacquire_logged {
                             let ts = chrono::Local::now().format("%H:%M:%S");
                             tracing::warn!(
@@ -2579,11 +2265,6 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                 }
                             }
                         }
-                        // EPIC #3078: faithful create/adopt shadow-parity. `panel_present`
-                        // is `false` here (the enclosing gate requires `status_panel_msg_id
-                        // .is_none()`), so the controller re-derives the SAME decision from
-                        // the raw inputs the legacy branch above read. Legacy still executes.
-                        crate::services::discord::watcher_panel_parity::assert_watcher_create_parity(&shared, channel_id, shared.ui.status_panel_v2_enabled, false, panel_eligible_turn, persisted_panel_msg_id);
                     }
 
                     loop {
@@ -4832,20 +4513,20 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             response_sent_offset,
             session_bound_fallback_uses_full_body,
         );
-        let has_direct_terminal_response = !direct_terminal_response.trim().is_empty();
-        // #2838 (relay-stability P0-1): count the primary duplicate-emit vector.
-        // The 10s session-bound terminal ACK timed out yet the watcher proceeds
-        // to direct-send, so the StreamRelay sink may have actually posted (just
-        // lagged the committed-sequence metric) and this re-sends the same
-        // answer. Rising counts here are the signal that the dual-authority
-        // terminal-delivery lease (P1) is overdue.
-        //
-        // #3042: keep recording the timeout even when the ownerless-timeout
-        // suppression above turns off the watcher-direct fallback — the ACK
-        // genuinely timed out and that is the observability signal we must not
-        // lose (the post-restart restore_inflight gap shows up precisely as
-        // ownerless `TimedOut`). Gate on the raw outcome plus the original
-        // should_direct_send intent rather than the (now-suppressed) fallback.
+        // #3520: skip a watcher-direct NEW-MESSAGE re-mirror already within the durable delivered frontier (same gen; absent=>0=>no suppress, no loss). NEW-message anchor path ONLY (placeholder_msg_id none) — the placeholder-edit arm must keep its already-delivered body, never delete it via the empty-body cleanup (codex BLOCKER).
+        let has_direct_terminal_response = !direct_terminal_response.trim().is_empty()
+            && !(watcher_direct_fallback_after_session_bound_ack
+                && placeholder_msg_id.is_none()
+                && watcher_resend_range_end
+                    <= dr::delivered_frontier_end_current_generation(
+                        &watcher_provider,
+                        channel_id,
+                        &tmux_session_name,
+                    ));
+        // #2838/#3042 (relay-stability P0-1): count the primary duplicate-emit vector — a
+        // session-bound terminal ACK that timed out while the watcher direct-sends (sink may
+        // have already posted; rising counts ⇒ P1 dual-authority lease overdue). Gate on the
+        // raw `TimedOut` + original `should_direct_send` intent (records even when the ownerless-timeout suppression turned the fallback off).
         if relay_decision.should_direct_send
             && matches!(
                 session_bound_ack_outcome,
@@ -7246,9 +6927,9 @@ mod tests {
         build_watcher_streaming_edit_text,
         discard_restored_response_seed_before_no_inflight_terminal_relay,
         legacy_wrapper_prompt_candidates_from_pane, mark_watcher_terminal_delivery_committed,
-        reacquire_watcher_inflight_for_active_stream, resolve_persistable_provider_session_id,
-        should_probe_tmux_liveness, terminal_relay_decision,
-        watcher_batch_contains_assistant_event, watcher_batch_contains_relayable_response,
+        reacquire_watcher_inflight_for_active_stream, should_probe_tmux_liveness,
+        terminal_relay_decision, watcher_batch_contains_assistant_event,
+        watcher_batch_contains_relayable_response,
         watcher_fallback_edit_failure_can_delete_original_placeholder,
         watcher_fresh_idle_finalize_decision, watcher_inflight_absence_is_abandonment,
         watcher_output_progressed_recently, watcher_should_clear_stale_terminal_message_ids,
@@ -7287,48 +6968,6 @@ mod tests {
                 None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
             }
         }
-    }
-
-    // #3095: a freshly observed TUI session id always wins so the DB tracks the
-    // newest selector.
-    #[test]
-    fn persistable_provider_session_prefers_freshly_observed_id() {
-        assert_eq!(
-            resolve_persistable_provider_session_id(Some("fresh-sid"), Some("cached-sid")),
-            Some("fresh-sid".to_string())
-        );
-    }
-
-    // #3095 core fix: a resume turn whose TUI output did NOT re-emit a session id
-    // must still persist the durable in-memory selector so the DB row is kept in
-    // sync and resume survives idle-expiry / dcserver restart.
-    #[test]
-    fn persistable_provider_session_falls_back_to_cached_selector_on_resume_turn() {
-        assert_eq!(
-            resolve_persistable_provider_session_id(None, Some("cached-sid")),
-            Some("cached-sid".to_string())
-        );
-    }
-
-    // #3095 guard: never overwrite a good DB row with an empty/blank selector —
-    // neither the observed nor the cached value is usable, so persist is skipped.
-    #[test]
-    fn persistable_provider_session_skips_when_no_usable_selector() {
-        assert_eq!(
-            resolve_persistable_provider_session_id(None, None),
-            None,
-            "no selector available -> skip persist"
-        );
-        assert_eq!(
-            resolve_persistable_provider_session_id(Some("   "), Some("")),
-            None,
-            "blank observed + empty cached -> skip persist"
-        );
-        assert_eq!(
-            resolve_persistable_provider_session_id(Some(""), Some("cached-sid")),
-            Some("cached-sid".to_string()),
-            "blank observed must fall through to the usable cached selector"
-        );
     }
 
     #[test]

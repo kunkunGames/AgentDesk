@@ -153,9 +153,21 @@
     (retained for a later phase, not the live watcher path after the R2 revert);
     -1 from #3038 S4 after routing the placeholder/status-panel cluster
     through `shared.ui`; still giant-file territory).
-  - `src/services/discord/tmux_watcher.rs` (7241 production lines after #3479
-    Phase-1 rank-2; was 7485 after #3479 Phase-1 rank-1 and 8122 after #3038
-    tmux_watcher S1 moved top-level decision
+  - `src/services/discord/tmux_watcher.rs` (6922 production lines after the #3479
+    SPC-shadow removal deleted the dead `StatusPanelController` watcher
+    shadow-parity calls — 2x `shadow_adopt_liveness_reacquired_panel` +
+    `assert_watcher_create_parity`; legacy reacquire/create/edit IO unchanged —
+    and after #3479 item-2 moved the provider-session persistence cluster
+    (`resolve_persistable_provider_session_id`,
+    `persist_watcher_provider_session_id`) verbatim into the `tmux_watcher/`
+    child module `provider_session_persistence.rs` (~101);
+    was 7022 after #3479 item-2 moved the orphan status-panel cleanup cluster
+    (`cleanup_orphan_external_input_status_panel`,
+    `complete_watcher_status_panel_v2`,
+    `refresh_watcher_session_panel_from_lifecycle`) verbatim into the
+    `tmux_watcher/` child module `orphan_status_panel_cleanup.rs` (~210);
+    was 7241 after #3479 Phase-1 rank-2, 7485 after #3479 Phase-1 rank-1 and
+    8122 after #3038 tmux_watcher S1 moved top-level decision
     clusters A/B/C/E/F/I/J/K
     into `tmux_watcher/` child modules: `liveness.rs` (301),
     `panel_decisions.rs` (372), `prompt_observe.rs` (109),
@@ -498,7 +510,7 @@
     Moved unit tests live in sibling `utf8_chunk_decoder_tests.rs` /
     `terminal_readiness_tests.rs`; both child modules sit under the
     `tmux_watcher/**` 700-line namespace cap.
-  - `src/services/discord/tui_prompt_relay.rs` (4630 production lines; #3296
+  - `src/services/discord/tui_prompt_relay.rs` (4301 production lines; #3296
     codex r1+r2: the ABORT cleanup hook pins the foreign prior inflight's
     identity — the live row at the record instant, or the worker's LAST-VIEW
     identity when that row just vanished — and persists the marker via
@@ -712,10 +724,23 @@
     moved to `tui_prompt_relay/rehydration.rs` (deps reached via `use super::*;`,
     names re-imported so the call sites + tests stay byte-identical). The sibling
     helpers shared with non-rehydration code (`claude_tui_runtime_binding_matches_launch`,
-    `resolve_rehydrated_claude_tmux_channel_id`, `parse_claude_tui_launch_script`,
-    `claude_tui_rehydrate_start_offset`, the `ClaudeTuiLaunchInfo` struct, the
-    `DEAD_ORPHANED_PANE_PROBE_*` consts) STAY in this root. Frozen baseline 5142 ->
-    4630 (-512, locks in the shrink; zero logic change).
+    `resolve_rehydrated_claude_tmux_channel_id`, `claude_tui_rehydrate_start_offset`, the
+    `DEAD_ORPHANED_PANE_PROBE_*` consts) STAY in this root (`parse_claude_tui_launch_script`
+    + the `ClaudeTuiLaunchInfo` struct later moved to `tui_prompt_relay/launch_script.rs`
+    in #3479 launch-script, see below). Frozen baseline 5142 ->
+    4630 (-512, locks in the shrink; zero logic change). #3479 item-2
+    (behavior-preserving extraction): the live-relay TUI-direct prompt anchor
+    COMPLETION lifecycle (`⏳ → ✅`) cluster — `should_complete_tui_direct_anchor_lifecycle`,
+    the `DeferredAnchorCompletionDrain` enum + `decide_deferred_anchor_completion_drain`
+    drain decision, `complete_tui_direct_prompt_anchor_lifecycle_if_present`,
+    `pinned_anchor_cleanup_target`, and `complete_tui_direct_anchor_lifecycle_for_inflight` —
+    moved verbatim to `tui_prompt_relay/anchor_completion.rs` (deps reached via
+    `use super::*;`, only `super::formatting` becomes `super::super::formatting`).
+    The three helpers reached from sibling discord modules (`tmux_watcher.rs`,
+    `recovery_engine.rs`) are re-exported at `pub(in crate::services::discord)`;
+    the relay-internal drain decision/enum are re-imported privately, so the call
+    sites + tests stay byte-identical. Frozen baseline 4630 -> 4458 (-172, locks in
+    the shrink; zero logic change).
   - `src/services/discord/tui_prompt_relay/injected_prompt_policy.rs` (318 prod
     lines; #3479 rank-5: pure injected-prompt classification + formatting policy
     extracted verbatim from `tui_prompt_relay.rs` — no `shared.`/`http.`/async-IO
@@ -732,13 +757,69 @@
     functions taking `&Arc<SharedData>` explicitly (no captured module state), so
     the move via `use super::*;` is behavior-identical; the five fns are
     `pub(super)` and re-imported by the parent; below the giant-file threshold).
-  - `src/services/discord/idle_recap.rs` (1319 prod lines; idle-recap card
-    compose/post/clear surface, registered giant-file (#3036) — bugfix only
-    outside an extraction plan. Crossed 1000 prod LoC with #3146 Part 1: the
-    shared capture-at-claim + CAS clear helpers, the `channel_has_active_turn`
+  - `src/services/discord/tui_prompt_relay/anchor_completion.rs` (213 prod lines;
+    #3479 item-2: the live-relay TUI-direct prompt anchor COMPLETION lifecycle
+    (`⏳ → ✅`) — the visibility gate, the deferred `⏳`-completion drain decision,
+    and the reaction-swap completers (shared-slot + pinned-injected-message paths)
+    — extracted verbatim from `tui_prompt_relay.rs`. Deps reached via
+    `use super::*;` (only `super::formatting` becomes `super::super::formatting`);
+    the three externally-called helpers are `pub(in crate::services::discord)` and
+    re-exported by the parent, the relay-internal drain decision/enum stay
+    `pub(super)`; below the giant-file threshold).
+  - `src/services/discord/tui_prompt_relay/launch_script.rs` (107 prod lines;
+    #3479 launch-script: the Claude TUI launch-*script* parsing helpers — the
+    parsed `ClaudeTuiLaunchInfo` record, `parse_claude_tui_launch_script` +
+    `parse_claude_tui_launch_script_content`, and the minimal single-quote
+    `shell_words_from_line` shell-word splitter — extracted verbatim from
+    `tui_prompt_relay.rs` (all `#[cfg(unix)]`). Deps reached via `use super::*;`;
+    `parse_claude_tui_launch_script` + the `ClaudeTuiLaunchInfo` record are `pub(super)`
+    and `parse_claude_tui_launch_script` is re-imported by the parent so the
+    `claude_tui_launch_context` caller and the sibling `rehydration` module keep
+    byte-identical call sites, while the module-internal
+    `parse_claude_tui_launch_script_content` + `shell_words_from_line` stay private;
+    below the giant-file threshold).
+  - `src/services/discord/tui_prompt_relay/idle_offset_resolution.rs` (100 prod
+    lines; #3479: the idle-tail transcript start-offset resolution helpers — the
+    #3154 timestamp-anchor choke point `resolve_idle_tail_start_offset`, the
+    `claude_idle_response_start_offset_after_timestamp` timestamp scan, the
+    stale-high `normalize_transcript_fallback_offset` guard, and the #3183
+    `clamp_idle_tail_start_offset_to_committed` committed-offset clamp — extracted
+    verbatim from `tui_prompt_relay.rs` (all `#[cfg(unix)]`). Deps reached via
+    `use super::*;`; `resolve_idle_tail_start_offset` +
+    `clamp_idle_tail_start_offset_to_committed` are `pub(super)` re-imported by the
+    parent's prod call sites, `claude_idle_response_start_offset_after_timestamp`
+    is `pub(super)` re-imported only under `#[cfg(all(unix, test))]` (its prod
+    callers are now child-internal), and the module-internal
+    `normalize_transcript_fallback_offset` stays private; below the giant-file
+    threshold).
+  - `src/services/discord/idle_recap.rs` (idle-recap card compose/post/clear
+    surface; #3479 dropped it below the giant-file threshold by extracting the
+    scrollback/summarizer and token-context-display clusters into the two
+    submodules below, so it is no longer a registered giant — its registry entry
+    and ratchet baseline were removed. Remaining surface: the
+    snapshot/compose/post/clear/CAS lifecycle, the `channel_has_active_turn`
     mailbox/inflight probe, and the `post_recheck_action` seam that skips/undoes
-    a recap post when a turn raced the compose window. Split compose vs
-    lifecycle/clear submodules before adding behavior).
+    a recap post when a turn raced the compose window).
+  - `src/services/discord/idle_recap/scrollback.rs` (#3479 scrollback: the tmux
+    `capture-pane` tail capture, the `claude-e` transcript-tail fallback
+    (`capture_transcript_scrollback` + the unit-testable `extract_transcript_tail_text`
+    / `parse_transcript_line_text` workers), and the Haiku `summarize_with_haiku`
+    call — extracted verbatim from `idle_recap.rs`. Deps reached via `use super::*;`;
+    `capture_tmux_scrollback` / `capture_transcript_scrollback` / `summarize_with_haiku`
+    are re-exported by the parent so the `server::routes::idle_recap` caller keeps
+    byte-identical `idle_recap::<fn>` call sites, while the parsing workers stay
+    `pub(super)` for the parent's in-file tests; below the giant-file threshold).
+  - `src/services/discord/idle_recap/context_display.rs` (#3479 context display:
+    the live/latest-turn/session token selection state machine
+    (`select_recap_context` + `RecapContextDisplay`), the freshness and
+    provider-match guards, and the `format_token_count` / `format_korean_duration`
+    formatters — extracted verbatim from `idle_recap.rs`. Deps reached via
+    `use super::*;`; `select_recap_context` / `RecapContextDisplay` /
+    `format_token_count` / `format_korean_duration` / `provider_session_ids` /
+    `normalized_text` are `pub(super)` and re-imported by the parent so
+    `compose_recap_header` and `attach_live_context_usage` keep byte-identical
+    call sites, while the rest of the selection helpers stay module-private;
+    below the giant-file threshold).
   - `src/services/codex_tmux_wrapper.rs` (1289 lines; Codex tmux wrapper JSON
     event parser and relay bridge for native Codex session events — bugfix only
     outside an extraction plan; +65 from #3275: capture per-call
@@ -746,9 +827,14 @@
     nested `usage` on the success result frame so watcher-owned codex turns
     persist token telemetry — never the session-cumulative
     `info.total_token_usage`).
-  - `src/services/tui_prompt_dedupe.rs` (1388 lines; shared TUI prompt
+  - `src/services/tui_prompt_dedupe.rs` (2867 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
-    outside an extraction plan; +88 from #3041 P1-4 codex: a per-record
+    outside an extraction plan; +37 from #3527: `is_discord_relayed_user_prompt`
+    skips re-observed `[User: … (ID: …)]` Discord-relay lines (whole-string scan —
+    context like `[External Recall]` may precede the marker and the legacy pane
+    observer collapses blocks mid-line) in the observation candidate filter so a
+    quiescence-timeout re-observation never mints a spurious synthetic turn (notice
+    + orphan panel); +88 from #3041 P1-4 codex: a per-record
     `generation: u64` nonce on `ExternalInputRelayLease` (process-global
     `AtomicU64`, stamped in `record_external_input_turn_lease` which now returns
     the recorded lease) plus the `clear_external_input_relay_lease_if_generation_matches`
@@ -767,7 +853,25 @@
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`;
     +62 from #3304: slash-command canonical prompt keys for `<command-*>` XML vs
     `/command args` dedupe, plus focused loop skill-expansion regressions).
-  - `src/services/discord/recovery_engine.rs` (3718 lines; #3479 r8 extracted the
+  - `src/services/discord/recovery_engine.rs` (3276 lines; the #3479 SPC-shadow
+    removal deleted the dead `StatusPanelController` recovery-completion shadow
+    block + `assert_recovery_completion_parity` fn + its dead test, leaving the
+    legacy `completion_target` let-else and `complete_status_panel_v2_with_http`
+    IO unchanged; #3479 also extracted the
+    recovered-turn analytics + transcript-persistence cluster
+    (`extract_turn_analytics_from_output` wrapper, `recovered_turn_duration_ms`,
+    `lookup_turn_finished_dispatch_kind`, `recovered_transcript_turn_id`,
+    `persist_recovered_transcript`) into the leaf `recovery_engine/analytics_transcript.rs`,
+    re-imported byte-identical; earlier #3479 item-2 extracted
+    the inflight-state derivation helper cluster (handoff message, ready-for-input
+    probes, worktree path/branch/info derivation, spawn-cwd) into the
+    sub-1000-prod-LoC leaf module `recovery_engine/state_extractors.rs` (~150) —
+    behaviour-preserving move, `save_missing_session_handoff` re-exported and
+    root-called helpers re-imported byte-identical; #3479 item-2 also extracted
+    the terminal-success watcher / recovery start-offset helper cluster into the
+    sub-1000-prod-LoC leaf module `recovery_engine/terminal_watcher.rs` (137) —
+    behaviour-preserving move, externally-called helpers re-imported byte-identical;
+    #3479 r8 extracted the
     pure output-path-detect, phase-policy, and jsonl-extract clusters into the
     sub-1000-prod-LoC leaf modules `recovery_engine/output_path_detect.rs` (177),
     `recovery_engine/phase_policy.rs` (120), and `recovery_engine/jsonl_extract.rs`
@@ -776,12 +880,9 @@
     watcher-spawn handles; +9 from #3166
     fetching real context thresholds for the recovered-turn status panel; +36 from #3099
     task-notification anchor `⏳` cleanup for `user_msg_id == 0` recovery; +4
-    from the #3099 re-review pinned-injected-message-id cleanup target; +55 from
-    #3078 PR-2 routing recovery completion through `StatusPanelController` behind
-    a shadow parity check (the controller adopts the recovered panel id and its
-    chosen completion id is asserted equal to the legacy
-    `recovery_status_panel_message_id_for_completion` result; the legacy path
-    still executes the Discord IO, so behaviour is unchanged); +4 from #3017
+    from the #3099 re-review pinned-injected-message-id cleanup target; net ±0
+    from #3078 PR-2 (recovery-completion shadow-parity routing, added then
+    reverted by the #3479 SPC-shadow-substrate removal); +4 from #3017
     routing the recovery terminal through the single-authority finalizer
     (`submit_terminal` + `FinalizeContext::monitor`) instead of inline
     `mailbox_finish_turn`; +60 from #3248 gap-1 adding
@@ -826,10 +927,14 @@
     force-clean watcher-respawn follow-through + always-run cross-tick
     retry/dead-man (P1-a: no early return on zero candidates), delegating the
     new behaviour to `health/watcher_respawn.rs`).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3769 lines;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3671 lines;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; #3464 extracted the
     unauthorized-voice-announcement scope decision to `voice_announcement_scope.rs`;
+    #3479 extracted the voice-transcript announcement route cluster
+    (`claim_voice_transcript_announcement_processing`,
+    `VoiceTranscriptAnnouncementRouteOutcome`,
+    `route_voice_transcript_announcement_once`) to `voice_announcement_route.rs`;
     +9 from #3082
     queued-only answer-flush gate (`is_queued_notice` on the two
     `send_intake_placeholder` call sites: `true` for the race-lost queued card,
@@ -845,13 +950,19 @@
     message handler; bugfix only outside a further extraction plan).
   - `src/services/discord/meeting_orchestrator.rs` (3222 lines after #3034
     dead-code sweep removed `is_meeting_channel`).
-  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1545 lines; provider
-    stop-token/tmux binding runtime + PID-exit observation helper (#2426),
-    split before adding non-bugfix behavior. #3169: added the
-    claude-anonymous-teardown SIGINT suppression guard (death #3)).
-  - `src/services/discord/turn_bridge/mod.rs` (6535 prod lines; the BRIDGE
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (964 prod lines; provider
+    stop-token/tmux binding runtime + the async interrupt/cancel/hard-stop
+    orchestration + session-teardown. #3169: the claude-anonymous-teardown
+    SIGINT suppression guard (death #3) lives in the `interrupt_policy` child.
+    #3479 decomposed the giant 1545 -> 964 by moving three cohesive, verbatim
+    clusters into `tmux_runtime/` child modules (`interrupt_policy.rs`,
+    `process_table.rs`, `pid_exit.rs` — see their entries below); no longer a
+    giant-file. Bugfix only outside a further extraction plan).
+  - `src/services/discord/turn_bridge/mod.rs` (6189 prod lines; the BRIDGE
     spawn/turn-lifecycle surface — `spawn_turn_bridge` and the per-channel
-    turn loop. Registered giant-file (#3038 decompose target — see
+    turn loop. #3479 extracted the task/session-panel line rendering +
+    active-placeholder-card helpers into the `panel_lifecycle.rs` leaf.
+    Registered giant-file (#3038 decompose target — see
     `giant-file-registry.md`, owner `discord-relay`, deadline 2026-08-31).
     It surfaced as a giant only after #3028 fixed the prod/test splitter: an
     unterminated char-literal scan on a Rust lifetime (`&'a self`) inside the
@@ -896,8 +1007,65 @@
     `spawn_watcher_orphan_spinner_cleanup_retry` + their tests. The retry-spawn
     routes through `task_supervisor`/`placeholder_cleanup` and takes all deps by
     value; not a giant-file).
-  - `src/services/discord/turn_bridge/completion_guard.rs` (1834 lines).
-  - `src/services/discord/turn_bridge/tmux_runtime.rs` (1545 lines).
+  - `src/services/discord/turn_bridge/response_delivery.rs` (74 prod lines; pure
+    response-delivery + transcript-event helpers extracted verbatim from `mod.rs`
+    by #3479: `push_transcript_event`, `response_portion_after_offset`,
+    `terminal_delivery_response_after_offset`,
+    `done_result_requires_full_terminal_replay`. All `pub(super)` and re-imported
+    so the parent call sites + inline tests stay byte-identical; the two
+    discord-level `super::` refs (`response_sanitizer`, `DISCORD_MSG_LIMIT`)
+    deepened to `super::super::`; no IO/async; not a giant-file).
+  - `src/services/discord/turn_bridge/completion_guard.rs` (872 prod lines; no
+    longer a giant-file after #3479 verbatim-extracted two leaf child modules
+    under `completion_guard/` (1834 -> 872 prod). It now holds the
+    review/verdict/decision extractors + `guard_review_dispatch_completion`, the
+    `fail_dispatch_*` retry policy, and the `complete_work_dispatch_on_turn_end`
+    orchestrator; the moved children are re-exported back so
+    `turn_bridge/mod.rs` paths are unchanged. Its giant-file-registry
+    `grandfathered` path and ratchet baseline were retired/win-locked).
+  - `src/services/discord/turn_bridge/completion_guard/completion_postgres.rs`
+    (530 prod lines; runtime-Postgres last-resort dispatch completion/failure
+    paths + auto-queue reconciliation + dispatch-followup/reconcile-marker
+    plumbing extracted from `completion_guard.rs` by #3479:
+    `runtime_pg_complete_dispatch_with_result`,
+    `runtime_pg_fail_dispatch_with_result`, the `runtime_pg_*_linked_auto_queue`
+    helpers, `runtime_db_fallback_complete_with_result`,
+    `streaming_final_complete_dispatch_with_result`,
+    `queue_dispatch_followup_with_handles`, `store_reconcile_marker_with_handles`
+    + their tests. Direct sqlx IO; not a giant-file).
+  - `src/services/discord/turn_bridge/completion_guard/completion_context.rs`
+    (462 prod lines; work-dispatch completion-context + commit attribution
+    extracted from `completion_guard.rs` by #3479: `extract_commit_sha_from_output`,
+    the `DispatchCompletionHints` lookup/parse helpers,
+    `work_dispatch_completion_context`, `build_work_dispatch_completion_result`,
+    and the `noop`/tracked-change context builders. Reads git history + Postgres
+    completion hints; not a giant-file).
+  - `src/services/discord/turn_bridge/tmux_runtime.rs` (964 prod lines; no longer
+    a giant-file after #3479 — see the description above and the three child
+    entries below).
+  - `src/services/discord/turn_bridge/tmux_runtime/interrupt_policy.rs` (225 prod
+    lines; pure provider turn-interrupt policy decisions + value types extracted
+    verbatim from `tmux_runtime.rs` by #3479: `ProviderTurnInterruptPlan`,
+    `ProviderTurnInterruptOutcome`, `interrupt_sigint_target_missing` (#3029 A),
+    `provider_turn_interrupt_plan`, `fallback_sigint_pid_for_provider` (#3021),
+    the `#3207` claude session-preserving delivery selection
+    (`ClaudeTurnInterruptDelivery` / `claude_turn_interrupt_delivery` /
+    `build_claude_interrupt_control_line`), and the `#3169`
+    `ANONYMOUS_TURN_BRIDGE_TEARDOWN_REASON` sentinel +
+    `claude_teardown_sigint_suppressed` + their tests. No IO/async; not a
+    giant-file).
+  - `src/services/discord/turn_bridge/tmux_runtime/process_table.rs` (248 prod
+    lines; `ps`-backed process-table discovery extracted verbatim from
+    `tmux_runtime.rs` by #3479: `ProcessRow`, `provider_cli_pid_in_tmux`,
+    `pane_foreground_is_provider_wrapper`, `select_provider_pid_in_pane`, the
+    descendant-walk/command-match scoring helpers, the wrapper-FIFO writer
+    (`write_line_to_wrapper_fifo`), and the `send_sigint` primitive. Depends only
+    on `platform::tmux::pane_pid` + `libc`/`std`; not a giant-file).
+  - `src/services/discord/turn_bridge/tmux_runtime/pid_exit.rs` (176 prod lines;
+    the `#2426` OS-level PID-exit observation family extracted verbatim from
+    `tmux_runtime.rs` by #3479: `wait_for_pid_exit` (kqueue `NOTE_EXIT` on macOS,
+    `pidfd_open`+`poll` on Linux, bounded-sleep fallback) + its tests. Depends
+    only on `libc`/`std`/`tokio`; not a giant-file).
   - `src/services/discord/turn_bridge/terminal_delivery.rs` (604 prod lines;
     no longer a giant-file after the #3028 splitter fix corrected its inline
     `#[cfg(test)] mod` accounting (previously miscounted as 1341 prod). Its
@@ -985,7 +1153,7 @@
     iteration-loop helpers; tracked decompose target — see
     `giant-file-registry.md` (owner `automation-pipeline`, deadline
     2026-08-31, #3036)).
-  - `src/services/discord/{commands/text_commands.rs, commands/diagnostics.rs,
+  - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs, inflight.rs}`
     (all 1000+ production lines).
 - active_callsite_coverage: n/a.
@@ -1004,6 +1172,17 @@
 - 2026-05-18 refresh: #2558 removed dead watcher/placeholder cleanup parameters
   and retained a warning log for pause/epoch placeholder delete failures; no
   new watcher ownership path was introduced.
+- 2026-06-16 refresh: #3479 decomposed `commands/diagnostics.rs` (1022 prod
+  LoC) verbatim into the `commands/diagnostics/` directory module — the root
+  `src/services/discord/commands/diagnostics/mod.rs` (389 production lines;
+  metrics/health/sessions/status/inflight/queue/adk-phase/debug slash commands +
+  the Gemini session helpers) re-exports the report builders from the new
+  `src/services/discord/commands/diagnostics/reports.rs` (651 production lines;
+  `build_health_report`/`build_status_report`/`build_inflight_report`/
+  `build_queue_report` plus the snapshot-normalization and runtime-labeling
+  helpers they consume). Behavior-preserving move; both files are sub-giant, so
+  diagnostics graduates from the giant-file registry/baseline. No runtime or
+  ownership path changed.
 - tests: `src/high_risk_recovery.rs` cancel/recovery suites.
 - related_issues: #964, #1112, #1138, #1222, #1223, #1283.
 
@@ -1229,7 +1408,10 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   execution are the canonical scheduled JS routine surfaces. Split focused
   helper modules before growing these files again.
 - `src/services/platform/binary_resolver.rs` (1221).
-- `src/services/discord/mod.rs` (4965; +34 from #3019 added the
+- `src/services/discord/mod.rs` (now 4074 prod LoC after #3479 item-2 extracted
+  the dispatch-policy cluster verbatim to `discord/dispatch_policy.rs` (-169) on
+  top of the earlier catch-up subsystem extraction to `discord/catch_up.rs`;
+  4965; +34 from #3019 added the
   single-authority `increment_global_active` helper + doc mirroring the
   existing decrement helper — offset by removing 6 inline raw `fetch_add`
   blocks across the relay turn-start sites that now route through it; +12 from
