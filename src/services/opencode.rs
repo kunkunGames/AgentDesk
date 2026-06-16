@@ -346,7 +346,25 @@ fn execute_command_streaming_inner(
     // turn that is blocked before `run_session` installs the SSE cancel
     // watchdog. The watchdog itself prefers the shared-server Arc, but this
     // keeps the historical PID-based cancel path working during startup.
-    register_child_pid(cancel_token, server.shared_server().id());
+    //
+    // Crucially, only register the PID when this turn is the *sole* active
+    // session on the server. The generic provider_exec timeout path calls
+    // `kill_pid_tree(child_pid)` unconditionally on timeout, so registering a
+    // shared `opencode serve` PID would let a single turn's timeout kill the
+    // warm server out from under every other concurrent streaming turn —
+    // defeating the warm-pool's whole purpose. When the server is shared, leave
+    // `child_pid` unset: the in-stream cancel watchdog (which guards its
+    // hard-kill fallback on `active_sessions <= 1`) plus `abort_session` are the
+    // only mechanisms allowed to terminate the turn, and neither disturbs the
+    // co-resident sessions.
+    if server
+        .shared_server()
+        .active_sessions
+        .load(Ordering::SeqCst)
+        <= 1
+    {
+        register_child_pid(cancel_token, server.shared_server().id());
+    }
     let result = run_session(
         prompt,
         system_prompt,
@@ -462,7 +480,20 @@ fn acquire_warm_server(
             e.into_inner()
         });
 
-        if healthy {
+        // Only lease the probed server if the pool *still* holds this exact
+        // instance. The lock was released across the (up to 30s) health probe,
+        // so a racing acquire may have evicted/swapped/shutdown this entry in
+        // the gap; leasing it then would hand out a server whose process is
+        // being torn down (or a duplicate the pool no longer tracks), leaking
+        // the `opencode serve` child and skewing `active_sessions`. When the
+        // instance is no longer pooled, fall through to the spawn path below,
+        // whose `Entry` match safely re-resolves the current pooled server (or
+        // publishes a fresh one).
+        let still_pooled = pool
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &server));
+
+        if healthy && still_pooled {
             server.active_sessions.fetch_add(1, Ordering::SeqCst);
             server.mark_used();
             tracing::debug!(
@@ -473,9 +504,12 @@ fn acquire_warm_server(
             return Ok(OpenCodeWarmServerLease { server });
         }
 
-        // Unhealthy server. Only evict/shutdown when no other turn is using
-        // it; killing a server with active sessions would interrupt those
-        // in-flight turns as collateral damage.
+        // Reached when the probed instance is unhealthy, or healthy but no
+        // longer the pooled entry (a racing acquire swapped in a replacement).
+        // Only evict/shutdown when no other turn is using it; killing a server
+        // with active sessions would interrupt those in-flight turns as
+        // collateral damage. The `Arc::ptr_eq` guard below ensures we never
+        // remove a replacement the pool now tracks.
         if server.active_sessions.load(Ordering::SeqCst) == 0 {
             // Confirm the pool still holds the same instance before removing,
             // so we don't evict a replacement inserted while the lock was
@@ -1255,6 +1289,11 @@ fn consume_sse_inner(
                 if is_cancelled(cancel_token) {
                     return Err("OpenCode request cancelled".to_string());
                 }
+                // Abnormal read error before a terminal event. Abort the
+                // server-side session so the async OpenCode turn does not keep
+                // running and mutating the (potentially warm-pooled, reused)
+                // workspace after we have given up on the stream.
+                abort_session(base_url, auth, session_id);
                 return Err(format!("OpenCode SSE stream read error: {e}"));
             }
         };
@@ -1336,6 +1375,11 @@ fn consume_sse_inner(
             abort_session(base_url, auth, session_id);
             return Err("OpenCode request cancelled".to_string());
         }
+        // Stream EOF with no terminal event, no recoverable text, and no
+        // cancel. The async session may still be live server-side; abort it so
+        // it cannot keep mutating a warm-pooled workspace that the next turn
+        // would reuse.
+        abort_session(base_url, auth, session_id);
         return Err("OpenCode stream ended without a terminal event".to_string());
     }
 
