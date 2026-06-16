@@ -827,7 +827,7 @@
     nested `usage` on the success result frame so watcher-owned codex turns
     persist token telemetry — never the session-cumulative
     `info.total_token_usage`).
-  - `src/services/tui_prompt_dedupe.rs` (1425 lines; shared TUI prompt
+  - `src/services/tui_prompt_dedupe.rs` (2867 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
     outside an extraction plan; +37 from #3527: `is_discord_relayed_user_prompt`
     skips re-observed `[User: … (ID: …)]` Discord-relay lines (whole-string scan —
