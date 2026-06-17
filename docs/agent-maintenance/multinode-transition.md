@@ -503,6 +503,12 @@
   HTTP helpers. This is **worker-local**: it touches only the recovered/finalized
   Discord message id on the worker processing that channel and adds no shared
   scheduling authority or cross-node lease dependency.
+- TUI hook registry upstream-port audit: `runtime_bootstrap.rs` bootstrap
+  wiring now feeds the Claude TUI hook buffer/claim registry, but the registry
+  is **worker-local** in-memory state scoped to a provider session / tmux key.
+  It adds no leader-only side effect, durable queue, cross-node singleton, or
+  PG lease; on restart it can only lose buffered hook events and falls back to
+  the legacy readiness path.
 - #3038 S1 (SharedData `QueuedPlaceholderState` extraction): `runtime_bootstrap.rs`
   changed in two helpers only — `run_bot_build_shared_data` (three consecutive
   queued-placeholder members wrapped into the new `queued:` group field;
