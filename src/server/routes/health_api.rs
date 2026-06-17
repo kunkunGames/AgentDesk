@@ -342,6 +342,9 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
         if let Some(report) = pipeline_override_report {
             json["pipeline_overrides"] = report;
         }
+        if detailed {
+            json["active_session_audit"] = build_active_session_audit(state).await.to_json();
+        }
         let json = if detailed {
             with_latest_startup_doctor(json, true)
         } else {
@@ -747,7 +750,8 @@ async fn load_active_session_audit_rows(
     // then the OLDEST heartbeats. Ordering newest-first would let stale/zombie
     // rows beyond the cap escape the audit entirely — the opposite of intent.
     let query = sqlx::query(
-        "SELECT session_key, provider, status, active_dispatch_id, last_heartbeat, thread_channel_id
+        "SELECT session_key, provider, status, active_dispatch_id, last_heartbeat,
+                COALESCE(thread_channel_id, channel_id) AS audit_channel_id
            FROM sessions
           WHERE status IN ('turn_active', 'working')
              OR COALESCE(btrim(active_dispatch_id), '') <> ''
@@ -776,7 +780,7 @@ async fn load_active_session_audit_rows(
             status: row.try_get("status").ok(),
             active_dispatch_id: row.try_get("active_dispatch_id").ok(),
             last_heartbeat: pg_timestamp_to_rfc3339(row, "last_heartbeat"),
-            thread_channel_id: row.try_get("thread_channel_id").ok(),
+            thread_channel_id: row.try_get("audit_channel_id").ok(),
         })
         .collect();
     (mapped, raw_matches_seen)
