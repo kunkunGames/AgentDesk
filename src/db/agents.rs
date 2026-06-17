@@ -48,8 +48,8 @@ impl AgentChannelBindings {
         match provider {
             ProviderKind::Claude => self.claude_channel(),
             ProviderKind::Codex => self.codex_channel(),
-            ProviderKind::OpenCode
-                if self.configured_provider_kind() == Some(ProviderKind::OpenCode) =>
+            ProviderKind::Gemini | ProviderKind::OpenCode | ProviderKind::Qwen
+                if self.configured_provider_kind().as_ref() == Some(provider) =>
             {
                 self.legacy_primary_channel()
             }
@@ -118,6 +118,47 @@ impl AgentChannelBindings {
     fn legacy_primary_channel(&self) -> Option<String> {
         normalized_channel(self.discord_channel_id.clone())
             .or_else(|| normalized_channel(self.discord_channel_cc.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(provider: &str, primary_channel: &str) -> AgentChannelBindings {
+        AgentChannelBindings {
+            provider: Some(provider.to_string()),
+            discord_channel_id: Some(primary_channel.to_string()),
+            ..AgentChannelBindings::default()
+        }
+    }
+
+    #[test]
+    fn resolved_primary_provider_preserves_gemini_primary_binding() {
+        let bindings = binding("gemini", "1470000000000000001");
+
+        assert_eq!(
+            bindings.resolved_primary_provider_kind(),
+            Some(ProviderKind::Gemini)
+        );
+        assert_eq!(
+            bindings.primary_channel().as_deref(),
+            Some("1470000000000000001")
+        );
+    }
+
+    #[test]
+    fn resolved_primary_provider_preserves_qwen_primary_binding() {
+        let bindings = binding("qwen", "1470000000000000002");
+
+        assert_eq!(
+            bindings.resolved_primary_provider_kind(),
+            Some(ProviderKind::Qwen)
+        );
+        assert_eq!(
+            bindings.primary_channel().as_deref(),
+            Some("1470000000000000002")
+        );
     }
 }
 
