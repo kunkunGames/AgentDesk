@@ -522,6 +522,7 @@ impl Drop for OpenCodeWarmServerLease {
 type OpenCodeServerPool = HashMap<OpenCodeServerKey, Arc<OpenCodeWarmServer>>;
 
 static OPENCODE_SERVER_POOL: OnceLock<Mutex<OpenCodeServerPool>> = OnceLock::new();
+static IDLE_DISPOSAL_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 fn opencode_server_pool() -> &'static Mutex<OpenCodeServerPool> {
     OPENCODE_SERVER_POOL.get_or_init(|| Mutex::new(HashMap::new()))
@@ -753,6 +754,41 @@ fn cleanup_idle_warm_servers(pool: &mut OpenCodeServerPool) {
     }
 }
 
+fn evict_warm_server_from_pool(server: &Arc<OpenCodeWarmServer>) {
+    let mut pool = opencode_server_pool().lock().unwrap_or_else(|e| {
+        tracing::warn!("Recovered poisoned lock for OpenCode server pool");
+        e.into_inner()
+    });
+    if pool
+        .get(&server.key)
+        .is_some_and(|current| Arc::ptr_eq(current, server))
+    {
+        pool.remove(&server.key);
+    }
+}
+
+/// Drain all resident warm servers. Called during AgentDesk shutdown so
+/// process-grouped `opencode serve` children do not survive a normal restart.
+pub fn shutdown_warm_servers() {
+    let servers = {
+        let mut pool = opencode_server_pool().lock().unwrap_or_else(|e| {
+            tracing::warn!("Recovered poisoned lock for OpenCode server pool");
+            e.into_inner()
+        });
+        pool.drain().map(|(_, server)| server).collect::<Vec<_>>()
+    };
+    for server in servers {
+        server.retiring.store(true, Ordering::SeqCst);
+        server.shutdown();
+    }
+}
+
+fn claim_idle_disposal_sweep(scheduled: &AtomicBool) -> bool {
+    scheduled
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 /// Schedule a one-shot idle-disposal sweep `WARM_SERVER_IDLE_TTL` from now.
 ///
 /// Called when the final lease on a warm server drops, so an idle
@@ -761,6 +797,9 @@ fn cleanup_idle_warm_servers(pool: &mut OpenCodeServerPool) {
 /// and `idle_for` under the pool lock, so a server that was re-acquired in
 /// the meantime is left untouched.
 fn schedule_idle_disposal() {
+    if !claim_idle_disposal_sweep(&IDLE_DISPOSAL_SCHEDULED) {
+        return;
+    }
     thread::spawn(|| {
         thread::sleep(WARM_SERVER_IDLE_TTL);
         let pool = opencode_server_pool();
@@ -769,6 +808,7 @@ fn schedule_idle_disposal() {
             e.into_inner()
         });
         cleanup_idle_warm_servers(&mut pool);
+        IDLE_DISPOSAL_SCHEDULED.store(false, Ordering::SeqCst);
     });
 }
 
@@ -1084,13 +1124,17 @@ fn run_session(
     }
 
     // 2. Create session
-    let session_id = create_session(base_url, auth)?;
+    let session_id = create_session(base_url, auth, cancel_token)?;
 
     // 3. Announce session
     let _ = sender.send(StreamMessage::Init {
         session_id: session_id.clone(),
         raw_session_id: None,
     });
+    if is_cancelled(cancel_token) {
+        abort_session(base_url, auth, &session_id);
+        return Err("OpenCode request cancelled before prompt send".to_string());
+    }
 
     // 4. Connect SSE stream first, then send prompt
     let sse_agent = ureq::AgentBuilder::new()
@@ -1105,7 +1149,7 @@ fn run_session(
         .map_err(|e| format!("Failed to connect to OpenCode SSE stream: {e}"))?;
 
     // 5. Send prompt (non-blocking — server processes it while we read SSE)
-    send_prompt(
+    if let Err(error) = send_prompt(
         base_url,
         auth,
         &session_id,
@@ -1113,7 +1157,11 @@ fn run_session(
         system_prompt,
         allowed_tools,
         model,
-    )?;
+        cancel_token,
+    ) {
+        abort_session(base_url, auth, &session_id);
+        return Err(error);
+    }
 
     // 6. Read SSE stream
     let reader: BufReader<Box<dyn std::io::Read + Send>> =
@@ -1162,7 +1210,14 @@ fn wait_for_health(
     }
 }
 
-fn create_session(base_url: &str, auth: &str) -> Result<String, String> {
+fn create_session(
+    base_url: &str,
+    auth: &str,
+    cancel_token: Option<&CancelToken>,
+) -> Result<String, String> {
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled before session creation".to_string());
+    }
     let agent = session_request_agent();
     let response = agent
         .post(&format!("{base_url}/session"))
@@ -1174,6 +1229,9 @@ fn create_session(base_url: &str, auth: &str) -> Result<String, String> {
     let json: Value = response
         .into_json()
         .map_err(|e| format!("Failed to parse session response: {e}"))?;
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled after session creation".to_string());
+    }
 
     // Accept "id", "sessionID", or "session_id"
     ["id", "sessionID", "session_id"]
@@ -1191,7 +1249,11 @@ fn send_prompt(
     system_prompt: Option<&str>,
     allowed_tools: Option<&[String]>,
     model: Option<&OpenCodeModelRef>,
+    cancel_token: Option<&CancelToken>,
 ) -> Result<(), String> {
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled before prompt send".to_string());
+    }
     let body = build_prompt_body(prompt, system_prompt, allowed_tools, model);
 
     let agent = session_request_agent();
@@ -1203,6 +1265,9 @@ fn send_prompt(
         .map_err(|e| format!("Failed to send prompt to OpenCode: {e}"))?;
 
     let status = resp.status();
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled after prompt send".to_string());
+    }
     if status == 204 || (200..300).contains(&(status as u32)) {
         Ok(())
     } else {
@@ -1577,6 +1642,7 @@ fn consume_sse(
                         {
                             if server.try_begin_exclusive_hard_kill().is_ok() {
                                 kill_pid_tree(server.id());
+                                evict_warm_server_from_pool(server);
                             } else {
                                 let active = server.active_sessions.load(Ordering::SeqCst);
                                 tracing::warn!(
@@ -1649,8 +1715,6 @@ fn consume_sse_inner(
             }
         };
 
-        last_event = Instant::now();
-
         // Keep-alive comment
         if line.starts_with(':') || line.starts_with("event:") {
             continue;
@@ -1667,6 +1731,7 @@ fn consume_sse_inner(
             current_data.clear();
 
             if let Some(should_stop) = process_sse_event(&data, session_id, sender, &mut state) {
+                last_event = Instant::now();
                 if should_stop {
                     terminal_seen = true;
                     if !state.terminal_error {
@@ -2673,6 +2738,15 @@ mod tests {
     }
 
     #[test]
+    fn idle_disposal_sweep_claim_is_coalesced() {
+        let scheduled = AtomicBool::new(false);
+        assert!(claim_idle_disposal_sweep(&scheduled));
+        assert!(!claim_idle_disposal_sweep(&scheduled));
+        scheduled.store(false, Ordering::SeqCst);
+        assert!(claim_idle_disposal_sweep(&scheduled));
+    }
+
+    #[test]
     fn opencode_warm_server_key_canonicalizes_equivalent_working_dirs() {
         let cwd = std::env::current_dir().expect("current dir");
         let key_from_dot = warm_server_key("opencode", ".");
@@ -2833,6 +2907,35 @@ mod tests {
         // A non-secret colon token (e.g. a URL) is left intact.
         let s = scrub_startup_secrets("listening http://127.0.0.1:8080 ready");
         assert!(s.contains("http://127.0.0.1:8080"), "mangled url: {s}");
+    }
+
+    #[test]
+    fn process_sse_event_ignores_other_session_without_liveness_signal() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut state = SseMessageState::default();
+        let other = serde_json::json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "other-session",
+                "message": {"id": "m1", "role": "assistant"}
+            }
+        });
+        assert_eq!(
+            process_sse_event(&other.to_string(), "current-session", &tx, &mut state),
+            None
+        );
+
+        let current = serde_json::json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "current-session",
+                "message": {"id": "m2", "role": "assistant"}
+            }
+        });
+        assert_eq!(
+            process_sse_event(&current.to_string(), "current-session", &tx, &mut state),
+            Some(false)
+        );
     }
 
     /// [TEST-006] empty pool is cold-start safe: returns empty, no panic.
