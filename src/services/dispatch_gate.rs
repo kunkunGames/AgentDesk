@@ -740,21 +740,35 @@ pub fn evaluate_agent_provider_pressure_with_overrides(
 pub fn persisted_runtime_overrides(
     runtime_config: Option<&Value>,
 ) -> (Option<bool>, Option<u64>, Option<i64>) {
+    persisted_runtime_overrides_with_fallbacks(
+        runtime_config,
+        gate_enabled(),
+        danger_pct(),
+        stale_sec(),
+    )
+}
+
+fn persisted_runtime_overrides_with_fallbacks(
+    runtime_config: Option<&Value>,
+    yaml_enabled: bool,
+    yaml_danger: u64,
+    yaml_stale: i64,
+) -> (Option<bool>, Option<u64>, Option<i64>) {
     let Some(value) = runtime_config else {
         return (None, None, None);
     };
     let enabled = value
         .get("dispatchRateLimitGateEnabled")
         .and_then(Value::as_bool)
-        .filter(|enabled| *enabled != true);
+        .filter(|enabled| *enabled != true || yaml_enabled != true);
     let danger = value
         .get("dispatchRateLimitGateDangerPct")
         .and_then(Value::as_u64)
-        .filter(|danger| *danger != DEFAULT_DANGER_PCT);
+        .filter(|danger| *danger != DEFAULT_DANGER_PCT || yaml_danger != DEFAULT_DANGER_PCT);
     let stale = value
         .get("rateLimitStaleSec")
         .and_then(Value::as_i64)
-        .filter(|stale| *stale != DEFAULT_STALE_SEC);
+        .filter(|stale| *stale != DEFAULT_STALE_SEC || yaml_stale != DEFAULT_STALE_SEC);
     (enabled, danger, stale)
 }
 
@@ -1249,6 +1263,20 @@ mod tests {
         assert_eq!(enabled, None);
         assert_eq!(danger, None);
         assert_eq!(stale, None);
+    }
+
+    #[test]
+    fn persisted_default_values_override_non_default_yaml_values() {
+        let cfg = json!({
+            "dispatchRateLimitGateEnabled": true,
+            "dispatchRateLimitGateDangerPct": 100,
+            "rateLimitStaleSec": 600,
+        });
+        let (enabled, danger, stale) =
+            persisted_runtime_overrides_with_fallbacks(Some(&cfg), false, 95, 900);
+        assert_eq!(enabled, Some(true));
+        assert_eq!(danger, Some(100));
+        assert_eq!(stale, Some(600));
     }
 
     #[test]
