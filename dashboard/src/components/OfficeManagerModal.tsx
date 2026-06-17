@@ -134,12 +134,7 @@ export default function OfficeManagerModal({
             {view === "agents" &&
               `${agentsOffice?.icon ?? ""} ${isKo ? agentsOffice?.name_ko : agentsOffice?.name} — ${tr("멤버 관리", "Manage Members")}`}
           </h2>
-          <SurfaceActionButton
-            tone="neutral"
-            compact
-            onClick={onClose}
-            aria-label={tr("닫기", "Close")}
-          >
+          <SurfaceActionButton tone="neutral" compact onClick={onClose}>
             <X size={16} />
           </SurfaceActionButton>
         </div>
