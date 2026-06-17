@@ -61,11 +61,10 @@ const HEADER_SCAN_LINE_LIMIT: usize = 20;
 const MAX_CACHED_ROOTS: usize = 32;
 
 /// Same-leaf rollout membership validation is intentionally bounded to the most
-/// recent rollout leaf directories. Codex creates new rollouts in the current
-/// dated leaf, so probing recent leaves catches the mtime-coarseness stale-hit
-/// risk without re-walking the whole sessions tree on every 100ms launch poll.
-const RECENT_MEMBERSHIP_PROBE_WINDOW: std::time::Duration =
-    std::time::Duration::from_secs(24 * 60 * 60);
+/// recently modified known directories. Codex creates new rollouts in the
+/// current dated leaf, so probing recent known directories catches the
+/// mtime-coarseness stale-hit risk without re-walking the whole sessions tree on
+/// every 100ms launch poll.
 const MAX_MEMBERSHIP_PROBE_DIRS: usize = 8;
 
 /// Parsed `session_meta` header for a single rollout file. This is the only
@@ -322,19 +321,34 @@ fn tree_signature(root: &Path) -> Option<u64> {
     discover_tree_signature(root).map(|signature| signature.value)
 }
 
-fn recent_rollout_membership_changed(previous_files: &HashMap<PathBuf, CachedFile>) -> bool {
-    let now = SystemTime::now();
-    let mut dirs = previous_files
+fn recent_rollout_membership_changed(index: &RootIndex) -> bool {
+    for dir in rollout_membership_probe_dirs(index) {
+        let Some(current) = rollout_files_in_dir(&dir) else {
+            return true;
+        };
+        let mut cached = index
+            .files
+            .keys()
+            .filter(|path| path.parent() == Some(dir.as_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        cached.sort();
+        if current != cached {
+            return true;
+        }
+    }
+    false
+}
+
+fn rollout_membership_probe_dirs(index: &RootIndex) -> Vec<PathBuf> {
+    let mut dirs = index
+        .dirs
         .iter()
-        .filter_map(|(path, cached)| {
-            let age = now
-                .duration_since(cached.modified)
-                .unwrap_or(std::time::Duration::ZERO);
-            if age > RECENT_MEMBERSHIP_PROBE_WINDOW {
-                return None;
-            }
-            path.parent()
-                .map(|parent| (cached.modified, parent.to_path_buf()))
+        .filter_map(|dir| {
+            std::fs::metadata(dir)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .map(|modified| (modified, dir.clone()))
         })
         .collect::<Vec<_>>();
     dirs.sort_by(|left, right| right.0.cmp(&left.0));
@@ -348,22 +362,7 @@ fn recent_rollout_membership_changed(previous_files: &HashMap<PathBuf, CachedFil
             break;
         }
     }
-
-    for dir in unique_dirs {
-        let Some(current) = rollout_files_in_dir(&dir) else {
-            return true;
-        };
-        let mut cached = previous_files
-            .keys()
-            .filter(|path| path.parent() == Some(dir.as_path()))
-            .cloned()
-            .collect::<Vec<_>>();
-        cached.sort();
-        if current != cached {
-            return true;
-        }
-    }
-    false
+    unique_dirs
 }
 
 fn rollout_files_in_dir(dir: &Path) -> Option<Vec<PathBuf>> {
@@ -448,7 +447,7 @@ fn cached_indexed_rollouts_inner(root: &Path, enabled: bool) -> Vec<IndexedRollo
     if signature_hit
         && previous
             .as_ref()
-            .is_some_and(|index| recent_rollout_membership_changed(&index.files))
+            .is_some_and(recent_rollout_membership_changed)
     {
         signature_hit = false;
     }
@@ -1100,6 +1099,30 @@ mod tests {
             second.len(),
             2,
             "same-leaf rollout membership must invalidate the cached file list even when directory mtime is unchanged"
+        );
+    }
+
+    #[test]
+    fn same_leaf_membership_probe_checks_empty_known_dirs() {
+        let _guard = lock_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let leaf = dir.path().join("2026/05");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let original_mtime = std::fs::metadata(&leaf).unwrap().modified().unwrap();
+
+        let first = cached_indexed_rollouts(dir.path());
+        assert!(first.is_empty(), "empty known leaf starts with no rollouts");
+
+        write_rollout(dir.path(), "2026/05/rollout-a.jsonl", "s1", cwd.path());
+        filetime::set_file_mtime(&leaf, filetime::FileTime::from_system_time(original_mtime))
+            .unwrap();
+
+        let second = cached_indexed_rollouts(dir.path());
+        assert_eq!(
+            second.len(),
+            1,
+            "empty cached leaves must be revalidated so a same-leaf rollout is discovered"
         );
     }
 
