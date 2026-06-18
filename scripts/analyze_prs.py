@@ -48,6 +48,7 @@ except Exception as e:
     exit(1)
 
 inventory_refresh_count = 0
+has_errors = False
 now = datetime.now(timezone.utc)
 
 for pr in prs:
@@ -60,16 +61,22 @@ for pr in prs:
     # Check PR hygiene requirements
     if "workfingerprint" not in body:
         print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
+        has_errors = True
     if "duplicate" not in body and "overlap" not in body:
         print("  [!] MISSING OVERLAP CHECK: PR body fails to explicitly mention a 'duplicate' or 'overlap' check.")
+        has_errors = True
     if "verification" not in body:
         print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
+        has_errors = True
     if "skipped checks" not in body:
         print("  [!] MISSING SKIPPED CHECKS: PR body fails to mention 'skipped checks' with reasons.")
+        has_errors = True
     if "risk" not in body:
         print("  [!] MISSING RISK: PR body fails to mention 'risk' assessment.")
+        has_errors = True
     if "rollback notes" not in body:
         print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
+        has_errors = True
 
     # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
     is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
@@ -80,15 +87,36 @@ for pr in prs:
 
     if is_stale:
         print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
+        has_errors = True
+
+
+    if stat:
+        scratch_found = []
+        for line in stat.split("\n"):
+            if "|" not in line:
+                continue
+            filename = line.split("|")[0].strip()
+            # Catch common ad-hoc files dumped in the root directory
+            is_root_test = filename.startswith("test_") and "/" not in filename and filename.endswith((".rs", ".py", ".sh", ".txt"))
+            is_plan = filename in ("plan.md", "pr-body.md", "scratch.txt", "scratch.md", "output.log")
+            if is_root_test or is_plan:
+                scratch_found.append(filename)
+        if scratch_found:
+            print(f"  [!] SCRATCH FILE GUARD: PR contains likely ad-hoc scratch files ({', '.join(scratch_found)}). Run a changed-file audit and clean up repository pollution.")
+            has_errors = True
 
     # PR #214/#215 lesson: no-change PRs must have 0 changed files
     if "no-change" in title.lower():
+        if "#" not in body and "branch" not in body and "pr " not in body:
+            print("  [!] MISSING OVERLAPPING PR INFO: No-change PR body fails to explicitly list exact overlapping PR numbers and branches.")
+            has_errors = True
         files_json, _ = run(f"gh pr view {num} --repo {REPO} --json files")
         try:
             files_data = json.loads(files_json)
             if files_data.get("files") is not None:
                 if len(files_data["files"]) > 0:
                     print(f"  [!] UNSAFE NO-CHANGE PR: Title claims no-change but modifies {len(files_data['files'])} files.")
+                    has_errors = True
                 else:
                     print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
         except Exception:
@@ -99,7 +127,12 @@ for pr in prs:
         inventory_refresh_count += 1
         if "duplicate-pr guard" not in body and "duplicate pr guard" not in body:
             print("  [!] MISSING DUPLICATE PR GUARD: Inventory refresh PR body fails to mention 'duplicate-pr guard'.")
+            has_errors = True
 
 if inventory_refresh_count > 1:
     print("\n[!] WARNING: Multiple open inventory refresh PRs detected. Ensure strict duplicate-PR guard is followed.")
+    has_errors = True
+
+if has_errors:
+    print("\n[!] PR hygiene checks failed. Please fix the issues above.")
     exit(1)
