@@ -423,10 +423,13 @@ pub(super) fn normalize_similarity_path(raw: &str) -> Option<String> {
 }
 
 pub(super) fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
-    let re = regex::Regex::new(
-        r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
-    )
-    .expect("file path regex must compile");
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
+        )
+        .expect("file path regex must compile")
+    });
     re.find_iter(text)
         .filter_map(|m| normalize_similarity_path(m.as_str()))
         .collect()
