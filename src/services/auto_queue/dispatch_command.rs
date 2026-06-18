@@ -428,7 +428,7 @@ pub(super) fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
         regex::Regex::new(
             r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
         )
-        .expect("file path regex must compile")
+        .expect("file path regex must compile") // agentdesk-audit: allow-unwrap deterministic static regex
     });
     re.find_iter(text)
         .filter_map(|m| normalize_similarity_path(m.as_str()))
