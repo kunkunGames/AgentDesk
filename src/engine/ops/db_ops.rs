@@ -552,7 +552,10 @@ fn translate_sqlite_rowid(sql: &str) -> String {
             }
 
             let token: String = chars[start..idx].iter().collect();
-            if token.eq_ignore_ascii_case("rowid") {
+            if token.eq_ignore_ascii_case("rowid")
+                || token.eq_ignore_ascii_case("_rowid_")
+                || token.eq_ignore_ascii_case("oid")
+            {
                 result.push_str("ctid");
             } else {
                 result.push_str(&token);
@@ -575,13 +578,26 @@ fn translate_sqlite_rowid(sql: &str) -> String {
             }
 
             let token: String = chars[start..idx].iter().collect();
-            if token.eq_ignore_ascii_case("rowid") {
+            if token.eq_ignore_ascii_case("rowid")
+                || token.eq_ignore_ascii_case("_rowid_")
+                || token.eq_ignore_ascii_case("oid")
+            {
                 result.push_str("ctid");
                 continue;
             }
 
             let lower = token.to_ascii_lowercase();
             if let Some(prefix) = lower.strip_suffix(".rowid") {
+                result.push_str(&token[..prefix.len()]);
+                result.push_str(".ctid");
+                continue;
+            }
+            if let Some(prefix) = lower.strip_suffix("._rowid_") {
+                result.push_str(&token[..prefix.len()]);
+                result.push_str(".ctid");
+                continue;
+            }
+            if let Some(prefix) = lower.strip_suffix(".oid") {
                 result.push_str(&token[..prefix.len()]);
                 result.push_str(".ctid");
                 continue;
@@ -1265,6 +1281,15 @@ mod tests {
         );
         assert!(prepared.sql.contains("ORDER BY td.ctid DESC, ctid DESC"));
         assert!(prepared.params.is_empty());
+
+        let sql_aliases = "SELECT _rowid_, td._rowid_, \"_rowid_\", oid, td.oid, \"oid\" FROM task_dispatches td ORDER BY td.oid DESC, _rowid_ DESC";
+        let prepared_aliases = prepare_policy_sql_for_pg(sql_aliases, &[]).expect("render rowid aliases");
+        assert!(
+            prepared_aliases
+                .sql
+                .contains("SELECT ctid, td.ctid, \"ctid\", ctid, td.ctid, \"ctid\"")
+        );
+        assert!(prepared_aliases.sql.contains("ORDER BY td.ctid DESC, ctid DESC"));
     }
 
     #[test]
