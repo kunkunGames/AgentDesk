@@ -570,7 +570,6 @@ test("timeouts long turn monitor module alerts every 30-minute threshold", () =>
         result: []
       },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] }
     ])
   });
 
@@ -604,8 +603,6 @@ test("timeouts long turn monitor module skips synthetic reattach placeholders", 
       }
     ],
     dbQuery: createSqlRouter([
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
     ])
   });

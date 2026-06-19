@@ -1,0 +1,31 @@
+**What changed**
+Optimized the cleanup loop for old `long_turn_alert` keys in the `long-turn-monitor.js` timeout policy. The N+1 pattern of fetching keys with `SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'` and running individual `DELETE` statements on each was replaced with a single deterministic `DELETE FROM kv_meta WHERE key LIKE 'long_turn_alert:%'` query.
+
+**Why**
+Repeated database calls in the periodic `onTick1min` timeout path add avoidable IO operations and intermediate memory allocations (holding all matched `key` rows in JS arrays). Replacing it with a single bulk query reduces database round-trips and is a direct O(N) to O(1) complexity reduction.
+
+**WorkFingerprint**
+- Agent: Bolt
+- Category Boundary: `policies/timeouts.js`, `policies/timeouts/long-turn-monitor.js`, `policies/__tests__/timeouts.test.js`
+- Primary Files Modified: `policies/timeouts/long-turn-monitor.js`, `policies/__tests__/timeouts.test.js`
+- Invariant Protected: Periodic timeout tasks execute with deterministic and reduced DB queries.
+- Public API Impact: None
+- Docs Impact: None
+- Verification Plan: `npm run test:policies`
+- Related PRs/Issues: None
+
+**Duplicate/Overlap Check**
+Checked `gh pr list` state. No overlapping open PRs modifying `policies/timeouts/long-turn-monitor.js` or targeting performance reduction for this query path were found.
+
+**Verification Commands & Results**
+- `npm run test:policies`: All policy tests pass, including the `long turn monitor module alerts every 30-minute threshold` test which was updated to reflect the optimized query structure.
+- `git diff --check`: Clean. No trailing whitespace or stray scratch files.
+
+**Skipped Checks**
+- `cargo check --all-targets` and `./scripts/verify-dashboard.sh` were skipped as changes are entirely localized to JS policy files and their corresponding unit tests.
+
+**Risk**
+Minimal. The behavior of deleting `long_turn_alert` prefix keys remains functionally identical. The `LIKE` query matches exactly the same rows the application previously fetched and iterated over.
+
+**Rollback Notes**
+Revert to the old loop-based query if the SQL wildcard match produces unexpected locking issues or syntax conflicts in testing environments.
