@@ -45,6 +45,73 @@ var _autoRefreshInventoryDocs = _inventory._autoRefreshInventoryDocs;
 var _preflight = require("./lib/kanban-preflight");
 var _runPreflight = _preflight._runPreflight;
 
+// #3605 (T2): scope-assessment result recorder is shared with
+// timeouts/reconciliation.js (missed-hook fallback) so both paths record
+// scope_depth + fall back to "full" identically.
+var _scopeAssessment = require("./lib/kanban-scope-assessment");
+var _recordScopeAssessment = _scopeAssessment._recordScopeAssessment;
+
+// #3605 (T2): canonical inert side-path dispatch-type predicate (shared).
+var _sidePath = require("./lib/dispatch-side-path");
+var isSidePathDispatch = _sidePath.isSidePathDispatch;
+
+// #3605 (T2): scope-assessment dispatch creation. Unlike consultation (#256)
+// which swaps to the counter-provider, this is sent to the ASSIGNED agent on
+// its primary channel — "scope-assessment" is intentionally absent from
+// `use_counter_model_channel` (outbox_route.rs), so routing falls back to the
+// assigned agent's primary channel. Kept local (not in auto-queue lib) because
+// this is a kanban-rules side-path, not an auto-queue lifecycle operation.
+function _createScopeAssessmentDispatch(cardId, agentId, title) {
+  try {
+    var dispatchId = agentdesk.dispatch.create(
+      cardId,
+      agentId,
+      "scope-assessment",
+      "[Scope Assessment] " + (title || cardId)
+    );
+    return dispatchId || null;
+  } catch (e) {
+    agentdesk.log.warn("[scope] scope-assessment dispatch failed for " + cardId + ": " + e);
+    return null;
+  }
+}
+
+// #3605 (T2): once-only scope-assessment trigger. Reads the card's
+// `scope_assessment_status`; if already set (pending/completed/skipped) it is a
+// no-op (dedupe). Otherwise it resolves the assigned agent, dispatches the
+// scope-assessment, and immediately marks `scope_assessment_status:"pending"`
+// (mirrors consultation.rs writing consultation_status="pending" up-front).
+function _maybeDispatchScopeAssessment(cardId) {
+  var meta = _loadCardMetadata(cardId);
+  if (meta.scope_assessment_status) {
+    // pending / completed / skipped → already handled, never dispatch twice.
+    return;
+  }
+  var rows = agentdesk.db.query(
+    "SELECT assigned_agent_id, title FROM kanban_cards WHERE id = ?",
+    [cardId]
+  );
+  if (rows.length === 0 || !rows[0].assigned_agent_id) {
+    // No assignee yet → cannot route to "the assigned agent". Skip silently;
+    // the trigger re-evaluates on the next requested entry.
+    agentdesk.log.info("[scope] Card " + cardId + " has no assigned agent — skipping scope-assessment");
+    return;
+  }
+  var agentId = rows[0].assigned_agent_id;
+  var dispatchId = _createScopeAssessmentDispatch(cardId, agentId, rows[0].title);
+  if (!dispatchId) {
+    // Dispatch creation failed — do NOT mark pending so a later requested entry
+    // can retry. T2 is inert, so a missing scope-assessment never blocks flow.
+    return;
+  }
+  _mergeCardMetadata(cardId, {
+    scope_assessment_status: "pending",
+    scope_assessment_dispatch_id: dispatchId
+  });
+  agentdesk.log.info("[scope] Card " + cardId + " → scope-assessment dispatch " + dispatchId + " (agent " + agentId + ")");
+}
+
+
 // ── Policy ───────────────────────────────────────────────────
 
 var rules = {
@@ -184,6 +251,16 @@ var rules = {
 
     // #197: e2e-test dispatches — handled by deploy-pipeline policy
     if (dispatch.dispatch_type === "e2e-test") return;
+
+    // #3605 (T2): scope-assessment dispatch completed — record depth on the
+    // card metadata and stop. This is a side-path (the card never advanced to
+    // in_progress on attach — see transition.rs skip_kickoff), so completion
+    // must NOT flow into the PM gate / review / XP lifecycle below. The depth
+    // is inert in T2: no redispatch, no escalate, no manual intervention.
+    if (dispatch.dispatch_type === "scope-assessment") {
+      _recordScopeAssessment(dispatch.kanban_card_id, dispatch);
+      return;
+    }
 
     // #256: Consultation dispatch completed — update preflight metadata
     if (dispatch.dispatch_type === "consultation") {
@@ -452,6 +529,29 @@ var rules = {
         agentdesk.log.info("[preflight] Card " + payload.card_id + " needs consultation: " + preflight.summary);
       }
       // "clear" and "assumption_ok" → do nothing, auto-queue will create implementation dispatch
+
+      // #3605 (T2): scope-assessment side-path. Once per card, right after
+      // preflight CLEARS, dispatch a scope-assessment to the ASSIGNED agent so
+      // it can record the issue's scale (scope_depth) before implementation.
+      // This is the only clean hook between assignment and the implementation
+      // dispatch (no per-assign hook exists). The depth is inert in T2 (no flow
+      // change); the T3 consumer reads it later.
+      //
+      // codex R2 (#3605): fire ONLY on the "preflight cleared" statuses
+      // ("clear" / "assumption_ok"), NOT merely "not invalid/already_applied".
+      // The previous wide condition also fired on "consult_required" (issue is
+      // too short/unclear and needs counterpart consultation FIRST) — emitting a
+      // scope-assessment there is premature: scope is meaningless until the
+      // consultation clarifies the issue, and it adds a redundant side-path
+      // dispatch. invalid/already_applied went terminal above; consult_required
+      // is handled by the consultation path; only clear/assumption_ok proceed to
+      // implementation and warrant a pre-implementation scope read.
+      if (
+        preflight.status === "clear" ||
+        preflight.status === "assumption_ok"
+      ) {
+        _maybeDispatchScopeAssessment(payload.card_id);
+      }
     }
   },
 
