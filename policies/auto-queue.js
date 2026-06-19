@@ -501,8 +501,7 @@ var autoQueue = {
       ") " +
       "AND (" +
       "  r.phase_gate_grace_until IS NULL " +
-      "  OR datetime(r.phase_gate_grace_until) IS NULL " +
-      "  OR datetime(r.phase_gate_grace_until) <= datetime('now')" +
+      "  OR r.phase_gate_grace_until <= datetime('now')" +
       ") ORDER BY r.id ASC LIMIT 50",
       []
     );
