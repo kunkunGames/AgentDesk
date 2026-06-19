@@ -258,6 +258,7 @@ export default function OfficeManagerView({
                         borderColor: "color-mix(in srgb, var(--th-border) 64%, transparent)",
                       }}
                       title={tr("위로", "Move Up")}
+                      aria-label={tr(`${office.name} 위로 이동`, `Move ${office.name} Up`)}
                     >
                       <ArrowUp size={13} />
                     </button>
@@ -273,6 +274,7 @@ export default function OfficeManagerView({
                         borderColor: "color-mix(in srgb, var(--th-border) 64%, transparent)",
                       }}
                       title={tr("아래로", "Move Down")}
+                      aria-label={tr(`${office.name} 아래로 이동`, `Move ${office.name} Down`)}
                     >
                       <ArrowDown size={13} />
                     </button>
