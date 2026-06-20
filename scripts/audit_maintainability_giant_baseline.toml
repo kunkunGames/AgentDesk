@@ -67,7 +67,23 @@
 # #3479 SPC-shadow removal: lowered 6939 -> 6922 (deleted the dead StatusPanelController
 # shadow-parity calls — 2x shadow_adopt_liveness_reacquired_panel + assert_watcher_create_parity;
 # legacy reacquire/create/edit IO unchanged).
-"src/services/discord/tmux_watcher.rs" = 6922
+# #3558 raised 6923 -> 6925: both `persist_watcher_stream_progress` streaming call
+# sites now thread the captured `turn_identity_for_panel.as_ref()` into the new
+# single-flock RMW helper so a late-frame fresh row B is rejected (+2 lines).
+# #3558 (codex review follow-up) raised 6925 -> 6935: the two remaining
+# session-bound-relay-success sites that still did an unlocked
+# `load_inflight_state` -> mutate -> `save_inflight_state` (re-writing a stale
+# `last_offset`/`response_sent_offset`) now route through the new
+# `persist_watcher_relay_watermark_locked` single-flock RMW helper, gated on the
+# captured `inflight_identity_before_relay` (+10 lines of identity-guarded calls
+# and explanatory comments).
+# #3579 raised 6935 -> 6946: the `session_bound_ack_outcome` INIT switched from
+# the `MissingTarget` failure sentinel to the new watcher-owned `NotAttempted`
+# non-attempt sentinel, with a load-bearing explanatory comment block at the init
+# site documenting why the skipped-ack-wait benign case is now distinct from the
+# real `wait_for_session_bound_relay_delivery_ack` target-none failure. NO new
+# direct send / behavior change — provenance/aggregation classification only.
+"src/services/discord/tmux_watcher.rs" = 6946
 # #3038 tmux_watcher S1 child modules, frozen at landed production LoC.
 "src/services/discord/tmux_watcher/commit_decisions.rs" = 140
 "src/services/discord/tmux_watcher/completion_gate.rs" = 275
@@ -81,7 +97,12 @@
 # tmux_watcher/** 700-line namespace cap; their moved unit tests live in sibling
 # *_tests.rs files (excluded from the production splitter).
 "src/services/discord/tmux_watcher/supervisor_relay.rs" = 393
-"src/services/discord/tmux_watcher/session_bound_ack.rs" = 404
+# #3579 raised 404 -> 427: added the `NotAttempted` enum variant + its fold arm
+# and a doc block distinguishing the watcher-owned non-attempt from the real
+# `MissingTarget` target-none failure (behavior-preserving; resend decision folds
+# to `DeliveryOutcome::Unknown` identically). Stays well under the 700-line cap;
+# the new sentinel-distinction unit tests live in sibling session_bound_ack_tests.rs.
+"src/services/discord/tmux_watcher/session_bound_ack.rs" = 427
 # #3479 Phase-1 rank-2 child modules (streaming UTF-8 chunk decoder + terminal-
 # readiness predicates / pure buffer reconcilers), frozen at landed production LoC.
 # Both sit under the tmux_watcher/** 700-line namespace cap; their moved unit tests
@@ -117,7 +138,10 @@
 # spawn_watcher_orphan_spinner_cleanup_retry) into
 # `turn_bridge/watcher_orphan_cleanup.rs` (both re-exported, call sites
 # byte-identical). Locks in the shrink win (ratchet down only).
-"src/services/discord/turn_bridge/mod.rs" = 6189
+# #3560: +9 (6189 -> 6198) for the footer-mode migration reconcile — the
+# migrate_separate_status_panel_to_footer call + comment at the footer-mode entry
+# (helper body itself extracted to turn_bridge/status_panel.rs, net decomposition).
+"src/services/discord/turn_bridge/mod.rs" = 6198
 # #3038 turn_bridge S1 child modules, frozen at landed production LoC.
 "src/services/discord/turn_bridge/headless_delivery.rs" = 415
 "src/services/discord/turn_bridge/status_panel.rs" = 437
@@ -134,8 +158,9 @@
 # #3038 S3: lowered 4980 -> 4965 (-15) as the cluster-E field block (13
 # restart-lifecycle fields) moved into `shared_state::RestartLifecycle`.
 # Locks in the shrink win (ratchet down only).
-# #3089 S0: +5 for default-off single_message_panel wrapper/log trigger in
-# mod.rs; parser/cache body lives in `single_message_panel.rs`.
+# #3089 S0 (updated #3560): +5 for the single_message_panel wrapper/log trigger
+# in mod.rs; parser/cache body lives in `single_message_panel.rs`. As of #3560
+# the flag is default-ON (opt-out via AGENTDESK_SINGLE_MESSAGE_PANEL=0|false).
 # #3038 S4: lowered 4970 -> 4967 (-3) as the cluster-F field block (5
 # live-placeholder/status-panel fields) moved into `shared_state::PlaceholderState`.
 # Locks in the shrink win (ratchet down only).
@@ -150,7 +175,10 @@
 # stale-dispatch turn gating + its tests, allowed-turn-sender / bot-user-id
 # resolvers, phase2 recovery predicate) moved verbatim to the capped sibling
 # `dispatch_policy.rs`, lowering the frozen baseline 4243 -> 4074 (-169).
-"src/services/discord/mod.rs" = 4074
+# #3557 (A): per-turn hard-ceiling backstop helpers (turn_hard_ceiling_timeout,
+# codex_turn_hard_ceiling_timeout, turn_hard_ceiling_deadline_ms,
+# clamp_auto_extend_deadline_ms) + their unit tests. +55 prod LoC. 4056 -> 4111.
+"src/services/discord/mod.rs" = 4111
 # #3305: the local-only pass-through lifecycle-skip (kind hoist + note-only return
 # branch + idle-loop skip) is offset by comment dedup in the same root, lowering the
 # frozen baseline 5438 -> 5429 (-9). Locks in the shrink win (#3028 ratchet).
@@ -180,7 +208,7 @@
 # verbatim to `tui_prompt_relay/launch_script.rs` (107 prod LoC, below the giant
 # threshold), reached via re-import so the call sites stay byte-identical. Lowers
 # the frozen baseline 4458 -> 4376 (-82). Locks in the shrink win (zero logic change).
-"src/services/discord/tui_prompt_relay.rs" = 4301
+"src/services/discord/tui_prompt_relay.rs" = 4310
 # #3038: lowered 4728 -> 4657 (-71) as `SensitivityState` (definition + impl)
 # moved to the `voice_sensitivity` sibling module. Locks in the shrink win.
 # #3038 VoiceBargeInRuntime S1: lowered 4657 -> 4350 (-307) as the STT
@@ -230,7 +258,21 @@
 # #3479 SPC-shadow removal: lowered 3330 -> 3276 (deleted the dead StatusPanelController
 # recovery-completion shadow block + assert_recovery_completion_parity fn + its dead test;
 # legacy completion_target let-else and complete_status_panel_v2_with_http IO unchanged).
-"src/services/discord/recovery_engine.rs" = 3276
+# #3562: +53 (3276 -> 3329) for recovery_fired/agent_quality_event turn_id+agent_id
+# traceability — turn_id (recovered_transcript_turn_id) and agent_id (resolve_role_binding)
+# derivation at the 3 recovery emit sites + helper signature widening; no logic change.
+# #3581: +11 (3329 -> 3340) for the rebind-origin birth-site stamps — the three
+# bounded-preservation fields (created_at_unix / deadline_secs / birth_generation)
+# are stamped right after `turn_source = ExternalAdopted` so an unadopted,
+# never-progressed rebind orphan can be reaped instead of wedging turn-start.
+# #3582: +9 (3340 -> 3349) for the `set_relay_owner_kind(Watcher)` stamp (+ its
+# rationale comment) on the same rebind-origin birth site. The STALL-WATCHDOG
+# force-clean -> respawn path lands here with `existing_inflight = None`, so the
+# synthetic row used to default to `relay_owner_kind = None` and run every later
+# idle-tail / panel / routing check on the degraded bridge-owned path even though
+# the respawned watcher owns the live tmux relay (the #3582 "relay re-occurrence"
+# regression). No new direct-send; pure inflight-field stamp mirroring tmux.rs.
+"src/services/discord/recovery_engine.rs" = 3349
 # #3034 batch-8: lowered 3771 -> 3770 (dead-code removal).
 # #3038 S1: +1 (3770 -> 3771) for the mechanical `shared.queued_placeholders` ->
 # `shared.queued.queued_placeholders` re-wire (one extra method-chain line) forced
@@ -238,7 +280,15 @@
 # FIX #6 (Codex P2): +6 (3771 -> 3777) for the `set_followup_requeue_context`
 # call that persists the originating Intervention's reply/upload/voice context on
 # the follow-up inflight row so a PRE-submit busy-timeout requeue can rebuild it.
-"src/services/discord/router/message_handler/intake_turn.rs" = 3671
+# #3557 (A): hard-ceiling clamp wired into the watchdog auto-extend block so a
+# turn keeping inflight warm forever can no longer push the deadline without
+# bound (Codex 13125s outlier source). +27 prod LoC. 3672 -> 3699.
+# #3557 (A) codex r2 baseline correction: the prior commit froze 3699 but the
+# splitter actually counts 3722 production LoC for this file (the auto-extend
+# clamp + the init-time ceiling-cap block landed together, the latter undercounted
+# in the prior bump). No new code lands here this round; this only corrects the
+# frozen value to the file's true LoC so the ratchet gate passes. 3699 -> 3722.
+"src/services/discord/router/message_handler/intake_turn.rs" = 3722
 "src/services/discord/meeting_orchestrator.rs" = 3227
 # #3293: +3 for the `registry_purge` child-module declaration (peek +
 # operator-gated idle-entry purge live outside the frozen root); lowered
@@ -259,7 +309,12 @@
 # `handle_event` (mirrors the model-picker / idle-recap arms — the dispatch can
 # only live in the root event handler). The cancel handler body itself lives in
 # the non-giant `steering.rs`, not here. Combined with #3446: 2969 -> 2975.
-"src/services/discord/router/intake_gate.rs" = 2975
+# #3576 announce-trigger restore: +1 (2977 -> 2978) for the extra
+# `announce_bot_id,` argument line on the `is_allowed_turn_sender` call in
+# `handle_event` (restores the announce branch removed by #3478). The call
+# site lives in the root event handler; the gate logic itself stays in the
+# non-giant `dispatch_policy.rs`.
+"src/services/discord/router/intake_gate.rs" = 2978
 "src/services/discord/formatting.rs" = 2802
 # #3038 run_bot S0/S1: lowered 2802 -> 1918 by adding characterization tests and
 # moving restored_state, queued_placeholders, startup_doctor, orphan_recovery,
@@ -274,7 +329,7 @@
 # #3038 run_bot S5: lowered 369 -> 274 by moving the 120-line leader gateway
 # runtime tail into `runtime_bootstrap/gateway_runtime.rs`; all
 # `runtime_bootstrap/` child modules remain under the 700-line namespace cap.
-"src/services/discord/runtime_bootstrap.rs" = 274
+"src/services/discord/runtime_bootstrap.rs" = 285
 # #3034 batch-8: lowered 2655 -> 2645 (dead-code removal: `stop_provider_channel_runtime`).
 # #3293: lowered 2645 -> 2641 (mailbox probe routed through the non-creating
 # `health/mailbox.rs::peeked_provider_mailbox_state`).
@@ -296,7 +351,58 @@
 # entry). Lowers 2585 -> 1980 (actual post-split prod LoC). The status-panel
 # guards stay in root: their compare-and-clear still needs the file-private
 # load/persist-under-lock internals, so they cannot move cleanly yet.
-"src/services/discord/inflight.rs" = 1980
+# #3552: +55 (1980 -> 2035) for the severity-aware invariant recorder
+# (`record_inflight_invariant_with_severity` + `offset_monotonic_invariant_severity`
+# pure helper + doc) on the save path. When the #3416 enforce guard will skip a
+# backward inflight write (offset preserved, zero data loss) the paired
+# offset-monotonic invariant is recorded at WARN instead of ERROR, killing the
+# duplicate ERROR-log noise; the ERROR severity is preserved for the persist path.
+# This save-path emit is the SINGLE lock-atomic authority for the
+# response_sent_offset_monotonic invariant (codex r2): it re-validates the row
+# under its own lock and emits at the correct severity atomically with the
+# skip/persist decision, so the tmux watcher pre-save emit was removed as a
+# race-prone duplicate (`offset_monotonic_invariant_severity` stays private).
+# #3558 raised 2035 -> 2275 (+240): two new single-flock read-modify-write helpers
+# that fix the watcher offset TOCTOU — `persist_watcher_stream_progress_locked`
+# (preserves the non-owned `last_offset` from the in-lock reload) and
+# `commit_watcher_terminal_delivery_locked` (max-serializes the watermark) — plus
+# their `WatcherStreamProgressPatch` / `WatcherTerminalCommitPatch` value structs,
+# `WatcherProgressOutcome` / `WatcherTerminalCommitOutcome` enums, and 5 unit
+# tests covering last_offset preservation, fresh-row identity rejection,
+# backward/forward commit max-serialize, and Gemini retry-reset non-destruction.
+# #3558 (codex review follow-up) raised 2275 -> 2378 (+103): a third single-flock
+# RMW helper `persist_watcher_relay_watermark_locked` (with its
+# `WatcherRelayWatermarkPatch` value struct and `WatcherRelayWatermarkOutcome`
+# enum) for the two `tmux_watcher.rs` session-bound-relay-success sites — it
+# patches ONLY `last_watcher_relayed_*` and preserves the in-lock
+# `last_offset`/`response_sent_offset`/`full_response`, so a late relay can no
+# longer clobber a concurrently-advanced watermark backward — plus 2 unit tests
+# (concurrent-advance preservation, fresh-row identity rejection).
+# #3581 raised 2378 -> 2551 (+173): bounded reap of abandoned rebind-origin
+# orphans (the STALL-WATCHDOG wedge source). Adds the env-overridable deadline
+# constant + `rebind_origin_deadline_secs_env` (clamped) + `now_unix`, the
+# strict-conjunction predicate `should_reap_abandoned_rebind_origin` (owner-less +
+# unadopted + never-progressed + never-delivered; reap iff past-deadline OR
+# prior-generation), the `rebind_origin_age_secs` stamp/mtime age helper, the
+# `emit_reap_abandoned_rebind_origin` #3561 lifecycle event, and the boot-time
+# reap branch wired into `invalidate_stale_generation_in_root` (the prior code
+# skipped every rebind row unconditionally, the permanent-orphan source). The
+# bulk is load-bearing doc comments pinning the never-live argument; the tests
+# live in `#[cfg(test)] mod rebind_origin_reap_tests` and are excluded here.
+# #3581 (codex TOCTOU follow-up) raised 2551 -> 2660 (+109): closes the
+# placeholder-sweeper reap race (unlocked-snapshot pre-check, then
+# `delete_inflight_state_file` unlinked without re-reading the row under the
+# lock — a racing intake/TUI claim could persist a new live inflight at the same
+# sidecar path and have it wiped). Adds the shared locked re-validate helper
+# `reap_abandoned_rebind_origin_locked_in_root` (+ its env wrapper
+# `reap_abandoned_rebind_origin_locked`), the `RebindReapOutcome` enum, and the
+# `rebind_row_identity_unchanged` identity guard (created_at + birth_generation +
+# turn_start_offset) so a replacement turn is never mistaken for the snapshotted
+# orphan. Both the sweeper and the boot `invalidate_stale_generation_in_root`
+# path now route their unlink through this single helper (the boot branch loses
+# its inline lock+reload). The bulk is load-bearing doc comments; the 4 new
+# boundary tests live in the excluded `rebind_origin_reap_tests` module.
+"src/services/discord/inflight.rs" = 2660
 # #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
 # prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
 # its ratchet entry is deleted (win; no baseline raises).
@@ -309,7 +415,26 @@
 # notify-outbox subsystem — build/enqueue/reconcile/parse/rollback).
 # suppressed-label noise, user report 2026-06-12: +38 for provider-aware
 # status/footer stripping in the placeholder suppression decisions.
-"src/services/discord/tmux.rs" = 2057
+# #3552 (codex r2): +1 (2057 -> 2058) — the racy pre-save
+# `response_sent_offset_monotonic` severity emit added in #3552 codex r1 is
+# REMOVED. It computed WARN/ERROR against an unlocked `load_inflight_state`
+# snapshot, but the immediately-following `save_inflight_state` re-judges the row
+# under its own lock; a concurrent clear/fresh-row between them could make the
+# tmux emit WARN while the save actually persists a stale backward write (a
+# WARN-only-when-skipped breach hidden). `persist_watcher_stream_progress` always
+# reaches that save (no early return after the check), so the lock-atomic
+# save-path emit is the single authoritative source — the tmux emit was a pure
+# duplicate. Dropping it also removes `record_watcher_invariant_with_severity`,
+# `persist_watcher_response_sent_offset_severity`, and the
+# `persist_watcher_stream_progress_with_authority` test seam; net +1 vs base is a
+# replacement doc-comment explaining the delegation. The DEBUG-only
+# `debug_assert!(monotonic_offset)` tripwire stays (production no-op).
+# #3558 lowered 2058 -> 2049 (-9): `persist_watcher_stream_progress` dropped its
+# unlocked `load_inflight_state` -> mutate -> `save_inflight_state` body and now
+# builds a `WatcherStreamProgressPatch` + delegates the read-modify-write to the
+# single-flock `inflight::persist_watcher_stream_progress_locked`. Locks in the
+# shrink win.
+"src/services/discord/tmux.rs" = 2049
 # completion_guard.rs decomposed in #3479 (1834 -> 872 prod LoC); dropped below
 # the giant threshold, so its ratchet baseline is retired (no longer tracked).
 # #3034 batch-8: lowered 1781 -> 1753 (deleted the dead `assistant_turns` turn-cap
@@ -336,7 +461,14 @@
 # into child modules. Pure move; each child is well under the 1000-prod-LoC
 # giant threshold so no new ratchet/registry entry is needed.
 "src/services/discord/turn_finalizer.rs" = 1337
-"src/services/discord/router/message_handler/headless_turn.rs" = 1462
+# #3557 (A) codex r2: the headless watchdog was missing the per-turn hard
+# ceiling cap that the foreground intake path already had — and it also
+# `mark_async_managed`s the token (sync watchdog stops enforcing), so this async
+# loop is the ONLY bound. Added the initial-deadline `min(now+timeout, ceiling)`
+# cap + one-shot ceiling warn and the auto-extend `clamp_auto_extend_deadline_ms`
+# clamp (reusing the shared discord/mod.rs helpers). +54 prod LoC (the new test
+# module is excluded from the production count). 1462 -> 1516.
+"src/services/discord/router/message_handler/headless_turn.rs" = 1516
 # #3038 S2: lowered 1054 -> 954 (-100) as the session-override bookkeeping
 # helpers (fast-mode reset-entry codec + reset-pending probes/clears +
 # enablement probes + sync_session_reset_pending) moved verbatim to the

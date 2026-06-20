@@ -40,6 +40,8 @@ use super::InflightRestartMode;
 use super::runtime_store::{atomic_write, discord_inflight_root};
 use crate::dispatch::Source;
 use crate::services::agent_protocol::{RuntimeHandoffKind, TaskNotificationKind};
+// #3552: short alias for the invariant-severity hint forwarded to observability.
+use crate::services::observability::InvariantSeverity as ObsSeverity;
 use crate::services::provider::ProviderKind;
 
 // #2235 (follow-up to #2213): bump v7→v8. v7 added `runtime_kind` without a
@@ -88,6 +90,149 @@ pub(super) const RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET: u32 = 3;
 /// stall-watchdog (#1446): both want fast recovery once an explicit signal failed
 /// to fire (a false-positive cleanup of a live turn is far worse than delay).
 pub(super) const INFLIGHT_STALENESS_THRESHOLD_SECS: u64 = 300;
+
+/// #3581: default deadline (seconds) after which an unadopted, never-progressed
+/// `rebind_origin` row is reaped. Far shorter than the placeholder sweeper's
+/// 1800s safety net so the wedge-causing orphan drains within a handful of
+/// sweep ticks, but comfortably longer than the ~8s TUI-direct adoption
+/// backstop window so a legitimate `/api/inflight/rebind` → TUI-adopt handoff
+/// is never raced. Overridable via `AGENTDESK_REBIND_ORIGIN_DEADLINE_SECS`.
+pub(super) const REBIND_ORIGIN_DEADLINE_SECS_DEFAULT: u64 = 120;
+
+/// #3581: floor for the env-overridden rebind-origin deadline. Guards against a
+/// pathologically small (or zero) override reaping rows before the adoption
+/// backstop window can complete.
+const REBIND_ORIGIN_DEADLINE_SECS_MIN: u64 = 30;
+
+/// #3581: resolve the rebind-origin reap deadline. Reads
+/// `AGENTDESK_REBIND_ORIGIN_DEADLINE_SECS`; on absence / parse failure falls
+/// back to [`REBIND_ORIGIN_DEADLINE_SECS_DEFAULT`]. Any explicit value is
+/// clamped up to [`REBIND_ORIGIN_DEADLINE_SECS_MIN`] so an operator cannot
+/// accidentally configure a reap that races the adoption backstop.
+pub(super) fn rebind_origin_deadline_secs_env() -> u64 {
+    std::env::var("AGENTDESK_REBIND_ORIGIN_DEADLINE_SECS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|secs| secs.max(REBIND_ORIGIN_DEADLINE_SECS_MIN))
+        .unwrap_or(REBIND_ORIGIN_DEADLINE_SECS_DEFAULT)
+}
+
+/// #3581: current Unix epoch seconds (wall clock). Used to stamp a
+/// rebind-origin row's birth time at creation.
+pub(super) fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// #3581: decide whether an abandoned `rebind_origin` inflight row is safe to
+/// reap. The predicate is a strict conjunction of "never-progressed,
+/// never-adopted, never-owned" signals so that a genuinely-live rebind
+/// (MonitorTriggered watcher rebind: `relay_owner_kind = Watcher`) or a row
+/// that has started relaying / been adopted is NEVER reaped:
+///
+///   * `rebind_origin` — only rebind-origin rows are in scope.
+///   * `turn_source == ExternalAdopted` — pins the predicate to the
+///     `recovery_engine` birth site; the `tmux` MonitorTriggered rebind
+///     (`turn_source = MonitorTriggered`, owner Watcher) is excluded twice.
+///   * `effective_relay_owner_kind() == None` — no live relay owner (also
+///     absorbs the legacy `watcher_owns_live_relay` bool).
+///   * `user_msg_id == 0 && current_msg_id == 0` — never adopted / no anchor.
+///   * `!terminal_delivery_committed` — not finalised.
+///   * `response_sent_offset == 0 && full_response.is_empty()` — nothing was
+///     ever streamed to Discord.
+///   * `last_offset == turn_start_offset` — the watcher never advanced past
+///     the birth offset (NOTE: a fresh rebind row is born with
+///     `last_offset == turn_start_offset == file_len`, which can be > 0 — the
+///     "no progress" test is offset equality, NOT `last_offset == 0`).
+///   * `restart_mode.is_none()` — planned restart / hot-swap rows own their
+///     own retention and are never reaped here.
+///
+/// When every structural conjunct holds, the row is reaped iff it is past its
+/// deadline OR it was born in a prior generation. `age_secs` is supplied by the
+/// caller (file-mtime age in the sweeper path) so legacy rows with no
+/// `rebind_origin_created_at_unix` stamp still age out via mtime.
+pub(super) fn should_reap_abandoned_rebind_origin(
+    state: &InflightTurnState,
+    age_secs: u64,
+    current_generation: u64,
+) -> bool {
+    if !state.rebind_origin {
+        return false;
+    }
+    let structurally_abandoned = state.turn_source == TurnSource::ExternalAdopted
+        && state.effective_relay_owner_kind() == RelayOwnerKind::None
+        && state.user_msg_id == 0
+        && state.current_msg_id == 0
+        && !state.terminal_delivery_committed
+        && state.response_sent_offset == 0
+        && state.full_response.is_empty()
+        && state.last_offset == state.turn_start_offset.unwrap_or(state.last_offset)
+        && state.restart_mode.is_none();
+    if !structurally_abandoned {
+        return false;
+    }
+
+    let deadline = state
+        .rebind_origin_deadline_secs
+        .unwrap_or_else(rebind_origin_deadline_secs_env);
+    let past_deadline = age_secs >= deadline;
+    let stale_generation = state
+        .rebind_origin_birth_generation
+        .is_some_and(|birth| birth != current_generation);
+    past_deadline || stale_generation
+}
+
+/// #3581: best-effort age (seconds) for a rebind-origin row. Prefers the
+/// persisted `rebind_origin_created_at_unix` stamp (so the deadline is anchored
+/// to the row's actual birth even if the file is later touched); falls back to
+/// the file's mtime age for legacy rows that pre-date the stamp. Returns 0 when
+/// neither signal is available — in that case only the generation-mismatch
+/// disjunct of `should_reap_abandoned_rebind_origin` can fire, which is the
+/// conservative outcome.
+fn rebind_origin_age_secs(path: &Path, state: &InflightTurnState) -> u64 {
+    if let Some(created) = state.rebind_origin_created_at_unix {
+        return now_unix().saturating_sub(created).max(0) as u64;
+    }
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// #3581: operator-visibility event for a reaped abandoned rebind-origin row
+/// (#3561 lifecycle stream). Mirrors the `evict_stale_generation` shape so the
+/// two boot-time reap reasons aggregate side by side.
+pub(super) fn emit_reap_abandoned_rebind_origin(
+    provider: &ProviderKind,
+    state: &InflightTurnState,
+    age_secs: u64,
+    current_generation: u64,
+    reason: &str,
+) {
+    crate::services::observability::emit_inflight_lifecycle_event(
+        provider.as_str(),
+        state.channel_id,
+        state.dispatch_id.as_deref(),
+        None,
+        None,
+        "reap_abandoned_rebind_origin",
+        serde_json::json!({
+            "reason": reason,
+            "age_secs": age_secs,
+            "deadline_secs": state
+                .rebind_origin_deadline_secs
+                .unwrap_or_else(rebind_origin_deadline_secs_env),
+            "birth_generation": state.rebind_origin_birth_generation,
+            "current_generation": current_generation,
+            "turn_source": state.turn_source.as_str(),
+            "tmux_session_name": state.tmux_session_name,
+        }),
+    );
+}
 
 pub(super) fn inflight_runtime_root() -> Option<PathBuf> {
     discord_inflight_root()
@@ -156,6 +301,114 @@ pub(super) fn delete_inflight_state_file(provider: &ProviderKind, channel_id: u6
     fs::remove_file(path).is_ok()
 }
 
+/// #3581 (codex TOCTOU fix): outcome of a locked rebind-origin reap attempt so
+/// callers (and tests) can distinguish "reaped" from "skipped because the row
+/// was replaced/no-longer-eligible" from "the file was already gone".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RebindReapOutcome {
+    /// The row was re-validated under the lock and unlinked.
+    Reaped,
+    /// The on-disk row no longer satisfies the reap predicate (e.g. a live
+    /// intake/claim replaced it between the unlocked snapshot and the lock) —
+    /// deletion was intentionally skipped.
+    Skipped,
+    /// The state file was already absent (idempotent no-op) or unreadable.
+    Missing,
+    /// The advisory lock could not be acquired — the caller should retry later.
+    LockUnavailable,
+}
+
+/// #3581 (codex TOCTOU fix): true when the on-disk `locked` row is still the
+/// *same* abandoned rebind-origin orphan identified by the unlocked `snapshot`.
+///
+/// The placeholder sweeper (and the boot invalidator) pass an unlocked snapshot
+/// to `should_reap_abandoned_rebind_origin`; between that read and acquiring the
+/// sidecar lock a normal intake / TUI claim can persist a brand-new live
+/// inflight at the same `(provider, channel_id)` path. Re-running the reap
+/// predicate alone is not sufficient: a *new* rebind-origin orphan could be born
+/// (different birth stamp/generation) that also looks structurally abandoned.
+/// We therefore additionally require the row's birth identity to be unchanged
+/// (`rebind_origin_created_at_unix` + `rebind_origin_birth_generation`), so a
+/// replacement turn is never mistaken for the snapshotted orphan.
+fn rebind_row_identity_unchanged(snapshot: &InflightTurnState, locked: &InflightTurnState) -> bool {
+    locked.rebind_origin == snapshot.rebind_origin
+        && locked.rebind_origin_created_at_unix == snapshot.rebind_origin_created_at_unix
+        && locked.rebind_origin_birth_generation == snapshot.rebind_origin_birth_generation
+        && locked.turn_start_offset == snapshot.turn_start_offset
+}
+
+/// #3581 (codex TOCTOU fix): reap an abandoned rebind-origin orphan under the
+/// sidecar lock with a re-validate-then-unlink contract. This is the shared
+/// implementation behind both the periodic placeholder-sweeper path and the
+/// boot-time `invalidate_stale_generation` path so the two stay consistent.
+///
+/// Contract:
+///   1. Acquire the sidecar advisory lock for the row's path (the same
+///      non-reentrant `flock` every intake/claim/persist helper takes).
+///   2. **Reload** the current on-disk row under the lock.
+///   3. Confirm the reloaded row is still the *same* orphan as `snapshot`
+///      (`rebind_row_identity_unchanged`) AND still satisfies
+///      `should_reap_abandoned_rebind_origin` with a freshly recomputed age
+///      (created-at preferred, mtime fallback for legacy rows).
+///   4. Unlink **only** when both checks hold; otherwise skip (a live intake /
+///      claim replaced the orphan since the snapshot).
+///
+/// Returns the [`RebindReapOutcome`]; the caller emits observability on
+/// [`RebindReapOutcome::Reaped`].
+fn reap_abandoned_rebind_origin_locked_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    snapshot: &InflightTurnState,
+    current_generation: u64,
+) -> RebindReapOutcome {
+    let path = inflight_state_path(root, provider, snapshot.channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return RebindReapOutcome::LockUnavailable;
+    };
+    let Some(locked) = read_inflight_state_content(&path) else {
+        return RebindReapOutcome::Missing;
+    };
+    // The unlocked snapshot may have raced a replacement turn. Re-validate the
+    // current row's birth identity AND its eligibility under a freshly computed
+    // age before touching the file.
+    if !rebind_row_identity_unchanged(snapshot, &locked) {
+        return RebindReapOutcome::Skipped;
+    }
+    let age_secs = rebind_origin_age_secs(&path, &locked);
+    if !should_reap_abandoned_rebind_origin(&locked, age_secs, current_generation) {
+        return RebindReapOutcome::Skipped;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => RebindReapOutcome::Reaped,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => RebindReapOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = snapshot.channel_id,
+                error = %error,
+                "#3581 rebind reap remove_file failed under lock; treating as Missing"
+            );
+            RebindReapOutcome::Missing
+        }
+    }
+}
+
+/// #3581 (codex TOCTOU fix): env-rooted wrapper around
+/// [`reap_abandoned_rebind_origin_locked_in_root`] for the periodic
+/// placeholder-sweeper path. Returns `true` iff the row was re-validated under
+/// the lock and unlinked (so the sweeper only counts/emits genuine reaps).
+pub(super) fn reap_abandoned_rebind_origin_locked(
+    provider: &ProviderKind,
+    snapshot: &InflightTurnState,
+    current_generation: u64,
+) -> bool {
+    let Some(root) = inflight_runtime_root() else {
+        return false;
+    };
+    reap_abandoned_rebind_origin_locked_in_root(&root, provider, snapshot, current_generation)
+        == RebindReapOutcome::Reaped
+}
+
 fn now_string() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -211,8 +464,44 @@ fn record_inflight_invariant(
     message: &'static str,
     details: serde_json::Value,
 ) -> bool {
+    record_inflight_invariant_with_severity(
+        condition,
+        state,
+        invariant,
+        code_location,
+        message,
+        details,
+        ObsSeverity::Error,
+    )
+}
+
+/// #3552 (pure, testable): the offset-monotonic invariants on the save path are
+/// paired with the #3416 enforce guard. When that guard will SKIP the backward
+/// write (`enforce_skips_backward_write`), the violation is already safely
+/// handled (offset preserved, zero data loss) → record at WARN so the paired
+/// `#3416 enforce` WARN is the only operator log and the duplicate ERROR noise
+/// (~17/day) disappears. Otherwise the backward write persists → ERROR (a
+/// genuine breach). The structured analytics event is identical either way.
+fn offset_monotonic_invariant_severity(enforce_skips_backward_write: bool) -> ObsSeverity {
+    if enforce_skips_backward_write {
+        ObsSeverity::Warn
+    } else {
+        ObsSeverity::Error
+    }
+}
+
+/// #3552: severity-aware variant of `record_inflight_invariant`.
+fn record_inflight_invariant_with_severity(
+    condition: bool,
+    state: &InflightTurnState,
+    invariant: &'static str,
+    code_location: &'static str,
+    message: &'static str,
+    details: serde_json::Value,
+    severity: ObsSeverity,
+) -> bool {
     let turn_id = turn_id_for_state(state);
-    crate::services::observability::record_invariant_check(
+    crate::services::observability::record_invariant_check_with_severity(
         condition,
         crate::services::observability::InvariantViolation {
             provider: Some(state.provider.as_str()),
@@ -225,6 +514,7 @@ fn record_inflight_invariant(
             message,
             details,
         },
+        severity,
     )
 }
 
@@ -272,7 +562,33 @@ fn validate_inflight_state_for_save(
         && existing.turn_start_offset == state.turn_start_offset;
     let monotonic_offset =
         !same_turn_identity || state.response_sent_offset >= existing.response_sent_offset;
-    record_inflight_invariant(
+    // I6 (last_offset_monotonic) — OBSERVE-ONLY on the bridge/watcher save
+    // path. A legit fresh-turn reset (different user_msg_id or
+    // turn_start_offset) lowers last_offset on purpose, so the check is gated
+    // by SAME turn identity; only a backward move within the same turn is a
+    // violation. We do not skip the write here (that would drop a legit fresh
+    // turn); the enforcing variant lives in the standby/refresh path.
+    let last_offset_monotonic = !same_turn_identity || state.last_offset >= existing.last_offset;
+
+    // #3552: when the #3416 enforce guard (below) will SKIP this backward write
+    // and preserve the offset (zero data loss), the offset-monotonic violation
+    // has already been safely handled — record it at WARN instead of ERROR so
+    // the paired `#3416 enforce` WARN is the only operator-facing log, killing
+    // the duplicate ERROR-log noise. When enforce is OFF the backward write
+    // actually persists below, so the violation stays ERROR (a genuine breach).
+    // Computed BEFORE the records so the severity is correct; the enforce branch
+    // itself (skip + return false) is unchanged.
+    use crate::services::discord::outbound::delivery_record as dr;
+    let authority = dr::delivery_record_authority_enabled();
+    let enforce_skips_backward_write = dr::authority_blocks_backward_inflight_write(
+        authority,
+        monotonic_offset,
+        last_offset_monotonic,
+    );
+    let offset_monotonic_severity =
+        offset_monotonic_invariant_severity(enforce_skips_backward_write);
+
+    record_inflight_invariant_with_severity(
         monotonic_offset,
         state,
         "response_sent_offset_monotonic",
@@ -284,20 +600,14 @@ fn validate_inflight_state_for_save(
             "same_turn_identity": same_turn_identity,
             "path": path.display().to_string(),
         }),
+        offset_monotonic_severity,
     );
     debug_assert!(
         monotonic_offset,
         "inflight response_sent_offset must not move backwards for the same turn identity"
     );
 
-    // I6 (last_offset_monotonic) — OBSERVE-ONLY on the bridge/watcher save
-    // path. A legit fresh-turn reset (different user_msg_id or
-    // turn_start_offset) lowers last_offset on purpose, so the check is gated
-    // by SAME turn identity; only a backward move within the same turn is a
-    // violation. We do not skip the write here (that would drop a legit fresh
-    // turn); the enforcing variant lives in the standby/refresh path.
-    let last_offset_monotonic = !same_turn_identity || state.last_offset >= existing.last_offset;
-    record_inflight_invariant(
+    record_inflight_invariant_with_severity(
         last_offset_monotonic,
         state,
         "last_offset_monotonic",
@@ -309,6 +619,7 @@ fn validate_inflight_state_for_save(
             "same_turn_identity": same_turn_identity,
             "path": path.display().to_string(),
         }),
+        offset_monotonic_severity,
     );
     debug_assert!(
         last_offset_monotonic,
@@ -334,14 +645,9 @@ fn validate_inflight_state_for_save(
 
     // #3416 (#3089 B3): observe→ENFORCE under the durable-authority flag (no-op
     // when OFF); see dr::authority_blocks_backward_inflight_write. The violation
-    // itself was already recorded by the monotonic record_inflight_invariant above.
-    use crate::services::discord::outbound::delivery_record as dr;
-    let authority = dr::delivery_record_authority_enabled();
-    if dr::authority_blocks_backward_inflight_write(
-        authority,
-        monotonic_offset,
-        last_offset_monotonic,
-    ) {
+    // itself was already recorded by the monotonic record_inflight_invariant
+    // above (downgraded to WARN for this skipped-write case — see #3552).
+    if enforce_skips_backward_write {
         tracing::warn!(
             "#3416 enforce: skipped backward inflight write at {}",
             path.display()
@@ -1491,6 +1797,349 @@ fn refresh_inflight_last_offset_if_matches_identity_in_root(
         .is_ok()
 }
 
+/// #3558: the watcher-owned streaming fields a single-flock RMW patches onto the
+/// persisted row. Plain value struct (moved into the helper). `last_offset` is
+/// deliberately ABSENT — the streaming caller does not own the relay watermark
+/// and the helper preserves whatever the in-lock disk reload carries (this is
+/// the core of the TOCTOU fix: the old unlocked load→save re-wrote a stale
+/// `last_offset`, racing a concurrent owner-gated `refresh_inflight_last_offset_*`
+/// advance and emitting a spurious `last_offset_monotonic` violation).
+#[derive(Debug, Clone)]
+pub(in crate::services::discord) struct WatcherStreamProgressPatch {
+    pub current_msg_id: Option<u64>,
+    pub full_response: String,
+    pub response_sent_offset: usize,
+    pub current_tool_line: Option<String>,
+    pub prev_tool_status: Option<String>,
+    pub task_notification_kind: Option<TaskNotificationKind>,
+    pub any_tool_used: bool,
+    pub has_post_tool_text: bool,
+}
+
+/// #3558: outcome of [`persist_watcher_stream_progress_locked_in_root`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum WatcherProgressOutcome {
+    /// The watcher-owned fields were patched and persisted.
+    Saved,
+    /// Either no row exists, or the in-lock reload no longer matches the
+    /// expected identity / tmux session (a fresh turn replaced it, or a
+    /// restart/rebind marker is now pinned). The write was skipped.
+    Skipped,
+    /// Filesystem or lock acquisition failure.
+    IoError,
+}
+
+/// #3558: single-flock read-modify-write for the tmux streaming-progress
+/// caller. Acquires the sidecar flock ONCE, reloads the on-disk row, re-checks
+/// the caller's identity/session guards against the freshly reloaded row, then
+/// patches ONLY the watcher-owned streaming fields and persists via
+/// [`persist_under_lock`] — never re-entering [`save_inflight_state`] (which
+/// would re-acquire the same non-reentrant flock and self-deadlock).
+///
+/// `last_offset` is preserved verbatim from the in-lock reload, so a concurrent
+/// owner-gated `refresh_inflight_last_offset_*` advance can no longer be
+/// clobbered backward by a stale unlocked snapshot.
+pub(in crate::services::discord) fn persist_watcher_stream_progress_locked(
+    provider: &ProviderKind,
+    channel_id: u64,
+    require_identity: Option<&InflightTurnIdentity>,
+    require_tmux_session_name: &str,
+    patch: WatcherStreamProgressPatch,
+) -> WatcherProgressOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return WatcherProgressOutcome::IoError;
+    };
+    persist_watcher_stream_progress_locked_in_root(
+        &root,
+        provider,
+        channel_id,
+        require_identity,
+        require_tmux_session_name,
+        patch,
+    )
+}
+
+/// Root-explicit variant of [`persist_watcher_stream_progress_locked`] for unit
+/// tests (avoids `AGENTDESK_ROOT_DIR` env-var races).
+fn persist_watcher_stream_progress_locked_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    require_identity: Option<&InflightTurnIdentity>,
+    require_tmux_session_name: &str,
+    patch: WatcherStreamProgressPatch,
+) -> WatcherProgressOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    if let Some(parent) = path.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return WatcherProgressOutcome::IoError;
+    }
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return WatcherProgressOutcome::IoError;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return WatcherProgressOutcome::Skipped;
+    };
+    // A pinned restart/rebind marker means a different lifecycle owns the row;
+    // the streaming caller must not touch it (mirrors the refresh-path guard).
+    if state.restart_mode.is_some() || state.rebind_origin {
+        return WatcherProgressOutcome::Skipped;
+    }
+    if state.tmux_session_name.as_deref() != Some(require_tmux_session_name) {
+        return WatcherProgressOutcome::Skipped;
+    }
+    // #3558: when the caller has captured a per-turn identity, reject a write
+    // onto a fresh row B (different user_msg_id / started_at / turn_start_offset)
+    // — exactly the late-frame race the old tmux-session-only guard let through.
+    // Before identity is captured (early frames) the caller passes `None` and we
+    // fall back to the historical tmux-session-only guard above.
+    if let Some(identity) = require_identity
+        && !identity.matches_state(&state)
+    {
+        return WatcherProgressOutcome::Skipped;
+    }
+
+    if let Some(msg_id) = patch.current_msg_id {
+        state.current_msg_id = msg_id;
+    }
+    state.full_response = patch.full_response;
+    // Recompute the boundary clamp against the freshly reloaded full_response so
+    // the persisted offset stays in-bounds even if the disk row's body differs
+    // from the caller's last unlocked snapshot.
+    state.response_sent_offset =
+        normalize_response_sent_offset(&state.full_response, patch.response_sent_offset);
+    state.current_tool_line = patch.current_tool_line;
+    state.prev_tool_status = patch.prev_tool_status;
+    state.any_tool_used = patch.any_tool_used;
+    state.has_post_tool_text = patch.has_post_tool_text;
+    if patch.task_notification_kind.is_some() {
+        state.task_notification_kind = patch.task_notification_kind;
+    }
+    // `last_offset` intentionally untouched — preserved from the in-lock reload.
+
+    match persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:persist_watcher_stream_progress_locked_in_root",
+    ) {
+        Ok(()) => WatcherProgressOutcome::Saved,
+        Err(_) => WatcherProgressOutcome::IoError,
+    }
+}
+
+/// #3558: the watcher-owned fields the terminal-commit RMW writes. Unlike the
+/// streaming patch, the commit caller IS the authoritative owner of the
+/// turn-end watermark, so it deliberately writes `last_offset` /
+/// `response_sent_offset` — but max-serializes them against the in-lock reload
+/// so a late commit observing a newer disk watermark never moves it backward.
+pub(in crate::services::discord) struct WatcherTerminalCommitPatch {
+    pub full_response: String,
+    pub last_offset: u64,
+    pub last_watcher_relayed_offset: Option<u64>,
+    pub last_watcher_relayed_generation_mtime_ns: Option<i64>,
+}
+
+/// #3558: outcome of [`commit_watcher_terminal_delivery_locked_in_root`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum WatcherTerminalCommitOutcome {
+    Committed,
+    Skipped,
+    IoError,
+}
+
+/// #3558: single-flock read-modify-write for the watcher terminal-commit caller
+/// (`commit_decisions::mark_watcher_terminal_delivery_committed`). Replaces the
+/// old unlocked `load_inflight_state` → mutate → `save_inflight_state` (which
+/// re-wrote a stale `last_offset`/`response_sent_offset`, racing a concurrent
+/// owner advance). Holds the flock across reload → identity guard → patch →
+/// `persist_under_lock`. The commit owns the watermark, so it writes
+/// `last_offset`/`response_sent_offset` but `max`-serializes both against the
+/// in-lock reload (forward writes are unchanged; only a backward commit is
+/// clamped up to the disk value).
+pub(in crate::services::discord) fn commit_watcher_terminal_delivery_locked(
+    provider: &ProviderKind,
+    channel_id: u64,
+    require_identity: &InflightTurnIdentity,
+    require_tmux_session_name: &str,
+    patch: WatcherTerminalCommitPatch,
+) -> WatcherTerminalCommitOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return WatcherTerminalCommitOutcome::IoError;
+    };
+    commit_watcher_terminal_delivery_locked_in_root(
+        &root,
+        provider,
+        channel_id,
+        require_identity,
+        require_tmux_session_name,
+        patch,
+    )
+}
+
+/// Root-explicit variant of [`commit_watcher_terminal_delivery_locked`] for unit
+/// tests.
+fn commit_watcher_terminal_delivery_locked_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    require_identity: &InflightTurnIdentity,
+    require_tmux_session_name: &str,
+    patch: WatcherTerminalCommitPatch,
+) -> WatcherTerminalCommitOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return WatcherTerminalCommitOutcome::IoError;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return WatcherTerminalCommitOutcome::Skipped;
+    };
+    if state.restart_mode.is_some() || state.rebind_origin {
+        return WatcherTerminalCommitOutcome::Skipped;
+    }
+    // Preserve the existing strong identity guard (user_msg_id + started_at +
+    // tmux_session + turn_start_offset) exactly — `matches_state` already
+    // compares all four, and we additionally pin the caller-supplied session.
+    if !require_identity.matches_state(&state)
+        || state.tmux_session_name.as_deref() != Some(require_tmux_session_name)
+    {
+        return WatcherTerminalCommitOutcome::Skipped;
+    }
+
+    state.terminal_delivery_committed = true;
+    // Max-serialize against the in-lock reload so a late commit never moves the
+    // watermark backward (the TOCTOU the old unlocked load→save introduced):
+    //  - `full_response`: keep whichever body is LONGER. A concurrent stream may
+    //    have persisted a longer body than this (possibly stale) commit carries;
+    //    adopting the longer one avoids truncating already-relayed content AND
+    //    keeps `response_sent_offset` in-bounds.
+    //  - `response_sent_offset`: the committed body length, never below disk.
+    //  - `last_offset`: the larger of the commit arg and the disk watermark.
+    if patch.full_response.len() >= state.full_response.len() {
+        state.full_response = patch.full_response;
+    }
+    let committed_response_offset = state.full_response.len().max(state.response_sent_offset);
+    state.response_sent_offset =
+        normalize_response_sent_offset(&state.full_response, committed_response_offset);
+    state.last_offset = patch.last_offset.max(state.last_offset);
+    state.last_watcher_relayed_offset = patch.last_watcher_relayed_offset;
+    state.last_watcher_relayed_generation_mtime_ns = patch.last_watcher_relayed_generation_mtime_ns;
+
+    match persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:commit_watcher_terminal_delivery_locked_in_root",
+    ) {
+        Ok(()) => WatcherTerminalCommitOutcome::Committed,
+        Err(_) => WatcherTerminalCommitOutcome::IoError,
+    }
+}
+
+/// #3558 (codex review follow-up): the watcher-owned relay-success watermark a
+/// single-flock RMW patches onto the persisted row. Unlike the terminal-commit
+/// patch this does NOT carry `last_offset` / `response_sent_offset` /
+/// `full_response` and does NOT set `terminal_delivery_committed` — those are
+/// preserved verbatim from the in-lock disk reload. The two
+/// session-bound-relay-success sites in `tmux_watcher.rs` only mean to advance
+/// the relay watermark; the old unlocked `load_inflight_state` → mutate →
+/// `save_inflight_state(&inflight)` re-wrote the whole stale row (including a
+/// possibly-backward `last_offset`/`response_sent_offset`), reintroducing the
+/// exact backward-write TOCTOU the #3558 fix closed elsewhere.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::services::discord) struct WatcherRelayWatermarkPatch {
+    pub last_watcher_relayed_offset: Option<u64>,
+    pub last_watcher_relayed_generation_mtime_ns: Option<i64>,
+}
+
+/// #3558: outcome of [`persist_watcher_relay_watermark_locked_in_root`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum WatcherRelayWatermarkOutcome {
+    Saved,
+    Skipped,
+    IoError,
+}
+
+/// #3558 (codex review follow-up): single-flock read-modify-write for the
+/// watcher's session-bound-relay-success watermark. Replaces the old unlocked
+/// `load_inflight_state` → mutate → `save_inflight_state` at
+/// `tmux_watcher.rs` (the two terminal-relay-success sites). Holds the sidecar
+/// flock across reload → identity guard → patch → [`persist_under_lock`], never
+/// re-entering [`save_inflight_state`] (which would re-acquire the same
+/// non-reentrant flock and self-deadlock). ONLY `last_watcher_relayed_*` is
+/// patched; `last_offset` / `response_sent_offset` / `full_response` are
+/// preserved verbatim from the in-lock reload so a concurrent owner-gated
+/// `refresh_inflight_last_offset_*` advance can no longer be clobbered backward
+/// by the stale unlocked snapshot these sites used to write back.
+pub(in crate::services::discord) fn persist_watcher_relay_watermark_locked(
+    provider: &ProviderKind,
+    channel_id: u64,
+    require_identity: &InflightTurnIdentity,
+    require_tmux_session_name: &str,
+    patch: WatcherRelayWatermarkPatch,
+) -> WatcherRelayWatermarkOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return WatcherRelayWatermarkOutcome::IoError;
+    };
+    persist_watcher_relay_watermark_locked_in_root(
+        &root,
+        provider,
+        channel_id,
+        require_identity,
+        require_tmux_session_name,
+        patch,
+    )
+}
+
+/// Root-explicit variant of [`persist_watcher_relay_watermark_locked`] for unit
+/// tests.
+fn persist_watcher_relay_watermark_locked_in_root(
+    root: &Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    require_identity: &InflightTurnIdentity,
+    require_tmux_session_name: &str,
+    patch: WatcherRelayWatermarkPatch,
+) -> WatcherRelayWatermarkOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return WatcherRelayWatermarkOutcome::IoError;
+    };
+    let Some(mut state) = load_inflight_state_unlocked(&path) else {
+        return WatcherRelayWatermarkOutcome::Skipped;
+    };
+    if state.restart_mode.is_some() || state.rebind_origin {
+        return WatcherRelayWatermarkOutcome::Skipped;
+    }
+    // Same strong identity guard as the terminal-commit helper (user_msg_id +
+    // started_at + tmux_session + turn_start_offset, plus the caller-supplied
+    // session). Rejects a write onto a fresh row B that replaced the row this
+    // relay was for — the late-frame race the old tmux-session-only load→save
+    // let through.
+    if !require_identity.matches_state(&state)
+        || state.tmux_session_name.as_deref() != Some(require_tmux_session_name)
+    {
+        return WatcherRelayWatermarkOutcome::Skipped;
+    }
+
+    state.last_watcher_relayed_offset = patch.last_watcher_relayed_offset;
+    state.last_watcher_relayed_generation_mtime_ns = patch.last_watcher_relayed_generation_mtime_ns;
+    // `last_offset` / `response_sent_offset` / `full_response` /
+    // `terminal_delivery_committed` intentionally untouched — preserved from the
+    // in-lock reload.
+
+    match persist_under_lock(
+        root,
+        &path,
+        &state,
+        "src/services/discord/inflight.rs:persist_watcher_relay_watermark_locked_in_root",
+    ) {
+        Ok(()) => WatcherRelayWatermarkOutcome::Saved,
+        Err(_) => WatcherRelayWatermarkOutcome::IoError,
+    }
+}
+
 fn inflight_state_allows_idle_tmux_repair_state(state: &InflightTurnState) -> bool {
     state.full_response.trim().is_empty()
         && state.response_sent_offset == 0
@@ -1616,6 +2265,36 @@ fn invalidate_stale_generation_in_root(
             continue;
         }
         if state.rebind_origin {
+            // #3581: a rebind-origin row is normally owned by the rebind API
+            // and skipped here. The one exception is an abandoned, never-
+            // progressed orphan from a STALL-WATCHDOG respawn: reap it at boot
+            // if it is past its deadline OR was born in a prior generation.
+            // The reap predicate's strict conjunction guarantees a live /
+            // adopted rebind is never touched.
+            //
+            // #3581 (codex TOCTOU fix): gate the unlocked-snapshot pre-check
+            // with the same locked re-validate-then-unlink helper the periodic
+            // sweeper now uses, so boot and sweeper stay consistent and a row
+            // replaced between the snapshot and the lock is never wiped.
+            let path = inflight_state_path(root, provider, state.channel_id);
+            let age_secs = rebind_origin_age_secs(&path, &state);
+            if should_reap_abandoned_rebind_origin(&state, age_secs, current_generation)
+                && reap_abandoned_rebind_origin_locked_in_root(
+                    root,
+                    provider,
+                    &state,
+                    current_generation,
+                ) == RebindReapOutcome::Reaped
+            {
+                emit_reap_abandoned_rebind_origin(
+                    provider,
+                    &state,
+                    age_secs,
+                    current_generation,
+                    "invalidate_stale_generation_boot",
+                );
+                removed.push((state.channel_id, state.rebind_origin_birth_generation));
+            }
             continue;
         }
         // Codex review HIGH on PR #2460: normal rows are constructed with
@@ -1982,13 +2661,18 @@ mod stall_recovery_tests {
         GuardedClearOutcome, GuardedSaveOutcome, INFLIGHT_STALENESS_THRESHOLD_SECS,
         InflightRestartMode, InflightTurnIdentity, InflightTurnState, RelayOwnerKind,
         StatusPanelBindGuard, StatusPanelBindOutcome, StatusPanelClearGuard,
+        WatcherProgressOutcome, WatcherRelayWatermarkOutcome, WatcherRelayWatermarkPatch,
+        WatcherStreamProgressPatch, WatcherTerminalCommitOutcome, WatcherTerminalCommitPatch,
         bind_status_panel_in_root, clear_current_msg_if_matches_in_root,
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
         clear_inflight_state_if_matches_zero_owned_in_root, clear_status_panel_if_current_in_root,
+        commit_watcher_terminal_delivery_locked_in_root,
         inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
         load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
+        offset_monotonic_invariant_severity, persist_watcher_relay_watermark_locked_in_root,
+        persist_watcher_stream_progress_locked_in_root,
         refresh_inflight_last_offset_if_matches_identity_in_root,
         save_inflight_state_if_matches_identity_in_root, save_inflight_state_in_root,
         validate_inflight_state_for_save,
@@ -2188,6 +2872,437 @@ mod stall_recovery_tests {
         assert!(!legacy.followup_merge_consecutive);
         assert!(legacy.followup_pending_uploads.is_empty());
         assert_eq!(legacy.followup_voice_announcement, None);
+    }
+
+    // ---- #3558: watcher locked read-modify-write (offset TOCTOU) tests ----
+
+    /// Seeds a watcher-streaming inflight row in `root` and returns it, with
+    /// caller-controlled `last_offset` / `response_sent_offset` / `full_response`
+    /// so the offset ownership semantics can be exercised.
+    fn seed_watcher_stream_state(
+        root: &Path,
+        channel_id: u64,
+        tmux_session_name: &str,
+        full_response: &str,
+        last_offset: u64,
+    ) -> InflightTurnState {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Claude,
+            channel_id,
+            Some("adk-claude".to_string()),
+            42,
+            42,
+            43,
+            "prompt".to_string(),
+            Some("session-3558".to_string()),
+            Some(tmux_session_name.to_string()),
+            Some("/tmp/agentdesk-3558.jsonl".to_string()),
+            None,
+            64,
+        );
+        state.turn_start_offset = Some(64);
+        state.full_response = full_response.to_string();
+        state.response_sent_offset = full_response.len();
+        state.last_offset = last_offset;
+        save_inflight_state_in_root(root, &state).expect("seed watcher stream state");
+        state
+    }
+
+    fn loaded_row(root: &Path, channel_id: u64) -> InflightTurnState {
+        load_inflight_states_from_root(root, &ProviderKind::Claude)
+            .into_iter()
+            .find(|s| s.channel_id == channel_id)
+            .expect("inflight row present")
+    }
+
+    /// Writes `state` to its on-disk path bypassing `validate_inflight_state_for_save`
+    /// so a test can seed a pre-condition that is itself a (legitimate)
+    /// fresh-turn reset / concurrently-advanced watermark without tripping the
+    /// `#[cfg(debug_assertions)]` monotonic tripwire — these are exactly the
+    /// disk states the helper under test must handle, not produce.
+    fn force_write_state(root: &Path, state: &InflightTurnState) {
+        let provider = state.provider_kind().expect("known provider");
+        let path = inflight_state_path(root, &provider, state.channel_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create provider dir");
+        }
+        let json = serde_json::to_string_pretty(state).expect("serialize state");
+        super::atomic_write(&path, &json).expect("force write state");
+    }
+
+    /// #3558 core: a streaming progress write must PRESERVE the on-disk
+    /// `last_offset` (which a concurrent owner-gated refresh advanced) instead
+    /// of clobbering it backward from a stale unlocked snapshot.
+    #[test]
+    fn watcher_stream_progress_preserves_concurrently_advanced_last_offset() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_001;
+        let session = "AgentDesk-claude-3558-a";
+        let state = seed_watcher_stream_state(temp.path(), channel_id, session, "hello", 100);
+        let identity = InflightTurnIdentity::from_state(&state);
+
+        // Concurrent owner-gated refresh advances the persisted watermark to 200
+        // (simulating the race window between the old unlocked load and save).
+        assert!(refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &identity,
+            Some(64),
+            "/tmp/agentdesk-3558.jsonl",
+            None,
+            200,
+            RelayOwnerKind::None,
+        ));
+
+        // The streaming caller (holding a stale last_offset == 100 implicitly)
+        // patches only watcher-owned fields.
+        let outcome = persist_watcher_stream_progress_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            Some(&identity),
+            session,
+            WatcherStreamProgressPatch {
+                current_msg_id: Some(43),
+                full_response: "hello world".to_string(),
+                response_sent_offset: 11,
+                current_tool_line: None,
+                prev_tool_status: None,
+                task_notification_kind: None,
+                any_tool_used: false,
+                has_post_tool_text: false,
+            },
+        );
+        assert_eq!(outcome, WatcherProgressOutcome::Saved);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(persisted.full_response, "hello world");
+        assert_eq!(persisted.response_sent_offset, 11);
+        assert_eq!(
+            persisted.last_offset, 200,
+            "last_offset must be preserved at the concurrently-advanced value, NOT clobbered to 100"
+        );
+    }
+
+    /// #3558: a streaming write must be SKIPPED when a fresh turn (row B) with a
+    /// different `turn_start_offset` replaced the row mid-frame — the identity
+    /// guard rejects it and leaves row B untouched.
+    #[test]
+    fn watcher_stream_progress_skips_on_fresh_row_identity_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_002;
+        let session = "AgentDesk-claude-3558-b";
+        let state = seed_watcher_stream_state(temp.path(), channel_id, session, "old", 50);
+        let stale_identity = InflightTurnIdentity::from_state(&state);
+
+        // A fresh turn B replaces the row (different turn_start_offset). A legit
+        // fresh-turn reset lowers last_offset/offset on purpose, so seed it via a
+        // direct write (the on-disk pre-condition the helper must reject).
+        let mut fresh = state.clone();
+        fresh.turn_start_offset = Some(999);
+        fresh.full_response = "fresh".to_string();
+        fresh.response_sent_offset = "fresh".len();
+        fresh.last_offset = 0;
+        force_write_state(temp.path(), &fresh);
+
+        let outcome = persist_watcher_stream_progress_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            Some(&stale_identity),
+            session,
+            WatcherStreamProgressPatch {
+                current_msg_id: Some(43),
+                full_response: "stale write".to_string(),
+                response_sent_offset: 11,
+                current_tool_line: None,
+                prev_tool_status: None,
+                task_notification_kind: None,
+                any_tool_used: false,
+                has_post_tool_text: false,
+            },
+        );
+        assert_eq!(outcome, WatcherProgressOutcome::Skipped);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(
+            persisted.full_response, "fresh",
+            "fresh row B must be untouched by the stale streaming write"
+        );
+        assert_eq!(persisted.turn_start_offset, Some(999));
+    }
+
+    /// #3558: the terminal-commit RMW max-serializes `last_offset` /
+    /// `response_sent_offset` / `full_response` — a late commit observing a NEWER
+    /// disk watermark (a concurrent stream persisted a longer body / larger
+    /// offset) must not move any of them backward. The commit owns the fields but
+    /// clamps up, keeping the longer already-relayed body so nothing is truncated.
+    #[test]
+    fn watcher_terminal_commit_max_serializes_backward_offsets() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_003;
+        let session = "AgentDesk-claude-3558-c";
+        // Disk carries a LONGER already-streamed body + watermark than the
+        // (stale) commit — the concurrent-advance pre-condition. Seed via a
+        // direct write since this is the on-disk state the commit must handle.
+        let long_body = "delivered body plus a much longer already-relayed tail";
+        let mut state = seed_watcher_stream_state(temp.path(), channel_id, session, long_body, 300);
+        state.response_sent_offset = long_body.len();
+        force_write_state(temp.path(), &state);
+        let identity = InflightTurnIdentity::from_state(&state);
+
+        // Commit arrives with a SMALLER last_offset (250 < disk 300) and a
+        // SHORTER body than disk.
+        let outcome = commit_watcher_terminal_delivery_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &identity,
+            session,
+            WatcherTerminalCommitPatch {
+                full_response: "delivered body".to_string(),
+                last_offset: 250,
+                last_watcher_relayed_offset: Some(64),
+                last_watcher_relayed_generation_mtime_ns: Some(7),
+            },
+        );
+        assert_eq!(outcome, WatcherTerminalCommitOutcome::Committed);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert!(persisted.terminal_delivery_committed);
+        assert_eq!(
+            persisted.last_offset, 300,
+            "backward commit last_offset must clamp UP to the disk watermark"
+        );
+        assert_eq!(
+            persisted.full_response, long_body,
+            "the longer already-relayed body must NOT be truncated by a shorter stale commit"
+        );
+        assert_eq!(
+            persisted.response_sent_offset,
+            long_body.len(),
+            "response_sent_offset must clamp UP to the longer body length, never backward"
+        );
+        assert!(
+            persisted.response_sent_offset <= persisted.full_response.len(),
+            "response_sent_offset must stay in bounds"
+        );
+    }
+
+    /// #3558: a forward commit (larger watermark than disk) advances normally —
+    /// the max-serialize is a no-op when the commit is the authoritative tip.
+    #[test]
+    fn watcher_terminal_commit_advances_forward_offset() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_004;
+        let session = "AgentDesk-claude-3558-d";
+        let state = seed_watcher_stream_state(temp.path(), channel_id, session, "body", 100);
+        let identity = InflightTurnIdentity::from_state(&state);
+
+        let outcome = commit_watcher_terminal_delivery_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &identity,
+            session,
+            WatcherTerminalCommitPatch {
+                full_response: "delivered response".to_string(),
+                last_offset: 256,
+                last_watcher_relayed_offset: Some(64),
+                last_watcher_relayed_generation_mtime_ns: Some(9),
+            },
+        );
+        assert_eq!(outcome, WatcherTerminalCommitOutcome::Committed);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(persisted.last_offset, 256);
+        assert_eq!(persisted.full_response, "delivered response");
+        assert_eq!(
+            persisted.response_sent_offset,
+            "delivered response".len(),
+            "forward commit sets response_sent_offset to the committed body length"
+        );
+        assert_eq!(persisted.last_watcher_relayed_offset, Some(64));
+        assert_eq!(persisted.last_watcher_relayed_generation_mtime_ns, Some(9));
+    }
+
+    /// #3558 (codex review follow-up): the two `tmux_watcher.rs`
+    /// session-bound-relay-success sites only mean to advance the relay
+    /// watermark, but the OLD unlocked `load_inflight_state` → mutate →
+    /// `save_inflight_state(&inflight)` re-wrote the WHOLE stale row — including a
+    /// `last_offset`/`response_sent_offset`/`full_response` that a concurrent
+    /// owner-gated refresh had since advanced — reintroducing the exact
+    /// backward-write TOCTOU. The locked relay-watermark RMW must patch ONLY
+    /// `last_watcher_relayed_*` and PRESERVE the concurrently-advanced disk
+    /// watermark.
+    #[test]
+    fn watcher_relay_watermark_preserves_concurrently_advanced_last_offset() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_007;
+        let session = "AgentDesk-claude-3558-g";
+        // Disk carries a SHORT body the relay observed when it loaded.
+        let state = seed_watcher_stream_state(temp.path(), channel_id, session, "hello", 100);
+        let identity = InflightTurnIdentity::from_state(&state);
+
+        // Between the relay's (now-removed) unlocked load and its save, a
+        // concurrent owner-gated refresh advances the watermark to 200 AND a
+        // concurrent stream lengthens the body — the race window the old
+        // load→save clobbered. Seed via a direct write (the on-disk pre-condition
+        // the helper must handle, not produce).
+        assert!(refresh_inflight_last_offset_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &identity,
+            Some(64),
+            "/tmp/agentdesk-3558.jsonl",
+            None,
+            200,
+            RelayOwnerKind::None,
+        ));
+        let mut advanced = loaded_row(temp.path(), channel_id);
+        advanced.full_response = "hello world longer body".to_string();
+        advanced.response_sent_offset = advanced.full_response.len();
+        force_write_state(temp.path(), &advanced);
+
+        // The relay-success site patches only the watcher watermark.
+        let outcome = persist_watcher_relay_watermark_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &identity,
+            session,
+            WatcherRelayWatermarkPatch {
+                last_watcher_relayed_offset: Some(64),
+                last_watcher_relayed_generation_mtime_ns: Some(11),
+            },
+        );
+        assert_eq!(outcome, WatcherRelayWatermarkOutcome::Saved);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(persisted.last_watcher_relayed_offset, Some(64));
+        assert_eq!(persisted.last_watcher_relayed_generation_mtime_ns, Some(11));
+        assert_eq!(
+            persisted.last_offset, 200,
+            "last_offset must be preserved at the concurrently-advanced value, NOT clobbered back to the relay's stale 100"
+        );
+        assert_eq!(
+            persisted.full_response, "hello world longer body",
+            "the concurrently-advanced body must NOT be re-written back to the relay's stale snapshot"
+        );
+        assert_eq!(
+            persisted.response_sent_offset,
+            "hello world longer body".len(),
+            "response_sent_offset must stay at the concurrently-advanced value, never backward"
+        );
+        assert!(
+            !persisted.terminal_delivery_committed,
+            "the relay-watermark write must NOT set terminal_delivery_committed (commit owns that)"
+        );
+    }
+
+    /// #3558 (codex review follow-up): a relay-watermark write must be SKIPPED
+    /// when a fresh turn (row B) with a different `turn_start_offset` replaced
+    /// the row between the relay's load and save — the identity guard rejects it
+    /// and leaves row B untouched, so a late relay can never stamp its stale
+    /// watermark over a newer turn.
+    #[test]
+    fn watcher_relay_watermark_skips_on_fresh_row_identity_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_008;
+        let session = "AgentDesk-claude-3558-h";
+        let state = seed_watcher_stream_state(temp.path(), channel_id, session, "old", 50);
+        let stale_identity = InflightTurnIdentity::from_state(&state);
+
+        let mut fresh = state.clone();
+        fresh.turn_start_offset = Some(999);
+        fresh.full_response = "fresh".to_string();
+        fresh.response_sent_offset = "fresh".len();
+        fresh.last_offset = 0;
+        fresh.last_watcher_relayed_offset = None;
+        force_write_state(temp.path(), &fresh);
+
+        let outcome = persist_watcher_relay_watermark_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            &stale_identity,
+            session,
+            WatcherRelayWatermarkPatch {
+                last_watcher_relayed_offset: Some(64),
+                last_watcher_relayed_generation_mtime_ns: Some(7),
+            },
+        );
+        assert_eq!(outcome, WatcherRelayWatermarkOutcome::Skipped);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(
+            persisted.turn_start_offset,
+            Some(999),
+            "fresh row B must be untouched by the stale relay-watermark write"
+        );
+        assert_eq!(
+            persisted.last_watcher_relayed_offset, None,
+            "fresh row B's relay watermark must not be stamped by the stale relay"
+        );
+        assert_eq!(persisted.last_offset, 0);
+    }
+
+    /// #3558 (Gemini retry non-destruction): after a same-turn retry reset
+    /// (full_response="", response_sent_offset=0), a streaming write that itself
+    /// carries the reset (empty body) must NOT pull the offset back up via any
+    /// blanket max-merge — the patched value is preserved exactly and stays
+    /// in-bounds.
+    #[test]
+    fn watcher_stream_progress_preserves_gemini_retry_reset() {
+        let temp = TempDir::new().unwrap();
+        let channel_id = 35_580_005;
+        let session = "AgentDesk-claude-3558-e";
+        let mut state =
+            seed_watcher_stream_state(temp.path(), channel_id, session, "first attempt", 100);
+        let identity = InflightTurnIdentity::from_state(&state);
+
+        // Legitimate same-turn retry reset (mirrors reset_gemini_retry_attempt_state).
+        // A reset lowers full_response/offset to 0 on purpose for the SAME turn
+        // identity — the bridge persists it; seed it via a direct write so the
+        // intentional backward reset does not trip the test-only monotonic
+        // tripwire (the production save records it OBSERVE-ONLY, never skips).
+        state.full_response = String::new();
+        state.response_sent_offset = 0;
+        force_write_state(temp.path(), &state);
+
+        // Watcher streams the retried turn from empty; the patch carries the
+        // post-reset body. No blanket max-merge: the offset follows the patch.
+        let outcome = persist_watcher_stream_progress_locked_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            channel_id,
+            Some(&identity),
+            session,
+            WatcherStreamProgressPatch {
+                current_msg_id: Some(43),
+                full_response: "retry body".to_string(),
+                response_sent_offset: 10,
+                current_tool_line: None,
+                prev_tool_status: None,
+                task_notification_kind: None,
+                any_tool_used: false,
+                has_post_tool_text: false,
+            },
+        );
+        assert_eq!(outcome, WatcherProgressOutcome::Saved);
+
+        let persisted = loaded_row(temp.path(), channel_id);
+        assert_eq!(persisted.full_response, "retry body");
+        assert_eq!(
+            persisted.response_sent_offset, 10,
+            "post-reset offset must follow the patch, not be pulled back up to the pre-reset value"
+        );
+        assert!(
+            persisted.response_sent_offset <= persisted.full_response.len(),
+            "response_sent_offset must stay in bounds after a retry reset"
+        );
     }
 
     // ---- #3077: typed status-panel ownership write tests ----
@@ -3655,6 +4770,22 @@ mod stall_recovery_tests {
     }
 
     #[test]
+    fn offset_monotonic_severity_downgrades_only_when_enforce_skips() {
+        use crate::services::observability::InvariantSeverity;
+        // #3552: when the #3416 enforce guard will skip the backward write the
+        // violation is already handled → WARN (no ERROR noise). When it will NOT
+        // skip (enforce OFF → write persists) it stays ERROR (a genuine breach).
+        assert_eq!(
+            offset_monotonic_invariant_severity(true),
+            InvariantSeverity::Warn
+        );
+        assert_eq!(
+            offset_monotonic_invariant_severity(false),
+            InvariantSeverity::Error
+        );
+    }
+
+    #[test]
     fn validate_save_records_backward_last_offset_violation_same_identity() {
         // #3017 I6 OBSERVE-ONLY on the save path: a backward last_offset for
         // the same turn identity records a `last_offset_monotonic` violation
@@ -4567,6 +5698,429 @@ mod wave_a_cleanup_tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].restart_generation, Some(2));
         assert_eq!(after[0].user_msg_id, 78);
+    }
+}
+
+#[cfg(test)]
+mod rebind_origin_reap_tests {
+    //! #3581: bounded reap of abandoned `rebind_origin` orphans.
+    //!
+    //! The predicate `should_reap_abandoned_rebind_origin` must fire ONLY on the
+    //! exact STALL-WATCHDOG orphan signature (rebind_origin + ExternalAdopted +
+    //! owner None + user_msg_id 0 + current_msg_id 0 + never-progressed +
+    //! never-delivered) AND only once past its deadline OR born in a prior
+    //! generation. Every single live/adopted signal (owner, offset advance,
+    //! user_msg_id, sent response, planned restart) must independently block the
+    //! reap so a genuinely-live rebind is never destroyed (#3154 / #3540
+    //! no-regression pins).
+    use super::{
+        InflightTurnState, REBIND_ORIGIN_DEADLINE_SECS_DEFAULT, RebindReapOutcome, RelayOwnerKind,
+        TurnSource, invalidate_stale_generation_in_root, load_inflight_states_from_root,
+        reap_abandoned_rebind_origin_locked_in_root, save_inflight_state_in_root,
+        should_reap_abandoned_rebind_origin,
+    };
+    use crate::services::discord::InflightRestartMode;
+    use crate::services::provider::ProviderKind;
+    use tempfile::TempDir;
+
+    /// A bare reapable rebind-origin row: born at offset `last_offset`,
+    /// never adopted, never progressed, no owner, deadline default, stamped at
+    /// `birth_generation`.
+    fn reapable_rebind(
+        channel_id: u64,
+        last_offset: u64,
+        birth_generation: u64,
+    ) -> InflightTurnState {
+        let mut state = InflightTurnState::new(
+            ProviderKind::Codex,
+            channel_id,
+            Some("adk-cdx".to_string()),
+            0, // request_owner
+            0, // user_msg_id
+            0, // current_msg_id
+            "/api/inflight/rebind".to_string(),
+            None,
+            Some(format!("AgentDesk-codex-adk-cdx-{channel_id}")),
+            Some("/tmp/out.jsonl".to_string()),
+            Some("/tmp/in.fifo".to_string()),
+            last_offset,
+        );
+        state.rebind_origin = true;
+        state.turn_source = TurnSource::ExternalAdopted;
+        state.rebind_origin_created_at_unix = Some(super::now_unix());
+        state.rebind_origin_deadline_secs = Some(REBIND_ORIGIN_DEADLINE_SECS_DEFAULT);
+        state.rebind_origin_birth_generation = Some(birth_generation);
+        // `new()` already sets last_offset == turn_start_offset; assert the
+        // never-progressed invariant the predicate depends on.
+        assert_eq!(state.last_offset, state.turn_start_offset.unwrap());
+        state
+    }
+
+    const CURRENT_GEN: u64 = 9;
+    const PAST_DEADLINE: u64 = REBIND_ORIGIN_DEADLINE_SECS_DEFAULT + 5;
+    const WITHIN_DEADLINE: u64 = REBIND_ORIGIN_DEADLINE_SECS_DEFAULT - 5;
+
+    #[test]
+    fn reaps_abandoned_rebind_past_deadline() {
+        // (a) Born on a non-empty output file (offset > 0), never adopted /
+        // progressed, past deadline → reap. This is the exact #3581 wedge row.
+        let state = reapable_rebind(1, 4096, CURRENT_GEN);
+        assert!(should_reap_abandoned_rebind_origin(
+            &state,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn preserves_fresh_rebind_within_deadline() {
+        // (b) Same signature but within deadline and same generation → preserve.
+        let state = reapable_rebind(2, 4096, CURRENT_GEN);
+        assert!(!should_reap_abandoned_rebind_origin(
+            &state,
+            WITHIN_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn live_protect_offset_progress_never_reaped() {
+        // (c-1) Watcher advanced past the birth offset → never reaped even past
+        // the deadline. last_offset != turn_start_offset.
+        let mut state = reapable_rebind(3, 4096, CURRENT_GEN);
+        state.last_offset = state.turn_start_offset.unwrap() + 100;
+        assert!(!should_reap_abandoned_rebind_origin(
+            &state,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn live_protect_owner_watcher_never_reaped() {
+        // (c-2) A live relay owner (MonitorTriggered watcher rebind shape) →
+        // never reaped. Test both the typed field and the legacy bool.
+        let mut typed = reapable_rebind(4, 4096, CURRENT_GEN);
+        typed.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        assert!(!should_reap_abandoned_rebind_origin(
+            &typed,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+
+        let mut legacy = reapable_rebind(5, 4096, CURRENT_GEN);
+        legacy.relay_owner_kind = RelayOwnerKind::None;
+        legacy.watcher_owns_live_relay = true; // legacy bool only
+        assert!(!should_reap_abandoned_rebind_origin(
+            &legacy,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn live_protect_adopted_user_msg_never_reaped() {
+        // (c-3) Adopted (user_msg_id != 0) → never reaped.
+        let mut state = reapable_rebind(6, 4096, CURRENT_GEN);
+        state.user_msg_id = 42;
+        assert!(!should_reap_abandoned_rebind_origin(
+            &state,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn live_protect_delivered_response_never_reaped() {
+        // (c-4) Any delivered text (response_sent_offset > 0 or non-empty
+        // full_response) → never reaped.
+        let mut sent = reapable_rebind(7, 4096, CURRENT_GEN);
+        sent.response_sent_offset = 10;
+        assert!(!should_reap_abandoned_rebind_origin(
+            &sent,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+
+        let mut accumulated = reapable_rebind(8, 4096, CURRENT_GEN);
+        accumulated.full_response = "partial answer".to_string();
+        assert!(!should_reap_abandoned_rebind_origin(
+            &accumulated,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn live_protect_anchor_or_terminal_never_reaped() {
+        // Anchor placeholder present (current_msg_id != 0) or terminal commit →
+        // never reaped.
+        let mut anchored = reapable_rebind(9, 4096, CURRENT_GEN);
+        anchored.current_msg_id = 777;
+        assert!(!should_reap_abandoned_rebind_origin(
+            &anchored,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+
+        let mut committed = reapable_rebind(10, 4096, CURRENT_GEN);
+        committed.terminal_delivery_committed = true;
+        assert!(!should_reap_abandoned_rebind_origin(
+            &committed,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn reaps_on_generation_mismatch_within_deadline() {
+        // (d) Born in a prior generation → reap even within the deadline.
+        let state = reapable_rebind(11, 4096, 1);
+        assert!(should_reap_abandoned_rebind_origin(
+            &state,
+            WITHIN_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn legacy_row_reaps_via_mtime_age() {
+        // (e) Legacy row: no created_at / birth_generation stamps. Reaps only
+        // via the supplied (file-mtime) age; preserved while within deadline.
+        let mut legacy = reapable_rebind(12, 4096, CURRENT_GEN);
+        legacy.rebind_origin_created_at_unix = None;
+        legacy.rebind_origin_deadline_secs = None; // falls back to env default
+        legacy.rebind_origin_birth_generation = None;
+
+        assert!(
+            should_reap_abandoned_rebind_origin(&legacy, PAST_DEADLINE, CURRENT_GEN),
+            "legacy row past mtime-age deadline must reap"
+        );
+        assert!(
+            !should_reap_abandoned_rebind_origin(&legacy, WITHIN_DEADLINE, CURRENT_GEN),
+            "legacy row within deadline must be preserved"
+        );
+    }
+
+    #[test]
+    fn planned_restart_rebind_never_reaped() {
+        // (f) restart_mode set → planned restart owns retention; never reaped.
+        let mut state = reapable_rebind(13, 4096, CURRENT_GEN);
+        state.set_restart_mode(InflightRestartMode::DrainRestart);
+        assert!(!should_reap_abandoned_rebind_origin(
+            &state,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn non_rebind_row_never_reaped() {
+        // A normal (non-rebind) row that happens to match every other conjunct
+        // is out of scope entirely.
+        let mut state = reapable_rebind(14, 4096, CURRENT_GEN);
+        state.rebind_origin = false;
+        assert!(!should_reap_abandoned_rebind_origin(
+            &state,
+            PAST_DEADLINE,
+            CURRENT_GEN
+        ));
+    }
+
+    #[test]
+    fn invalidate_stale_generation_reaps_prior_generation_rebind_orphan() {
+        // Boot-time integration: a rebind orphan stamped from a prior
+        // generation is reaped by `invalidate_stale_generation_in_root` even
+        // though it has no `restart_generation` stamp (the old skip path would
+        // have preserved it forever).
+        let temp = TempDir::new().unwrap();
+        let orphan = reapable_rebind(2001, 4096, 1); // birth gen 1
+        save_inflight_state_in_root(temp.path(), &orphan).expect("save");
+
+        let removed =
+            invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, CURRENT_GEN);
+        assert_eq!(
+            removed.len(),
+            1,
+            "prior-generation rebind orphan must be reaped"
+        );
+        assert_eq!(removed[0], (2001, Some(1)));
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn invalidate_stale_generation_preserves_same_generation_fresh_rebind() {
+        // A same-generation rebind orphan whose file mtime is fresh (age 0)
+        // must survive the boot-time pass — neither the deadline nor the
+        // generation disjunct fires.
+        let temp = TempDir::new().unwrap();
+        let fresh = reapable_rebind(2002, 4096, CURRENT_GEN);
+        save_inflight_state_in_root(temp.path(), &fresh).expect("save");
+
+        let removed =
+            invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, CURRENT_GEN);
+        assert!(
+            removed.is_empty(),
+            "fresh same-generation rebind row must survive the boot-time pass"
+        );
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].rebind_origin);
+    }
+
+    #[test]
+    fn invalidate_stale_generation_preserves_live_owned_rebind_prior_generation() {
+        // Even with a prior-generation stamp, a rebind row that has a live
+        // owner (Watcher) must NOT be reaped at boot — the live-protection
+        // conjunction overrides the generation disjunct.
+        let temp = TempDir::new().unwrap();
+        let mut live = reapable_rebind(2003, 4096, 1); // prior gen
+        live.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &live).expect("save");
+
+        let removed =
+            invalidate_stale_generation_in_root(temp.path(), &ProviderKind::Codex, CURRENT_GEN);
+        assert!(
+            removed.is_empty(),
+            "owner-Watcher rebind must survive boot reap even from a prior generation"
+        );
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1);
+    }
+
+    // ----------------------------------------------------------------------
+    // #3581 (codex TOCTOU fix): locked re-validate boundary for the periodic
+    // placeholder-sweeper reap path. The sweeper passes an UNLOCKED snapshot to
+    // `should_reap_abandoned_rebind_origin`; between that snapshot and the
+    // delete, a normal intake / TUI claim can persist a brand-new live inflight
+    // at the same sidecar path. `reap_abandoned_rebind_origin_locked_in_root`
+    // must reload + re-validate identity + eligibility under the lock and skip
+    // the unlink when the on-disk row is no longer the snapshotted orphan.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn locked_reap_unlinks_orphan_that_is_still_the_same_row() {
+        // (b) The on-disk row is unchanged since the snapshot and is still a
+        // prior-generation orphan → the locked re-validate succeeds and unlinks.
+        let temp = TempDir::new().unwrap();
+        let orphan = reapable_rebind(3001, 4096, 1); // prior gen → reap disjunct
+        save_inflight_state_in_root(temp.path(), &orphan).expect("save");
+        // Pre-check passes on the unlocked snapshot (mirrors the sweeper).
+        assert!(should_reap_abandoned_rebind_origin(&orphan, 0, CURRENT_GEN));
+
+        let outcome = reap_abandoned_rebind_origin_locked_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            &orphan,
+            CURRENT_GEN,
+        );
+        assert_eq!(
+            outcome,
+            RebindReapOutcome::Reaped,
+            "unchanged prior-generation orphan must be unlinked under the lock"
+        );
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert!(after.is_empty(), "orphan file must be gone after reap");
+    }
+
+    #[test]
+    fn locked_reap_skips_when_row_replaced_by_new_live_turn() {
+        // (a) THE RACE: the sweeper snapshots an abandoned orphan, but before it
+        // takes the lock a normal intake persists a brand-new LIVE turn at the
+        // same channel path. The locked re-validate must DETECT the replacement
+        // (live row no longer reapable) and skip the unlink so the new live turn
+        // survives.
+        let temp = TempDir::new().unwrap();
+        let snapshot = reapable_rebind(3002, 4096, 1); // prior gen, reapable
+        save_inflight_state_in_root(temp.path(), &snapshot).expect("save snapshot");
+        assert!(should_reap_abandoned_rebind_origin(
+            &snapshot,
+            0,
+            CURRENT_GEN
+        ));
+
+        // Simulate the racing intake: overwrite the same path with a live,
+        // adopted, current-generation turn (NOT reapable). Same channel_id.
+        let mut live = reapable_rebind(3002, 4096, CURRENT_GEN);
+        live.rebind_origin = false; // a normal intake turn, not a rebind orphan
+        live.turn_source = TurnSource::Managed;
+        live.user_msg_id = 9999; // adopted → live-protected
+        save_inflight_state_in_root(temp.path(), &live).expect("save live replacement");
+
+        let outcome = reap_abandoned_rebind_origin_locked_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            &snapshot,
+            CURRENT_GEN,
+        );
+        assert_eq!(
+            outcome,
+            RebindReapOutcome::Skipped,
+            "a live replacement turn must NOT be reaped by a stale snapshot"
+        );
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1, "the live replacement turn must survive");
+        assert_eq!(after[0].user_msg_id, 9999, "survivor is the live turn");
+        assert!(!after[0].rebind_origin);
+    }
+
+    #[test]
+    fn locked_reap_skips_when_orphan_replaced_by_fresh_rebind_orphan() {
+        // (a') Subtle variant: the replacement is ALSO a structurally-abandoned
+        // rebind orphan, but a NEW birth (different created_at/generation). The
+        // bare `should_reap_*` re-check could still fire on it, so the identity
+        // guard is what blocks the wrong unlink — proving identity re-validation
+        // (not just predicate re-run) is load-bearing.
+        let temp = TempDir::new().unwrap();
+        let snapshot = reapable_rebind(3003, 4096, 1); // birth gen 1
+        save_inflight_state_in_root(temp.path(), &snapshot).expect("save snapshot");
+
+        // Racing rebind respawn: same channel, fresh birth (gen 2, new
+        // created_at, different turn_start_offset) but still prior to CURRENT_GEN
+        // so the predicate alone would happily reap it.
+        let mut respawn = reapable_rebind(3003, 8192, 2); // different offset + gen
+        respawn.rebind_origin_created_at_unix =
+            Some(snapshot.rebind_origin_created_at_unix.unwrap() + 100);
+        save_inflight_state_in_root(temp.path(), &respawn).expect("save respawn");
+        // Sanity: the predicate WOULD reap the respawn on its own (gen 2 != 9).
+        assert!(should_reap_abandoned_rebind_origin(
+            &respawn,
+            0,
+            CURRENT_GEN
+        ));
+
+        let outcome = reap_abandoned_rebind_origin_locked_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            &snapshot, // stale snapshot drives the reap
+            CURRENT_GEN,
+        );
+        assert_eq!(
+            outcome,
+            RebindReapOutcome::Skipped,
+            "a freshly-reborn orphan must not be reaped under the prior snapshot's identity"
+        );
+        let after = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(after.len(), 1, "the respawned row must survive this pass");
+        assert_eq!(after[0].rebind_origin_birth_generation, Some(2));
+    }
+
+    #[test]
+    fn locked_reap_missing_when_file_already_gone() {
+        // Idempotency: a snapshot whose file was already removed (e.g. a peer
+        // sweep / claim cleared it) yields Missing, never a spurious Reaped.
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join(ProviderKind::Codex.as_str())).unwrap();
+        let snapshot = reapable_rebind(3004, 4096, 1);
+        // Deliberately do NOT save the row.
+        let outcome = reap_abandoned_rebind_origin_locked_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            &snapshot,
+            CURRENT_GEN,
+        );
+        assert_eq!(outcome, RebindReapOutcome::Missing);
     }
 }
 

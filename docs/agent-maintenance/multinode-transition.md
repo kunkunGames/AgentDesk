@@ -52,9 +52,17 @@
   instead of looping back through the internal HTTP cleanup route. The singleton
   assumption remains unchanged: the task is still spawned from the leased
   gateway runtime.
-- 2026-06-12 audit note (#3089 S0): `runtime_bootstrap` only initializes the
-  default-off `single_message_panel` flag for startup logging. Gateway lease,
-  startup order, worker ownership, and singleton assumptions are unchanged.
+- 2026-06-12 audit note (#3089 S0; updated #3560): `runtime_bootstrap` only
+  initializes the `single_message_panel` flag for startup logging. Since #3560
+  the flag is default-ON (opt-out via `AGENTDESK_SINGLE_MESSAGE_PANEL=0|false`).
+  Gateway lease, startup order, worker ownership, and singleton assumptions are
+  unchanged.
+- 2026-06-17 audit note (#3548): PR analyzer hygiene guard work is confined to
+  `scripts/analyze_prs.py`; gateway lease, startup order, worker ownership, and
+  singleton assumptions are unchanged.
+- 2026-06-17 audit note (#3546): SQLite rowid compatibility work is confined to
+  `src/engine/ops/db_ops.rs`; gateway lease, startup order, worker ownership,
+  and singleton assumptions are unchanged.
 - invariants: `singleton_on_leader`,
   `heartbeat_capability_registry_routing`.
 - allowed_changes: `bugfix` only before #876/#877. New gateway, reconnect,
@@ -396,6 +404,46 @@
 
 ### Audited touches
 
+- #3560 single_message_panel default-ON + footer-mode migration guard: the
+  `single_message_panel` flag is now default-ON (opt-out via
+  `AGENTDESK_SINGLE_MESSAGE_PANEL=0|false`) and `turn_bridge/mod.rs` gained a
+  deployment-boundary migration guard. When a turn that created a *separate*
+  status panel under the old default-OFF runtime resumes under footer mode, the
+  bridge now reconciles (edits to a migration notice) and clears its OWN
+  `inflight_state.status_message_id` instead of orphaning that Discord message.
+  This is purely worker-local: it operates on the resuming turn's own per-turn
+  inflight handle and its own gateway, with no node ownership, lease, or
+  singleton implication. Gateway lease, startup order, worker ownership, and
+  singleton assumptions are unchanged.
+- #3540 phantom-synthetic-inflight fix: two worker-local, in-memory-state-only
+  touches with no multinode ownership/lease/singleton implications.
+  (A) `tui_prompt_dedupe.rs` gained a process-global `relayed_entry_ids_by_tmux`
+  ledger keyed on the Claude transcript `user` entry's stable `uuid`
+  (TTL-purged + ring-capped) and the `SuppressedReplayedEntry` observation, so
+  the idle-transcript scanner suppresses an already-relayed prompt re-encountered
+  after a relay-watermark reset / jsonl head rotation BY IDENTITY. This is the
+  same per-process dedupe state the relay already owns (it is NOT a routing
+  authority and is never read cross-node); the channel→tmux routing invariant is
+  untouched. (B) `tui_direct_pending_start.rs` adds a no-evict post-abort queue
+  promote: on the terminal backstop ABORT it kicks the EXISTING
+  `schedule_deferred_idle_queue_kickoff` once (after the pending record is
+  deleted) so a queued follow-up dispatches through the unchanged
+  `mailbox_try_start_turn_kinded` FSM — NO inflight is cleared/reset/deleted, so
+  the worst case is a normal merge with zero live-turn loss. The detached worker
+  remains per-`(provider, channel_id)` worker-local under the existing channel
+  lock; queue ownership, lease semantics, and singleton assumptions are
+  unchanged. (C) absorbed warm-followup strand fix in
+  `turn_bridge/watcher_handoff.rs`: the #3277 proven-delivered guard
+  (`busy_turn_already_proven_delivered`) now reads the transcript's on-disk EOF
+  (`std::fs::metadata(output_path).len()`) instead of the racy in-memory
+  `tmux_last_offset` to decide whether a quiescence-timeout turn already grew
+  its full response past `turn_start_offset`. Both `turn_start_offset` and
+  `tmux_last_offset` are seeded to the same per-turn `inflight_offset` (itself a
+  `std::fs::metadata().len()` of the same `output_path`), so the new EOF read is
+  in the SAME single-file byte-space — purely a worker-local disk read on the
+  bridge's own transcript path, with no node ownership, lease, or singleton
+  implication. A rotated/truncated transcript shrinks the EOF and the guard
+  conservatively fails open to the existing #3268 watcher handoff.
 - #3038 run_bot S5: the leader gateway runtime tail moved verbatim from
   `runtime_bootstrap.rs` into `runtime_bootstrap/gateway_runtime.rs`: restored
   generation/model/fast-mode logging, health registry registration,
@@ -468,6 +516,12 @@
   HTTP helpers. This is **worker-local**: it touches only the recovered/finalized
   Discord message id on the worker processing that channel and adds no shared
   scheduling authority or cross-node lease dependency.
+- TUI hook registry upstream-port audit: `runtime_bootstrap.rs` bootstrap
+  wiring now feeds the Claude TUI hook buffer/claim registry, but the registry
+  is **worker-local** in-memory state scoped to a provider session / tmux key.
+  It adds no leader-only side effect, durable queue, cross-node singleton, or
+  PG lease; on restart it can only lose buffered hook events and falls back to
+  the legacy readiness path.
 - #3038 S1 (SharedData `QueuedPlaceholderState` extraction): `runtime_bootstrap.rs`
   changed in two helpers only — `run_bot_build_shared_data` (three consecutive
   queued-placeholder members wrapped into the new `queued:` group field;
@@ -729,3 +783,36 @@
   token-built Http fallback on standby nodes) are byte-identical and stay
   process-local. No new multinode ownership, singleton, or lease assumption
   is introduced.
+- Active-session audit: `active_session_audit` adds read-only health diagnostics
+  plus optional local repair-path metadata for stale running-session rows. It
+  does not move Discord gateway startup, worker ownership, durable queue claims,
+  or PG lease boundaries; each reported repair action still targets the existing
+  node-local/runtime owner. No new multinode ownership, singleton, or lease
+  assumption is introduced.
+- #3543 follow-up (OpenCode warm-server race/timeout hardening):
+  `opencode.rs` now marks a warm server as retiring before the exclusive
+  hard-kill fallback and rejects new leases on retiring servers; pre-SSE
+  `/session` and `/prompt_async` REST calls use bounded request timeouts.
+  This remains a worker-local provider process pool on the node that owns the
+  OpenCode turn. It adds no durable queue, cross-node read, leader-only side
+  effect, or PG lease assumption, so multinode ownership semantics are
+  unchanged.
+- #3558 (watcher offset TOCTOU root fix): the two watcher write paths that ran an
+  unlocked `load_inflight_state` -> mutate -> `save_inflight_state` (the streaming
+  `persist_watcher_stream_progress` and the terminal-commit
+  `mark_watcher_terminal_delivery_committed`) now delegate to two new single-flock
+  read-modify-write helpers in `inflight.rs`
+  (`persist_watcher_stream_progress_locked` /
+  `commit_watcher_terminal_delivery_locked`). Both acquire the EXISTING
+  per-`(provider, channel_id)` sidecar `flock` ONCE, reload the on-disk row,
+  re-check the caller's identity/session guards against the freshly reloaded row,
+  patch only watcher-owned fields, and persist via `persist_under_lock` (never
+  re-entering `save_inflight_state`, so the non-reentrant flock cannot
+  self-deadlock). This is **worker-local**: it operates entirely on the same
+  per-channel inflight sidecar file the watcher already owns, under the same
+  advisory lock. No lease, durable queue, leader/standby ownership, or singleton
+  assumption changes — the only behavioural change is that the streaming path now
+  PRESERVES the non-owned `last_offset` from the in-lock reload (instead of
+  clobbering it backward) and the commit path `max`-serializes its watermark
+  against the reload, eliminating the backward-write race with the owner-gated
+  `refresh_inflight_last_offset_*` advance.

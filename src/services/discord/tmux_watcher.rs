@@ -1187,6 +1187,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             should_flush_post_terminal_success_continuation(
                 turn_result_relayed,
                 found_result,
+                current_offset > data_start_offset,
                 &full_response,
             );
         if post_terminal_success_continuation_flush {
@@ -2320,6 +2321,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                                             &watcher_provider,
                                             channel_id,
                                             &tmux_session_name,
+                                            turn_identity_for_panel.as_ref(),
                                             placeholder_msg_id,
                                             &full_response,
                                             response_sent_offset,
@@ -2425,6 +2427,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                             &watcher_provider,
                             channel_id,
                             &tmux_session_name,
+                            turn_identity_for_panel.as_ref(),
                             placeholder_msg_id,
                             &full_response,
                             response_sent_offset,
@@ -4314,7 +4317,18 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let relay_producer_session_name = cached_relay_producer
             .as_ref()
             .map(|producer| producer.session_name());
-        let mut session_bound_ack_outcome = SessionBoundRelayAckOutcome::MissingTarget;
+        // #3579: INIT the ack outcome to the watcher-owned NON-attempt sentinel.
+        // When `session_bound_relay_should_own_terminal_delivery` returns false
+        // (e.g. relay_owner=Watcher) the ack-wait block below is SKIPPED and this
+        // init value is what the flight recorder logs as `frame_ack_outcome`. It
+        // is BENIGN (the watcher owns terminal delivery; the sink-delegated ack
+        // path is intentionally not taken) — distinct from `MissingTarget`, which
+        // `wait_for_session_bound_relay_delivery_ack` returns only when the block
+        // ACTUALLY RAN but had no target (a real unconfirmed). Before #3579 this
+        // init was `MissingTarget`, conflating the two and inflating relay-loss
+        // tallies. Behavior is unchanged: `NotAttempted` folds to the same
+        // `DeliveryOutcome::Unknown` as `MissingTarget` for the resend decision.
+        let mut session_bound_ack_outcome = SessionBoundRelayAckOutcome::NotAttempted;
         let session_bound_terminal_delivery_attempted =
             session_bound_relay_should_own_terminal_delivery(
                 relay_decision.should_direct_send,
@@ -4728,24 +4742,31 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 crate::services::observability::watcher_latency::record_first_relay(
                     channel_id.get(),
                 );
-                if let Some((pk, _)) = parse_provider_and_channel_from_tmux_name(&tmux_session_name)
-                {
-                    if let Some(mut inflight) =
-                        crate::services::discord::inflight::load_inflight_state(
-                            &pk,
+                // #3558 (codex review follow-up): the old unlocked
+                // `load_inflight_state` → mutate → `save_inflight_state(&inflight)`
+                // re-wrote the WHOLE stale row (including a possibly-backward
+                // `last_offset`/`response_sent_offset`), reintroducing the exact
+                // backward-write TOCTOU the #3558 fix closed in the streaming /
+                // terminal-commit paths. Route the relay-success watermark through
+                // the single-flock RMW helper, which patches ONLY
+                // `last_watcher_relayed_*` and preserves the disk watermark.
+                // #3041 P1-3 (Part a, B1 — FRAME-CARRIED): the authoritative
+                // consumed-terminal END is NOT written here; it rides the
+                // RESULT-bearing `StreamFrame` and the sink advances
+                // `confirmed_end_offset` identity-gated on its confirmed POST.
+                if let Some(identity) = inflight_identity_before_relay.as_ref() {
+                    let _ =
+                        crate::services::discord::inflight::persist_watcher_relay_watermark_locked(
+                            &watcher_provider,
                             channel_id.get(),
-                        )
-                    {
-                        inflight.last_watcher_relayed_offset = Some(turn_data_start_offset);
-                        inflight.last_watcher_relayed_generation_mtime_ns =
-                            last_observed_generation_mtime_ns;
-                        // #3041 P1-3 (Part a, B1 — FRAME-CARRIED): the authoritative
-                        // consumed-terminal END is NO LONGER written to the inflight
-                        // file (the racy inflight-persist Part (a) is removed). It now
-                        // rides the RESULT-bearing `StreamFrame` and the sink advances
-                        // `confirmed_end_offset` identity-gated on its confirmed POST.
-                        let _ = crate::services::discord::inflight::save_inflight_state(&inflight);
-                    }
+                            identity,
+                            &tmux_session_name,
+                            crate::services::discord::inflight::WatcherRelayWatermarkPatch {
+                                last_watcher_relayed_offset: Some(turn_data_start_offset),
+                                last_watcher_relayed_generation_mtime_ns:
+                                    last_observed_generation_mtime_ns,
+                            },
+                        );
                 }
             }
             clear_provider_overload_retry_state(channel_id);
@@ -5242,27 +5263,30 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     crate::services::observability::watcher_latency::record_first_relay(
                         channel_id.get(),
                     );
-                    if let Some((pk, _)) =
-                        parse_provider_and_channel_from_tmux_name(&tmux_session_name)
-                    {
-                        if let Some(mut inflight) =
-                            crate::services::discord::inflight::load_inflight_state(
-                                &pk,
-                                channel_id.get(),
-                            )
-                        {
-                            inflight.last_watcher_relayed_offset = Some(turn_data_start_offset);
-                            // #1270: persist the matching `.generation` mtime
-                            // alongside the offset so a replacement watcher
-                            // (e.g. after dcserver restart) can disambiguate
-                            // same-wrapper rotation (mtime unchanged → pin to
-                            // EOF) from cancel→respawn (mtime changed → reset
-                            // to 0) when restoring this offset.
-                            inflight.last_watcher_relayed_generation_mtime_ns =
-                                last_observed_generation_mtime_ns;
-                            let _ =
-                                crate::services::discord::inflight::save_inflight_state(&inflight);
-                        }
+                    // #3558 (codex review follow-up): same backward-write TOCTOU
+                    // as the session-bound-delegation arm — the old unlocked
+                    // `load_inflight_state` → mutate → `save_inflight_state` re-wrote
+                    // the whole stale row (including `last_offset`/
+                    // `response_sent_offset`). Route the relay-success watermark
+                    // through the single-flock RMW helper, which patches ONLY
+                    // `last_watcher_relayed_*` and preserves the disk watermark.
+                    // #1270: persist the matching `.generation` mtime alongside the
+                    // offset so a replacement watcher (e.g. after dcserver restart)
+                    // can disambiguate same-wrapper rotation (mtime unchanged → pin
+                    // to EOF) from cancel→respawn (mtime changed → reset to 0) when
+                    // restoring this offset.
+                    if let Some(identity) = inflight_identity_before_relay.as_ref() {
+                        let _ = crate::services::discord::inflight::persist_watcher_relay_watermark_locked(
+                            &watcher_provider,
+                            channel_id.get(),
+                            identity,
+                            &tmux_session_name,
+                            crate::services::discord::inflight::WatcherRelayWatermarkPatch {
+                                last_watcher_relayed_offset: Some(turn_data_start_offset),
+                                last_watcher_relayed_generation_mtime_ns:
+                                    last_observed_generation_mtime_ns,
+                            },
+                        );
                     }
                 }
                 clear_provider_overload_retry_state(channel_id);
@@ -8976,7 +9000,9 @@ TUI-E2E-marker ssh-direct
         let relay_decision = terminal_relay_decision(has_assistant_response, None, true);
         let watcher_direct_send = watcher_should_direct_send_after_session_bound_ack(
             relay_decision.should_direct_send,
-            SessionBoundRelayAckOutcome::MissingTarget,
+            // #3579: the non-attempt sentinel folds to `Unknown` exactly like the
+            // old `MissingTarget` init, so the watcher-direct gate is unchanged.
+            SessionBoundRelayAckOutcome::NotAttempted,
             false,
         );
 

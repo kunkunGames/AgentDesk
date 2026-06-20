@@ -38,6 +38,13 @@ const GITHUB_SYNC_ADVISORY_LOCK_ID: i64 = 7_801_002;
 const POLICY_TICK_WARN_MS: u128 = 500;
 const POLICY_TICK_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Set once the rate-limit sync loop has emitted its first WARN about absent
+/// Gemini OAuth credentials. When Gemini is simply not configured, the loop runs
+/// every 2 minutes and would otherwise spam an identical WARN forever (#3566).
+/// First miss logs at WARN; subsequent misses drop to DEBUG. Transient errors
+/// (network/API) bypass this flag and keep WARNing every cycle.
+static GEMINI_CREDS_MISSING_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Monotonically increasing count of policy tick hook timeouts (#747).
 /// Incremented each time `fire_tick_hook_by_name_with_timeout` returns
 /// because the wall-clock timeout elapsed before the spawn_blocking task
@@ -346,6 +353,12 @@ pub(crate) async fn run(
     let cluster_instance_id = cluster_runtime.instance_id().to_string();
     if let Some(pool) = pg_pool.clone() {
         crate::services::dispatch_watchdog::spawn(pool);
+    }
+    // #3557 (A): long-turn cluster probe — pages out when a burst of >10m turns
+    // finishes inside one window (the stall watchdog's blind spot for
+    // delegated_to_watcher turns, which stay desynced=false).
+    if let Some(pool) = pg_pool.clone() {
+        crate::services::long_turn_watchdog::spawn(pool);
     }
     crate::pipeline::refresh_override_health_report(pg_pool.as_ref()).await;
     let boot_reconcile_engine = match startup_pg_pool.as_ref() {
@@ -1008,7 +1021,35 @@ async fn rate_limit_sync_loop(pg_pool: Arc<PgPool>) {
                 tracing::info!("[rate-limit-sync] Gemini: {} buckets cached", n);
             }
             Err(e) => {
-                tracing::warn!("[rate-limit-sync] Gemini rate_limit fetch failed: {e}");
+                let msg = e.to_string();
+                // Only suppress the genuine "not configured / file missing" case,
+                // classified at the source (provider_auth) by `io::ErrorKind`:
+                //   - "no home dir"            (no $HOME)
+                //   - NotFound                 (oauth_creds.json does not exist)
+                // PermissionDenied / IsADirectory / transient I/O are tagged
+                // differently and corrupt/partial creds ("no access_token" /
+                // "no refresh_token") are separate problems — all keep WARNing,
+                // so we deliberately do NOT match on "oauth_creds.json" broadly
+                // here (#3566 over-suppress fix, codex r2).
+                let creds_missing =
+                    crate::services::provider_auth::is_gemini_unconfigured_error(&e);
+                if creds_missing {
+                    // Gemini simply isn't configured — log once, then drop to DEBUG
+                    // so the 2-minute sync loop doesn't spam an identical WARN (#3566).
+                    if !GEMINI_CREDS_MISSING_WARNED.swap(true, Ordering::AcqRel) {
+                        tracing::warn!(
+                            "[rate-limit-sync] Gemini credentials not configured ({msg}); suppressing further repeats"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "[rate-limit-sync] Gemini credentials absent; skipping (suppressed)"
+                        );
+                    }
+                } else {
+                    // Transient errors (network/API/token refresh) and corrupt/partial
+                    // credentials keep WARNing.
+                    tracing::warn!("[rate-limit-sync] Gemini rate_limit fetch failed: {e}");
+                }
             }
         }
 
@@ -1166,17 +1207,94 @@ fn parse_header_i64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<
     headers.get(name)?.to_str().ok()?.parse().ok()
 }
 
-/// Parse ISO 8601 reset timestamp from header into unix epoch seconds.
+/// Parse reset timestamp from a rate-limit header into unix epoch seconds.
+///
+/// Anthropic returns RFC3339 timestamps. OpenAI commonly returns relative
+/// durations such as `1s` or `6m0s`, so accept both forms.
 fn parse_header_reset(headers: &reqwest::header::HeaderMap, name: &str) -> i64 {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .ok()
-                .map(|dt| dt.timestamp())
-        })
+        .and_then(|s| parse_rate_limit_reset_value(s, chrono::Utc::now().timestamp()))
         .unwrap_or(0)
+}
+
+fn parse_rate_limit_reset_value(value: &str, now: i64) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp())
+        .or_else(|| parse_rate_limit_duration_seconds(value).map(|seconds| now + seconds))
+}
+
+fn parse_rate_limit_duration_seconds(value: &str) -> Option<i64> {
+    let input = value.trim();
+    if input.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = input.parse::<i64>() {
+        return Some(seconds.max(0));
+    }
+
+    let mut total = 0.0_f64;
+    let mut number = String::new();
+    let mut consumed = false;
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_ascii_digit() || ch == '.' {
+            number.push(ch);
+            index += 1;
+            continue;
+        }
+        if number.is_empty() {
+            return None;
+        }
+        let amount = number.parse::<f64>().ok()?;
+        number.clear();
+        let multiplier = match ch {
+            'd' => 86_400.0,
+            'h' => 3_600.0,
+            'm' => {
+                if chars.get(index + 1) == Some(&'s') {
+                    index += 1;
+                    0.001
+                } else {
+                    60.0
+                }
+            }
+            's' => 1.0,
+            _ => return None,
+        };
+        total += amount * multiplier;
+        consumed = true;
+        index += 1;
+    }
+
+    if !number.is_empty() || !consumed {
+        return None;
+    }
+    Some(total.ceil().max(0.0) as i64)
+}
+
+#[cfg(test)]
+mod rate_limit_header_tests {
+    use super::{parse_rate_limit_duration_seconds, parse_rate_limit_reset_value};
+
+    #[test]
+    fn parses_openai_relative_reset_duration() {
+        assert_eq!(parse_rate_limit_duration_seconds("6m0s"), Some(360));
+        assert_eq!(parse_rate_limit_duration_seconds("1s"), Some(1));
+        assert_eq!(parse_rate_limit_reset_value("500ms", 1_000), Some(1_001));
+    }
+
+    #[test]
+    fn parses_rfc3339_reset_timestamp() {
+        assert_eq!(
+            parse_rate_limit_reset_value("2026-06-17T00:00:00Z", 1_000),
+            Some(1_781_654_400)
+        );
+    }
 }
 
 /// Fetch Claude usage via OAuth API (subscription-based, no API key needed).
@@ -1221,9 +1339,11 @@ async fn fetch_claude_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>,
                 "seven_day_sonnet" => "7d Sonnet",
                 _ => key,
             };
-            // Convert utilization (0-100 float) to used/limit format for consistency
+            // Convert utilization (0-100 float) to used/limit format for
+            // consistency, but keep the precise value so the dispatch gate does
+            // not round 99.5% into a false 100% saturation.
             let limit = 100i64;
-            let used = utilization.round() as i64;
+            let used = utilization.floor().clamp(0.0, 100.0) as i64;
             let reset_ts = chrono::DateTime::parse_from_rfc3339(resets_at)
                 .map(|dt| dt.timestamp())
                 .unwrap_or(0);
@@ -1233,6 +1353,7 @@ async fn fetch_claude_oauth_usage(token: &str) -> Result<Vec<serde_json::Value>,
                 "limit": limit,
                 "used": used,
                 "remaining": limit - used,
+                "utilization": utilization,
                 "reset": reset_ts,
             }));
         }
@@ -2603,6 +2724,44 @@ async fn routine_runtime_loop(
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "routine script registry hot-reload failed"),
+            }
+        }
+        // #3564: surface routines that have been stuck in `paused` past the
+        // configured threshold. A failed/timed-out routine can otherwise stay
+        // paused forever because paused routines are excluded from claims, so we
+        // alert the operator instead of letting it silently never run again. The
+        // knob defaults to 0 (disabled), so this is a no-op for deployments that
+        // have not opted in.
+        //
+        // Visibility only — we intentionally do NOT auto-resume here. Reliably
+        // telling a failure-induced pause apart from a deliberate one needs a
+        // structural pause-cause field on the routine (the `last_result`
+        // heuristic has both false positives and false negatives), which is out
+        // of scope for this change; opt-in auto-resume is deferred to a
+        // follow-up that adds a pause-cause column.
+        let stale_paused_alert_secs = routines_config.stale_paused_alert_secs;
+        if stale_paused_alert_secs > 0 {
+            let now = chrono::Utc::now();
+            let cutoff = now - chrono::Duration::seconds(stale_paused_alert_secs as i64);
+            match store.list_stale_paused_routines(cutoff).await {
+                Ok(stale) => {
+                    for routine in &stale {
+                        let paused_for_secs = (now - routine.updated_at).num_seconds().max(0);
+                        if paused_for_secs >= stale_paused_alert_secs as i64 {
+                            discord_logger
+                                .log_stale_paused(
+                                    &store,
+                                    routine,
+                                    paused_for_secs,
+                                    routines_config.stale_paused_alert_ttl_secs as i64,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "routine stale-paused scan failed")
+                }
             }
         }
         match poll_agent_turns(

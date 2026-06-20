@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::services::agent_protocol::StreamMessage;
 use crate::services::process::{configure_child_process_group, kill_pid_tree};
-use crate::services::provider::{CancelToken, ProviderKind, cancel_requested, register_child_pid};
+use crate::services::provider::{CancelToken, ProviderKind, cancel_requested};
 use crate::services::remote::RemoteProfile;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -29,6 +29,7 @@ const HEALTH_POLL_MS: u64 = 250;
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const DISPOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MESSAGE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_OUTPUT_LIMIT: usize = 8 * 1024;
 const WARM_SERVER_IDLE_TTL: Duration = Duration::from_secs(20 * 60);
 
@@ -118,6 +119,7 @@ struct OpenCodeWarmServer {
     startup_output: Arc<Mutex<OpenCodeStartupOutput>>,
     process: Mutex<OpenCodeServerProcess>,
     active_sessions: AtomicUsize,
+    retiring: AtomicBool,
     last_used: Mutex<Instant>,
 }
 
@@ -160,6 +162,18 @@ impl OpenCodeWarmServer {
             e.into_inner()
         });
         shutdown_server(&mut process, &self.base_url, &self.auth);
+    }
+
+    fn try_acquire_lease(&self) -> bool {
+        let acquired = try_acquire_warm_server_session(&self.active_sessions, &self.retiring);
+        if acquired {
+            self.mark_used();
+        }
+        acquired
+    }
+
+    fn try_begin_exclusive_hard_kill(&self) -> Result<(), usize> {
+        try_begin_exclusive_warm_server_hard_kill(&self.active_sessions, &self.retiring)
     }
 }
 
@@ -309,7 +323,11 @@ fn scrub_startup_secrets(raw: &str) -> String {
                     out.push(format!("{key}:"));
                     redact_next = true;
                 } else {
-                    // `token:abc` — value is inline.
+                    // `token:abc` — value is inline. If that inline value is
+                    // itself an auth scheme marker (e.g. `Authorization:Basic
+                    // <cred>`), the real credential is the *next* token, so keep
+                    // redacting forward instead of leaking it into the tail.
+                    redact_next = is_auth_scheme_marker(value);
                     out.push(format!("{key}:[REDACTED]"));
                 }
                 continue;
@@ -359,6 +377,55 @@ fn compute_suspicious_active_leak(active_sessions: u32, _idle_secs: u64, running
     // on an `opencode serve` that has exited, so a high count there is a genuine
     // never-released-lease leak rather than normal in-use fan-out.
     !running
+}
+
+/// Whether a warm `opencode serve` process may be hard-killed (process-tree
+/// SIGKILL) to satisfy a single turn's cancel/timeout. A warm server is shared
+/// across co-resident turns, so the kill is only safe when the requesting turn
+/// is the *sole* active session; otherwise the SIGKILL would tear the server
+/// out from under unrelated live SSE streams.
+///
+/// This predicate is the **only** guard protecting co-resident sessions: the
+/// shared server PID is intentionally never registered on a `CancelToken`
+/// (see `execute_command_streaming_inner`), because the generic kill sinks
+/// (`provider_exec` timeout, `cancel_active_token` teardown) fire
+/// unconditionally and a register-time `active_sessions <= 1` check is a TOCTOU
+/// — a second turn can attach right after registration. The in-stream cancel
+/// watchdog re-evaluates this predicate at kill time, which is race-safe.
+fn warm_server_hard_kill_allowed(active_sessions: usize) -> bool {
+    active_sessions <= 1
+}
+
+fn try_acquire_warm_server_session(active_sessions: &AtomicUsize, retiring: &AtomicBool) -> bool {
+    if retiring.load(Ordering::SeqCst) {
+        return false;
+    }
+    active_sessions.fetch_add(1, Ordering::SeqCst);
+    if retiring.load(Ordering::SeqCst) {
+        active_sessions.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+fn try_begin_exclusive_warm_server_hard_kill(
+    active_sessions: &AtomicUsize,
+    retiring: &AtomicBool,
+) -> Result<(), usize> {
+    if retiring
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(active_sessions.load(Ordering::SeqCst));
+    }
+
+    let active = active_sessions.load(Ordering::SeqCst);
+    if warm_server_hard_kill_allowed(active) {
+        Ok(())
+    } else {
+        retiring.store(false, Ordering::SeqCst);
+        Err(active)
+    }
 }
 
 impl OpenCodeWarmServer {
@@ -455,6 +522,7 @@ impl Drop for OpenCodeWarmServerLease {
 type OpenCodeServerPool = HashMap<OpenCodeServerKey, Arc<OpenCodeWarmServer>>;
 
 static OPENCODE_SERVER_POOL: OnceLock<Mutex<OpenCodeServerPool>> = OnceLock::new();
+static IDLE_DISPOSAL_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 fn opencode_server_pool() -> &'static Mutex<OpenCodeServerPool> {
     OPENCODE_SERVER_POOL.get_or_init(|| Mutex::new(HashMap::new()))
@@ -613,30 +681,22 @@ fn execute_command_streaming_inner(
     })?;
 
     let server = acquire_warm_server(&bin, &resolution, working_dir)?;
-    // Register the warm server's PID on the caller's CancelToken so timeout
-    // callers (which only have `CancelToken.child_pid` to kill) can interrupt a
-    // turn that is blocked before `run_session` installs the SSE cancel
-    // watchdog. The watchdog itself prefers the shared-server Arc, but this
-    // keeps the historical PID-based cancel path working during startup.
-    //
-    // Crucially, only register the PID when this turn is the *sole* active
-    // session on the server. The generic provider_exec timeout path calls
-    // `kill_pid_tree(child_pid)` unconditionally on timeout, so registering a
-    // shared `opencode serve` PID would let a single turn's timeout kill the
-    // warm server out from under every other concurrent streaming turn —
-    // defeating the warm-pool's whole purpose. When the server is shared, leave
-    // `child_pid` unset: the in-stream cancel watchdog (which guards its
-    // hard-kill fallback on `active_sessions <= 1`) plus `abort_session` are the
-    // only mechanisms allowed to terminate the turn, and neither disturbs the
-    // co-resident sessions.
-    if server
-        .shared_server()
-        .active_sessions
-        .load(Ordering::SeqCst)
-        <= 1
-    {
-        register_child_pid(cancel_token, server.shared_server().id());
-    }
+    // The shared `opencode serve` PID is deliberately NOT registered on the
+    // caller's CancelToken. Every generic cancel/timeout sink kills
+    // `CancelToken.child_pid` *unconditionally* — the provider_exec timeout
+    // path (`kill_pid_tree(child_pid)`) and the Discord `cancel_active_token`
+    // teardown both fire without re-reading `active_sessions`. A register-time
+    // `active_sessions <= 1` guard does not make this safe: the count is only
+    // valid at registration, and a second co-resident turn can attach to the
+    // same warm server immediately afterward (active_sessions 1 -> 2). The
+    // first turn's later timeout/stop would then SIGKILL the shared server out
+    // from under the second turn's live SSE stream — a TOCTOU that defeats the
+    // warm pool's whole purpose. Closing it at the source (never handing the
+    // shared PID to an unconditional killer) is robust against every present
+    // and future kill sink. Cancellation is handled race-safely by the
+    // in-stream watchdog in `run_session` — which re-checks
+    // `active_sessions <= 1` at kill time (see `warm_server_hard_kill_allowed`)
+    // — plus cooperative `abort_session`; neither disturbs co-resident sessions.
     let result = run_session(
         prompt,
         system_prompt,
@@ -694,6 +754,60 @@ fn cleanup_idle_warm_servers(pool: &mut OpenCodeServerPool) {
     }
 }
 
+fn next_idle_disposal_delay(pool: &OpenCodeServerPool) -> Option<Duration> {
+    pool.values()
+        .filter(|server| server.active_sessions.load(Ordering::SeqCst) == 0)
+        .map(|server| idle_disposal_delay_for_idle_duration(server.idle_for()))
+        .min()
+}
+
+fn idle_disposal_delay_for_idle_duration(idle_for: Duration) -> Duration {
+    WARM_SERVER_IDLE_TTL.saturating_sub(idle_for)
+}
+
+fn min_idle_disposal_delay(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(delay), None) | (None, Some(delay)) => Some(delay),
+        (None, None) => None,
+    }
+}
+
+fn evict_warm_server_from_pool(server: &Arc<OpenCodeWarmServer>) {
+    let mut pool = opencode_server_pool().lock().unwrap_or_else(|e| {
+        tracing::warn!("Recovered poisoned lock for OpenCode server pool");
+        e.into_inner()
+    });
+    if pool
+        .get(&server.key)
+        .is_some_and(|current| Arc::ptr_eq(current, server))
+    {
+        pool.remove(&server.key);
+    }
+}
+
+/// Drain all resident warm servers. Called during AgentDesk shutdown so
+/// process-grouped `opencode serve` children do not survive a normal restart.
+pub fn shutdown_warm_servers() {
+    let servers = {
+        let mut pool = opencode_server_pool().lock().unwrap_or_else(|e| {
+            tracing::warn!("Recovered poisoned lock for OpenCode server pool");
+            e.into_inner()
+        });
+        pool.drain().map(|(_, server)| server).collect::<Vec<_>>()
+    };
+    for server in servers {
+        server.retiring.store(true, Ordering::SeqCst);
+        server.shutdown();
+    }
+}
+
+fn claim_idle_disposal_sweep(scheduled: &AtomicBool) -> bool {
+    scheduled
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
 /// Schedule a one-shot idle-disposal sweep `WARM_SERVER_IDLE_TTL` from now.
 ///
 /// Called when the final lease on a warm server drops, so an idle
@@ -702,14 +816,34 @@ fn cleanup_idle_warm_servers(pool: &mut OpenCodeServerPool) {
 /// and `idle_for` under the pool lock, so a server that was re-acquired in
 /// the meantime is left untouched.
 fn schedule_idle_disposal() {
-    thread::spawn(|| {
-        thread::sleep(WARM_SERVER_IDLE_TTL);
+    schedule_idle_disposal_after(WARM_SERVER_IDLE_TTL);
+}
+
+fn schedule_idle_disposal_after(delay: Duration) {
+    if !claim_idle_disposal_sweep(&IDLE_DISPOSAL_SCHEDULED) {
+        return;
+    }
+    thread::spawn(move || {
+        thread::sleep(delay);
         let pool = opencode_server_pool();
         let mut pool = pool.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for OpenCode server pool");
             e.into_inner()
         });
         cleanup_idle_warm_servers(&mut pool);
+        let next_delay = next_idle_disposal_delay(&pool);
+        drop(pool);
+        IDLE_DISPOSAL_SCHEDULED.store(false, Ordering::SeqCst);
+        let rechecked_delay = {
+            let pool = opencode_server_pool().lock().unwrap_or_else(|e| {
+                tracing::warn!("Recovered poisoned lock for OpenCode server pool");
+                e.into_inner()
+            });
+            next_idle_disposal_delay(&pool)
+        };
+        if let Some(delay) = min_idle_disposal_delay(next_delay, rechecked_delay) {
+            schedule_idle_disposal_after(delay);
+        }
     });
 }
 
@@ -765,9 +899,7 @@ fn acquire_warm_server(
             .get(&key)
             .is_some_and(|current| Arc::ptr_eq(current, &server));
 
-        if healthy && still_pooled {
-            server.active_sessions.fetch_add(1, Ordering::SeqCst);
-            server.mark_used();
+        if healthy && still_pooled && server.try_acquire_lease() {
             tracing::debug!(
                 "Reusing OpenCode warm server {} for {}",
                 server.base_url,
@@ -834,6 +966,7 @@ fn acquire_warm_server(
         startup_output,
         process: Mutex::new(server_process),
         active_sessions: AtomicUsize::new(1),
+        retiring: AtomicBool::new(false),
         last_used: Mutex::new(Instant::now()),
     });
     tracing::info!(
@@ -858,19 +991,28 @@ fn acquire_warm_server(
         e.into_inner()
     });
     match pool.entry(key) {
-        Entry::Occupied(existing) => {
+        Entry::Occupied(mut existing) => {
             // Another thread won the race. Reuse their server (taking a lease)
             // and discard ours to avoid leaking an orphaned `opencode serve`.
             let winner = existing.get().clone();
-            winner.active_sessions.fetch_add(1, Ordering::SeqCst);
-            winner.mark_used();
-            drop(pool);
-            tracing::info!(
-                "Discarding duplicate OpenCode warm server {} after losing startup race",
-                server.base_url
-            );
-            server.shutdown();
-            Ok(OpenCodeWarmServerLease { server: winner })
+            if winner.try_acquire_lease() {
+                drop(pool);
+                tracing::info!(
+                    "Discarding duplicate OpenCode warm server {} after losing startup race",
+                    server.base_url
+                );
+                server.shutdown();
+                Ok(OpenCodeWarmServerLease { server: winner })
+            } else {
+                existing.insert(server.clone());
+                drop(pool);
+                tracing::info!(
+                    "Replacing retiring OpenCode warm server with {} for {}",
+                    server.base_url,
+                    server.key.working_dir
+                );
+                Ok(OpenCodeWarmServerLease { server })
+            }
         }
         Entry::Vacant(slot) => {
             slot.insert(server.clone());
@@ -1017,28 +1159,39 @@ fn run_session(
     }
 
     // 2. Create session
-    let session_id = create_session(base_url, auth)?;
+    let session_id = create_session(base_url, auth, cancel_token)?;
 
     // 3. Announce session
     let _ = sender.send(StreamMessage::Init {
         session_id: session_id.clone(),
         raw_session_id: None,
     });
+    if is_cancelled(cancel_token) {
+        abort_session(base_url, auth, &session_id);
+        return Err("OpenCode request cancelled before prompt send".to_string());
+    }
 
     // 4. Connect SSE stream first, then send prompt
     let sse_agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
         .timeout_read(SSE_READ_TIMEOUT)
         .build();
 
-    let sse_response = sse_agent
+    let sse_response = match sse_agent
         .get(&format!("{base_url}/global/event"))
         .set("Authorization", auth)
         .set("Accept", "text/event-stream")
         .call()
-        .map_err(|e| format!("Failed to connect to OpenCode SSE stream: {e}"))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            abort_session(base_url, auth, &session_id);
+            return Err(format!("Failed to connect to OpenCode SSE stream: {error}"));
+        }
+    };
 
     // 5. Send prompt (non-blocking — server processes it while we read SSE)
-    send_prompt(
+    if let Err(error) = send_prompt(
         base_url,
         auth,
         &session_id,
@@ -1046,7 +1199,11 @@ fn run_session(
         system_prompt,
         allowed_tools,
         model,
-    )?;
+        cancel_token,
+    ) {
+        abort_session(base_url, auth, &session_id);
+        return Err(error);
+    }
 
     // 6. Read SSE stream
     let reader: BufReader<Box<dyn std::io::Read + Send>> =
@@ -1095,8 +1252,17 @@ fn wait_for_health(
     }
 }
 
-fn create_session(base_url: &str, auth: &str) -> Result<String, String> {
-    let response = ureq::post(&format!("{base_url}/session"))
+fn create_session(
+    base_url: &str,
+    auth: &str,
+    cancel_token: Option<&CancelToken>,
+) -> Result<String, String> {
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled before session creation".to_string());
+    }
+    let agent = session_request_agent();
+    let response = agent
+        .post(&format!("{base_url}/session"))
         .set("Authorization", auth)
         .set("Content-Type", "application/json")
         .send_json(serde_json::json!({}))
@@ -1105,6 +1271,9 @@ fn create_session(base_url: &str, auth: &str) -> Result<String, String> {
     let json: Value = response
         .into_json()
         .map_err(|e| format!("Failed to parse session response: {e}"))?;
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled after session creation".to_string());
+    }
 
     // Accept "id", "sessionID", or "session_id"
     ["id", "sessionID", "session_id"]
@@ -1122,21 +1291,37 @@ fn send_prompt(
     system_prompt: Option<&str>,
     allowed_tools: Option<&[String]>,
     model: Option<&OpenCodeModelRef>,
+    cancel_token: Option<&CancelToken>,
 ) -> Result<(), String> {
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled before prompt send".to_string());
+    }
     let body = build_prompt_body(prompt, system_prompt, allowed_tools, model);
 
-    let resp = ureq::post(&format!("{base_url}/session/{session_id}/prompt_async"))
+    let agent = session_request_agent();
+    let resp = agent
+        .post(&format!("{base_url}/session/{session_id}/prompt_async"))
         .set("Authorization", auth)
         .set("Content-Type", "application/json")
         .send_json(body)
         .map_err(|e| format!("Failed to send prompt to OpenCode: {e}"))?;
 
     let status = resp.status();
+    if is_cancelled(cancel_token) {
+        return Err("OpenCode request cancelled after prompt send".to_string());
+    }
     if status == 204 || (200..300).contains(&(status as u32)) {
         Ok(())
     } else {
         Err(format!("prompt_async returned unexpected status: {status}"))
     }
+}
+
+fn session_request_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout(SESSION_REQUEST_TIMEOUT)
+        .build()
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1497,13 +1682,15 @@ fn consume_sse(
                         if !stop.load(Ordering::Relaxed)
                             && let Some(server) = watchdog_server.as_ref()
                         {
-                            if server.active_sessions.load(Ordering::SeqCst) <= 1 {
+                            if server.try_begin_exclusive_hard_kill().is_ok() {
                                 kill_pid_tree(server.id());
+                                evict_warm_server_from_pool(server);
                             } else {
+                                let active = server.active_sessions.load(Ordering::SeqCst);
                                 tracing::warn!(
                                     "Skipping OpenCode hard-kill cancel fallback for shared warm server {} with {} active sessions",
                                     server.base_url,
-                                    server.active_sessions.load(Ordering::SeqCst)
+                                    active
                                 );
                             }
                         }
@@ -1519,6 +1706,26 @@ fn consume_sse(
         watchdog_done.store(true, Ordering::Relaxed);
         result
     })
+}
+
+/// Whether a line successfully read from the SSE socket proves the transport is
+/// still alive and must therefore refresh the `SSE_READ_TIMEOUT` idle deadline
+/// in [`consume_sse_inner`].
+///
+/// Intentionally `true` for EVERY line — keep-alive comments (`:` / `event:`),
+/// `data:` chunks, the blank dispatch delimiter, and frames addressed to OTHER
+/// co-resident sessions on the shared `/global/event` stream. The warm pool
+/// multiplexes many sessions over one `opencode serve` SSE stream, so liveness
+/// is a property of the TRANSPORT, not of this session's dispatched events.
+/// Tying the refresh to `process_sse_event` returning `Some(_)` (which is `None`
+/// for keep-alives and any non-matching `sessionID`) would let a long-running
+/// turn that legitimately emits no data for >120s be falsely declared idle and
+/// `abort_session`'d — killing the live server-side turn — whenever co-resident
+/// traffic keeps the socket busy. Restores the pre-warm-pool transport-idle
+/// semantics; guarded by `sse_idle_timer_refreshes_on_all_transport_lines`.
+#[inline]
+fn sse_line_is_transport_liveness(_line: &str) -> bool {
+    true
 }
 
 fn consume_sse_inner(
@@ -1570,7 +1777,13 @@ fn consume_sse_inner(
             }
         };
 
-        last_event = Instant::now();
+        // Transport-liveness: any line we manage to read refreshes the idle
+        // deadline, BEFORE the keep-alive / data / dispatch branches below.
+        // (See `sse_line_is_transport_liveness` for why this must not be gated
+        // on this session's dispatched events in the shared warm-pool stream.)
+        if sse_line_is_transport_liveness(&line) {
+            last_event = Instant::now();
+        }
 
         // Keep-alive comment
         if line.starts_with(':') || line.starts_with("event:") {
@@ -1621,6 +1834,7 @@ fn consume_sse_inner(
     if !terminal_seen {
         let result = state.accumulated_text.trim().to_string();
         if !result.is_empty() {
+            abort_session(base_url, auth, session_id);
             send_sse_done(sender, session_id, result);
             return Ok(());
         }
@@ -1640,6 +1854,7 @@ fn consume_sse_inner(
                 abort_session(base_url, auth, session_id);
                 return Err("OpenCode request cancelled".to_string());
             }
+            abort_session(base_url, auth, session_id);
             send_sse_done(sender, session_id, result);
             return Ok(());
         }
@@ -2548,6 +2763,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn warm_server_hard_kill_vetoed_when_co_resident() {
+        // Sole session (or under-counted) -> hard-kill permitted.
+        assert!(warm_server_hard_kill_allowed(0));
+        assert!(warm_server_hard_kill_allowed(1));
+        // Co-resident turns share the warm server -> hard-kill must be vetoed
+        // so a single turn's cancel/timeout cannot SIGKILL the shared
+        // `opencode serve` out from under another turn's live SSE stream.
+        assert!(!warm_server_hard_kill_allowed(2));
+        assert!(!warm_server_hard_kill_allowed(8));
+    }
+
+    #[test]
+    fn retiring_warm_server_rejects_new_lease_without_incrementing() {
+        let active = AtomicUsize::new(1);
+        let retiring = AtomicBool::new(true);
+
+        assert!(!try_acquire_warm_server_session(&active, &retiring));
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hard_kill_marks_retiring_only_for_exclusive_session() {
+        let active = AtomicUsize::new(1);
+        let retiring = AtomicBool::new(false);
+
+        assert!(try_begin_exclusive_warm_server_hard_kill(&active, &retiring).is_ok());
+        assert!(retiring.load(Ordering::SeqCst));
+        assert!(!try_acquire_warm_server_session(&active, &retiring));
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hard_kill_veto_clears_retiring_for_shared_session() {
+        let active = AtomicUsize::new(2);
+        let retiring = AtomicBool::new(false);
+
+        assert_eq!(
+            try_begin_exclusive_warm_server_hard_kill(&active, &retiring),
+            Err(2)
+        );
+        assert!(!retiring.load(Ordering::SeqCst));
+        assert!(try_acquire_warm_server_session(&active, &retiring));
+        assert_eq!(active.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn idle_disposal_sweep_claim_is_coalesced() {
+        let scheduled = AtomicBool::new(false);
+        assert!(claim_idle_disposal_sweep(&scheduled));
+        assert!(!claim_idle_disposal_sweep(&scheduled));
+        scheduled.store(false, Ordering::SeqCst);
+        assert!(claim_idle_disposal_sweep(&scheduled));
+    }
+
+    #[test]
+    fn idle_disposal_delay_reschedules_until_ttl_elapsed() {
+        assert_eq!(
+            idle_disposal_delay_for_idle_duration(Duration::from_secs(0)),
+            WARM_SERVER_IDLE_TTL
+        );
+        assert_eq!(
+            idle_disposal_delay_for_idle_duration(WARM_SERVER_IDLE_TTL / 2),
+            WARM_SERVER_IDLE_TTL / 2
+        );
+        assert_eq!(
+            idle_disposal_delay_for_idle_duration(WARM_SERVER_IDLE_TTL + Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn idle_disposal_reschedule_uses_rechecked_soonest_delay() {
+        assert_eq!(
+            min_idle_disposal_delay(None, Some(Duration::from_secs(1))),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            min_idle_disposal_delay(Some(Duration::from_secs(30)), Some(Duration::from_secs(5))),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            min_idle_disposal_delay(Some(Duration::from_secs(5)), Some(Duration::from_secs(30))),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            min_idle_disposal_delay(Some(Duration::from_secs(5)), None),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(min_idle_disposal_delay(None, None), None);
+    }
+
+    #[test]
     fn opencode_warm_server_key_canonicalizes_equivalent_working_dirs() {
         let cwd = std::env::current_dir().expect("current dir");
         let key_from_dot = warm_server_key("opencode", ".");
@@ -2689,9 +2996,78 @@ mod tests {
         assert!(s.contains("password:[REDACTED]"), "got: {s}");
         assert!(s.contains("ok"));
 
+        // Inline `auth:Scheme value` — when the inline value is itself a
+        // `Basic`/`Bearer` scheme marker, the real credential is the next token
+        // and must still be redacted (otherwise it leaks into the detail tail).
+        let s = scrub_startup_secrets("Authorization:Basic c2VjcmV0Y3JlZA== done");
+        assert!(
+            !s.contains("c2VjcmV0Y3JlZA=="),
+            "leaked inline-scheme credential: {s}"
+        );
+        assert!(s.contains("done"));
+        let s = scrub_startup_secrets("auth:Bearer tok_inlinecred tail");
+        assert!(
+            !s.contains("tok_inlinecred"),
+            "leaked inline bearer credential: {s}"
+        );
+        assert!(s.contains("tail"));
+
         // A non-secret colon token (e.g. a URL) is left intact.
         let s = scrub_startup_secrets("listening http://127.0.0.1:8080 ready");
         assert!(s.contains("http://127.0.0.1:8080"), "mangled url: {s}");
+    }
+
+    #[test]
+    fn process_sse_event_ignores_other_session_without_liveness_signal() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut state = SseMessageState::default();
+        let other = serde_json::json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "other-session",
+                "message": {"id": "m1", "role": "assistant"}
+            }
+        });
+        assert_eq!(
+            process_sse_event(&other.to_string(), "current-session", &tx, &mut state),
+            None
+        );
+
+        let current = serde_json::json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "current-session",
+                "message": {"id": "m2", "role": "assistant"}
+            }
+        });
+        assert_eq!(
+            process_sse_event(&current.to_string(), "current-session", &tx, &mut state),
+            Some(false)
+        );
+    }
+
+    /// Regression guard for the warm-pool SSE idle-timeout: the 120s
+    /// `SSE_READ_TIMEOUT` deadline is a TRANSPORT-idle guard, so every line read
+    /// from the shared `/global/event` stream must refresh it — keep-alives,
+    /// `event:` framing, `data:` chunks, the blank dispatch delimiter, and
+    /// frames for OTHER co-resident sessions. Gating the refresh on this
+    /// session's dispatched events (the bug this fix reverts) false-aborted
+    /// long-running turns that emit no data for >120s while co-resident traffic
+    /// kept the socket alive.
+    #[test]
+    fn sse_idle_timer_refreshes_on_all_transport_lines() {
+        for line in [
+            ":heartbeat",
+            "event: message.updated",
+            "data: {\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"other-session\"}}",
+            "",
+            "data: {\"type\":\"session.idle\"}",
+        ] {
+            assert!(
+                sse_line_is_transport_liveness(line),
+                "line must count as transport liveness for the SSE idle timer: {line:?}"
+            );
+        }
     }
 
     /// [TEST-006] empty pool is cold-start safe: returns empty, no panic.

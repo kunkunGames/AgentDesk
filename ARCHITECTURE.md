@@ -725,6 +725,7 @@ src/
 │   │   ├── quality_alert.rs
 │   │   ├── queries.rs
 │   │   ├── recovery_audit.rs
+│   │   ├── relay_signal_alert.rs
 │   │   ├── retention.rs
 │   │   ├── session_inventory.rs
 │   │   ├── turn_lifecycle.rs
@@ -806,6 +807,7 @@ src/
 │   ├── issue_announcements.rs
 │   ├── kanban.rs
 │   ├── kanban_cards.rs
+│   ├── long_turn_watchdog.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
 │   ├── mod.rs

@@ -1161,6 +1161,16 @@ pub struct KanbanConfig {
     pub human_alert_channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pm_decision_gate_enabled: Option<bool>,
+    /// #3561 — operator override for the relay-signal alert threshold. When
+    /// set, every per-hour relay invariant signal (terminal-ack timeout,
+    /// uncommitted-inflight-cleared, owner-unknown, offset invariant
+    /// violation) fires once its hourly window count reaches this value,
+    /// overriding the conservative per-signal code defaults. `None` keeps the
+    /// built-in defaults; it does NOT disable alerting (the alert target —
+    /// `kanban_human_alert_channel_id` — remaining unset is the real off
+    /// switch, so an unconfigured deploy never spams).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_alert_threshold: Option<u32>,
 }
 
 impl KanbanConfig {
@@ -1169,6 +1179,7 @@ impl KanbanConfig {
             && self.deadlock_manager_channel_id.is_none()
             && self.human_alert_channel_id.is_none()
             && self.pm_decision_gate_enabled.is_none()
+            && self.relay_alert_threshold.is_none()
     }
 }
 
@@ -1353,6 +1364,57 @@ pub struct RuntimeSettingsConfig {
     /// prior Codex turn block the follow-up wait for the full configured duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followup_prompt_ready_timeout_secs: Option<u64>,
+    /// Master rollback flag for the read-only DB active-session mismatch audit
+    /// surfaced on `/api/health/detail` (`active_session_audit` block). When
+    /// unset it defaults to ON; `Some(false)` makes the audit report
+    /// `enabled:false` with empty candidates and skips the DB query entirely.
+    /// Read live via `config_live_reload::current()` so an `agentdesk.yaml` edit
+    /// applies on the next `/api/health/detail` call without a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_audit_enabled: Option<bool>,
+    /// Minimum seconds since `last_heartbeat` before a raw-active session can be
+    /// flagged by the active-session mismatch audit (post-restart/long-turn
+    /// grace). Unset (or `0`) falls back to the compiled-in 120s default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_audit_stale_secs: Option<u64>,
+    /// Hard cap on audit candidate rows AND the SQL `LIMIT`. Unset falls back to
+    /// the compiled-in 50 default; clamped to `1..=500` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session_audit_max_candidates: Option<u64>,
+    /// TTL (seconds) for the in-memory TUI hook registry buffer. A hook that has
+    /// been buffered longer than this is swept and never replayed to a claiming
+    /// listener, so a stale Stop from a previous turn cannot wake a fresh turn.
+    /// When unset (or `0`) the compiled-in 30s default
+    /// (`hook_registry::DEFAULT_HOOK_BUFFER_TTL`) is used.
+    ///
+    /// NOT hot-reloadable: this value is captured ONCE when the process-global
+    /// `hook_registry::GLOBAL` is first accessed (effectively at process start)
+    /// and stored on the immutable `HookRegistry.ttl`. Editing it in
+    /// `agentdesk.yaml` takes effect only on the next process start (restart
+    /// required). Only `tui_hook_registry_enabled` is read live per-hook.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_hook_buffer_ttl_secs: Option<u64>,
+    /// Diagnostic delay (milliseconds) before an unclaimed Stop in the TUI hook
+    /// registry is considered "elapsed". Diagnostic-only in P0 — it never
+    /// triggers a transcript sync or finalization. When unset (or `0`) the
+    /// compiled-in 2000ms default (`hook_registry::DEFAULT_UNCLAIMED_STOP_DELAY`)
+    /// is used.
+    ///
+    /// NOT hot-reloadable: like `tui_hook_buffer_ttl_secs`, this is captured ONCE
+    /// when `hook_registry::GLOBAL` is first accessed (process start) and stored
+    /// on the immutable `HookRegistry.unclaimed_stop_delay`. Editing it in
+    /// `agentdesk.yaml` takes effect only on the next process start (restart
+    /// required). Only `tui_hook_registry_enabled` is genuinely hot-reloadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_unclaimed_stop_delay_ms: Option<u64>,
+    /// Rollback switch for the TUI hook registry buffering layer. Defaults to ON
+    /// (`None` => enabled). Set to `false` in `agentdesk.yaml` to stop feeding
+    /// the registry from the hook receiver, leaving the legacy broadcast +
+    /// polling path exactly as before. Genuinely hot-reloadable (no restart
+    /// required): `registry_enabled()` reads it live per-hook. This is the ONLY
+    /// live-reloadable key of the three TUI hook registry settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui_hook_registry_enabled: Option<bool>,
     /// Enable the in-process Codex rollout discovery index cache used by the
     /// Codex TUI resume / follow-up readiness paths
     /// (`codex_tui::rollout_index`). The cache avoids re-walking
@@ -1389,57 +1451,6 @@ pub struct RuntimeSettingsConfig {
     /// edit applies on the next activation without a restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_rate_limit_gate_danger_pct: Option<u8>,
-    /// TTL (seconds) for the in-memory TUI hook registry buffer. A hook that has
-    /// been buffered longer than this is swept and never replayed to a claiming
-    /// listener, so a stale Stop from a previous turn cannot wake a fresh turn.
-    /// When unset (or `0`) the compiled-in 30s default
-    /// (`hook_registry::DEFAULT_HOOK_BUFFER_TTL`) is used.
-    ///
-    /// NOT hot-reloadable: this value is captured ONCE when the process-global
-    /// `hook_registry::GLOBAL` is first accessed (effectively at process start)
-    /// and stored on the immutable `HookRegistry.ttl`. Editing it in
-    /// `agentdesk.yaml` takes effect only on the next process start (restart
-    /// required). Only `tui_hook_registry_enabled` is read live per-hook.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tui_hook_buffer_ttl_secs: Option<u64>,
-    /// Diagnostic delay (milliseconds) before an unclaimed Stop in the TUI hook
-    /// registry is considered "elapsed". Diagnostic-only in P0 — it never
-    /// triggers a transcript sync or finalization. When unset (or `0`) the
-    /// compiled-in 2000ms default (`hook_registry::DEFAULT_UNCLAIMED_STOP_DELAY`)
-    /// is used.
-    ///
-    /// NOT hot-reloadable: like `tui_hook_buffer_ttl_secs`, this is captured ONCE
-    /// when `hook_registry::GLOBAL` is first accessed (process start) and stored
-    /// on the immutable `HookRegistry.unclaimed_stop_delay`. Editing it in
-    /// `agentdesk.yaml` takes effect only on the next process start (restart
-    /// required). Only `tui_hook_registry_enabled` is genuinely hot-reloadable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tui_unclaimed_stop_delay_ms: Option<u64>,
-    /// Rollback switch for the TUI hook registry buffering layer. Defaults to ON
-    /// (`None` => enabled). Set to `false` in `agentdesk.yaml` to stop feeding
-    /// the registry from the hook receiver, leaving the legacy broadcast +
-    /// polling path exactly as before. Genuinely hot-reloadable (no restart
-    /// required): `registry_enabled()` reads it live per-hook. This is the ONLY
-    /// live-reloadable key of the three TUI hook registry settings.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tui_hook_registry_enabled: Option<bool>,
-    /// Master rollback flag for the read-only DB active-session mismatch audit
-    /// surfaced on `/api/health/detail` (`active_session_audit` block). When
-    /// unset it defaults to ON; `Some(false)` makes the audit report
-    /// `enabled:false` with empty candidates and skips the DB query entirely.
-    /// Read live via `config_live_reload::current()` so an `agentdesk.yaml` edit
-    /// applies on the next `/api/health/detail` call without a restart.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_session_audit_enabled: Option<bool>,
-    /// Minimum seconds since `last_heartbeat` before a raw-active session can be
-    /// flagged by the active-session mismatch audit (post-restart/long-turn
-    /// grace). Unset (or `0`) falls back to the compiled-in 120s default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_session_audit_stale_secs: Option<u64>,
-    /// Hard cap on audit candidate rows AND the SQL `LIMIT`. Unset falls back to
-    /// the compiled-in 50 default; clamped to `1..=500` when set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_session_audit_max_candidates: Option<u64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub reset_overrides_on_restart: bool,
 }
@@ -1471,15 +1482,15 @@ impl RuntimeSettingsConfig {
             && self.github_repo_cache_sec.is_none()
             && self.rate_limit_stale_sec.is_none()
             && self.followup_prompt_ready_timeout_secs.is_none()
-            && self.codex_rollout_index_cache_enabled.is_none()
-            && self.dispatch_rate_limit_gate_enabled.is_none()
-            && self.dispatch_rate_limit_gate_danger_pct.is_none()
-            && self.tui_hook_buffer_ttl_secs.is_none()
-            && self.tui_unclaimed_stop_delay_ms.is_none()
-            && self.tui_hook_registry_enabled.is_none()
             && self.active_session_audit_enabled.is_none()
             && self.active_session_audit_stale_secs.is_none()
             && self.active_session_audit_max_candidates.is_none()
+            && self.tui_hook_buffer_ttl_secs.is_none()
+            && self.tui_unclaimed_stop_delay_ms.is_none()
+            && self.tui_hook_registry_enabled.is_none()
+            && self.codex_rollout_index_cache_enabled.is_none()
+            && self.dispatch_rate_limit_gate_enabled.is_none()
+            && self.dispatch_rate_limit_gate_danger_pct.is_none()
             && !self.reset_overrides_on_restart
     }
 }
@@ -2079,6 +2090,19 @@ pub struct RoutinesConfig {
     /// Watch `dir` for script changes and reload without restart.
     #[serde(default = "default_true")]
     pub hot_reload: bool,
+    /// Alert the operator (Discord) when a routine has been `paused` for at
+    /// least this many seconds. A routine that fails/times out can become stuck
+    /// in `paused` indefinitely (it is excluded from claims), so this surfaces
+    /// the stall instead of letting it silently never run again (#3564).
+    /// Defaults to 0, which disables the alert and preserves prior behavior.
+    #[serde(default)]
+    pub stale_paused_alert_secs: u64,
+    /// Dedupe window for the stale-paused alert, in seconds. The tick fires
+    /// every `tick_interval_secs`, so without a long dedupe TTL the alert would
+    /// re-fire every tick for every stuck routine. Defaults to 86400 (once per
+    /// day per routine).
+    #[serde(default = "default_routines_stale_paused_alert_ttl_secs")]
+    pub stale_paused_alert_ttl_secs: u64,
 }
 
 impl Default for RoutinesConfig {
@@ -2094,6 +2118,8 @@ impl Default for RoutinesConfig {
             agent_timeout_secs: default_routines_agent_timeout_secs(),
             max_checkpoint_bytes: default_routines_max_checkpoint_bytes(),
             hot_reload: true,
+            stale_paused_alert_secs: 0,
+            stale_paused_alert_ttl_secs: default_routines_stale_paused_alert_ttl_secs(),
         }
     }
 }
@@ -2142,6 +2168,10 @@ fn default_routines_max_checkpoint_bytes() -> usize {
     256 * 1024
 }
 
+fn default_routines_stale_paused_alert_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+
 #[cfg(test)]
 mod routine_config_unit_tests {
     use super::*;
@@ -2165,6 +2195,32 @@ mod routine_config_unit_tests {
                 PathBuf::from("/Volumes/ops/agentdesk-routines")
             ]
         );
+    }
+
+    #[test]
+    fn stale_paused_knobs_default_to_disabled_alert_preserving_prior_behavior() {
+        // Omitting the new field must leave the stale-paused alert disabled (0)
+        // so the tick loop never enters the block — i.e. existing deployments
+        // behave exactly as before (#3564).
+        let config: RoutinesConfig = serde_json::from_str("{}").expect("empty routines config");
+        assert_eq!(config.stale_paused_alert_secs, 0);
+        // The dedupe TTL still defaults to a non-spammy once-per-day window so
+        // that, once the alert is enabled, it cannot flood the channel.
+        assert_eq!(config.stale_paused_alert_ttl_secs, 24 * 60 * 60);
+        assert_eq!(config, RoutinesConfig::default());
+    }
+
+    #[test]
+    fn stale_paused_knobs_deserialize_when_provided() {
+        let config: RoutinesConfig = serde_json::from_str(
+            r#"{
+                "stale_paused_alert_secs": 86400,
+                "stale_paused_alert_ttl_secs": 43200
+            }"#,
+        )
+        .expect("routines config with stale-paused knobs");
+        assert_eq!(config.stale_paused_alert_secs, 86_400);
+        assert_eq!(config.stale_paused_alert_ttl_secs, 43_200);
     }
 }
 

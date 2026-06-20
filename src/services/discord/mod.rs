@@ -132,6 +132,9 @@ pub(in crate::services::discord) use shared_state::RuntimeHttpCache;
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
 // to `crate::services`), so the group type is re-exported with that same scope.
 pub(in crate::services) use shared_state::SessionOverrideState;
+// #3479 Item 3: the cluster members were `pub(super)` on `SharedData` (visible
+// up to `crate::services`), so the group type is re-exported with that scope.
+pub(in crate::services) use shared_state::DispatchRoutingState;
 // #3038 S3: same scope rationale as S2 — the cluster-E members were
 // `pub(super)` on `SharedData` (visible up to `crate::services`).
 pub(in crate::services) use shared_state::RestartLifecycle;
@@ -331,6 +334,60 @@ pub(super) fn turn_watchdog_timeout() -> Duration {
 pub(super) fn turn_idle_timeout() -> Duration {
     static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_TURN_IDLE_TIMEOUT_SECS", 3600))
+}
+
+/// #3557 (A): per-turn HARD ceiling measured from turn start. Unlike
+/// [`turn_watchdog_timeout`] (which the auto-extend loop pushes forward
+/// indefinitely while inflight stays warm — the root of the unbounded turn
+/// length), this is an absolute wall-clock cap on a single turn that the
+/// auto-extend loop clamps to. Default 6h matches the current effective cap so
+/// this is non-destructive by default; lower it via
+/// `AGENTDESK_TURN_HARD_CEILING_SECS` to enforce a real backstop. When the
+/// ceiling is hit, no further extension is granted and the next watchdog tick
+/// drives the turn through the existing reconcile/cancel path.
+pub(super) fn turn_hard_ceiling_timeout() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_TURN_HARD_CEILING_SECS", 6 * 3600))
+}
+
+/// #3557 (A): Codex-specific per-turn HARD ceiling. Codex `exec` turns are the
+/// source of the worst outliers (a 13125s≈3.6h turn from a hung Codex process
+/// that emitted no terminal event), so they get a tighter default ceiling (4h)
+/// than the generic [`turn_hard_ceiling_timeout`]. Override via
+/// `AGENTDESK_CODEX_TURN_HARD_CEILING_SECS`.
+pub(super) fn codex_turn_hard_ceiling_timeout() -> Duration {
+    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_CODEX_TURN_HARD_CEILING_SECS", 4 * 3600))
+}
+
+/// #3557 (A): the absolute hard-ceiling deadline (ms) for a turn given when it
+/// started and which provider runs it. Codex uses the tighter
+/// [`codex_turn_hard_ceiling_timeout`]; every other provider uses the generic
+/// [`turn_hard_ceiling_timeout`]. The auto-extend loop never pushes the
+/// watchdog deadline past this value.
+pub(super) fn turn_hard_ceiling_deadline_ms(turn_started_ms: i64, provider: &ProviderKind) -> i64 {
+    let ceiling = if matches!(provider, ProviderKind::Codex) {
+        codex_turn_hard_ceiling_timeout()
+    } else {
+        turn_hard_ceiling_timeout()
+    };
+    turn_started_ms.saturating_add(ceiling.as_millis() as i64)
+}
+
+/// #3557 (A): clamp a proposed auto-extend deadline so it never exceeds the
+/// per-turn hard ceiling. Returns the clamped deadline and whether clamping
+/// actually capped the proposal (so the caller can warn exactly once). The
+/// proposal is only ever lowered, never raised — a ceiling already in the past
+/// hard-stops further extension.
+pub(super) fn clamp_auto_extend_deadline_ms(
+    proposed_deadline_ms: i64,
+    ceiling_deadline_ms: i64,
+) -> (i64, bool) {
+    if proposed_deadline_ms > ceiling_deadline_ms {
+        (ceiling_deadline_ms, true)
+    } else {
+        (proposed_deadline_ms, false)
+    }
 }
 
 /// Extend the watchdog deadline for a channel and move the per-turn max cap
@@ -1883,16 +1940,11 @@ pub(crate) struct SharedData {
     /// side-effects) as an atomic, exactly-once unit. Bridge/watcher terminals
     /// submit terminal events here instead of finalizing inline.
     pub(in crate::services::discord) turn_finalizer: Arc<turn_finalizer::TurnFinalizer>,
-    /// Intake-level dedup cache: prevents the same message from starting two turns
-    /// when duplicate bot dispatches arrive nearly simultaneously.
-    /// Key: dedup key (dispatch_id or channel+author+text hash).
-    /// Value: (first-seen Instant, was_thread_context).
-    pub(super) intake_dedup: dashmap::DashMap<String, (std::time::Instant, bool)>,
-    /// Maps parent channel → active dispatch thread channel.
-    /// When a dispatch creates a thread, the parent is recorded here so that
-    /// subsequent bot messages to the parent are queued instead of starting
-    /// a parallel turn.  Cleared when the dispatch thread turn completes.
-    pub(super) dispatch_thread_parents: dashmap::DashMap<ChannelId, ChannelId>,
+    /// #3479 Item 3 — dispatch intake/routing state: the intake dedup cache, the
+    /// parent→dispatch-thread map, and the per-thread role/model override map.
+    /// Field declarations and docs live on `shared_state::DispatchRoutingState`;
+    /// call sites access the members via `shared.dispatch.<original field name>`.
+    pub(super) dispatch: DispatchRoutingState,
     /// Runtime bridge from songbird receive events and STT transcript sidecars
     /// into live playback cuts, explicit-stop cancellation, and deferred prompts.
     pub(in crate::services::discord) voice_barge_in: Arc<voice_barge_in::VoiceBargeInRuntime>,
@@ -1912,12 +1964,6 @@ pub(crate) struct SharedData {
     /// `shared_state::SessionOverrideState`; call sites access the members via
     /// `shared.overrides.<original field name>`.
     pub(super) overrides: SessionOverrideState,
-    /// Per-thread role/model override for cross-channel dispatch reuse.
-    /// When a review dispatch reuses an implementation thread, this maps
-    /// thread_channel_id → alt_channel_id so role_binding and model_for_turn
-    /// resolve from the counter-model channel instead of the thread's parent.
-    /// Cleared when the turn completes.
-    pub(super) dispatch_role_overrides: dashmap::DashMap<ChannelId, ChannelId>,
     /// Per-channel last processed message ID — used for startup catch-up polling.
     pub(super) last_message_ids: dashmap::DashMap<ChannelId, u64>,
     /// Channels where catch-up stopped because the intervention queue was at
@@ -2195,8 +2241,11 @@ pub(super) fn make_shared_data_for_tests_with_storage(
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),
         },
         turn_finalizer: turn_finalizer::TurnFinalizer::spawn(),
-        intake_dedup: dashmap::DashMap::new(),
-        dispatch_thread_parents: dashmap::DashMap::new(),
+        dispatch: DispatchRoutingState {
+            intake_dedup: dashmap::DashMap::new(),
+            thread_parents: dashmap::DashMap::new(),
+            role_overrides: dashmap::DashMap::new(),
+        },
         voice_barge_in: Arc::new(voice_barge_in::VoiceBargeInRuntime::disabled()),
         voice_pairings: Arc::new(voice_routing::VoiceChannelPairingStore::load_default()),
         bot_connected: std::sync::atomic::AtomicBool::new(false),
@@ -2211,7 +2260,6 @@ pub(super) fn make_shared_data_for_tests_with_storage(
             session_reset_pending: dashmap::DashSet::new(),
             model_picker_pending: dashmap::DashMap::new(),
         },
-        dispatch_role_overrides: dashmap::DashMap::new(),
         last_message_ids: dashmap::DashMap::new(),
         catch_up_retry_pending: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
@@ -2240,7 +2288,8 @@ fn queue_persistence_context(
         provider,
         &shared.token_hash,
         shared
-            .dispatch_role_overrides
+            .dispatch
+            .role_overrides
             .get(&channel_id)
             .map(|override_id| override_id.value().get()),
     )
@@ -3436,7 +3485,7 @@ async fn mailbox_restart_drain_all(
         .restart_drain_all(
             provider,
             &shared.token_hash,
-            &shared.dispatch_role_overrides,
+            &shared.dispatch.role_overrides,
         )
         .await;
     for failure in &result.persistence_errors {
@@ -4758,5 +4807,122 @@ mod queued_placeholder_cluster_characterization_tests {
                 other => panic!("expected Committed, got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hard_ceiling_tests {
+    use super::{
+        ProviderKind, clamp_auto_extend_deadline_ms, codex_turn_hard_ceiling_timeout,
+        turn_hard_ceiling_deadline_ms, turn_hard_ceiling_timeout,
+    };
+
+    #[test]
+    fn clamp_caps_proposal_above_ceiling() {
+        let ceiling = 1_000_000;
+        let (clamped, did_clamp) = clamp_auto_extend_deadline_ms(ceiling + 50_000, ceiling);
+        assert_eq!(clamped, ceiling);
+        assert!(did_clamp);
+    }
+
+    #[test]
+    fn clamp_leaves_proposal_below_ceiling_untouched() {
+        let ceiling = 1_000_000;
+        let proposed = ceiling - 50_000;
+        let (clamped, did_clamp) = clamp_auto_extend_deadline_ms(proposed, ceiling);
+        assert_eq!(clamped, proposed);
+        assert!(!did_clamp);
+    }
+
+    #[test]
+    fn clamp_at_exact_ceiling_is_not_a_clamp() {
+        let ceiling = 1_000_000;
+        let (clamped, did_clamp) = clamp_auto_extend_deadline_ms(ceiling, ceiling);
+        assert_eq!(clamped, ceiling);
+        assert!(
+            !did_clamp,
+            "equal-to-ceiling must not be reported as clamped"
+        );
+    }
+
+    #[test]
+    fn codex_uses_tighter_ceiling_than_generic() {
+        // Defaults: generic 6h, codex 4h. Codex's ceiling deadline must be
+        // strictly earlier than the generic provider's for the same start.
+        let start = 10_000_000;
+        let codex = turn_hard_ceiling_deadline_ms(start, &ProviderKind::Codex);
+        let claude = turn_hard_ceiling_deadline_ms(start, &ProviderKind::Claude);
+        assert_eq!(
+            codex,
+            start + codex_turn_hard_ceiling_timeout().as_millis() as i64
+        );
+        assert_eq!(
+            claude,
+            start + turn_hard_ceiling_timeout().as_millis() as i64
+        );
+        // Only assert ordering when the env hasn't overridden defaults.
+        if std::env::var("AGENTDESK_CODEX_TURN_HARD_CEILING_SECS").is_err()
+            && std::env::var("AGENTDESK_TURN_HARD_CEILING_SECS").is_err()
+        {
+            assert!(
+                codex < claude,
+                "codex ceiling ({codex}) must be earlier than generic ceiling ({claude})"
+            );
+        }
+    }
+
+    /// #3557 (A) Codex-review fix: the INITIAL watchdog deadline must already be
+    /// capped at the provider ceiling, not only the auto-extend clamp. This
+    /// reproduces the `min(now + watchdog_timeout, ceiling_deadline)` the
+    /// watchdog now applies at spawn. With a 6h watchdog timeout and the tighter
+    /// 4h Codex ceiling, the initial deadline must land at 4h (the ceiling), so
+    /// a hung Codex turn is reconciled at 4h instead of 6h.
+    #[test]
+    fn initial_deadline_is_capped_at_codex_ceiling() {
+        // Only meaningful with default ceilings (codex 4h < generic/timeout 6h).
+        if std::env::var("AGENTDESK_CODEX_TURN_HARD_CEILING_SECS").is_ok()
+            || std::env::var("AGENTDESK_TURN_TIMEOUT_SECS").is_ok()
+        {
+            return;
+        }
+        let now_ms: i64 = 1_000_000_000;
+        let watchdog_timeout_ms = super::turn_watchdog_timeout().as_millis() as i64; // 6h
+        let proposed_initial_dl = now_ms + watchdog_timeout_ms;
+        let codex_ceiling = turn_hard_ceiling_deadline_ms(now_ms, &ProviderKind::Codex);
+        let initial = std::cmp::min(proposed_initial_dl, codex_ceiling);
+        assert_eq!(
+            initial, codex_ceiling,
+            "Codex initial deadline must be capped at the 4h ceiling, not the 6h timeout"
+        );
+        assert!(
+            initial < proposed_initial_dl,
+            "the cap must actually lower the initial deadline below the 6h timeout"
+        );
+        // The cap binds => the init-time warn condition (`proposed > ceiling`)
+        // is true, so the operator gets the one-shot ceiling warning.
+        assert!(proposed_initial_dl > codex_ceiling);
+    }
+
+    /// For a non-Codex provider whose ceiling equals the watchdog timeout (the
+    /// non-destructive default), the initial cap is a no-op: `min` leaves the
+    /// timeout-based deadline untouched and the init warn does NOT fire.
+    #[test]
+    fn initial_deadline_uncapped_when_ceiling_equals_timeout() {
+        if std::env::var("AGENTDESK_TURN_HARD_CEILING_SECS").is_ok()
+            || std::env::var("AGENTDESK_TURN_TIMEOUT_SECS").is_ok()
+        {
+            return;
+        }
+        let now_ms: i64 = 2_000_000_000;
+        let watchdog_timeout_ms = super::turn_watchdog_timeout().as_millis() as i64;
+        let proposed_initial_dl = now_ms + watchdog_timeout_ms;
+        let claude_ceiling = turn_hard_ceiling_deadline_ms(now_ms, &ProviderKind::Claude);
+        let initial = std::cmp::min(proposed_initial_dl, claude_ceiling);
+        // Defaults: generic ceiling 6h == watchdog timeout 6h.
+        assert_eq!(initial, proposed_initial_dl);
+        assert!(
+            proposed_initial_dl <= claude_ceiling,
+            "with equal defaults the init warn (proposed > ceiling) must not fire"
+        );
     }
 }

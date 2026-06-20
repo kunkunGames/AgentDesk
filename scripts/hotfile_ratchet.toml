@@ -1,0 +1,48 @@
+# Hotfile raw-LOC ratchet baseline (#3565).
+#
+# Freezes the raw line count (`wc -l`: comments, blank lines, and test code all
+# COUNTED) of the three oversized Discord-relay hot files at their current size.
+# `scripts/check_hotfile_ratchet.py` fails CI when a file's raw line count
+# exceeds its ceiling here, so these already-giant modules cannot regress and
+# grow even larger while a decomposition is pending.
+#
+# Metric note: this gate uses RAW wc -l (total physical lines). That is a
+# DELIBERATELY DIFFERENT, complementary metric from the production-LoC ratchet
+# in scripts/audit_maintainability_giant_baseline.toml, which excludes test
+# (`#[cfg(test)]`) code. A change can satisfy one gate and trip the other; both
+# are intended to stay in force. This raw-LOC gate is the coarse "the physical
+# file may not get bigger" backstop; the production-LoC ratchet is the finer
+# "production complexity may not re-inflate" gate.
+#
+# Workflow:
+#   * As a file shrinks, LOWER its number here to lock in the win.
+#   * Growing a hot file requires RAISING its number — a deliberate, reviewable
+#     admission in the diff that the file got bigger. Prefer splitting instead.
+#
+# Counts are raw `wc -l` (equivalently Python `str.splitlines()`) on the
+# LF-terminated source; the two agree exactly for this repo's LF-only files.
+
+[hotfile_ratchet]
+# #3558: 10086 -> 10088 (+2), reviewable admission — both
+# `persist_watcher_stream_progress` streaming call sites thread the captured
+# `turn_identity_for_panel.as_ref()` into the new single-flock offset-TOCTOU RMW
+# helper so a late-frame fresh row B is rejected. The helper bodies live in
+# inflight.rs; this is the minimal call-site cost.
+# #3558 (codex review follow-up): 10088 -> 10098 (+10), reviewable admission —
+# the two remaining session-bound-relay-success sites that still did an unlocked
+# `load_inflight_state` -> mutate -> `save_inflight_state` now route through the
+# new `persist_watcher_relay_watermark_locked` single-flock RMW helper, gated on
+# the captured `inflight_identity_before_relay`. The helper body lives in
+# inflight.rs; this is the identity-guarded call-site + comment cost.
+# #3579: 10098 -> 10111 (+13), reviewable admission — the `session_bound_ack_outcome`
+# INIT switched from the `MissingTarget` failure sentinel to the new watcher-owned
+# `NotAttempted` non-attempt sentinel, plus a load-bearing comment block at the init
+# site explaining why the skipped-ack-wait benign case is now distinct from the real
+# target-none failure. Behavior-preserving (folds to the same resend decision); the
+# new sentinel-distinction tests live in the sibling session_bound_ack_tests.rs file.
+"src/services/discord/tmux_watcher.rs" = 10111
+"src/services/discord/tui_prompt_relay.rs" = 7789
+# #3560: 6612 -> 6621 (+9), reviewable admission — footer-mode separate-panel
+# migration reconcile call + comment at the resume entry. Helper body lives in
+# turn_bridge/status_panel.rs; this is the minimal call-site cost.
+"src/services/discord/turn_bridge/mod.rs" = 6621
