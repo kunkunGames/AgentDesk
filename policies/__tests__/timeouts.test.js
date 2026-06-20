@@ -603,14 +603,20 @@ test("timeouts long turn monitor module skips synthetic reattach placeholders", 
       }
     ],
     dbQuery: createSqlRouter([
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
     ])
   });
 
   policy._section_L();
 
+  // Synthetic placeholders never trigger alerts or tier writes…
   assert.equal(state.deadlockAlerts.length, 0);
-  assert.equal(state.executions.length, 0);
+  // …but the cleanup pass still runs and the bulk alert-key DELETE must execute.
+  const bulkAlertDeletes = state.executions.filter((execution) =>
+    /DELETE FROM kv_meta WHERE key LIKE 'long_turn_alert:%'/.test(execution.sql)
+  );
+  assert.equal(bulkAlertDeletes.length, 1);
 });
 
 test("timeouts long turn monitor module skips repeated 30-minute threshold", () => {
