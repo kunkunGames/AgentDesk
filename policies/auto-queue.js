@@ -485,7 +485,6 @@ var autoQueue = {
     );
     for (var tp = 0; tp < terminalPending.length; tp++) {
       var pending = terminalPending[tp];
-      if (!agentdesk.pipeline.isTerminal(pending.status, tickCfg)) continue;
       autoQueueLog("info", "onTick1min: skipping terminal pending entry " + pending.id + " for card " + pending.kanban_card_id + " at " + pending.status, {
         run_id: pending.run_id,
         entry_id: pending.id,
