@@ -51,7 +51,6 @@ const RUNTIME_CONFIG_KEYS: &[&str] = &[
     "dispatchRateLimitGateEnabled",
     "dispatchRateLimitGateDangerPct",
 ];
-pub(crate) const RUNTIME_CONFIG_EXPLICIT_KEYS_META: &str = "__runtimeConfigExplicitKeys";
 
 /// Known individual `kv_meta` config keys surfaced to the dashboard and policy helpers.
 /// (key, category, label_ko, label_en, default_value)
@@ -83,15 +82,6 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
         "quality",
         "에이전트 품질 알림 채널 ID",
         "Agent Quality Alert Channel ID",
-        None,
-    ),
-    (
-        // #3561 — operator override for the per-hour relay-loss signal alert
-        // threshold. Empty/absent ⇒ conservative per-signal code defaults.
-        "kanban_relay_alert_threshold",
-        "quality",
-        "릴레이 누락 신호 경보 임계",
-        "Relay Signal Alert Threshold",
         None,
     ),
     (
@@ -258,7 +248,6 @@ impl SettingsConfigPatchResponse {
 pub struct RuntimeConfigResponse {
     pub current: Map<String, Value>,
     pub defaults: Map<String, Value>,
-    pub explicit_keys: Vec<String>,
 }
 
 impl SettingsService {
@@ -431,36 +420,19 @@ impl SettingsService {
         let mut current = defaults.clone();
         if let Some(saved_obj) = saved.as_object() {
             for (key, value) in saved_obj {
-                if key == RUNTIME_CONFIG_EXPLICIT_KEYS_META {
-                    continue;
-                }
                 current.insert(key.clone(), value.clone());
             }
         }
-        let mut explicit_keys = saved
-            .as_object()
-            .map(explicit_runtime_config_keys)
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<Vec<_>>();
-        explicit_keys.sort();
 
-        Ok(RuntimeConfigResponse {
-            current,
-            defaults,
-            explicit_keys,
-        })
+        Ok(RuntimeConfigResponse { current, defaults })
     }
 
     pub async fn put_runtime_config(&self, body: Value) -> ServiceResult<SettingsOkResponse> {
         let pool = self.pg_pool("put_runtime_config.pg_pool")?;
+        let value_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
         if let Some(values) = body.as_object() {
-            let marked = with_explicit_runtime_config_keys(values.clone());
-            let value_str = serde_json::to_string(&Value::Object(marked.clone()))
-                .unwrap_or_else(|_| "{}".to_string());
-            write_runtime_config_pg_async(pool, &value_str, &marked).await?;
+            write_runtime_config_pg_async(pool, &value_str, values).await?;
         } else {
-            let value_str = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
             upsert_runtime_config_value_pg_async(pool, &value_str).await?;
         }
         Ok(SettingsOkResponse::ok())
@@ -499,7 +471,6 @@ fn yaml_section_value(config: &crate::config::Config, key: &str) -> Option<Strin
         "deadlock_manager_channel_id" => config.kanban.deadlock_manager_channel_id.clone(),
         "kanban_human_alert_channel_id" => config.kanban.human_alert_channel_id.clone(),
         "agent_quality_monitoring_channel_id" => None,
-        "kanban_relay_alert_threshold" => stringified_number(config.kanban.relay_alert_threshold),
         "review_enabled" => stringified_bool(config.review.enabled),
         "max_review_rounds" => stringified_number(config.review.max_rounds),
         "pm_decision_gate_enabled" => stringified_bool(config.kanban.pm_decision_gate_enabled),
@@ -738,9 +709,6 @@ async fn write_runtime_config_pg_async(
     }
 
     for (key, value) in values {
-        if !RUNTIME_CONFIG_KEYS.contains(&key.as_str()) {
-            continue;
-        }
         let Some(text) = runtime_scalar_to_string(value) else {
             continue;
         };
@@ -930,29 +898,6 @@ pub fn runtime_config_defaults(config: &crate::config::Config) -> Value {
     Value::Object(runtime_config_defaults_map(config))
 }
 
-pub(crate) fn explicit_runtime_config_keys(values: &Map<String, Value>) -> HashSet<String> {
-    values
-        .get(RUNTIME_CONFIG_EXPLICIT_KEYS_META)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|key| RUNTIME_CONFIG_KEYS.contains(key))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn with_explicit_runtime_config_keys(mut values: Map<String, Value>) -> Map<String, Value> {
-    let explicit_keys = explicit_runtime_config_keys(&values);
-    let mut keys = explicit_keys.into_iter().collect::<Vec<_>>();
-    keys.sort();
-    values.insert(
-        RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(),
-        Value::Array(keys.into_iter().map(Value::String).collect()),
-    );
-    values
-}
-
 fn runtime_scalar_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
@@ -970,7 +915,6 @@ fn write_runtime_config_pg(
         serde_json::to_string(&Value::Object(values.clone())).unwrap_or_else(|_| "{}".to_string());
     let scalar_values = values
         .iter()
-        .filter(|(key, _)| RUNTIME_CONFIG_KEYS.contains(&key.as_str()))
         .filter_map(|(key, value)| runtime_scalar_to_string(value).map(|text| (key.clone(), text)))
         .collect::<Vec<_>>();
 
@@ -1058,54 +1002,20 @@ fn seeded_runtime_config_map(
 ) -> Map<String, Value> {
     let defaults = runtime_config_defaults_map(config);
     let yaml_overrides = runtime_config_yaml_overrides(config);
-    let has_yaml_overrides = !yaml_overrides.is_empty();
-    let explicit_keys = saved_obj
-        .as_ref()
-        .map(explicit_runtime_config_keys)
-        .unwrap_or_default();
 
-    let has_explicit_meta = saved_obj
-        .as_ref()
-        .is_some_and(|obj| obj.contains_key(RUNTIME_CONFIG_EXPLICIT_KEYS_META));
     let mut current = if config.runtime.reset_overrides_on_restart {
         defaults.clone()
-    } else if has_explicit_meta {
-        let mut seeded = defaults.clone();
-        if let Some(saved_obj) = saved_obj.as_ref() {
-            for key in &explicit_keys {
-                if let Some(value) = saved_obj.get(key) {
-                    seeded.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        seeded
     } else {
         saved_obj.clone().unwrap_or_else(|| defaults.clone())
     };
-    current.remove(RUNTIME_CONFIG_EXPLICIT_KEYS_META);
 
     if !config.runtime.reset_overrides_on_restart {
         for (key, value) in yaml_overrides {
-            if explicit_keys.contains(&key) {
-                continue;
-            }
             current.insert(key, value);
         }
     }
-    if !config.runtime.reset_overrides_on_restart && !explicit_keys.is_empty() {
-        let mut keys = explicit_keys.into_iter().collect::<Vec<_>>();
-        keys.sort();
-        current.insert(
-            RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(),
-            Value::Array(keys.into_iter().map(Value::String).collect()),
-        );
-    }
 
-    if config.runtime.reset_overrides_on_restart
-        || saved_obj.is_none()
-        || has_yaml_overrides
-        || current != defaults
-    {
+    if config.runtime.reset_overrides_on_restart || saved_obj.is_none() || current != defaults {
         current
     } else {
         saved_obj.unwrap_or(current)
@@ -1149,125 +1059,5 @@ mod tests {
         let value =
             serde_json::to_value(SettingsOkResponse::ok()).expect("serialize settings ok response");
         assert_eq!(value, json!({"ok": true}));
-    }
-
-    #[test]
-    fn seeded_runtime_config_applies_yaml_overrides_over_seeded_defaults() {
-        let saved_obj = runtime_config_defaults_map(&crate::config::Config::default());
-        let mut config = crate::config::Config::default();
-        config.runtime.dispatch_rate_limit_gate_enabled = Some(false);
-        config.runtime.dispatch_rate_limit_gate_danger_pct = Some(95);
-        config.runtime.rate_limit_stale_sec = Some(900);
-
-        let seeded = seeded_runtime_config_map(Some(saved_obj), &config);
-
-        assert_eq!(
-            seeded.get("dispatchRateLimitGateEnabled"),
-            Some(&json!(false))
-        );
-        assert_eq!(
-            seeded.get("dispatchRateLimitGateDangerPct"),
-            Some(&json!(95))
-        );
-        assert_eq!(seeded.get("rateLimitStaleSec"), Some(&json!(900)));
-    }
-
-    #[test]
-    fn seeded_runtime_config_preserves_explicit_api_overrides_over_yaml() {
-        let mut saved_obj = runtime_config_defaults_map(&crate::config::Config::default());
-        saved_obj.insert("dispatchRateLimitGateEnabled".to_string(), json!(true));
-        saved_obj.insert("dispatchRateLimitGateDangerPct".to_string(), json!(100));
-        saved_obj.insert("rateLimitStaleSec".to_string(), json!(600));
-        saved_obj.insert(
-            RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(),
-            json!([
-                "dispatchRateLimitGateEnabled",
-                "dispatchRateLimitGateDangerPct",
-                "rateLimitStaleSec"
-            ]),
-        );
-        let mut config = crate::config::Config::default();
-        config.runtime.dispatch_rate_limit_gate_enabled = Some(false);
-        config.runtime.dispatch_rate_limit_gate_danger_pct = Some(95);
-        config.runtime.rate_limit_stale_sec = Some(900);
-
-        let seeded = seeded_runtime_config_map(Some(saved_obj), &config);
-
-        assert_eq!(
-            seeded.get("dispatchRateLimitGateEnabled"),
-            Some(&json!(true))
-        );
-        assert_eq!(
-            seeded.get("dispatchRateLimitGateDangerPct"),
-            Some(&json!(100))
-        );
-        assert_eq!(seeded.get("rateLimitStaleSec"), Some(&json!(600)));
-        assert!(
-            seeded
-                .get(RUNTIME_CONFIG_EXPLICIT_KEYS_META)
-                .and_then(Value::as_array)
-                .is_some_and(|keys| keys.len() == 3)
-        );
-    }
-
-    #[test]
-    fn seeded_runtime_config_rebases_non_explicit_saved_values() {
-        let mut saved_obj = runtime_config_defaults_map(&crate::config::Config::default());
-        saved_obj.insert("dispatchRateLimitGateEnabled".to_string(), json!(true));
-        saved_obj.insert("dispatchRateLimitGateDangerPct".to_string(), json!(100));
-        saved_obj.insert("rateLimitStaleSec".to_string(), json!(600));
-        saved_obj.insert(
-            RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(),
-            json!(["rateLimitStaleSec"]),
-        );
-        let mut config = crate::config::Config::default();
-        config.runtime.dispatch_rate_limit_gate_enabled = Some(false);
-        config.runtime.dispatch_rate_limit_gate_danger_pct = Some(95);
-        config.runtime.rate_limit_stale_sec = Some(900);
-
-        let seeded = seeded_runtime_config_map(Some(saved_obj), &config);
-
-        assert_eq!(
-            seeded.get("dispatchRateLimitGateEnabled"),
-            Some(&json!(false)),
-            "non-explicit full-dashboard save values must not freeze YAML/default gate settings"
-        );
-        assert_eq!(
-            seeded.get("dispatchRateLimitGateDangerPct"),
-            Some(&json!(95)),
-            "non-explicit gate threshold follows YAML/default baseline"
-        );
-        assert_eq!(
-            seeded.get("rateLimitStaleSec"),
-            Some(&json!(600)),
-            "explicit API override still wins over YAML"
-        );
-    }
-
-    #[test]
-    fn explicit_runtime_config_keys_respects_payload_metadata() {
-        let mut values = runtime_config_defaults_map(&crate::config::Config::default());
-        values.insert(
-            RUNTIME_CONFIG_EXPLICIT_KEYS_META.to_string(),
-            json!(["rateLimitStaleSec"]),
-        );
-
-        let keys = explicit_runtime_config_keys(&values);
-
-        assert_eq!(keys.len(), 1);
-        assert!(keys.contains("rateLimitStaleSec"));
-        assert!(!keys.contains("dispatchRateLimitGateEnabled"));
-    }
-
-    #[test]
-    fn explicit_runtime_config_keys_without_metadata_is_empty() {
-        let values = runtime_config_defaults_map(&crate::config::Config::default());
-
-        let keys = explicit_runtime_config_keys(&values);
-
-        assert!(
-            keys.is_empty(),
-            "full saved runtime-config values are not explicit unless the metadata says so"
-        );
     }
 }

@@ -1086,8 +1086,7 @@ async fn do_finalize(
         //     Moved here so they cannot diverge between the routed paths.
         super::clear_watchdog_deadline_override(channel_id.get()).await;
         shared
-            .dispatch
-            .thread_parents
+            .dispatch_thread_parents
             .retain(|_, thread| *thread != channel_id);
 
         let voice_deferred_enqueued = if ctx.drain_voice {
@@ -1100,7 +1099,7 @@ async fn do_finalize(
         };
         let has_pending_after_voice = finish.has_pending || voice_deferred_enqueued;
         if !has_pending_after_voice {
-            shared.dispatch.role_overrides.remove(&channel_id);
+            shared.dispatch_role_overrides.remove(&channel_id);
         }
 
         // (E) optional deferred queue kickoff (watcher path), gated exactly as
@@ -2261,8 +2260,8 @@ mod tests {
             //   * dispatch_role_overrides is keyed BY `ch`.
             let thread_ch = ChannelId::new(1314);
             let override_ch = ChannelId::new(1315);
-            shared.dispatch.thread_parents.insert(thread_ch, ch);
-            shared.dispatch.role_overrides.insert(ch, override_ch);
+            shared.dispatch_thread_parents.insert(thread_ch, ch);
+            shared.dispatch_role_overrides.insert(ch, override_ch);
 
             let fin = TurnFinalizer::spawn();
             // A STALE terminal for turn-1 (its real id) arrives. The finalizer
@@ -2325,16 +2324,14 @@ mod tests {
             // side-effects, not corrupt the newer turn's routing/watchdog metadata.
             assert!(
                 shared
-                    .dispatch
-                    .thread_parents
+                    .dispatch_thread_parents
                     .get(&thread_ch)
                     .is_some_and(|v| *v == ch),
                 "stale terminal must NOT drop turn-2's dispatch_thread_parents entry"
             );
             assert!(
                 shared
-                    .dispatch
-                    .role_overrides
+                    .dispatch_role_overrides
                     .get(&ch)
                     .is_some_and(|v| *v == override_ch),
                 "stale terminal must NOT drop turn-2's dispatch_role_overrides entry"

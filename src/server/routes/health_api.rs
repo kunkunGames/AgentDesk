@@ -21,18 +21,6 @@ use crate::services::provider::ProviderKind;
 use super::AppState;
 
 const OUTBOX_AGE_DEGRADED_SECS: i64 = 60;
-const ACTIVE_SESSION_AUDIT_QUERY: &str =
-    "SELECT session_key, provider, status, active_dispatch_id, last_heartbeat,
-                thread_channel_id, channel_id
-           FROM sessions
-          WHERE parent_session_id IS NULL
-            AND (NULLIF($2, '') IS NULL OR instance_id IS NULL OR instance_id = $2)
-            AND (
-                status IN ('turn_active', 'working')
-                OR COALESCE(btrim(active_dispatch_id), '') <> ''
-            )
-          ORDER BY last_heartbeat ASC NULLS FIRST, id ASC
-          LIMIT $1";
 
 struct DispatchOutboxStats {
     pending: i64,
@@ -417,9 +405,6 @@ async fn health_response(state: &AppState, detailed: bool) -> Response {
         if let Some(report) = pipeline_override_report {
             json["pipeline_overrides"] = report;
         }
-        if detailed {
-            json["active_session_audit"] = build_active_session_audit(state).await.to_json();
-        }
         if let Some(opencode_block) = opencode_warm_pool_json(detailed) {
             json["opencode"] = opencode_block;
         }
@@ -694,8 +679,7 @@ async fn load_pipeline_override_report_pg(pg_pool: Option<&PgPool>) -> Option<se
 /// Read the dispatch-gate enable flag and gate danger threshold persisted via
 /// `PUT /api/settings/runtime-config` (`kv_meta` `runtime-config` JSON) so the
 /// diagnostics block reports the EFFECTIVE values the gate uses, not the
-/// YAML-only fallback. Returns `(None, None)` for the displayed settings when
-/// no pool / no override exists.
+/// YAML-only fallback. Returns `(None, None)` when no pool / no override.
 async fn load_dispatch_gate_runtime_overrides(
     pg_pool: Option<&PgPool>,
 ) -> (Option<bool>, Option<u64>) {
@@ -710,9 +694,7 @@ async fn load_dispatch_gate_runtime_overrides(
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
-    let (enabled, danger, _stale) =
-        crate::services::dispatch_gate::persisted_runtime_overrides(runtime_config.as_ref());
-    (enabled, danger)
+    crate::services::dispatch_gate::persisted_runtime_overrides(runtime_config.as_ref())
 }
 
 async fn load_channel_session_state(
@@ -809,109 +791,6 @@ async fn enrich_mailbox_session_state(json: &mut serde_json::Value, state: &AppS
     }
 }
 
-/// Build the read-only `active_session_audit` block for `/api/health/detail`.
-///
-/// Reads audit settings live from `config_live_reload::current()` (hot-reload,
-/// no restart) with compiled-in fallbacks. When disabled by config it returns
-/// the empty `enabled:false` block WITHOUT issuing the DB query (rollback path).
-/// Otherwise it runs ONE bounded `SELECT` (`LIMIT` = max_candidates) against the
-/// existing `sessions` columns and classifies the rows with the pure
-/// [`active_session_audit`] classifier. No UPDATE/INSERT/DELETE, no tmux probe.
-async fn build_active_session_audit(state: &AppState) -> ActiveSessionAuditReport {
-    let runtime = crate::config_live_reload::current().map(|cfg| {
-        (
-            cfg.runtime.active_session_audit_enabled,
-            cfg.runtime.active_session_audit_stale_secs,
-            cfg.runtime.active_session_audit_max_candidates,
-        )
-    });
-    let (enabled_override, stale_override, cap_override) = runtime.unwrap_or((None, None, None));
-    let settings =
-        ActiveSessionAuditSettings::from_overrides(enabled_override, stale_override, cap_override);
-
-    if !settings.enabled {
-        return ActiveSessionAuditReport::disabled(settings.stale_secs);
-    }
-
-    let Some(pool) = state.pg_pool_ref() else {
-        return ActiveSessionAuditReport::disabled(settings.stale_secs);
-    };
-
-    let local_instance_id = state.cluster_instance_id.as_deref();
-    let (rows, raw_matches_total) =
-        load_active_session_audit_rows(pool, settings.max_candidates, local_instance_id).await;
-    let mut resolver = crate::services::session_activity::SessionActivityResolver::new();
-    active_session_audit::classify_active_session_audit(
-        &rows,
-        &mut resolver,
-        settings,
-        raw_matches_total,
-        chrono::Utc::now(),
-    )
-}
-
-/// One bounded `SELECT` for raw active-like sessions (`turn_active`, legacy
-/// `working`, OR a non-empty `active_dispatch_id`). Read-only. Fetches one
-/// sentinel row beyond the cap so `truncated` can be computed without an
-/// uncapped `COUNT(*)`. Duplicate rows are not possible because each row is a
-/// distinct `sessions` row; precedence dedup of the raw signal happens in the
-/// classifier.
-async fn load_active_session_audit_rows(
-    pool: &PgPool,
-    max_candidates: u64,
-    local_instance_id: Option<&str>,
-) -> (Vec<RawSessionRow>, usize) {
-    let capped = max_candidates.min(i64::MAX as u64) as usize;
-    let limit = max_candidates.saturating_add(1).min(i64::MAX as u64) as i64;
-    let local_instance_id = local_instance_id.map(str::trim).unwrap_or("");
-    // Surface the staleness-relevant rows FIRST so the LIMIT keeps the candidates
-    // that matter: NULL/unknown heartbeats (can't be proven fresh) come first,
-    // then the OLDEST heartbeats. Ordering newest-first would let stale/zombie
-    // rows beyond the cap escape the audit entirely — the opposite of intent.
-    let query = sqlx::query(ACTIVE_SESSION_AUDIT_QUERY)
-        .bind(limit)
-        .bind(local_instance_id);
-    let rows = match query.fetch_all(pool).await {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::debug!(
-                event = "active_session_audit_query_failed",
-                error = %error,
-                "active-session audit query failed; emitting empty candidate set"
-            );
-            return (Vec::new(), 0);
-        }
-    };
-    let raw_matches_seen = rows.len();
-    let mapped: Vec<RawSessionRow> = rows
-        .iter()
-        .take(capped)
-        .map(|row| RawSessionRow {
-            session_key: row.try_get("session_key").ok(),
-            provider: row.try_get("provider").ok(),
-            status: row.try_get("status").ok(),
-            active_dispatch_id: row.try_get("active_dispatch_id").ok(),
-            last_heartbeat: pg_timestamp_to_rfc3339(row, "last_heartbeat"),
-            thread_channel_id: row.try_get("thread_channel_id").ok(),
-            channel_id: row.try_get("channel_id").ok(),
-        })
-        .collect();
-    (mapped, raw_matches_seen)
-}
-
-/// Read a (possibly `timestamptz`/`timestamp`/`text`) heartbeat column into a
-/// string the audit classifier + `SessionActivityResolver` can parse. Falls back
-/// across representations so schema variance does not panic the read.
-fn pg_timestamp_to_rfc3339(row: &PgRow, column: &str) -> Option<String> {
-    if let Ok(Some(ts)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(column) {
-        return Some(ts.to_rfc3339());
-    }
-    if let Ok(Some(naive)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(column) {
-        return Some(naive.format("%Y-%m-%d %H:%M:%S").to_string());
-    }
-    row.try_get::<Option<String>, _>(column).ok().flatten()
-}
-
 /// Build the additive `opencode` warm-pool diagnostics block.
 ///
 /// `detailed=true` (authenticated/local) includes the full redacted per-server
@@ -964,6 +843,143 @@ fn opencode_warm_pool_degraded_reasons() -> Vec<serde_json::Value> {
         )));
     }
     reasons
+}
+
+/// Build the read-only `active_session_audit` block for `/api/health/detail`.
+///
+/// Reads audit settings live from `config_live_reload::current()` (hot-reload,
+/// no restart) with compiled-in fallbacks. When disabled by config it returns
+/// the empty `enabled:false` block WITHOUT issuing the DB query (rollback path).
+/// Otherwise it runs ONE bounded `SELECT` (`LIMIT` = max_candidates) against the
+/// existing `sessions` columns and classifies the rows with the pure
+/// [`active_session_audit`] classifier. No UPDATE/INSERT/DELETE, no tmux probe.
+async fn build_active_session_audit(state: &AppState) -> ActiveSessionAuditReport {
+    let runtime = crate::config_live_reload::current().map(|cfg| {
+        (
+            cfg.runtime.active_session_audit_enabled,
+            cfg.runtime.active_session_audit_stale_secs,
+            cfg.runtime.active_session_audit_max_candidates,
+        )
+    });
+    let (enabled_override, stale_override, cap_override) = runtime.unwrap_or((None, None, None));
+    let settings =
+        ActiveSessionAuditSettings::from_overrides(enabled_override, stale_override, cap_override);
+
+    if !settings.enabled {
+        return ActiveSessionAuditReport::disabled(settings.stale_secs);
+    }
+
+    let Some(pool) = state.pg_pool_ref() else {
+        return ActiveSessionAuditReport::disabled(settings.stale_secs);
+    };
+
+    let (rows, raw_matches_total) =
+        load_active_session_audit_rows(pool, settings.max_candidates).await;
+    let mut resolver = crate::services::session_activity::SessionActivityResolver::new();
+    active_session_audit::classify_active_session_audit(
+        &rows,
+        &mut resolver,
+        settings,
+        raw_matches_total,
+        chrono::Utc::now(),
+    )
+}
+
+/// One bounded `SELECT` for raw active-like sessions (`turn_active`, legacy
+/// `working`, OR a non-empty `active_dispatch_id`). Read-only. Returns the
+/// capped rows and the total raw-match count (capped at `LIMIT`, used only for
+/// the `truncated` flag). Duplicate rows are not possible because each row is a
+/// distinct `sessions` row; precedence dedup of the raw signal happens in the
+/// classifier.
+async fn load_active_session_audit_rows(
+    pool: &PgPool,
+    max_candidates: u64,
+) -> (Vec<RawSessionRow>, usize) {
+    let limit = max_candidates.min(i64::MAX as u64) as i64;
+    // Surface the staleness-relevant rows FIRST so the LIMIT keeps the candidates
+    // that matter: NULL/unknown heartbeats (can't be proven fresh) come first,
+    // then the OLDEST heartbeats. Ordering newest-first would let stale/zombie
+    // rows beyond the cap escape the audit entirely — the opposite of intent.
+    let query = sqlx::query(
+        "SELECT session_key, provider, status, active_dispatch_id, last_heartbeat, thread_channel_id
+           FROM sessions
+          WHERE status IN ('turn_active', 'working')
+             OR COALESCE(btrim(active_dispatch_id), '') <> ''
+          ORDER BY last_heartbeat ASC NULLS FIRST, id ASC
+          LIMIT $1",
+    )
+    .bind(limit);
+    let rows = match query.fetch_all(pool).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::debug!(
+                event = "active_session_audit_query_failed",
+                error = %error,
+                "active-session audit query failed; emitting empty candidate set"
+            );
+            return (Vec::new(), 0);
+        }
+    };
+    let mapped: Vec<RawSessionRow> = rows
+        .iter()
+        .map(|row| RawSessionRow {
+            session_key: row.try_get("session_key").ok(),
+            provider: row.try_get("provider").ok(),
+            status: row.try_get("status").ok(),
+            active_dispatch_id: row.try_get("active_dispatch_id").ok(),
+            last_heartbeat: pg_timestamp_to_rfc3339(row, "last_heartbeat"),
+            thread_channel_id: row.try_get("thread_channel_id").ok(),
+        })
+        .collect();
+    // `truncated` must reflect the PRE-LIMIT raw-match count, not `mapped.len()`
+    // (which is capped at `LIMIT`). Compute it with a matching COUNT over the same
+    // predicate. If the returned rows are fewer than the cap, nothing was omitted
+    // and we can skip the extra round-trip; otherwise count the raw matches.
+    let raw_matches_total = if (mapped.len() as i64) < limit {
+        mapped.len()
+    } else {
+        count_active_session_audit_rows(pool)
+            .await
+            .unwrap_or(mapped.len())
+    };
+    (mapped, raw_matches_total)
+}
+
+/// Pre-LIMIT raw-match count over the same predicate as
+/// [`load_active_session_audit_rows`]. Read-only; used only to compute the
+/// `truncated` flag accurately when the capped query fills to `LIMIT`.
+async fn count_active_session_audit_rows(pool: &PgPool) -> Option<usize> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM sessions
+          WHERE status IN ('turn_active', 'working')
+             OR COALESCE(btrim(active_dispatch_id), '') <> ''",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|error| {
+        tracing::debug!(
+            event = "active_session_audit_count_failed",
+            error = %error,
+            "active-session audit count query failed; using capped row count"
+        );
+        error
+    })
+    .ok()?;
+    Some(count.max(0) as usize)
+}
+
+/// Read a (possibly `timestamptz`/`timestamp`/`text`) heartbeat column into a
+/// string the audit classifier + `SessionActivityResolver` can parse. Falls back
+/// across representations so schema variance does not panic the read.
+fn pg_timestamp_to_rfc3339(row: &PgRow, column: &str) -> Option<String> {
+    if let Ok(Some(ts)) = row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(column) {
+        return Some(ts.to_rfc3339());
+    }
+    if let Ok(Some(naive)) = row.try_get::<Option<chrono::NaiveDateTime>, _>(column) {
+        return Some(naive.format("%Y-%m-%d %H:%M:%S").to_string());
+    }
+    row.try_get::<Option<String>, _>(column).ok().flatten()
 }
 
 /// GET /api/health — public safe health summary.
@@ -1794,8 +1810,8 @@ pub async fn senddm_handler(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_SESSION_AUDIT_QUERY, RegistryPurgeDecision, discord_control_endpoints_allowed,
-        public_health_json, registry_purge_decision, stale_mailbox_repair_applied,
+        RegistryPurgeDecision, discord_control_endpoints_allowed, public_health_json,
+        registry_purge_decision, stale_mailbox_repair_applied,
     };
     use axum::{
         body::Body,
@@ -2003,14 +2019,6 @@ mod tests {
         assert!(public.get("degraded_reasons").is_none());
         // TEST-004: the detail-only audit block is dropped from public health.
         assert!(public.get("active_session_audit").is_none());
-    }
-
-    #[test]
-    fn active_session_audit_query_filters_foreign_and_background_rows() {
-        assert!(ACTIVE_SESSION_AUDIT_QUERY.contains("parent_session_id IS NULL"));
-        assert!(ACTIVE_SESSION_AUDIT_QUERY.contains("instance_id IS NULL OR instance_id = $2"));
-        assert!(ACTIVE_SESSION_AUDIT_QUERY.contains("thread_channel_id, channel_id"));
-        assert!(!ACTIVE_SESSION_AUDIT_QUERY.contains("COALESCE(thread_channel_id, channel_id)"));
     }
 
     /// [TEST-003] public health omits the per-server OpenCode warm_servers

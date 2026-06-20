@@ -55,8 +55,6 @@ pub(super) fn run_bot_spawn_recovery_and_flush_restart_reports(
                 let settings = shared_for_tmux2.settings.read().await;
                 settings.allowed_bot_ids.clone()
             };
-            let announce_bot_id_for_restore =
-                super::resolve_announce_bot_user_id(&shared_for_tmux2).await;
             // P1-1: Restore dispatch_role_overrides from queue snapshots
             for (thread_channel_id, alt_channel_id) in &restored_overrides {
                 if !matches!(
@@ -67,8 +65,7 @@ pub(super) fn run_bot_spawn_recovery_and_flush_restart_reports(
                     continue;
                 }
                 shared_for_tmux2
-                    .dispatch
-                    .role_overrides
+                    .dispatch_role_overrides
                     .insert(*thread_channel_id, *alt_channel_id);
             }
             if !restored_overrides.is_empty() {
@@ -97,7 +94,6 @@ pub(super) fn run_bot_spawn_recovery_and_flush_restart_reports(
                     for item in items {
                         if !super::is_allowed_turn_sender(
                             &allowed_bot_ids_for_restore,
-                            announce_bot_id_for_restore,
                             item.author_id.get(),
                             item.author_is_bot,
                             &item.text,

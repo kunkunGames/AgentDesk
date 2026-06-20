@@ -53,10 +53,7 @@ export default function EmojiPicker({
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-        buttonRef.current?.focus();
-      }
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     };
     const keyHandler = (e: KeyboardEvent) => {
       if (e.key === "Escape") {

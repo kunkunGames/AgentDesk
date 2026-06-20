@@ -118,8 +118,6 @@ pub(super) fn run_bot_spawn_sigterm_handler(
                     }
                 }
 
-                crate::services::opencode::shutdown_warm_servers();
-
                 // Wait for all providers to finish saving before exiting.
                 // CAS guard: skip if this provider already decremented via deferred restart path.
                 if shared_for_signal

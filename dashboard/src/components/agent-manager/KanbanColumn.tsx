@@ -206,7 +206,7 @@ function BacklogIssueCard({
         <a
           href={issue.url}
           target="_blank"
-          rel="noopener noreferrer"
+          rel="noreferrer"
           className="text-xs hover:underline"
           style={{ color: "#93c5fd" }}
           onClick={(event) => event.stopPropagation()}
@@ -318,7 +318,7 @@ function KanbanCardArticle({
           <a
             href={githubIssueUrl}
             target="_blank"
-            rel="noopener noreferrer"
+            rel="noreferrer"
             className="text-xs hover:underline"
             style={{ color: "var(--info)" }}
             onClick={(event) => event.stopPropagation()}

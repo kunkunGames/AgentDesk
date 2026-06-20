@@ -24,11 +24,7 @@
 //!   (`hook_server::subscribe_hook_events`) so we observe Stop events the
 //!   moment they land instead of polling the transcript every second.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use chrono::{DateTime, Utc};
@@ -47,36 +43,10 @@ const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Default timeout if the caller omits one.
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
-static SEND_NOT_BEFORE: OnceLock<Mutex<HashMap<String, DateTime<Utc>>>> = OnceLock::new();
-
 /// Buffer name used when pasting send-text. Each request gets its own buffer
 /// so concurrent sends to different sessions cannot stomp each other.
 fn allocate_buffer_name() -> String {
     format!("adk-tui-send-{}", uuid::Uuid::new_v4().simple())
-}
-
-fn send_not_before_map() -> &'static Mutex<HashMap<String, DateTime<Utc>>> {
-    SEND_NOT_BEFORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn remember_send_not_before(session_name: &str, not_before: DateTime<Utc>) {
-    if let Ok(mut map) = send_not_before_map().lock() {
-        map.insert(session_name.to_string(), not_before);
-    }
-}
-
-fn last_send_not_before(session_name: &str) -> Option<DateTime<Utc>> {
-    send_not_before_map()
-        .lock()
-        .ok()
-        .and_then(|map| map.get(session_name).copied())
-}
-
-fn resolve_wait_not_before(
-    session_name: &str,
-    explicit: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    explicit.or_else(|| last_send_not_before(session_name))
 }
 
 pub(crate) trait SendBackend: Send + Sync {
@@ -134,8 +104,6 @@ pub struct SendResponse {
     pub session_name: String,
     pub bytes: usize,
     pub submitted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,15 +223,9 @@ fn handle_send_with_backend(
     }
 
     let mut submitted = false;
-    let mut not_before = None;
     if req.submit {
-        let turn_boundary = Utc::now();
         match backend.send_enter(&session_name) {
-            Ok(()) => {
-                submitted = true;
-                not_before = Some(turn_boundary);
-                remember_send_not_before(&session_name, turn_boundary);
-            }
+            Ok(()) => submitted = true,
             Err(error) => {
                 return ok_error_json(&format!("tmux send-keys Enter failed: {error}"));
             }
@@ -275,7 +237,6 @@ fn handle_send_with_backend(
         session_name,
         bytes,
         submitted,
-        not_before,
     };
     (
         StatusCode::OK,
@@ -313,7 +274,6 @@ async fn handle_wait(Json(req): Json<WaitRequest>) -> Json<Value> {
         return Json(error_json("until=token requires a non-empty token"));
     }
 
-    let wait_not_before = resolve_wait_not_before(&session_name, req.not_before);
     let started = Instant::now();
 
     // #tui-hook-ttl-buffer (REQ-002/REQ-005/REQ-006): SUBSCRIBE to the broadcast
@@ -337,7 +297,7 @@ async fn handle_wait(Json(req): Json<WaitRequest>) -> Json<Value> {
         req.session_id.as_deref(),
         &until_mode,
         token.as_deref(),
-        wait_not_before,
+        req.not_before,
     ) {
         let summary = json!({
             "provider": early.provider,
@@ -392,7 +352,7 @@ async fn handle_wait(Json(req): Json<WaitRequest>) -> Json<Value> {
                     req.session_id.as_deref(),
                     &until_mode,
                     token.as_deref(),
-                    wait_not_before,
+                    req.not_before,
                 ) {
                     continue;
                 }
@@ -438,11 +398,6 @@ fn try_claim_registry_match(
     if !hook_registry::registry_enabled() {
         return None;
     }
-    // Registry replay must be tied to a concrete turn lower-bound. Without it,
-    // a previous turn's still-in-TTL Stop/token payload for the same provider
-    // session can satisfy the next wait before the live broadcast path sees any
-    // new assistant output.
-    let not_before = not_before?;
     let provider = want_provider.map(str::trim).filter(|p| !p.is_empty())?;
     let session_id = want_session_id.map(str::trim).filter(|s| !s.is_empty())?;
     let key = hook_registry::RegistryKey::new(provider, Some(session_id), None)?;
@@ -455,36 +410,15 @@ fn try_claim_registry_match(
     let until_mode = until_mode.to_string();
     let token = token.map(str::to_string);
     hook_registry::global().claim_matching_once(key, |event| {
-        event_matches_registry_replay(
+        event_matches(
             event,
             want_provider,
             want_session_id,
             &until_mode,
             token.as_deref(),
-            Some(not_before),
+            not_before,
         )
     })
-}
-
-fn event_matches_registry_replay(
-    event: &HookEvent,
-    want_provider: Option<&str>,
-    want_session_id: Option<&str>,
-    until_mode: &str,
-    token: Option<&str>,
-    not_before: Option<DateTime<Utc>>,
-) -> bool {
-    if until_mode == "token" && matches!(event.kind, HookEventKind::UserPromptSubmit) {
-        return false;
-    }
-    event_matches(
-        event,
-        want_provider,
-        want_session_id,
-        until_mode,
-        token,
-        not_before,
-    )
 }
 
 fn event_matches(
@@ -632,32 +566,6 @@ mod tests {
         assert_eq!(body.0["session_name"], "test-session");
         assert_eq!(body.0["bytes"].as_u64(), Some("hello\nworld".len() as u64));
         assert_eq!(body.0["submitted"], true);
-        assert!(body.0["not_before"].as_str().is_some());
-    }
-
-    #[test]
-    fn handle_send_records_not_before_for_followup_waits() {
-        let mut req = send_request("hello", true);
-        req.session_name = "not-before-session".to_string();
-        let (status, body) = handle_send_with_backend(req, &FakeSendBackend);
-
-        assert_eq!(status, StatusCode::OK);
-        let recorded = body.0["not_before"]
-            .as_str()
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.with_timezone(&Utc))
-            .expect("send response should include not_before");
-        assert_eq!(
-            resolve_wait_not_before("not-before-session", None),
-            Some(recorded)
-        );
-
-        let explicit = recorded + chrono::Duration::seconds(5);
-        assert_eq!(
-            resolve_wait_not_before("not-before-session", Some(explicit)),
-            Some(explicit),
-            "caller-supplied not_before must override the remembered send boundary"
-        );
     }
 
     fn make_event(provider: &str, sid: &str, kind: HookEventKind, payload: Value) -> HookEvent {
@@ -668,10 +576,6 @@ mod tests {
             received_at: Utc::now(),
             payload,
         }
-    }
-
-    fn replay_lower_bound() -> Option<DateTime<Utc>> {
-        Some(Utc::now() - chrono::Duration::seconds(1))
     }
 
     #[test]
@@ -857,56 +761,15 @@ mod tests {
             make_event(provider, session, HookEventKind::Stop, json!({})),
         );
 
-        let matched = try_claim_registry_match(
-            Some(provider),
-            Some(session),
-            "stop",
-            None,
-            replay_lower_bound(),
-        );
+        let matched = try_claim_registry_match(Some(provider), Some(session), "stop", None, None);
         assert!(matched.is_some(), "buffered early Stop must be claimed");
         assert_eq!(matched.unwrap().kind, HookEventKind::Stop);
 
         // Single-consumption: a second claim finds nothing.
-        let second = try_claim_registry_match(
-            Some(provider),
-            Some(session),
-            "stop",
-            None,
-            replay_lower_bound(),
-        );
+        let second = try_claim_registry_match(Some(provider), Some(session), "stop", None, None);
         assert!(
             second.is_none(),
             "claimed Stop must not replay to a later wait"
-        );
-    }
-
-    #[test]
-    fn try_claim_registry_match_requires_turn_lower_bound() {
-        use crate::services::claude_tui::hook_registry::{RegistryKey, global};
-        let provider = "claude";
-        let session = "wait-requires-bound";
-        if let Some(k) = RegistryKey::new(provider, Some(session), None) {
-            let _ = global().claim_once(k);
-        }
-        let key = RegistryKey::new(provider, Some(session), None).unwrap();
-        global().deliver(
-            key,
-            make_event(provider, session, HookEventKind::Stop, json!({})),
-        );
-
-        assert!(
-            try_claim_registry_match(Some(provider), Some(session), "stop", None, None).is_none()
-        );
-        assert!(
-            try_claim_registry_match(
-                Some(provider),
-                Some(session),
-                "stop",
-                None,
-                replay_lower_bound(),
-            )
-            .is_some()
         );
     }
 
@@ -915,14 +778,8 @@ mod tests {
     /// through to the broadcast wait (registry returns `None`).
     #[test]
     fn try_claim_registry_match_skips_when_no_session_id() {
-        assert!(
-            try_claim_registry_match(Some("claude"), None, "stop", None, replay_lower_bound())
-                .is_none()
-        );
-        assert!(
-            try_claim_registry_match(None, Some("sid"), "stop", None, replay_lower_bound())
-                .is_none()
-        );
+        assert!(try_claim_registry_match(Some("claude"), None, "stop", None, None).is_none());
+        assert!(try_claim_registry_match(None, Some("sid"), "stop", None, None).is_none());
     }
 
     /// Cross-provider isolation at the wait seam: a Stop buffered for
@@ -943,25 +800,11 @@ mod tests {
         );
         // A claude wait for the same session id must not see the codex Stop.
         assert!(
-            try_claim_registry_match(
-                Some("claude"),
-                Some(session),
-                "stop",
-                None,
-                replay_lower_bound(),
-            )
-            .is_none()
+            try_claim_registry_match(Some("claude"), Some(session), "stop", None, None).is_none()
         );
         // The codex wait does see it.
         assert!(
-            try_claim_registry_match(
-                Some("codex"),
-                Some(session),
-                "stop",
-                None,
-                replay_lower_bound(),
-            )
-            .is_some()
+            try_claim_registry_match(Some("codex"), Some(session), "stop", None, None).is_some()
         );
     }
 
@@ -989,7 +832,7 @@ mod tests {
             Some(session),
             "token",
             Some("absent-token"),
-            replay_lower_bound(),
+            None,
         );
         assert!(
             token_miss.is_none(),
@@ -998,13 +841,7 @@ mod tests {
 
         // The buffered Stop must still be claimable by a later Stop wait — the
         // failed token wait must not have discarded it.
-        let stop_hit = try_claim_registry_match(
-            Some(provider),
-            Some(session),
-            "stop",
-            None,
-            replay_lower_bound(),
-        );
+        let stop_hit = try_claim_registry_match(Some(provider), Some(session), "stop", None, None);
         assert!(
             stop_hit.is_some(),
             "unmatched token wait must not discard the buffered Stop"
@@ -1042,74 +879,15 @@ mod tests {
             Some(session),
             "token",
             Some("needle-42"),
-            replay_lower_bound(),
+            None,
         );
         assert!(token_hit.is_some(), "token payload must be claimable");
 
         // The Stop is still buffered and claimable.
-        let stop_hit = try_claim_registry_match(
-            Some(provider),
-            Some(session),
-            "stop",
-            None,
-            replay_lower_bound(),
-        );
+        let stop_hit = try_claim_registry_match(Some(provider), Some(session), "stop", None, None);
         assert!(
             stop_hit.is_some(),
             "the Stop must survive a token-mode claim on the same session"
-        );
-    }
-
-    #[test]
-    fn try_claim_registry_match_token_ignores_prompt_submit_payload() {
-        use crate::services::claude_tui::hook_registry::{RegistryKey, global};
-        let provider = "claude";
-        let session = "wait-token-prompt-submit";
-        if let Some(k) = RegistryKey::new(provider, Some(session), None) {
-            let _ = global().claim_once(k);
-        }
-        let key = RegistryKey::new(provider, Some(session), None).unwrap();
-        global().deliver(
-            key.clone(),
-            make_event(
-                provider,
-                session,
-                HookEventKind::UserPromptSubmit,
-                json!({ "prompt": "marker-from-user-prompt" }),
-            ),
-        );
-        global().deliver(
-            key,
-            make_event(
-                provider,
-                session,
-                HookEventKind::Notification,
-                json!({ "text": "marker-from-assistant" }),
-            ),
-        );
-
-        let prompt_submit = try_claim_registry_match(
-            Some(provider),
-            Some(session),
-            "token",
-            Some("marker-from-user-prompt"),
-            replay_lower_bound(),
-        );
-        assert!(
-            prompt_submit.is_none(),
-            "registry replay must not satisfy token waits from prompt-submit echo"
-        );
-
-        let assistant_token = try_claim_registry_match(
-            Some(provider),
-            Some(session),
-            "token",
-            Some("marker-from-assistant"),
-            replay_lower_bound(),
-        );
-        assert!(
-            assistant_token.is_some(),
-            "non-prompt-submit token payload remains claimable"
         );
     }
 

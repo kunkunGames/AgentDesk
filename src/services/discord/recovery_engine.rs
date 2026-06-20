@@ -280,24 +280,17 @@ fn emit_recovery_quality_event(
     channel_id: u64,
     dispatch_id: Option<&str>,
     session_key: Option<&str>,
-    turn_id: Option<&str>,
-    agent_id: Option<&str>,
     reason: &str,
 ) {
     crate::services::observability::emit_agent_quality_event(
         crate::services::observability::AgentQualityEvent {
-            // #3562: prefer the turn_id as the source_event_id so this quality
-            // row joins back to turn_started/turn_finished on the same standard
-            // key (turn_analytics keys source_event_id = turn_id). Fall back to
-            // the legacy session_key → dispatch_id chain when no turn_id exists.
-            source_event_id: turn_id
+            source_event_id: session_key
                 .map(str::to_string)
-                .or_else(|| session_key.map(str::to_string))
                 .or_else(|| dispatch_id.map(str::to_string)),
             correlation_id: dispatch_id
                 .map(str::to_string)
                 .or_else(|| session_key.map(str::to_string)),
-            agent_id: agent_id.map(str::to_string),
+            agent_id: None,
             provider: Some(provider.as_str().to_string()),
             channel_id: Some(channel_id.to_string()),
             card_id: None,
@@ -306,7 +299,6 @@ fn emit_recovery_quality_event(
             payload: serde_json::json!({
                 "reason": reason,
                 "session_key": session_key,
-                "turn_id": turn_id,
             }),
         },
     );
@@ -1248,41 +1240,27 @@ pub(super) async fn restore_inflight_turns(
         );
         let restart_report_exists =
             super::restart_report::load_restart_report(provider, state.channel_id).is_some();
-        // #3562: derive the turn identity and agent role so the recovery_fired
-        // observability events back-trace to a specific agent/turn. `turn_id`
-        // matches the recovered-transcript key (joins turn_started/turn_finished
-        // for message-bearing turns); `agent_id` is the role bound to the channel.
-        let recovery_turn_id = self::analytics_transcript::recovered_transcript_turn_id(
-            state.channel_id,
-            state.user_msg_id,
-            state.session_key.as_deref(),
-            state.turn_start_offset,
-            &state.started_at,
-        );
-        let recovery_agent_id =
-            resolve_role_binding(channel_id, state.channel_name.as_deref()).map(|b| b.role_id);
-        let recovery_reason = if restart_report_exists {
-            "restart_report"
-        } else {
-            "restore_inflight"
-        };
         crate::services::observability::emit_recovery_fired(
             provider.as_str(),
             state.channel_id,
             state.dispatch_id.as_deref(),
             state.session_key.as_deref(),
-            Some(recovery_turn_id.as_str()),
-            recovery_agent_id.as_deref(),
-            recovery_reason,
+            if restart_report_exists {
+                "restart_report"
+            } else {
+                "restore_inflight"
+            },
         );
         emit_recovery_quality_event(
             provider,
             state.channel_id,
             state.dispatch_id.as_deref(),
             state.session_key.as_deref(),
-            Some(recovery_turn_id.as_str()),
-            recovery_agent_id.as_deref(),
-            recovery_reason,
+            if restart_report_exists {
+                "restart_report"
+            } else {
+                "restore_inflight"
+            },
         );
 
         // No generation gate — adopt mode allows old-gen session recovery. If a
@@ -2772,25 +2750,11 @@ pub(super) async fn restore_inflight_turns(
                             .or_else(|| parse_dispatch_id(&state.user_text));
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::error!("  [{ts}] {error}; main-workspace fallback blocked");
-                        // #3562: back-trace the recovery to a specific agent/turn.
-                        let recovery_turn_id =
-                            self::analytics_transcript::recovered_transcript_turn_id(
-                                state.channel_id,
-                                state.user_msg_id,
-                                state.session_key.as_deref(),
-                                state.turn_start_offset,
-                                &state.started_at,
-                            );
-                        let recovery_agent_id =
-                            resolve_role_binding(channel_id, state.channel_name.as_deref())
-                                .map(|b| b.role_id);
                         crate::services::observability::emit_recovery_fired(
                             provider.as_str(),
                             state.channel_id,
                             dispatch_id.as_deref(),
                             state.session_key.as_deref(),
-                            Some(recovery_turn_id.as_str()),
-                            recovery_agent_id.as_deref(),
                             "worktree_missing_main_fallback_blocked",
                         );
                         emit_recovery_quality_event(
@@ -2798,8 +2762,6 @@ pub(super) async fn restore_inflight_turns(
                             state.channel_id,
                             dispatch_id.as_deref(),
                             state.session_key.as_deref(),
-                            Some(recovery_turn_id.as_str()),
-                            recovery_agent_id.as_deref(),
                             "worktree_missing_main_fallback_blocked",
                         );
                         let relay_ok = relay_recovered_terminal_text_to_placeholder(
@@ -3019,24 +2981,11 @@ pub(super) async fn restore_inflight_turns(
                     .or_else(|| parse_dispatch_id(&state.user_text));
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::error!("  [{ts}] {error}; main-workspace fallback blocked");
-                // #3562: back-trace the recovery to a specific agent/turn.
-                let recovery_turn_id = self::analytics_transcript::recovered_transcript_turn_id(
-                    state.channel_id,
-                    state.user_msg_id,
-                    state.session_key.as_deref(),
-                    state.turn_start_offset,
-                    &state.started_at,
-                );
-                let recovery_agent_id =
-                    resolve_role_binding(channel_id, state.channel_name.as_deref())
-                        .map(|b| b.role_id);
                 crate::services::observability::emit_recovery_fired(
                     provider.as_str(),
                     state.channel_id,
                     dispatch_id.as_deref(),
                     state.session_key.as_deref(),
-                    Some(recovery_turn_id.as_str()),
-                    recovery_agent_id.as_deref(),
                     "worktree_missing_main_fallback_blocked",
                 );
                 emit_recovery_quality_event(
@@ -3044,8 +2993,6 @@ pub(super) async fn restore_inflight_turns(
                     state.channel_id,
                     dispatch_id.as_deref(),
                     state.session_key.as_deref(),
-                    Some(recovery_turn_id.as_str()),
-                    recovery_agent_id.as_deref(),
                     "worktree_missing_main_fallback_blocked",
                 );
                 let relay_ok = relay_recovered_terminal_text_to_placeholder(
@@ -3609,26 +3556,6 @@ pub(crate) async fn rebind_inflight_for_channel(
         // #2285 E1–E5) routes both identically — this is pure audit
         // metadata.
         state.turn_source = super::inflight::TurnSource::ExternalAdopted;
-        // #3582: bind the relay to the watcher we respawn below. The
-        // STALL-WATCHDOG force-clean -> respawn path reaches this birth site with
-        // `existing_inflight = None` (force-clean deleted the row first); without
-        // this stamp the synthetic row defaults to `relay_owner_kind = None` and
-        // every later idle-tail / panel / routing check runs the degraded
-        // bridge-owned path even though the watcher owns the live tmux relay. The
-        // monitor-auto-turn birth site (`tmux.rs`) already stamps Watcher the same
-        // way; `rebind_origin` and `relay_owner_kind` are independent flags.
-        state.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
-        // #3581: stamp the bounded-preservation fields so an unadopted,
-        // never-progressed rebind-origin row can be reaped after a deadline (or
-        // a boot-time generation mismatch) instead of becoming a permanent
-        // orphan that wedges turn-start. Only this birth site stamps them; the
-        // reap predicate (`should_reap_abandoned_rebind_origin`) still requires
-        // the row to be owner-less / unadopted / never-progressed, so a row that
-        // goes live before the deadline is never reaped.
-        state.rebind_origin_created_at_unix = Some(super::inflight::now_unix());
-        state.rebind_origin_deadline_secs =
-            Some(super::inflight::rebind_origin_deadline_secs_env());
-        state.rebind_origin_birth_generation = Some(super::runtime_store::load_generation());
 
         // Atomic create-or-fail: if a legitimate turn created its inflight file
         // between the preflight check above and this point, the write fails
@@ -3842,49 +3769,6 @@ mod post_work_evidence_tests {
         state.any_tool_used = false;
         state.last_tool_summary = Some("Bash completed".to_string());
         assert!(recovery_has_post_work_ready_evidence(&state));
-    }
-
-    /// #3582 regression: the synthetic inflight that `rebind_inflight_for_channel`
-    /// creates when `existing_inflight = None` (the STALL-WATCHDOG force-clean ->
-    /// respawn path, which deletes the row first) must be stamped watcher-owned.
-    /// Before the fix this row defaulted to `relay_owner_kind = None`, so
-    /// `effective_relay_owner_kind()` resolved to `None` and every later idle-tail /
-    /// panel / routing check ran the degraded bridge-owned path even though the
-    /// watcher actually owns the live tmux relay. This mirrors the exact stamps the
-    /// birth site applies; if a refactor drops `set_relay_owner_kind(Watcher)` there
-    /// this assertion fails.
-    #[test]
-    fn synthetic_rebind_origin_row_is_watcher_owned() {
-        let mut state = inflight::InflightTurnState::new(
-            ProviderKind::Claude,
-            1_479_671_298_497_183_835,
-            Some("adk-cc".to_string()),
-            0, // request_owner_user_id — no originating Discord user
-            0, // user_msg_id
-            0, // current_msg_id (placeholder)
-            String::from("/api/inflight/rebind"),
-            None,
-            Some("AgentDesk-claude-adk-cc".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            None,
-            0,
-        );
-        // Birth-site stamps (must stay in sync with `rebind_inflight_for_channel`).
-        state.rebind_origin = true;
-        state.turn_source = inflight::TurnSource::ExternalAdopted;
-        state.set_relay_owner_kind(inflight::RelayOwnerKind::Watcher);
-
-        assert_eq!(
-            state.effective_relay_owner_kind(),
-            inflight::RelayOwnerKind::Watcher,
-            "force-clean respawn must leave the relay watcher-owned, not degraded to None",
-        );
-        assert!(
-            state.watcher_owns_live_relay,
-            "the legacy bool must agree so older deserializers also see watcher ownership",
-        );
-        // rebind_origin and watcher ownership are independent flags and must coexist.
-        assert!(state.rebind_origin);
     }
 }
 

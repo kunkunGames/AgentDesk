@@ -94,7 +94,6 @@ impl RoutineAgentExecutor {
         prompt: String,
         dm_user_id: Option<String>,
         checkpoint: Option<Value>,
-        last_result: Option<String>,
         next_due_at: Option<DateTime<Utc>>,
     ) -> Result<RoutineRunOutcome> {
         let action = "agent".to_string();
@@ -128,18 +127,13 @@ impl RoutineAgentExecutor {
                 fresh_context_guaranteed: FRESH_CONTEXT_GUARANTEED,
             }),
             Ok(started) => {
-                // Prefer the dispatch label the routine script returned (e.g.
-                // "dependency update check dispatched"); fall back to the
-                // generic message only when the script omitted lastResult.
-                let consumed_last_result = last_result
-                    .as_deref()
-                    .unwrap_or("headless command consumed without starting an agent turn");
+                let last_result = "headless command consumed without starting an agent turn";
                 let closed = store
                     .complete_agent_run(
                         &claimed.run_id,
                         Some(started.result_json.clone()),
                         checkpoint,
-                        Some(consumed_last_result),
+                        Some(last_result),
                         match next_due_at {
                             Some(value) => NextDueAtUpdate::Set(value),
                             None => NextDueAtUpdate::Preserve,
@@ -171,7 +165,6 @@ impl RoutineAgentExecutor {
                     prompt,
                     dm_user_id,
                     checkpoint,
-                    last_result,
                     next_due_at,
                     &agent_id,
                     "primary",
@@ -190,7 +183,6 @@ impl RoutineAgentExecutor {
         prompt: String,
         dm_user_id: Option<String>,
         checkpoint: Option<Value>,
-        last_result: Option<String>,
         next_due_at: Option<DateTime<Utc>>,
         failed_agent_id: &str,
         attempt_kind: &str,
@@ -269,19 +261,14 @@ impl RoutineAgentExecutor {
                         });
                     }
                     Ok(started) => {
-                        // Preserve the routine's dispatch label across the
-                        // fallback path too; only the agent that never started
-                        // a turn reaches here, so the script's lastResult is
-                        // still the most meaningful summary.
-                        let consumed_last_result = last_result.as_deref().unwrap_or(
-                            "fallback headless command consumed without starting an agent turn",
-                        );
+                        let last_result =
+                            "fallback headless command consumed without starting an agent turn";
                         let closed = store
                             .complete_agent_run(
                                 &claimed.run_id,
                                 Some(started.result_json.clone()),
                                 checkpoint,
-                                Some(consumed_last_result),
+                                Some(last_result),
                                 match next_due_at {
                                     Some(value) => NextDueAtUpdate::Set(value),
                                     None => NextDueAtUpdate::Preserve,

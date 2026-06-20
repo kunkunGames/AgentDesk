@@ -139,23 +139,15 @@ pub fn emit_recovery_fired(
     channel_id: u64,
     dispatch_id: Option<&str>,
     session_key: Option<&str>,
-    turn_id: Option<&str>,
-    agent_id: Option<&str>,
     reason: &str,
 ) {
-    // #3562: thread the turn identity and agent role through so consumers can
-    // back-trace *which* agent/turn triggered the recovery. `turn_id` rides the
-    // dedicated correlation column (enrich_payload_with_correlation also mirrors
-    // it into payload_json for jsonl/dashboard parsers). `observability_events`
-    // has no `agent_id` column, so `agent_id` lives only in payload_json — a
-    // backward-compatible add (older rows simply omit the key).
     emit_event(
         "recovery_fired",
         Some(provider),
         Some(channel_id),
         dispatch_id,
         session_key,
-        turn_id,
+        None,
         normalize_string(reason).as_deref(),
         CounterDelta {
             recovery_fires: 1,
@@ -163,7 +155,6 @@ pub fn emit_recovery_fired(
         },
         json!({
             "reason": normalize_string(reason),
-            "agent_id": agent_id.and_then(normalize_string),
         }),
     );
 }
@@ -257,58 +248,22 @@ pub(super) fn emit_relay_root_cause_counter(provider: &str, channel_id: u64, cou
 }
 
 pub fn record_invariant_check(condition: bool, violation: InvariantViolation<'_>) -> bool {
-    record_invariant_check_with_severity(condition, violation, InvariantSeverity::Error)
-}
-
-/// #3552: severity for a recorded invariant violation. `Error` is the default
-/// (ERROR-level tracing log) used by every breach that actually persists bad
-/// state. `Warn` is used ONLY when a downstream guard has *already handled* the
-/// condition (e.g. the #3416 enforce path skips the backward inflight write and
-/// preserves the offset → zero data loss), so an ERROR is inappropriate noise.
-/// The structured `invariant_violation` analytics event (incl. `guard_fires`)
-/// is emitted identically in both cases — only the tracing log level changes —
-/// so dashboards/PG analytics keep full visibility while the operator-facing
-/// ERROR log stays clean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InvariantSeverity {
-    Error,
-    Warn,
-}
-
-pub fn record_invariant_check_with_severity(
-    condition: bool,
-    violation: InvariantViolation<'_>,
-    severity: InvariantSeverity,
-) -> bool {
     if condition {
         return true;
     }
 
     let invariant = normalize_string(violation.invariant).unwrap_or_else(|| "unknown".to_string());
-    match severity {
-        InvariantSeverity::Error => tracing::error!(
-            invariant = %invariant,
-            provider = violation.provider.unwrap_or_default(),
-            channel_id = violation.channel_id.unwrap_or_default(),
-            dispatch_id = violation.dispatch_id.unwrap_or_default(),
-            session_key = violation.session_key.unwrap_or_default(),
-            turn_id = violation.turn_id.unwrap_or_default(),
-            code_location = violation.code_location,
-            "[invariant] {}",
-            violation.message
-        ),
-        InvariantSeverity::Warn => tracing::warn!(
-            invariant = %invariant,
-            provider = violation.provider.unwrap_or_default(),
-            channel_id = violation.channel_id.unwrap_or_default(),
-            dispatch_id = violation.dispatch_id.unwrap_or_default(),
-            session_key = violation.session_key.unwrap_or_default(),
-            turn_id = violation.turn_id.unwrap_or_default(),
-            code_location = violation.code_location,
-            "[invariant] {} (handled by downstream guard — downgraded to WARN)",
-            violation.message
-        ),
-    }
+    tracing::error!(
+        invariant = %invariant,
+        provider = violation.provider.unwrap_or_default(),
+        channel_id = violation.channel_id.unwrap_or_default(),
+        dispatch_id = violation.dispatch_id.unwrap_or_default(),
+        session_key = violation.session_key.unwrap_or_default(),
+        turn_id = violation.turn_id.unwrap_or_default(),
+        code_location = violation.code_location,
+        "[invariant] {}",
+        violation.message
+    );
 
     emit_event(
         "invariant_violation",
@@ -638,8 +593,6 @@ mod tests {
             42,
             Some("dispatch-recovery"),
             Some("session-recovery"),
-            Some("turn-recovery"),
-            Some("planner"),
             "watchdog",
         );
         emit_turn_cancelled(
@@ -757,99 +710,6 @@ mod tests {
         assert_eq!(quality.payload["dispatch_id"], "dispatch-quality");
         assert_eq!(quality.payload["source_event_id"], "turn-quality");
         assert_eq!(quality.payload["status"], "review_pass");
-
-        // #3562: recovery_fired must carry the turn identity (correlation column +
-        // mirrored into payload_json) and the agent_id (payload_json only) so
-        // consumers can back-trace which agent/turn triggered the recovery.
-        let recovery = events
-            .iter()
-            .find(|event| event.event_type == "recovery_fired")
-            .expect("recovery_fired should be in recent ring");
-        assert_eq!(recovery.payload["turn_id"], "turn-recovery");
-        assert_eq!(recovery.payload["agent_id"], "planner");
-        assert_eq!(recovery.payload["reason"], "watchdog");
-    }
-
-    #[test]
-    fn warn_severity_invariant_still_emits_event_without_error_level() {
-        // #3552: a violation downgraded to WARN (because a downstream guard
-        // already handled it) must keep full structured-event visibility — the
-        // analytics `invariant_violation` event (incl. guard_fires) is identical
-        // to the ERROR case; only the tracing log LEVEL changes. The recorder
-        // still returns `false` (violation observed), so callers/debug_asserts
-        // behave exactly as before.
-        let _guard = super::super::test_runtime_lock();
-        super::super::reset_for_tests();
-
-        // Holds true regardless of severity → no event recorded.
-        assert!(record_invariant_check_with_severity(
-            true,
-            InvariantViolation {
-                provider: Some("Codex"),
-                channel_id: Some(7),
-                dispatch_id: None,
-                session_key: None,
-                turn_id: None,
-                invariant: "last_offset_monotonic",
-                code_location: "src/services/observability/emit.rs:test",
-                message: "should not fire",
-                details: json!({}),
-            },
-            InvariantSeverity::Warn,
-        ));
-
-        // Violation downgraded to WARN → returns false AND records the event.
-        assert!(!record_invariant_check_with_severity(
-            false,
-            InvariantViolation {
-                provider: Some("Codex"),
-                channel_id: Some(7),
-                dispatch_id: None,
-                session_key: None,
-                turn_id: None,
-                invariant: "last_offset_monotonic",
-                code_location: "src/services/observability/emit.rs:test",
-                message: "handled-by-guard violation",
-                details: json!({"downgraded": true}),
-            },
-            InvariantSeverity::Warn,
-        ));
-
-        // Isolation-robust: assert THIS test's specific WARN-downgraded event is
-        // present in the (shared, global) recent-events ring — filtered by a
-        // unique marker (`details.downgraded` + the verbatim message) — rather
-        // than demanding exactly one `invariant_violation` event ring-wide. Other
-        // tests that don't hold `test_runtime_lock()` can concurrently push their
-        // own `invariant_violation` events into the same global ring on a parallel
-        // (self-hosted) runner, which would otherwise inflate the count past 1.
-        // The analytics event is byte-for-byte identical across Error/Warn (only
-        // the tracing log LEVEL differs), so presence of this exact event — emitted
-        // despite the WARN downgrade — is what proves the test's intent.
-        let events = events::recent(50);
-        let downgraded_events: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                event.event_type == "invariant_violation"
-                    && event.payload["message"] == "handled-by-guard violation"
-                    && event.payload["details"]["downgraded"] == json!(true)
-            })
-            .collect();
-        assert_eq!(
-            downgraded_events.len(),
-            1,
-            "WARN-downgraded violation must still emit exactly one analytics event for THIS test's \
-             unique marker (details.downgraded + message); other concurrent invariant_violation \
-             events in the shared ring are tolerated"
-        );
-        let downgraded_event = downgraded_events[0];
-        assert_eq!(
-            downgraded_event.payload["invariant"],
-            "last_offset_monotonic"
-        );
-        // The downgrade only changes the tracing log level; the structured event
-        // is emitted identically and carries the same provider/channel as ERROR.
-        assert_eq!(downgraded_event.provider.as_deref(), Some("codex"));
-        assert_eq!(downgraded_event.channel_id, Some(7));
     }
 
     #[test]

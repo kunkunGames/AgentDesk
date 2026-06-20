@@ -1,88 +1,36 @@
 use super::*;
 
-/// #3479 Item 3: runtime services/handles/backends consumed by the SharedData
-/// builder. Groups seven former positional args; field names match the original
-/// argument names so the builder body is unchanged after destructuring.
-pub(super) struct RuntimeServices {
-    pub(super) initial_skills: Vec<(String, String)>,
-    pub(super) token_hash: String,
-    pub(super) api_port: u16,
-    pub(super) voice_barge_in: Arc<voice_barge_in::VoiceBargeInRuntime>,
-    pub(super) health_registry: Arc<health::HealthRegistry>,
-    pub(super) pg_pool: Option<sqlx::PgPool>,
-    pub(super) engine: Option<crate::engine::PolicyEngine>,
-}
-
-/// #3479 Item 3: process-wide lifecycle counters shared across all providers
-/// (injected so every provider's `SharedData` shares the same atomics).
-pub(super) struct ProcessLifecycleCounters {
-    pub(super) global_active: Arc<std::sync::atomic::AtomicUsize>,
-    pub(super) global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
-    pub(super) shutdown_remaining: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-/// #3479 Item 3: UI feature gates for the live-placeholder / status-panel surface.
-pub(super) struct UiFeatureFlags {
-    pub(super) placeholder_live_events_enabled: bool,
-    pub(super) status_panel_v2_enabled: bool,
-}
-
-/// #3479 Item 3: session state restored from persisted bot settings. Borrowed
-/// because run_bot reuses these slices for logging + session-reset bootstrap
-/// after the builder returns.
-pub(super) struct RestoredSessionState<'a> {
-    pub(super) model_overrides: &'a [(ChannelId, String)],
-    pub(super) fast_mode_channels: &'a [ChannelId],
-    pub(super) fast_mode_reset_entries: &'a [String],
-    pub(super) fast_mode_reset_channels: &'a [ChannelId],
-    pub(super) codex_goals_channels: &'a [ChannelId],
-    pub(super) codex_goals_reset_channels: &'a [ChannelId],
-}
-
 /// Build all owned `SharedData` fields and wrap in an `Arc`. Side-effecting
 /// initializers (`TurnFinalizer::spawn`,
 /// `runtime_store::load_generation`, `load_queue_exit_placeholder_clears`,
 /// the `inflight_signals` broadcast channel) run here in the exact same order
-/// as the original inline struct literal. `bot_settings`, `services.initial_skills`,
-/// `counters.global_active`, `counters.global_finalizing`, `services.pg_pool`, and
-/// `services.engine` are consumed by move; the `restored.*` slices are borrowed
-/// (they are reused later in run_bot for logging and session-reset bootstrap).
+/// as the original inline struct literal. `bot_settings`, `initial_skills`,
+/// `global_active`, `global_finalizing`, `pg_pool`, and `engine` are consumed
+/// by move; the `restored_*` slices are borrowed (they are reused later in
+/// run_bot for logging and session-reset bootstrap).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_bot_build_shared_data(
     bot_settings: DiscordBotSettings,
+    initial_skills: Vec<(String, String)>,
     provider: &ProviderKind,
-    services: RuntimeServices,
-    counters: ProcessLifecycleCounters,
-    flags: UiFeatureFlags,
-    restored: RestoredSessionState<'_>,
+    token_hash: &str,
+    voice_barge_in: &Arc<voice_barge_in::VoiceBargeInRuntime>,
+    global_active: Arc<std::sync::atomic::AtomicUsize>,
+    global_finalizing: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown_remaining: &Arc<std::sync::atomic::AtomicUsize>,
+    health_registry: &Arc<health::HealthRegistry>,
+    pg_pool: Option<sqlx::PgPool>,
+    engine: Option<crate::engine::PolicyEngine>,
+    api_port: u16,
+    placeholder_live_events_enabled: bool,
+    status_panel_v2_enabled: bool,
+    restored_model_overrides: &[(ChannelId, String)],
+    restored_fast_mode_channels: &[ChannelId],
+    restored_fast_mode_reset_entries: &[String],
+    restored_fast_mode_reset_channels: &[ChannelId],
+    restored_codex_goals_channels: &[ChannelId],
+    restored_codex_goals_reset_channels: &[ChannelId],
 ) -> Arc<SharedData> {
-    // #3479 Item 3: destructure the grouped params back into the original
-    // variable names so the construction body below is byte-identical.
-    let RuntimeServices {
-        initial_skills,
-        token_hash,
-        api_port,
-        voice_barge_in,
-        health_registry,
-        pg_pool,
-        engine,
-    } = services;
-    let ProcessLifecycleCounters {
-        global_active,
-        global_finalizing,
-        shutdown_remaining,
-    } = counters;
-    let UiFeatureFlags {
-        placeholder_live_events_enabled,
-        status_panel_v2_enabled,
-    } = flags;
-    let RestoredSessionState {
-        model_overrides: restored_model_overrides,
-        fast_mode_channels: restored_fast_mode_channels,
-        fast_mode_reset_entries: restored_fast_mode_reset_entries,
-        fast_mode_reset_channels: restored_fast_mode_reset_channels,
-        codex_goals_channels: restored_codex_goals_channels,
-        codex_goals_reset_channels: restored_codex_goals_reset_channels,
-    } = restored;
     Arc::new(SharedData {
         core: Mutex::new(CoreState {
             sessions: HashMap::new(),
@@ -117,7 +65,7 @@ pub(super) fn run_bot_build_shared_data(
                 let map = dashmap::DashMap::new();
                 for (key, placeholder_msg_id) in
                     crate::services::discord::queued_placeholders_store::load_queue_exit_placeholder_clears(
-                        provider, &token_hash,
+                        provider, token_hash,
                     )
                 {
                     map.insert(key, placeholder_msg_id);
@@ -151,19 +99,12 @@ pub(super) fn run_bot_build_shared_data(
             recovery_duration_ms: std::sync::atomic::AtomicU64::new(0),
             global_active,
             global_finalizing,
-            shutdown_remaining,
+            shutdown_remaining: shutdown_remaining.clone(),
             shutdown_counted: std::sync::atomic::AtomicBool::new(false),
         },
         turn_finalizer: crate::services::discord::turn_finalizer::TurnFinalizer::spawn(),
-        // #3479 Item 3: dispatch intake/routing cluster. All three members are
-        // side-effect-free `DashMap::new()` inits, so grouping them at this
-        // first-member position (dispatch_role_overrides moved up from below)
-        // preserves the evaluation order of every side-effecting initializer.
-        dispatch: DispatchRoutingState {
-            intake_dedup: dashmap::DashMap::new(),
-            thread_parents: dashmap::DashMap::new(),
-            role_overrides: dashmap::DashMap::new(),
-        },
+        intake_dedup: dashmap::DashMap::new(),
+        dispatch_thread_parents: dashmap::DashMap::new(),
         bot_connected: std::sync::atomic::AtomicBool::new(false),
         last_turn_at: std::sync::Mutex::new(None),
         // #3038 S2: wrapped verbatim at the first-member position (evaluation-order preserved).
@@ -211,7 +152,8 @@ pub(super) fn run_bot_build_shared_data(
             ),
             model_picker_pending: dashmap::DashMap::new(),
         },
-        voice_barge_in,
+        dispatch_role_overrides: dashmap::DashMap::new(),
+        voice_barge_in: voice_barge_in.clone(),
         voice_pairings: Arc::new(voice_routing::VoiceChannelPairingStore::load_default()),
         last_message_ids: dashmap::DashMap::new(),
         catch_up_retry_pending: dashmap::DashMap::new(),
@@ -221,12 +163,12 @@ pub(super) fn run_bot_build_shared_data(
             cached_serenity_ctx: tokio::sync::OnceCell::new(),
             cached_bot_token: tokio::sync::OnceCell::new(),
         },
-        token_hash,
+        token_hash: token_hash.to_string(),
         provider: provider.clone(),
         api_port,
         pg_pool,
         policy: PolicyRuntime { engine },
-        health_registry: Arc::downgrade(&health_registry),
+        health_registry: Arc::downgrade(health_registry),
         known_slash_commands: tokio::sync::OnceCell::new(),
         // #2448: capacity 256 gives ~hundreds of in-flight turns headroom
         // before a slow listener triggers `RecvError::Lagged`. The standby

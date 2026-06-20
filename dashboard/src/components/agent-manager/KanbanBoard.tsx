@@ -255,7 +255,7 @@ export default function KanbanBoard({
                         <a
                           href={githubIssueUrl}
                           target="_blank"
-                          rel="noopener noreferrer"
+                          rel="noreferrer"
                           className="shrink-0 text-xs hover:underline"
                           onClick={(event) => event.stopPropagation()}
                           style={{ color: "#93c5fd" }}

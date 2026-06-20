@@ -57,14 +57,9 @@ export async function saveVoiceConfig(
 // ── Runtime Config ──
 
 export interface RuntimeConfigResponse {
-  current: RuntimeConfigMap;
-  defaults: RuntimeConfigMap;
-  explicit_keys?: string[];
+  current: Record<string, number>;
+  defaults: Record<string, number>;
 }
-
-export type RuntimeConfigValue = number | string | boolean;
-export type RuntimeConfigMap = Record<string, RuntimeConfigValue>;
-export type RuntimeConfigSaveBody = Record<string, RuntimeConfigValue | string[] | undefined>;
 
 export type EscalationMode = "pm" | "user" | "scheduled";
 
@@ -88,7 +83,7 @@ export async function getRuntimeConfig(): Promise<RuntimeConfigResponse> {
 }
 
 export async function saveRuntimeConfig(
-  patch: RuntimeConfigSaveBody,
+  patch: Record<string, number>,
 ): Promise<{ ok: boolean }> {
   return request("/api/settings/runtime-config", {
     method: "PUT",

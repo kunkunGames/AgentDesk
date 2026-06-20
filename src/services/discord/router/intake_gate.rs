@@ -561,7 +561,7 @@ pub(super) async fn thread_guard_force_clean_stale_thread(
         "  [{ts}] 🔓 THREAD-GUARD: stale inflight detected for thread {}, cleaning up and proceeding",
         thread_id
     );
-    shared.dispatch.thread_parents.remove(&parent_channel_id);
+    shared.dispatch_thread_parents.remove(&parent_channel_id);
     super::super::inflight::delete_inflight_state_file(provider, thread_id.get());
     let cleared = mailbox_clear_channel(shared, provider, thread_id).await;
     super::super::stall_recovery::finalize_orphaned_clear(
@@ -621,11 +621,10 @@ async fn release_queue_blocked_stale_active_turn(
         "1456_queue_blocked_stale_proof",
     );
     shared
-        .dispatch
-        .thread_parents
+        .dispatch_thread_parents
         .retain(|_, thread_id| *thread_id != channel_id);
     if !finish.has_pending {
-        shared.dispatch.role_overrides.remove(&channel_id);
+        shared.dispatch_role_overrides.remove(&channel_id);
     }
     true
 }
@@ -1722,7 +1721,7 @@ pub(in crate::services::discord) async fn handle_event(
                             )
                             .is_ok()
                     {
-                        data.shared.dispatch.intake_dedup.retain(|k, v| {
+                        data.shared.intake_dedup.retain(|k, v| {
                             if k.starts_with("mid:") {
                                 now.duration_since(v.0) < MSG_DEDUP_TTL
                             } else {
@@ -1748,7 +1747,7 @@ pub(in crate::services::discord) async fn handle_event(
                 // `is_allowed_bot`. We trust the mailbox as the source
                 // of truth.
                 let mut thread_promotion_blocked = false;
-                let is_dup = match data.shared.dispatch.intake_dedup.entry(key.clone()) {
+                let is_dup = match data.shared.intake_dedup.entry(key.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(mut e) => {
                         let (ts, was_thread) = *e.get();
                         if now.duration_since(ts) >= MSG_DEDUP_TTL {
@@ -2006,7 +2005,6 @@ pub(in crate::services::discord) async fn handle_event(
             if is_allowed_bot_sender
                 && !super::super::is_allowed_turn_sender(
                     &settings_snapshot.allowed_bot_ids,
-                    announce_bot_id,
                     user_id.get(),
                     new_message.author.bot,
                     raw_text,
@@ -2225,7 +2223,7 @@ pub(in crate::services::discord) async fn handle_event(
                 // Lazy cleanup: remove expired bot-specific entries.
                 // Skip mid:* entries — they use a longer TTL and are cleaned
                 // separately in the universal dedup section above.
-                data.shared.dispatch.intake_dedup.retain(|k, v| {
+                data.shared.intake_dedup.retain(|k, v| {
                     if k.starts_with("mid:") {
                         true // preserved; cleaned by universal dedup cleanup
                     } else {
@@ -2235,8 +2233,7 @@ pub(in crate::services::discord) async fn handle_event(
 
                 // Atomic check+insert via entry() — holds shard lock so two
                 // simultaneous arrivals cannot both see a miss.
-                let is_duplicate = match data.shared.dispatch.intake_dedup.entry(dedup_key.clone())
-                {
+                let is_duplicate = match data.shared.intake_dedup.entry(dedup_key.clone()) {
                     dashmap::mapref::entry::Entry::Occupied(e) => {
                         now.duration_since(e.get().0) < INTAKE_DEDUP_TTL
                     }
@@ -2278,8 +2275,7 @@ pub(in crate::services::discord) async fn handle_event(
                 // RwLock. The narrow scope below releases the ref at the `}`.
                 let thread_id_opt = {
                     data.shared
-                        .dispatch
-                        .thread_parents
+                        .dispatch_thread_parents
                         .get(&channel_id)
                         .map(|entry| *entry.value())
                 };
@@ -2374,7 +2370,7 @@ pub(in crate::services::discord) async fn handle_event(
                         }
                     } else {
                         // Thread turn finished — clean up stale mapping
-                        data.shared.dispatch.thread_parents.remove(&channel_id);
+                        data.shared.dispatch_thread_parents.remove(&channel_id);
                     }
                 }
             }

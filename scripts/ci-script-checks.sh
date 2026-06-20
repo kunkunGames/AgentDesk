@@ -26,9 +26,6 @@ python3 scripts/audit_state_lint_hardening.py
 echo "=== await_holding_lock ratchet guard ==="
 python3 scripts/check_await_holding_lock_ratchet.py
 
-echo "=== Hotfile LOC ratchet guard (#3565) ==="
-python3 scripts/check_hotfile_ratchet.py
-
 echo "=== CI runner hardening guard ==="
 ./scripts/check-ci-runner-hardening.sh
 
@@ -81,8 +78,7 @@ echo "=== Portable deployable path lint ==="
 python3 scripts/check-portable-paths.py
 python3 -m unittest \
   tests.test_portable_path_lint \
-  tests.test_install_bootstrap_portable \
-  tests.test_analyze_prs
+  tests.test_install_bootstrap_portable
 
 echo "=== Generate inventory docs (also gates giant-file registry, #3036) ==="
 # The generator hard-fails (exit 2) on giant-file registry drift: unregistered

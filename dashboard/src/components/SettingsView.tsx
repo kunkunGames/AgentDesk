@@ -6,7 +6,7 @@ import type {
   VoiceGlobalConfig,
 } from "../types";
 import * as api from "../api";
-import type { OperatorConnectorsResponse, RuntimeConfigMap, RuntimeConfigValue } from "../api";
+import type { OperatorConnectorsResponse } from "../api";
 import { STORAGE_KEYS } from "../lib/storageKeys";
 import { writeLocalStorageValue } from "../lib/useLocalStorage";
 import { SurfaceEmptyState as SettingsEmptyState } from "./common/SurfacePrimitives";
@@ -54,9 +54,8 @@ export default function SettingsView({
   const [theme, setTheme] = useState(settings.theme);
   const [saving, setSaving] = useState(false);
 
-  const [rcValues, setRcValues] = useState<RuntimeConfigMap>({});
-  const [rcDefaults, setRcDefaults] = useState<RuntimeConfigMap>({});
-  const [rcExplicitKeys, setRcExplicitKeys] = useState<Set<string>>(() => new Set());
+  const [rcValues, setRcValues] = useState<Record<string, number>>({});
+  const [rcDefaults, setRcDefaults] = useState<Record<string, number>>({});
   const [rcLoaded, setRcLoaded] = useState(false);
   const [rcSaving, setRcSaving] = useState(false);
   const [rcDirty, setRcDirty] = useState(false);
@@ -182,7 +181,6 @@ export default function SettingsView({
       .then((data) => {
         setRcValues(data?.current ?? {});
         setRcDefaults(data?.defaults ?? {});
-        setRcExplicitKeys(new Set(data?.explicit_keys ?? []));
         setRcLoaded(true);
       })
       .catch(() => {
@@ -327,10 +325,7 @@ export default function SettingsView({
   const handleRcSave = async () => {
     setRcSaving(true);
     try {
-      await api.saveRuntimeConfig({
-        ...rcValues,
-        __runtimeConfigExplicitKeys: Array.from(rcExplicitKeys).sort(),
-      });
+      await api.saveRuntimeConfig(rcValues);
       setRcDirty(false);
       notify("런타임 설정을 저장했습니다.", "Saved runtime settings.", "success");
     } catch {
@@ -340,24 +335,14 @@ export default function SettingsView({
     }
   };
 
-  const handleRcChange = (key: string, value: RuntimeConfigValue) => {
+  const handleRcChange = (key: string, value: number) => {
     setRcValues((prev) => ({ ...prev, [key]: value }));
-    setRcExplicitKeys((prev) => {
-      const next = new Set(prev);
-      next.add(key);
-      return next;
-    });
     setRcDirty(true);
   };
 
   const handleRcReset = (key: string) => {
     if (rcDefaults[key] !== undefined) {
       setRcValues((prev) => ({ ...prev, [key]: rcDefaults[key] }));
-      setRcExplicitKeys((prev) => {
-        const next = new Set(prev);
-        next.delete(key);
-        return next;
-      });
       setRcDirty(true);
     }
   };
@@ -495,7 +480,7 @@ export default function SettingsView({
         setTheme(value as typeof theme);
         return;
       }
-      if (Object.prototype.hasOwnProperty.call(rcDefaults, key)) {
+      if (rcDefaults[key] !== undefined && typeof value === "number") {
         handleRcChange(key, value);
         return;
       }
