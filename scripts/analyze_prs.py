@@ -148,13 +148,9 @@ def main():
             print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
         if not has_duplicate_guard_ack(body):
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
-        # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
-        is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
-        is_no_change = "no-change" in title.lower()
-
-        if is_no_change and not has_no_change_verification_ack(body):
+        if not has_no_change_verification_ack(body):
             print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
-        if is_stale and not has_stale_branch_cleanup_ack(body):
+        if not has_stale_branch_cleanup_ack(body):
             print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
@@ -166,6 +162,9 @@ def main():
             print("  [!] MISSING RISK: PR body fails to mention 'risk' assessment.")
         if not has_non_empty_body_field(body, ["rollback notes", "rollback"]):
             print("  [!] MISSING ROLLBACK NOTES: PR body fails to mention 'rollback notes'.")
+
+        # 2026-05-13 lesson: treat low-signal or stale broad branches as queue debt
+        is_stale = head_commit_at is not None and (now - head_commit_at) > timedelta(days=14)
 
         # Get diff stat
         stat, _ = run(f"gh pr diff {num} --repo {repo} --stat")
