@@ -77,8 +77,8 @@
 | `compat` | `src/compat/mod.rs` | 39 | 39 | 0 |  |
 | `compat::legacy_db_paths` | `src/compat/legacy_db_paths.rs` | 12 | 12 | 0 |  |
 | `compat::legacy_tmp_paths` | `src/compat/legacy_tmp_paths.rs` | 27 | 27 | 0 |  |
-| `config` | `src/config.rs` | 2655 | 2447 | 208 | giant-file |
-| `config_live_reload` | `src/config_live_reload.rs` | 342 | 263 | 79 |  |
+| `config` | `src/config.rs` | 2657 | 2449 | 208 | giant-file |
+| `config_live_reload` | `src/config_live_reload.rs` | 413 | 293 | 120 |  |
 | `crate` | `src/main.rs` | 7 | 7 | 0 |  |
 | `credential` | `src/credential.rs` | 212 | 59 | 153 |  |
 | `db` | `src/db/mod.rs` | 137 | 137 | 0 |  |
@@ -315,7 +315,7 @@
 | `services::auto_queue::dispatch_assignment_command` | `src/services/auto_queue/dispatch_assignment_command.rs` | 101 | 101 | 0 |  |
 | `services::auto_queue::dispatch_command` | `src/services/auto_queue/dispatch_command.rs` | 908 | 908 | 0 |  |
 | `services::auto_queue::dispatch_query` | `src/services/auto_queue/dispatch_query.rs` | 93 | 93 | 0 |  |
-| `services::auto_queue::fsm` | `src/services/auto_queue/fsm.rs` | 693 | 693 | 0 |  |
+| `services::auto_queue::fsm` | `src/services/auto_queue/fsm.rs` | 714 | 694 | 20 |  |
 | `services::auto_queue::order_routes` | `src/services/auto_queue/order_routes.rs` | 270 | 270 | 0 |  |
 | `services::auto_queue::phase_gate` | `src/services/auto_queue/phase_gate.rs` | 543 | 543 | 0 |  |
 | `services::auto_queue::phase_gate_catalog` | `src/services/auto_queue/phase_gate_catalog.rs` | 104 | 68 | 36 |  |
@@ -675,7 +675,7 @@
 | `services::dispatches::wait_queue` | `src/services/dispatches/wait_queue.rs` | 588 | 369 | 219 |  |
 | `services::dispatches_followup` | `src/services/dispatches_followup.rs` | 66 | 66 | 0 |  |
 | `services::envelope_dedup` | `src/services/envelope_dedup.rs` | 295 | 195 | 100 |  |
-| `services::escalation_settings` | `src/services/escalation_settings.rs` | 113 | 113 | 0 |  |
+| `services::escalation_settings` | `src/services/escalation_settings.rs` | 122 | 122 | 0 |  |
 | `services::gemini` | `src/services/gemini.rs` | 1389 | 1358 | 31 | giant-file |
 | `services::git` | `src/services/git/mod.rs` | 33 | 33 | 0 |  |
 | `services::git::branch_resolver` | `src/services/git/branch_resolver.rs` | 123 | 123 | 0 |  |
