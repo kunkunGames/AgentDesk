@@ -82,7 +82,7 @@
 | `crate` | `src/main.rs` | 7 | 7 | 0 |  |
 | `credential` | `src/credential.rs` | 212 | 59 | 153 |  |
 | `db` | `src/db/mod.rs` | 137 | 137 | 0 |  |
-| `db::agents` | `src/db/agents.rs` | 312 | 234 | 78 |  |
+| `db::agents` | `src/db/agents.rs` | 339 | 244 | 95 |  |
 | `db::auto_queue` | `src/db/auto_queue/mod.rs` | 21 | 21 | 0 |  |
 | `db::auto_queue::claim` | `src/db/auto_queue/claim.rs` | 699 | 699 | 0 |  |
 | `db::auto_queue::consultation` | `src/db/auto_queue/consultation.rs` | 112 | 112 | 0 |  |
@@ -376,7 +376,7 @@
 | `services::codex_tui::session` | `src/services/codex_tui/session.rs` | 530 | 197 | 333 |  |
 | `services::discord` | `src/services/discord/mod.rs` | 4928 | 4111 | 817 | giant-file |
 | `services::discord::adk_session` | `src/services/discord/adk_session.rs` | 980 | 854 | 126 |  |
-| `services::discord::agent_handoff` | `src/services/discord/agent_handoff.rs` | 758 | 524 | 234 |  |
+| `services::discord::agent_handoff` | `src/services/discord/agent_handoff.rs` | 844 | 544 | 300 |  |
 | `services::discord::agentdesk_config` | `src/services/discord/agentdesk_config.rs` | 1057 | 956 | 101 |  |
 | `services::discord::answer_flush_barrier` | `src/services/discord/answer_flush_barrier.rs` | 511 | 209 | 302 |  |
 | `services::discord::catch_up` | `src/services/discord/catch_up.rs` | 851 | 735 | 116 |  |
