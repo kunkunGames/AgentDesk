@@ -148,10 +148,6 @@ def main():
             print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
         if not has_duplicate_guard_ack(body):
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
-        if not has_no_change_verification_ack(body):
-            print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
-        if not has_stale_branch_cleanup_ack(body):
-            print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if "verification" not in normalized_body:
@@ -172,9 +168,13 @@ def main():
 
         if is_stale:
             print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
+            if not has_stale_branch_cleanup_ack(body):
+                print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
 
         # PR #214/#215 lesson: no-change PRs must have 0 changed files
         if "no-change" in title.lower():
+            if not has_no_change_verification_ack(body):
+                print("  [!] MISSING NO-CHANGE VERIFICATION CHECK: PR body lacks a completed no-change verification acknowledgement.")
             files_json, _ = run(f"gh pr view {num} --repo {repo} --json files")
             try:
                 files_data = json.loads(files_json)
