@@ -688,6 +688,31 @@ mod tests {
     }
 
     #[test]
+    fn handoff_turn_target_keeps_codex_for_primary_only_binding() {
+        // Regression (#3556 P1): a Codex agent bound ONLY via discord_channel_id
+        // (no cdx/alt mailbox) must still resolve to the Codex provider. The
+        // earlier fallback derived Claude — codex_channel() found nothing, so
+        // resolution slid to the Claude counterpart aliasing the same primary
+        // channel — reserving a Claude turn on a Codex mailbox.
+        let codex = AgentChannelBindings {
+            provider: Some("codex".to_string()),
+            discord_channel_id: Some("1495040912361914399".to_string()),
+            ..AgentChannelBindings::default()
+        };
+        let target = resolve_agent_handoff_turn_target(
+            &codex,
+            "from",
+            "to",
+            "prompt",
+            AgentHandoffChannelKind::Cc,
+            true,
+        )
+        .expect("codex primary-only binding resolves");
+        assert_eq!(target.channel_id, "1495040912361914399");
+        assert_eq!(target.provider, ProviderKind::Codex);
+    }
+
+    #[test]
     fn handoff_turn_target_reaches_opencode_mailbox() {
         // opencode/gemini/qwen agents expose neither cc nor cdx; their mailbox
         // is discord_channel_id. Any requested kind must resolve there with the
