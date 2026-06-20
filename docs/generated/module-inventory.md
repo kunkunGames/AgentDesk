@@ -306,7 +306,7 @@
 | `services::api_friction::patterns` | `src/services/api_friction/patterns.rs` | 154 | 154 | 0 |  |
 | `services::api_friction::storage` | `src/services/api_friction/storage.rs` | 278 | 278 | 0 |  |
 | `services::auto_queue` | `src/services/auto_queue.rs` | 1817 | 1546 | 271 | giant-file |
-| `services::auto_queue::activate_command` | `src/services/auto_queue/activate_command.rs` | 1487 | 1457 | 30 | giant-file |
+| `services::auto_queue::activate_command` | `src/services/auto_queue/activate_command.rs` | 1484 | 1454 | 30 | giant-file |
 | `services::auto_queue::activate_preflight` | `src/services/auto_queue/activate_preflight.rs` | 199 | 199 | 0 |  |
 | `services::auto_queue::activate_route` | `src/services/auto_queue/activate_route.rs` | 19 | 19 | 0 |  |
 | `services::auto_queue::cancel_run` | `src/services/auto_queue/cancel_run.rs` | 1032 | 1032 | 0 | giant-file |
