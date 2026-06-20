@@ -62,7 +62,7 @@
 | `src/server/routes/resume.rs` | 1260 |
 | `src/server/routes/v1.rs` | 1857 |
 | `src/services/auto_queue.rs` | 1546 |
-| `src/services/auto_queue/activate_command.rs` | 1457 |
+| `src/services/auto_queue/activate_command.rs` | 1454 |
 | `src/services/auto_queue/cancel_run.rs` | 1032 |
 | `src/services/claude.rs` | 2963 |
 | `src/services/claude_tui/input.rs` | 1636 |
