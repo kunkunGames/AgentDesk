@@ -1299,11 +1299,12 @@
     relocated the `require_explicit_bearer_token` /
     `resolve_requesting_agent_id_with_pg` auth/identity helpers to
     `crate::services::kanban`).
-  - `src/server/routes/docs.rs` (5940 lines; +40 from #3556 documenting
+  - `src/server/routes/docs.rs` (5956 lines; +40 from #3556 documenting
     the agent-to-agent turn-trigger handoff endpoint `/api/agents/{id}/handoff`
-    paired example + 409 conflict error example + curl).
+    paired example + 409 conflict error example + curl; +16 documenting the
+    `expect_reply` reply-expectation param on /message and /handoff).
   - `src/server/routes/escalation.rs` (1376 lines).
-  - `src/server/routes/meetings.rs` (1675 lines).
+  - `src/server/routes/meetings.rs` (1266 lines; SQL extracted to `src/db/meetings.rs` in #3570 slice 1).
   - `src/server/routes/review_verdict/decision_route.rs` was decomposed in
     #3038 slice 1 and S1-relocated into a 26-line route shim delegating to
     `src/services/review_decision.rs` plus sub-1000-line service modules under
@@ -1363,8 +1364,8 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2449 lines).
-  - `src/server/mod.rs` (2593 lines; +6 from #3557 (A) long_turn_watchdog spawn).
+  - `src/config.rs` (2458 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +6 from #3557 (A) long_turn_watchdog spawn is included in this baseline).
+  - `src/server/mod.rs` (2635 lines; +42 from #3573 auto-resume tick + backoff-race fix + #3628 dormancy note; +6 from #3557 (A) long_turn_watchdog spawn is included in this baseline).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
   - `src/reconcile.rs` (1816 lines; periodic reconcile loop covering stale
