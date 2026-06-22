@@ -247,8 +247,8 @@
 | `POST` | `/api/routines/{id}/resume` | `routines::resume_routine` | `src/server/routes/routines.rs:376` | `src/server/routes/domains/ops.rs:235` |
 | `POST` | `/api/routines/{id}/run-now` | `routines::run_routine_now` | `src/server/routes/routines.rs:439` | `src/server/routes/domains/ops.rs:237` |
 | `GET` | `/api/routines/{id}/runs` | `routines::list_routine_runs` | `src/server/routes/routines.rs:239` | `src/server/routes/domains/ops.rs:233` |
-| `POST` | `/api/routines/{id}/session/kill` | `routines::kill_routine_session` | `src/server/routes/routines.rs:570` | `src/server/routes/domains/ops.rs:242` |
-| `POST` | `/api/routines/{id}/session/reset` | `routines::reset_routine_session` | `src/server/routes/routines.rs:563` | `src/server/routes/domains/ops.rs:238` |
+| `POST` | `/api/routines/{id}/session/kill` | `routines::kill_routine_session` | `src/server/routes/routines.rs:572` | `src/server/routes/domains/ops.rs:242` |
+| `POST` | `/api/routines/{id}/session/reset` | `routines::reset_routine_session` | `src/server/routes/routines.rs:565` | `src/server/routes/domains/ops.rs:238` |
 | `GET` | `/api/session-termination-events` | `termination_events::list_termination_events` | `src/server/routes/termination_events.rs:23` | `src/server/routes/domains/ops.rs:203` |
 | `GET` | `/api/sessions` | `agents_crud::list_sessions` | `src/server/routes/agents_crud.rs:1831` | `src/server/routes/domains/agents.rs:51` |
 | `GET` | `/api/sessions/{id}/tmux-output` | `dispatched_sessions::tmux_output` | `src/server/routes/dispatched_sessions.rs:93` | `src/server/routes/domains/ops.rs:199` |

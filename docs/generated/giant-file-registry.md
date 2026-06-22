@@ -14,7 +14,7 @@
 | `src/db/automation_candidates.rs` | 1003 | automation-pipeline | 2026-08-31 | #3405 |
 | `src/services/discord/session_relay_sink.rs` | 1738 | discord-relay | 2026-08-31 | #3405 |
 | `src/services/discord/tui_direct_pending_start.rs` | 1030 | discord-relay | 2026-08-31 | #3540 |
-| `src/services/discord/turn_bridge/mod.rs` | 6175 | discord-relay | 2026-08-31 | #3038 |
+| `src/services/discord/turn_bridge/mod.rs` | 6241 | discord-relay | 2026-08-31 | #3038 |
 | `src/services/discord/turn_finalizer.rs` | 1335 | discord-finalizer | 2026-08-31 | #3016 |
 | `src/services/discord/voice_barge_in.rs` | 2823 | voice-runtime | 2026-08-31 | #3405 |
 | `src/voice/announce_meta.rs` | 1001 | voice-runtime | 2026-08-31 | #3405 |
@@ -50,7 +50,7 @@
 | `src/pipeline.rs` | 1366 |
 | `src/receipt.rs` | 1842 |
 | `src/reconcile.rs` | 1816 |
-| `src/server/mod.rs` | 2635 |
+| `src/server/mod.rs` | 2634 |
 | `src/server/routes/agents.rs` | 1182 |
 | `src/server/routes/agents_crud.rs` | 1903 |
 | `src/server/routes/agents_setup.rs` | 1365 |
@@ -65,17 +65,17 @@
 | `src/services/auto_queue/activate_command.rs` | 1506 |
 | `src/services/auto_queue/cancel_run.rs` | 1032 |
 | `src/services/claude.rs` | 2963 |
-| `src/services/claude_tui/input.rs` | 1636 |
+| `src/services/claude_tui/input.rs` | 1656 |
 | `src/services/codex.rs` | 3011 |
 | `src/services/codex_tmux_wrapper.rs` | 1403 |
 | `src/services/codex_tui/input.rs` | 1366 |
 | `src/services/codex_tui/rollout_tail.rs` | 1768 |
 | `src/services/discord/commands/text_commands.rs` | 1490 |
 | `src/services/discord/formatting.rs` | 2802 |
-| `src/services/discord/health/recovery.rs` | 2637 |
-| `src/services/discord/inflight.rs` | 2660 |
+| `src/services/discord/health/recovery.rs` | 2722 |
+| `src/services/discord/inflight.rs` | 2771 |
 | `src/services/discord/meeting_orchestrator.rs` | 3222 |
-| `src/services/discord/mod.rs` | 4101 |
+| `src/services/discord/mod.rs` | 4102 |
 | `src/services/discord/recovery_engine.rs` | 3397 |
 | `src/services/discord/router/intake_gate.rs` | 2986 |
 | `src/services/discord/router/message_handler/headless_turn.rs` | 1469 |
@@ -96,9 +96,9 @@
 | `src/services/platform/binary_resolver.rs` | 1221 |
 | `src/services/provider.rs` | 1818 |
 | `src/services/qwen.rs` | 2196 |
-| `src/services/routines/agent_executor.rs` | 1973 |
+| `src/services/routines/agent_executor.rs` | 2021 |
 | `src/services/routines/discord_log.rs` | 1589 |
-| `src/services/routines/store.rs` | 3444 |
+| `src/services/routines/store.rs` | 3453 |
 | `src/services/settings.rs` | 1114 |
 | `src/services/tui_prompt_dedupe.rs` | 1613 |
 | `src/services/turn_orchestrator.rs` | 3089 |
