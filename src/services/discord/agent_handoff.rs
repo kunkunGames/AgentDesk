@@ -762,7 +762,6 @@ mod tests {
             "prompt",
             AgentHandoffChannelKind::Cc,
             true,
-            None,
         )
         .expect("codex primary-only binding resolves");
         assert_eq!(target.channel_id, "1495040912361914399");
@@ -786,7 +785,6 @@ mod tests {
             "prompt",
             AgentHandoffChannelKind::Cdx,
             true,
-            None,
         )
         .expect("opencode mailbox resolves via primary channel");
         assert_eq!(target.channel_id, "1495040912361914398");
@@ -803,7 +801,6 @@ mod tests {
             "prompt",
             AgentHandoffChannelKind::Cc,
             true,
-            None,
         )
         .unwrap_err();
         assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
