@@ -146,6 +146,18 @@ def main():
         # Check PR hygiene requirements
         if "workfingerprint" not in normalized_body:
             print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
+        if not has_non_empty_body_field(body, ["agent"]):
+            print("  [!] MISSING AGENT: PR body lacks the required 'Agent' field.")
+        if not has_non_empty_body_field(body, ["boundary"]):
+            print("  [!] MISSING BOUNDARY: PR body lacks the required 'Boundary' field.")
+        if not has_non_empty_body_field(body, ["primary files"]):
+            print("  [!] MISSING PRIMARY FILES: PR body lacks the required 'Primary files' field.")
+        if not has_non_empty_body_field(body, ["queue hygiene invariant"]):
+            print("  [!] MISSING QUEUE HYGIENE INVARIANT: PR body lacks the required 'Queue hygiene invariant' field.")
+        if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs"]):
+            print("  [!] MISSING RELATED PRS: PR body lacks the required 'Related PRs/issues checked' field.")
+        if not has_non_empty_body_field(body, ["why this is non-overlapping", "non-overlapping reason"]):
+            print("  [!] MISSING NON-OVERLAPPING REASON: PR body lacks the required 'Why this is non-overlapping' field.")
         if not has_duplicate_guard_ack(body):
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
