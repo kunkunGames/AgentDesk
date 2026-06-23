@@ -870,6 +870,62 @@ pub(in crate::services::discord) fn save_inflight_state_if_matches_identity(
     )
 }
 
+pub(in crate::services::discord) fn set_relay_owner_kind_if_matches_identity(
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    relay_owner_kind: RelayOwnerKind,
+) -> GuardedSaveOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    let path = inflight_state_path(&root, provider, channel_id);
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return GuardedSaveOutcome::IoError;
+        }
+    }
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedSaveOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedSaveOutcome::Missing;
+    };
+    let Ok(mut on_disk) = serde_json::from_str::<InflightTurnState>(&data) else {
+        return GuardedSaveOutcome::IdentityMismatch;
+    };
+    if on_disk.restart_mode.is_some() || on_disk.rebind_origin {
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    if expected.user_msg_id == 0 || !expected.matches_state(&on_disk) {
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
+    if let Some(expected_offset) = expected_turn_start_offset {
+        if on_disk.turn_start_offset != Some(expected_offset) {
+            return GuardedSaveOutcome::IdentityMismatch;
+        }
+    }
+    on_disk.set_relay_owner_kind(relay_owner_kind);
+    on_disk.updated_at = now_string();
+    let Ok(json) = serde_json::to_string_pretty(&on_disk) else {
+        return GuardedSaveOutcome::IoError;
+    };
+    match atomic_write(&path, &json) {
+        Ok(()) => GuardedSaveOutcome::Saved,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                expected_user_msg_id = expected.user_msg_id,
+                error = %error,
+                "inflight relay-owner update failed; leaving on-disk row untouched"
+            );
+            GuardedSaveOutcome::IoError
+        }
+    }
+}
+
 /// Root-explicit inner form of [`save_inflight_state_if_matches_identity`] for
 /// unit tests (avoids `AGENTDESK_ROOT_DIR` env-var races).
 pub(super) fn save_inflight_state_if_matches_identity_in_root(

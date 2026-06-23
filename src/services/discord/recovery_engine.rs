@@ -3531,16 +3531,28 @@ pub(crate) async fn rebind_inflight_for_channel(
     // Validate provider↔channel binding against the settings snapshot,
     // mirroring what `restore_inflight_turns` requires for watcher revival.
     let settings_snapshot = shared.settings.read().await.clone();
+    let channel_lookup_timeout = std::time::Duration::from_secs(5);
     let is_dm = matches!(
-        discord_channel_id.to_channel(http).await,
-        Ok(serenity::model::channel::Channel::Private(_))
+        tokio::time::timeout(channel_lookup_timeout, discord_channel_id.to_channel(http)).await,
+        Ok(Ok(serenity::model::channel::Channel::Private(_)))
     );
-    let (allowlist_channel_id, provider_channel_name) =
-        if let Some((pid, pname)) = super::resolve_thread_parent(http, discord_channel_id).await {
-            (pid, pname.or(channel_name.clone()))
-        } else {
+    let (allowlist_channel_id, provider_channel_name) = match tokio::time::timeout(
+        channel_lookup_timeout,
+        super::resolve_thread_parent(http, discord_channel_id),
+    )
+    .await
+    {
+        Ok(Some((pid, pname))) => (pid, pname.or(channel_name.clone())),
+        Ok(None) => (discord_channel_id, channel_name.clone()),
+        Err(_) => {
+            tracing::warn!(
+                channel_id,
+                provider = provider.as_str(),
+                "rebind channel metadata lookup timed out; falling back to direct channel validation",
+            );
             (discord_channel_id, channel_name.clone())
-        };
+        }
+    };
     if validate_bot_channel_routing_with_provider_channel(
         &settings_snapshot,
         provider,
@@ -3622,7 +3634,25 @@ pub(crate) async fn rebind_inflight_for_channel(
         synthetic_initial_offset
     };
 
-    let recovered_state_for_session = if let Some(existing) = existing_inflight.clone() {
+    let recovered_state_for_session = if let Some(mut existing) = existing_inflight.clone() {
+        let expected = super::inflight::InflightTurnIdentity::from_state(&existing);
+        let expected_turn_start_offset = existing.turn_start_offset;
+        existing.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
+        let save_outcome = super::inflight::set_relay_owner_kind_if_matches_identity(
+            provider,
+            existing.channel_id,
+            &expected,
+            expected_turn_start_offset,
+            super::inflight::RelayOwnerKind::Watcher,
+        );
+        if !matches!(save_outcome, super::inflight::GuardedSaveOutcome::Saved) {
+            tracing::warn!(
+                channel_id,
+                tmux_session = %tmux_session_name,
+                ?save_outcome,
+                "rebind could not stamp existing inflight as watcher-owned",
+            );
+        }
         existing
     } else {
         // Build and persist the new inflight state. No request_owner / msg_ids

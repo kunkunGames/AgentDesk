@@ -24,7 +24,7 @@ fn can_resume_existing_rebind_inflight(state: &inflight::InflightTurnState) -> b
         && state.request_owner_user_id != 0
         && state.user_msg_id != 0
         && state.current_msg_id != 0
-        && state.full_response.trim().is_empty()
+        && !state.terminal_delivery_committed
         && state.last_watcher_relayed_offset.is_none()
 }
 
