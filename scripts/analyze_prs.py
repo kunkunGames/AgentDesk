@@ -144,6 +144,10 @@ def main():
         print(f"\n# {num} - {title}")
 
         # Check PR hygiene requirements
+        if not has_non_empty_body_field(body, ["what changed"]):
+            print("  [!] MISSING WHAT CHANGED: PR body lacks a required 'What changed' description.")
+        if not has_non_empty_body_field(body, ["why"]):
+            print("  [!] MISSING WHY: PR body lacks a required 'Why' description.")
         if "workfingerprint" not in normalized_body:
             print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
         if not has_duplicate_guard_ack(body):
