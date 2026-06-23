@@ -993,7 +993,7 @@
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2637 lines; +3 from #3479 item-3 `shared.dispatch.<field>` nesting; health recovery
+  - `src/services/discord/health/recovery.rs` (2722 lines; +85 from #3629 NO_REPLY/empty orphan inflight identity-guarded cleanup in the completed-stale leak detection path; +3 from #3479 item-3 `shared.dispatch.<field>` nesting; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests; +88
     from #3169 stall-watchdog jsonl-mtime liveness guard + tests, closing the
@@ -1045,7 +1045,7 @@
     clusters into `tmux_runtime/` child modules (`interrupt_policy.rs`,
     `process_table.rs`, `pid_exit.rs` — see their entries below); no longer a
     giant-file. Bugfix only outside a further extraction plan).
-  - `src/services/discord/turn_bridge/mod.rs` (6162 prod lines; the BRIDGE
+  - `src/services/discord/turn_bridge/mod.rs` (6241 lines; production LoC; the BRIDGE
     spawn/turn-lifecycle surface — `spawn_turn_bridge` and the per-channel
     turn loop. #3479 extracted the task/session-panel line rendering +
     active-placeholder-card helpers into the `panel_lifecycle.rs` leaf.
@@ -1070,7 +1070,17 @@
     into `streaming_edit_text.rs` and the watcher-orphan spinner-cleanup
     decision + retry-spawn helpers into `watcher_orphan_cleanup.rs` (both
     re-exported, call sites byte-identical).
+    #3607 adds only the TimedOut+committed terminal-UI obligation hook in the
+    hot branch; the durable sidecar store + isolated sweeper live in
+    `terminal_ui_obligation.rs`. It edits only the turn's status card and does
+    not touch body delivery, offset authority, or `delivery_record.rs`.
     Hotfile — bugfix only outside the #3038 decompose plan).
+  - `src/services/discord/terminal_ui_obligation.rs` (545 prod LoC; #3607
+    worker-local durable terminal-UI obligation sidecar store plus isolated
+    status-card reconciliation sweeper. The file owns
+    `discord_terminal_ui_obligations/<provider>/<channel_id>.json`, pure
+    record/reconcile predicates, and boot-resumed status-card edit convergence.
+    It is below the giant-file threshold).
   - `src/services/discord/turn_bridge/cancel_finalize_policy.rs` (131 prod
     lines; pure cancel/finalize-policy decisions extracted from `mod.rs` by
     #3479: `classify_turn_finished_dispatch_kind`,
@@ -1241,8 +1251,8 @@
     `giant-file-registry.md` (owner `automation-pipeline`, deadline
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
-    discord_config_audit.rs, router/intake_gate.rs, inflight.rs}`
-    (all 1000+ production lines).
+    discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
+    lines) and `src/services/discord/inflight.rs` (2771 lines).
 - active_callsite_coverage: n/a.
 - invariants: watcher single-owner per #1222; placeholder lifecycle invariants
   per #1112; `/api/inflight/rebind` is the only path that synthesises an
@@ -1299,11 +1309,12 @@
     relocated the `require_explicit_bearer_token` /
     `resolve_requesting_agent_id_with_pg` auth/identity helpers to
     `crate::services::kanban`).
-  - `src/server/routes/docs.rs` (5940 lines; +40 from #3556 documenting
+  - `src/server/routes/docs.rs` (5956 lines; +40 from #3556 documenting
     the agent-to-agent turn-trigger handoff endpoint `/api/agents/{id}/handoff`
-    paired example + 409 conflict error example + curl).
+    paired example + 409 conflict error example + curl; +16 documenting the
+    `expect_reply` reply-expectation param on /message and /handoff).
   - `src/server/routes/escalation.rs` (1376 lines).
-  - `src/server/routes/meetings.rs` (1675 lines).
+  - `src/server/routes/meetings.rs` (1266 lines; SQL extracted to `src/db/meetings.rs` in #3570 slice 1).
   - `src/server/routes/review_verdict/decision_route.rs` was decomposed in
     #3038 slice 1 and S1-relocated into a 26-line route shim delegating to
     `src/services/review_decision.rs` plus sub-1000-line service modules under
@@ -1363,8 +1374,8 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2449 lines).
-  - `src/server/mod.rs` (2593 lines; +6 from #3557 (A) long_turn_watchdog spawn).
+  - `src/config.rs` (2460 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +6 from #3557 (A) long_turn_watchdog spawn is included in this baseline).
+  - `src/server/mod.rs` (2634 lines; +42 from #3573 auto-resume tick + backoff-race fix + #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; +6 from #3557 (A) long_turn_watchdog spawn is included in this baseline).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
   - `src/reconcile.rs` (1816 lines; periodic reconcile loop covering stale
@@ -1473,12 +1484,13 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   detector and prompt delivery surface (#2399 hardened the post-turn
   handoff deadline). Treat as giant-file territory; split before adding
   non-bugfix behavior beyond the readiness/cancel contract.
-- `src/services/claude_tui/input.rs` (1636) — Claude TUI input readiness
+- `src/services/claude_tui/input.rs` (1656) — Claude TUI input readiness
   detector, prompt delivery, and cancellation/offset handoff surface. Treat as
   giant-file territory; split before adding non-bugfix behavior beyond the
   readiness/cancel contract. (+191 from the #685/#720 reliability fixes:
   startup-dialog auto-dismiss and keeping the follow-up readiness wait alive
-  while the prior turn streams.)
+  while the prior turn streams; +20 from #3637 centralizing post-paste error
+  cleanup and making draft clearing cancel-agnostic.)
 - `src/services/memory/memento.rs` (1893).
 - `src/services/dispatched_sessions.rs` (1328) — dispatched session domain
   service. This is the post-#1515 SRP extraction target for route/database
