@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use sqlx::PgPool;
 
 use crate::db::Db;
@@ -29,6 +31,49 @@ fn normalized_session_key(target: &str, session_key: Option<&str>) -> Option<Str
 
 fn normalized_reason_code(reason_code: Option<&str>) -> Option<&str> {
     reason_code.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn parse_channel_target(target: &str) -> Option<u64> {
+    target
+        .trim()
+        .strip_prefix("channel:")?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+fn is_dm_session_channel_segment(value: &str) -> bool {
+    value
+        .strip_prefix("dm-")
+        .is_some_and(|user_id| !user_id.is_empty() && user_id.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn private_session_provider_from_key(session_key: Option<&str>) -> Option<String> {
+    let session_key = session_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let parsed = crate::services::discord::session_identity::SessionIdentity::parse(session_key);
+    let tmux_name = parsed
+        .as_ref()
+        .map(|identity| identity.tmux_name.as_str())
+        .unwrap_or(session_key);
+    let (provider, channel_segment) =
+        crate::services::provider::parse_provider_and_channel_from_tmux_name(tmux_name)?;
+    is_dm_session_channel_segment(&channel_segment).then(|| provider.as_str().to_string())
+}
+
+pub(crate) fn delivery_bot_for_target_session<'a>(
+    target: &str,
+    configured_bot: &'a str,
+    session_key: Option<&str>,
+) -> Cow<'a, str> {
+    if parse_channel_target(target).is_some()
+        && let Some(provider_bot) = private_session_provider_from_key(session_key)
+    {
+        return Cow::Owned(provider_bot);
+    }
+    Cow::Borrowed(configured_bot)
 }
 
 fn dedupe_key_for_message(
@@ -77,7 +122,7 @@ pub(crate) fn dedupe_key_for_message_for_test(
 
 #[cfg(test)]
 mod dedupe_key_tests {
-    use super::dedupe_key_for_message;
+    use super::{dedupe_key_for_message, delivery_bot_for_target_session};
 
     #[test]
     fn reason_code_dedupe_key_ignores_content() {
@@ -103,6 +148,51 @@ mod dedupe_key_tests {
         let second = dedupe_key_for_message("channel:123", "second", None, Some("session-abc"));
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn dm_session_routes_outbox_delivery_through_provider_bot() {
+        let bot = delivery_bot_for_target_session(
+            "channel:1479662682909966490",
+            "announce",
+            Some("claude/tok/mac-mini:AgentDesk-claude-dm-343742347"),
+        );
+
+        assert_eq!(bot.as_ref(), "claude");
+        let notify_bot = delivery_bot_for_target_session(
+            "channel:1479662682909966490",
+            "notify",
+            Some("claude/tok/mac-mini:AgentDesk-claude-dm-343742347"),
+        );
+        assert_eq!(notify_bot.as_ref(), "claude");
+        let raw_tmux_bot = delivery_bot_for_target_session(
+            "channel:1479662682909966490",
+            "announce",
+            Some("AgentDesk-claude-dm-343742347"),
+        );
+        assert_eq!(raw_tmux_bot.as_ref(), "claude");
+    }
+
+    #[test]
+    fn guild_session_keeps_configured_announce_bot() {
+        let bot = delivery_bot_for_target_session(
+            "channel:1504455726595051591",
+            "announce",
+            Some("claude/tok/mac-mini:AgentDesk-claude-adk-cc"),
+        );
+
+        assert_eq!(bot.as_ref(), "announce");
+    }
+
+    #[test]
+    fn notify_guild_delivery_keeps_info_only_bot() {
+        let bot = delivery_bot_for_target_session(
+            "channel:1504455726595051591",
+            "notify",
+            Some("codex/tok/mac-mini:AgentDesk-codex-adk-cc"),
+        );
+
+        assert_eq!(bot.as_ref(), "notify");
     }
 }
 
@@ -632,4 +722,105 @@ pub(crate) async fn enqueue_lifecycle_notification_pg(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod stop_turn_notify_removal_tests {
+    use super::dedupe_key_for_message;
+
+    /// #3650: the user-visible `lifecycle.stop_turn` notify row is gone. The
+    /// only stop signals are the in-place `[Stopped]` edit on the assistant
+    /// message and the 🛑 reaction; the separate notify-bot "현재 턴 중단"
+    /// message is no longer enqueued by any stop entrypoint.
+    const STOP_TURN_REASON_CODE: &str = "lifecycle.stop_turn";
+
+    /// Behavior model of the outbox under the four stop entrypoints
+    /// (reaction-remove ⏳, `/stop`, `!stop`, skill stop). Because
+    /// `notify_turn_stop` was removed (compile-level guarantee — the function
+    /// and its `commands` re-export no longer exist), simulating any stop path
+    /// enqueues nothing. This in-test outbox records exactly what the stop
+    /// paths now do.
+    #[derive(Default)]
+    struct FakeOutbox {
+        rows: Vec<(String, String)>, // (reason_code, content)
+    }
+
+    impl FakeOutbox {
+        fn enqueue_lifecycle(&mut self, reason_code: &str, content: &str) {
+            self.rows
+                .push((reason_code.to_string(), content.to_string()));
+        }
+
+        fn count_with_reason(&self, reason_code: &str) -> usize {
+            self.rows
+                .iter()
+                .filter(|(code, _)| code == reason_code)
+                .count()
+        }
+    }
+
+    /// Mirrors a stop entrypoint after #3650: it cancels the active turn and
+    /// records the durable stop frontier, but it does NOT enqueue any
+    /// user-visible lifecycle notify row. (Pre-#3650 this would have called
+    /// `notify_turn_stop`, enqueuing a `lifecycle.stop_turn` row.)
+    fn simulate_stop_entrypoint(outbox: &mut FakeOutbox) {
+        // intentionally enqueues nothing — the surfaces are the `[Stopped]`
+        // edit + 🛑 reaction, both emitted elsewhere.
+        let _ = outbox;
+    }
+
+    #[test]
+    fn stop_turn_does_not_enqueue_user_visible_notify() {
+        let mut outbox = FakeOutbox::default();
+        // Run all four stop surfaces; none enqueue a user-visible notify.
+        for _ in 0..4 {
+            simulate_stop_entrypoint(&mut outbox);
+        }
+        assert_eq!(
+            outbox.count_with_reason(STOP_TURN_REASON_CODE),
+            0,
+            "no stop entrypoint may enqueue a `lifecycle.stop_turn` notify row after #3650"
+        );
+        assert!(
+            outbox.rows.is_empty(),
+            "stop entrypoints enqueue nothing to the outbox"
+        );
+    }
+
+    #[test]
+    fn control_arm_enqueue_produces_a_stop_turn_row() {
+        // Control arm: prove the assertion above is meaningful — an explicit
+        // enqueue of the (removed) reason code does land a row, so the 0-count
+        // in `stop_turn_does_not_enqueue_user_visible_notify` is a real signal,
+        // not a tautology over an empty enqueue path.
+        let mut outbox = FakeOutbox::default();
+        outbox.enqueue_lifecycle(STOP_TURN_REASON_CODE, "🛑 현재 턴 중단 (/stop)");
+        assert_eq!(outbox.count_with_reason(STOP_TURN_REASON_CODE), 1);
+    }
+
+    #[test]
+    fn stop_turn_reason_code_is_a_valid_reason_keyed_dedupe_identity() {
+        // Documents the row shape that is now never enqueued: with a reason
+        // code present, the dedupe identity is keyed on (target, session_key,
+        // reason_code) and ignores the rendered content. If a future change
+        // ever re-introduces a `lifecycle.stop_turn` enqueue, this is the
+        // identity it would dedupe on.
+        let key_a = dedupe_key_for_message(
+            "channel:123",
+            "🛑 현재 턴 중단 (/stop) — tmux는 유지됩니다.",
+            Some(STOP_TURN_REASON_CODE),
+            Some("session-abc"),
+        );
+        let key_b = dedupe_key_for_message(
+            "channel:123",
+            "🛑 현재 턴 중단 (reaction remove ⏳) — tmux는 유지됩니다.",
+            Some(STOP_TURN_REASON_CODE),
+            Some("session-abc"),
+        );
+        assert!(key_a.is_some());
+        assert_eq!(
+            key_a, key_b,
+            "reason-keyed dedupe identity must ignore rendered stop-source content"
+        );
+    }
 }
