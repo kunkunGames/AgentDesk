@@ -513,7 +513,7 @@
 | `services::discord::restart_ctrl` | `src/services/discord/restart_ctrl.rs` | 102 | 102 | 0 |  |
 | `services::discord::restart_mode` | `src/services/discord/restart_mode.rs` | 32 | 32 | 0 |  |
 | `services::discord::restart_report` | `src/services/discord/restart_report.rs` | 433 | 433 | 0 |  |
-| `services::discord::role_map` | `src/services/discord/role_map.rs` | 645 | 645 | 0 |  |
+| `services::discord::role_map` | `src/services/discord/role_map.rs` | 642 | 642 | 0 |  |
 | `services::discord::router` | `src/services/discord/router/mod.rs` | 22 | 22 | 0 |  |
 | `services::discord::router::authorization` | `src/services/discord/router/authorization.rs` | 48 | 48 | 0 |  |
 | `services::discord::router::dispatch_trigger` | `src/services/discord/router/dispatch_trigger.rs` | 203 | 143 | 60 |  |
