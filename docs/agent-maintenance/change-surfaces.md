@@ -135,7 +135,7 @@
     lifecycle extraction surface from #1435; split further before adding new
     lifecycle behavior; #3016 phase-5b2 dropped the `mailbox_finalize_owed`
     construction from the watcher-spawn handle).
-  - `src/services/discord/tmux.rs` (2049 lines after #2558 dead-code sweep;
+  - `src/services/discord/tmux.rs` (2048 lines after #2558 dead-code sweep;
     +1 from #3384 restored-seed undelivered-body discard guard;
     +38 for suppressed-label noise, user report 2026-06-12: provider-aware
     status/footer stripping in the placeholder suppression decisions;
@@ -920,7 +920,7 @@
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`;
     +62 from #3304: slash-command canonical prompt keys for `<command-*>` XML vs
     `/command args` dedupe, plus focused loop skill-expansion regressions).
-  - `src/services/discord/recovery_engine.rs` (3397 lines; +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
+  - `src/services/discord/recovery_engine.rs` (3434 lines; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
     `set_relay_owner_kind(Watcher)` at the rebind-origin birth site so the
     STALL-WATCHDOG force-clean -> respawn synthetic row (which lands here with
     `existing_inflight = None`) is watcher-owned instead of degrading to
@@ -993,7 +993,7 @@
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2722 lines; +85 from #3629 NO_REPLY/empty orphan inflight identity-guarded cleanup in the completed-stale leak detection path; +3 from #3479 item-3 `shared.dispatch.<field>` nesting; health recovery
+  - `src/services/discord/health/recovery.rs` (2722 lines; #3656 stall-watchdog force-clean ages from current turn `started_at` not `updated_at` (turn-scoped, net 0 after comment condense); +85 from #3629 NO_REPLY/empty orphan inflight identity-guarded cleanup in the completed-stale leak detection path; +3 from #3479 item-3 `shared.dispatch.<field>` nesting; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests; +88
     from #3169 stall-watchdog jsonl-mtime liveness guard + tests, closing the
@@ -1007,7 +1007,7 @@
     force-clean watcher-respawn follow-through + always-run cross-tick
     retry/dead-man (P1-a: no early return on zero candidates), delegating the
     new behaviour to `health/watcher_respawn.rs`).
-  - `src/services/discord/router/message_handler/intake_turn.rs` (3680 lines; -40 from #3591 100턴 세션 리셋(AssistantTurnCap) 제거: reset 판정/clear/DB clear/display 블록 삭제; -2 from #3588 idle 세션 리셋 제거(IdleExpired display arm + `now` 인자 정리); +23 from #3557 Codex review: cap the INITIAL watchdog deadline at the provider hard ceiling (+one-shot ceiling warn); +27 from #3557 (A) per-turn hard-ceiling clamp wired into the watchdog auto-extend block; +1 from #3479 item-3 `shared.dispatch.<field>` nesting;
+  - `src/services/discord/router/message_handler/intake_turn.rs` (3615 lines; -65 from #3653 removing the separate session-restore notify bot send path so restore is absorbed by the session/status panel; -40 from #3591 100턴 세션 리셋(AssistantTurnCap) 제거: reset 판정/clear/DB clear/display 블록 삭제; -2 from #3588 idle 세션 리셋 제거(IdleExpired display arm + `now` 인자 정리); +23 from #3557 Codex review: cap the INITIAL watchdog deadline at the provider hard ceiling (+one-shot ceiling warn); +27 from #3557 (A) per-turn hard-ceiling clamp wired into the watchdog auto-extend block; +1 from #3479 item-3 `shared.dispatch.<field>` nesting;
     Discord message intake turn orchestration split from the router message
     handler; bugfix only outside a further extraction plan; #3464 extracted the
     unauthorized-voice-announcement scope decision to `voice_announcement_scope.rs`;
@@ -1045,7 +1045,7 @@
     clusters into `tmux_runtime/` child modules (`interrupt_policy.rs`,
     `process_table.rs`, `pid_exit.rs` — see their entries below); no longer a
     giant-file. Bugfix only outside a further extraction plan).
-  - `src/services/discord/turn_bridge/mod.rs` (6241 lines; production LoC; the BRIDGE
+  - `src/services/discord/turn_bridge/mod.rs` (6234 lines; production LoC; the BRIDGE
     spawn/turn-lifecycle surface — `spawn_turn_bridge` and the per-channel
     turn loop. #3479 extracted the task/session-panel line rendering +
     active-placeholder-card helpers into the `panel_lifecycle.rs` leaf.
@@ -1252,7 +1252,7 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (2771 lines).
+    lines) and `src/services/discord/inflight.rs` (2822 lines).
 - active_callsite_coverage: n/a.
 - invariants: watcher single-owner per #1222; placeholder lifecycle invariants
   per #1112; `/api/inflight/rebind` is the only path that synthesises an
@@ -1374,8 +1374,8 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2460 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +6 from #3557 (A) long_turn_watchdog spawn is included in this baseline).
-  - `src/server/mod.rs` (2634 lines; +42 from #3573 auto-resume tick + backoff-race fix + #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; +6 from #3557 (A) long_turn_watchdog spawn is included in this baseline).
+  - `src/config.rs` (2476 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment).
+  - `src/server/mod.rs` (2634 lines; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
   - `src/reconcile.rs` (1816 lines; periodic reconcile loop covering stale

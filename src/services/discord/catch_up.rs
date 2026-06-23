@@ -49,6 +49,44 @@ fn catch_up_checkpoint_for_scan(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatchUpFetchMode {
+    After(u64),
+    Recent,
+}
+
+impl CatchUpFetchMode {
+    fn checkpoint(self) -> Option<u64> {
+        match self {
+            Self::After(checkpoint) => Some(checkpoint),
+            Self::Recent => None,
+        }
+    }
+}
+
+fn catch_up_fetch_mode_for_scan(
+    candidate: &CatchUpChannelCandidate,
+    live_checkpoint: Option<u64>,
+    retry_checkpoint: Option<u64>,
+) -> CatchUpFetchMode {
+    if let Some(disk_checkpoint) = candidate.disk_checkpoint {
+        return CatchUpFetchMode::After(catch_up_checkpoint_for_scan(
+            disk_checkpoint,
+            live_checkpoint,
+            retry_checkpoint,
+        ));
+    }
+
+    if let Some(retry_checkpoint) = retry_checkpoint {
+        return CatchUpFetchMode::After(retry_checkpoint);
+    }
+    if let Some(live_checkpoint) = live_checkpoint {
+        return CatchUpFetchMode::After(live_checkpoint);
+    }
+
+    CatchUpFetchMode::Recent
+}
+
 #[derive(Debug, Clone)]
 struct CatchUpChannelCandidate {
     channel_id: ChannelId,
@@ -168,6 +206,55 @@ fn collect_catch_up_channel_candidates(
 /// previous size was overrun by bursty bot output and silently dropped buried
 /// user messages.
 const CATCH_UP_FETCH_LIMIT: u8 = 50;
+
+/// Inter-channel pacing for the catch-up REST sweep.
+///
+/// Startup recovery and the periodic backstop scan every configured channel
+/// back-to-back (two REST round-trips each — binding-status + message fetch).
+/// On a fresh restart, dozens of channels are scanned with no checkpoint at
+/// once, and that tight, un-paced burst monopolises the async executor and
+/// Discord REST budget right as every background DB consumer is also spinning
+/// up — starving DB-bound tasks of the time they need to acquire a pooled
+/// connection within `acquire_timeout`. Spacing the per-channel scans by a
+/// small delay spreads the burst so the rest of the runtime keeps making
+/// progress. `AGENTDESK_CATCH_UP_SCAN_PACE_MS` overrides the gap (0 disables —
+/// used by tests and by operators who want the old unthrottled behaviour).
+const CATCH_UP_SCAN_PACE_DEFAULT_MS: u64 = 100;
+
+/// Pure parse of the pacing override. Missing or unparseable values fall back
+/// to the default; `0` is honoured and yields a zero (no-op) gap. Kept env-free
+/// so it is deterministically unit-testable without touching process globals.
+fn parse_catch_up_scan_pace(raw: Option<&str>) -> std::time::Duration {
+    let ms = raw
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(CATCH_UP_SCAN_PACE_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn catch_up_scan_pace() -> std::time::Duration {
+    parse_catch_up_scan_pace(
+        std::env::var("AGENTDESK_CATCH_UP_SCAN_PACE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Whether to wait the pacing gap before the next per-channel scan. The first
+/// scan in a sweep runs immediately (`already_scanned == false`); every later
+/// scan is paced. Extracted as a named predicate so the first-immediate /
+/// subsequent-paced contract is covered by a unit test.
+fn should_pace_before_scan(already_scanned: bool) -> bool {
+    already_scanned
+}
+
+/// Sleep the configured catch-up pacing gap before the next per-channel scan.
+/// No-op when pacing is disabled (0 ms) so test runs stay fast.
+async fn catch_up_scan_pace_gap() {
+    let pace = catch_up_scan_pace();
+    if !pace.is_zero() {
+        tokio::time::sleep(pace).await;
+    }
+}
 
 /// Filter outcome categories for the catch-up REST scan. Used both at runtime
 /// (to emit per-channel breakdown logs even when nothing was recovered) and in
@@ -334,15 +421,16 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
         return;
     }
 
+    // Pace successive per-channel REST scans so a many-channel sweep doesn't
+    // fire as one tight burst (see `catch_up_scan_pace`). The first eligible
+    // channel runs immediately; subsequent scans wait the configured gap.
+    let mut paced_scan = false;
     for candidate in candidates.values() {
-        let Some(disk_last_id) = candidate.disk_checkpoint else {
-            continue;
-        };
         let channel_id = candidate.channel_id;
         let retry_checkpoint = retry_checkpoints.get(&channel_id).copied();
         let live_checkpoint = shared.last_message_ids.get(&channel_id).map(|entry| *entry);
-        let last_id = catch_up_checkpoint_for_scan(disk_last_id, live_checkpoint, retry_checkpoint);
-        let after_msg = MessageId::new(last_id);
+        let fetch_mode = catch_up_fetch_mode_for_scan(candidate, live_checkpoint, retry_checkpoint);
+        let scan_checkpoint = fetch_mode.checkpoint();
 
         // #429: skip channels this bot cannot access.  Utility bots
         // (notify/announce) share the claude provider checkpoint dir but
@@ -353,6 +441,11 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
                 continue;
             }
         }
+
+        if should_pace_before_scan(paced_scan) {
+            catch_up_scan_pace_gap().await;
+        }
+        paced_scan = true;
 
         match resolve_runtime_channel_binding_status(http, channel_id).await {
             RuntimeChannelBindingStatus::Owned => {}
@@ -375,7 +468,10 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
             RuntimeChannelBindingStatus::Unknown => continue,
         }
 
-        // Fetch messages after last_id (Discord returns oldest first with after=)
+        // Fetch messages after the saved cursor when one exists. Configured
+        // channels can legitimately have no last_message checkpoint yet (for
+        // example after `/clear` or stale-checkpoint pruning), so fall back to a
+        // bounded recent-message scan instead of silently skipping the channel.
         // #1227: limit was 10 — channels with bursty bot activity (streaming
         // replies + many short turns) routinely fill that window with bot
         // messages, pushing user messages outside the page. Discord applies
@@ -383,15 +479,11 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
         // headroom for the realistic
         // bot:user ratio. Discord per-channel rate limit (5 req / 5 sec)
         // has plenty of margin for this 5x cost.
-        let messages = match channel_id
-            .messages(
-                http,
-                serenity::builder::GetMessages::new()
-                    .after(after_msg)
-                    .limit(CATCH_UP_FETCH_LIMIT),
-            )
-            .await
-        {
+        let mut request = serenity::builder::GetMessages::new().limit(CATCH_UP_FETCH_LIMIT);
+        if let CatchUpFetchMode::After(last_id) = fetch_mode {
+            request = request.after(MessageId::new(last_id));
+        }
+        let mut messages = match channel_id.messages(http, request).await {
             Ok(msgs) => msgs,
             Err(e) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -412,6 +504,7 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
         if messages.is_empty() {
             continue;
         }
+        messages.sort_by_key(|msg| msg.id.get());
 
         // Get bot's own user ID to filter out self-messages
         // Collect existing message IDs in queue for dedup
@@ -470,13 +563,15 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
             // the last actually-queued message — newer entries that we
             // declined are still > `after_msg` for the next pass.
             if outcome == CatchUpClassification::Recover && stats.recovered >= remaining_capacity {
-                let retry_after = max_recovered_id.unwrap_or(last_id);
-                shared
-                    .catch_up_retry_pending
-                    .insert(channel_id, retry_after);
+                let retry_after = max_recovered_id.or(scan_checkpoint);
+                if let Some(retry_after) = retry_after {
+                    shared
+                        .catch_up_retry_pending
+                        .insert(channel_id, retry_after);
+                }
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
-                    "  [{ts}] 🔁 catch-up: queue cap reached for channel {}; retry armed after checkpoint {}",
+                    "  [{ts}] 🔁 catch-up: queue cap reached for channel {}; retry armed after checkpoint {:?}",
                     channel_id,
                     retry_after
                 );
@@ -554,7 +649,7 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
 
         // Only advance checkpoint if we actually recovered messages
         if let Some(newest) = max_recovered_id {
-            shared.last_message_ids.insert(channel_id, newest);
+            advance_last_message_checkpoint(shared, provider, channel_id, MessageId::new(newest));
             if retry_checkpoint.is_some()
                 && !shared.catch_up_retry_pending.contains_key(&channel_id)
             {
@@ -587,6 +682,8 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
     };
     let announce_bot_id_phase2 = resolve_announce_bot_user_id(shared).await;
 
+    // Same per-channel pacing as phase 1 (see `catch_up_scan_pace`).
+    let mut paced_scan_phase2 = false;
     for candidate in candidates.values() {
         let channel_id = candidate.channel_id;
 
@@ -596,6 +693,11 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
                 continue;
             }
         }
+
+        if should_pace_before_scan(paced_scan_phase2) {
+            catch_up_scan_pace_gap().await;
+        }
+        paced_scan_phase2 = true;
 
         match resolve_runtime_channel_binding_status(http, channel_id).await {
             RuntimeChannelBindingStatus::Owned => {}
@@ -736,10 +838,51 @@ pub(in crate::services::discord) async fn catch_up_missed_messages_inner(
 #[cfg(test)]
 mod catch_up_recovery_tests {
     use super::{
-        CatchUpClassification, CatchUpMessageView, ChannelId, ProviderKind,
-        classify_catch_up_message, insert_configured_catch_up_candidate,
+        CATCH_UP_SCAN_PACE_DEFAULT_MS, CatchUpChannelCandidate, CatchUpClassification,
+        CatchUpFetchMode, CatchUpMessageView, ChannelId, ProviderKind,
+        catch_up_fetch_mode_for_scan, classify_catch_up_message,
+        insert_configured_catch_up_candidate, parse_catch_up_scan_pace, should_pace_before_scan,
     };
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn scan_pace_parses_valid_zero_invalid_and_missing() {
+        // Explicit value is honoured.
+        assert_eq!(
+            parse_catch_up_scan_pace(Some("250")).as_millis(),
+            250,
+            "valid value should be used verbatim"
+        );
+        // 0 is honoured and yields a no-op (zero) gap — the documented disable.
+        assert!(
+            parse_catch_up_scan_pace(Some("0")).is_zero(),
+            "0 must disable pacing"
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(parse_catch_up_scan_pace(Some("  75 ")).as_millis(), 75);
+        // Unparseable and missing both fall back to the default.
+        assert_eq!(
+            parse_catch_up_scan_pace(Some("abc")).as_millis(),
+            CATCH_UP_SCAN_PACE_DEFAULT_MS as u128,
+            "garbage falls back to default"
+        );
+        assert_eq!(
+            parse_catch_up_scan_pace(None).as_millis(),
+            CATCH_UP_SCAN_PACE_DEFAULT_MS as u128,
+            "missing env falls back to default"
+        );
+    }
+
+    #[test]
+    fn first_scan_runs_immediately_then_subsequent_scans_pace() {
+        // Mirrors the loop contract: the very first eligible channel scans with
+        // no delay; once one scan has happened, every later channel is paced.
+        assert!(!should_pace_before_scan(false), "first scan must not wait");
+        assert!(
+            should_pace_before_scan(true),
+            "subsequent scans must wait the pacing gap"
+        );
+    }
 
     #[test]
     fn configured_channel_is_scanned_without_checkpoint_file() {
@@ -758,6 +901,10 @@ mod catch_up_recovery_tests {
         assert_eq!(candidate.fallback_name.as_deref(), Some("adk-cc"));
         assert!(candidate.checkpoint_path.is_none());
         assert!(candidate.disk_checkpoint.is_none());
+        assert_eq!(
+            catch_up_fetch_mode_for_scan(candidate, None, None),
+            CatchUpFetchMode::Recent
+        );
     }
 
     #[test]
@@ -787,6 +934,29 @@ mod catch_up_recovery_tests {
         assert_eq!(candidate.disk_checkpoint, Some(1504812094456070174));
         assert!(candidate.checkpoint_path.is_some());
         assert_eq!(candidate.fallback_name.as_deref(), Some("adk-cc"));
+        assert_eq!(
+            catch_up_fetch_mode_for_scan(candidate, Some(1504812094456070175), None),
+            CatchUpFetchMode::After(1504812094456070175)
+        );
+    }
+
+    #[test]
+    fn retry_checkpoint_overrides_live_cursor_for_recent_scan_retry() {
+        let candidate = CatchUpChannelCandidate {
+            channel_id: ChannelId::new(1479671298497183835),
+            fallback_name: Some("adk-cc".to_string()),
+            checkpoint_path: None,
+            disk_checkpoint: None,
+        };
+
+        assert_eq!(
+            catch_up_fetch_mode_for_scan(
+                &candidate,
+                Some(1504812094456070999),
+                Some(1504812094456070000)
+            ),
+            CatchUpFetchMode::After(1504812094456070000)
+        );
     }
 
     #[test]
