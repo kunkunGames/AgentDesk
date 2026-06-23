@@ -401,14 +401,6 @@ pub(in crate::services::discord) async fn handle_text_command(
                             termination_recorded,
                         ),
                     );
-                    super::super::commands::notify_turn_stop(
-                        &ctx.http,
-                        &data.shared,
-                        &data.provider,
-                        channel_id,
-                        "!stop",
-                    )
-                    .await;
                     // #1672: belt-and-suspenders drain trigger so the
                     // !stop surface matches the cancel-API contract.
                     // The turn_bridge cancellation tail also schedules
@@ -439,6 +431,7 @@ pub(in crate::services::discord) async fn handle_text_command(
                 &data.provider,
                 channel_id,
                 "!clear",
+                super::SoftClearNotifyMode::Suppress,
             )
             .await;
             let _ = msg.reply(&ctx.http, "Session cleared.").await;
@@ -1346,14 +1339,6 @@ Any other message is sent to {p}.
                                     termination_recorded,
                                 ),
                             );
-                            super::super::commands::notify_turn_stop(
-                                &ctx.http,
-                                &data.shared,
-                                &data.provider,
-                                channel_id,
-                                &stop_reason,
-                            )
-                            .await;
                             // #1672: mirror the !stop / cancel API drain
                             // trigger so the three cancel surfaces all
                             // pick up the queued user message after the
