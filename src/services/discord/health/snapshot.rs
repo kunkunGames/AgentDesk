@@ -375,8 +375,23 @@ impl HealthRegistry {
         channel_id: u64,
     ) -> Option<WatcherStateSnapshot> {
         let channel = ChannelId::new(channel_id);
-        if let Some(shared) = self.shared_for_provider_on_channel(provider, channel).await {
-            return watcher_state_snapshot_for_shared(provider.as_str(), shared, channel).await;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.shared_for_provider_on_channel(provider, channel),
+        )
+        .await
+        {
+            Ok(Some(shared)) => {
+                return watcher_state_snapshot_for_shared(provider.as_str(), shared, channel).await;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(
+                    provider = provider.as_str(),
+                    channel_id,
+                    "watcher-state provider/channel runtime resolve timed out; falling back to provider scan",
+                );
+            }
         }
 
         self.snapshot_watcher_state_filtered(channel_id, Some(provider))
