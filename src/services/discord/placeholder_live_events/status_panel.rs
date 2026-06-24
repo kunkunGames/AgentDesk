@@ -31,7 +31,7 @@ pub(super) struct SubagentSlot {
     pub(super) finished: Option<bool>,
     /// #3084: Task tool-use id that opened this slot, so `SubagentEnd` closes the
     /// exact slot among parallels instead of the first unfinished one.
-    pub(super) tool_use_id: Option<String>,
+    tool_use_id: Option<String>,
     /// #3086: TUI-parity accounting from the finishing `SubagentEnd`; drives the
     /// `Done (N tools · M tokens · Xs)` summary on the render line.
     summary: Option<SubagentSummary>,
@@ -42,14 +42,11 @@ pub(super) struct SubagentSlot {
     /// `TaskToolSlot::ordinal`) backing slot-identity subagent eviction.
     ordinal: u64,
 }
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DerivedStatus {
-    #[default]
     Running,
     MonitorWait,
     ScheduleWakeup(Option<u64>),
-    TerminalDeliveryPending,
-    TerminalDeliveryUnconfirmed,
     Completed {
         kind: CompletedKind,
     },
@@ -78,6 +75,12 @@ impl CompletedKind {
         } else {
             Self::Foreground
         }
+    }
+}
+
+impl Default for DerivedStatus {
+    fn default() -> Self {
+        Self::Running
     }
 }
 
@@ -603,10 +606,6 @@ fn render_derived_status(status: &DerivedStatus) -> String {
             format!("⏰ scheduled wakeup ({eta_secs}s 후)")
         }
         DerivedStatus::ScheduleWakeup(None) => "⏰ scheduled wakeup".to_string(),
-        DerivedStatus::TerminalDeliveryPending => "↻ 응답 전달됨 · 세션 종료 확인 중".to_string(),
-        DerivedStatus::TerminalDeliveryUnconfirmed => {
-            "⚠ 응답 전달됨 · 세션 종료 미확인".to_string()
-        }
         DerivedStatus::Completed {
             kind: CompletedKind::Background,
         } => "✅ **백그라운드 완료**".to_string(),

@@ -29,7 +29,6 @@ pub(in crate::services::discord) enum RelayRecoveryActionKind {
     ClearStaleThreadProof,
     ClearOrphanPendingToken,
     ReattachWatcher,
-    DrainPendingQueue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +66,6 @@ impl RelayRecoveryActionKind {
             Self::ClearStaleThreadProof => "clear_stale_thread_proof",
             Self::ClearOrphanPendingToken => "clear_orphan_pending_token",
             Self::ReattachWatcher => "reattach_watcher",
-            Self::DrainPendingQueue => "drain_pending_queue",
         }
     }
 }
@@ -311,18 +309,10 @@ fn eligible_reattach_watcher(snapshot: &RelayHealthSnapshot) -> bool {
     // fresh-heartbeat live watcher still makes this ineligible: auto-heal
     // never replaces a live handle (that case is the finalizer far-backstop's
     // job, #3277 Defect C).
-    //
-    // A mailbox token is strong live-turn evidence, but it is not required for
-    // post-restart adoption: a valid inflight row can outlive the in-memory
-    // mailbox token while the AgentDesk tmux session keeps producing output.
-    // In that inflight-only shape, allow bounded reattach when there is no
-    // competing mailbox owner.
     snapshot.tmux_alive == Some(true)
         && snapshot.bridge_inflight_present
-        && (snapshot.mailbox_has_cancel_token || snapshot.mailbox_active_user_msg_id.is_none())
-        && (!snapshot.watcher_attached
-            || snapshot.watcher_attached_stale
-            || !snapshot.watcher_owns_live_relay)
+        && snapshot.mailbox_has_cancel_token
+        && (!snapshot.watcher_attached || snapshot.watcher_attached_stale)
         && snapshot.desynced
         && is_agentdesk_tmux_session(snapshot.tmux_session.as_deref())
 }
@@ -409,22 +399,12 @@ pub(in crate::services::discord) fn plan_relay_recovery(
                 }),
             )
         }
-        RelayStallState::QueueBlocked => {
-            let eligible = snapshot.queue_depth > 0
-                && matches!(snapshot.active_turn, RelayActiveTurn::None)
-                && !snapshot.mailbox_has_cancel_token
-                && snapshot.mailbox_active_user_msg_id.is_none();
-            (
-                RelayRecoveryActionKind::DrainPendingQueue,
-                if eligible {
-                    "queued work is stranded behind an idle mailbox; bounded queue drain can restore delivery"
-                } else {
-                    "queued work exists but live turn evidence prevents automatic queue drain"
-                },
-                eligible,
-                (!eligible).then_some("queue_blocked_has_live_turn_evidence"),
-            )
-        }
+        RelayStallState::QueueBlocked => (
+            RelayRecoveryActionKind::ObserveOnly,
+            "queued work is already surfaced as degraded health; relay recovery has no safe local cleanup",
+            false,
+            Some("operator_inspection_required"),
+        ),
     };
 
     RelayRecoveryDecision {
@@ -486,7 +466,8 @@ pub(in crate::services::discord) async fn run_relay_recovery(
     // Channel-aware: multi-bot deployments register several runtimes per
     // provider, so a name-only lookup would auto-heal the wrong runtime's
     // relay state for this channel.
-    let shared = resolve_recovery_shared(registry, &provider, &decision)
+    let shared = registry
+        .shared_for_provider_on_channel(&provider, ChannelId::new(decision.channel_id))
         .await
         .ok_or_else(|| RelayRecoveryError::ProviderUnavailable(decision.provider.clone()))?;
     Ok(apply_relay_recovery_plan(
@@ -498,45 +479,6 @@ pub(in crate::services::discord) async fn run_relay_recovery(
         RelayRecoveryApplySource::Manual,
     )
     .await)
-}
-
-async fn resolve_recovery_shared(
-    registry: &HealthRegistry,
-    provider: &ProviderKind,
-    decision: &RelayRecoveryDecision,
-) -> Option<Arc<SharedData>> {
-    let expected_tmux = decision.affected.tmux_session.as_deref();
-    for shared in registry.all_shared_for_provider(provider).await {
-        let Some(snapshot) = registry
-            .snapshot_watcher_state_for_shared(provider, shared.clone(), decision.channel_id)
-            .await
-        else {
-            continue;
-        };
-        if expected_tmux.is_none() || snapshot.relay_health.tmux_session.as_deref() == expected_tmux
-        {
-            return Some(shared);
-        }
-    }
-
-    let channel = ChannelId::new(decision.channel_id);
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        registry.shared_for_provider_on_channel(provider, channel),
-    )
-    .await
-    {
-        Ok(Some(shared)) => Some(shared),
-        Ok(None) => registry.shared_for_provider(provider).await,
-        Err(_) => {
-            tracing::warn!(
-                provider = provider.as_str(),
-                channel_id = decision.channel_id,
-                "relay recovery provider/channel runtime resolve timed out; falling back to provider runtime",
-            );
-            registry.shared_for_provider(provider).await
-        }
-    }
 }
 
 pub(in crate::services::discord) async fn auto_apply_relay_recovery_for_shared(
@@ -647,7 +589,6 @@ fn relay_recovery_status_counts_as_applied(status: &'static str) -> bool {
             | "reattached_watcher"
             | "reuse_existing_live_watcher"
             | "cleared_idle_tmux_stale_turn"
-            | "scheduled_pending_queue_drain"
     )
 }
 
@@ -763,7 +704,6 @@ async fn apply_relay_recovery_decision(
             let channel = ChannelId::new(decision.channel_id);
             forget_completion_footer_for_relay_recovery(channel);
             if let Some(tmux_session) = decision.affected.tmux_session.as_deref()
-                && decision.evidence.unread_bytes.unwrap_or(0) == 0
                 && idle_tmux_repair_ready_for_input(provider, decision.channel_id, tmux_session)
                 && super::inflight::inflight_state_allows_idle_tmux_repair(
                     provider,
@@ -846,32 +786,6 @@ async fn apply_relay_recovery_decision(
                     reattach_initial_offset: None,
                     reattach_error: Some("provider unavailable".to_string()),
                 },
-            }
-        }
-        RelayRecoveryActionKind::DrainPendingQueue => {
-            let channel = ChannelId::new(decision.channel_id);
-            let outcome = super::health::schedule_pending_queue_drain_after_cancel(
-                registry,
-                provider.as_str(),
-                channel,
-                "relay_recovery_queue_blocked",
-            )
-            .await;
-            let after = mailbox_snapshot(shared, channel).await;
-            RelayRecoveryApplyResult {
-                status: if outcome.queue_depth_after > 0 {
-                    "scheduled_pending_queue_drain"
-                } else {
-                    "pending_queue_empty"
-                },
-                removed_thread_proofs: 0,
-                removed_mailbox_token: false,
-                post_mailbox_has_cancel_token: Some(after.cancel_token.is_some()),
-                post_mailbox_queue_depth: Some(after.intervention_queue.len()),
-                reattach_watcher_spawned: None,
-                reattach_watcher_replaced: None,
-                reattach_initial_offset: None,
-                reattach_error: None,
             }
         }
         RelayRecoveryActionKind::ObserveOnly => RelayRecoveryApplyResult {
@@ -1071,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_blocked_schedules_bounded_pending_queue_drain_when_idle() {
+    fn queue_blocked_is_honest_observe_only_because_health_already_degrades() {
         let decision = plan_relay_recovery(
             &RelayHealthSnapshot {
                 queue_depth: 2,
@@ -1081,33 +995,15 @@ mod tests {
             1_000,
         );
 
-        assert_eq!(decision.action, RelayRecoveryActionKind::DrainPendingQueue);
+        assert_eq!(decision.action, RelayRecoveryActionKind::ObserveOnly);
         assert_eq!(
             decision.reason,
-            "queued work is stranded behind an idle mailbox; bounded queue drain can restore delivery"
+            "queued work is already surfaced as degraded health; relay recovery has no safe local cleanup"
         );
-        assert!(decision.auto_heal.eligible);
-        assert_eq!(decision.auto_heal.skipped_reason, None);
-    }
-
-    #[test]
-    fn queue_blocked_does_not_drain_when_live_turn_evidence_remains() {
-        let decision = plan_relay_recovery(
-            &RelayHealthSnapshot {
-                active_turn: RelayActiveTurn::Foreground,
-                mailbox_has_cancel_token: true,
-                queue_depth: 2,
-                ..snapshot()
-            },
-            RelayStallState::QueueBlocked,
-            1_000,
-        );
-
-        assert_eq!(decision.action, RelayRecoveryActionKind::DrainPendingQueue);
         assert!(!decision.auto_heal.eligible);
         assert_eq!(
             decision.auto_heal.skipped_reason,
-            Some("queue_blocked_has_live_turn_evidence")
+            Some("operator_inspection_required")
         );
     }
 
@@ -1179,11 +1075,10 @@ mod tests {
         assert_eq!(decision.evidence.active_turn, RelayActiveTurn::Foreground);
     }
 
-    /// #3277 (Defect D) + deploy-preserved ownerless restore eligibility table:
-    /// a DEAD attached watcher handle (`watcher_attached_stale`) no longer
-    /// blocks the bounded reattach; a genuinely-live watcher that already owns
-    /// the relay still does; and a live-but-ownerless watcher is eligible
-    /// because rebind only needs to restamp ownership and reuse the incumbent.
+    /// #3277 (Defect D) eligibility table: a DEAD attached watcher handle
+    /// (`watcher_attached_stale`) no longer blocks the bounded reattach, while
+    /// a genuinely-live attached watcher still does, and the legacy
+    /// detached-watcher case stays eligible.
     #[test]
     fn reattach_eligibility_distinguishes_stale_attached_watcher_from_live() {
         let base = || RelayHealthSnapshot {
@@ -1215,10 +1110,8 @@ mod tests {
         );
         assert_eq!(stale_attached.auto_heal.skipped_reason, None);
 
-        // attached + LIVE ownerless handle → eligible; this is the
-        // post-deploy `watcher_attached=true` / `watcher_owns_live_relay=false`
-        // gap where the handle exists but cannot relay the current inflight.
-        let live_ownerless_attached = plan_relay_recovery(
+        // attached + LIVE handle → never auto-replace a live watcher.
+        let live_attached = plan_relay_recovery(
             &RelayHealthSnapshot {
                 watcher_attached: true,
                 watcher_attached_stale: false,
@@ -1228,28 +1121,11 @@ mod tests {
             1_000,
         );
         assert!(
-            live_ownerless_attached.auto_heal.eligible,
-            "a live but ownerless watcher should be reused and restamped by reattach"
-        );
-        assert_eq!(live_ownerless_attached.auto_heal.skipped_reason, None);
-
-        // attached + LIVE owner → never auto-replace a live relay owner.
-        let live_owned_attached = plan_relay_recovery(
-            &RelayHealthSnapshot {
-                watcher_attached: true,
-                watcher_attached_stale: false,
-                watcher_owns_live_relay: true,
-                ..base()
-            },
-            RelayStallState::TmuxAliveRelayDead,
-            1_000,
-        );
-        assert!(
-            !live_owned_attached.auto_heal.eligible,
-            "a fresh-heartbeat live watcher that owns relay must keep reattach operator-gated"
+            !live_attached.auto_heal.eligible,
+            "a fresh-heartbeat live watcher must keep reattach operator-gated"
         );
         assert_eq!(
-            live_owned_attached.auto_heal.skipped_reason,
+            live_attached.auto_heal.skipped_reason,
             Some("reattach_missing_required_live_evidence")
         );
 

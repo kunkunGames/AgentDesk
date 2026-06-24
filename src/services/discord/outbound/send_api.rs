@@ -109,19 +109,7 @@ pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static s
 
     let http = match resolve_bot_http(registry, &request.bot).await {
         Ok(h) => h,
-        Err(resp) => {
-            // #3643: a DM that resolves no bot HTTP handle (unknown/misconfigured
-            // bot name) previously failed silently server-side — only the caller
-            // saw the HTTP error. Log the resolved bot + target so a recurring DM
-            // routing failure is attributable to the bot, not guessed.
-            tracing::warn!(
-                bot = %request.bot,
-                user_id = request.user_id,
-                status = resp.0,
-                "DM send aborted: failed to resolve bot HTTP handle (unknown/misconfigured bot?)"
-            );
-            return resp;
-        }
+        Err(resp) => return resp,
     };
     let user_id_text = request.user_id.to_string();
     let dm_delivery_id = request.delivery_id();
@@ -148,10 +136,8 @@ pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static s
         } => {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!(
-                bot = %request.bot,
-                "  [{ts}] 📨 DM: → user {} via shared outbound (bot={})",
-                request.user_id,
-                request.bot
+                "  [{ts}] 📨 DM: → user {} via shared outbound",
+                request.user_id
             );
             let mut response = serde_json::json!({
                 "ok": true,
@@ -163,26 +149,10 @@ pub async fn handle_senddm(registry: &HealthRegistry, body: &str) -> (&'static s
             }
             ("200 OK", response.to_string())
         }
-        ManualDeliveryOutcome::Failed { detail } => {
-            // #3643: surface the bot identity + Discord error (e.g. 50001 Missing
-            // Access) server-side. Without this the failure was visible only to
-            // the caller, so reports could not distinguish wrong-bot routing from
-            // an announce-bot permission/shared-guild gap. `detail` carries the
-            // serenity error string including the Discord error code.
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::warn!(
-                bot = %request.bot,
-                user_id = request.user_id,
-                detail = %detail,
-                "  [{ts}] ⚠ DM: send failed → user {} (bot={})",
-                request.user_id,
-                request.bot
-            );
-            (
-                "500 Internal Server Error",
-                format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
-            )
-        }
+        ManualDeliveryOutcome::Failed { detail } => (
+            "500 Internal Server Error",
+            format!(r#"{{"ok":false,"error":"DM send failed: {}"}}"#, detail),
+        ),
     }
 }
 

@@ -1009,25 +1009,37 @@ pub(super) async fn finish_recovered_turn_mailbox(
     let _ = stop_source;
 }
 
-/// #3248/#3645: recovery must re-seed a Watcher-owned ledger entry after
-/// restart, keyed by the stable finalizer id, so busy GateTimeout defers and
-/// the far-backstop can reconcile. `register_start` is idempotent for the same
-/// `TurnKey`, so a later bridge handoff is a no-op refresh.
+/// #3248 gap-1 — re-seed the single-authority finalizer ledger for a
+/// watcher-owned turn re-attached by recovery after a mid-turn dcserver restart
+/// (e.g. `SKIP_TURN_DRAIN=1` deploy). The in-memory ledger is empty post-restart,
+/// so without this the watcher's channel-only (id-0) GateTimeout creates a
+/// `RelayOwnerKind::None` entry that finalizes-as-orphan (the 8s gate-backstop
+/// arms only for `relay_owner != None`; the far-backstop reconcile collects only
+/// `relay_owner == Watcher` rows) — the live pane never auto-reconciles until a
+/// NEW user turn. Registering with the Watcher owner reproduces the bridge
+/// handoff (`turn_bridge/mod.rs` `register_start(.., Watcher, ..)`) so the
+/// gate-timeout DEFERS (arms the backstop) and the reconcile can collect the row.
+///
+/// IDEMPOTENT: the actor's `Start` handler is `entry().and_modify().or_insert()`
+/// — never resurrects a `Finalized` turn, `get_or_insert`s the deadline (never
+/// pushes it forward) — so a later bridge handoff `register_start` of the SAME
+/// `TurnKey` is a no-op refresh (the normal, non-restart path is unaffected).
 fn reseed_watcher_owned_finalizer_ledger(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
-    finalizer_turn_id: u64,
+    user_msg_id: MessageId,
     provider: &ProviderKind,
 ) {
-    // id-0 would key the channel-only orphan slot. Only seed a full-identity
-    // Watcher entry; synthetic live turns use their persisted finalizer_turn_id.
-    if finalizer_turn_id == 0 {
+    // id-0 would key the channel-only orphan slot; the sole caller already
+    // returns early on id-0, but guard here so this path only ever seeds a
+    // full-identity Watcher entry.
+    if user_msg_id.get() == 0 {
         return;
     }
     shared.turn_finalizer.register_start(
         super::turn_finalizer::TurnKey::new(
             channel_id,
-            finalizer_turn_id,
+            user_msg_id.get(),
             shared.restart.current_generation,
         ),
         provider.clone(),
@@ -1040,13 +1052,12 @@ pub(super) async fn reregister_active_turn_from_inflight(
     shared: &Arc<SharedData>,
     state: &inflight::InflightTurnState,
 ) -> bool {
-    let finalizer_turn_id = state.effective_finalizer_turn_id();
-    if finalizer_turn_id == 0 {
+    if state.current_msg_id == 0 || state.user_msg_id == 0 || state.request_owner_user_id == 0 {
         return false;
     }
 
     let channel_id = ChannelId::new(state.channel_id);
-    let finalizer_msg_id = MessageId::new(finalizer_turn_id);
+    let user_msg_id = MessageId::new(state.user_msg_id);
     let snapshot = super::mailbox_snapshot(shared, channel_id).await;
     let Some(provider) = ProviderKind::from_str(&state.provider) else {
         tracing::error!(
@@ -1060,7 +1071,7 @@ pub(super) async fn reregister_active_turn_from_inflight(
         tracing::warn!(
             provider = %provider.as_str(),
             channel = state.channel_id,
-            finalizer_turn_id,
+            user_msg_id = state.user_msg_id,
             "inflight reregister skipped: terminal delivery already committed; clearing stale active turn state"
         );
         finish_recovered_turn_mailbox(
@@ -1075,7 +1086,7 @@ pub(super) async fn reregister_active_turn_from_inflight(
     }
     if snapshot.cancel_token.is_some() {
         if let Some(token) = snapshot.cancel_token.as_ref()
-            && snapshot.active_user_message_id == Some(finalizer_msg_id)
+            && snapshot.active_user_message_id == Some(user_msg_id)
         {
             super::ensure_cancel_token_bound_from_inflight_state(
                 &provider,
@@ -1084,16 +1095,13 @@ pub(super) async fn reregister_active_turn_from_inflight(
                 "inflight reregister existing active turn",
             );
         }
-        let restored = snapshot.active_user_message_id == Some(finalizer_msg_id);
+        let restored = snapshot.active_user_message_id == Some(user_msg_id);
         if restored {
-            reseed_watcher_owned_finalizer_ledger(shared, channel_id, finalizer_turn_id, &provider);
+            // #3248 gap-1: existing-active-turn rebind — re-seed the empty
+            // post-restart ledger so the watcher gate-timeout arms its backstop.
+            reseed_watcher_owned_finalizer_ledger(shared, channel_id, user_msg_id, &provider);
         }
         return restored;
-    }
-
-    if state.request_owner_user_id == 0 {
-        reseed_watcher_owned_finalizer_ledger(shared, channel_id, finalizer_turn_id, &provider);
-        return false;
     }
 
     let cancel_token = Arc::new(CancelToken::new());
@@ -1109,11 +1117,14 @@ pub(super) async fn reregister_active_turn_from_inflight(
         channel_id,
         cancel_token,
         UserId::new(state.request_owner_user_id),
-        finalizer_msg_id,
+        user_msg_id,
     )
     .await;
     if started {
-        reseed_watcher_owned_finalizer_ledger(shared, channel_id, finalizer_turn_id, &provider);
+        // #3248 gap-1: freshly re-attached active turn — seed the empty
+        // post-restart ledger with the Watcher owner (idempotent vs. a later
+        // bridge handoff) so the live pane auto-reconciles without a new user turn.
+        reseed_watcher_owned_finalizer_ledger(shared, channel_id, user_msg_id, &provider);
     }
     started
 }
@@ -3520,28 +3531,16 @@ pub(crate) async fn rebind_inflight_for_channel(
     // Validate provider↔channel binding against the settings snapshot,
     // mirroring what `restore_inflight_turns` requires for watcher revival.
     let settings_snapshot = shared.settings.read().await.clone();
-    let channel_lookup_timeout = std::time::Duration::from_secs(5);
     let is_dm = matches!(
-        tokio::time::timeout(channel_lookup_timeout, discord_channel_id.to_channel(http)).await,
-        Ok(Ok(serenity::model::channel::Channel::Private(_)))
+        discord_channel_id.to_channel(http).await,
+        Ok(serenity::model::channel::Channel::Private(_))
     );
-    let (allowlist_channel_id, provider_channel_name) = match tokio::time::timeout(
-        channel_lookup_timeout,
-        super::resolve_thread_parent(http, discord_channel_id),
-    )
-    .await
-    {
-        Ok(Some((pid, pname))) => (pid, pname.or(channel_name.clone())),
-        Ok(None) => (discord_channel_id, channel_name.clone()),
-        Err(_) => {
-            tracing::warn!(
-                channel_id,
-                provider = provider.as_str(),
-                "rebind channel metadata lookup timed out; falling back to direct channel validation",
-            );
+    let (allowlist_channel_id, provider_channel_name) =
+        if let Some((pid, pname)) = super::resolve_thread_parent(http, discord_channel_id).await {
+            (pid, pname.or(channel_name.clone()))
+        } else {
             (discord_channel_id, channel_name.clone())
-        }
-    };
+        };
     if validate_bot_channel_routing_with_provider_channel(
         &settings_snapshot,
         provider,
@@ -3556,13 +3555,10 @@ pub(crate) async fn rebind_inflight_for_channel(
     }
 
     let (default_output_path, input_fifo) = tmux_runtime_paths(&tmux_session_name);
-    let fallback_output_path = existing_saved_output_path
-        .clone()
-        .unwrap_or_else(|| default_output_path.clone());
     let (output_path, synthetic_initial_offset) = {
         #[cfg(unix)]
         {
-            match detect_live_tmux_output_path(&tmux_session_name, &fallback_output_path) {
+            match detect_live_tmux_output_path(&tmux_session_name, &default_output_path) {
                 Ok(Some(detected)) => {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!(
@@ -3575,15 +3571,15 @@ pub(crate) async fn rebind_inflight_for_channel(
                     (detected.path, detected.initial_offset)
                 }
                 Ok(None) => {
-                    let synthetic_initial_offset = std::fs::metadata(&fallback_output_path)
+                    let synthetic_initial_offset = std::fs::metadata(&default_output_path)
                         .map(|m| m.len())
                         .unwrap_or(0);
-                    (fallback_output_path.clone(), synthetic_initial_offset)
+                    (default_output_path.clone(), synthetic_initial_offset)
                 }
                 Err(stale) => {
                     return Err(RebindError::StaleOutputPath {
                         tmux_session: tmux_session_name.clone(),
-                        output_path: fallback_output_path.clone(),
+                        output_path: default_output_path.clone(),
                         live_fd: stale.fd,
                         live_inode: stale.inode,
                         live_path: stale.raw_path,
@@ -3593,10 +3589,10 @@ pub(crate) async fn rebind_inflight_for_channel(
         }
         #[cfg(not(unix))]
         {
-            let synthetic_initial_offset = std::fs::metadata(&fallback_output_path)
+            let synthetic_initial_offset = std::fs::metadata(&default_output_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            (fallback_output_path.clone(), synthetic_initial_offset)
+            (default_output_path.clone(), synthetic_initial_offset)
         }
     };
 
@@ -3626,28 +3622,7 @@ pub(crate) async fn rebind_inflight_for_channel(
         synthetic_initial_offset
     };
 
-    let recovered_state_for_session = if let Some(mut existing) = existing_inflight.clone() {
-        let expected = super::inflight::InflightTurnIdentity::from_state(&existing);
-        let expected_turn_start_offset = existing.turn_start_offset;
-        existing.tmux_session_name = Some(tmux_session_name.clone());
-        existing.output_path = Some(output_path.clone());
-        existing.input_fifo_path = Some(input_fifo.clone());
-        existing.set_relay_owner_kind(super::inflight::RelayOwnerKind::Watcher);
-        let save_outcome = super::inflight::set_relay_owner_kind_if_matches_identity(
-            provider,
-            existing.channel_id,
-            &expected,
-            expected_turn_start_offset,
-            super::inflight::RelayOwnerKind::Watcher,
-        );
-        if !matches!(save_outcome, super::inflight::GuardedSaveOutcome::Saved) {
-            tracing::warn!(
-                channel_id,
-                tmux_session = %tmux_session_name,
-                ?save_outcome,
-                "rebind could not stamp existing inflight as watcher-owned",
-            );
-        }
+    let recovered_state_for_session = if let Some(existing) = existing_inflight.clone() {
         existing
     } else {
         // Build and persist the new inflight state. No request_owner / msg_ids
@@ -3753,12 +3728,6 @@ pub(crate) async fn rebind_inflight_for_channel(
         restore_recovered_session_worktree(session, &recovered_state_for_session);
     }
 
-    let finish_mailbox_on_completion = if existing_inflight.is_some() {
-        reregister_active_turn_from_inflight(shared, &recovered_state_for_session).await
-    } else {
-        false
-    };
-
     // #1135: claim with the single-watcher policy. A live watcher for this
     // same tmux session is reused; a cancelled same-session handle or a
     // different-session channel incumbent is replaced so recovery is not
@@ -3796,17 +3765,12 @@ pub(crate) async fn rebind_inflight_for_channel(
             );
             if claim.should_spawn() {
                 shared.record_tmux_watcher_reconnect(discord_channel_id);
-                let restored_turn = super::tmux::restored_watcher_turn_from_inflight(
-                    &recovered_state_for_session,
-                    &tmux_session_name,
-                    finish_mailbox_on_completion,
-                );
                 super::task_supervisor::spawn_observed_tmux_watcher(
                     "recovery_restore_inflight_tmux_output_watcher",
                     shared.clone(),
                     tmux_session_name.clone(),
                     cancel.clone(),
-                    super::tmux::tmux_output_watcher_with_restore(
+                    super::tmux::tmux_output_watcher(
                         discord_channel_id,
                         http.clone(),
                         shared.clone(),
@@ -3819,7 +3783,6 @@ pub(crate) async fn rebind_inflight_for_channel(
                         pause_epoch,
                         turn_delivered,
                         last_heartbeat_ts_ms,
-                        restored_turn,
                     ),
                 );
             }
@@ -4073,47 +4036,28 @@ mod reregister_ledger_reseed_tests {
         );
     }
 
+    // Safety: a recovery turn WITHOUT a real user_msg_id (== 0) must be skipped by
+    // the early guard — it must NOT register a channel-only (id-0) orphan ledger
+    // entry that could collide with the watcher's id-0 submissions.
     #[tokio::test(flavor = "current_thread")]
-    async fn zero_user_msg_id_reseeds_with_finalizer_turn_id() {
+    async fn zero_user_msg_id_is_not_registered() {
         let shared = super::super::make_shared_data_for_tests_with_storage(None, None);
         let ch = ChannelId::new(52_483);
+        // user_msg_id == 0 (and thus the early guard returns false before any
+        // register_start).
         let mut state = active_turn_state(ch.get(), 0);
         state.user_msg_id = 0;
         state.current_msg_id = 0;
-        state.finalizer_turn_id = 9_010_777;
 
         let restored = super::reregister_active_turn_from_inflight(&shared, &state).await;
+        assert!(!restored, "a zero-id recovery turn is not re-attached");
         assert!(
-            restored,
-            "a zero user_msg_id turn with a stable finalizer_turn_id is re-attached"
-        );
-        assert!(
-            shared
+            !shared
                 .turn_finalizer
                 .has_live_watcher_pending(ch, shared.restart.current_generation)
                 .await,
-            "zero-id recovery must seed a Watcher entry under finalizer_turn_id"
+            "a zero user_msg_id turn must NOT seed an orphan ledger entry"
         );
-        let outcome = shared
-            .turn_finalizer
-            .submit_terminal(
-                super::super::turn_finalizer::TurnKey::new(
-                    ch,
-                    state.finalizer_turn_id,
-                    shared.restart.current_generation,
-                ),
-                ProviderKind::Claude,
-                super::super::turn_finalizer::TerminalEvent::GateTimeout {
-                    pane_quiescent: Some(false),
-                },
-                super::super::turn_finalizer::FinalizeContext::watcher(),
-                shared.clone(),
-            )
-            .await;
-        assert!(matches!(
-            outcome,
-            super::super::turn_finalizer::FinalizeOutcome::Deferred
-        ));
     }
 
     // #3089 A0 — characterization of the recovery probe-classified outcome

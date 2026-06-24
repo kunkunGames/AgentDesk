@@ -31,7 +31,7 @@ use completion_footer::{CompletionFooterRender, render_completion_footer};
 use context_panel::ContextPanelSnapshot;
 use recent_events::render_events;
 use session_panel::SessionPanelSnapshot;
-use status_panel::{CompletedKind, DerivedStatus, StatusPanelState, render_status_panel};
+use status_panel::{StatusPanelState, render_status_panel};
 pub(in crate::services::discord) use task_panel::TaskPanelInfo;
 use task_panel::{TaskPanelSnapshot, clean_task_panel_value};
 
@@ -41,7 +41,9 @@ use common::{
     STATUS_PANEL_WORKFLOW_LIMIT, STATUS_PANEL_WORKFLOW_PHASE_LIMIT,
 };
 #[cfg(test)]
-use status_panel::{render_recent_section_header, truncate_status_panel_sections};
+use status_panel::{
+    CompletedKind, DerivedStatus, render_recent_section_header, truncate_status_panel_sections,
+};
 
 pub(in crate::services::discord) use recent_events::RecentPlaceholderEvent;
 pub(in crate::services::discord) use status_events::{
@@ -84,13 +86,6 @@ pub(in crate::services::discord) struct LiveContextPanelSnapshot {
     pub(in crate::services::discord) provider_session_id: Option<String>,
     pub(in crate::services::discord) used_tokens: u64,
     pub(in crate::services::discord) context_window_tokens: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum TerminalUiObligationPanelStatus {
-    Pending,
-    Completed,
-    Deadline,
 }
 
 impl PlaceholderLiveEvents {
@@ -213,55 +208,6 @@ impl PlaceholderLiveEvents {
         for event in events {
             self.push_status_event(channel_id, event);
         }
-    }
-
-    /// #3393: bridge an observed `<task-notification>` XML user-record into the
-    /// live-panel terminal StatusEvents for `channel_id`.
-    pub(in crate::services::discord) fn bridge_task_notification_xml(
-        &self,
-        channel_id: ChannelId,
-        raw: &str,
-    ) {
-        let events = status_events::status_events_from_task_notification_xml(raw);
-        if events.is_empty() {
-            return;
-        }
-        let parsed = super::tui_task_card::parse_task_notification(raw);
-        tracing::info!(
-            channel_id = channel_id.get(),
-            kind = parsed.kind(),
-            tool_use_id = parsed.tool_use_id.as_deref().unwrap_or(""),
-            status = parsed.status.as_deref().unwrap_or(""),
-            "#3393: bridged user-record <task-notification> XML to live panel terminal StatusEvents"
-        );
-        self.push_status_events(channel_id, events);
-    }
-
-    pub(in crate::services::discord) fn task_notification_completion_visible_in_footer_for_mode(
-        &self,
-        channel_id: ChannelId,
-        raw: &str,
-        footer_mode_enabled: bool,
-    ) -> bool {
-        if !footer_mode_enabled {
-            return false;
-        }
-        let events =
-            status_events::status_events_from_task_notification_xml_for_footer_mode(raw, true);
-        if events.is_empty() {
-            return false;
-        }
-        let snapshot = self
-            .status_by_channel
-            .get(&channel_id)
-            .map(|entry| {
-                entry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            })
-            .unwrap_or_default();
-        task_notification_success_completion_visible_in_snapshot(&snapshot, &events)
     }
 
     pub(in crate::services::discord) fn set_session_panel_lifecycle_event(
@@ -490,41 +436,6 @@ impl PlaceholderLiveEvents {
         )
     }
 
-    pub(in crate::services::discord) fn render_terminal_ui_obligation_panel(
-        &self,
-        channel_id: ChannelId,
-        provider: &ProviderKind,
-        started_at_unix: i64,
-        status: TerminalUiObligationPanelStatus,
-    ) -> String {
-        let mut snapshot = self
-            .status_by_channel
-            .get(&channel_id)
-            .map(|entry| {
-                entry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone()
-            })
-            .unwrap_or_default();
-        snapshot.status = match status {
-            TerminalUiObligationPanelStatus::Pending => DerivedStatus::TerminalDeliveryPending,
-            TerminalUiObligationPanelStatus::Completed => DerivedStatus::Completed {
-                kind: CompletedKind::Foreground,
-            },
-            TerminalUiObligationPanelStatus::Deadline => DerivedStatus::TerminalDeliveryUnconfirmed,
-        };
-        let completed = matches!(status, TerminalUiObligationPanelStatus::Completed);
-        render_status_panel(
-            snapshot,
-            self.render_block(channel_id),
-            provider,
-            started_at_unix,
-            chrono::Utc::now().timestamp(),
-            !completed,
-        )
-    }
-
     // True when the live-panel compaction counts for this channel differ from
     // the last logged pair. Zero counts re-arm the gate (the next compaction
     // episode logs again) and never log themselves.
@@ -612,31 +523,4 @@ impl PlaceholderLiveEvents {
             .unwrap_or_default();
         render_completion_footer(snapshot, provider, indicator)
     }
-}
-
-fn task_notification_success_completion_visible_in_snapshot(
-    snapshot: &StatusPanelState,
-    events: &[StatusEvent],
-) -> bool {
-    events.iter().any(|event| match event {
-        StatusEvent::BackgroundTaskEnd {
-            tool_use_id,
-            success: true,
-        } => snapshot.tasks.iter().any(|slot| {
-            slot.background && slot.tool_use_id.as_deref() == Some(tool_use_id.as_str())
-        }),
-        StatusEvent::SubagentEnd {
-            success: true,
-            tool_use_id: Some(tool_use_id),
-            ack_only: false,
-            ..
-        } => snapshot
-            .subagents
-            .iter()
-            .any(|slot| slot.tool_use_id.as_deref() == Some(tool_use_id.as_str())),
-        // Completion footers render Tasks/Subagents only. Suppressing Workflow
-        // completion cards here would drop the only completion signal.
-        StatusEvent::WorkflowEnd { .. } => false,
-        _ => false,
-    })
 }

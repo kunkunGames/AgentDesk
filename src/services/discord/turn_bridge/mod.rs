@@ -1175,7 +1175,7 @@ fn handle_watcher_runtime_handoff(
             shared_owned.turn_finalizer.register_start(
                 super::turn_finalizer::TurnKey::new(
                     channel_id,
-                    inflight_state.effective_finalizer_turn_id(),
+                    inflight_state.user_msg_id,
                     shared_owned.restart.current_generation,
                 ),
                 provider.clone(),
@@ -3086,16 +3086,18 @@ pub(super) fn spawn_turn_bridge(
                                     // `handle_watcher_runtime_handoff` helper.
                                     // This legacy `StreamMessage::TmuxReady`
                                     // handoff does NOT go through that helper, so
-                                    // without this the watcher terminal would
-                                    // have no Watcher-owned ledger entry — and
-                                    // a busy-pane gate-timeout would finalize
-                                    // immediately instead of arming the
-                                    // deadline-backstop. Registering here with
-                                    // the same finalizer id makes it defer.
+                                    // without this the watcher's channel-only
+                                    // (id-0) GateTimeout/Complete submissions
+                                    // would create a `RelayOwnerKind::None`
+                                    // ledger entry — and a busy-pane gate-timeout
+                                    // would then finalize immediately instead of
+                                    // arming the deadline-backstop. Registering
+                                    // here with the Watcher owner makes the
+                                    // gate-timeout defer correctly.
                                     shared_owned.turn_finalizer.register_start(
                                         super::turn_finalizer::TurnKey::new(
                                             channel_id,
-                                            inflight_state.effective_finalizer_turn_id(),
+                                            inflight_state.user_msg_id,
                                             shared_owned.restart.current_generation,
                                         ),
                                         provider.clone(),
@@ -4132,7 +4134,10 @@ pub(super) fn spawn_turn_bridge(
                     .submit_terminal(
                         super::turn_finalizer::TurnKey::new(
                             channel_id,
-                            inflight_state.effective_finalizer_turn_id(),
+                            // user_msg_id == 0 collapses to the channel-only
+                            // terminal that `turn_finalizer` already supports
+                            // (recovery/orphan path) instead of panicking.
+                            user_msg_id.map(|id| id.get()).unwrap_or(0),
                             shared_owned.restart.current_generation,
                         ),
                         provider.clone(),
@@ -4221,7 +4226,9 @@ pub(super) fn spawn_turn_bridge(
                 .submit_terminal(
                     super::turn_finalizer::TurnKey::new(
                         channel_id,
-                        inflight_state.effective_finalizer_turn_id(),
+                        // user_msg_id == 0 → channel-only terminal key, which
+                        // turn_finalizer already supports (recovery/orphan path).
+                        user_msg_id.map(|id| id.get()).unwrap_or(0),
                         shared_owned.restart.current_generation,
                     ),
                     provider.clone(),
@@ -4573,29 +4580,17 @@ pub(super) fn spawn_turn_bridge(
                 // `NoRange` has NO new bytes → no advance outside a lease (codex
                 // P1-b: a degenerate equal-nonzero range must not advance).
                 if let Some(lease) = stop_lease {
-                    let lease_range = lease.range();
                     let outcome = if replace_committed {
                         crate::services::discord::LeaseOutcome::Delivered
                     } else {
                         crate::services::discord::LeaseOutcome::NotDelivered
                     };
-                    let committed = lease.commit_and_advance(
+                    lease.commit_and_advance(
                         shared_owned.as_ref(),
                         watcher_owner_channel_id,
                         inflight_state.tmux_session_name.as_deref(),
                         outcome,
                     );
-                    if replace_committed && committed {
-                        super::outbound::delivery_record::shadow_mirror_delivered_frontier(
-                            shared_owned.as_ref(),
-                            &provider,
-                            watcher_owner_channel_id,
-                            lease_range,
-                            true,
-                            Some(current_msg_id.get()),
-                            Some(channel_id.get()),
-                        );
-                    }
                 }
                 if !replace_committed {
                     preserve_inflight_for_cleanup_retry = true;
@@ -4669,29 +4664,17 @@ pub(super) fn spawn_turn_bridge(
                 // B6 (codex P1-b): advance ONLY via a successful lease commit.
                 // NoRange has no new bytes → no advance outside the lease.
                 if let Some(lease) = plt_lease {
-                    let lease_range = lease.range();
                     let outcome = if replace_committed {
                         crate::services::discord::LeaseOutcome::Delivered
                     } else {
                         crate::services::discord::LeaseOutcome::NotDelivered
                     };
-                    let committed = lease.commit_and_advance(
+                    lease.commit_and_advance(
                         shared_owned.as_ref(),
                         watcher_owner_channel_id,
                         inflight_state.tmux_session_name.as_deref(),
                         outcome,
                     );
-                    if replace_committed && committed {
-                        super::outbound::delivery_record::shadow_mirror_delivered_frontier(
-                            shared_owned.as_ref(),
-                            &provider,
-                            watcher_owner_channel_id,
-                            lease_range,
-                            true,
-                            Some(current_msg_id.get()),
-                            Some(channel_id.get()),
-                        );
-                    }
                 }
                 if !replace_committed {
                     preserve_inflight_for_cleanup_retry = true;
@@ -5339,39 +5322,17 @@ pub(super) fn spawn_turn_bridge(
                                 );
                                 // #3041 P1-2 / B6: confirmed_end advance flows ONLY through the lease commit — `Delivered` on a committed replace, `NotDelivered` otherwise (mirrors pre-P1-2).
                                 let outcome = if let Some(lease) = lease {
-                                    let lease_range = lease.range();
                                     let outcome = if replace_committed {
                                         crate::services::discord::LeaseOutcome::Delivered
                                     } else {
                                         crate::services::discord::LeaseOutcome::NotDelivered
                                     };
-                                    let committed = lease.commit_and_advance(
+                                    lease.commit_and_advance(
                                         shared_owned.as_ref(),
                                         watcher_owner_channel_id,
                                         inflight_state.tmux_session_name.as_deref(),
                                         outcome,
                                     );
-                                    // #3630: durably mirror the delivered frontier (like
-                                    // the cutover/long-chunk paths) so a post-restart
-                                    // no-inflight watcher dedups it instead of re-relaying
-                                    // the already-delivered body as a DUPLICATE. Gate on
-                                    // `replace_committed && committed`: commit_and_advance
-                                    // returns true on ANY successful lease commit (incl.
-                                    // NotDelivered) but only Delivered advances
-                                    // confirmed_end_offset — recording on NotDelivered would
-                                    // break M4 (durable END must mirror confirmed_end) and
-                                    // wrongly suppress a retry (#3610, codex #3630 review).
-                                    if replace_committed && committed {
-                                        super::outbound::delivery_record::shadow_mirror_delivered_frontier(
-                                            shared_owned.as_ref(),
-                                            &provider,
-                                            watcher_owner_channel_id,
-                                            lease_range,
-                                            true,
-                                            Some(current_msg_id.get()),
-                                            Some(channel_id.get()),
-                                        );
-                                    }
                                     replace_committed
                                 } else {
                                     // NoRange (zero/inverted range or no tmux session): NO new bytes → deliver without a lease and WITHOUT advancing (codex P1-b: no advance outside a commit).
@@ -5689,26 +5650,6 @@ pub(super) fn spawn_turn_bridge(
                     if tui_quiescence_timeout_requires_inflight_retry(terminal_delivery_committed) {
                         preserve_inflight_for_cleanup_retry = true;
                     } else {
-                        let terminal_ui_status_msg_id = normalize_status_panel_message_id(
-                            inflight_state.status_message_id.map(MessageId::new),
-                        );
-                        if super::terminal_ui_obligation::should_record_terminal_ui_obligation(
-                                terminal_delivery_committed,
-                                true,
-                                terminal_ui_status_msg_id.is_some(),
-                            )
-                            && let Some(status_msg_id) = terminal_ui_status_msg_id
-                        {
-                            super::terminal_ui_obligation::record_terminal_ui_obligation_pending_status(
-                                shared_owned.as_ref(),
-                                &provider,
-                                channel_id,
-                                status_msg_id,
-                                status_panel_started_at,
-                                &inflight_state,
-                            )
-                            .await;
-                        }
                         tracing::warn!(
                             provider = %provider.as_str(),
                             channel = channel_id.get(),

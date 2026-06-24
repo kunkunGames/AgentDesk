@@ -13,7 +13,6 @@ mod receipt;
 mod recovery_ops;
 mod restart;
 mod session;
-mod sidecar;
 mod skill;
 mod steer;
 mod text_commands;
@@ -39,7 +38,7 @@ pub(in crate::services::discord) use config::{
 };
 pub(super) use config::{cmd_adduser, cmd_allowall, cmd_allowed, cmd_allowedtools, cmd_removeuser};
 pub(in crate::services::discord) use control::{
-    SoftClearNotifyMode, clear_channel_session_state, reset_channel_provider_state,
+    clear_channel_session_state, notify_turn_stop, reset_channel_provider_state,
     reset_managed_process_session, reset_provider_session_if_pending,
 };
 pub(super) use control::{cmd_clear, cmd_down, cmd_shell, cmd_stop};
@@ -60,7 +59,6 @@ pub(super) use receipt::{cmd_receipt, cmd_usage};
 pub(super) use recovery_ops::{cmd_deadlock_recover, cmd_machine_flip, cmd_stuck_pr_rebase};
 pub(super) use restart::cmd_restart;
 pub(super) use session::{cmd_pwd, cmd_start};
-pub(super) use sidecar::cmd_sidecar;
 pub(in crate::services::discord) use skill::build_provider_skill_prompt;
 pub(super) use skill::{cmd_cc, cmd_skill};
 pub(super) use steer::cmd_steer;

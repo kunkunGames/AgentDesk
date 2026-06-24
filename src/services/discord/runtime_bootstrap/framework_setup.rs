@@ -109,11 +109,6 @@ pub(super) async fn run_bot_framework_setup(
         &health_registry_for_setup,
         api_port,
     );
-    super::spawns::run_bot_spawn_periodic_catch_up(
-        ctx.http.clone(),
-        &shared_for_tmux,
-        &provider_for_setup,
-    );
 
     // Background: periodic cleanup for stale Discord upload files
     super::spawns::run_bot_spawn_upload_cleanup();
@@ -144,15 +139,6 @@ pub(super) async fn run_bot_framework_setup(
         shared_clone.clone(),
         provider_for_setup.clone(),
         health_registry_for_setup.started_at_unix(),
-    );
-
-    // #3607: durable UI-only reconciliation for terminal-delivered turns whose
-    // TUI quiescence confirmation timed out. The sidecar survives restart; the
-    // sweeper picks up existing records on its first immediate tick.
-    super::terminal_ui_obligation::spawn_terminal_ui_obligation_sweeper(
-        ctx.http.clone(),
-        shared_clone.clone(),
-        provider_for_setup.clone(),
     );
 
     // #2436 (#2427 B wire): heartbeat-gap → explicit
@@ -227,7 +213,6 @@ pub(super) fn run_bot_build_slash_commands() -> Vec<poise::Command<Data, Error>>
         commands::cmd_cc(),
         commands::cmd_metrics(),
         commands::cmd_model(),
-        commands::cmd_sidecar(),
         commands::cmd_fast(),
         commands::cmd_goals(),
         commands::cmd_effort(),

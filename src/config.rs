@@ -1962,23 +1962,7 @@ fn default_database_user() -> String {
     "agentdesk".into()
 }
 fn default_database_pool_max() -> u32 {
-    // Sized for the always-on background DB consumers (cluster heartbeat,
-    // dispatch/message outbox claiming, observability flush, session-discovery,
-    // policy-tick, routine recovery) plus foreground turn ingestion. At 12 the
-    // steady-state pool was already near-saturated and any burst (e.g. a
-    // post-restart catch-up sweep coinciding with a turn) pushed it into
-    // sustained `acquire_timeout` errors, delaying message ingestion.
-    //
-    // Upper bound is the shared Postgres `max_connections` (100, minus 3
-    // superuser-reserved = 97 usable). During boot a node runs BOTH the runtime
-    // pool (this value) AND the startup warmup pool (1.5x, see
-    // `startup_pool_settings`) concurrently until boot reconcile drops the
-    // warmup pool — a per-node peak of `2.5 * pool_max`. With two cluster nodes
-    // potentially booting at once (coordinated deploy), the worst case is
-    // `2 * 2.5 * pool_max`, which must stay under 97. 18 → 2*(18+27)=90, leaving
-    // headroom for psql/admin. Going higher requires raising Postgres
-    // `max_connections` or capping the warmup multiplier first.
-    18
+    12
 }
 fn default_cluster_role() -> String {
     "auto".into()
@@ -2121,16 +2105,6 @@ pub struct RoutinesConfig {
     /// day per routine).
     #[serde(default = "default_routines_stale_paused_alert_ttl_secs")]
     pub stale_paused_alert_ttl_secs: u64,
-    /// Opt-in auto-resume: automatically re-enable routines whose
-    /// `pause_reason = 'failure'` and that have been paused for at least this
-    /// many seconds (backoff window). Routines with `pause_reason = 'manual'`,
-    /// `'migration_invalid'`, or `NULL` (pre-existing rows) are NEVER touched.
-    /// The `ResumeRequiresNextDueAt` guard also applies: schedule-less routines
-    /// with no `next_due_at` are skipped.
-    ///
-    /// Defaults to 0 (disabled). Set to e.g. 3600 (1 hour) to enable.
-    #[serde(default)]
-    pub failure_pause_auto_resume_secs: u64,
 }
 
 impl Default for RoutinesConfig {
@@ -2148,7 +2122,6 @@ impl Default for RoutinesConfig {
             hot_reload: true,
             stale_paused_alert_secs: 0,
             stale_paused_alert_ttl_secs: default_routines_stale_paused_alert_ttl_secs(),
-            failure_pause_auto_resume_secs: 0,
         }
     }
 }

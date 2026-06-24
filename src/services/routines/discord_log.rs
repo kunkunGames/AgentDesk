@@ -1617,7 +1617,6 @@ mod tests {
             discord_thread_id: None,
             timeout_secs: None,
             in_flight_run_id: None,
-            pause_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1690,7 +1689,6 @@ mod tests {
             discord_thread_id: None,
             timeout_secs: None,
             in_flight_run_id: None,
-            pause_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1736,7 +1734,6 @@ mod tests {
             discord_thread_id: Some("1499416722204004372".to_string()),
             timeout_secs: None,
             in_flight_run_id: None,
-            pause_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1778,7 +1775,6 @@ mod tests {
             discord_thread_id: None,
             timeout_secs: None,
             in_flight_run_id: None,
-            pause_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1823,7 +1819,6 @@ mod tests {
             discord_thread_id: None,
             timeout_secs: None,
             in_flight_run_id: None,
-            pause_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

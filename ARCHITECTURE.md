@@ -101,7 +101,6 @@ src/
 │   ├── idempotency.rs
 │   ├── intake_outbox.rs
 │   ├── kanban.rs
-│   ├── meetings.rs
 │   ├── memento_feedback_stats.rs
 │   ├── mod.rs
 │   ├── postgres.rs
@@ -143,8 +142,7 @@ src/
 │   │   ├── queue_ops.rs
 │   │   ├── review_automation_ops.rs
 │   │   ├── review_ops.rs
-│   │   ├── runtime_ops.rs
-│   │   └── turn_ops.rs
+│   │   └── runtime_ops.rs
 │   ├── hooks.rs
 │   ├── intent.rs
 │   ├── loader.rs
@@ -391,7 +389,6 @@ src/
 │   │   │   ├── recovery_ops.rs
 │   │   │   ├── restart.rs
 │   │   │   ├── session.rs
-│   │   │   ├── sidecar.rs
 │   │   │   ├── skill.rs
 │   │   │   ├── steer.rs
 │   │   │   ├── text_commands.rs
@@ -414,7 +411,6 @@ src/
 │   │   │   └── scrollback.rs
 │   │   ├── inflight/
 │   │   │   ├── budget.rs
-│   │   │   ├── finalizer_identity.rs
 │   │   │   ├── model.rs
 │   │   │   └── store.rs
 │   │   ├── outbound/
@@ -652,7 +648,6 @@ src/
 │   │   ├── settings.rs
 │   │   ├── shared_memory.rs
 │   │   ├── shared_state.rs
-│   │   ├── sidecar_interaction.rs
 │   │   ├── single_message_panel.rs
 │   │   ├── stall_recovery.rs
 │   │   ├── standby_relay.rs
@@ -661,7 +656,6 @@ src/
 │   │   ├── steering.rs
 │   │   ├── streaming_finalizer.rs
 │   │   ├── task_supervisor.rs
-│   │   ├── terminal_ui_obligation.rs
 │   │   ├── tmux.rs
 │   │   ├── tmux_error_detect.rs
 │   │   ├── tmux_kill_policy.rs

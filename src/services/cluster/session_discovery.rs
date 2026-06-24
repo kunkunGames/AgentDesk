@@ -42,13 +42,12 @@
 //! [`request_discovery_tick`] for that purpose so future PRs can nudge the
 //! loop without changing this module.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sqlx::{PgPool, Row as SqlxRow};
+use sqlx::PgPool;
 use tokio::sync::Notify;
 
 use super::session_matcher::{
@@ -57,7 +56,7 @@ use super::session_matcher::{
 };
 use super::session_registry::{RegistryChange, SessionRegistry, global_session_registry};
 use crate::services::platform::tmux::{EnumeratedSession, list_sessions_with_pane_command};
-use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
+use crate::services::provider::ProviderKind;
 
 /// Knobs for the discovery loop. Production callers use [`Self::default`].
 /// Kept as a struct (rather than a bare `Duration`) so future tuning (jitter,
@@ -111,8 +110,7 @@ pub async fn build_channel_directory_from_pg(
     let name_map = tokio::task::spawn_blocking(build_yaml_channel_name_map)
         .await
         .unwrap_or_default();
-    let session_tmux_segments = load_session_tmux_segments_pg(pool).await?;
-    build_channel_directory_from_pg_with_config(pool, name_map, session_tmux_segments).await
+    build_channel_directory_from_pg_with_config(pool, name_map).await
 }
 
 /// Lookup table: `(agent_id, provider, channel_id) → channel_name`. Built once
@@ -123,8 +121,7 @@ pub async fn build_channel_directory_from_pg(
 /// Without this, the directory keys collapse to `(provider, channel_id)` and
 /// fail to match `AgentDesk-{provider}-{channel_name}` sessions, leaving the
 /// post-restart adoption path silently broken (issue #2465).
-pub type ChannelNameMap = HashMap<(String, ProviderKind, String), String>;
-type SessionTmuxSegmentMap = HashMap<(ProviderKind, String), String>;
+pub type ChannelNameMap = std::collections::HashMap<(String, ProviderKind, String), String>;
 
 /// Build the channel-name map from the live yaml config. Returns an empty map
 /// on any failure so discovery degrades gracefully (legacy snowflake-keyed
@@ -152,7 +149,6 @@ pub fn build_yaml_channel_name_map() -> ChannelNameMap {
 async fn build_channel_directory_from_pg_with_config(
     pool: &PgPool,
     name_map: ChannelNameMap,
-    session_tmux_segments: SessionTmuxSegmentMap,
 ) -> Result<ChannelDirectory, sqlx::Error> {
     let all = crate::db::agents::load_all_agent_channel_bindings_pg(pool).await?;
 
@@ -170,12 +166,7 @@ async fn build_channel_directory_from_pg_with_config(
             // `channel_id` preserves legacy bindings without a yaml entry.
             let tmux_segment = name_map
                 .get(&(agent_id.clone(), provider.clone(), channel_id.clone()))
-                .cloned()
-                .or_else(|| {
-                    session_tmux_segments
-                        .get(&(provider.clone(), channel_id.clone()))
-                        .cloned()
-                });
+                .cloned();
             let binding = ChannelBinding {
                 channel_id,
                 agent_id: agent_id.clone(),
@@ -192,89 +183,6 @@ async fn build_channel_directory_from_pg_with_config(
         }
     }
     Ok(directory)
-}
-
-/// Best-effort post-restart adoption aid:
-///
-/// `agentdesk.yaml` is the preferred source for a Discord channel's tmux
-/// segment, but some operator/by-id channels only exist in the database. Live
-/// provider sessions still persist their exact `session_key` as
-/// `...:AgentDesk-{provider}-{tmux_segment}`. Use that runtime fact as a
-/// fallback so discovery can re-bind an already-running tmux session after
-/// dcserver restarts instead of logging it as an unowned operator session.
-async fn load_session_tmux_segments_pg(
-    pool: &PgPool,
-) -> Result<SessionTmuxSegmentMap, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT provider, channel_id, session_key
-         FROM sessions
-         WHERE NULLIF(TRIM(channel_id), '') IS NOT NULL
-           AND NULLIF(TRIM(session_key), '') IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
-
-    let mut map = SessionTmuxSegmentMap::new();
-    for row in rows {
-        let channel_id: Option<String> = row.try_get("channel_id")?;
-        let session_key: Option<String> = row.try_get("session_key")?;
-        let provider_hint: Option<String> = row.try_get("provider")?;
-        let Some(channel_id) = normalize_nonempty(channel_id.as_deref()) else {
-            continue;
-        };
-        let Some(session_key) = session_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        else {
-            continue;
-        };
-        let Some((provider, tmux_segment)) = tmux_segment_from_session_key(session_key) else {
-            continue;
-        };
-        if let Some(hint) = provider_hint
-            .as_deref()
-            .and_then(|value| ProviderKind::from_str(value.trim()))
-            && hint != provider
-        {
-            tracing::debug!(
-                session_key = %session_key,
-                provider_hint = ?hint,
-                parsed_provider = ?provider,
-                "session-discovery: ignoring mismatched sessions.provider while deriving tmux segment",
-            );
-        }
-        match map.entry((provider, channel_id)) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(tmux_segment);
-            }
-            std::collections::hash_map::Entry::Occupied(existing)
-                if existing.get() != &tmux_segment =>
-            {
-                tracing::debug!(
-                    channel_id = %existing.key().1,
-                    provider = ?existing.key().0,
-                    existing_tmux_segment = %existing.get(),
-                    candidate_tmux_segment = %tmux_segment,
-                    "session-discovery: keeping first runtime tmux segment for channel",
-                );
-            }
-            std::collections::hash_map::Entry::Occupied(_) => {}
-        }
-    }
-    Ok(map)
-}
-
-fn normalize_nonempty(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn tmux_segment_from_session_key(session_key: &str) -> Option<(ProviderKind, String)> {
-    let (_, tmux_name) = session_key.rsplit_once(':')?;
-    parse_provider_and_channel_from_tmux_name(tmux_name)
 }
 
 /// Extract the `(provider, channel_id)` pairs an agent declares. Today this
@@ -295,7 +203,6 @@ fn channel_pairs_for_agent(
     // Claude → discord_channel_cc; Codex → discord_channel_cdx.
     push(ProviderKind::Claude, bindings.discord_channel_cc.clone());
     push(ProviderKind::Codex, bindings.discord_channel_cdx.clone());
-    push(ProviderKind::Codex, bindings.discord_channel_alt.clone());
 
     // Legacy primary channel: routed under the configured provider when set.
     if let Some(provider_str) = bindings.provider.as_deref() {

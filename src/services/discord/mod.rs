@@ -46,7 +46,6 @@ mod replace_outcome_policy;
 pub(crate) mod response_sanitizer;
 #[cfg(unix)]
 mod session_relay_sink;
-mod sidecar_interaction;
 // #2011 Phase 5.3: standalone JSONL → Discord relay loop on cluster-standby nodes (leader uses tmux_watcher's relay path).
 #[cfg(unix)]
 mod standby_relay;
@@ -77,7 +76,6 @@ mod status_panel_orphan_store;
 mod steering;
 pub(in crate::services::discord) mod streaming_finalizer;
 pub(in crate::services::discord) mod task_supervisor;
-mod terminal_ui_obligation;
 #[cfg(unix)]
 mod tmux;
 #[cfg(unix)]

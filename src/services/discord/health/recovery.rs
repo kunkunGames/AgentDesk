@@ -1190,7 +1190,7 @@ pub fn spawn_watchdog(port: u16) {
 /// All gates must hold:
 /// - `attached == true` and `desynced == true` (snapshot already classified
 ///   the watcher as detached/diverged), AND
-/// - `inflight_started_at` is older than `threshold_secs` seconds
+/// - `inflight_updated_at` is older than `threshold_secs` seconds
 ///   (defaults to `2 * INFLIGHT_STALENESS_THRESHOLD_SECS`), AND
 /// - `terminal_delivery_committed == false` (the in-flight row is NOT a
 ///   normally-completed turn that is merely sleeping; see below).
@@ -1308,21 +1308,21 @@ async fn preserve_resume_selector_on_force_clean(
 /// turns keeps the watchdog targeting only genuinely hung (never-completed)
 /// turns.
 ///
-/// #3041 post-restart grace: the current turn's `started_at` may predate a
-/// dcserver restart. Right after deploy/restart every watcher is transiently
-/// `desynced` (relay offsets not yet re-synced), so the bare
-/// `now - started_at >= threshold` test could fire immediately and force-kill
-/// a perfectly healthy work session that simply hadn't re-synced yet. Anchoring
-/// the age at `max(started_at, boot)` restarts the staleness clock at boot,
-/// giving the watcher a full `threshold_secs` window after restart to re-sync
-/// (which clears `desynced` and the kill never happens). A genuinely hung turn
-/// stays desynced past that window and is still cleaned.
-/// #3656: age from the current turn's `started_at` (not `updated_at`) so consecutive short turns under one session key don't accumulate into a fake stall.
+/// #3041 post-restart grace: `inflight_updated_at` is frozen at the wall-clock
+/// time of the last relay write *before* a dcserver restart. Right after a
+/// deploy/restart every watcher is transiently `desynced` (relay offsets not
+/// yet re-synced) while its inflight row already reads arbitrarily stale — so
+/// the bare `now - updated_at >= threshold` test fires immediately and
+/// force-kills a perfectly healthy work session that simply hadn't re-synced
+/// yet. Anchoring the age at `max(updated_at, boot)` restarts the staleness
+/// clock at boot, giving the watcher a full `threshold_secs` window after the
+/// restart to re-sync (which clears `desynced` and the kill never happens).
+/// A genuinely hung turn stays desynced past that window and is still cleaned.
 pub(crate) fn stall_watchdog_should_force_clean(
     attached: bool,
     desynced: bool,
     inflight_terminal_delivery_committed: bool,
-    inflight_started_at: Option<&str>,
+    inflight_updated_at: Option<&str>,
     now_unix_secs: i64,
     threshold_secs: u64,
     boot_unix_secs: i64,
@@ -1335,16 +1335,16 @@ pub(crate) fn stall_watchdog_should_force_clean(
     if inflight_terminal_delivery_committed {
         return false;
     }
-    let Some(started_at) = inflight_started_at else {
+    let Some(updated_at) = inflight_updated_at else {
         return false;
     };
-    let Some(started_at_unix) = discord::inflight::parse_updated_at_unix(started_at) else {
+    let Some(updated_at_unix) = discord::inflight::parse_updated_at_unix(updated_at) else {
         return false;
     };
     // #3041: never count staleness that accrued before this process booted —
-    // a pre-restart turn `started_at` must not instantly satisfy the
+    // a pre-restart-frozen `updated_at` must not instantly satisfy the
     // threshold the moment the watchdog's initial delay elapses.
-    let age_anchor = started_at_unix.max(boot_unix_secs);
+    let age_anchor = updated_at_unix.max(boot_unix_secs);
     let age_secs = now_unix_secs.saturating_sub(age_anchor);
     age_secs >= 0 && (age_secs as u64) >= threshold_secs
 }
@@ -1392,42 +1392,6 @@ pub(crate) fn inflight_completed_stale_leak_detected(
     };
     let age_secs = now_unix_secs.saturating_sub(updated_at_unix);
     age_secs >= 0 && (age_secs as u64) >= threshold_secs
-}
-
-/// #3629: clean-vs-preserve fork for a completed-stale inflight that has NO
-/// unrelayed answer. Reached only after [`inflight_completed_stale_leak_detected`]
-/// already held — i.e. the relay is healthy, the mailbox has NO active turn,
-/// the tmux session is alive, and the row is stale. The sole remaining
-/// discriminator is whether the turn ever committed a terminal delivery:
-///
-/// - `terminal_delivery_committed == true` → the answer WAS delivered and the
-///   session is merely idle now (e.g. a #3126 wakeup-waiting loop, or a turn
-///   whose answer the watcher relayed). PRESERVE — the user may still send the
-///   next message and the delivered response must not be disturbed.
-/// - `terminal_delivery_committed == false` → nothing was ever delivered AND
-///   there is nothing left to deliver (no unrelayed answer): a NO_REPLY / empty
-///   terminal turn. The bridge left an inflight row that no answer will ever
-///   fill and that no live turn owns, so it never self-clears and the external
-///   deadlock monitor flags it every ~30 min forever (#3629). CLEAN it.
-///
-/// The removal at the call site is identity-guarded against the on-disk
-/// `user_msg_id`, so a newer turn's row is never clobbered — this predicate only
-/// decides intent. Kept as a pure seam so the fork is unit-testable without
-/// driving the watchdog loop.
-///
-/// `this_turn_user_msg_id == 0` is NEVER cleaned (codex #3629 review): a zero-id
-/// row cannot be distinguished from a LIVE recovery/TUI-direct turn
-/// (`RecoveryKickoff` holds a live cancel_token with `active_user_message_id =
-/// None`, so the "no active mailbox turn" precondition does not prove it is
-/// dead) nor from a NEWER pinned zero-id turn (the zero-owned guard only checks
-/// `user_msg_id == 0`, not identity). Only a real, non-zero user_msg_id can be
-/// identity-guarded safely, so zero-id rows keep the prior detection-only
-/// behavior.
-pub(crate) fn completed_stale_no_answer_orphan_should_clean(
-    terminal_delivery_committed: bool,
-    this_turn_user_msg_id: u64,
-) -> bool {
-    !terminal_delivery_committed && this_turn_user_msg_id != 0
 }
 
 fn outbound_activity_is_recent(
@@ -1713,7 +1677,7 @@ pub(crate) async fn run_stall_watchdog_pass(
             snapshot.attached,
             snapshot.desynced,
             snapshot.inflight_terminal_delivery_committed,
-            snapshot.inflight_started_at.as_deref(),
+            snapshot.inflight_updated_at.as_deref(),
             now_unix_secs,
             STALL_WATCHDOG_THRESHOLD_SECS,
             registry.started_at_unix(),
@@ -1793,55 +1757,6 @@ pub(crate) async fn run_stall_watchdog_pass(
                         .is_some()
                 });
                 if !has_unrelayed_answer {
-                    // #3629: a completed-stale row with no unrelayed answer is
-                    // either a delivered-and-idle turn (committed → preserve) or
-                    // a never-committed NO_REPLY/empty orphan (clean). We only
-                    // reach here when the mailbox has NO active turn and the
-                    // relay is healthy. Only a real, NON-ZERO user_msg_id is
-                    // cleaned — zero-id rows are never auto-cleaned because they
-                    // can be a live recovery/TUI-direct turn or a newer pinned
-                    // zero-id turn (codex #3629 review). See
-                    // `completed_stale_no_answer_orphan_should_clean`.
-                    let terminal_committed = leak_inflight
-                        .as_ref()
-                        .is_some_and(|s| s.terminal_delivery_committed);
-                    let this_turn_user_msg_id =
-                        leak_inflight.as_ref().map(|s| s.user_msg_id).unwrap_or(0);
-                    if completed_stale_no_answer_orphan_should_clean(
-                        terminal_committed,
-                        this_turn_user_msg_id,
-                    ) {
-                        // Identity-guarded removal: a newer turn that has since
-                        // written this channel's row yields UserMsgMismatch and
-                        // is preserved; planned-restart / rebind-origin rows are
-                        // skipped. We only ever delete THIS leaked turn's row.
-                        let clear_outcome = discord::inflight::clear_inflight_state_if_matches(
-                            provider,
-                            channel_id.get(),
-                            this_turn_user_msg_id,
-                        );
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::warn!(
-                            "  [{ts}] 🧹 #3629 cleaned NO_REPLY/empty orphan inflight on channel {} (provider={}, outcome={:?})",
-                            channel_id,
-                            provider.as_str(),
-                            clear_outcome
-                        );
-                        crate::services::observability::emit_inflight_lifecycle_event(
-                            provider.as_str(),
-                            channel_id.get(),
-                            leak_dispatch_id.as_deref(),
-                            leak_session_key.as_deref(),
-                            leak_turn_id.as_deref(),
-                            "leak_cleaned_noreply_orphan",
-                            serde_json::json!({
-                                "guarded_clear_outcome": format!("{clear_outcome:?}"),
-                                "inflight_started_at": snapshot.inflight_started_at,
-                                "inflight_updated_at": snapshot.inflight_updated_at,
-                                "tmux_session_alive": snapshot.tmux_session_alive,
-                            }),
-                        );
-                    }
                     continue;
                 }
                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -2724,13 +2639,12 @@ mod stall_watchdog_pure_tests {
     use super::super::stall_liveness::stall_watchdog_jsonl_liveness_defers_force_clean;
     use super::{
         LeakRecoveryLedgerIdentity, STALL_WATCHDOG_THRESHOLD_SECS,
-        completed_stale_no_answer_orphan_should_clean, force_clean_should_preserve_resume_selector,
-        inflight_completed_stale_leak_detected, leak_recovery_chunk_fingerprints,
-        leak_recovery_clear_chunk_ledger, leak_recovery_confirmed_chunk_count,
-        leak_recovery_confirmed_prefix_from_ledger, leak_recovery_record_confirmed_chunk,
-        leak_recovery_unrelayed_range, preserve_cancel_should_skip_provider_interrupt_for_idle_tui,
-        render_leak_recovery_delivery, stale_idle_foreground_queue_detected,
-        stall_watchdog_should_force_clean,
+        force_clean_should_preserve_resume_selector, inflight_completed_stale_leak_detected,
+        leak_recovery_chunk_fingerprints, leak_recovery_clear_chunk_ledger,
+        leak_recovery_confirmed_chunk_count, leak_recovery_confirmed_prefix_from_ledger,
+        leak_recovery_record_confirmed_chunk, leak_recovery_unrelayed_range,
+        preserve_cancel_should_skip_provider_interrupt_for_idle_tui, render_leak_recovery_delivery,
+        stale_idle_foreground_queue_detected, stall_watchdog_should_force_clean,
         stall_watchdog_should_force_clean_orphan_explicit_background_work,
     };
     use crate::services::discord::relay_health::{RelayActiveTurn, RelayStallState};
@@ -3045,27 +2959,6 @@ mod stall_watchdog_pure_tests {
             .expect("valid local time")
             .format("%Y-%m-%d %H:%M:%S")
             .to_string()
-    }
-
-    /// #3629: a completed-stale, no-unrelayed-answer row is cleaned ONLY when it
-    /// never committed a terminal delivery (NO_REPLY/empty orphan) AND it has a
-    /// real, non-zero user_msg_id. A committed delivered-and-idle row (#3126
-    /// wakeup-waiting) and any zero-id row (live recovery / newer pinned zero-id
-    /// turn, codex #3629 review) must be preserved.
-    #[test]
-    fn completed_stale_no_answer_orphan_cleans_only_uncommitted_nonzero() {
-        let real_id = 9_100_084_013_837_195_159u64;
-        // NO_REPLY / empty terminal turn with a real id: orphan → clean.
-        assert!(completed_stale_no_answer_orphan_should_clean(
-            false, real_id
-        ));
-        // Delivered-and-idle turn (#3126): committed → preserve.
-        assert!(!completed_stale_no_answer_orphan_should_clean(
-            true, real_id
-        ));
-        // Zero-id rows are NEVER auto-cleaned, regardless of committed state.
-        assert!(!completed_stale_no_answer_orphan_should_clean(false, 0));
-        assert!(!completed_stale_no_answer_orphan_should_clean(true, 0));
     }
 
     /// `inflight_completed_stale_leak_detected` requires every signal of the
@@ -3540,8 +3433,8 @@ mod stall_watchdog_pure_tests {
         };
         let stale_str = to_local(stale_unix);
         let fresh_str = to_local(now_unix - 5);
-        // Boot far in the past so `max(started_at, boot)` resolves to
-        // `started_at` — these cases assert the pre-#3041 semantics.
+        // Boot far in the past so `max(updated_at, boot)` resolves to
+        // `updated_at` — these cases assert the pre-#3041 semantics.
         let boot_unix = stale_unix - 100;
 
         // Happy path: attached + desynced + stale + not-committed → clean.
@@ -3577,7 +3470,7 @@ mod stall_watchdog_pure_tests {
             boot_unix,
         ));
 
-        // fresh started_at → no clean (live-turn safety net).
+        // fresh updated_at → no clean (live-turn safety net).
         assert!(!stall_watchdog_should_force_clean(
             true,
             true,
@@ -3588,7 +3481,7 @@ mod stall_watchdog_pure_tests {
             boot_unix,
         ));
 
-        // missing started_at → no clean.
+        // missing updated_at → no clean.
         assert!(!stall_watchdog_should_force_clean(
             true,
             true,
@@ -3599,7 +3492,7 @@ mod stall_watchdog_pure_tests {
             boot_unix,
         ));
 
-        // unparseable started_at → no clean.
+        // unparseable updated_at → no clean.
         assert!(!stall_watchdog_should_force_clean(
             true,
             true,
@@ -3638,35 +3531,6 @@ mod stall_watchdog_pure_tests {
             STALL_WATCHDOG_THRESHOLD_SECS,
             /* boot_unix_secs */ now_unix - (STALL_WATCHDOG_THRESHOLD_SECS as i64) - 1,
         ));
-    }
-
-    /// #3656: consecutive short turns under the same session key must not
-    /// inherit an old channel-level update anchor. The force-clean age is based
-    /// on the current turn's `started_at`, so a freshly-started turn is not
-    /// killed just because a prior turn in the same session was old.
-    #[test]
-    fn stall_watchdog_age_uses_current_turn_started_at() {
-        let now_unix = chrono::Utc::now().timestamp();
-        let fresh_started_unix = now_unix - 5;
-        let fresh_started = chrono::Local
-            .timestamp_opt(fresh_started_unix, 0)
-            .single()
-            .expect("valid local time")
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        assert!(
-            !stall_watchdog_should_force_clean(
-                true,
-                true,
-                false,
-                Some(fresh_started.as_str()),
-                now_unix,
-                STALL_WATCHDOG_THRESHOLD_SECS,
-                now_unix - 10_000,
-            ),
-            "a fresh current-turn started_at must reset the watchdog age even for the same session"
-        );
     }
 
     /// #3126 false-positive guard: a normally-completed turn that is now idle

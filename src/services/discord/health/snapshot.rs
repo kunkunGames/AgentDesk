@@ -156,36 +156,11 @@ struct RelayThreadProofSnapshot {
     stale_thread_proof: bool,
 }
 
-/// #3631: a rebind-origin inflight row (POST /api/inflight/rebind) is a
-/// synthetic origin marker — `turn_id`/`dispatch_id` null, `user_msg_id`/
-/// `current_msg_id` 0, `full_response` empty — NOT a real user/agent turn.
-/// With no mailbox cancel token there is no live turn, so the channel is idle.
-/// The classifier previously fell through to `Foreground`, falsely reporting
-/// `active_foreground_stream` and stranding queued messages (they never
-/// dispatch because no real turn ever ends to drain the queue). A cancel token
-/// present means a real turn HAS since started on the adopted session, so it is
-/// genuinely active — only treat it as idle when no cancel token is held.
-///
-/// Pure seam so the idle decision is unit-testable without constructing a full
-/// `InflightTurnState`.
-fn rebind_origin_inflight_is_idle(mailbox_has_cancel_token: bool, rebind_origin: bool) -> bool {
-    rebind_origin && !mailbox_has_cancel_token
-}
-
 fn relay_active_turn_from_inflight(
     mailbox_has_cancel_token: bool,
     inflight: Option<&discord::inflight::InflightTurnState>,
 ) -> RelayActiveTurn {
     if !mailbox_has_cancel_token && inflight.is_none() {
-        return RelayActiveTurn::None;
-    }
-
-    // #3631: a rebind-origin row (POST /api/inflight/rebind) is a synthetic
-    // origin marker, NOT a real user/agent turn — treat it as idle when there
-    // is no live turn. See `rebind_origin_inflight_is_idle`.
-    if inflight.is_some_and(|state| {
-        rebind_origin_inflight_is_idle(mailbox_has_cancel_token, state.rebind_origin)
-    }) {
         return RelayActiveTurn::None;
     }
 
@@ -375,23 +350,8 @@ impl HealthRegistry {
         channel_id: u64,
     ) -> Option<WatcherStateSnapshot> {
         let channel = ChannelId::new(channel_id);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.shared_for_provider_on_channel(provider, channel),
-        )
-        .await
-        {
-            Ok(Some(shared)) => {
-                return watcher_state_snapshot_for_shared(provider.as_str(), shared, channel).await;
-            }
-            Ok(None) => {}
-            Err(_) => {
-                tracing::warn!(
-                    provider = provider.as_str(),
-                    channel_id,
-                    "watcher-state provider/channel runtime resolve timed out; falling back to provider scan",
-                );
-            }
+        if let Some(shared) = self.shared_for_provider_on_channel(provider, channel).await {
+            return watcher_state_snapshot_for_shared(provider.as_str(), shared, channel).await;
         }
 
         self.snapshot_watcher_state_filtered(channel_id, Some(provider))
@@ -853,24 +813,4 @@ pub(super) fn observe_global_active_invariant(
     }
 
     (raw_global_active, None)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rebind_origin_inflight_is_idle;
-
-    /// #3631: a rebind-origin row with NO cancel token is idle (so the channel
-    /// is not falsely reported as an active foreground stream and queued
-    /// messages can dispatch). A cancel token present (a real turn started on
-    /// the adopted session) or a non-rebind-origin row is NOT idle.
-    #[test]
-    fn rebind_origin_idle_only_without_cancel_token() {
-        // rebind-origin + no cancel token → idle.
-        assert!(rebind_origin_inflight_is_idle(false, true));
-        // rebind-origin + live cancel token → NOT idle (real turn running).
-        assert!(!rebind_origin_inflight_is_idle(true, true));
-        // not a rebind-origin row → never idle via this seam.
-        assert!(!rebind_origin_inflight_is_idle(false, false));
-        assert!(!rebind_origin_inflight_is_idle(true, false));
-    }
 }

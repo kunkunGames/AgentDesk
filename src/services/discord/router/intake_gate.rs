@@ -1581,9 +1581,18 @@ async fn handle_reaction_remove(
                         removed_reaction.message_id,
                         channel_id
                     );
-                    // #3650: no separate notify-bot stop message — the in-place
-                    // `[Stopped]` edit on the assistant message and the 🛑
-                    // reaction already cover the stop signal.
+                    super::super::commands::notify_turn_stop(
+                        &ctx.http,
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        "reaction remove ⏳",
+                    )
+                    .await;
+                    // Removed `Turn cancelled.` reply — the in-place
+                    // `[Stopped]` edit on the assistant message + the
+                    // `🛑 현재 턴 중단` outbox lifecycle notice from
+                    // `notify_turn_stop` already cover the same signal.
                 }
                 super::message_handler::TextStopLookup::AlreadyStopping => {
                     send_reaction_control_reply(
@@ -1652,14 +1661,6 @@ pub(in crate::services::discord) async fn handle_event(
                 }
                 if super::super::steering::is_steer_cancel_custom_id(&component.data.custom_id) {
                     return super::super::steering::handle_steer_cancel_interaction(
-                        ctx, component, data,
-                    )
-                    .await;
-                }
-                if super::super::sidecar_interaction::is_sidecar_custom_id(
-                    &component.data.custom_id,
-                ) {
-                    return super::super::sidecar_interaction::handle_sidecar_interaction(
                         ctx, component, data,
                     )
                     .await;

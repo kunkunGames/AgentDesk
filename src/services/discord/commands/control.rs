@@ -26,32 +26,6 @@ enum ManagedSessionClearBehavior {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::services::discord) enum SoftClearNotifyMode {
-    Enqueue,
-    Suppress,
-}
-
-impl SoftClearNotifyMode {
-    fn should_enqueue(self) -> bool {
-        matches!(self, Self::Enqueue)
-    }
-}
-
-const SOFT_CLEAR_REASON_CODE: &str = "lifecycle.soft_clear";
-
-fn soft_clear_lifecycle_notify_row(
-    clear_source: &str,
-    notify_mode: SoftClearNotifyMode,
-) -> Option<(&'static str, String)> {
-    notify_mode.should_enqueue().then(|| {
-        (
-            SOFT_CLEAR_REASON_CODE,
-            format!("🧹 세션 클리어 ({clear_source})"),
-        )
-    })
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedSessionResetBehavior {
     ResetManagedProcess,
     Noop,
@@ -279,6 +253,31 @@ pub(in crate::services::discord) async fn reset_channel_provider_state(
     tmux_name
 }
 
+pub(in crate::services::discord) async fn notify_turn_stop(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+    stop_source: &str,
+) {
+    let session_key = resolve_session_key_for_clear(http, shared, channel_id, provider)
+        .await
+        .unwrap_or_else(|| format!("channel:{}", channel_id.get()));
+    let sqlite_runtime_db = if shared.pg_pool.is_some() {
+        None
+    } else {
+        None::<&crate::db::Db>
+    };
+    crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
+        sqlite_runtime_db,
+        shared.pg_pool.as_ref(),
+        &format!("channel:{}", channel_id.get()),
+        Some(&session_key),
+        "lifecycle.stop_turn",
+        &format!("🛑 현재 턴 중단 ({stop_source}) — tmux는 유지됩니다."),
+    );
+}
+
 pub(in crate::services::discord) async fn reset_provider_session_if_pending(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
@@ -349,7 +348,6 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
     provider: &ProviderKind,
     channel_id: serenity::ChannelId,
     clear_source: &str,
-    notify_mode: SoftClearNotifyMode,
 ) {
     let tmux_name = {
         let data = shared.core.lock().await;
@@ -430,23 +428,20 @@ pub(in crate::services::discord) async fn clear_channel_session_state(
         ManagedSessionClearBehavior::Noop => {}
     }
 
-    if let Some((reason_code, content)) = soft_clear_lifecycle_notify_row(clear_source, notify_mode)
-    {
-        // Notify bot message for clear paths that have no direct provider reply.
-        let sqlite_runtime_db = if shared.pg_pool.is_some() {
-            None
-        } else {
-            None::<&crate::db::Db>
-        };
-        crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
-            sqlite_runtime_db,
-            shared.pg_pool.as_ref(),
-            &format!("channel:{}", channel_id.get()),
-            session_key.as_deref(),
-            reason_code,
-            &content,
-        );
-    }
+    // Notify bot message for session clear visibility
+    let sqlite_runtime_db = if shared.pg_pool.is_some() {
+        None
+    } else {
+        None::<&crate::db::Db>
+    };
+    crate::services::message_outbox::enqueue_lifecycle_notification_best_effort(
+        sqlite_runtime_db,
+        shared.pg_pool.as_ref(),
+        &format!("channel:{}", channel_id.get()),
+        session_key.as_deref(),
+        "lifecycle.soft_clear",
+        &format!("🧹 세션 클리어 ({clear_source})"),
+    );
 }
 
 /// /stop — Cancel in-progress AI request
@@ -490,6 +485,14 @@ pub(in crate::services::discord) async fn cmd_stop(ctx: Context<'_>) -> Result<(
                 "/stop",
             )
             .await;
+            notify_turn_stop(
+                &ctx.serenity_context().http,
+                &ctx.data().shared,
+                &ctx.data().provider,
+                channel_id,
+                "/stop",
+            )
+            .await;
             tracing::info!("  [{ts}] ■ Cancel signal sent");
         }
         None => {
@@ -522,44 +525,12 @@ pub(in crate::services::discord) async fn cmd_clear(ctx: Context<'_>) -> Result<
         &ctx.data().provider,
         ctx.channel_id(),
         "/clear",
-        SoftClearNotifyMode::Suppress,
     )
     .await;
 
     ctx.say("Session cleared.").await?;
     tracing::info!("  [{ts}] ▶ [{user_name}] Session cleared");
     Ok(())
-}
-
-#[cfg(test)]
-mod soft_clear_notify_tests {
-    use super::{SOFT_CLEAR_REASON_CODE, SoftClearNotifyMode, soft_clear_lifecycle_notify_row};
-
-    #[test]
-    fn slash_and_text_clear_suppress_soft_clear_notify_row() {
-        assert_eq!(
-            soft_clear_lifecycle_notify_row("/clear", SoftClearNotifyMode::Suppress),
-            None,
-            "`/clear` and `!clear` already reply `Session cleared.` and must not enqueue a duplicate `lifecycle.soft_clear` notify row"
-        );
-        assert_eq!(
-            soft_clear_lifecycle_notify_row("!clear", SoftClearNotifyMode::Suppress),
-            None,
-            "`!clear` should leave the provider reply as the single user-visible completion surface"
-        );
-    }
-
-    #[test]
-    fn idle_recap_clear_keeps_soft_clear_notify_row() {
-        assert_eq!(
-            soft_clear_lifecycle_notify_row("idle_recap_clear", SoftClearNotifyMode::Enqueue),
-            Some((
-                SOFT_CLEAR_REASON_CODE,
-                "🧹 세션 클리어 (idle_recap_clear)".to_string(),
-            )),
-            "idle recap clear has no provider reply, so it must keep the single user-visible `lifecycle.soft_clear` notify row"
-        );
-    }
 }
 
 /// /down <file> — Download file from server

@@ -2518,7 +2518,12 @@ async fn message_outbox_loop(pg_pool: Arc<PgPool>, health_registry: Option<Arc<H
 
     let mut poll_interval = Duration::from_millis(500);
     let max_interval = Duration::from_secs(5);
-    // Periodic stale-row GC: prune old terminal rows so config rejections do not accumulate.
+    // Periodic stale-row GC: prunes failed rows older than 7d and sent rows
+    // older than 30d. Without this, every config-rejected send (`unknown
+    // source role`, `channel not in role-map`) accumulates indefinitely; the
+    // 2026-05-09 incident found 7163+149+188 stale failed rows from sources
+    // that are now allowed but whose historical rejections were never cleaned
+    // up.
     let mut next_gc_at = std::time::Instant::now() + Duration::from_secs(60);
 
     loop {
@@ -2548,11 +2553,6 @@ async fn message_outbox_loop(pg_pool: Arc<PgPool>, health_registry: Option<Arc<H
                 let pg_pool = pg_pool.clone();
                 async move {
                     let (correlation_id, semantic_event_id) = row.delivery_ids();
-                    let bot = crate::services::message_outbox::delivery_bot_for_target_session(
-                        &row.target,
-                        &row.bot,
-                        row.session_key.as_deref(),
-                    );
                     let (status, err_text) =
                         crate::services::discord::health::send_message_with_backends_and_delivery_options(
                             &health_registry,
@@ -2561,7 +2561,7 @@ async fn message_outbox_loop(pg_pool: Arc<PgPool>, health_registry: Option<Arc<H
                             &row.target,
                             &row.content,
                             &row.source,
-                            bot.as_ref(),
+                            &row.bot,
                             None,
                             Some(crate::services::discord::health::ManualOutboundDeliveryId {
                                 correlation_id: &correlation_id,
@@ -2732,6 +2732,13 @@ async fn routine_runtime_loop(
         // alert the operator instead of letting it silently never run again. The
         // knob defaults to 0 (disabled), so this is a no-op for deployments that
         // have not opted in.
+        //
+        // Visibility only — we intentionally do NOT auto-resume here. Reliably
+        // telling a failure-induced pause apart from a deliberate one needs a
+        // structural pause-cause field on the routine (the `last_result`
+        // heuristic has both false positives and false negatives), which is out
+        // of scope for this change; opt-in auto-resume is deferred to a
+        // follow-up that adds a pause-cause column.
         let stale_paused_alert_secs = routines_config.stale_paused_alert_secs;
         if stale_paused_alert_secs > 0 {
             let now = chrono::Utc::now();
@@ -2757,57 +2764,10 @@ async fn routine_runtime_loop(
                 }
             }
         }
-        // #3573/#3628: opt-in auto-resume for failure-paused routines. Only
-        // routines with `pause_reason = 'failure'` are eligible; manual/
-        // migration_invalid/NULL rows are never touched. The
-        // `ResumeRequiresNextDueAt` guard is applied inside
-        // `auto_resume_failure_paused_routine`. The knob defaults to 0
-        // (disabled); set to e.g. 3600 to enable with a 1-hour backoff.
-        let auto_resume_secs = routines_config.failure_pause_auto_resume_secs;
-        let pause_on_terminal_failure = routines_config.failure_pause_auto_resume_secs > 0;
-        if pause_on_terminal_failure {
-            let now = chrono::Utc::now();
-            let cutoff = now - chrono::Duration::seconds(auto_resume_secs as i64);
-            match store.list_failure_paused_routines(cutoff).await {
-                Ok(candidates) => {
-                    for routine in &candidates {
-                        match store
-                            .auto_resume_failure_paused_routine(&routine.id, cutoff)
-                            .await
-                        {
-                            Ok(true) => {
-                                tracing::info!(
-                                    routine_id = %routine.id,
-                                    routine_name = %routine.name,
-                                    "auto-resumed failure-paused routine"
-                                );
-                            }
-                            Ok(false) => {
-                                tracing::debug!(
-                                    routine_id = %routine.id,
-                                    "auto-resume: routine no longer eligible (already resumed or re-paused)"
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    routine_id = %routine.id,
-                                    error = %error,
-                                    "auto-resume failure-paused routine failed"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(error = %error, "routine auto-resume scan failed")
-                }
-            }
-        }
         match poll_agent_turns(
             &store,
             &agent_executor,
             routines_config.max_agent_polls_per_tick,
-            pause_on_terminal_failure,
         )
         .await
         {
@@ -2827,7 +2787,6 @@ async fn routine_runtime_loop(
             Some(&agent_executor),
             Some(&discord_logger),
             routines_config.max_due_per_tick,
-            pause_on_terminal_failure,
         )
         .await
         {
