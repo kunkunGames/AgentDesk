@@ -1598,6 +1598,17 @@ pub(crate) async fn run_stall_watchdog_pass(
             Some(snapshot) => snapshot,
             None => continue,
         };
+        // #3668 F2: if a final answer is still persisted in JSONL after
+        // `last_offset`, skip ALL destructive watchdog branches this tick (the
+        // idle-clear AND the desynced force-clean below) — let normal recovery /
+        // #3645 far-backstop deliver it first, then re-evaluate next tick once
+        // `last_offset` advances past the delivered answer.
+        if crate::services::discord::relay_recovery::idle_tmux_repair_has_unrelayed_tail_answer(
+            provider,
+            channel_id.get(),
+        ) {
+            continue;
+        }
         // #2965: a ready-for-input TUI can still look "desynced" when the
         // capture file has bytes past relay offsets. Prefer the idle-safe
         // anchor cleanup before the destructive desynced force-clean branch.

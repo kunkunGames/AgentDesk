@@ -920,7 +920,7 @@
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`;
     +62 from #3304: slash-command canonical prompt keys for `<command-*>` XML vs
     `/command args` dedupe, plus focused loop skill-expansion regressions).
-  - `src/services/discord/recovery_engine.rs` (3410 lines; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
+  - `src/services/discord/recovery_engine.rs` (3412 lines; +2 from #3668 re-exporting `success_result_end_offset_after_offset` (pub(in discord)) so the relay_recovery F2 tail-answer guard can require terminal success evidence; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
     `set_relay_owner_kind(Watcher)` at the rebind-origin birth site so the
     STALL-WATCHDOG force-clean -> respawn synthetic row (which lands here with
     `existing_inflight = None`) is watcher-owned instead of degrading to
@@ -993,7 +993,7 @@
     children (`send_target`, `send_gate`, `send_api`, `manual_delivery`) to
     `outbound/` while preserving the `health::` re-export API; #1879
     snapshot/mailbox extraction, and #3082 answer-flush-barrier field).
-  - `src/services/discord/health/recovery.rs` (2722 lines; #3656 stall-watchdog force-clean ages from current turn `started_at` not `updated_at` (turn-scoped, net 0 after comment condense); +85 from #3629 NO_REPLY/empty orphan inflight identity-guarded cleanup in the completed-stale leak detection path; +3 from #3479 item-3 `shared.dispatch.<field>` nesting; health recovery
+  - `src/services/discord/health/recovery.rs` (2733 lines; +11 from #3668 F2 watchdog loop-top tail-answer guard — one early-`continue` that skips BOTH destructive branches (idle-clear + desynced force-clean) for the channel this tick when JSONL still holds an unrelayed final answer after last_offset; #3656 stall-watchdog force-clean ages from current turn `started_at` not `updated_at` (turn-scoped, net 0 after comment condense); +85 from #3629 NO_REPLY/empty orphan inflight identity-guarded cleanup in the completed-stale leak detection path; +3 from #3479 item-3 `shared.dispatch.<field>` nesting; health recovery
     extraction surface, split further before adding non-bugfix behavior; +70
     from #3126 stall-watchdog completed-idle false-positive guard tests; +88
     from #3169 stall-watchdog jsonl-mtime liveness guard + tests, closing the

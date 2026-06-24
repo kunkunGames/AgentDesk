@@ -643,6 +643,56 @@ fn idle_tmux_repair_ready_for_input(
         })
 }
 
+/// #3668 F2: detect tail answer text that the destructive idle-tmux clear would
+/// permanently lose.
+///
+/// `idle_tmux_repair_ready_for_input` returns Ready when the JSONL has a
+/// terminal envelope after `last_offset` (the offset-behind path in
+/// `tui_turn_state::jsonl_ready_for_input`), which means a final answer is
+/// already persisted past the inflight watermark. The companion inflight guard
+/// (`inflight_state_allows_idle_tmux_repair`) only inspects the streaming
+/// `full_response`, so an empty-stream + JSONL-terminal-answer row passes both
+/// guards and reaches `clear_inflight_state`, dropping text that
+/// `extract_response_from_output_pub(output_path, last_offset)` could still
+/// recover. The recovery_engine normal path (extract → relay → clear) never has
+/// this asymmetry. This guard reads the same offset slice read-only: if it
+/// yields non-empty relayable text, the caller skips the destructive clear and
+/// falls through to the non-destructive rebind path (which preserves the
+/// inflight/output so normal relay/recovery delivers the text). On extract
+/// failure / IO error the function returns false → existing behavior (only the
+/// genuinely-empty tail still clears), so this is behavior-preserving.
+pub(crate) fn idle_tmux_repair_has_unrelayed_tail_answer(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> bool {
+    let Some(state) = super::inflight::load_inflight_state(provider, channel_id) else {
+        return false;
+    };
+    let Some(output_path) = state
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    // #3668 codex r3: only treat this as an answer worth preserving when there
+    // is TERMINAL completion evidence — a *successful* `result` record after
+    // `last_offset`. A hung / desynced turn with only partial assistant text and
+    // no terminal result must NOT suppress the destructive idle-clear / force-
+    // clean: otherwise the watchdog would skip it every tick forever, since
+    // #3645 far-backstop / normal recovery only advance `last_offset` on a
+    // terminal success. Requiring the success-result record keeps the guard to
+    // genuinely-deliverable, complete-but-unrelayed answers.
+    if super::recovery::success_result_end_offset_after_offset(output_path, state.last_offset)
+        .is_none()
+    {
+        return false;
+    }
+    let tail = super::recovery::extract_response_from_output_pub(output_path, state.last_offset);
+    !tail.trim().is_empty()
+}
+
 async fn apply_relay_recovery_decision(
     registry: &HealthRegistry,
     shared: &Arc<SharedData>,
@@ -712,6 +762,10 @@ async fn apply_relay_recovery_decision(
                     decision.channel_id,
                 )
                 .unwrap_or(false)
+                // #3668 F2: never destructively clear when a final answer is
+                // still persisted in JSONL after `last_offset` — fall through to
+                // the non-destructive rebind path so normal relay delivers it.
+                && !idle_tmux_repair_has_unrelayed_tail_answer(provider, decision.channel_id)
             {
                 let finish = mailbox_finish_turn(shared, provider, channel).await;
                 if let Some(token) = finish.removed_token.as_ref() {
@@ -1459,6 +1513,144 @@ mod tests {
         assert!(
             shared.dispatch.thread_parents.contains_key(&parent),
             "auto orphan cleanup must not apply other recovery action kinds"
+        );
+    }
+
+    // #3668 F2: the destructive idle-tmux clear must not drop a final answer that
+    // is still persisted in JSONL after `last_offset`. The guard reads the same
+    // offset slice via `extract_response_from_output_pub`; when it yields
+    // non-empty text the caller skips the destructive clear (rebind fall-
+    // through). When the tail is genuinely empty the guard is silent and the
+    // existing clear behavior is preserved.
+    struct AgentdeskRootGuard(Option<std::ffi::OsString>);
+    impl Drop for AgentdeskRootGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    fn write_inflight_with_output(
+        provider: &ProviderKind,
+        channel_id: u64,
+        output_path: &std::path::Path,
+        last_offset: u64,
+        jsonl_body: &str,
+    ) {
+        std::fs::write(output_path, jsonl_body).expect("write output jsonl");
+        let state = super::super::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel_id,
+            Some("adk-cdx".to_string()),
+            7,
+            777,
+            7777,
+            "hello".to_string(),
+            None,
+            Some(format!("AgentDesk-codex-adk-cdx-{channel_id}")),
+            Some(output_path.to_string_lossy().to_string()),
+            None,
+            last_offset,
+        );
+        // full_response stays empty (streaming guard would pass): F2 reproduces
+        // the empty-stream + JSONL-terminal-answer asymmetry exactly.
+        assert!(state.full_response.is_empty());
+        super::super::inflight::save_inflight_state(&state).expect("save inflight");
+    }
+
+    #[test]
+    fn idle_tmux_repair_guard_detects_tail_answer_after_offset() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _root_guard = AgentdeskRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let provider = ProviderKind::Codex;
+        let channel_id = 3_668_001;
+        let output_path = temp.path().join("out.jsonl");
+
+        // A leading pre-offset record (consumed) followed by a terminal answer
+        // record after `last_offset`. `last_offset` points past the first line so
+        // only the final answer remains in the extracted slice.
+        let pre = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}}\n";
+        let post = "{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"FINAL ANSWER\"}\n";
+        let last_offset = pre.len() as u64;
+        write_inflight_with_output(
+            &provider,
+            channel_id,
+            &output_path,
+            last_offset,
+            &format!("{pre}{post}"),
+        );
+
+        assert!(
+            idle_tmux_repair_has_unrelayed_tail_answer(&provider, channel_id),
+            "JSONL terminal answer after last_offset must block destructive clear"
+        );
+    }
+
+    #[test]
+    fn idle_tmux_repair_guard_silent_when_tail_empty() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _root_guard = AgentdeskRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let provider = ProviderKind::Codex;
+        let channel_id = 3_668_002;
+        let output_path = temp.path().join("out.jsonl");
+
+        // Only a pre-offset record exists; nothing relayable remains after
+        // `last_offset`, so the guard stays silent and the existing destructive
+        // clear behavior is preserved (behavior-preserving regression guard).
+        let body = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}}\n";
+        let last_offset = body.len() as u64;
+        write_inflight_with_output(&provider, channel_id, &output_path, last_offset, body);
+
+        assert!(
+            !idle_tmux_repair_has_unrelayed_tail_answer(&provider, channel_id),
+            "empty JSONL tail must not block the existing destructive clear path"
+        );
+    }
+
+    #[test]
+    fn idle_tmux_repair_guard_silent_when_partial_text_has_no_terminal_result() {
+        // #3668 codex r3: a hung/desynced turn that emitted partial assistant
+        // text after `last_offset` but NO terminal `result` record must NOT
+        // suppress the destructive clear — otherwise the watchdog would skip it
+        // every tick forever (recovery only advances the offset on terminal
+        // success). The guard requires success-result completion evidence.
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = tempfile::TempDir::new().unwrap();
+        let _root_guard = AgentdeskRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+
+        let provider = ProviderKind::Codex;
+        let channel_id = 3_668_003;
+        let output_path = temp.path().join("out.jsonl");
+
+        let pre = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"old\"}]}}\n";
+        let post = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"partial, still streaming...\"}]}}\n";
+        let last_offset = pre.len() as u64;
+        write_inflight_with_output(
+            &provider,
+            channel_id,
+            &output_path,
+            last_offset,
+            &format!("{pre}{post}"),
+        );
+
+        assert!(
+            !idle_tmux_repair_has_unrelayed_tail_answer(&provider, channel_id),
+            "partial assistant text without a terminal success result must not block force-clean"
         );
     }
 }
