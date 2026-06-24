@@ -1683,19 +1683,21 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
             if !age_ok {
                 continue;
             }
-            // Only remove when restart_mode is absent. A file with a restart_mode
-            // set is owned by a planned lifecycle (drain/hot-swap); the existing
-            // inflight retention helpers cover those.
+            // Only remove when restart_mode is absent and rebind_origin is false.
+            // A file with a restart_mode set is owned by a planned lifecycle
+            // (drain/hot-swap); a rebind_origin file is managed by the placeholder
+            // sweeper. The existing inflight retention helpers cover those.
             #[derive(serde::Deserialize)]
-            struct RestartModeExt {
+            struct LifecycleExt {
                 restart_mode: Option<serde_json::Value>,
+                #[serde(default)]
+                rebind_origin: bool,
             }
-            let restart_mode_present = fs::read_to_string(&fpath)
+            let is_managed_lifecycle = fs::read_to_string(&fpath)
                 .ok()
-                .and_then(|body| serde_json::from_str::<RestartModeExt>(&body).ok())
-                .and_then(|v| v.restart_mode.filter(|rm| !rm.is_null()).map(|_| true))
-                .unwrap_or(false);
-            if restart_mode_present {
+                .and_then(|body| serde_json::from_str::<LifecycleExt>(&body).ok())
+                .is_some_and(|v| v.restart_mode.is_some_and(|rm| !rm.is_null()) || v.rebind_origin);
+            if is_managed_lifecycle {
                 continue;
             }
             if fs::remove_file(&fpath).is_ok() {

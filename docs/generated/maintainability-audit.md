@@ -17,7 +17,7 @@ Baseline no-regression gates are **enabled** for 2 checks: `route_srp_violations
 | `giant_files` | 0 | YES | no |
 | `giant_file_ratchet` | 0 | YES | no |
 | `namespace_size_caps` | 0 | YES | no |
-| `route_srp_violations` | 13 | no | YES |
+| `route_srp_violations` | 12 | no | YES |
 | `service_server_backflow` | 0 | no | YES |
 | `direct_discord_sends` | 0 | YES | no |
 | `manual_json_row_mapping` | 0 | YES | no |
@@ -57,7 +57,6 @@ Files under src/server/routes/ that mix raw SQL, json!() shaping, and crate::ser
 | warn | `src/server/routes/escalation.rs` |  | route file mixes SQL (24), json!() (24), and crate::services calls (3) |
 | warn | `src/server/routes/github.rs` |  | route file mixes SQL (8), json!() (30), and crate::services calls (5) |
 | warn | `src/server/routes/health_api.rs` |  | route file mixes SQL (30), json!() (103), and crate::services calls (14) |
-| warn | `src/server/routes/meetings.rs` |  | route file mixes SQL (62), json!() (69), and crate::services calls (3) |
 | warn | `src/server/routes/memory_api.rs` |  | route file mixes SQL (8), json!() (16), and crate::services calls (8) |
 | warn | `src/server/routes/provider_cli_api.rs` |  | route file mixes SQL (3), json!() (12), and crate::services calls (6) |
 | warn | `src/server/routes/queue_api.rs` |  | route file mixes SQL (4), json!() (15), and crate::services calls (3) |

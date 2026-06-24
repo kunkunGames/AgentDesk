@@ -920,7 +920,7 @@
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`;
     +62 from #3304: slash-command canonical prompt keys for `<command-*>` XML vs
     `/command args` dedupe, plus focused loop skill-expansion regressions).
-  - `src/services/discord/recovery_engine.rs` (3410 lines; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
+  - `src/services/discord/recovery_engine.rs` (3434 lines; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
     `set_relay_owner_kind(Watcher)` at the rebind-origin birth site so the
     STALL-WATCHDOG force-clean -> respawn synthetic row (which lands here with
     `existing_inflight = None`) is watcher-owned instead of degrading to
@@ -1252,7 +1252,7 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (2766 lines).
+    lines) and `src/services/discord/inflight.rs` (2822 lines).
 - active_callsite_coverage: n/a.
 - invariants: watcher single-owner per #1222; placeholder lifecycle invariants
   per #1112; `/api/inflight/rebind` is the only path that synthesises an
@@ -1374,11 +1374,11 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2474 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment).
+  - `src/config.rs` (2476 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment).
   - `src/server/mod.rs` (2634 lines; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
-  - `src/reconcile.rs` (1816 lines; periodic reconcile loop covering stale
+  - `src/reconcile.rs` (1818 lines; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.
