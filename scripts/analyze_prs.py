@@ -116,6 +116,28 @@ def has_scratch_file_cleanup_ack(body):
 def has_overlap_reference(body):
     return bool(re.search(r"(?i)(?:#[0-9]+|github\.com/[^/]+/[^/]+/pull/[0-9]+)", body))
 
+def has_template_summary(body):
+    return has_non_empty_body_field(body, ["summary"])
+
+def is_scratch_file_path(path):
+    if not path or "/" in path:
+        return False
+    root_scratch_files = {
+        "pr-body.md",
+        "plan.md",
+        "plan.txt",
+        "scratch.md",
+        "scratch.txt",
+        "scratchpad.md",
+        "scratchpad.txt",
+        "test.sh",
+        "test.sql",
+        "test_scratch.rs",
+    }
+    if path in root_scratch_files:
+        return True
+    return bool(re.match(r"^(?:scratch|scratchpad|test_scratch)[._-].+\.(?:md|txt|sh|sql|rs)$", path))
+
 def main():
     repo = _detect_repo()
     print("Fetching PRs...")
@@ -144,9 +166,10 @@ def main():
         print(f"\n# {num} - {title}")
 
         # Check PR hygiene requirements
-        if not has_non_empty_body_field(body, ["what changed"]):
+        summary_satisfies_change_context = has_template_summary(body)
+        if not has_non_empty_body_field(body, ["what changed"]) and not summary_satisfies_change_context:
             print("  [!] MISSING WHAT CHANGED: PR body lacks a required 'What changed' description.")
-        if not has_non_empty_body_field(body, ["why"]):
+        if not has_non_empty_body_field(body, ["why"]) and not summary_satisfies_change_context:
             print("  [!] MISSING WHY: PR body lacks a required 'Why' description.")
         if "workfingerprint" not in normalized_body:
             print("  [!] MISSING FINGERPRINT: PR body lacks the required 'WorkFingerprint' section.")
@@ -196,7 +219,7 @@ def main():
             scratch_files = []
             for f in files_data["files"]:
                 path = f.get("path", "")
-                if path in ["pr-body.md", "plan.md"] or path.endswith((".sh", ".sql")):
+                if is_scratch_file_path(path):
                     scratch_files.append(path)
             if scratch_files:
                 print(f"  [!] SCRATCH FILE DETECTED: PR includes scratch files like pr-body.md, plan.md, or test scripts ({', '.join(scratch_files)}).")

@@ -7,6 +7,8 @@ from scripts.analyze_prs import (
     has_stale_branch_cleanup_ack,
     has_scratch_file_cleanup_ack,
     has_overlap_reference,
+    has_template_summary,
+    is_scratch_file_path,
 )
 
 
@@ -139,6 +141,37 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
     def test_missing_overlap_reference(self):
         body = "This is a no-change PR but lacks exact PR numbers."
         self.assertFalse(has_overlap_reference(body))
+
+
+class PrAnalyzerTemplateSummaryTests(unittest.TestCase):
+    def test_populated_template_summary_counts_as_change_context(self):
+        body = """
+## Summary
+
+Update analyzer hygiene checks to match the current template.
+"""
+
+        self.assertTrue(has_template_summary(body))
+
+    def test_empty_template_summary_is_not_change_context(self):
+        body = """
+## Summary
+
+## Test plan
+"""
+
+        self.assertFalse(has_template_summary(body))
+
+
+class PrAnalyzerScratchPathTests(unittest.TestCase):
+    def test_root_scratch_files_are_flagged(self):
+        self.assertTrue(is_scratch_file_path("pr-body.md"))
+        self.assertTrue(is_scratch_file_path("test.sh"))
+        self.assertTrue(is_scratch_file_path("scratch-check.sql"))
+
+    def test_checked_in_scripts_and_migrations_are_not_scratch(self):
+        self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
+        self.assertFalse(is_scratch_file_path("migrations/postgres/001_init.sql"))
 
 if __name__ == "__main__":
     unittest.main()
