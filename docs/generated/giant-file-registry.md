@@ -49,7 +49,7 @@
 | `src/github/sync.rs` | 1513 |
 | `src/pipeline.rs` | 1366 |
 | `src/receipt.rs` | 1842 |
-| `src/reconcile.rs` | 1816 |
+| `src/reconcile.rs` | 1818 |
 | `src/server/mod.rs` | 2634 |
 | `src/server/routes/agents.rs` | 1182 |
 | `src/server/routes/agents_crud.rs` | 1903 |
