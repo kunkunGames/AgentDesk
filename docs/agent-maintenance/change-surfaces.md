@@ -1252,7 +1252,15 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (2766 lines).
+    lines) and `src/services/discord/inflight.rs` (3052 lines; #3635 added the
+    dead-watcher rebind-origin reap — `WatcherLiveness` DI trait, three-state tmux
+    pane liveness, spawn-blocking warm sweeper probe, and fs-only locked
+    re-validation; the byte-for-byte-unchanged #3581 None-owner predicate is
+    preserved verbatim).
+  - `src/services/discord/placeholder_sweeper.rs` (1004 lines; crossed the giant
+    threshold in #3635 when the dead-watcher reap branch joined the async
+    rebind-origin sweep arm — tracked decompose target, see `giant-file-registry.md` (owner
+    `discord-relay`, deadline 2026-08-31, #3405)).
 - active_callsite_coverage: n/a.
 - invariants: watcher single-owner per #1222; placeholder lifecycle invariants
   per #1112; `/api/inflight/rebind` is the only path that synthesises an
