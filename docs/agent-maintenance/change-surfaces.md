@@ -1378,7 +1378,7 @@
   - `src/server/mod.rs` (2634 lines; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
-  - `src/reconcile.rs` (1816 lines; periodic reconcile loop covering stale
+  - `src/reconcile.rs` (1818 lines; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.

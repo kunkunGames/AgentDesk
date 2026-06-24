@@ -1696,9 +1696,7 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
             let is_managed_lifecycle = fs::read_to_string(&fpath)
                 .ok()
                 .and_then(|body| serde_json::from_str::<LifecycleExt>(&body).ok())
-                .is_some_and(|v| {
-                    v.restart_mode.is_some_and(|rm| !rm.is_null()) || v.rebind_origin
-                });
+                .is_some_and(|v| v.restart_mode.is_some_and(|rm| !rm.is_null()) || v.rebind_origin);
             if is_managed_lifecycle {
                 continue;
             }
