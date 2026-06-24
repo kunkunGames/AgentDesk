@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from scripts.analyze_prs import (
     has_duplicate_guard_ack,
@@ -29,6 +30,39 @@ class PrAnalyzerBodyFieldTests(unittest.TestCase):
 
         self.assertFalse(has_non_empty_body_field(body, ["risk", "risk assessment"]))
         self.assertFalse(has_non_empty_body_field(body, ["rollback notes", "rollback"]))
+
+    def test_html_comment_placeholder_is_not_meaningful_field_content(self):
+        body = """
+## Summary
+
+<!-- 1-3 bullets: what changed and why. -->
+"""
+
+        self.assertFalse(has_non_empty_body_field(body, ["summary"]))
+
+    def test_html_comment_before_real_content_does_not_hide_content(self):
+        body = """
+## Summary
+
+<!-- 1-3 bullets: what changed and why. -->
+Update analyzer hygiene checks.
+"""
+
+        self.assertTrue(has_non_empty_body_field(body, ["summary"]))
+
+    def test_allow_none_is_limited_to_explicit_callers(self):
+        body = "- Skipped checks with reasons: none"
+        labels = ["skipped checks with reasons", "skipped checks"]
+
+        self.assertFalse(has_non_empty_body_field(body, labels))
+        self.assertTrue(has_non_empty_body_field(body, labels, allow_none=True))
+        self.assertFalse(
+            has_non_empty_body_field(
+                "- Skipped checks with reasons: n/a",
+                labels,
+                allow_none=True,
+            )
+        )
 
     def test_multiline_field_value_stops_at_next_field_label(self):
         body = """
@@ -142,6 +176,22 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
         body = "This is a no-change PR but lacks exact PR numbers."
         self.assertFalse(has_overlap_reference(body))
 
+    def test_generic_template_issue_references_are_not_overlap_references(self):
+        body = """
+- Dashboard checklist issue references: #1254 / #1251
+- Related PRs/issues checked: #9999
+"""
+
+        self.assertFalse(has_overlap_reference(body))
+
+    def test_overlap_reference_inside_overlap_field(self):
+        body = """
+- Duplicate/overlap check:
+  - #1234 on branch codex/same-scope covers this no-change PR.
+"""
+
+        self.assertTrue(has_overlap_reference(body))
+
 
 class PrAnalyzerTemplateSummaryTests(unittest.TestCase):
     def test_populated_template_summary_counts_as_change_context(self):
@@ -162,6 +212,15 @@ Update analyzer hygiene checks to match the current template.
 
         self.assertFalse(has_template_summary(body))
 
+    def test_html_comment_template_summary_is_not_change_context(self):
+        body = """
+## Summary
+
+<!-- 1-3 bullets: what changed and why. -->
+"""
+
+        self.assertFalse(has_template_summary(body))
+
 
 class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_root_scratch_files_are_flagged(self):
@@ -172,6 +231,14 @@ class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_checked_in_scripts_and_migrations_are_not_scratch(self):
         self.assertFalse(is_scratch_file_path("scripts/deploy-release.sh"))
         self.assertFalse(is_scratch_file_path("migrations/postgres/001_init.sql"))
+
+
+class CiScriptScratchGuardTests(unittest.TestCase):
+    def test_ci_guard_includes_root_sql_scratch_files(self):
+        script = Path("scripts/ci-script-checks.sh").read_text()
+
+        self.assertIn("test.sql", script)
+        self.assertIn("scratch[._-]*.sql", script)
 
 if __name__ == "__main__":
     unittest.main()

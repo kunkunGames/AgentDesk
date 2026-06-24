@@ -33,27 +33,36 @@ def head_commit_timestamp(pr, repo):
         return None
     return parse_github_timestamp(timestamp)
 
-def _meaningful_field_value(value):
-    normalized = value.strip().strip("-–—").strip()
-    return bool(normalized) and normalized.casefold() not in {"n/a", "none", "todo", "tbd", "na"}
+def _strip_html_comments(value):
+    return re.sub(r"<!--.*?-->", "", value, flags=re.S)
+
+def _meaningful_field_value(value, *, allow_none=False):
+    normalized = _strip_html_comments(value).strip().strip("-–—").strip()
+    placeholders = {"n/a", "todo", "tbd", "na"}
+    if not allow_none:
+        placeholders.add("none")
+    return bool(normalized) and normalized.casefold() not in placeholders
 
 def _is_top_level_field_label(line):
     if line[:1] in {" ", "\t"}:
         return False
     return re.match(r"^(?:[-*]\s*)?[a-z0-9 /_-]+\s*:(?:\s.*)?$", line.strip(), re.I)
 
-def has_non_empty_body_field(body, labels):
+def has_non_empty_body_field(body, labels, *, allow_none=False):
     for label in labels:
         pattern = re.compile(
             rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?{re.escape(label)}(?:[ \t]*:[ \t]*(.*)|[ \t]*)$"
         )
         for match in pattern.finditer(body):
-            if _meaningful_field_value(match.group(1) or ""):
+            if _meaningful_field_value(match.group(1) or "", allow_none=allow_none):
                 return True
 
             for next_line in body[match.end():].splitlines():
                 stripped = next_line.strip()
                 if not stripped:
+                    continue
+                commentless = _strip_html_comments(stripped).strip()
+                if not commentless:
                     continue
                 if stripped.startswith("#"):
                     break
@@ -62,7 +71,7 @@ def has_non_empty_body_field(body, labels):
                 # following populated field (e.g. `- Rollback notes: revert`).
                 if _is_top_level_field_label(next_line):
                     break
-                if _meaningful_field_value(stripped):
+                if _meaningful_field_value(commentless, allow_none=allow_none):
                     return True
                 break
     return False
@@ -114,7 +123,24 @@ def has_scratch_file_cleanup_ack(body):
     )
 
 def has_overlap_reference(body):
-    return bool(re.search(r"(?i)(?:#[0-9]+|github\.com/[^/]+/[^/]+/pull/[0-9]+)", body))
+    pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
+    overlap_context = re.compile(r"(?i)\b(?:overlap|overlapping|duplicate|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
+    in_overlap_block = False
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("#"):
+            in_overlap_block = bool(overlap_context.search(stripped))
+        elif _is_top_level_field_label(line):
+            in_overlap_block = bool(overlap_context.search(stripped))
+
+        if pr_ref.search(stripped) and (in_overlap_block or overlap_context.search(stripped)):
+            return True
+
+    return False
 
 def has_template_summary(body):
     return has_non_empty_body_field(body, ["summary"])
@@ -191,7 +217,7 @@ def main():
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if not has_non_empty_body_field(body, ["verification commands and results", "verification"]):
             print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
-        if not has_non_empty_body_field(body, ["skipped checks with reasons", "skipped checks"]):
+        if not has_non_empty_body_field(body, ["skipped checks with reasons", "skipped checks"], allow_none=True):
             print("  [!] MISSING SKIPPED CHECKS: PR body fails to mention 'skipped checks' with reasons.")
         if not has_non_empty_body_field(body, ["risk", "risk assessment"]):
             print("  [!] MISSING RISK: PR body fails to mention 'risk' assessment.")
