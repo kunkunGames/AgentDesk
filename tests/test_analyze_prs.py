@@ -86,6 +86,16 @@ Update analyzer hygiene checks.
         self.assertTrue(has_non_empty_body_field(body, ["risk", "risk assessment"]))
         self.assertTrue(has_non_empty_body_field(body, ["rollback notes", "rollback"]))
 
+    def test_related_prs_issues_label_alias_is_populated(self):
+        body = "- Related PRs/issues: checked #123"
+
+        self.assertTrue(
+            has_non_empty_body_field(
+                body,
+                ["related prs/issues checked", "related prs/issues", "related prs"],
+            )
+        )
+
 
 class PrAnalyzerDuplicateGuardTests(unittest.TestCase):
     def test_unchecked_template_duplicate_guard_is_not_acknowledgement(self):
@@ -164,16 +174,20 @@ class PrAnalyzerScratchFileCleanupGuardTests(unittest.TestCase):
 
 
 class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
-    def test_overlap_reference_with_hash(self):
-        body = "This is a no-change PR overlapping with #1234."
+    def test_overlap_reference_with_hash_and_branch(self):
+        body = "This is a no-change PR overlapping with #1234 on branch codex/same-scope."
         self.assertTrue(has_overlap_reference(body))
 
-    def test_overlap_reference_with_url(self):
-        body = "Overlap with https://github.com/owner/repo/pull/5678."
+    def test_overlap_reference_with_url_and_branch(self):
+        body = "Overlap with https://github.com/owner/repo/pull/5678 on branch feature/replacement."
         self.assertTrue(has_overlap_reference(body))
 
     def test_missing_overlap_reference(self):
         body = "This is a no-change PR but lacks exact PR numbers."
+        self.assertFalse(has_overlap_reference(body))
+
+    def test_pr_number_without_branch_is_not_overlap_reference(self):
+        body = "This is a no-change PR overlapping with #1234."
         self.assertFalse(has_overlap_reference(body))
 
     def test_generic_template_issue_references_are_not_overlap_references(self):
@@ -221,6 +235,15 @@ Update analyzer hygiene checks to match the current template.
 
         self.assertFalse(has_template_summary(body))
 
+    def test_colon_prefixed_summary_bullet_counts_as_change_context(self):
+        body = """
+## Summary
+
+- Tests: add analyzer coverage.
+"""
+
+        self.assertTrue(has_template_summary(body))
+
 
 class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_root_scratch_files_are_flagged(self):
@@ -239,6 +262,12 @@ class CiScriptScratchGuardTests(unittest.TestCase):
 
         self.assertIn("test.sql", script)
         self.assertIn("scratch[._-]*.sql", script)
+
+    def test_ci_guard_includes_root_shell_scratch_globs(self):
+        script = Path("scripts/ci-script-checks.sh").read_text()
+
+        self.assertIn("scratch[._-]*.sh", script)
+        self.assertIn("scratchpad[._-]*.sh", script)
 
 if __name__ == "__main__":
     unittest.main()

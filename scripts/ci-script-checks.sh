@@ -46,6 +46,12 @@ for scratch_file in scratch.sql scratchpad.sql scratch[._-]*.sql scratchpad[._-]
     FAIL=1
   fi
 done
+for scratch_file in scratch[._-]*.sh scratchpad[._-]*.sh test_scratch[._-]*.sh; do
+  if [ -f "$scratch_file" ]; then
+    echo "ERROR: Scratch shell file detected in repository root: $scratch_file"
+    FAIL=1
+  fi
+done
 if [ "$FAIL" -ne 0 ]; then
   exit "$FAIL"
 fi

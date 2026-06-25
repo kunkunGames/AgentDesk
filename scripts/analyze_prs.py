@@ -48,7 +48,7 @@ def _is_top_level_field_label(line):
         return False
     return re.match(r"^(?:[-*]\s*)?[a-z0-9 /_-]+\s*:(?:\s.*)?$", line.strip(), re.I)
 
-def has_non_empty_body_field(body, labels, *, allow_none=False):
+def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_labels=True):
     for label in labels:
         pattern = re.compile(
             rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?{re.escape(label)}(?:[ \t]*:[ \t]*(.*)|[ \t]*)$"
@@ -69,7 +69,7 @@ def has_non_empty_body_field(body, labels, *, allow_none=False):
                 # Next field label is a boundary whether or not it carries a
                 # value: an empty `- Risk:` must not borrow the value of a
                 # following populated field (e.g. `- Rollback notes: revert`).
-                if _is_top_level_field_label(next_line):
+                if stop_at_field_labels and _is_top_level_field_label(next_line):
                     break
                 if _meaningful_field_value(commentless, allow_none=allow_none):
                     return True
@@ -125,6 +125,7 @@ def has_scratch_file_cleanup_ack(body):
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
     overlap_context = re.compile(r"(?i)\b(?:overlap|overlapping|duplicate|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
+    branch_token = re.compile(r"`?[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*`?")
     in_overlap_block = False
 
     for line in body.splitlines():
@@ -137,13 +138,17 @@ def has_overlap_reference(body):
         elif _is_top_level_field_label(line):
             in_overlap_block = bool(overlap_context.search(stripped))
 
-        if pr_ref.search(stripped) and (in_overlap_block or overlap_context.search(stripped)):
+        if (
+            pr_ref.search(stripped)
+            and branch_token.search(stripped)
+            and (in_overlap_block or overlap_context.search(stripped))
+        ):
             return True
 
     return False
 
 def has_template_summary(body):
-    return has_non_empty_body_field(body, ["summary"])
+    return has_non_empty_body_field(body, ["summary"], stop_at_field_labels=False)
 
 def is_scratch_file_path(path):
     if not path or "/" in path:
@@ -207,7 +212,7 @@ def main():
             print("  [!] MISSING PRIMARY FILES: PR body lacks the required 'Primary files' field.")
         if not has_non_empty_body_field(body, ["queue hygiene invariant"]):
             print("  [!] MISSING QUEUE HYGIENE INVARIANT: PR body lacks the required 'Queue hygiene invariant' field.")
-        if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs"]):
+        if not has_non_empty_body_field(body, ["related prs/issues checked", "related prs/issues", "related prs"]):
             print("  [!] MISSING RELATED PRS: PR body lacks the required 'Related PRs/issues checked' field.")
         if not has_non_empty_body_field(body, ["why this is non-overlapping", "non-overlapping reason"]):
             print("  [!] MISSING NON-OVERLAPPING REASON: PR body lacks the required 'Why this is non-overlapping' field.")
