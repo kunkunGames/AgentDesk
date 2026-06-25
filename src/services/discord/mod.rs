@@ -184,6 +184,7 @@ use formatting::{
     send_long_message_raw, truncate_str,
 };
 pub(crate) use inflight::clear_inflight_state;
+pub(crate) use inflight::lock_inflight_state_path;
 use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
 use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
 use recovery_engine::restore_inflight_turns;

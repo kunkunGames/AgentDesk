@@ -1266,8 +1266,9 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (3138 lines; #3680 relay
-    recovery review hardening; #3635 added the
+    lines) and `src/services/discord/inflight.rs` (3137 lines; #3680 relay
+    recovery review hardening; #3685 exposes the inflight sidecar lock
+    crate-wide for locked legacy rebind backfill; #3635 added the
     dead-watcher rebind-origin reap — `WatcherLiveness` DI trait, three-state tmux
     pane liveness, spawn-blocking warm sweeper probe, and fs-only locked
     re-validation; the byte-for-byte-unchanged #3581 None-owner predicate is
@@ -1401,7 +1402,8 @@
   - `src/server/mod.rs` (2640 lines; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
-  - `src/reconcile.rs` (1816 lines; periodic reconcile loop covering stale
+  - `src/reconcile.rs` (1868 lines; #3685 rebind-origin stale-inflight
+    preservation review hardening; periodic reconcile loop covering stale
     inflights, orphan uploads, dispatched-session drift, and queue-review
     drift — split before adding non-bugfix behavior).
 - active_callsite_coverage: n/a.
