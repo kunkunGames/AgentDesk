@@ -1228,7 +1228,7 @@
     was removed from `giant_file_registry.toml`; #3038 S5 locked the final
     root ratchet at 274 production lines).
   - `src/services/discord/session_runtime.rs` (1712 lines; -41 from #3591 dead `assistant_turn_count`/`recent_history_context` 메서드 제거 — 100턴/idle 세션 리셋 폐기 연쇄).
-  - `src/services/discord/voice_barge_in.rs` (2823 lines after #3038
+  - `src/services/discord/voice_barge_in.rs` (2812 lines after #3038
     VoiceBargeInRuntime S1 moved the STT method cluster to
     `src/services/discord/voice_barge_in/stt.rs` (314 production lines) and
     S2 moved the progress playback method cluster to
