@@ -1,10 +1,13 @@
 <!-- Keep title concise (≤70 chars). Use the body for details. -->
 
-## Summary
-<!-- 1–3 bullets: what changed and why. -->
+## What changed
+<!-- 1–3 bullets explaining the exact modifications made. -->
+
+## Why
+<!-- Explain the rationale and intent behind this change. -->
 
 ## Test plan
-<!-- Bulleted checklist: how to verify the change. -->
+<!-- Bulleted checklist: how to verify the change. Include explicit commands and results. -->
 
 ## Queue Hygiene & Merge-Readiness checklist
 - [ ] **Duplicate PR guard:** I have checked for overlapping open PRs before creating this PR (especially for generated refresh work).
