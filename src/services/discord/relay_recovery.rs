@@ -413,8 +413,7 @@ pub(in crate::services::discord) fn plan_relay_recovery(
             )
         }
         RelayStallState::QueueBlocked => {
-            let eligible = snapshot.queue_depth > 0
-                && matches!(snapshot.active_turn, RelayActiveTurn::None)
+            let eligible = matches!(snapshot.active_turn, RelayActiveTurn::None)
                 && !snapshot.mailbox_has_cancel_token
                 && snapshot.mailbox_active_user_msg_id.is_none();
             (
@@ -508,20 +507,6 @@ async fn resolve_recovery_shared(
     provider: &ProviderKind,
     decision: &RelayRecoveryDecision,
 ) -> Option<Arc<SharedData>> {
-    let expected_tmux = decision.affected.tmux_session.as_deref();
-    for shared in registry.all_shared_for_provider(provider).await {
-        let Some(snapshot) = registry
-            .snapshot_watcher_state_for_shared(provider, shared.clone(), decision.channel_id)
-            .await
-        else {
-            continue;
-        };
-        if expected_tmux.is_none() || snapshot.relay_health.tmux_session.as_deref() == expected_tmux
-        {
-            return Some(shared);
-        }
-    }
-
     let channel = ChannelId::new(decision.channel_id);
     match tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -530,14 +515,14 @@ async fn resolve_recovery_shared(
     .await
     {
         Ok(Some(shared)) => Some(shared),
-        Ok(None) => registry.shared_for_provider(provider).await,
+        Ok(None) => None,
         Err(_) => {
             tracing::warn!(
                 provider = provider.as_str(),
                 channel_id = decision.channel_id,
-                "relay recovery provider/channel runtime resolve timed out; falling back to provider runtime",
+                "relay recovery provider/channel runtime resolve timed out; skipping channel-scoped recovery",
             );
-            registry.shared_for_provider(provider).await
+            None
         }
     }
 }
@@ -1034,6 +1019,13 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
+    fn isolated_agentdesk_root() -> (AgentdeskRootGuard, tempfile::TempDir) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let guard = AgentdeskRootGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        (guard, temp)
+    }
+
     async fn registry_with_shared(provider: ProviderKind) -> (HealthRegistry, Arc<SharedData>) {
         let registry = HealthRegistry::new();
         let shared = super::super::make_shared_data_for_tests();
@@ -1182,6 +1174,25 @@ mod tests {
             "queued work is stranded behind an idle mailbox; bounded queue drain can restore delivery"
         );
         assert!(decision.auto_heal.eligible);
+        assert_eq!(decision.auto_heal.skipped_reason, None);
+    }
+
+    #[test]
+    fn queue_blocked_allows_disk_backed_queue_to_reach_drain_helper() {
+        let decision = plan_relay_recovery(
+            &RelayHealthSnapshot {
+                queue_depth: 0,
+                ..snapshot()
+            },
+            RelayStallState::QueueBlocked,
+            1_000,
+        );
+
+        assert_eq!(decision.action, RelayRecoveryActionKind::DrainPendingQueue);
+        assert!(
+            decision.auto_heal.eligible,
+            "disk-backed pending queues are hydrated by the drain helper"
+        );
         assert_eq!(decision.auto_heal.skipped_reason, None);
     }
 
@@ -1412,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn live_agentdesk_tmux_relay_dead_without_mailbox_token_needs_operator() {
+    fn live_agentdesk_tmux_relay_dead_without_mailbox_token_can_adopt_ownerless_inflight() {
         let decision = plan_relay_recovery(
             &RelayHealthSnapshot {
                 tmux_session: Some("AgentDesk-codex-42".to_string()),
@@ -1427,11 +1438,8 @@ mod tests {
         );
 
         assert_eq!(decision.action, RelayRecoveryActionKind::ReattachWatcher);
-        assert!(!decision.auto_heal.eligible);
-        assert_eq!(
-            decision.auto_heal.skipped_reason,
-            Some("reattach_missing_required_live_evidence")
-        );
+        assert!(decision.auto_heal.eligible);
+        assert_eq!(decision.auto_heal.skipped_reason, None);
     }
 
     #[test]
@@ -1493,6 +1501,7 @@ mod tests {
     async fn auto_apply_orphan_pending_token_clears_mailbox_token() {
         let _guard = auto_heal_test_lock().lock().await;
         clear_auto_heal_attempts_for_tests();
+        let (_root_guard, _root_dir) = isolated_agentdesk_root();
         let provider = ProviderKind::Codex;
         let (registry, shared) = registry_with_shared(provider.clone()).await;
         let channel = ChannelId::new(3_360_001);
@@ -1541,6 +1550,7 @@ mod tests {
     async fn probe_auto_apply_is_rate_limited_per_channel_action() {
         let _guard = auto_heal_test_lock().lock().await;
         clear_auto_heal_attempts_for_tests();
+        let (_root_guard, _root_dir) = isolated_agentdesk_root();
         let provider = ProviderKind::Codex;
         let (registry, shared) = registry_with_shared(provider.clone()).await;
         let channel = ChannelId::new(3_360_002);
@@ -1589,6 +1599,7 @@ mod tests {
     async fn watchdog_auto_apply_is_rate_limited_after_first_token_reclaim() {
         let _guard = auto_heal_test_lock().lock().await;
         clear_auto_heal_attempts_for_tests();
+        let (_root_guard, _root_dir) = isolated_agentdesk_root();
         let provider = ProviderKind::Codex;
         let (registry, shared) = registry_with_shared(provider.clone()).await;
         let channel = ChannelId::new(3_360_005);
@@ -1675,6 +1686,7 @@ mod tests {
     async fn auto_apply_is_limited_to_requested_action_kind() {
         let _guard = auto_heal_test_lock().lock().await;
         clear_auto_heal_attempts_for_tests();
+        let (_root_guard, _root_dir) = isolated_agentdesk_root();
         let provider = ProviderKind::Codex;
         let (registry, shared) = registry_with_shared(provider.clone()).await;
         let parent = ChannelId::new(3_360_003);
@@ -1753,6 +1765,7 @@ mod tests {
 
     #[test]
     fn idle_tmux_repair_guard_detects_tail_answer_after_offset() {
+        let _guard = auto_heal_test_lock().blocking_lock();
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1786,6 +1799,7 @@ mod tests {
 
     #[test]
     fn idle_tmux_repair_guard_silent_when_tail_empty() {
+        let _guard = auto_heal_test_lock().blocking_lock();
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1817,6 +1831,7 @@ mod tests {
         // suppress the destructive clear — otherwise the watchdog would skip it
         // every tick forever (recovery only advances the offset on terminal
         // success). The guard requires success-result completion evidence.
+        let _guard = auto_heal_test_lock().blocking_lock();
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
