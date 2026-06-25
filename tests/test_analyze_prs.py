@@ -96,6 +96,19 @@ Update analyzer hygiene checks.
             )
         )
 
+    def test_related_prs_issues_allows_bare_issue_ref_value(self):
+        body = """
+- Related PRs/issues checked:
+  #1234
+"""
+
+        self.assertTrue(
+            has_non_empty_body_field(
+                body,
+                ["related prs/issues checked", "related prs/issues", "related prs"],
+            )
+        )
+
 
 class PrAnalyzerDuplicateGuardTests(unittest.TestCase):
     def test_unchecked_template_duplicate_guard_is_not_acknowledgement(self):
@@ -223,6 +236,13 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
 
         self.assertTrue(has_overlap_reference(body))
 
+    def test_non_overlapping_reason_is_not_overlap_evidence(self):
+        body = """
+- Why this is non-overlapping: not overlapping with #1234 on branch feature/foo
+"""
+
+        self.assertFalse(has_overlap_reference(body))
+
 
 class PrAnalyzerTemplateSummaryTests(unittest.TestCase):
     def test_populated_template_summary_counts_as_change_context(self):
@@ -261,11 +281,23 @@ Update analyzer hygiene checks to match the current template.
 
         self.assertTrue(has_template_summary(body))
 
+    def test_empty_summary_field_labels_are_not_change_context(self):
+        body = """
+## Summary
+
+- What changed:
+- Why:
+"""
+
+        self.assertFalse(has_template_summary(body))
+
 
 class PrAnalyzerScratchPathTests(unittest.TestCase):
     def test_root_scratch_files_are_flagged(self):
         self.assertTrue(is_scratch_file_path("pr-body.md"))
         self.assertTrue(is_scratch_file_path("test.sh"))
+        self.assertTrue(is_scratch_file_path("scratch.sh"))
+        self.assertTrue(is_scratch_file_path("scratchpad.sh"))
         self.assertTrue(is_scratch_file_path("scratch-check.sql"))
         self.assertTrue(is_scratch_file_path("test_cli.rs"))
 
@@ -284,6 +316,8 @@ class CiScriptScratchGuardTests(unittest.TestCase):
     def test_ci_guard_includes_root_shell_scratch_globs(self):
         script = Path("scripts/ci-script-checks.sh").read_text()
 
+        self.assertIn("scratch.sh", script)
+        self.assertIn("scratchpad.sh", script)
         self.assertIn("scratch[._-]*.sh", script)
         self.assertIn("scratchpad[._-]*.sh", script)
 

@@ -38,10 +38,15 @@ def _strip_html_comments(value):
 
 def _meaningful_field_value(value, *, allow_none=False):
     normalized = _strip_html_comments(value).strip().strip("-–—").strip()
+    if re.match(r"(?i)^[a-z0-9 /_-]+\s*:\s*$", normalized):
+        return False
     placeholders = {"n/a", "todo", "tbd", "na"}
     if not allow_none:
         placeholders.add("none")
     return bool(normalized) and normalized.casefold() not in placeholders
+
+def _is_markdown_heading(line):
+    return bool(re.match(r"^[ \t]{0,3}#{1,6}[ \t]+\S", line))
 
 def _is_top_level_field_label(line):
     if line[:1] in {" ", "\t"}:
@@ -64,7 +69,7 @@ def has_non_empty_body_field(body, labels, *, allow_none=False, stop_at_field_la
                 commentless = _strip_html_comments(stripped).strip()
                 if not commentless:
                     continue
-                if stripped.startswith("#"):
+                if _is_markdown_heading(next_line):
                     break
                 # Next field label is a boundary whether or not it carries a
                 # value: an empty `- Risk:` must not borrow the value of a
@@ -125,6 +130,7 @@ def has_scratch_file_cleanup_ack(body):
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
     overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicate|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
+    negated_overlap_context = re.compile(r"(?i)\b(?:non[- ]?overlapp?ing|non[- ]?overlap|not overlapping|not overlap|does not overlap)\b")
     branch_ref = re.compile(r"(?i)\b(?:branch(?:es)?|head(?: ref)?|ref)\s*[:=-]?\s*`?([A-Za-z0-9][A-Za-z0-9._/-]*)`?")
     overlap_detail_field = re.compile(r"(?i)^(?:[-*]\s*)?(?:pr|pull request|branch(?:es)?|head(?: ref)?|ref)\s*:")
     in_overlap_block = False
@@ -134,6 +140,8 @@ def has_overlap_reference(body):
     for line in body.splitlines():
         stripped = line.strip()
         if not stripped:
+            continue
+        if negated_overlap_context.search(stripped):
             continue
 
         is_boundary = stripped.startswith("#") or _is_top_level_field_label(line)
@@ -167,8 +175,10 @@ def is_scratch_file_path(path):
         "plan.md",
         "plan.txt",
         "scratch.md",
+        "scratch.sh",
         "scratch.txt",
         "scratchpad.md",
+        "scratchpad.sh",
         "scratchpad.txt",
         "test.sh",
         "test.sql",
