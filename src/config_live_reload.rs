@@ -13,12 +13,12 @@
 //!
 //! Subsystems read the live snapshot via [`current`] each cycle, so settings
 //! they re-read per tick (e.g. routine tunables) take effect without a restart.
-//! Infra fields (`server` bind/port/auth, `database`, `data`, `discord` client
-//! and bot bindings, `providers` runtimes, `agents` per-channel runtime hosting
-//! overrides, `mcp_servers` child processes, the `mcp` credential watcher, and
-//! the `memory` backend) are bound into long-lived objects at boot and cannot be
-//! swapped under a running process; a change to those is still stored in the
-//! snapshot but reported by
+//! Boot-bound fields (`server` bind/port/auth, `database`, `data`, `cluster`,
+//! Discord client and bot bindings, provider runtimes, agent launch/voice
+//! bindings, global voice runtime settings, MCP child processes/credentials,
+//! memory backend, GitHub sync cadence, prompt retention, and watcher flags) are
+//! bound into long-lived objects at boot and cannot be swapped under a running
+//! process; a change to those is still stored in the snapshot but reported by
 //! [`restart_required_changes`] and logged as restart-required.
 //!
 //! The whole-`Config` value is NOT threaded through every reader — instead this
@@ -34,7 +34,10 @@ use std::time::{Duration, Instant};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 
-use crate::config::{BotConfig, Config, DiscordBotAuthConfig, DiscordConfig};
+use crate::config::{
+    AgentVoiceConfig, BotConfig, Config, DiscordBotAuthConfig, DiscordConfig, RoutinesConfig,
+};
+use crate::voice::barge_in::BargeInSensitivity;
 
 /// Process-global live config snapshot. `None` until [`install`] runs at boot.
 static LIVE: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
@@ -149,6 +152,16 @@ struct AgentLaunchFingerprint {
     agent_ids: BTreeSet<String>,
     channel_ids: BTreeSet<u64>,
     runtime_bindings: BTreeMap<AgentProviderRuntimeBindingKey, AgentProviderRuntimeBindingValue>,
+    voice_bindings: Vec<AgentVoiceRestartFingerprint>,
+}
+
+#[derive(PartialEq, Eq)]
+struct AgentVoiceRestartFingerprint {
+    agent_id: String,
+    fallback_provider: String,
+    voice_enabled: bool,
+    sensitivity_mode: Option<BargeInSensitivity>,
+    voice: AgentVoiceConfig,
 }
 
 fn agent_launch_fingerprint(config: &Config) -> AgentLaunchFingerprint {
@@ -157,10 +170,20 @@ fn agent_launch_fingerprint(config: &Config) -> AgentLaunchFingerprint {
     let mut provider_keys = BTreeSet::new();
     let mut agent_ids = BTreeSet::new();
     let mut channel_ids = BTreeSet::new();
+    let mut voice_bindings = Vec::new();
     for agent in &config.agents {
         let agent_id = agent.id.trim().to_ascii_lowercase();
         if !agent_id.is_empty() {
             agent_ids.insert(agent_id);
+        }
+        if agent_voice_restart_relevant(agent) {
+            voice_bindings.push(AgentVoiceRestartFingerprint {
+                agent_id: agent.id.trim().to_ascii_lowercase(),
+                fallback_provider: agent.provider.trim().to_ascii_lowercase(),
+                voice_enabled: agent.voice_enabled,
+                sensitivity_mode: agent.sensitivity_mode,
+                voice: agent.voice.clone(),
+            });
         }
         for (channel_kind, channel) in agent.channels.iter() {
             let Some(channel) = channel else {
@@ -206,6 +229,32 @@ fn agent_launch_fingerprint(config: &Config) -> AgentLaunchFingerprint {
         agent_ids,
         channel_ids,
         runtime_bindings: bindings,
+        voice_bindings,
+    }
+}
+
+fn agent_voice_restart_relevant(agent: &crate::config::AgentDef) -> bool {
+    !agent.voice_enabled || agent.sensitivity_mode.is_some() || !agent.voice.is_default()
+}
+
+#[derive(PartialEq, Eq)]
+struct RoutinesRestartFingerprint {
+    enabled: bool,
+    script_dirs: Vec<PathBuf>,
+    tick_interval_secs: u64,
+    default_timezone: String,
+    agent_timeout_secs: u64,
+    max_checkpoint_bytes: usize,
+}
+
+fn routines_restart_fingerprint(routines: &RoutinesConfig) -> RoutinesRestartFingerprint {
+    RoutinesRestartFingerprint {
+        enabled: routines.enabled,
+        script_dirs: routines.script_dirs(),
+        tick_interval_secs: routines.tick_interval_secs,
+        default_timezone: routines.default_timezone.clone(),
+        agent_timeout_secs: routines.agent_timeout_secs,
+        max_checkpoint_bytes: routines.max_checkpoint_bytes,
     }
 }
 
@@ -214,12 +263,12 @@ fn agent_launch_fingerprint(config: &Config) -> AgentLaunchFingerprint {
 /// snapshot but needs a restart to take full effect, so it is reported to the
 /// operator (logged as restart-required) instead of silently appearing to apply.
 ///
-/// Without this list, editing e.g. a Discord bot token, an `mcp_servers` entry,
-/// or a `providers` runtime in `agentdesk.yaml` would swap into the snapshot
-/// with no observable effect and no warning — the exact "the edit did nothing"
-/// trap. Most sections use serialized equality for broad coverage, while
-/// secret-bearing or order-sensitive sections use deterministic non-logging
-/// fingerprints.
+/// Without this list, editing e.g. a Discord bot token, a cluster role, an
+/// `mcp_servers` entry, or a `providers` runtime in `agentdesk.yaml` would swap
+/// into the snapshot with no observable effect and no warning — the exact "the
+/// edit did nothing" trap. Most sections use serialized equality for broad
+/// coverage, while secret-bearing or order-sensitive sections use deterministic
+/// non-logging fingerprints.
 pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
     if section_changed(&old.server, &new.server) {
@@ -230,6 +279,10 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     }
     if section_changed(&old.data, &new.data) {
         changed.push("data");
+    }
+    // Cluster runtime and wait-queue snapshots are installed at boot.
+    if old.cluster != new.cluster {
+        changed.push("cluster");
     }
     // The policy engine constructs its QuickJS runtime, directory watcher, and
     // hook timeout/memory limits at boot.
@@ -251,9 +304,19 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     if agent_launch_fingerprint(old) != agent_launch_fingerprint(new) {
         changed.push("agents");
     }
+    // Discord voice receive/STT/TTS workers are constructed during gateway setup.
+    if old.voice != new.voice {
+        changed.push("voice");
+    }
     // MCP servers are spawned as child processes at boot.
     if section_changed(&old.mcp_servers, &new.mcp_servers) {
         changed.push("mcp_servers");
+    }
+    // Review slim-mode MCP catalogs are generated during provider bootstrap.
+    if normalized_string_set(&old.review_mcp_allowlist)
+        != normalized_string_set(&new.review_mcp_allowlist)
+    {
+        changed.push("review_mcp_allowlist");
     }
     // The MCP credential watcher (and its dedupe window) is started at boot.
     if section_changed(&old.mcp, &new.mcp) {
@@ -263,6 +326,19 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     if section_changed(&old.memory, &new.memory) {
         changed.push("memory");
     }
+    // GitHub sync worker cadence is captured when the worker starts.
+    if old.github.sync_interval_minutes != new.github.sync_interval_minutes {
+        changed.push("github");
+    }
+    // Discord placeholder/status-panel flags are copied into shared UI state at boot.
+    if old.placeholder != new.placeholder {
+        changed.push("placeholder");
+    }
+    // Routine worker startup, script dirs, tick cadence, store limits/timezone, and
+    // agent timeout are boot-bound. Per-tick caps and alert knobs are live-read.
+    if routines_restart_fingerprint(&old.routines) != routines_restart_fingerprint(&new.routines) {
+        changed.push("routines");
+    }
     // Prompt-manifest retention is installed into a set-once boot snapshot.
     if section_changed(
         &old.prompt_manifest_retention,
@@ -270,7 +346,20 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     ) {
         changed.push("prompt_manifest_retention");
     }
+    // The file watcher itself is created (or skipped) from the boot value.
+    if old.config_hot_reload != new.config_hot_reload {
+        changed.push("config_hot_reload");
+    }
     changed
+}
+
+fn normalized_string_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Re-read, validate, and (on success) atomically swap in the config at `path`.
@@ -569,10 +658,33 @@ mod tests {
     // A hot-swappable-only change (routine tunable) reports no restart-required.
     #[test]
     fn routine_tunable_change_needs_no_restart() {
-        let old = Config::default();
+        let mut old = Config::default();
+        old.routines.enabled = true;
         let mut new = old.clone();
         new.routines.max_agent_polls_per_tick =
             old.routines.max_agent_polls_per_tick.wrapping_add(1);
+        assert!(restart_required_changes(&old, &new).is_empty());
+
+        new = old.clone();
+        new.routines.max_due_per_tick = old.routines.max_due_per_tick.wrapping_add(1);
+        assert!(restart_required_changes(&old, &new).is_empty());
+
+        new = old.clone();
+        new.routines.hot_reload = !old.routines.hot_reload;
+        assert!(restart_required_changes(&old, &new).is_empty());
+
+        new = old.clone();
+        new.routines.stale_paused_alert_secs = old.routines.stale_paused_alert_secs.wrapping_add(1);
+        assert!(restart_required_changes(&old, &new).is_empty());
+
+        new = old.clone();
+        new.routines.stale_paused_alert_ttl_secs =
+            old.routines.stale_paused_alert_ttl_secs.wrapping_add(1);
+        assert!(restart_required_changes(&old, &new).is_empty());
+
+        new = old.clone();
+        new.routines.failure_pause_auto_resume_secs =
+            old.routines.failure_pause_auto_resume_secs.wrapping_add(1);
         assert!(restart_required_changes(&old, &new).is_empty());
     }
 
@@ -616,6 +728,37 @@ mod tests {
         memory.memory = Some(crate::config::MemoryConfig::default());
         assert_eq!(restart_required_changes(&base, &memory), vec!["memory"]);
 
+        let mut cluster = base.clone();
+        cluster.cluster.enabled = !base.cluster.enabled;
+        assert_eq!(restart_required_changes(&base, &cluster), vec!["cluster"]);
+
+        let mut global_voice = base.clone();
+        global_voice.voice.enabled = !base.voice.enabled;
+        assert_eq!(
+            restart_required_changes(&base, &global_voice),
+            vec!["voice"]
+        );
+
+        let mut review_mcp_allowlist = base.clone();
+        review_mcp_allowlist
+            .review_mcp_allowlist
+            .push("memento".to_string());
+        assert_eq!(
+            restart_required_changes(&base, &review_mcp_allowlist),
+            vec!["review_mcp_allowlist"]
+        );
+
+        let mut github = base.clone();
+        github.github.sync_interval_minutes = base.github.sync_interval_minutes.wrapping_add(1);
+        assert_eq!(restart_required_changes(&base, &github), vec!["github"]);
+
+        let mut placeholder = base.clone();
+        placeholder.placeholder.live_events_enabled = !base.placeholder.live_events_enabled;
+        assert_eq!(
+            restart_required_changes(&base, &placeholder),
+            vec!["placeholder"]
+        );
+
         let mut prompt_retention = base.clone();
         prompt_retention.prompt_manifest_retention.full_content_days = base
             .prompt_manifest_retention
@@ -624,6 +767,64 @@ mod tests {
         assert_eq!(
             restart_required_changes(&base, &prompt_retention),
             vec!["prompt_manifest_retention"]
+        );
+
+        let mut config_hot_reload = base.clone();
+        config_hot_reload.config_hot_reload = !base.config_hot_reload;
+        assert_eq!(
+            restart_required_changes(&base, &config_hot_reload),
+            vec!["config_hot_reload"]
+        );
+    }
+
+    #[test]
+    fn restart_required_changes_flags_boot_bound_routine_settings() {
+        let base = Config::default();
+
+        let mut enabled = base.clone();
+        enabled.routines.enabled = !base.routines.enabled;
+        assert_eq!(restart_required_changes(&base, &enabled), vec!["routines"]);
+
+        let mut dir = base.clone();
+        dir.routines.dir = PathBuf::from("./alternate-routines");
+        assert_eq!(restart_required_changes(&base, &dir), vec!["routines"]);
+
+        let mut additional_dirs = base.clone();
+        additional_dirs
+            .routines
+            .additional_dirs
+            .push(PathBuf::from("./operator-routines"));
+        assert_eq!(
+            restart_required_changes(&base, &additional_dirs),
+            vec!["routines"]
+        );
+
+        let mut tick_interval = base.clone();
+        tick_interval.routines.tick_interval_secs =
+            base.routines.tick_interval_secs.wrapping_add(1);
+        assert_eq!(
+            restart_required_changes(&base, &tick_interval),
+            vec!["routines"]
+        );
+
+        let mut timezone = base.clone();
+        timezone.routines.default_timezone = "UTC".to_string();
+        assert_eq!(restart_required_changes(&base, &timezone), vec!["routines"]);
+
+        let mut agent_timeout = base.clone();
+        agent_timeout.routines.agent_timeout_secs =
+            base.routines.agent_timeout_secs.wrapping_add(1);
+        assert_eq!(
+            restart_required_changes(&base, &agent_timeout),
+            vec!["routines"]
+        );
+
+        let mut checkpoint_limit = base.clone();
+        checkpoint_limit.routines.max_checkpoint_bytes =
+            base.routines.max_checkpoint_bytes.wrapping_add(1);
+        assert_eq!(
+            restart_required_changes(&base, &checkpoint_limit),
+            vec!["routines"]
         );
     }
 
@@ -692,6 +893,27 @@ mod tests {
         renamed_agent.agents[0].id = "renamed-dispatcher".to_string();
         assert_eq!(
             restart_required_changes(&new, &renamed_agent),
+            vec!["agents"]
+        );
+    }
+
+    #[test]
+    fn restart_required_changes_flags_agent_voice_bindings() {
+        let mut old = Config::default();
+        old.agents
+            .push(test_agent_with_claude_channel("123", None, None));
+
+        let mut voice_channel_changed = old.clone();
+        voice_channel_changed.agents[0].voice.channel_id = Some("456".to_string());
+        assert_eq!(
+            restart_required_changes(&old, &voice_channel_changed),
+            vec!["agents"]
+        );
+
+        let mut foreground_changed = voice_channel_changed.clone();
+        foreground_changed.agents[0].voice.foreground.provider = Some("codex".to_string());
+        assert_eq!(
+            restart_required_changes(&voice_channel_changed, &foreground_changed),
             vec!["agents"]
         );
     }
