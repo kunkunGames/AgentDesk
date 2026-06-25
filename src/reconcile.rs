@@ -1683,20 +1683,26 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
             if !age_ok {
                 continue;
             }
-            // Only remove when restart_mode is absent and rebind_origin is false.
-            // A file with a restart_mode set is owned by a planned lifecycle
-            // (drain/hot-swap); a rebind_origin file is managed by the placeholder
-            // sweeper. The existing inflight retention helpers cover those.
+            // Only remove when restart_mode is absent and the file is not an
+            // externally adopted rebind-origin placeholder. Planned restart
+            // rows are owned by drain/hot-swap lifecycle; externally adopted
+            // rebind-origin rows are managed by the placeholder sweeper.
             #[derive(serde::Deserialize)]
             struct LifecycleExt {
                 restart_mode: Option<serde_json::Value>,
                 #[serde(default)]
                 rebind_origin: bool,
+                turn_source: Option<String>,
             }
             let is_managed_lifecycle = fs::read_to_string(&fpath)
                 .ok()
                 .and_then(|body| serde_json::from_str::<LifecycleExt>(&body).ok())
-                .is_some_and(|v| v.restart_mode.is_some_and(|rm| !rm.is_null()) || v.rebind_origin);
+                .is_some_and(|v| {
+                    let planned_restart = v.restart_mode.is_some_and(|rm| !rm.is_null());
+                    let external_rebind_origin =
+                        v.rebind_origin && v.turn_source.as_deref() == Some("external_adopted");
+                    planned_restart || external_rebind_origin
+                });
             if is_managed_lifecycle {
                 continue;
             }
@@ -1711,6 +1717,69 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
         }
     }
     removed
+}
+
+#[cfg(test)]
+mod stale_inflight_sweep_tests {
+    use super::sweep_stale_inflight_files_at;
+    use filetime::{FileTime, set_file_mtime};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, SystemTime},
+    };
+
+    fn write_stale_inflight(root: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let provider_dir = root.join("claude");
+        fs::create_dir_all(&provider_dir).expect("provider dir");
+        let path = provider_dir.join(format!("{name}.json"));
+        fs::write(&path, body).expect("write inflight");
+        let old_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
+        set_file_mtime(&path, old_mtime).expect("set mtime");
+        path
+    }
+
+    #[test]
+    fn stale_sweep_preserves_external_rebind_origin_only() {
+        let root = tempfile::tempdir().expect("temp root");
+        let external = write_stale_inflight(
+            root.path(),
+            "external",
+            r#"{"rebind_origin":true,"turn_source":"external_adopted"}"#,
+        );
+        let monitor = write_stale_inflight(
+            root.path(),
+            "monitor",
+            r#"{"rebind_origin":true,"turn_source":"monitor_triggered"}"#,
+        );
+
+        let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
+
+        assert_eq!(removed, 1);
+        assert!(
+            external.exists(),
+            "external adopted rebind-origin is placeholder-managed"
+        );
+        assert!(
+            !monitor.exists(),
+            "monitor-triggered stale rebind-origin remains sweepable"
+        );
+    }
+
+    #[test]
+    fn stale_sweep_preserves_planned_restart_rows() {
+        let root = tempfile::tempdir().expect("temp root");
+        let planned = write_stale_inflight(
+            root.path(),
+            "planned",
+            r#"{"restart_mode":"hot_swap","rebind_origin":false}"#,
+        );
+
+        let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
+
+        assert_eq!(removed, 0);
+        assert!(planned.exists());
+    }
 }
 
 /// Remove `discord_uploads/<channel>/*` files older than
