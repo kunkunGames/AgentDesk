@@ -42,7 +42,7 @@
 //! [`request_discovery_tick`] for that purpose so future PRs can nudge the
 //! loop without changing this module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,15 +103,24 @@ pub fn request_discovery_tick() {
 ///
 /// Logs at WARN if the directory builder rejects a per-binding collision so
 /// operators can fix the config without aborting the whole tick.
+#[allow(dead_code)] // compatibility helper; the discovery tick uses the live-session-filtered path
 pub async fn build_channel_directory_from_pg(
     pool: &PgPool,
+) -> Result<ChannelDirectory, sqlx::Error> {
+    let live_session_names = HashSet::new();
+    build_channel_directory_from_pg_for_live_sessions(pool, &live_session_names).await
+}
+
+async fn build_channel_directory_from_pg_for_live_sessions(
+    pool: &PgPool,
+    live_session_names: &HashSet<String>,
 ) -> Result<ChannelDirectory, sqlx::Error> {
     // load_graceful() does sync filesystem IO + yaml parse — push to a blocking
     // thread so we don't stall the tokio runtime on every discovery tick.
     let name_map = tokio::task::spawn_blocking(build_yaml_channel_name_map)
         .await
         .unwrap_or_default();
-    let session_tmux_segments = load_session_tmux_segments_pg(pool).await?;
+    let session_tmux_segments = load_session_tmux_segments_pg(pool, live_session_names).await?;
     build_channel_directory_from_pg_with_config(pool, name_map, session_tmux_segments).await
 }
 
@@ -137,6 +146,8 @@ const SESSION_TMUX_SEGMENTS_QUERY: &str = "SELECT provider, channel_id, session_
              'idle',
              'working'
            )
+           AND last_heartbeat IS NOT NULL
+           AND last_heartbeat > NOW() - INTERVAL '10 minutes'
          ORDER BY last_heartbeat DESC NULLS LAST,
                   created_at DESC NULLS LAST,
                   id DESC";
@@ -219,6 +230,7 @@ async fn build_channel_directory_from_pg_with_config(
 /// dcserver restarts instead of logging it as an unowned operator session.
 async fn load_session_tmux_segments_pg(
     pool: &PgPool,
+    live_session_names: &HashSet<String>,
 ) -> Result<SessionTmuxSegmentMap, sqlx::Error> {
     let rows = sqlx::query(SESSION_TMUX_SEGMENTS_QUERY)
         .fetch_all(pool)
@@ -239,7 +251,9 @@ async fn load_session_tmux_segments_pg(
         else {
             continue;
         };
-        let Some((provider, tmux_segment)) = tmux_segment_from_session_key(session_key) else {
+        let Some((provider, tmux_segment)) =
+            live_tmux_segment_from_session_key(session_key, live_session_names)
+        else {
             continue;
         };
         if let Some(hint) = provider_hint
@@ -282,9 +296,28 @@ fn normalize_nonempty(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn tmux_segment_from_session_key(session_key: &str) -> Option<(ProviderKind, String)> {
+fn tmux_name_and_segment_from_session_key(
+    session_key: &str,
+) -> Option<(&str, ProviderKind, String)> {
     let (_, tmux_name) = session_key.rsplit_once(':')?;
-    parse_provider_and_channel_from_tmux_name(tmux_name)
+    let (provider, tmux_segment) = parse_provider_and_channel_from_tmux_name(tmux_name)?;
+    Some((tmux_name, provider, tmux_segment))
+}
+
+fn live_tmux_segment_from_session_key(
+    session_key: &str,
+    live_session_names: &HashSet<String>,
+) -> Option<(ProviderKind, String)> {
+    let (tmux_name, provider, tmux_segment) = tmux_name_and_segment_from_session_key(session_key)?;
+    if !live_session_names.contains(tmux_name) {
+        tracing::debug!(
+            session_key = %session_key,
+            tmux_name = %tmux_name,
+            "session-discovery: ignoring non-live session row while deriving tmux segment",
+        );
+        return None;
+    }
+    Some((provider, tmux_segment))
 }
 
 /// Extract the `(provider, channel_id)` pairs an agent declares. Today this
@@ -567,18 +600,6 @@ async fn run_single_tick(
         tracing::debug!("session-discovery: yielding tick to foreground under pool pressure",);
         return TickReport::default();
     }
-    // PG load failure → ABORT THE TICK. Returning a default report leaves the
-    // registry untouched, so a transient PG hiccup never wipes live entries.
-    let directory = match build_channel_directory_from_pg(pool).await {
-        Ok(dir) => dir,
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                "session-discovery: agent-binding load failed; skipping tick to preserve registry",
-            );
-            return TickReport::default();
-        }
-    };
     let enumeration_result = tokio::task::spawn_blocking(list_sessions_with_pane_command).await;
     let enumeration = match enumeration_result {
         Ok(Ok(sessions)) => sessions,
@@ -588,6 +609,27 @@ async fn run_single_tick(
         }
         Err(error) => {
             tracing::warn!(?error, "session-discovery: tmux enumeration join failed");
+            return TickReport::default();
+        }
+    };
+    let live_session_names: HashSet<String> = enumeration
+        .iter()
+        .map(|session| session.session_name.clone())
+        .collect();
+    // PG load failure → ABORT THE TICK. Returning a default report leaves the
+    // registry untouched, so a transient PG hiccup never wipes live entries.
+    let directory = match build_channel_directory_from_pg_for_live_sessions(
+        pool,
+        &live_session_names,
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "session-discovery: agent-binding load failed; skipping tick to preserve registry",
+            );
             return TickReport::default();
         }
     };
@@ -905,10 +947,66 @@ mod tests {
             "stale terminal statuses must not be eligible"
         );
         assert!(
+            query.contains("last_heartbeat IS NOT NULL")
+                && query.contains("last_heartbeat > NOW() - INTERVAL '10 minutes'"),
+            "fallback tmux segments must come from current-runtime heartbeat rows"
+        );
+        assert!(
             query.contains("ORDER BY last_heartbeat DESC NULLS LAST")
                 && query.contains("created_at DESC NULLS LAST")
                 && query.contains("id DESC"),
             "newest live session rows must be considered before older rows"
+        );
+    }
+
+    #[test]
+    fn session_tmux_segment_fallback_requires_live_tmux_session() {
+        let snowflake = "1234567890";
+        let stale_named_session =
+            expected_session_name_for(None, &ProviderKind::Claude, "old-channel-name");
+        let live_snowflake_session =
+            expected_session_name_for(None, &ProviderKind::Claude, snowflake);
+        let live_named_session =
+            expected_session_name_for(None, &ProviderKind::Claude, "current-channel-name");
+        let live_session_names = std::collections::HashSet::from([
+            live_snowflake_session.clone(),
+            live_named_session.clone(),
+        ]);
+
+        assert!(
+            live_tmux_segment_from_session_key(
+                &format!("provider-cli:{stale_named_session}"),
+                &live_session_names,
+            )
+            .is_none(),
+            "stale DB session rows must not install a tmux_segment fallback"
+        );
+        assert_eq!(
+            live_tmux_segment_from_session_key(
+                &format!("provider-cli:{live_named_session}"),
+                &live_session_names,
+            ),
+            Some((ProviderKind::Claude, "current-channel-name".to_string())),
+            "live tmux-verified session rows remain eligible"
+        );
+
+        let directory = ChannelDirectory::from_bindings(vec![binding(
+            snowflake,
+            "legacy-agent",
+            ProviderKind::Claude,
+        )]);
+        let registry = SessionRegistry::new();
+
+        let report = reconcile_from_enumeration(
+            Some(NODE_A),
+            vec![enumerated(&live_snowflake_session, "claude")],
+            &directory,
+            &registry,
+        );
+
+        assert_eq!(
+            report.matched, 1,
+            "skipping stale fallback must leave channel_id matching intact"
         );
     }
 
