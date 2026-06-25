@@ -199,9 +199,11 @@ function RateLimitBucketGauge({
 export function MiniRateLimitBar({
   isKo,
   density = "compact",
+  layout = "default",
 }: {
   isKo: boolean;
   density?: "compact" | "comfortable";
+  layout?: "default" | "homeWide";
 }) {
   const [providers, setProviders] = useState<RLProvider[]>([]);
   const isComfy = density === "comfortable";
@@ -223,80 +225,167 @@ export function MiniRateLimitBar({
 
   if (providers.length === 0) return null;
 
+  const renderComfortableProvider = (p: RLProvider) => {
+    const providerMeta = getProviderMeta(p.provider);
+    const visible = p.buckets;
+    return (
+      <div key={p.provider} className="space-y-1.5">
+        <div className="flex items-center gap-1">
+          <span
+            className="text-sm font-bold uppercase truncate"
+            style={{ color: providerMeta.color }}
+          >
+            {(RL_ICONS[p.provider] ?? "•")} {p.provider}
+          </span>
+          {p.stale ? (
+            <span
+              className="rounded px-1 text-[8px] font-medium shrink-0"
+              style={{
+                color: "var(--warn)",
+                background:
+                  "color-mix(in oklch, var(--warn) 14%, var(--bg-2) 86%)",
+                border:
+                  "1px solid color-mix(in oklch, var(--warn) 28%, var(--line) 72%)",
+              }}
+            >
+              {isKo ? "지연" : "STALE"}
+            </span>
+          ) : null}
+        </div>
+        {p.unsupported || visible.length === 0 ? (
+          <div className="flex items-center gap-2 overflow-hidden">
+            <span
+              className="rounded px-1.5 py-0.5 text-[10px] font-semibold shrink-0"
+              style={{
+                color: "var(--fg-dim)",
+                background:
+                  "color-mix(in oklch, var(--fg-faint) 10%, var(--bg-2) 90%)",
+                border:
+                  "1px solid color-mix(in oklch, var(--fg-faint) 20%, var(--line) 80%)",
+              }}
+            >
+              {p.unsupported ? "N/A" : (isKo ? "비어있음" : "EMPTY")}
+            </span>
+            <span
+              className="truncate text-[11px]"
+              style={{ color: "var(--th-text-muted)" }}
+            >
+              {p.unsupported
+                ? p.reason ??
+                  (isKo
+                    ? "한도 텔레메트리 미지원"
+                    : "Rate-limit telemetry unavailable")
+                : isKo
+                  ? "표시할 버킷 데이터 없음"
+                  : "No bucket data"}
+            </span>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-y-1.5">
+            {visible.map((b) => (
+              <RateLimitBucketGauge
+                key={b.id}
+                bucket={b}
+                provider={p.provider}
+                isKo={isKo}
+                density="comfortable"
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderHomeWideProvider = (p: RLProvider) => {
+    const providerMeta = getProviderMeta(p.provider);
+    const visible = p.buckets;
+    return (
+      <div key={p.provider} className="min-w-0 space-y-1.5">
+        <div className="flex h-5 min-w-0 items-center gap-1">
+          <span
+            className="truncate text-sm font-bold uppercase"
+            style={{ color: providerMeta.color }}
+          >
+            {(RL_ICONS[p.provider] ?? "•")} {p.provider}
+          </span>
+          {p.stale ? (
+            <span
+              className="rounded px-1 text-[8px] font-medium shrink-0"
+              style={{
+                color: "var(--warn)",
+                background:
+                  "color-mix(in oklch, var(--warn) 14%, var(--bg-2) 86%)",
+                border:
+                  "1px solid color-mix(in oklch, var(--warn) 28%, var(--line) 72%)",
+              }}
+            >
+              {isKo ? "지연" : "STALE"}
+            </span>
+          ) : null}
+        </div>
+        {p.unsupported || visible.length === 0 ? (
+          <div className="flex items-center gap-2 overflow-hidden">
+            <span
+              className="rounded px-1.5 py-0.5 text-[9px] font-semibold shrink-0"
+              style={{
+                color: "var(--fg-dim)",
+                background:
+                  "color-mix(in oklch, var(--fg-faint) 10%, var(--bg-2) 90%)",
+                border:
+                  "1px solid color-mix(in oklch, var(--fg-faint) 20%, var(--line) 80%)",
+              }}
+            >
+              {p.unsupported ? "N/A" : (isKo ? "비어있음" : "EMPTY")}
+            </span>
+            <span
+              className="truncate text-[11px]"
+              style={{ color: "var(--th-text-muted)" }}
+            >
+              {p.unsupported
+                ? p.reason ??
+                  (isKo
+                    ? "한도 텔레메트리 미지원"
+                    : "Rate-limit telemetry unavailable")
+                : isKo
+                  ? "표시할 버킷 데이터 없음"
+                  : "No bucket data"}
+            </span>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-y-1">
+            {visible.map((b) => (
+              <RateLimitBucketGauge
+                key={b.id}
+                bucket={b}
+                provider={p.provider}
+                isKo={isKo}
+                density="compact"
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  if (layout === "homeWide") {
+    return (
+      <div className="mt-3">
+        <div className="hidden min-w-0 gap-4 lg:grid lg:grid-cols-2">
+          {providers.map(renderHomeWideProvider)}
+        </div>
+        <div className="space-y-3 lg:hidden">
+          {providers.map(renderComfortableProvider)}
+        </div>
+      </div>
+    );
+  }
+
   if (isComfy) {
     return (
       <div className="mt-3 space-y-3">
-        {providers.map((p) => {
-          const providerMeta = getProviderMeta(p.provider);
-          const visible = p.buckets;
-          return (
-            <div key={p.provider} className="space-y-1.5">
-              <div className="flex items-center gap-1">
-                <span
-                  className="text-sm font-bold uppercase truncate"
-                  style={{ color: providerMeta.color }}
-                >
-                  {(RL_ICONS[p.provider] ?? "•")} {p.provider}
-                </span>
-                {p.stale ? (
-                  <span
-                    className="rounded px-1 text-[8px] font-medium shrink-0"
-                    style={{
-                      color: "var(--warn)",
-                      background:
-                        "color-mix(in oklch, var(--warn) 14%, var(--bg-2) 86%)",
-                      border:
-                        "1px solid color-mix(in oklch, var(--warn) 28%, var(--line) 72%)",
-                    }}
-                  >
-                    {isKo ? "지연" : "STALE"}
-                  </span>
-                ) : null}
-              </div>
-              {p.unsupported || visible.length === 0 ? (
-                <div className="flex items-center gap-2 overflow-hidden">
-                  <span
-                    className="rounded px-1.5 py-0.5 text-[10px] font-semibold shrink-0"
-                    style={{
-                      color: "var(--fg-dim)",
-                      background:
-                        "color-mix(in oklch, var(--fg-faint) 10%, var(--bg-2) 90%)",
-                      border:
-                        "1px solid color-mix(in oklch, var(--fg-faint) 20%, var(--line) 80%)",
-                    }}
-                  >
-                    {p.unsupported ? "N/A" : (isKo ? "비어있음" : "EMPTY")}
-                  </span>
-                  <span
-                    className="truncate text-[11px]"
-                    style={{ color: "var(--th-text-muted)" }}
-                  >
-                    {p.unsupported
-                      ? p.reason ??
-                        (isKo
-                          ? "한도 텔레메트리 미지원"
-                          : "Rate-limit telemetry unavailable")
-                      : isKo
-                        ? "표시할 버킷 데이터 없음"
-                        : "No bucket data"}
-                  </span>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 gap-y-1.5">
-                  {visible.map((b) => (
-                    <RateLimitBucketGauge
-                      key={b.id}
-                      bucket={b}
-                      provider={p.provider}
-                      isKo={isKo}
-                      density="comfortable"
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {providers.map(renderComfortableProvider)}
       </div>
     );
   }

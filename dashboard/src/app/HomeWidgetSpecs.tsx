@@ -173,7 +173,7 @@ export function buildHomeWidgetSpecs(ctx: any) {
                 </span>
               </div>
               <div className="mt-auto">
-                <MiniRateLimitBar isKo={isKo} density="comfortable" />
+                <MiniRateLimitBar isKo={isKo} density="comfortable" layout="homeWide" />
               </div>
             </div>
           </div>
