@@ -124,28 +124,37 @@ def has_scratch_file_cleanup_ack(body):
 
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
-    overlap_context = re.compile(r"(?i)\b(?:overlap|overlapping|duplicate|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
-    branch_token = re.compile(r"`?[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._/-]*`?")
+    overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicate|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
+    branch_ref = re.compile(r"(?i)\b(?:branch(?:es)?|head(?: ref)?|ref)\s*[:=-]?\s*`?([A-Za-z0-9][A-Za-z0-9._/-]*)`?")
+    overlap_detail_field = re.compile(r"(?i)^(?:[-*]\s*)?(?:pr|pull request|branch(?:es)?|head(?: ref)?|ref)\s*:")
     in_overlap_block = False
+    block_has_pr = False
+    block_has_branch = False
 
     for line in body.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
 
-        if stripped.startswith("#"):
+        is_boundary = stripped.startswith("#") or _is_top_level_field_label(line)
+        is_overlap_detail = bool(overlap_detail_field.search(stripped))
+        if is_boundary and not (in_overlap_block and is_overlap_detail):
+            if in_overlap_block and block_has_pr and block_has_branch:
+                return True
             in_overlap_block = bool(overlap_context.search(stripped))
-        elif _is_top_level_field_label(line):
-            in_overlap_block = bool(overlap_context.search(stripped))
+            block_has_pr = False
+            block_has_branch = False
 
-        if (
-            pr_ref.search(stripped)
-            and branch_token.search(stripped)
-            and (in_overlap_block or overlap_context.search(stripped))
-        ):
+        line_has_context = in_overlap_block or bool(overlap_context.search(stripped))
+        if not line_has_context:
+            continue
+
+        block_has_pr = block_has_pr or bool(pr_ref.search(stripped))
+        block_has_branch = block_has_branch or bool(branch_ref.search(stripped))
+        if block_has_pr and block_has_branch:
             return True
 
-    return False
+    return in_overlap_block and block_has_pr and block_has_branch
 
 def has_template_summary(body):
     return has_non_empty_body_field(body, ["summary"], stop_at_field_labels=False)

@@ -190,6 +190,14 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
         body = "This is a no-change PR overlapping with #1234."
         self.assertFalse(has_overlap_reference(body))
 
+    def test_plural_overlap_wording_with_branch_is_reference(self):
+        body = "This no-change PR overlaps #1234 on branch inventory-refresh."
+        self.assertTrue(has_overlap_reference(body))
+
+    def test_pull_url_without_branch_is_not_overlap_reference(self):
+        body = "Overlap with https://github.com/owner/repo/pull/5678."
+        self.assertFalse(has_overlap_reference(body))
+
     def test_generic_template_issue_references_are_not_overlap_references(self):
         body = """
 - Dashboard checklist issue references: #1254 / #1251
@@ -202,6 +210,15 @@ class PrAnalyzerOverlapReferenceTests(unittest.TestCase):
         body = """
 - Duplicate/overlap check:
   - #1234 on branch codex/same-scope covers this no-change PR.
+"""
+
+        self.assertTrue(has_overlap_reference(body))
+
+    def test_overlap_reference_accepts_split_pr_and_branch_lines(self):
+        body = """
+- Duplicate/overlap check:
+  - PR: #1234
+  - Branch: codex/same-scope
 """
 
         self.assertTrue(has_overlap_reference(body))
@@ -268,6 +285,13 @@ class CiScriptScratchGuardTests(unittest.TestCase):
 
         self.assertIn("scratch[._-]*.sh", script)
         self.assertIn("scratchpad[._-]*.sh", script)
+
+    def test_ci_guard_includes_analyzer_md_txt_rs_scratch_globs(self):
+        script = Path("scripts/ci-script-checks.sh").read_text()
+
+        self.assertIn("scratch[._-]*.md", script)
+        self.assertIn("scratchpad[._-]*.txt", script)
+        self.assertIn("test_scratch[._-]*.rs", script)
 
 if __name__ == "__main__":
     unittest.main()
