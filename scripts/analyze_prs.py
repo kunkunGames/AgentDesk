@@ -40,12 +40,12 @@ def _meaningful_field_value(value):
 def _is_top_level_field_label(line):
     if line[:1] in {" ", "\t"}:
         return False
-    return re.match(r"^(?:[-*]\s*)?[a-z0-9 /_-]+\s*:(?:\s.*)?$", line.strip(), re.I)
+    return re.match(r"^(?:[-*]\s*)?(?:\*\*)?[a-z0-9 /_-]+(?:\*\*)?\s*:(?:\s.*)?$", line.strip(), re.I)
 
 def has_non_empty_body_field(body, labels):
     for label in labels:
         pattern = re.compile(
-            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?{re.escape(label)}(?:[ \t]*:[ \t]*(.*)|[ \t]*)$"
+            rf"(?im)^[ \t]*(?:[-*][ \t]*)?(?:#{{1,6}}[ \t]*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?(?:[ \t]*:[ \t]*(.*)|[ \t]*)$"
         )
         for match in pattern.finditer(body):
             if _meaningful_field_value(match.group(1) or ""):

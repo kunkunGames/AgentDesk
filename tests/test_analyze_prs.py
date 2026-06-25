@@ -50,6 +50,17 @@ class PrAnalyzerBodyFieldTests(unittest.TestCase):
         self.assertTrue(has_non_empty_body_field(body, ["risk", "risk assessment"]))
         self.assertTrue(has_non_empty_body_field(body, ["rollback notes", "rollback"]))
 
+    def test_bold_field_labels_are_supported(self):
+        body = """
+- **Risk**:
+  Bold risk.
+- **Rollback notes**:
+  Bold rollback notes.
+"""
+
+        self.assertTrue(has_non_empty_body_field(body, ["risk", "risk assessment"]))
+        self.assertTrue(has_non_empty_body_field(body, ["rollback notes", "rollback"]))
+
 
 class PrAnalyzerDuplicateGuardTests(unittest.TestCase):
     def test_unchecked_template_duplicate_guard_is_not_acknowledgement(self):
