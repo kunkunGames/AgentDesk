@@ -109,7 +109,7 @@ export default function OfficeManagerModal({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label={tr("오피스 관리", "Manage Offices")}
+        aria-labelledby="office-manager-title"
         className="mx-4 flex max-h-[84vh] w-full max-w-2xl flex-col rounded-[28px] border"
         style={{
           background:
@@ -123,6 +123,7 @@ export default function OfficeManagerModal({
           style={{ borderBottom: "1px solid color-mix(in srgb, var(--th-border) 72%, transparent)" }}
         >
           <h2
+            id="office-manager-title"
             className="text-lg font-bold"
             style={{ color: "var(--th-text-heading)" }}
           >
@@ -134,7 +135,7 @@ export default function OfficeManagerModal({
             {view === "agents" &&
               `${agentsOffice?.icon ?? ""} ${isKo ? agentsOffice?.name_ko : agentsOffice?.name} — ${tr("멤버 관리", "Manage Members")}`}
           </h2>
-          <SurfaceActionButton tone="neutral" compact onClick={onClose}>
+          <SurfaceActionButton tone="neutral" compact onClick={onClose} aria-label={tr("닫기", "Close")}>
             <X size={16} />
           </SurfaceActionButton>
         </div>
@@ -236,12 +237,14 @@ export default function OfficeManagerModal({
                 <div className="space-y-4">
                   <div>
                 <label
+                  htmlFor="office-name-en"
                   className="block text-xs font-medium mb-1"
                   style={{ color: "var(--th-text-secondary)" }}
                 >
                   {tr("이름 (영문)", "Name (EN)")}
                 </label>
                 <input
+                  id="office-name-en"
                   value={draft.name}
                   onChange={(e) => setDraft((prev) => ({ ...prev, name: e.target.value }))}
                   className="w-full px-3 py-2 rounded-lg text-sm"
@@ -255,12 +258,14 @@ export default function OfficeManagerModal({
               </div>
                   <div>
                     <label
+                      htmlFor="office-name-ko"
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("이름 (한국어)", "Name (KO)")}
                     </label>
                     <input
+                      id="office-name-ko"
                       value={draft.name_ko}
                       onChange={(e) => setDraft((prev) => ({ ...prev, name_ko: e.target.value }))}
                       className="w-full px-3 py-2 rounded-lg text-sm"
@@ -445,8 +450,18 @@ export default function OfficeManagerModal({
                 return (
                   <SurfaceCard
                     key={a.id}
+                    role="switch"
+                    aria-checked={inOffice}
+                    aria-label={tr(`${a.name_ko || a.name} - 오피스 멤버 토글`, `Toggle ${a.name} in office members`)}
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        toggleAgent(a.id);
+                      }
+                    }}
                     onClick={() => toggleAgent(a.id)}
-                    className="w-full cursor-pointer p-2.5 text-left transition-all"
+                    className="w-full cursor-pointer p-2.5 text-left transition-all focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
                     style={{
                       background: inOffice
                         ? "color-mix(in srgb, var(--th-accent-primary-soft) 22%, var(--th-bg-surface) 78%)"
