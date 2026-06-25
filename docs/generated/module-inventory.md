@@ -254,7 +254,7 @@
 | `server::routes::kanban_repos` | `src/server/routes/kanban_repos.rs` | 266 | 266 | 0 |  |
 | `server::routes::maintenance` | `src/server/routes/maintenance.rs` | 17 | 17 | 0 |  |
 | `server::routes::meetings` | `src/server/routes/meetings.rs` | 1266 | 1266 | 0 | giant-file |
-| `server::routes::memory_api` | `src/server/routes/memory_api.rs` | 555 | 510 | 45 |  |
+| `server::routes::memory_api` | `src/server/routes/memory_api.rs` | 537 | 492 | 45 |  |
 | `server::routes::messages` | `src/server/routes/messages.rs` | 185 | 185 | 0 |  |
 | `server::routes::monitoring` | `src/server/routes/monitoring.rs` | 96 | 96 | 0 |  |
 | `server::routes::offices` | `src/server/routes/offices.rs` | 485 | 485 | 0 |  |
