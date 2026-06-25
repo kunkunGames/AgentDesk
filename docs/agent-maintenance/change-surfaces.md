@@ -886,7 +886,7 @@
     normal long SILENT tool run (e.g. a big build) is never mistaken for an idle
     hang, with the 4h hard ceiling as the real backstop, and noted the limitation
     in the idle-kill error message + a delayed-event test).
-  - `src/services/tui_prompt_dedupe.rs` (1633 lines; shared TUI prompt
+  - `src/services/tui_prompt_dedupe.rs` (1625 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
     outside an extraction plan; +20 from #3676: Codex rollout user prompts now
     prefer the stable message entry id when present so Codex TUI direct prompt
@@ -922,9 +922,12 @@
     atomic read, closing the present/generation TOCTOU) plus its dedicated accessor unit
     test; the watcher-snapshot no-clobber regression test is retained, rewritten to take
     its G1/G2 snapshots from `external_input_relay_lease(...).map(|l| l.generation)`;
-    +62 from #3304: slash-command canonical prompt keys for `<command-*>` XML vs
+    -8 from #3695: moved the synthetic TUI user prompt filter into
+    `tui_prompt_dedupe/synthetic_prompt.rs` while adding exact Claude interrupt
+    marker suppression for stop-control transcript envelopes; +62 from #3304:
+    slash-command canonical prompt keys for `<command-*>` XML vs
     `/command args` dedupe, plus focused loop skill-expansion regressions).
-  - `src/services/discord/recovery_engine.rs` (3412 lines; +2 from #3668 re-exporting `success_result_end_offset_after_offset` (pub(in discord)) so the relay_recovery F2 tail-answer guard can require terminal success evidence; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +9 from #3582 stamping
+  - `src/services/discord/recovery_engine.rs` (3438 lines; +2 from #3668 re-exporting `success_result_end_offset_after_offset` (pub(in discord)) so the relay_recovery F2 tail-answer guard can require terminal success evidence; +24 from f12b09366 backstop missed turn intake (drain-restart ownerless-inflight recovery: phase_policy/relay_recovery/relay_health predicates); +15 from #3610 PR-2 codex r2 Issue-2 storm-guard comment at the committed-branch anchor-repost dispose (passes `tmux_alive = false` so a transient send-new is budget-bounded, not pane-preserved forever; the now-unused liveness probe is dropped); +33 from #3610 PR-2 anchor-repost fallback (flag-gated, default OFF); +26 from #3680 relay recovery review hardening; +9 from #3582 stamping
     `set_relay_owner_kind(Watcher)` at the rebind-origin birth site so the
     STALL-WATCHDOG force-clean -> respawn synthetic row (which lands here with
     `existing_inflight = None`) is watcher-owned instead of degrading to
@@ -986,6 +989,9 @@
     one-arm gate at `relay_recovered_terminal_text_to_placeholder` is offset by
     non-#-tag prose-comment compaction in the same root, the cutover body lives in
     the sub-1000-prod-LoC sibling `recovery_paths/controller_cutover.rs`).
+  - `src/services/discord/relay_recovery.rs` (1007 lines; #3680 split relay
+    recovery reattach/self-heal path; new behavior is bugfix-only until a
+    follow-up extraction drops it below the giant-file threshold).
   - `src/services/discord/health.rs` (417 prod lines after the #3038 Phase A
     directory decomposition; module root keeps the `HealthRegistry` core +
     re-export surface, and the former monolith body lives in flat
@@ -1260,8 +1266,9 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (3051 lines; #3685 exposes the
-    inflight sidecar lock crate-wide for locked legacy rebind backfill; #3635 added the
+    lines) and `src/services/discord/inflight.rs` (7382 lines; #3680 relay
+    recovery review hardening; #3685 exposes the inflight sidecar lock
+    crate-wide for locked legacy rebind backfill; #3635 added the
     dead-watcher rebind-origin reap — `WatcherLiveness` DI trait, three-state tmux
     pane liveness, spawn-blocking warm sweeper probe, and fs-only locked
     re-validation; the byte-for-byte-unchanged #3581 None-owner predicate is
@@ -1307,7 +1314,7 @@
   its query/command/view/FSM behavior lives under
   `src/services/auto_queue/{query,command,view,fsm,phase_gate}.rs` plus
   smaller route-delegation slices.
-  `src/services/auto_queue/activate_command.rs` (1509 lines, post-#1444
+  `src/services/auto_queue/activate_command.rs` (1506 lines, post-#1444
   idempotency-guard expansion + #3038 phase-helper decomposition) is the
   canonical activate/dispatch-next command surface; it is intentionally above
   the giant-file threshold and tracked here. The `activate_with_deps_pg`
@@ -1368,7 +1375,7 @@
   - `src/cli/migrate.rs` is the retired postgres-cutover facade (now below the
     giant-file threshold; bugfix only).
   - `src/cli/doctor/orchestrator.rs` (4381 lines).
-  - `src/cli/migrate/apply.rs` (3231 lines; +1 from #3690 AgentDef preferred_intake_node_labels literal).
+  - `src/cli/migrate/apply.rs` (3237 lines; +1 from #3690 AgentDef preferred_intake_node_labels literal; +6 from #3697 OpenClaw --write-db non-leader roster-sync gate).
   - `src/cli/migrate/{plan.rs (1513), source.rs (1612)}`.
   - `src/cli/{init.rs (1445), client.rs (2955), direct.rs (1781),
     dcserver.rs (1560)}`.
@@ -1391,7 +1398,7 @@
   (supervised-worker registry / leader-only lifecycle).
 - legacy_modules: none — these are shared runtime coordination surfaces.
 - do_not_edit_without_migration_plan (giant-file):
-  - `src/config.rs` (2529 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc).
+  - `src/config.rs` (2559 lines; +11 from #3573 failure_pause_auto_resume_secs config field; +16 from #3655 DB pool default 12→18 + 2-node-boot sizing-rationale comment; +47 from #3651 DatabaseConfig.foreground_reserve field (best-effort advisory docs) + manual Default impl + default-consistency tests; +8 from #3690 AgentDef.preferred_intake_node_labels field + doc; #3683 config hot-reload restart-fingerprint config surface).
   - `src/server/mod.rs` (2640 lines; +42 from #3573 auto-resume tick + backoff-race fix; #3628 wires failure→pause producer behind the same knob, net -1 line from comment condensation; #3651 net ~0 — the message_outbox_loop is the foreground headless-delivery drain and must NOT be backpressured, so its earlier backpressure gate was removed during codex review).
   - `src/receipt.rs` (1842 lines).
   - `src/github/sync.rs` (1513 lines).
@@ -1458,7 +1465,7 @@ Line counts are *production* LoC (the `Prod` column in `module-inventory.md`,
 which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync.
 
 - `src/services/auto_queue.rs` (1546) and
-  `src/services/auto_queue/activate_command.rs` (1509); auto-queue route
+  `src/services/auto_queue/activate_command.rs` (1506); auto-queue route
   behavior is split across `src/services/auto_queue/*` slices, with
   `activate_command.rs` now giant-file territory.
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;

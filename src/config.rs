@@ -1,5 +1,5 @@
 use crate::voice::{VoiceConfig, barge_in::BargeInSensitivity};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -65,9 +65,12 @@ pub struct Config {
     /// without a restart, mirroring the policies watcher: the candidate file is
     /// pre-validated (parsed + runtime defaults applied) and only then atomically
     /// swapped in; a parse/validation failure keeps the running config. Infra
-    /// fields (`server` bind/port/auth, `database`, `data.dir`) are NOT
-    /// hot-swapped — a change to those is applied to the shared snapshot but
-    /// logged as restart-required, since live subsystems bound them at boot.
+    /// fields (`server` bind/port/auth, `database`, `data.dir`, `cluster`,
+    /// Discord/provider/agent launch and voice runtimes, MCP child processes and
+    /// credential watcher, `memory`, GitHub sync cadence, prompt retention, and
+    /// the config watcher flag itself) are NOT hot-swapped — a change to those is
+    /// applied to the shared snapshot but logged as restart-required, since live
+    /// subsystems bound them at boot.
     #[serde(default = "default_true")]
     pub config_hot_reload: bool,
 }
@@ -2479,6 +2482,7 @@ pub fn load() -> Result<Config> {
         .resolve_runtime_relative_paths(runtime_root.as_deref());
     register_config_secrets(&config);
     audit_config_file_permissions_if_secret_bearing(&path, &config);
+    validate_config(&config).with_context(|| format!("Invalid config: {path_display}"))?;
 
     // Ensure data dir exists
     std::fs::create_dir_all(&config.data.dir)?;
@@ -2514,7 +2518,33 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
         .resolve_runtime_relative_paths(runtime_root.as_deref());
     register_config_secrets(&config);
     audit_config_file_permissions_if_secret_bearing(path, &config);
+    validate_config(&config).with_context(|| format!("Invalid config {}", path.display()))?;
     Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    validate_escalation_schedule(&config.escalation.schedule)
+}
+
+fn validate_escalation_schedule(schedule: &EscalationScheduleConfig) -> Result<()> {
+    if let Some(timezone) = schedule.timezone.as_deref()
+        && timezone.parse::<chrono_tz::Tz>().is_err()
+    {
+        bail!("schedule.timezone must be a valid IANA timezone");
+    }
+    if let Some(pm_hours) = schedule.pm_hours.as_deref()
+        && parse_escalation_time_window(pm_hours).is_none()
+    {
+        bail!("schedule.pm_hours must be HH:MM-HH:MM");
+    }
+    Ok(())
+}
+
+fn parse_escalation_time_window(raw: &str) -> Option<(chrono::NaiveTime, chrono::NaiveTime)> {
+    let (start, end) = raw.trim().split_once('-')?;
+    let start = chrono::NaiveTime::parse_from_str(start.trim(), "%H:%M").ok()?;
+    let end = chrono::NaiveTime::parse_from_str(end.trim(), "%H:%M").ok()?;
+    Some((start, end))
 }
 
 fn register_config_secrets(config: &Config) {
@@ -2576,6 +2606,32 @@ mod secret_bearing_config_file_tests {
     use super::*;
 
     #[test]
+    fn load_from_path_rejects_invalid_escalation_schedule_timezone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentdesk.yaml");
+        let mut config = Config::default();
+        config.escalation.schedule.timezone = Some("Mars/Olympus".to_string());
+        save_to_path(&path, &config).unwrap();
+
+        let error = format!("{:#}", load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("schedule.timezone must be a valid IANA timezone"));
+    }
+
+    #[test]
+    fn load_from_path_rejects_invalid_escalation_schedule_pm_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentdesk.yaml");
+        let mut config = Config::default();
+        config.escalation.schedule.pm_hours = Some("soon".to_string());
+        save_to_path(&path, &config).unwrap();
+
+        let error = format!("{:#}", load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("schedule.pm_hours must be HH:MM-HH:MM"));
+    }
+
+    #[test]
     fn save_and_load_harden_secret_bearing_config_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agentdesk.yaml");
@@ -2607,6 +2663,29 @@ mod secret_bearing_config_file_tests {
             let loaded = load_from_path(&path).unwrap();
             assert_eq!(loaded.database.password.as_deref(), Some("database-secret"));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_from_path_hardens_secret_file_before_semantic_validation_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentdesk.yaml");
+        let mut config = Config::default();
+        config.database.password = Some("database-secret".to_string());
+        config.escalation.schedule.timezone = Some("Mars/Olympus".to_string());
+        save_to_path(&path, &config).unwrap();
+
+        let mut loose_permissions = std::fs::metadata(&path).unwrap().permissions();
+        loose_permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, loose_permissions).unwrap();
+
+        let error = format!("{:#}", load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("schedule.timezone must be a valid IANA timezone"));
+        let hardened_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(hardened_mode, 0o600);
     }
 }
 
