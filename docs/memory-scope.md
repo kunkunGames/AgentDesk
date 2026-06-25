@@ -4,6 +4,11 @@ This document pins down which kinds of facts belong in `scope: permanent` vs `sc
 
 It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder under issue 910-6).
 
+This contract applies to MCP-backed Memento data. The PostgreSQL `local_memory`
+fallback documented in [`docs/source-of-truth.md`](source-of-truth.md) stores
+route-level rows with `workspace` metadata, but it does not implement Memento
+`permanent` scope, promotion, or amend semantics.
+
 ## TL;DR
 
 - `permanent` is for durable, identity-level knowledge about the user, their environment, and long-lived decisions.
