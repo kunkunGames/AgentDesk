@@ -1,5 +1,5 @@
 use crate::voice::{VoiceConfig, barge_in::BargeInSensitivity};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -66,10 +66,11 @@ pub struct Config {
     /// pre-validated (parsed + runtime defaults applied) and only then atomically
     /// swapped in; a parse/validation failure keeps the running config. Infra
     /// fields (`server` bind/port/auth, `database`, `data.dir`, `discord` client
-    /// and bot bindings, `providers` runtimes, `mcp_servers` child processes, the
-    /// `mcp` credential watcher, and the `memory` backend) are NOT hot-swapped —
-    /// a change to those is applied to the shared snapshot but logged as
-    /// restart-required, since live subsystems bound them at boot.
+    /// and bot bindings, `providers` runtimes, `agents` per-channel runtime
+    /// hosting overrides, `mcp_servers` child processes, the `mcp` credential
+    /// watcher, and the `memory` backend) are NOT hot-swapped — a change to
+    /// those is applied to the shared snapshot but logged as restart-required,
+    /// since live subsystems bound them at boot.
     #[serde(default = "default_true")]
     pub config_hot_reload: bool,
 }
@@ -2471,6 +2472,7 @@ pub fn load() -> Result<Config> {
     let config = config
         .apply_runtime_defaults()
         .resolve_runtime_relative_paths(runtime_root.as_deref());
+    validate_config(&config).with_context(|| format!("Invalid config: {path_display}"))?;
     register_config_secrets(&config);
     audit_config_file_permissions_if_secret_bearing(&path, &config);
 
@@ -2506,9 +2508,35 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
     let config = config
         .apply_runtime_defaults()
         .resolve_runtime_relative_paths(runtime_root.as_deref());
+    validate_config(&config).with_context(|| format!("Invalid config {}", path.display()))?;
     register_config_secrets(&config);
     audit_config_file_permissions_if_secret_bearing(path, &config);
     Ok(config)
+}
+
+fn validate_config(config: &Config) -> Result<()> {
+    validate_escalation_schedule(&config.escalation.schedule)
+}
+
+fn validate_escalation_schedule(schedule: &EscalationScheduleConfig) -> Result<()> {
+    if let Some(timezone) = schedule.timezone.as_deref()
+        && timezone.parse::<chrono_tz::Tz>().is_err()
+    {
+        bail!("schedule.timezone must be a valid IANA timezone");
+    }
+    if let Some(pm_hours) = schedule.pm_hours.as_deref()
+        && parse_escalation_time_window(pm_hours).is_none()
+    {
+        bail!("schedule.pm_hours must be HH:MM-HH:MM");
+    }
+    Ok(())
+}
+
+fn parse_escalation_time_window(raw: &str) -> Option<(chrono::NaiveTime, chrono::NaiveTime)> {
+    let (start, end) = raw.trim().split_once('-')?;
+    let start = chrono::NaiveTime::parse_from_str(start.trim(), "%H:%M").ok()?;
+    let end = chrono::NaiveTime::parse_from_str(end.trim(), "%H:%M").ok()?;
+    Some((start, end))
 }
 
 fn register_config_secrets(config: &Config) {
@@ -2568,6 +2596,32 @@ pub fn save_to_path(path: &Path, config: &Config) -> Result<()> {
 #[cfg(test)]
 mod secret_bearing_config_file_tests {
     use super::*;
+
+    #[test]
+    fn load_from_path_rejects_invalid_escalation_schedule_timezone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentdesk.yaml");
+        let mut config = Config::default();
+        config.escalation.schedule.timezone = Some("Mars/Olympus".to_string());
+        save_to_path(&path, &config).unwrap();
+
+        let error = format!("{:#}", load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("schedule.timezone must be a valid IANA timezone"));
+    }
+
+    #[test]
+    fn load_from_path_rejects_invalid_escalation_schedule_pm_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentdesk.yaml");
+        let mut config = Config::default();
+        config.escalation.schedule.pm_hours = Some("soon".to_string());
+        save_to_path(&path, &config).unwrap();
+
+        let error = format!("{:#}", load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("schedule.pm_hours must be HH:MM-HH:MM"));
+    }
 
     #[test]
     fn save_and_load_harden_secret_bearing_config_file() {

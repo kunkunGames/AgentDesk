@@ -14,16 +14,18 @@
 //! Subsystems read the live snapshot via [`current`] each cycle, so settings
 //! they re-read per tick (e.g. routine tunables) take effect without a restart.
 //! Infra fields (`server` bind/port/auth, `database`, `data`, `discord` client
-//! and bot bindings, `providers` runtimes, `mcp_servers` child processes, the
-//! `mcp` credential watcher, and the `memory` backend) are bound into long-lived
-//! objects at boot and cannot be swapped under a running process; a change to
-//! those is still stored in the snapshot but reported by
+//! and bot bindings, `providers` runtimes, `agents` per-channel runtime hosting
+//! overrides, `mcp_servers` child processes, the `mcp` credential watcher, and
+//! the `memory` backend) are bound into long-lived objects at boot and cannot be
+//! swapped under a running process; a change to those is still stored in the
+//! snapshot but reported by
 //! [`restart_required_changes`] and logged as restart-required.
 //!
 //! The whole-`Config` value is NOT threaded through every reader — instead this
 //! follows the existing global-runtime-setter precedent
 //! (`set_runtime_cluster_config`) so consumers opt in by reading [`current`].
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -32,7 +34,7 @@ use std::time::{Duration, Instant};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{BotConfig, Config, DiscordBotAuthConfig, DiscordConfig};
 
 /// Process-global live config snapshot. `None` until [`install`] runs at boot.
 static LIVE: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
@@ -85,6 +87,92 @@ fn section_changed<T: Serialize>(old: &T, new: &T) -> bool {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct DiscordRestartFingerprint {
+    bots: BTreeMap<String, DiscordBotRestartFingerprint>,
+    guild_id: Option<String>,
+    dm_default_agent: Option<String>,
+    owner_id: Option<u64>,
+}
+
+#[derive(PartialEq, Eq)]
+struct DiscordBotRestartFingerprint {
+    token: Option<String>,
+    description: Option<String>,
+    provider: Option<String>,
+    agent: Option<String>,
+    auth: DiscordBotAuthConfig,
+}
+
+fn discord_restart_fingerprint(discord: &DiscordConfig) -> DiscordRestartFingerprint {
+    DiscordRestartFingerprint {
+        bots: discord
+            .bots
+            .iter()
+            .map(|(name, bot)| (name.clone(), discord_bot_restart_fingerprint(bot)))
+            .collect(),
+        guild_id: discord.guild_id.clone(),
+        dm_default_agent: discord.dm_default_agent.clone(),
+        owner_id: discord.owner_id,
+    }
+}
+
+fn discord_bot_restart_fingerprint(bot: &BotConfig) -> DiscordBotRestartFingerprint {
+    DiscordBotRestartFingerprint {
+        token: bot.token.clone(),
+        description: bot.description.clone(),
+        provider: bot.provider.clone(),
+        agent: bot.agent.clone(),
+        auth: bot.auth.clone(),
+    }
+}
+
+fn discord_boot_config_changed(old: &DiscordConfig, new: &DiscordConfig) -> bool {
+    discord_restart_fingerprint(old) != discord_restart_fingerprint(new)
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct AgentProviderRuntimeBinding {
+    provider_id: String,
+    channel_id: u64,
+    tui_hosting: Option<bool>,
+    runtime: Option<String>,
+}
+
+fn agent_provider_runtime_bindings(config: &Config) -> BTreeSet<AgentProviderRuntimeBinding> {
+    let mut bindings = BTreeSet::new();
+    for agent in &config.agents {
+        for (channel_kind, channel) in agent.channels.iter() {
+            let Some(channel) = channel else {
+                continue;
+            };
+            let Some(channel_id) = channel
+                .channel_id()
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let tui_hosting = channel.tui_hosting();
+            let runtime = channel.runtime_mode_raw();
+            if tui_hosting.is_none() && runtime.is_none() {
+                continue;
+            }
+            let provider_id = channel
+                .provider()
+                .unwrap_or_else(|| channel_kind.to_string())
+                .trim()
+                .to_ascii_lowercase();
+            bindings.insert(AgentProviderRuntimeBinding {
+                provider_id,
+                channel_id,
+                tui_hosting,
+                runtime,
+            });
+        }
+    }
+    bindings
+}
+
 /// The infra sections that are bound into long-lived objects at boot and cannot
 /// be hot-swapped under a running process. A change here is applied to the
 /// snapshot but needs a restart to take full effect, so it is reported to the
@@ -93,9 +181,9 @@ fn section_changed<T: Serialize>(old: &T, new: &T) -> bool {
 /// Without this list, editing e.g. a Discord bot token, an `mcp_servers` entry,
 /// or a `providers` runtime in `agentdesk.yaml` would swap into the snapshot
 /// with no observable effect and no warning — the exact "the edit did nothing"
-/// trap. Section-level granularity matches `section_changed`; note that fields
-/// marked `skip_serializing` (e.g. bot tokens) do not move the serialized form,
-/// so a token-only change is not detected here (same caveat as `server.auth_token`).
+/// trap. Most sections use serialized equality for broad coverage, while
+/// secret-bearing or order-sensitive sections use deterministic non-logging
+/// fingerprints.
 pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str> {
     let mut changed = Vec::new();
     if section_changed(&old.server, &new.server) {
@@ -108,12 +196,17 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
         changed.push("data");
     }
     // The Discord client + bot bindings/ids are constructed at boot.
-    if section_changed(&old.discord, &new.discord) {
+    if discord_boot_config_changed(&old.discord, &new.discord) {
         changed.push("discord");
     }
     // Provider runtimes (TUI hosting, remote SSH) are wired up at boot.
     if section_changed(&old.providers, &new.providers) {
         changed.push("providers");
+    }
+    // Per-agent channel provider runtime/tui_hosting bindings are installed
+    // into process-global maps at boot by `services::provider_hosting`.
+    if agent_provider_runtime_bindings(old) != agent_provider_runtime_bindings(new) {
+        changed.push("agents");
     }
     // MCP servers are spawned as child processes at boot.
     if section_changed(&old.mcp_servers, &new.mcp_servers) {
@@ -308,6 +401,52 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    fn test_bot(token: &str) -> crate::config::BotConfig {
+        crate::config::BotConfig {
+            token: Some(token.to_string()),
+            description: Some("test bot".to_string()),
+            provider: Some("claude".to_string()),
+            agent: Some("dispatcher".to_string()),
+            auth: crate::config::DiscordBotAuthConfig {
+                allowed_channel_ids: Some(vec![42]),
+                ..crate::config::DiscordBotAuthConfig::default()
+            },
+        }
+    }
+
+    fn test_agent_with_claude_channel(
+        channel_id: &str,
+        tui_hosting: Option<bool>,
+        runtime: Option<&str>,
+    ) -> crate::config::AgentDef {
+        crate::config::AgentDef {
+            id: "dispatcher".to_string(),
+            name: "Dispatcher".to_string(),
+            name_ko: None,
+            aliases: Vec::new(),
+            wake_word: None,
+            voice_enabled: true,
+            sensitivity_mode: None,
+            voice: crate::config::AgentVoiceConfig::default(),
+            provider: "codex".to_string(),
+            channels: crate::config::AgentChannels {
+                claude: Some(crate::config::AgentChannel::Detailed(
+                    crate::config::AgentChannelConfig {
+                        id: Some(channel_id.to_string()),
+                        provider: Some("claude".to_string()),
+                        tui_hosting,
+                        runtime: runtime.map(str::to_string),
+                        ..crate::config::AgentChannelConfig::default()
+                    },
+                )),
+                ..crate::config::AgentChannels::default()
+            },
+            keywords: Vec::new(),
+            department: None,
+            avatar_emoji: None,
+        }
+    }
+
     // A valid edit validates and swaps into the live snapshot.
     #[test]
     fn reload_applies_valid_config() {
@@ -409,5 +548,51 @@ mod tests {
         let mut memory = base.clone();
         memory.memory = Some(crate::config::MemoryConfig::default());
         assert_eq!(restart_required_changes(&base, &memory), vec!["memory"]);
+    }
+
+    #[test]
+    fn restart_required_changes_detects_discord_token_only_rotation() {
+        let mut old = Config::default();
+        old.discord
+            .bots
+            .insert("notify".to_string(), test_bot("old"));
+        let mut new = old.clone();
+        new.discord.bots.get_mut("notify").unwrap().token = Some("new".to_string());
+
+        assert_eq!(restart_required_changes(&old, &new), vec!["discord"]);
+    }
+
+    #[test]
+    fn restart_required_changes_ignores_discord_bot_hashmap_order() {
+        let mut old = Config::default();
+        old.discord.bots.insert("alpha".to_string(), test_bot("a"));
+        old.discord.bots.insert("beta".to_string(), test_bot("b"));
+
+        let mut new = Config::default();
+        new.discord.bots.insert("beta".to_string(), test_bot("b"));
+        new.discord.bots.insert("alpha".to_string(), test_bot("a"));
+
+        assert!(restart_required_changes(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn restart_required_changes_flags_agent_channel_runtime_bindings() {
+        let mut old = Config::default();
+        old.agents.push(test_agent_with_claude_channel(
+            "123",
+            Some(false),
+            Some("pipe"),
+        ));
+
+        let mut runtime_changed = old.clone();
+        runtime_changed.agents[0] = test_agent_with_claude_channel("123", Some(false), Some("tui"));
+        assert_eq!(
+            restart_required_changes(&old, &runtime_changed),
+            vec!["agents"]
+        );
+
+        let mut tui_changed = old.clone();
+        tui_changed.agents[0] = test_agent_with_claude_channel("123", Some(true), Some("pipe"));
+        assert_eq!(restart_required_changes(&old, &tui_changed), vec!["agents"]);
     }
 }
