@@ -167,31 +167,29 @@ static DISPATCH_DELIVERY_MISMATCH_COUNTERS: OnceLock<dashmap::DashMap<String, Ar
 static DISPATCH_DELIVERY_RECOVERY_COUNTERS: OnceLock<dashmap::DashMap<String, Arc<AtomicU64>>> =
     OnceLock::new();
 
-fn dispatch_delivery_mismatch_counter(kind: &str) -> Arc<AtomicU64> {
-    DISPATCH_DELIVERY_MISMATCH_COUNTERS
-        .get_or_init(dashmap::DashMap::new)
-        .entry(kind.to_string())
-        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-        .clone()
-}
-
 fn record_dispatch_delivery_mismatch_metric(kind: &str) {
-    dispatch_delivery_mismatch_counter(kind).fetch_add(1, Ordering::Relaxed);
-}
-
-fn dispatch_delivery_recovery_counter(kind: &str) -> Arc<AtomicU64> {
-    DISPATCH_DELIVERY_RECOVERY_COUNTERS
-        .get_or_init(dashmap::DashMap::new)
-        .entry(kind.to_string())
+    let map = DISPATCH_DELIVERY_MISMATCH_COUNTERS.get_or_init(dashmap::DashMap::new);
+    if let Some(counter) = map.get(kind) {
+        counter.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    map.entry(kind.to_string())
         .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-        .clone()
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 fn record_dispatch_delivery_recovery_metric(kind: &str, count: u64) {
     if count == 0 {
         return;
     }
-    dispatch_delivery_recovery_counter(kind).fetch_add(count, Ordering::Relaxed);
+    let map = DISPATCH_DELIVERY_RECOVERY_COUNTERS.get_or_init(dashmap::DashMap::new);
+    if let Some(counter) = map.get(kind) {
+        counter.fetch_add(count, Ordering::Relaxed);
+        return;
+    }
+    map.entry(kind.to_string())
+        .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+        .fetch_add(count, Ordering::Relaxed);
 }
 
 pub(crate) fn dispatch_delivery_event_recovery_metrics_snapshot()
