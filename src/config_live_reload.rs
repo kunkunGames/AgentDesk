@@ -25,7 +25,7 @@
 //! follows the existing global-runtime-setter precedent
 //! (`set_runtime_cluster_config`) so consumers opt in by reading [`current`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -132,15 +132,21 @@ fn discord_boot_config_changed(old: &DiscordConfig, new: &DiscordConfig) -> bool
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct AgentProviderRuntimeBinding {
+struct AgentProviderRuntimeBindingKey {
     provider_id: String,
     channel_id: u64,
+}
+
+#[derive(PartialEq, Eq)]
+struct AgentProviderRuntimeBindingValue {
     tui_hosting: Option<bool>,
     runtime: Option<String>,
 }
 
-fn agent_provider_runtime_bindings(config: &Config) -> BTreeSet<AgentProviderRuntimeBinding> {
-    let mut bindings = BTreeSet::new();
+fn agent_provider_runtime_bindings(
+    config: &Config,
+) -> BTreeMap<AgentProviderRuntimeBindingKey, AgentProviderRuntimeBindingValue> {
+    let mut bindings = BTreeMap::new();
     for agent in &config.agents {
         for (channel_kind, channel) in agent.channels.iter() {
             let Some(channel) = channel else {
@@ -162,12 +168,16 @@ fn agent_provider_runtime_bindings(config: &Config) -> BTreeSet<AgentProviderRun
                 .unwrap_or_else(|| channel_kind.to_string())
                 .trim()
                 .to_ascii_lowercase();
-            bindings.insert(AgentProviderRuntimeBinding {
-                provider_id,
-                channel_id,
-                tui_hosting,
-                runtime,
-            });
+            bindings.insert(
+                AgentProviderRuntimeBindingKey {
+                    provider_id,
+                    channel_id,
+                },
+                AgentProviderRuntimeBindingValue {
+                    tui_hosting,
+                    runtime,
+                },
+            );
         }
     }
     bindings
@@ -595,5 +605,34 @@ mod tests {
         let mut tui_changed = old.clone();
         tui_changed.agents[0] = test_agent_with_claude_channel("123", Some(true), Some("pipe"));
         assert_eq!(restart_required_changes(&old, &tui_changed), vec!["agents"]);
+    }
+
+    #[test]
+    fn restart_required_changes_preserves_duplicate_agent_channel_last_wins() {
+        let mut old = Config::default();
+        old.agents.push(test_agent_with_claude_channel(
+            "123",
+            Some(false),
+            Some("pipe"),
+        ));
+        old.agents.push(test_agent_with_claude_channel(
+            "123",
+            Some(false),
+            Some("tui"),
+        ));
+
+        let mut new = Config::default();
+        new.agents.push(test_agent_with_claude_channel(
+            "123",
+            Some(false),
+            Some("tui"),
+        ));
+        new.agents.push(test_agent_with_claude_channel(
+            "123",
+            Some(false),
+            Some("pipe"),
+        ));
+
+        assert_eq!(restart_required_changes(&old, &new), vec!["agents"]);
     }
 }

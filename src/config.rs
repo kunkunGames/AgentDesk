@@ -2480,9 +2480,9 @@ pub fn load() -> Result<Config> {
     let config = config
         .apply_runtime_defaults()
         .resolve_runtime_relative_paths(runtime_root.as_deref());
-    validate_config(&config).with_context(|| format!("Invalid config: {path_display}"))?;
     register_config_secrets(&config);
     audit_config_file_permissions_if_secret_bearing(&path, &config);
+    validate_config(&config).with_context(|| format!("Invalid config: {path_display}"))?;
 
     // Ensure data dir exists
     std::fs::create_dir_all(&config.data.dir)?;
@@ -2516,9 +2516,9 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
     let config = config
         .apply_runtime_defaults()
         .resolve_runtime_relative_paths(runtime_root.as_deref());
-    validate_config(&config).with_context(|| format!("Invalid config {}", path.display()))?;
     register_config_secrets(&config);
     audit_config_file_permissions_if_secret_bearing(path, &config);
+    validate_config(&config).with_context(|| format!("Invalid config {}", path.display()))?;
     Ok(config)
 }
 
@@ -2663,6 +2663,29 @@ mod secret_bearing_config_file_tests {
             let loaded = load_from_path(&path).unwrap();
             assert_eq!(loaded.database.password.as_deref(), Some("database-secret"));
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_from_path_hardens_secret_file_before_semantic_validation_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agentdesk.yaml");
+        let mut config = Config::default();
+        config.database.password = Some("database-secret".to_string());
+        config.escalation.schedule.timezone = Some("Mars/Olympus".to_string());
+        save_to_path(&path, &config).unwrap();
+
+        let mut loose_permissions = std::fs::metadata(&path).unwrap().permissions();
+        loose_permissions.set_mode(0o644);
+        std::fs::set_permissions(&path, loose_permissions).unwrap();
+
+        let error = format!("{:#}", load_from_path(&path).unwrap_err());
+
+        assert!(error.contains("schedule.timezone must be a valid IANA timezone"));
+        let hardened_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(hardened_mode, 0o600);
     }
 }
 
