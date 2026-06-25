@@ -1263,7 +1263,7 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (3134 lines; #3680 relay
+    lines) and `src/services/discord/inflight.rs` (3138 lines; #3680 relay
     recovery review hardening; #3635 added the
     dead-watcher rebind-origin reap — `WatcherLiveness` DI trait, three-state tmux
     pane liveness, spawn-blocking warm sweeper probe, and fs-only locked

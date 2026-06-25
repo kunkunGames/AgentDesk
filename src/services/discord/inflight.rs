@@ -1329,7 +1329,11 @@ fn save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
         }
     }
 
-    let mut updated = state.clone();
+    let mut updated = on_disk;
+    updated.tmux_session_name = state.tmux_session_name.clone();
+    updated.output_path = state.output_path.clone();
+    updated.input_fifo_path = state.input_fifo_path.clone();
+    updated.set_relay_owner_kind(state.effective_relay_owner_kind());
     updated.ensure_finalizer_turn_id();
     let _ = validate_inflight_state_for_save(
         root,
@@ -5843,6 +5847,62 @@ mod stall_recovery_tests {
             rows[0].restart_mode,
             Some(InflightRestartMode::DrainRestart)
         );
+    }
+
+    #[test]
+    fn existing_rebind_adoption_merges_into_fresh_on_disk_row() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut on_disk = build_inflight_for_guard_tests(ProviderKind::Claude, 323, 777);
+        on_disk.user_msg_id = 777;
+        on_disk.current_msg_id = 778;
+        save_inflight_state_in_root(temp.path(), &on_disk).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&on_disk);
+        let mut adopted = on_disk.clone();
+        adopted.tmux_session_name = Some("AgentDesk-claude-adk-restored".to_string());
+        adopted.output_path = Some("/tmp/restored-output.jsonl".to_string());
+        adopted.input_fifo_path = Some("/tmp/restored-input.fifo".to_string());
+        adopted.set_relay_owner_kind(RelayOwnerKind::Watcher);
+
+        let mut progressed = on_disk.clone();
+        progressed.last_offset = 4096;
+        progressed.last_watcher_relayed_offset = Some(2048);
+        progressed.full_response = "newer streamed text".to_string();
+        save_inflight_state_in_root(temp.path(), &progressed).unwrap();
+
+        let outcome = save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
+            temp.path(),
+            &adopted,
+            &expected,
+            on_disk.turn_start_offset,
+        );
+
+        assert_eq!(outcome, GuardedSaveOutcome::Saved);
+        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Claude);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].tmux_session_name.as_deref(),
+            Some("AgentDesk-claude-adk-restored")
+        );
+        assert_eq!(
+            rows[0].output_path.as_deref(),
+            Some("/tmp/restored-output.jsonl")
+        );
+        assert_eq!(
+            rows[0].input_fifo_path.as_deref(),
+            Some("/tmp/restored-input.fifo")
+        );
+        assert_eq!(
+            rows[0].effective_relay_owner_kind(),
+            RelayOwnerKind::Watcher
+        );
+        assert_eq!(rows[0].last_offset, 4096);
+        assert_eq!(rows[0].last_watcher_relayed_offset, Some(2048));
+        assert_eq!(rows[0].full_response, "newer streamed text");
     }
 
     #[test]

@@ -269,17 +269,14 @@ async fn load_session_tmux_segments_pg(
         else {
             continue;
         };
-        if let Some(hint) = provider_hint
-            .as_deref()
-            .and_then(|value| ProviderKind::from_str(value.trim()))
-            && hint != provider
-        {
+        if !provider_hint_matches_session_provider(provider_hint.as_deref(), &provider) {
             tracing::debug!(
                 session_key = %session_key,
-                provider_hint = ?hint,
+                provider_hint = provider_hint.as_deref().unwrap_or("<none>"),
                 parsed_provider = ?provider,
                 "session-discovery: ignoring mismatched sessions.provider while deriving tmux segment",
             );
+            continue;
         }
         match map.entry((provider, channel_id)) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -306,6 +303,28 @@ fn normalized_instance_id(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn default_instance_hostname(value: &str) -> Option<&str> {
+    let (hostname, pid) = value.rsplit_once('-')?;
+    if hostname.is_empty() || pid.is_empty() || !pid.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    Some(hostname)
+}
+
+fn provider_hint_matches_session_provider(
+    provider_hint: Option<&str>,
+    parsed_provider: &ProviderKind,
+) -> bool {
+    match provider_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(ProviderKind::from_str)
+    {
+        Some(hint) => hint == *parsed_provider,
+        None => true,
+    }
+}
+
 fn session_row_matches_local_instance(
     row_instance_id: Option<&str>,
     local_instance_id: Option<&str>,
@@ -313,7 +332,14 @@ fn session_row_matches_local_instance(
     let Some(local) = normalized_instance_id(local_instance_id) else {
         return true;
     };
-    normalized_instance_id(row_instance_id).is_some_and(|row| row == local)
+    let Some(row) = normalized_instance_id(row_instance_id) else {
+        return false;
+    };
+    row == local
+        || matches!(
+            (default_instance_hostname(row), default_instance_hostname(local)),
+            (Some(row_host), Some(local_host)) if row_host == local_host
+        )
 }
 
 fn normalize_nonempty(value: Option<&str>) -> Option<String> {
@@ -1049,8 +1075,20 @@ mod tests {
             "local session rows remain eligible"
         );
         assert!(
+            session_row_matches_local_instance(Some("mac-mini-123"), Some("mac-mini-456")),
+            "default hostname-PID instance ids on the same host remain eligible across restart"
+        );
+        assert!(
             !session_row_matches_local_instance(Some(NODE_B), Some(NODE_A)),
             "foreign session rows must not seed local tmux segment fallbacks"
+        );
+        assert!(
+            !session_row_matches_local_instance(Some("mac-book-123"), Some("mac-mini-456")),
+            "default hostname-PID instance ids on different hosts must not match"
+        );
+        assert!(
+            !session_row_matches_local_instance(Some("mac-mini-release"), Some("mac-mini-prod")),
+            "operator-provided stable instance ids must still match exactly"
         );
         assert!(
             !session_row_matches_local_instance(None, Some(NODE_A)),
@@ -1059,6 +1097,22 @@ mod tests {
         assert!(
             session_row_matches_local_instance(Some(NODE_B), None),
             "single-node/legacy callers without a local instance keep compatibility"
+        );
+    }
+
+    #[test]
+    fn session_tmux_segment_fallback_rejects_provider_hint_mismatch() {
+        assert!(provider_hint_matches_session_provider(
+            Some("claude"),
+            &ProviderKind::Claude
+        ));
+        assert!(
+            !provider_hint_matches_session_provider(Some("claude"), &ProviderKind::Codex),
+            "sessions.provider mismatch must discard the runtime tmux segment fallback"
+        );
+        assert!(
+            provider_hint_matches_session_provider(Some("unknown-provider"), &ProviderKind::Codex),
+            "unparseable legacy provider hints remain non-authoritative"
         );
     }
 

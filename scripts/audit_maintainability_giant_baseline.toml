@@ -478,7 +478,7 @@
 # changed; only the warm placeholder-sweeper carries the liveness gate (never the
 # boot path) so a freshly-restarted live watcher is never false-classified as dead.
 # Tests live in the excluded `rebind_origin_reap_tests` module.
-"src/services/discord/inflight.rs" = 3134 # #3680 existing-inflight rebind adoption guards
+"src/services/discord/inflight.rs" = 3138 # #3680 relay recovery review hardening / adoption guards
 "src/services/discord/relay_recovery.rs" = 1008 # #3680 ownerless relay recovery reattach
 # #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
 # prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
