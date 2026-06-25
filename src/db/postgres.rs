@@ -327,34 +327,8 @@ pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String
         register_repo(pool, &repo_id).await?;
     }
 
-    // #3692: in a cluster, the shared `agents` table is owned by the leader.
-    // `sync_agents_from_config_pg` is destructive (it DELETEs agents absent from
-    // the local config), so if a worker/auto node ran it at boot it would
-    // clobber the leader's roster — each node's startup would fight over the
-    // shared table and the roster would flip-flop per deploy order. Reseed runs
-    // before cluster leadership election, so gate on the configured role: only a
-    // single-node deployment (cluster disabled) or the explicitly-configured
-    // leader owns the roster sync. Workers/auto nodes trust the shared roster.
-    if agent_roster_sync_enabled(config) {
-        sync_agents_from_config_pg(pool, &config.agents).await?;
-    } else {
-        tracing::info!(
-            "[agent-sync] skipping config→DB agent roster sync on non-leader node \
-             (cluster.role={}); the cluster leader owns the shared agents table (#3692)",
-            config.cluster.role
-        );
-    }
+    sync_agents_from_config_pg(pool, &config.agents).await?;
     Ok(())
-}
-
-/// Whether this node should run the destructive config→DB agent roster sync.
-/// True for single-node deployments (cluster disabled) and for the node
-/// explicitly configured as `cluster.role: leader`. Worker/auto nodes return
-/// false so they never clobber the leader-owned shared roster (#3692). Shared
-/// with the config-audit path (`discord_config_audit`), which reaches the same
-/// destructive sync before `startup_reseed` runs.
-pub(crate) fn agent_roster_sync_enabled(config: &Config) -> bool {
-    !config.cluster.enabled || config.cluster.role.trim().eq_ignore_ascii_case("leader")
 }
 
 pub async fn health_check(pool: &PgPool) -> Result<(), String> {
@@ -681,25 +655,12 @@ async fn upsert_agent_from_config_pg(pool: &PgPool, agent: &AgentDef) -> Result<
     let discord_channel_id = provider_primary.or_else(|| discord_channel_cc.clone());
     let discord_channel_alt = discord_channel_cdx.clone();
 
-    // #3667: config-declared intake node-affinity labels. `None` (key absent
-    // from yaml) binds SQL NULL; the COALESCE then keeps the existing DB value
-    // so an out-of-band label (e.g. ch-td's DB-only `["mac-book"]`, not in yaml)
-    // is never wiped by a routine restart sync. `Some([...])` sets/overwrites it
-    // and `Some([])` explicitly clears it. We reference the bound `$11` (not
-    // EXCLUDED) in the conflict branch so the NULL signal survives the VALUES
-    // COALESCE used to satisfy the NOT NULL column on insert.
-    let preferred_intake_node_labels = agent
-        .preferred_intake_node_labels
-        .as_ref()
-        .map(|labels| serde_json::json!(labels));
-
     sqlx::query(
         "INSERT INTO agents (
             id, name, name_ko, provider, department, avatar_emoji,
-            discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx,
-            preferred_intake_node_labels
+            discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, '[]'::JSONB))
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (id) DO UPDATE
          SET name = EXCLUDED.name,
              name_ko = EXCLUDED.name_ko,
@@ -709,9 +670,7 @@ async fn upsert_agent_from_config_pg(pool: &PgPool, agent: &AgentDef) -> Result<
              discord_channel_id = EXCLUDED.discord_channel_id,
              discord_channel_alt = EXCLUDED.discord_channel_alt,
              discord_channel_cc = EXCLUDED.discord_channel_cc,
-             discord_channel_cdx = EXCLUDED.discord_channel_cdx,
-             preferred_intake_node_labels =
-                 COALESCE($11, agents.preferred_intake_node_labels)",
+             discord_channel_cdx = EXCLUDED.discord_channel_cdx",
     )
     .bind(&agent.id)
     .bind(&agent.name)
@@ -723,7 +682,6 @@ async fn upsert_agent_from_config_pg(pool: &PgPool, agent: &AgentDef) -> Result<
     .bind(discord_channel_alt)
     .bind(discord_channel_cc)
     .bind(discord_channel_cdx)
-    .bind(preferred_intake_node_labels)
     .execute(pool)
     .await
     .map_err(|error| format!("upsert postgres agent {}: {error}", agent.id))?;
@@ -791,16 +749,7 @@ async fn copy_runtime_fields_from_legacy_pg(
              sprite_number = COALESCE(legacy.sprite_number, agents.sprite_number),
              description = COALESCE(legacy.description, agents.description),
              system_prompt = COALESCE(legacy.system_prompt, agents.system_prompt),
-             pipeline_config = COALESCE(legacy.pipeline_config, agents.pipeline_config),
-             -- #3667: inherit a legacy DB-only intake label only when the
-             -- canonical row has none yet (config-set value wins; the column is
-             -- NOT NULL so a plain COALESCE would clobber it with '[]').
-             preferred_intake_node_labels = CASE
-                 WHEN jsonb_array_length(agents.preferred_intake_node_labels) = 0
-                      AND jsonb_array_length(legacy.preferred_intake_node_labels) > 0
-                     THEN legacy.preferred_intake_node_labels
-                 ELSE agents.preferred_intake_node_labels
-             END
+             pipeline_config = COALESCE(legacy.pipeline_config, agents.pipeline_config)
          FROM agents AS legacy
          WHERE legacy.id = $1
            AND agents.id = $2",
@@ -1168,12 +1117,11 @@ pub(crate) async fn close_test_pool(pool: PgPool, label: &str) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvisoryLockLease, POSTGRES_MIGRATOR, STARTUP_PG_ACQUIRE_TIMEOUT_SECS,
-        agent_roster_sync_enabled, checksum_hex, clamp_foreground_reserve, close_test_pool,
-        config_database_summary, connect_options, connect_test_pool_and_migrate_config,
-        create_test_database, database_enabled, database_summary, health_check,
-        run_test_postgres_sqlx_op_with_timeout, runtime_pool_settings, should_yield_for_counters,
-        startup_pool_settings, startup_reseed, sync_agents_from_config_pg,
+        AdvisoryLockLease, POSTGRES_MIGRATOR, STARTUP_PG_ACQUIRE_TIMEOUT_SECS, checksum_hex,
+        clamp_foreground_reserve, close_test_pool, config_database_summary, connect_options,
+        connect_test_pool_and_migrate_config, create_test_database, database_enabled,
+        database_summary, health_check, run_test_postgres_sqlx_op_with_timeout,
+        runtime_pool_settings, should_yield_for_counters, startup_pool_settings, startup_reseed,
     };
     use sqlx::Row;
     use std::collections::BTreeMap;
@@ -1291,7 +1239,6 @@ mod tests {
             keywords: Vec::new(),
             department: Some("platform".to_string()),
             avatar_emoji: Some(":gear:".to_string()),
-            preferred_intake_node_labels: None,
         }];
         config
     }
@@ -1613,178 +1560,6 @@ mod tests {
         test_db.drop().await;
     }
 
-    #[test]
-    fn agent_roster_sync_gated_to_leader_or_single_node() {
-        // #3692: only a single-node deployment or the configured leader owns the
-        // destructive config→DB agent roster sync.
-        let mut config = crate::config::Config::default();
-
-        config.cluster.enabled = false; // single-node: always owns the roster
-        config.cluster.role = "auto".to_string();
-        assert!(agent_roster_sync_enabled(&config));
-
-        config.cluster.enabled = true;
-        for (role, expected) in [
-            ("leader", true),
-            ("Leader", true),
-            ("  leader  ", true),
-            ("worker", false),
-            ("auto", false),
-            ("", false),
-        ] {
-            config.cluster.role = role.to_string();
-            assert_eq!(
-                agent_roster_sync_enabled(&config),
-                expected,
-                "cluster.role={role:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn worker_node_reseed_does_not_clobber_shared_agent_roster() {
-        // #3692: a cluster worker/auto node must NOT run the destructive agent
-        // sync at boot — doing so would delete leader-owned agents from the
-        // shared table and re-add its own, causing roster flip-flop per deploy.
-        let test_db = TestDatabase::create().await;
-        let mut config = postgres_test_config(&test_db);
-
-        let pool = connect_test_pool_and_migrate_config(
-            &config,
-            "db::postgres worker-reseed gating test pool",
-        )
-        .await
-        .expect("connect and migrate postgres")
-        .expect("postgres pool");
-
-        // Simulate a leader-owned agent already present in the shared table.
-        sqlx::query("INSERT INTO agents (id, name, provider) VALUES ($1, $2, $3)")
-            .bind("leader-owned")
-            .bind("Leader Owned")
-            .bind("claude")
-            .execute(&pool)
-            .await
-            .expect("seed leader-owned agent");
-
-        // This node is a cluster worker: reseed must skip the agent sync.
-        config.cluster.enabled = true;
-        config.cluster.role = "worker".to_string();
-        startup_reseed(&pool, &config).await.expect("worker reseed");
-
-        let leader_owned: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM agents WHERE id = 'leader-owned'")
-                .fetch_one(&pool)
-                .await
-                .expect("count leader-owned");
-        assert_eq!(
-            leader_owned, 1,
-            "worker reseed must not delete leader-owned agents"
-        );
-        let own_agent: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM agents WHERE id = 'pg-agent'")
-                .fetch_one(&pool)
-                .await
-                .expect("count pg-agent");
-        assert_eq!(
-            own_agent, 0,
-            "worker reseed must not sync its own config agents into the shared roster"
-        );
-
-        close_test_pool(pool, "db::postgres worker-reseed gating test pool")
-            .await
-            .expect("close postgres pool");
-        test_db.drop().await;
-    }
-
-    #[tokio::test]
-    async fn sync_agents_writes_and_preserves_preferred_intake_node_labels() {
-        // #3667: config-declared node-affinity labels (`Option<Vec<String>>`)
-        // are synced to the agents.preferred_intake_node_labels JSONB column:
-        //   Some([...]) sets/overwrites, Some([]) clears, None preserves an
-        //   out-of-band value (the ch-td DB-only `["mac-book"]` case, absent
-        //   from yaml).
-        let test_db = TestDatabase::create().await;
-        let mut config = postgres_test_config(&test_db);
-
-        let pool = connect_test_pool_and_migrate_config(
-            &config,
-            "db::postgres intake-label sync test pool",
-        )
-        .await
-        .expect("connect and migrate postgres")
-        .expect("postgres pool");
-
-        let read_labels = |id: &'static str| {
-            let pool = pool.clone();
-            async move {
-                let value: serde_json::Value = sqlx::query_scalar(
-                    "SELECT preferred_intake_node_labels FROM agents WHERE id = $1",
-                )
-                .bind(id)
-                .fetch_one(&pool)
-                .await
-                .expect("read preferred_intake_node_labels");
-                value
-            }
-        };
-
-        // 1. Config declares Some(["mac-mini"]) -> written verbatim on insert.
-        config.agents[0].preferred_intake_node_labels = Some(vec!["mac-mini".to_string()]);
-        sync_agents_from_config_pg(&pool, &config.agents)
-            .await
-            .expect("sync with labels");
-        assert_eq!(
-            read_labels("pg-agent").await,
-            serde_json::json!(["mac-mini"])
-        );
-
-        // 2. Seed an out-of-band label, then sync with the field ABSENT (None:
-        //    agent in yaml but no key). COALESCE($11=NULL, existing) must
-        //    preserve the existing value instead of wiping it.
-        sqlx::query("UPDATE agents SET preferred_intake_node_labels = $1 WHERE id = $2")
-            .bind(serde_json::json!(["mac-book"]))
-            .bind("pg-agent")
-            .execute(&pool)
-            .await
-            .expect("seed out-of-band label");
-        config.agents[0].preferred_intake_node_labels = None;
-        sync_agents_from_config_pg(&pool, &config.agents)
-            .await
-            .expect("sync with absent field");
-        assert_eq!(
-            read_labels("pg-agent").await,
-            serde_json::json!(["mac-book"]),
-            "absent field (None) must not wipe an out-of-band label"
-        );
-
-        // 3. A non-empty config list is authoritative again on conflict/update.
-        config.agents[0].preferred_intake_node_labels =
-            Some(vec!["mac-mini".to_string(), "release".to_string()]);
-        sync_agents_from_config_pg(&pool, &config.agents)
-            .await
-            .expect("sync overwrite labels");
-        assert_eq!(
-            read_labels("pg-agent").await,
-            serde_json::json!(["mac-mini", "release"])
-        );
-
-        // 4. Some([]) is an explicit clear, distinct from None.
-        config.agents[0].preferred_intake_node_labels = Some(Vec::new());
-        sync_agents_from_config_pg(&pool, &config.agents)
-            .await
-            .expect("sync explicit clear");
-        assert_eq!(
-            read_labels("pg-agent").await,
-            serde_json::json!([]),
-            "Some([]) must explicitly clear the label"
-        );
-
-        close_test_pool(pool, "db::postgres intake-label sync test pool")
-            .await
-            .expect("close postgres pool");
-        test_db.drop().await;
-    }
-
     #[tokio::test]
     async fn core_status_constraints_reject_invalid_values_and_allow_valid_states() {
         let test_db = TestDatabase::create().await;
@@ -2036,7 +1811,6 @@ mod tests {
             keywords: Vec::new(),
             department: Some("engineering".to_string()),
             avatar_emoji: Some("🛠️".to_string()),
-            preferred_intake_node_labels: None,
         }];
 
         let pool =
@@ -2175,7 +1949,6 @@ mod tests {
                 keywords: Vec::new(),
                 department: Some("engineering".to_string()),
                 avatar_emoji: None,
-                preferred_intake_node_labels: None,
             },
             crate::config::AgentDef {
                 id: "openclaw-maker".to_string(),
@@ -2194,7 +1967,6 @@ mod tests {
                 keywords: Vec::new(),
                 department: Some("legacy".to_string()),
                 avatar_emoji: None,
-                preferred_intake_node_labels: None,
             },
         ];
 

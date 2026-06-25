@@ -4,11 +4,6 @@ This document pins down which kinds of facts belong in `scope: permanent` vs `sc
 
 It is the working contract for the rule referenced from `_shared.prompt.md` and from [`docs/source-of-truth.md`](source-of-truth.md) (the Memento workspace memory row, previously placeholder under issue 910-6).
 
-This contract applies to MCP-backed Memento data. The PostgreSQL `local_memory`
-fallback documented in [`docs/source-of-truth.md`](source-of-truth.md) stores
-route-level rows with `workspace` metadata, but it does not implement Memento
-`permanent` scope, promotion, or amend semantics.
-
 ## TL;DR
 
 - `permanent` is for durable, identity-level knowledge about the user, their environment, and long-lived decisions.
@@ -96,7 +91,7 @@ A fragment-level audit of existing `scope: permanent` entries was NOT performed 
 5. **Inferred / unverified claims** — fragments with `assertionStatus = inferred` that were never amended to `verified`. Demote to `workspace` or `forget`.
 6. **Cache copies of source-of-truth** — fragments that summarize `docs/source-of-truth.md` rows. If the summary is genuinely user-facing, mark the fragment with a `cache` note linking back to the doc; otherwise delete.
 
-The weekly `memory.memento_consolidation` maintenance job (see `src/services/maintenance/jobs/memento_consolidation.rs`) calls the `memory_consolidate` MCP tool for workspace-level deduplication and low-importance cleanup. It does not replace an explicit permanent-scope audit of the buckets above.
+The audit pass itself is now driven periodically by the weekly `memory.memento_consolidation` maintenance job (see `src/services/maintenance/jobs/memento_consolidation.rs`), which calls the `memory_consolidate` MCP tool to deduplicate and sweep low-importance fragments.
 
 ## Related Documents
 

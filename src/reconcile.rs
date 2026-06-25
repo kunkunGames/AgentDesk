@@ -1683,35 +1683,20 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
             if !age_ok {
                 continue;
             }
-            // Only remove when restart_mode is absent and the file is not an
-            // externally adopted rebind-origin placeholder. Planned restart
-            // rows are owned by drain/hot-swap lifecycle; externally adopted
-            // rebind-origin rows are managed by the placeholder sweeper.
+            // Only remove when restart_mode is absent and rebind_origin is false.
+            // A file with a restart_mode set is owned by a planned lifecycle
+            // (drain/hot-swap); a rebind_origin file is managed by the placeholder
+            // sweeper. The existing inflight retention helpers cover those.
             #[derive(serde::Deserialize)]
             struct LifecycleExt {
                 restart_mode: Option<serde_json::Value>,
                 #[serde(default)]
                 rebind_origin: bool,
-                turn_source: Option<String>,
             }
             let is_managed_lifecycle = fs::read_to_string(&fpath)
                 .ok()
-                .and_then(|body| {
-                    let v = serde_json::from_str::<LifecycleExt>(&body).ok()?;
-                    let planned_restart = v.restart_mode.is_some_and(|rm| !rm.is_null());
-                    if planned_restart {
-                        return Some(true);
-                    }
-                    if !v.rebind_origin {
-                        return Some(false);
-                    }
-                    match v.turn_source.as_deref() {
-                        Some("external_adopted") => Some(true),
-                        None => Some(backfill_legacy_rebind_origin_turn_source(&fpath)),
-                        _ => Some(false),
-                    }
-                })
-                .unwrap_or(false);
+                .and_then(|body| serde_json::from_str::<LifecycleExt>(&body).ok())
+                .is_some_and(|v| v.restart_mode.is_some_and(|rm| !rm.is_null()) || v.rebind_origin);
             if is_managed_lifecycle {
                 continue;
             }
@@ -1726,121 +1711,6 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
         }
     }
     removed
-}
-
-fn backfill_legacy_rebind_origin_turn_source(path: &std::path::Path) -> bool {
-    let Ok(_lock) = crate::services::discord::lock_inflight_state_path(path) else {
-        return false;
-    };
-    let Ok(body) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
-        return false;
-    };
-    let Some(object) = value.as_object_mut() else {
-        return false;
-    };
-    if object.get("rebind_origin") != Some(&serde_json::Value::Bool(true)) {
-        return false;
-    }
-    match object
-        .get("turn_source")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("external_adopted") => return true,
-        Some(_) => return false,
-        None => {}
-    }
-    object.insert(
-        "turn_source".to_string(),
-        serde_json::Value::String("external_adopted".to_string()),
-    );
-    let Ok(updated) = serde_json::to_string_pretty(&value) else {
-        return false;
-    };
-    crate::services::discord::runtime_store::atomic_write(path, &format!("{updated}\n")).is_ok()
-}
-
-#[cfg(test)]
-mod stale_inflight_sweep_tests {
-    use super::sweep_stale_inflight_files_at;
-    use filetime::{FileTime, set_file_mtime};
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{Duration, SystemTime},
-    };
-
-    fn write_stale_inflight(root: &std::path::Path, name: &str, body: &str) -> PathBuf {
-        let provider_dir = root.join("claude");
-        fs::create_dir_all(&provider_dir).expect("provider dir");
-        let path = provider_dir.join(format!("{name}.json"));
-        fs::write(&path, body).expect("write inflight");
-        let old_mtime = FileTime::from_system_time(SystemTime::now() - Duration::from_secs(3600));
-        set_file_mtime(&path, old_mtime).expect("set mtime");
-        path
-    }
-
-    #[test]
-    fn stale_sweep_preserves_external_rebind_origin_only() {
-        let root = tempfile::tempdir().expect("temp root");
-        let external = write_stale_inflight(
-            root.path(),
-            "external",
-            r#"{"rebind_origin":true,"turn_source":"external_adopted"}"#,
-        );
-        let monitor = write_stale_inflight(
-            root.path(),
-            "monitor",
-            r#"{"rebind_origin":true,"turn_source":"monitor_triggered"}"#,
-        );
-
-        let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
-
-        assert_eq!(removed, 1);
-        assert!(
-            external.exists(),
-            "external adopted rebind-origin is placeholder-managed"
-        );
-        assert!(
-            !monitor.exists(),
-            "monitor-triggered stale rebind-origin remains sweepable"
-        );
-    }
-
-    #[test]
-    fn stale_sweep_preserves_legacy_rebind_origin_without_turn_source() {
-        let root = tempfile::tempdir().expect("temp root");
-        let legacy = write_stale_inflight(root.path(), "legacy", r#"{"rebind_origin":true}"#);
-
-        let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
-
-        assert_eq!(removed, 0);
-        assert!(
-            legacy.exists(),
-            "legacy rebind-origin rows predate turn_source and remain placeholder-managed"
-        );
-        let updated: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&legacy).expect("legacy body"))
-                .expect("updated legacy json");
-        assert_eq!(updated["turn_source"], "external_adopted");
-    }
-
-    #[test]
-    fn stale_sweep_preserves_planned_restart_rows() {
-        let root = tempfile::tempdir().expect("temp root");
-        let planned = write_stale_inflight(
-            root.path(),
-            "planned",
-            r#"{"restart_mode":"hot_swap","rebind_origin":false}"#,
-        );
-
-        let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
-
-        assert_eq!(removed, 0);
-        assert!(planned.exists());
-    }
 }
 
 /// Remove `discord_uploads/<channel>/*` files older than

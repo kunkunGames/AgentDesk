@@ -324,11 +324,10 @@ deadline = "2026-08-31"
 decompose_issue = "#3405"
 
 [[entry]]
-# Crossed the 1000-prod-LoC threshold in #3680: relay recovery gained the
-# bounded watcher-reattach planner/apply guards for ownerless inflight recovery
-# and multi-runtime channel ownership. Keep future relay recovery orchestration
-# growth honest; split action planning/apply execution into child modules once
-# the reattach lifecycle stabilizes.
+# Crossed the 1000-prod-LoC threshold when relay recovery gained the F2 tail-answer
+# guard and dead-watcher rebind-origin recovery paths. This is the relay recovery
+# orchestration shell; split evidence collection and recovery decision helpers
+# once the #3635/#3668 lifecycle stabilizes.
 file = "src/services/discord/relay_recovery.rs"
 owner = "discord-relay"
 deadline = "2026-08-31"
