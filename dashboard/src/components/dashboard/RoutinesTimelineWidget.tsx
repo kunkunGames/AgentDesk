@@ -347,6 +347,336 @@ function previewValue(value: unknown, fallback = "-"): string {
   return raw.length > 520 ? `${raw.slice(0, 520)}...` : raw;
 }
 
+type RoutineRunResultFact = {
+  key: string;
+  value: string;
+  mono?: boolean;
+};
+
+type RoutineRunResultNote = {
+  key: string;
+  value: string;
+};
+
+export interface RoutineRunResultSummary {
+  summary: string | null;
+  assistantPreview: string | null;
+  facts: RoutineRunResultFact[];
+  notes: RoutineRunResultNote[];
+  rawPreview: string | null;
+  structured: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compactResultText(value: string, maxChars = 240): string {
+  const trimmed = value.trim().replace(/\r/g, "");
+  if (!trimmed) return "";
+  const text = trimmed.replace(/\n{3,}/g, "\n\n");
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}...`;
+}
+
+function resultString(value: unknown, maxChars = 160): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "string") return compactResultText(value, maxChars);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const raw = JSON.stringify(value);
+  return raw ? compactResultText(raw, maxChars) : null;
+}
+
+function firstResultString(
+  record: Record<string, unknown>,
+  keys: string[],
+  maxChars?: number,
+): string | null {
+  for (const key of keys) {
+    const text = resultString(record[key], maxChars);
+    if (text) return text;
+  }
+  return null;
+}
+
+function formatDurationMs(value: unknown): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  if (value < 1_000) return `${Math.round(value)}ms`;
+  return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`;
+}
+
+export function summarizeRoutineRunResult(
+  result: unknown,
+): RoutineRunResultSummary {
+  if (!isRecord(result)) {
+    const text = resultString(result, 360);
+    return {
+      summary: text,
+      assistantPreview: null,
+      facts: [],
+      notes: [],
+      rawPreview: null,
+      structured: Boolean(text),
+    };
+  }
+
+  const facts: RoutineRunResultFact[] = [];
+  const notes: RoutineRunResultNote[] = [];
+  const addFact = (key: string, value: string | null, mono = false) => {
+    if (value) facts.push({ key, value, mono });
+  };
+  const addNote = (key: string, value: string | null) => {
+    if (value) notes.push({ key, value });
+  };
+
+  const summary = firstResultString(
+    result,
+    ["outcome_summary", "summary", "reason", "error"],
+    280,
+  );
+  const assistantPreview = firstResultString(
+    result,
+    ["assistant_message_preview"],
+    420,
+  );
+
+  addFact("status", firstResultString(result, ["status"], 80));
+  addFact("agent", firstResultString(result, ["agent_id"], 80));
+  addFact("failed_agent", firstResultString(result, ["failed_agent_id"], 80));
+  addFact("attempt", firstResultString(result, ["attempt_kind"], 80));
+  addFact("retry_count", firstResultString(result, ["retry_count"], 40));
+  addFact("next_retry", firstResultString(result, ["next_retry_at"], 80));
+  addFact("provider", firstResultString(result, ["provider"], 80));
+  addFact("turn", firstResultString(result, ["turn_id"], 80), true);
+  addFact("duration", formatDurationMs(result.duration_ms));
+  addFact("evidence", firstResultString(result, ["completion_evidence"], 80));
+  addFact("terminal", firstResultString(result, ["turn_terminal_status"], 80));
+  addFact("mode", firstResultString(result, ["mode"], 80));
+  addFact("agent_status", firstResultString(result, ["agentStatus", "agent_status"], 80));
+  addFact("idle", firstResultString(result, ["isIdle", "is_idle"], 40));
+  addFact("heartbeat", firstResultString(result, ["heartbeatCount", "heartbeat_count"], 40));
+  addFact("checked", firstResultString(result, ["checkedAt", "checked_at"], 80));
+  addFact("reviews", firstResultString(result, ["review_count"], 40));
+  addFact("approved", firstResultString(result, ["approved_count"], 40));
+  addFact("skipped", firstResultString(result, ["skipped"], 40));
+  addFact("skipped_approved", firstResultString(result, ["skipped_approved"], 40));
+  addFact("skipped_quality", firstResultString(result, ["skipped_quality_gate"], 40));
+  addFact("observations", firstResultString(result, ["observation_count"], 40));
+  addFact("active_candidates", firstResultString(result, ["active_candidate_count"], 40));
+  addFact("recommendations_today", firstResultString(result, ["recommendations_today"], 40));
+  addFact("reopt", firstResultString(result, ["reopt_count"], 40));
+  addFact("target", firstResultString(result, ["targetKey", "target_key"], 80));
+  addFact("summary_count", firstResultString(result, ["summaryCount", "summary_count"], 40));
+  addFact(
+    "fresh_context",
+    firstResultString(result, ["fresh_context_guaranteed", "freshContextGuaranteed"], 40),
+  );
+
+  addNote("decision", firstResultString(result, ["decision_summary"], 260));
+  addNote("evidence", firstResultString(result, ["top_evidence_summary"], 260));
+  addNote("suppression", firstResultString(result, ["suppression_summary"], 260));
+  addNote("scoring", firstResultString(result, ["scoring_summary"], 260));
+
+  const structured = Boolean(summary || assistantPreview || facts.length || notes.length);
+  return {
+    summary,
+    assistantPreview,
+    facts,
+    notes,
+    rawPreview: previewValue(result, ""),
+    structured,
+  };
+}
+
+function runResultFactLabel(key: string, t: TFunction): string {
+  switch (key) {
+    case "status":
+      return t({ ko: "상태", en: "Status", ja: "状態", zh: "状态" });
+    case "agent":
+      return t({ ko: "agent", en: "Agent", ja: "agent", zh: "agent" });
+    case "failed_agent":
+      return t({ ko: "실패 agent", en: "Failed agent", ja: "失敗agent", zh: "失败 agent" });
+    case "attempt":
+      return t({ ko: "시도", en: "Attempt", ja: "試行", zh: "尝试" });
+    case "retry_count":
+      return t({ ko: "재시도", en: "Retries", ja: "リトライ", zh: "重试" });
+    case "next_retry":
+      return t({ ko: "다음 재시도", en: "Next retry", ja: "次回リトライ", zh: "下次重试" });
+    case "provider":
+      return t({ ko: "provider", en: "Provider", ja: "provider", zh: "provider" });
+    case "turn":
+      return t({ ko: "turn", en: "Turn", ja: "turn", zh: "turn" });
+    case "duration":
+      return t({ ko: "소요", en: "Duration", ja: "所要時間", zh: "耗时" });
+    case "evidence":
+      return t({ ko: "완료 근거", en: "Evidence", ja: "完了根拠", zh: "完成依据" });
+    case "terminal":
+      return t({ ko: "종료 상태", en: "Terminal", ja: "終了状態", zh: "终止状态" });
+    case "mode":
+      return t({ ko: "모드", en: "Mode", ja: "モード", zh: "模式" });
+    case "agent_status":
+      return t({ ko: "agent 상태", en: "Agent status", ja: "agent状態", zh: "agent 状态" });
+    case "idle":
+      return t({ ko: "idle", en: "Idle", ja: "idle", zh: "idle" });
+    case "heartbeat":
+      return t({ ko: "heartbeat", en: "Heartbeat", ja: "heartbeat", zh: "heartbeat" });
+    case "checked":
+      return t({ ko: "확인 시각", en: "Checked", ja: "確認時刻", zh: "检查时间" });
+    case "reviews":
+      return t({ ko: "검토", en: "Reviews", ja: "レビュー", zh: "审查" });
+    case "approved":
+      return t({ ko: "승인", en: "Approved", ja: "承認", zh: "批准" });
+    case "skipped":
+      return t({ ko: "스킵", en: "Skipped", ja: "スキップ", zh: "跳过" });
+    case "skipped_approved":
+      return t({ ko: "이미 승인", en: "Already approved", ja: "承認済み", zh: "已批准" });
+    case "skipped_quality":
+      return t({ ko: "품질 게이트", en: "Quality gate", ja: "品質ゲート", zh: "质量门" });
+    case "observations":
+      return t({ ko: "관찰", en: "Observations", ja: "観察", zh: "观测" });
+    case "active_candidates":
+      return t({ ko: "활성 후보", en: "Active candidates", ja: "有効候補", zh: "活跃候选" });
+    case "recommendations_today":
+      return t({ ko: "오늘 추천", en: "Recommendations today", ja: "今日の推薦", zh: "今日推荐" });
+    case "reopt":
+      return t({ ko: "재최적화", en: "Reopt", ja: "再最適化", zh: "重新优化" });
+    case "target":
+      return t({ ko: "대상", en: "Target", ja: "対象", zh: "目标" });
+    case "summary_count":
+      return t({ ko: "요약 횟수", en: "Summary count", ja: "要約回数", zh: "摘要次数" });
+    case "fresh_context":
+      return t({ ko: "fresh context", en: "Fresh context", ja: "fresh context", zh: "fresh context" });
+    default:
+      return key;
+  }
+}
+
+function runResultNoteLabel(key: string, t: TFunction): string {
+  switch (key) {
+    case "decision":
+      return t({ ko: "판단", en: "Decision", ja: "判断", zh: "判断" });
+    case "evidence":
+      return t({ ko: "근거", en: "Evidence", ja: "根拠", zh: "依据" });
+    case "suppression":
+      return t({ ko: "억제", en: "Suppression", ja: "抑制", zh: "抑制" });
+    case "scoring":
+      return t({ ko: "스코어링", en: "Scoring", ja: "スコアリング", zh: "评分" });
+    default:
+      return key;
+  }
+}
+
+function RoutineRunResultPayload({
+  error,
+  result,
+  t,
+}: {
+  error: string | null;
+  result: unknown | null;
+  t: TFunction;
+}) {
+  const hasError = Boolean(error?.trim());
+  const errorText = hasError ? compactResultText(error ?? "", 520) : null;
+  const summary =
+    result === null || result === undefined
+      ? null
+      : summarizeRoutineRunResult(result);
+  const visibleSummary =
+    summary?.summary && summary.summary !== errorText ? summary.summary : null;
+  if (!hasError && !summary) return null;
+
+  return (
+    <div className="mt-2 space-y-2">
+      {hasError ? (
+        <div
+          className="rounded-lg px-2 py-2 text-xs leading-5"
+          style={{
+            background: "color-mix(in srgb, var(--th-accent-danger) 10%, var(--th-overlay-medium) 90%)",
+            color: "var(--th-text-primary)",
+          }}
+        >
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em]" style={{ color: "var(--th-accent-danger)" }}>
+            {t({ ko: "오류", en: "Error", ja: "エラー", zh: "错误" })}
+          </div>
+          <div className="whitespace-pre-wrap break-words">{errorText}</div>
+        </div>
+      ) : null}
+
+      {summary && summary.structured ? (
+        <div
+          className="space-y-2 rounded-lg px-2 py-2"
+          style={{
+            background: "color-mix(in srgb, var(--th-overlay-medium) 62%, transparent)",
+            color: "var(--th-text-primary)",
+          }}
+        >
+          {visibleSummary ? (
+            <p className="text-xs leading-5">{visibleSummary}</p>
+          ) : null}
+          {summary.assistantPreview ? (
+            <div className="space-y-1">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.12em]" style={{ color: "var(--th-text-muted)" }}>
+                {t({ ko: "에이전트 응답", en: "Agent response", ja: "エージェント応答", zh: "智能体回复" })}
+              </div>
+              <p className="whitespace-pre-wrap break-words text-xs leading-5">
+                {summary.assistantPreview}
+              </p>
+            </div>
+          ) : null}
+          {summary.notes.length ? (
+            <div className="space-y-1">
+              {summary.notes.map((note) => (
+                <div key={note.key} className="text-xs leading-5">
+                  <span className="font-medium" style={{ color: "var(--th-text-muted)" }}>
+                    {runResultNoteLabel(note.key, t)}:
+                  </span>{" "}
+                  <span>{note.value}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {summary.facts.length ? (
+            <div className="flex flex-wrap gap-1.5">
+              {summary.facts.map((fact) => (
+                <span
+                  key={`${fact.key}:${fact.value}`}
+                  className={cx(
+                    "inline-flex min-w-0 max-w-full items-center gap-1 rounded-md px-2 py-1 text-[11px] leading-4",
+                    fact.mono ? "font-mono" : "",
+                  )}
+                  style={{
+                    background: "color-mix(in srgb, var(--th-bg-surface) 74%, transparent)",
+                    color: "var(--th-text-primary)",
+                  }}
+                >
+                  <span className="shrink-0 font-medium" style={{ color: "var(--th-text-muted)" }}>
+                    {runResultFactLabel(fact.key, t)}
+                  </span>
+                  <span className="min-w-0 break-all">{fact.value}</span>
+                </span>
+              ))}
+            </div>
+          ) : null}
+          {summary.rawPreview ? (
+            <details className="text-[11px] leading-5" style={{ color: "var(--th-text-muted)" }}>
+              <summary className="cursor-pointer select-none">
+                {t({ ko: "원본 JSON", en: "Raw JSON", ja: "元JSON", zh: "原始 JSON" })}
+              </summary>
+              <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words font-mono" style={{ color: "var(--th-text-primary)" }}>
+                {summary.rawPreview}
+              </pre>
+            </details>
+          ) : null}
+        </div>
+      ) : summary?.rawPreview ? (
+        <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded-lg px-2 py-2 text-[11px] leading-5" style={{ background: "color-mix(in srgb, var(--th-overlay-medium) 82%, transparent)", color: "var(--th-text-primary)" }}>
+          {summary.rawPreview}
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
 function DetailField({
   label,
   value,
@@ -463,11 +793,7 @@ function RoutineDetailDrawer({
                       {run.action ? `${t({ ko: "action", en: "action", ja: "action", zh: "action" })}: ${run.action}` : null}
                       {run.finished_at ? ` · ${t({ ko: "완료", en: "finished", ja: "完了", zh: "完成" })} ${formatDateTime(run.finished_at, localeTag)}` : null}
                     </div>
-                    {(run.error || run.result_json) ? (
-                      <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap rounded-lg px-2 py-2 text-[11px] leading-5" style={{ background: "color-mix(in srgb, var(--th-overlay-medium) 82%, transparent)", color: "var(--th-text-primary)" }}>
-                        {run.error ?? previewValue(run.result_json)}
-                      </pre>
-                    ) : null}
+                    <RoutineRunResultPayload error={run.error} result={run.result_json} t={t} />
                   </div>
                 ))
               )}

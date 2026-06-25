@@ -4,6 +4,7 @@ import {
   describeRoutinePurpose,
   describeRoutineSchedule,
   sortRoutinesChronologically,
+  summarizeRoutineRunResult,
 } from "./RoutinesTimelineWidget";
 import type { TFunction } from "./model";
 
@@ -109,5 +110,71 @@ describe("RoutinesTimelineWidget helpers", () => {
         koT,
       ),
     ).toContain("worktree");
+  });
+
+  it("summarizes known routine result fields without requiring raw JSON first", () => {
+    const result = summarizeRoutineRunResult({
+      status: "ok",
+      outcome_summary: "성공 요약: 새 자동화 추천 후보 없음",
+      decision_summary: "임계값 이하라 보류",
+      scoring_summary: "scored=4, deduped=2",
+      observation_count: 12,
+      active_candidate_count: 3,
+      recommendations_today: 1,
+    });
+
+    expect(result.structured).toBe(true);
+    expect(result.summary).toBe("성공 요약: 새 자동화 추천 후보 없음");
+    expect(result.notes).toContainEqual({
+      key: "decision",
+      value: "임계값 이하라 보류",
+    });
+    expect(result.notes).toContainEqual({
+      key: "scoring",
+      value: "scored=4, deduped=2",
+    });
+    expect(result.facts).toEqual(
+      expect.arrayContaining([
+        { key: "status", value: "ok", mono: false },
+        { key: "observations", value: "12", mono: false },
+        { key: "active_candidates", value: "3", mono: false },
+        { key: "recommendations_today", value: "1", mono: false },
+      ]),
+    );
+  });
+
+  it("extracts agent completion previews and routing metadata", () => {
+    const result = summarizeRoutineRunResult({
+      status: "completed",
+      agent_id: "codex",
+      attempt_kind: "primary",
+      turn_id: "turn-123456",
+      duration_ms: 1234,
+      assistant_message_preview: "자동화 후보는 보류합니다.\n근거가 부족합니다.",
+    });
+
+    expect(result.structured).toBe(true);
+    expect(result.assistantPreview).toBe(
+      "자동화 후보는 보류합니다.\n근거가 부족합니다.",
+    );
+    expect(result.facts).toEqual(
+      expect.arrayContaining([
+        { key: "status", value: "completed", mono: false },
+        { key: "agent", value: "codex", mono: false },
+        { key: "attempt", value: "primary", mono: false },
+        { key: "turn", value: "turn-123456", mono: true },
+        { key: "duration", value: "1.2s", mono: false },
+      ]),
+    );
+  });
+
+  it("falls back to raw preview for unknown JSON shapes", () => {
+    const result = summarizeRoutineRunResult({
+      nested: { value: true },
+    });
+
+    expect(result.structured).toBe(false);
+    expect(result.summary).toBeNull();
+    expect(result.rawPreview).toContain('"nested"');
   });
 });
