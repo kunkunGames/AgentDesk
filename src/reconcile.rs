@@ -1699,8 +1699,8 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
                 .and_then(|body| serde_json::from_str::<LifecycleExt>(&body).ok())
                 .is_some_and(|v| {
                     let planned_restart = v.restart_mode.is_some_and(|rm| !rm.is_null());
-                    let external_rebind_origin =
-                        v.rebind_origin && v.turn_source.as_deref() == Some("external_adopted");
+                    let external_rebind_origin = v.rebind_origin
+                        && matches!(v.turn_source.as_deref(), None | Some("external_adopted"));
                     planned_restart || external_rebind_origin
                 });
             if is_managed_lifecycle {
@@ -1763,6 +1763,20 @@ mod stale_inflight_sweep_tests {
         assert!(
             !monitor.exists(),
             "monitor-triggered stale rebind-origin remains sweepable"
+        );
+    }
+
+    #[test]
+    fn stale_sweep_preserves_legacy_rebind_origin_without_turn_source() {
+        let root = tempfile::tempdir().expect("temp root");
+        let legacy = write_stale_inflight(root.path(), "legacy", r#"{"rebind_origin":true}"#);
+
+        let removed = sweep_stale_inflight_files_at(root.path(), Duration::from_secs(60));
+
+        assert_eq!(removed, 0);
+        assert!(
+            legacy.exists(),
+            "legacy rebind-origin rows predate turn_source and remain placeholder-managed"
         );
     }
 
