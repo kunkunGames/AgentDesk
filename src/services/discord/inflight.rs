@@ -26,9 +26,8 @@ mod store;
 // is named nowhere outside `store` (it only flows as a return type), so it keeps
 // its module-tree visibility there without a parent re-export.
 use store::inflight_provider_dir;
-pub(in crate::services::discord::inflight) use store::{
-    inflight_state_path, lock_inflight_state_path,
-};
+pub(in crate::services::discord::inflight) use store::inflight_state_path;
+pub(crate) use store::lock_inflight_state_path;
 
 use finalizer_identity::{
     backfill_finalizer_turn_id_under_lock, parse_inflight_state_content,

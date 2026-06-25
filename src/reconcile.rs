@@ -1707,7 +1707,7 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
                     }
                     match v.turn_source.as_deref() {
                         Some("external_adopted") => Some(true),
-                        None => Some(backfill_legacy_rebind_origin_turn_source(&fpath, &body)),
+                        None => Some(backfill_legacy_rebind_origin_turn_source(&fpath)),
                         _ => Some(false),
                     }
                 })
@@ -1728,13 +1728,30 @@ pub(crate) fn sweep_stale_inflight_files_at(root: &std::path::Path, max_age: Dur
     removed
 }
 
-fn backfill_legacy_rebind_origin_turn_source(path: &std::path::Path, body: &str) -> bool {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+fn backfill_legacy_rebind_origin_turn_source(path: &std::path::Path) -> bool {
+    let Ok(_lock) = crate::services::discord::lock_inflight_state_path(path) else {
+        return false;
+    };
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&body) else {
         return false;
     };
     let Some(object) = value.as_object_mut() else {
         return false;
     };
+    if object.get("rebind_origin") != Some(&serde_json::Value::Bool(true)) {
+        return false;
+    }
+    match object
+        .get("turn_source")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("external_adopted") => return true,
+        Some(_) => return false,
+        None => {}
+    }
     object.insert(
         "turn_source".to_string(),
         serde_json::Value::String("external_adopted".to_string()),
@@ -1742,7 +1759,7 @@ fn backfill_legacy_rebind_origin_turn_source(path: &std::path::Path, body: &str)
     let Ok(updated) = serde_json::to_string_pretty(&value) else {
         return false;
     };
-    std::fs::write(path, format!("{updated}\n")).is_ok()
+    crate::services::discord::runtime_store::atomic_write(path, &format!("{updated}\n")).is_ok()
 }
 
 #[cfg(test)]
