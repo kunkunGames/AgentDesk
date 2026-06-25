@@ -184,6 +184,7 @@ use formatting::{
     send_long_message_raw, truncate_str,
 };
 pub(crate) use inflight::clear_inflight_state;
+pub(crate) use inflight::lock_inflight_state_path;
 use inflight::{InflightTurnState, load_inflight_states, save_inflight_state};
 use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
 use recovery_engine::restore_inflight_turns;
@@ -2511,7 +2512,7 @@ fn idle_queue_snapshot_has_kickable_backlog(
         // finalize before claiming. Do NOT kick normal queued work in the
         // meantime — that would re-introduce the very turn-interleave this fix
         // serializes away.
-        && !tui_direct_pending_start::pending_synthetic_start_present(
+        && !tui_direct_pending_start::pending_synthetic_start_blocks_idle_kickoff(
             provider.as_str(),
             channel_id.get(),
         )
