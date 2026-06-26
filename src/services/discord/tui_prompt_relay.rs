@@ -1313,10 +1313,10 @@ async fn claim_tui_direct_synthetic_turn(
     // #3167 — the self-paced TUI loop / TUI-direct turn is a low-priority
     // background turn; mark it `Background` so a queued external USER
     // intervention is not starved behind the continuously-cycling loop.
-    let started = super::mailbox_try_start_turn_kinded(
+    let mut started = super::mailbox_try_start_turn_kinded(
         shared,
         channel_id,
-        cancel_token,
+        cancel_token.clone(),
         serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
         anchor_message_id,
         crate::services::turn_orchestrator::ActiveTurnKind::Background,
@@ -1325,22 +1325,59 @@ async fn claim_tui_direct_synthetic_turn(
     if !started {
         let snapshot = super::mailbox_snapshot(shared, channel_id).await;
         if snapshot.active_user_message_id != Some(anchor_message_id) {
-            tracing::warn!(
-                provider = %provider.as_str(),
-                channel_id = channel_id.get(),
-                tmux_session_name = %tmux_session_name,
-                active_user_message_id = snapshot
-                    .active_user_message_id
-                    .map(|id| id.get())
-                    .unwrap_or(0),
-                anchor_message_id = anchor_message_id.get(),
-                "skipping TUI-direct synthetic inflight; mailbox already owns a different turn"
-            );
-            return TuiDirectSyntheticTurnClaim {
-                relay_owner,
-                claimed: false,
-                turn_start_offset: start_offset,
-            };
+            if let Some(active_user_message_id) = snapshot.active_user_message_id
+                && release_stale_ownerless_tui_direct_mailbox_if_current(
+                    shared,
+                    provider,
+                    channel_id,
+                    tmux_session_name,
+                    active_user_message_id,
+                    anchor_message_id,
+                )
+                .await
+            {
+                started = super::mailbox_try_start_turn_kinded(
+                    shared,
+                    channel_id,
+                    cancel_token.clone(),
+                    serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
+                    anchor_message_id,
+                    crate::services::turn_orchestrator::ActiveTurnKind::Background,
+                )
+                .await;
+                if started {
+                    tracing::info!(
+                        provider = %provider.as_str(),
+                        channel_id = channel_id.get(),
+                        tmux_session_name = %tmux_session_name,
+                        anchor_message_id = anchor_message_id.get(),
+                        "TUI-direct synthetic inflight claimed after releasing stale ownerless mailbox"
+                    );
+                }
+            }
+        }
+        if !started {
+            let snapshot = super::mailbox_snapshot(shared, channel_id).await;
+            if snapshot.active_user_message_id == Some(anchor_message_id) {
+                started = true;
+            } else {
+                tracing::warn!(
+                    provider = %provider.as_str(),
+                    channel_id = channel_id.get(),
+                    tmux_session_name = %tmux_session_name,
+                    active_user_message_id = snapshot
+                        .active_user_message_id
+                        .map(|id| id.get())
+                        .unwrap_or(0),
+                    anchor_message_id = anchor_message_id.get(),
+                    "skipping TUI-direct synthetic inflight; mailbox already owns a different turn"
+                );
+                return TuiDirectSyntheticTurnClaim {
+                    relay_owner,
+                    claimed: false,
+                    turn_start_offset: start_offset,
+                };
+            }
         }
     }
 
@@ -1481,6 +1518,55 @@ async fn claim_tui_direct_synthetic_turn(
         claimed: true,
         turn_start_offset: start_offset,
     }
+}
+
+async fn release_stale_ownerless_tui_direct_mailbox_if_current(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    active_user_message_id: MessageId,
+    anchor_message_id: MessageId,
+) -> bool {
+    let Some(state) = super::inflight::load_inflight_state(provider, channel_id.get()) else {
+        return false;
+    };
+    if state.user_msg_id != active_user_message_id.get()
+        || state.tmux_session_name.as_deref() != Some(tmux_session_name)
+        || !super::inflight::ownerless_external_input_inflight_is_stale(&state)
+    {
+        return false;
+    }
+
+    let finish =
+        super::mailbox_finish_turn_if_matches(shared, provider, channel_id, active_user_message_id)
+            .await;
+    let Some(token) = finish.removed_token.as_ref() else {
+        tracing::info!(
+            provider = %provider.as_str(),
+            channel_id = channel_id.get(),
+            tmux_session_name = %tmux_session_name,
+            stale_user_message_id = active_user_message_id.get(),
+            anchor_message_id = anchor_message_id.get(),
+            "TUI-direct stale ownerless mailbox release skipped because mailbox identity changed"
+        );
+        return false;
+    };
+    token
+        .cancelled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let global_active_decremented = super::saturating_decrement_global_active(shared);
+    tracing::warn!(
+        provider = %provider.as_str(),
+        channel_id = channel_id.get(),
+        tmux_session_name = %tmux_session_name,
+        stale_user_message_id = active_user_message_id.get(),
+        anchor_message_id = anchor_message_id.get(),
+        global_active_decremented,
+        had_pending_queue = finish.has_pending,
+        "released stale ownerless TUI-direct mailbox before claiming new synthetic inflight"
+    );
+    true
 }
 
 // ===========================================================================
@@ -4196,6 +4282,36 @@ mod tests {
         "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"
     }
 
+    /// Scoped env-var override for inflight persistence tests. `AGENTDESK_ROOT_DIR`
+    /// is process-global, so serialize it with the shared test env lock.
+    struct EnvRootGuard {
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvRootGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let lock = crate::config::shared_test_env_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let previous = std::env::var_os("AGENTDESK_ROOT_DIR");
+            unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvRootGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
     // ====================================================================
     // #3154 P2-2 (c) — the KEY residual risk: prove there is NO relay GAP
     // (not merely no duplicate) on the deferred synthetic-start path.
@@ -6669,6 +6785,157 @@ mod tests {
         let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
         assert!(snapshot.cancel_token.is_none());
         assert_eq!(snapshot.active_user_message_id, None);
+    }
+
+    fn save_ownerless_tui_direct_inflight_for_mailbox_release_test(
+        provider: ProviderKind,
+        channel_id: ChannelId,
+        user_message_id: MessageId,
+        tmux_session_name: &str,
+        output_path: &Path,
+        stale_started_at: bool,
+    ) {
+        let lease = ExternalInputRelayLease::unassigned(Some(channel_id.get()));
+        let mut state = build_tui_direct_synthetic_inflight_state(
+            provider,
+            channel_id,
+            user_message_id,
+            None,
+            "typed in TUI",
+            tmux_session_name,
+            Some(output_path),
+            0,
+            &lease,
+            RelayOwnerKind::None,
+        );
+        state.set_restart_mode(super::super::InflightRestartMode::DrainRestart);
+        if stale_started_at {
+            let stale_started_at = chrono::Local::now()
+                - chrono::Duration::seconds(
+                    (super::super::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS + 1) as i64,
+                );
+            state.started_at = stale_started_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        }
+        state.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        super::super::inflight::save_inflight_state(&state).expect("save inflight state");
+    }
+
+    #[tokio::test]
+    async fn stale_ownerless_tui_direct_mailbox_release_allows_new_synthetic_claim() {
+        let temp = tempfile::tempdir().expect("temp runtime root");
+        let _env = EnvRootGuard::set(temp.path());
+        let shared = super::super::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let channel_id = ChannelId::new(940_000_000_000_009);
+        let stale_message_id = MessageId::new(940_000_000_000_109);
+        let anchor_message_id = MessageId::new(940_000_000_000_209);
+        let tmux_session_name = "AgentDesk-codex-stale-mailbox-release";
+        let output_path = temp.path().join("codex-rollout.jsonl");
+        let stale_token = Arc::new(CancelToken::new());
+
+        assert!(
+            super::super::mailbox_try_start_turn(
+                shared.as_ref(),
+                channel_id,
+                stale_token.clone(),
+                serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
+                stale_message_id,
+            )
+            .await,
+            "test precondition: stale mailbox turn starts"
+        );
+        shared.restart.global_active.store(1, Ordering::Relaxed);
+        save_ownerless_tui_direct_inflight_for_mailbox_release_test(
+            provider.clone(),
+            channel_id,
+            stale_message_id,
+            tmux_session_name,
+            &output_path,
+            true,
+        );
+
+        assert!(
+            release_stale_ownerless_tui_direct_mailbox_if_current(
+                &shared,
+                &provider,
+                channel_id,
+                tmux_session_name,
+                stale_message_id,
+                anchor_message_id,
+            )
+            .await,
+            "stale ownerless ExternalInput mailbox should be released"
+        );
+        assert!(stale_token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+        let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
+        assert!(snapshot.cancel_token.is_none());
+        assert_eq!(snapshot.active_user_message_id, None);
+
+        assert!(
+            super::super::mailbox_try_start_turn(
+                shared.as_ref(),
+                channel_id,
+                Arc::new(CancelToken::new()),
+                serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
+                anchor_message_id,
+            )
+            .await,
+            "new synthetic claim must be able to occupy the released mailbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_ownerless_tui_direct_mailbox_release_preserves_fresh_owner() {
+        let temp = tempfile::tempdir().expect("temp runtime root");
+        let _env = EnvRootGuard::set(temp.path());
+        let shared = super::super::make_shared_data_for_tests();
+        let provider = ProviderKind::Codex;
+        let channel_id = ChannelId::new(940_000_000_000_010);
+        let active_message_id = MessageId::new(940_000_000_000_110);
+        let anchor_message_id = MessageId::new(940_000_000_000_210);
+        let tmux_session_name = "AgentDesk-codex-fresh-mailbox-preserve";
+        let output_path = temp.path().join("codex-rollout.jsonl");
+        let active_token = Arc::new(CancelToken::new());
+
+        assert!(
+            super::super::mailbox_try_start_turn(
+                shared.as_ref(),
+                channel_id,
+                active_token.clone(),
+                serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
+                active_message_id,
+            )
+            .await,
+            "test precondition: active mailbox turn starts"
+        );
+        shared.restart.global_active.store(1, Ordering::Relaxed);
+        save_ownerless_tui_direct_inflight_for_mailbox_release_test(
+            provider.clone(),
+            channel_id,
+            active_message_id,
+            tmux_session_name,
+            &output_path,
+            false,
+        );
+
+        assert!(
+            !release_stale_ownerless_tui_direct_mailbox_if_current(
+                &shared,
+                &provider,
+                channel_id,
+                tmux_session_name,
+                active_message_id,
+                anchor_message_id,
+            )
+            .await,
+            "fresh ownerless ExternalInput mailbox must not be released"
+        );
+        assert!(!active_token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+        let snapshot = super::super::mailbox_snapshot(shared.as_ref(), channel_id).await;
+        assert_eq!(snapshot.active_user_message_id, Some(active_message_id));
+        assert!(snapshot.cancel_token.is_some());
     }
 
     #[cfg(unix)]
