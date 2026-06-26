@@ -420,6 +420,7 @@ src/
 │   │   │   ├── budget.rs
 │   │   │   ├── finalizer_identity.rs
 │   │   │   ├── model.rs
+│   │   │   ├── rebind_reap.rs
 │   │   │   └── store.rs
 │   │   ├── outbound/
 │   │   │   ├── confirmation.rs
@@ -553,11 +554,13 @@ src/
 │   │   │   ├── anchor_completion.rs
 │   │   │   ├── bridge_completion.rs
 │   │   │   ├── bridge_gateway.rs
+│   │   │   ├── codex_idle_rollout.rs
 │   │   │   ├── idle_offset_resolution.rs
 │   │   │   ├── idle_transcript_scan.rs
 │   │   │   ├── injected_prompt_policy.rs
 │   │   │   ├── launch_script.rs
-│   │   │   └── rehydration.rs
+│   │   │   ├── rehydration.rs
+│   │   │   └── tests.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
 │   │   │   │   ├── completion_context.rs

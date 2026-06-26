@@ -1271,13 +1271,12 @@
     2026-08-31, #3036)).
   - `src/services/discord/{commands/text_commands.rs,
     discord_config_audit.rs, router/intake_gate.rs}` (all 1000+ production
-    lines) and `src/services/discord/inflight.rs` (3137 lines; #3680 relay
+    lines) and `src/services/discord/inflight.rs` (3004 lines; #3680 relay
     recovery review hardening; #3685 exposes the inflight sidecar lock
-    crate-wide for locked legacy rebind backfill; #3635 added the
-    dead-watcher rebind-origin reap — `WatcherLiveness` DI trait, three-state tmux
-    pane liveness, spawn-blocking warm sweeper probe, and fs-only locked
-    re-validation; the byte-for-byte-unchanged #3581 None-owner predicate is
-    preserved verbatim).
+    crate-wide for locked legacy rebind backfill; #3715 moved the #3635
+    dead-watcher rebind-origin reap helpers into
+    `src/services/discord/inflight/rebind_reap.rs`, while the parent preserves
+    the #3581 None-owner predicate and sidecar state contract).
   - `src/services/discord/placeholder_sweeper.rs` (1004 lines; crossed the giant
     threshold in #3635 when the dead-watcher reap branch joined the async
     rebind-origin sweep arm — tracked decompose target, see `giant-file-registry.md` (owner
@@ -1446,7 +1445,7 @@
   - `src/db/kanban_cards/` (1932 total lines; kanban card persistence and
     GitHub sync lookup surface).
   - `src/db/postgres.rs` (1167 lines; #3651: the `FOREGROUND_RESERVE` process-global, the `background_should_yield` backpressure predicate + pure `should_yield_for_counters` helper, the `clamp_foreground_reserve` helper that keeps the background budget >= 1 for small `pool_max` configs, reserve install+clamp in `connect`, and the predicate + clamp unit tests; #3690: preferred_intake_node_labels upsert/sync + COALESCE preserve; #3692: `agent_roster_sync_enabled` leader-ownership gate on the roster sync).
-  - `src/db/dispatched_sessions.rs` (1612 lines; dispatched session
+  - `src/db/dispatched_sessions.rs` (1621 lines; dispatched session
     persistence helpers. #3306: +48 for the narrow `load_session_channel_id_pg`
     durable-truth accessor the idle-relay drift self-heal reads; #3693: +2 to
     include `cwd` in provider resume selector lookup).
@@ -1477,7 +1476,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   `src/services/auto_queue/cancel_run.rs` (1032) is also giant-file territory;
   split before further non-bugfix growth.
 - `src/services/onboarding/mod.rs` (2937),
-  `src/services/dispatched_sessions.rs` (1375), and
+  `src/services/dispatched_sessions.rs` (1441), and
   `src/services/settings.rs` (1114) — service-layer route support surfaces
   split out of the large dashboard route modules. (`src/services/onboarding.rs`
   and `src/services/api_friction.rs` have been removed/decomposed.)
@@ -1530,7 +1529,7 @@ which excludes `#[cfg(test)] mod` blocks); the freshness gate keeps them in sync
   while the prior turn streams; +20 from #3637 centralizing post-paste error
   cleanup and making draft clearing cancel-agnostic.)
 - `src/services/memory/memento.rs` (1893).
-- `src/services/dispatched_sessions.rs` (1375) — dispatched session domain
+- `src/services/dispatched_sessions.rs` (1441) — dispatched session domain
   service. This is the post-#1515 SRP extraction target for route/database
   callsites, but the module itself is now giant-file territory; split focused
   helpers before adding non-bugfix behavior. (+5 from #3169 exposing the idle-
