@@ -1,10 +1,19 @@
 <!-- Keep title concise (≤70 chars). Use the body for details. -->
 
-## Summary
-<!-- 1–3 bullets: what changed and why. -->
+## What changed
+<!-- 1–3 bullets: what changed. -->
 
-## Test plan
-<!-- Bulleted checklist: how to verify the change. -->
+## Why
+<!-- 1–3 bullets: why this change was made. -->
+
+## Verification commands and results
+<!-- How this change was verified and the results of those commands. -->
+
+## Skipped checks with reasons
+<!-- List any checks that were skipped and why. -->
+
+## Risk and rollback notes
+<!-- Assess risk and provide instructions for reverting this change if needed. -->
 
 ## Queue Hygiene & Merge-Readiness checklist
 - [ ] **Duplicate PR guard:** I have checked for overlapping open PRs before creating this PR (especially for generated refresh work).
