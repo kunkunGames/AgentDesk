@@ -852,6 +852,18 @@ pub(super) fn inflight_state_is_stale(
     age_secs >= 0 && (age_secs as u64) >= threshold_secs
 }
 
+fn inflight_state_started_at_is_stale(
+    state: &InflightTurnState,
+    now_unix_secs: i64,
+    threshold_secs: u64,
+) -> bool {
+    let Some(started_at_unix) = parse_started_at_unix(&state.started_at) else {
+        return false;
+    };
+    let age_secs = now_unix_secs.saturating_sub(started_at_unix);
+    age_secs >= 0 && (age_secs as u64) >= threshold_secs
+}
+
 /// A TUI-direct `ExternalInput` row can be born as a bridge-owned synthetic
 /// claim before the bridge tail has created the real response placeholder. If
 /// dcserver restarts in that narrow window, the tail is gone and the row has no
@@ -870,7 +882,13 @@ pub(super) fn ownerless_external_input_inflight_is_stale_at(
         && state.full_response.trim().is_empty()
         && state.last_watcher_relayed_offset.is_none()
         && !state.terminal_delivery_committed
-        && inflight_state_is_stale(state, now_unix_secs, INFLIGHT_STALENESS_THRESHOLD_SECS)
+        && (inflight_state_is_stale(state, now_unix_secs, INFLIGHT_STALENESS_THRESHOLD_SECS)
+            || (state.restart_mode.is_some()
+                && inflight_state_started_at_is_stale(
+                    state,
+                    now_unix_secs,
+                    INFLIGHT_STALENESS_THRESHOLD_SECS,
+                )))
 }
 
 pub(super) fn ownerless_external_input_inflight_is_stale(state: &InflightTurnState) -> bool {
@@ -3292,6 +3310,13 @@ mod stall_recovery_tests {
             "fresh synthetic rows still block to protect live turns"
         );
 
+        state.restart_mode = Some(InflightRestartMode::DrainRestart);
+        assert!(
+            ownerless_external_input_inflight_is_stale_at(&state, now_unix),
+            "planned-restart rows use started_at because updated_at is rewritten during boot"
+        );
+
+        state.restart_mode = None;
         state.updated_at = to_local(stale_unix);
         state.set_relay_owner_kind(RelayOwnerKind::Watcher);
         assert!(

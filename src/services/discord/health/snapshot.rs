@@ -173,11 +173,9 @@ fn rebind_origin_inflight_is_idle(mailbox_has_cancel_token: bool, rebind_origin:
 }
 
 fn ownerless_external_input_inflight_is_idle(
-    mailbox_has_cancel_token: bool,
     inflight: Option<&discord::inflight::InflightTurnState>,
 ) -> bool {
-    !mailbox_has_cancel_token
-        && inflight.is_some_and(discord::inflight::ownerless_external_input_inflight_is_stale)
+    inflight.is_some_and(discord::inflight::ownerless_external_input_inflight_is_stale)
 }
 
 fn relay_active_turn_from_inflight(
@@ -197,10 +195,11 @@ fn relay_active_turn_from_inflight(
         return RelayActiveTurn::None;
     }
 
-    // A stale bridge-owned TUI-direct synthetic row has no cancel token and no
-    // live relay owner left after a restart. It cannot finish itself, so it must
-    // not make health/recovery report `active_foreground_stream` forever.
-    if ownerless_external_input_inflight_is_idle(mailbox_has_cancel_token, inflight) {
+    // A stale bridge-owned TUI-direct synthetic row has no live relay owner left
+    // after a restart. Restart recovery can recreate a mailbox cancel token for
+    // the persisted row, but that token is not evidence that the lost bridge
+    // tail can still make progress.
+    if ownerless_external_input_inflight_is_idle(inflight) {
         return RelayActiveTurn::None;
     }
 
@@ -899,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_ownerless_external_input_inflight_is_not_foreground_without_cancel_token() {
+    fn stale_ownerless_external_input_inflight_is_not_foreground_even_with_cancel_token() {
         let now_unix = chrono::Utc::now().timestamp();
         let stale_unix = now_unix
             - (crate::services::discord::inflight::INFLIGHT_STALENESS_THRESHOLD_SECS as i64)
@@ -944,8 +943,8 @@ mod tests {
         );
         assert_eq!(
             relay_active_turn_from_inflight(true, Some(&state)),
-            RelayActiveTurn::Foreground,
-            "a cancel token is live-turn evidence even for the same row shape"
+            RelayActiveTurn::None,
+            "restart recovery can resurrect a cancel token for the stale row, but not the lost bridge tail"
         );
     }
 
