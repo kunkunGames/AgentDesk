@@ -20,7 +20,7 @@ pub(in crate::services::discord::inflight) fn inflight_state_path(
     inflight_provider_dir(root, provider).join(format!("{channel_id}.json"))
 }
 
-pub(in crate::services::discord::inflight) struct InflightStateFileLock {
+pub(crate) struct InflightStateFileLock {
     _file: fs::File,
 }
 
@@ -39,9 +39,7 @@ fn inflight_state_lock_path(path: &Path) -> PathBuf {
     path.with_extension("json.lock")
 }
 
-pub(in crate::services::discord::inflight) fn lock_inflight_state_path(
-    path: &Path,
-) -> Result<InflightStateFileLock, String> {
+pub(crate) fn lock_inflight_state_path(path: &Path) -> Result<InflightStateFileLock, String> {
     let lock_path = inflight_state_lock_path(path);
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
