@@ -88,7 +88,7 @@
 | `db::auto_queue::consultation` | `src/db/auto_queue/consultation.rs` | 112 | 112 | 0 |  |
 | `db::auto_queue::entries` | `src/db/auto_queue/entries.rs` | 1508 | 1508 | 0 | giant-file |
 | `db::auto_queue::phase_gates` | `src/db/auto_queue/phase_gates.rs` | 3116 | 1639 | 1477 | giant-file |
-| `db::auto_queue::queries` | `src/db/auto_queue/queries.rs` | 533 | 533 | 0 |  |
+| `db::auto_queue::queries` | `src/db/auto_queue/queries.rs` | 535 | 535 | 0 |  |
 | `db::auto_queue::runs` | `src/db/auto_queue/runs.rs` | 291 | 291 | 0 |  |
 | `db::auto_queue::slot_predicate` | `src/db/auto_queue/slot_predicate.rs` | 249 | 104 | 145 |  |
 | `db::auto_queue::slots` | `src/db/auto_queue/slots.rs` | 204 | 204 | 0 |  |
