@@ -180,7 +180,7 @@ async fn cancel_dispatch_and_reset_auto_queue_on_pg_tx_inner(
         Some(payload) => sqlx::query(
             "UPDATE task_dispatches
              SET status = 'cancelled',
-                 result = $1,
+                 result = CAST($1 AS jsonb),
                  updated_at = NOW(),
                  last_stuck_alert_at = NULL
              WHERE id = $2
