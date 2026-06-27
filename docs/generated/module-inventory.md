@@ -193,7 +193,7 @@
 | `manual_intervention` | `src/manual_intervention.rs` | 35 | 35 | 0 |  |
 | `pipeline` | `src/pipeline.rs` | 1500 | 1366 | 134 | giant-file |
 | `receipt` | `src/receipt.rs` | 1842 | 1842 | 0 | giant-file |
-| `reconcile` | `src/reconcile.rs` | 2911 | 1868 | 1043 | giant-file |
+| `reconcile` | `src/reconcile.rs` | 2901 | 1858 | 1043 | giant-file |
 | `runtime_layout` | `src/runtime_layout/mod.rs` | 773 | 715 | 58 |  |
 | `runtime_layout::config_merge` | `src/runtime_layout/config_merge.rs` | 602 | 602 | 0 |  |
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 | 396 | 0 |  |

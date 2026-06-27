@@ -1389,9 +1389,15 @@ async fn refire_missing_review_dispatches_pg(
     crate::pipeline::ensure_loaded();
 
     let cards: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT id, status, repo_id, assigned_agent_id
-         FROM kanban_cards
-         WHERE status NOT IN ('done', 'backlog', 'ready')",
+        "SELECT c.id, c.status, c.repo_id, c.assigned_agent_id
+         FROM kanban_cards c
+         WHERE c.status NOT IN ('done', 'backlog', 'ready')
+           AND NOT EXISTS (
+               SELECT 1 FROM task_dispatches td
+               WHERE td.kanban_card_id = c.id
+                 AND td.dispatch_type IN ('review', 'review-decision')
+                 AND td.status IN ('pending', 'dispatched')
+           )",
     )
     .fetch_all(pool)
     .await?;
@@ -1404,23 +1410,7 @@ async fn refire_missing_review_dispatches_pg(
         let is_review_state = effective.hooks_for_state(&status).map_or(false, |hooks| {
             hooks.on_enter.iter().any(|name| name == "OnReviewEnter")
         });
-        if !is_review_state {
-            continue;
-        }
-
-        let has_review_dispatch = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(
-                SELECT 1 FROM task_dispatches
-                WHERE kanban_card_id = $1
-                  AND dispatch_type IN ('review', 'review-decision')
-                  AND status IN ('pending', 'dispatched')
-            )",
-        )
-        .bind(&card_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
-        if !has_review_dispatch {
+        if is_review_state {
             candidates.push(card_id);
         }
     }
