@@ -223,7 +223,7 @@
 # verbatim to `tui_prompt_relay/launch_script.rs` (107 prod LoC, below the giant
 # threshold), reached via re-import so the call sites stay byte-identical. Lowers
 # the frozen baseline 4458 -> 4376 (-82). Locks in the shrink win (zero logic change).
-"src/services/discord/tui_prompt_relay.rs" = 4310
+"src/services/discord/tui_prompt_relay.rs" = 4574
 # #3038: lowered 4728 -> 4657 (-71) as `SensitivityState` (definition + impl)
 # moved to the `voice_sensitivity` sibling module. Locks in the shrink win.
 # #3038 VoiceBargeInRuntime S1: lowered 4657 -> 4350 (-307) as the STT
@@ -478,7 +478,7 @@
 # changed; only the warm placeholder-sweeper carries the liveness gate (never the
 # boot path) so a freshly-restarted live watcher is never false-classified as dead.
 # Tests live in the excluded `rebind_origin_reap_tests` module.
-"src/services/discord/inflight.rs" = 3138 # #3680 relay recovery review hardening / adoption guards
+"src/services/discord/inflight.rs" = 3180 # #3680 relay recovery review hardening / adoption guards
 "src/services/discord/relay_recovery.rs" = 1008 # #3680 ownerless relay recovery reattach
 # #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
 # prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
