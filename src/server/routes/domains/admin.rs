@@ -5,7 +5,7 @@ use axum::{
 
 use super::super::{
     ApiRouter, AppState, analytics, departments, escalation, home_metrics, offices,
-    protected_api_domain, receipt, settings, stats, voice_config,
+    protected_api_domain, provider_cli_api, receipt, settings, stats, voice_config,
 };
 
 // Category: admin and ops
@@ -87,7 +87,15 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/receipt", get(receipt::get_receipt))
             .route("/token-analytics", get(receipt::get_token_analytics))
             .route("/home/kpi-trends", get(home_metrics::home_kpi_trends))
-            .route("/skills-trend", get(analytics::skills_trend)),
+            .route("/skills-trend", get(analytics::skills_trend))
+            .route(
+                "/provider-cli",
+                get(provider_cli_api::get_provider_cli_status),
+            )
+            .route(
+                "/provider-cli/{provider}",
+                patch(provider_cli_api::patch_provider_cli),
+            ),
         state,
     )
 }

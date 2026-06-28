@@ -6,7 +6,7 @@ use axum::{
 use super::super::{
     ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
     health_api, idle_recap, maintenance, messages, monitoring, pipeline, prompt_manifest_retention,
-    protected_api_domain, provider_cli_api, queue_api, routines, skills_api, termination_events,
+    protected_api_domain, queue_api, routines, skills_api, termination_events,
 };
 
 // Category: dispatches, queue, and ops
@@ -324,14 +324,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/docs/{group}/{category}",
                 get(docs::api_docs_group_category),
-            )
-            .route(
-                "/provider-cli",
-                get(provider_cli_api::get_provider_cli_status),
-            )
-            .route(
-                "/provider-cli/{provider}",
-                patch(provider_cli_api::patch_provider_cli),
             ),
         state,
     )
