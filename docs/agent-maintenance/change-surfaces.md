@@ -108,7 +108,7 @@
 - legacy_modules: none.
 - do_not_edit_without_migration_plan (giant-file, awaiting split issue):
   - `src/dispatch/dispatch_context.rs` (2803 lines).
-  - `src/dispatch/dispatch_create.rs` (1385 lines).
+  - `src/dispatch/dispatch_create.rs` (1379 lines).
   - `src/dispatch/dispatch_status.rs` (1508 lines).
   - `src/services/dispatches/outbox_route.rs` (1120 lines; route extraction
     orchestration surface from #1722, split before adding non-bugfix behavior).
