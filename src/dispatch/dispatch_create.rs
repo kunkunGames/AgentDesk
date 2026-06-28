@@ -696,7 +696,6 @@ async fn create_dispatch_core_internal(
         )
         .await?
     } else {
-        let mut base = serde_json::to_string(&context_with_session_strategy)?;
         let phase_gate_sidecar = context_with_session_strategy
             .get("phase_gate")
             .and_then(|value| value.as_object())
@@ -733,8 +732,7 @@ async fn create_dispatch_core_internal(
         };
 
         if let Some((wt_path, wt_branch, managed_created)) = worktree_target
-            && let Ok(mut obj) =
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
+            && let Some(obj) = context_with_session_strategy.as_object_mut()
         {
             obj.insert("worktree_path".to_string(), json!(wt_path.clone()));
             if let Some(wt_branch) = wt_branch {
@@ -750,17 +748,14 @@ async fn create_dispatch_core_internal(
                 kanban_card_id,
                 wt_path
             );
-            base = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(base);
         }
         if dispatch_type == "review-decision"
-            && let Ok(mut obj) =
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&base)
+            && let Some(obj) = context_with_session_strategy.as_object_mut()
         {
-            inject_review_dispatch_identifiers(pg_pool, kanban_card_id, dispatch_type, &mut obj)
+            inject_review_dispatch_identifiers(pg_pool, kanban_card_id, dispatch_type, obj)
                 .await;
-            base = serde_json::to_string(&serde_json::Value::Object(obj)).unwrap_or(base);
         }
-        base
+        serde_json::to_string(&context_with_session_strategy)?
     };
     // #3605 (T2): the broader "skip kickoff" set — review-family plus inert
     // side-paths (consultation, scope-assessment). A side-path must NOT pass a
