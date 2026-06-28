@@ -56,12 +56,7 @@ deprecated_note: "Legacy architecture/config references are retained for context
 
 ## 모듈 상세
 
-드리프트가 잦은 사실값은 generated docs를 source of truth로 관리한다. 아래
-파일들은 `python3 scripts/generate_inventory_docs.py`로 갱신된다. 일반 PR의
-generated markdown freshness drift는 warning-only이며, 정기 `Regen inventory
-docs` workflow가 누적 drift를 maintenance PR로 갱신한다. 단, giant-file
-registry 불일치나 필수 metadata 누락처럼 generator가 검증하는 유지보수
-invariant 위반은 별도의 hard gate다.
+드리프트가 잦은 사실값은 generated docs를 source of truth로 관리한다. 아래 파일들은 `python3 scripts/generate_inventory_docs.py`로 갱신되며, CI가 stale 상태를 실패로 처리한다.
 
 - [Module inventory](generated/module-inventory.md)
 - [Route inventory](generated/route-inventory.md)
@@ -364,7 +359,7 @@ CREATE TABLE task_dispatches (
 -- 세션 (기존 PCD dispatched_sessions 유지)
 CREATE TABLE sessions (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_key         TEXT UNIQUE,         -- legacy host:tmux or namespaced provider/token/host:tmux
+  session_key         TEXT UNIQUE,         -- hostname:tmux-session
   agent_id            TEXT REFERENCES agents(id),
   provider            TEXT DEFAULT 'claude',
   status              TEXT DEFAULT 'disconnected',

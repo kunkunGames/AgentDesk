@@ -144,7 +144,6 @@ src/
 │   │   ├── review_automation_ops.rs
 │   │   ├── review_ops.rs
 │   │   ├── runtime_ops.rs
-│   │   ├── timeouts_ops.rs
 │   │   └── turn_ops.rs
 │   ├── hooks.rs
 │   ├── intent.rs
@@ -205,11 +204,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   ├── tuning_aggregate.rs
 │   │   │   └── verdict_route.rs
-│   │   ├── tests/
-│   │   │   ├── preflight_harness/
-│   │   │   │   ├── types.rs
-│   │   │   │   └── validation.rs
-│   │   │   └── auto_queue_preflight_harness_tests.rs
+│   │   ├── active_session_audit.rs
 │   │   ├── agents.rs
 │   │   ├── agents_crud.rs
 │   │   ├── agents_setup.rs
@@ -369,9 +364,6 @@ src/
 │   │   ├── rollout_tail.rs
 │   │   └── session.rs
 │   ├── discord/
-│   │   ├── catch_up/
-│   │   │   ├── classification.rs
-│   │   │   └── phase2.rs
 │   │   ├── commands/
 │   │   │   ├── diagnostics/
 │   │   │   │   ├── mod.rs
@@ -428,7 +420,6 @@ src/
 │   │   │   ├── budget.rs
 │   │   │   ├── finalizer_identity.rs
 │   │   │   ├── model.rs
-│   │   │   ├── rebind_reap.rs
 │   │   │   └── store.rs
 │   │   ├── outbound/
 │   │   │   ├── confirmation.rs
@@ -439,13 +430,11 @@ src/
 │   │   │   ├── message.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── policy.rs
-│   │   │   ├── reaction_control.rs
 │   │   │   ├── result.rs
 │   │   │   ├── send_api.rs
 │   │   │   ├── send_gate.rs
 │   │   │   ├── send_target.rs
 │   │   │   ├── send_to_agent.rs
-│   │   │   ├── serenity_reference.rs
 │   │   │   ├── transport.rs
 │   │   │   └── turn_output_controller.rs
 │   │   ├── placeholder_live_events/
@@ -506,7 +495,6 @@ src/
 │   │   │   ├── authorization.rs
 │   │   │   ├── dispatch_trigger.rs
 │   │   │   ├── intake_gate.rs
-│   │   │   ├── intake_queue_transaction.rs
 │   │   │   ├── message_handler.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── response_format.rs
@@ -535,8 +523,6 @@ src/
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
-│   │   ├── single_message_panel/
-│   │   │   └── completion_footer_registry.rs
 │   │   ├── tmux_watcher/
 │   │   │   ├── commit_decisions.rs
 │   │   │   ├── completion_gate.rs
@@ -567,13 +553,11 @@ src/
 │   │   │   ├── anchor_completion.rs
 │   │   │   ├── bridge_completion.rs
 │   │   │   ├── bridge_gateway.rs
-│   │   │   ├── codex_idle_rollout.rs
 │   │   │   ├── idle_offset_resolution.rs
 │   │   │   ├── idle_transcript_scan.rs
 │   │   │   ├── injected_prompt_policy.rs
 │   │   │   ├── launch_script.rs
-│   │   │   ├── rehydration.rs
-│   │   │   └── tests.rs
+│   │   │   └── rehydration.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
 │   │   │   │   ├── completion_context.rs
@@ -587,7 +571,6 @@ src/
 │   │   │   ├── chunk_compose_tests.rs
 │   │   │   ├── completion_guard.rs
 │   │   │   ├── context_window.rs
-│   │   │   ├── followup_requeue.rs
 │   │   │   ├── headless_delivery.rs
 │   │   │   ├── memory_lifecycle.rs
 │   │   │   ├── mod.rs
@@ -618,18 +601,14 @@ src/
 │   │   │   ├── delivery_lease.rs
 │   │   │   └── watcher_backstop.rs
 │   │   ├── voice_barge_in/
-│   │   │   ├── tests/
-│   │   │   │   └── pcm_harness_tests.rs
 │   │   │   ├── final_result_playback.rs
 │   │   │   ├── foreground_decision.rs
 │   │   │   ├── live_cut_playback.rs
 │   │   │   ├── progress_playback.rs
-│   │   │   ├── receive_hook.rs
 │   │   │   ├── routing.rs
 │   │   │   ├── stt.rs
 │   │   │   └── tts_pipeline.rs
 │   │   ├── watchers/
-│   │   │   ├── codex_tui_restore.rs
 │   │   │   ├── lifecycle.rs
 │   │   │   └── lifecycle_decision.rs
 │   │   ├── adk_session.rs
@@ -641,7 +620,6 @@ src/
 │   │   ├── dispatch_policy.rs
 │   │   ├── formatting.rs
 │   │   ├── gateway.rs
-│   │   ├── gateway_voice_queue.rs
 │   │   ├── health.rs
 │   │   ├── http.rs
 │   │   ├── idle_detector.rs
@@ -673,8 +651,6 @@ src/
 │   │   ├── relay_health.rs
 │   │   ├── relay_owner_observability.rs
 │   │   ├── relay_recovery.rs
-│   │   ├── relay_recovery_auto_heal_attempts.rs
-│   │   ├── relay_recovery_completion_footer.rs
 │   │   ├── replace_outcome_policy.rs
 │   │   ├── response_sanitizer.rs
 │   │   ├── restart_ctrl.rs
@@ -683,7 +659,6 @@ src/
 │   │   ├── role_map.rs
 │   │   ├── runtime_bootstrap.rs
 │   │   ├── runtime_store.rs
-│   │   ├── semantic_boundaries.rs
 │   │   ├── session_identity.rs
 │   │   ├── session_relay_sink.rs
 │   │   ├── session_runtime.rs
@@ -698,7 +673,6 @@ src/
 │   │   ├── status_panel_orphan_store.rs
 │   │   ├── steering.rs
 │   │   ├── streaming_finalizer.rs
-│   │   ├── subagent_notification_card.rs
 │   │   ├── task_supervisor.rs
 │   │   ├── terminal_ui_obligation.rs
 │   │   ├── tmux.rs
@@ -737,7 +711,6 @@ src/
 │   │   ├── outbox_queue.rs
 │   │   ├── outbox_route.rs
 │   │   ├── routing_constraint.rs
-│   │   ├── thread_reuse.rs
 │   │   └── wait_queue.rs
 │   ├── git/
 │   │   ├── branch_resolver.rs
@@ -851,11 +824,9 @@ src/
 │   ├── dispatch_watchdog.rs
 │   ├── dispatched_sessions.rs
 │   ├── dispatches_followup.rs
+│   ├── envelope_dedup.rs
 │   ├── escalation_settings.rs
 │   ├── gemini.rs
-│   ├── github_issue_creation.rs
-│   ├── health_active_session_audit.rs
-│   ├── health_diagnostics.rs
 │   ├── issue_announcements.rs
 │   ├── kanban.rs
 │   ├── kanban_cards.rs
@@ -970,7 +941,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | --- | --- |
 | `src/cli/` | Operator-facing CLI commands, direct API shims, migrations, and Discord send helpers. |
 | `src/compat/` | Centralised home for compatibility/legacy/fallback shims (#1076). Each public item carries a `REMOVE_WHEN` comment so retirement is grep-driven. |
-| `src/db/` | PostgreSQL access layer, migration helpers, and schema authority. |
+| `src/db/` | SQLite access layer and schema authority (`src/db/schema.rs`). |
 | `src/dispatch/` | Dispatch context construction, review metadata, and worktree targeting. |
 | `src/engine/` | QuickJS policy runtime, hook wiring, transition logic, and Rust-JS bridge ops. |
 | `src/github/` | GitHub sync, issue triage, and Definition-of-Done mirroring. |

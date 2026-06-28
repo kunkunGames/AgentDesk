@@ -7,7 +7,6 @@ use poise::serenity_prelude::{self as serenity, ChannelId, MessageId};
 use serde::Serialize;
 
 use crate::services::discord::relay_health::{RelayActiveTurn, RelayStallState};
-use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::discord::{self as discord, SharedData};
 use crate::services::provider::{CancelToken, ProviderKind};
 
@@ -872,7 +871,11 @@ pub async fn clear_provider_channel_runtime(
             .get(&channel_id)
             .and_then(|session| session.channel_name.as_ref())
             .map(|channel_name| provider.build_tmux_session_name(channel_name))
-            .or_else(|| session_key.and_then(tmux_name_from_session_key))
+            .or_else(|| {
+                session_key
+                    .and_then(|key| key.split_once(':'))
+                    .map(|(_, tmux_name)| tmux_name.to_string())
+            })
     };
 
     let cleared = discord::mailbox_clear_channel(&shared, &provider, channel_id).await;
@@ -2428,9 +2431,7 @@ async fn maybe_recover_completed_stale_leak(
     // Discord's 2000). For multi-chunk recovery we first consult the durable
     // per-chunk ledger. Legacy/pre-ledger retries can still derive a prefix
     // from live Discord state, then seed the ledger before continuing.
-    let chunks = discord::semantic_boundaries::add_continuation_context(
-        discord::formatting::split_message(&delivery_text),
-    );
+    let chunks = discord::formatting::split_message(&delivery_text);
     if chunks.is_empty() {
         return false;
     }
@@ -2745,8 +2746,8 @@ async fn maybe_recover_completed_stale_leak(
 
 /// #1446 — pure-helper tests for the stall-watchdog decision logic.
 /// Always-on (`#[cfg(test)]`) because the helper has no filesystem/runtime
-/// dependencies; keeping them in a removed SQLite-only gate would prevent them
-/// from running in normal `cargo test --bin agentdesk` invocations.
+/// dependencies; the legacy-sqlite-tests gate would prevent these from
+/// running in normal `cargo test --bin agentdesk` invocations.
 
 #[cfg(test)]
 mod stall_watchdog_pure_tests {

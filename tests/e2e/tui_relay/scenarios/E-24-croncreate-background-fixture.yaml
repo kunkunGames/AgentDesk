@@ -1,6 +1,5 @@
 id: E-24
 title: exact CronCreate Background relay fixture
-agent_mode: none
 cells: [claude-pipe]
 execution: fixture
 isolation: local

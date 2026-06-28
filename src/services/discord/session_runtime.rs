@@ -12,10 +12,7 @@ pub(super) struct DiscordSession {
     pub(super) history: Vec<HistoryItem>,
     pub(super) pending_uploads: Vec<String>,
     pub(super) cleared: bool,
-    /// Legacy remote profile name slot.
-    ///
-    /// Remote SSH is disabled by policy (#2193), so restored/persisted profile
-    /// names must not influence routing, path validation, or dispatch.
+    /// Remote profile name for SSH execution (None = local)
     pub(super) remote_profile_name: Option<String>,
     pub(super) channel_id: Option<u64>,
     pub(super) channel_name: Option<String>,
@@ -29,14 +26,22 @@ pub(super) struct DiscordSession {
     pub(super) born_generation: u64,
 }
 
-pub(super) fn session_path_is_usable(current_path: &str) -> bool {
-    std::path::Path::new(current_path).is_dir()
+pub(super) fn allows_nonlocal_session_path(remote_profile_name: Option<&str>) -> bool {
+    remote_profile_name.is_some_and(|name| !name.trim().is_empty())
+}
+
+pub(super) fn session_path_is_usable(
+    current_path: &str,
+    remote_profile_name: Option<&str>,
+) -> bool {
+    allows_nonlocal_session_path(remote_profile_name) || std::path::Path::new(current_path).is_dir()
 }
 
 pub(super) fn select_restored_session_path(
     configured_path: Option<String>,
     db_cwd: Option<String>,
     yaml_path: Option<String>,
+    remote_profile_name: Option<&str>,
     db_cwd_is_reusable_worktree: bool,
 ) -> Option<String> {
     // #3219: when the channel-scoped DB cwd is the channel's OWN existing managed
@@ -56,15 +61,17 @@ pub(super) fn select_restored_session_path(
     // different repo under the same `worktrees_root` — is NOT elevated and falls
     // through to the configured path below.
     if db_cwd_is_reusable_worktree
-        && let Some(worktree) = db_cwd.as_ref().filter(|path| session_path_is_usable(path))
+        && let Some(worktree) = db_cwd
+            .as_ref()
+            .filter(|path| session_path_is_usable(path, remote_profile_name))
     {
         return Some(worktree.clone());
     }
 
     configured_path
-        .filter(|path| session_path_is_usable(path))
-        .or_else(|| db_cwd.filter(|path| session_path_is_usable(path)))
-        .or_else(|| yaml_path.filter(|path| session_path_is_usable(path)))
+        .filter(|path| session_path_is_usable(path, remote_profile_name))
+        .or_else(|| db_cwd.filter(|path| session_path_is_usable(path, remote_profile_name)))
+        .or_else(|| yaml_path.filter(|path| session_path_is_usable(path, remote_profile_name)))
 }
 
 /// #3219: true when the recovered DB cwd is the channel's own reusable managed
@@ -147,7 +154,7 @@ impl DiscordSession {
     /// If the path is stale (deleted), clear `current_path` and `worktree`, log, and return `None`.
     pub(super) fn validated_path(&mut self, channel_id: impl std::fmt::Display) -> Option<String> {
         let current_path = self.current_path.as_ref()?;
-        if session_path_is_usable(current_path) {
+        if session_path_is_usable(current_path, self.remote_profile_name.as_deref()) {
             return Some(current_path.clone());
         }
         let ts = chrono::Local::now().format("%H:%M:%S");
@@ -449,7 +456,7 @@ fn worktree_is_squash_merged(
 }
 
 fn disconnect_sessions_for_worktree_path(
-    _db: Option<&crate::db::Db>,
+    db: Option<&crate::db::Db>,
     pg_pool: Option<&sqlx::PgPool>,
     worktree_path: &str,
 ) {
@@ -490,6 +497,39 @@ fn disconnect_sessions_for_worktree_path(
                 err
             ),
         }
+    }
+
+    let Some(db) = db else {
+        return;
+    };
+
+    let Ok(conn) = db.lock() else {
+        tracing::warn!(
+            "Failed to lock DB while disconnecting sessions for removed worktree {}",
+            worktree_path
+        );
+        return;
+    };
+
+    match conn.execute(
+        "UPDATE sessions
+         SET cwd = NULL,
+             status = 'disconnected',
+             active_dispatch_id = NULL,
+             claude_session_id = NULL
+         WHERE cwd = ?1",
+        [worktree_path],
+    ) {
+        Ok(updated) if updated > 0 => tracing::info!(
+            "Disconnected {updated} SQLite session(s) referencing removed worktree {}",
+            worktree_path
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            "Failed to disconnect SQLite sessions for removed worktree {}: {}",
+            worktree_path,
+            err
+        ),
     }
 }
 
@@ -653,7 +693,7 @@ pub(super) async fn auto_restore_session_force(
     let is_dm = resolve_is_dm_channel(dm_hint, is_dm);
 
     // Read settings first to get provider and runtime restore metadata.
-    let (last_path, provider) = {
+    let (last_path, saved_remote, provider) = {
         let settings = shared.settings.read().await;
         let provider = settings.provider.clone();
         let configured_path = settings::resolve_workspace(channel_id, restore_ch_name.as_deref())
@@ -665,6 +705,12 @@ pub(super) async fn auto_restore_session_force(
                     None
                 }
             });
+        let saved_remote = load_last_remote_profile(
+            shared.pg_pool.as_ref(),
+            &shared.token_hash,
+            channel_id.get(),
+        );
+
         // Use the effective tmux channel name here so restart recovery keeps
         // looking up the same session key for thread sessions that intentionally
         // use a synthetic "{parent}-t{thread_id}" channel name.
@@ -696,7 +742,7 @@ pub(super) async fn auto_restore_session_force(
         // Only a usable path is honored for install into `session.current_path`.
         let mut db_cwd: Option<String> = restored_cwd
             .map(|r| r.path)
-            .filter(|p| !p.is_empty() && session_path_is_usable(p));
+            .filter(|p| !p.is_empty() && session_path_is_usable(p, saved_remote.as_deref()));
 
         // #3216 GAP 2: reconcile the DB cwd against the live tmux pane. The live
         // pane is the source of truth for where the session actually runs; if the
@@ -713,7 +759,7 @@ pub(super) async fn auto_restore_session_force(
                 .unwrap_or(false);
             let tmux_cwd_is_usable = tmux_cwd
                 .as_deref()
-                .map(session_path_is_usable)
+                .map(|p| session_path_is_usable(p, saved_remote.as_deref()))
                 .unwrap_or(false);
             if let Some(reconciled) = reconcile_recovery_cwd(
                 db_cwd.as_deref(),
@@ -778,10 +824,11 @@ pub(super) async fn auto_restore_session_force(
             configured_path,
             db_cwd,
             persisted_path,
+            saved_remote.as_deref(),
             reusable_worktree,
         );
 
-        (last_path, provider)
+        (last_path, saved_remote, provider)
     };
 
     let mut data = shared.core.lock().await;
@@ -790,7 +837,9 @@ pub(super) async fn auto_restore_session_force(
         session.last_active = tokio::time::Instant::now();
         session.channel_name = restore_ch_name.clone();
         session.category_name = cat_name.clone();
-        session.remote_profile_name = None;
+        if session.remote_profile_name.is_none() {
+            session.remote_profile_name = saved_remote.clone();
+        }
         if session.current_path.is_some() || last_path.is_none() {
             // A pre-existing session (e.g. inserted by restart watcher
             // registration with `current_path` from `sessions.cwd` but
@@ -811,7 +860,7 @@ pub(super) async fn auto_restore_session_force(
     }
 
     if let Some(last_path) = last_path
-        && session_path_is_usable(&last_path)
+        && session_path_is_usable(&last_path, saved_remote.as_deref())
     {
         // Session ID is restored from DB (sessions.claude_session_id column)
         // which is already loaded into DiscordSession.session_id at startup.
@@ -829,7 +878,7 @@ pub(super) async fn auto_restore_session_force(
                 channel_id: Some(channel_id.get()),
                 channel_name: restore_ch_name.clone(),
                 category_name: cat_name.clone(),
-                remote_profile_name: None,
+                remote_profile_name: saved_remote.clone(),
                 last_active: tokio::time::Instant::now(),
                 worktree: None,
                 born_generation: runtime_store::load_generation(),
@@ -838,7 +887,9 @@ pub(super) async fn auto_restore_session_force(
         session.last_active = tokio::time::Instant::now();
         session.channel_name = restore_ch_name.clone();
         session.category_name = cat_name.clone();
-        session.remote_profile_name = None;
+        if session.remote_profile_name.is_none() {
+            session.remote_profile_name = saved_remote.clone();
+        }
         session.current_path = Some(last_path.clone());
         reconstruct_managed_worktree_metadata(session, &provider, channel_id, &last_path);
         drop(data);
@@ -847,7 +898,11 @@ pub(super) async fn auto_restore_session_force(
         let new_skills = scan_skills(&provider, Some(&last_path));
         *shared.skills_cache.write().await = new_skills;
         let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!("  [{ts}] ↻ Auto-restored session: {last_path}");
+        let remote_info = saved_remote
+            .as_ref()
+            .map(|n| format!(" (remote: {})", n))
+            .unwrap_or_default();
+        tracing::info!("  [{ts}] ↻ Auto-restored session: {last_path}{remote_info}");
     }
 }
 
@@ -1663,105 +1718,68 @@ mod select_restored_session_path_tests {
     //! (`db_cwd_is_reusable_worktree`, git-validated against the configured parent
     //! repo); here we verify the selector honors that decision and otherwise
     //! preserves the configured→db_cwd→yaml fallback order unchanged.
-    use super::{
-        db_cwd_is_reusable_worktree, select_restored_session_path, session_path_is_usable,
-    };
+    use super::{db_cwd_is_reusable_worktree, select_restored_session_path};
 
-    struct FixturePaths {
-        _root: tempfile::TempDir,
-        base: String,
-        wt: String,
-        yaml: String,
-    }
-
-    fn fixture_paths() -> FixturePaths {
-        let root = tempfile::tempdir().expect("temp root");
-        let base = root.path().join("workspaces").join("agentdesk");
-        let wt = root.path().join("worktrees").join("claude-adk-cc-113822");
-        let yaml = root.path().join("yaml").join("path");
-        std::fs::create_dir_all(&base).expect("base dir");
-        std::fs::create_dir_all(&wt).expect("worktree dir");
-        std::fs::create_dir_all(&yaml).expect("yaml dir");
-        FixturePaths {
-            _root: root,
-            base: base.display().to_string(),
-            wt: wt.display().to_string(),
-            yaml: yaml.display().to_string(),
-        }
-    }
+    const BASE: &str = "/repo/workspaces/agentdesk";
+    const WT: &str = "/repo/worktrees/claude-adk-cc-113822";
 
     #[test]
     fn reusable_worktree_outranks_configured_base() {
-        let paths = fixture_paths();
         let selected = select_restored_session_path(
-            Some(paths.base.clone()),
-            Some(paths.wt.clone()),
+            Some(BASE.into()),
+            Some(WT.into()),
             None,
+            // remote profile set → session_path_is_usable short-circuits true so
+            // the assertion does not depend on these paths existing on disk.
+            Some("remote"),
             true,
         );
-        assert_eq!(selected.as_deref(), Some(paths.wt.as_str()));
+        assert_eq!(selected.as_deref(), Some(WT));
     }
 
     #[test]
     fn non_reusable_db_cwd_keeps_configured_priority() {
-        let paths = fixture_paths();
         // When the caller's git validation says the worktree is NOT reusable
         // (stale/foreign/relocated/remote), configured base wins as before.
         let selected = select_restored_session_path(
-            Some(paths.base.clone()),
-            Some(paths.wt.clone()),
+            Some(BASE.into()),
+            Some(WT.into()),
             None,
+            Some("remote"),
             false,
         );
-        assert_eq!(selected.as_deref(), Some(paths.base.as_str()));
+        assert_eq!(selected.as_deref(), Some(BASE));
     }
 
     #[test]
     fn falls_back_to_db_cwd_then_yaml_when_no_configured() {
-        let paths = fixture_paths();
         // No configured path: existing fallback order is unchanged regardless of
         // the reusable flag.
         let selected = select_restored_session_path(
             None,
-            Some(paths.wt.clone()),
-            Some(paths.yaml.clone()),
+            Some(WT.into()),
+            Some("/yaml/path".into()),
+            Some("remote"),
             false,
         );
-        assert_eq!(selected.as_deref(), Some(paths.wt.as_str()));
+        assert_eq!(selected.as_deref(), Some(WT));
 
-        let selected = select_restored_session_path(None, None, Some(paths.yaml.clone()), true);
-        assert_eq!(selected.as_deref(), Some(paths.yaml.as_str()));
-    }
-
-    #[test]
-    fn legacy_remote_profile_names_do_not_bypass_local_path_validation() {
-        let missing = "/agentdesk/remote-only/path";
-        assert!(
-            !session_path_is_usable(missing),
-            "remote-profile compatibility names must not make remote-only paths usable"
-        );
         let selected = select_restored_session_path(
-            Some(missing.into()),
-            Some("~/remote-shell-cwd".into()),
             None,
+            None,
+            Some("/yaml/path".into()),
+            Some("remote"),
             true,
         );
-        assert_eq!(
-            selected, None,
-            "restored paths must be real local directories while remote SSH is disabled"
-        );
+        assert_eq!(selected.as_deref(), Some("/yaml/path"));
     }
 
     #[test]
     fn reusable_predicate_requires_configured_and_db_cwd() {
         // No git work here: a missing configured parent or missing db_cwd can
         // never be "reusable" (the full git validation only runs when both exist).
-        let paths = fixture_paths();
-        assert!(!db_cwd_is_reusable_worktree(None, Some(paths.wt.as_str())));
-        assert!(!db_cwd_is_reusable_worktree(
-            Some(paths.base.as_str()),
-            None
-        ));
+        assert!(!db_cwd_is_reusable_worktree(None, Some(WT)));
+        assert!(!db_cwd_is_reusable_worktree(Some(BASE), None));
         assert!(!db_cwd_is_reusable_worktree(None, None));
     }
 }
