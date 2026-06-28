@@ -192,6 +192,9 @@ def is_scratch_file_path(path):
         "scratchpad.sh",
         "scratchpad.txt",
         "test.sh",
+        "scratch.sql",
+        "scratchpad.sql",
+        "sql_test.rs",
         "test.sql",
         "test_scratch.rs",
     }
