@@ -319,7 +319,9 @@ fn canonical_category(category: &str) -> &'static str {
         "dispatches" | "dispatched-sessions" | "internal" | "messages" | "sessions" => "dispatches",
         "auto-queue" | "cron" | "queue" => "queue",
         "routines" => "routines",
-        "analytics" | "auth" | "cluster" | "docs" | "health" | "monitoring" | "stats" | "v1" => "ops",
+        "analytics" | "auth" | "cluster" | "docs" | "health" | "monitoring" | "stats" | "v1" => {
+            "ops"
+        }
         "discord" | "github" | "github-dashboard" | "meetings" => "integrations",
         "departments" | "memory" | "offices" | "onboarding" | "policies" | "settings"
         | "skills" | "provider-cli" => "admin",
