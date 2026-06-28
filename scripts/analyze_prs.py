@@ -193,6 +193,7 @@ def is_scratch_file_path(path):
         "scratchpad.txt",
         "test.sh",
         "test.sql",
+        "test_plan.md",
         "test_scratch.rs",
     }
     if path in root_scratch_files:
