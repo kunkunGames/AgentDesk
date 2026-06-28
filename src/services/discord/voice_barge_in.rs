@@ -2879,7 +2879,9 @@ async fn remove_file_quietly_silent(path: &Path) {
 }
 
 fn transcript_dirs_from_config(config: &VoiceConfig) -> Vec<PathBuf> {
-    vec![crate::voice::utils::expand_tilde(&config.audio.transcripts_dir)]
+    vec![crate::voice::utils::expand_tilde(
+        &config.audio.transcripts_dir,
+    )]
 }
 
 fn lock_monitor(
