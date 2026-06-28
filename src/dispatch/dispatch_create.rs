@@ -752,8 +752,7 @@ async fn create_dispatch_core_internal(
         if dispatch_type == "review-decision"
             && let Some(obj) = context_with_session_strategy.as_object_mut()
         {
-            inject_review_dispatch_identifiers(pg_pool, kanban_card_id, dispatch_type, obj)
-                .await;
+            inject_review_dispatch_identifiers(pg_pool, kanban_card_id, dispatch_type, obj).await;
         }
         serde_json::to_string(&context_with_session_strategy)?
     };
