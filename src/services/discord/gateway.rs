@@ -40,7 +40,9 @@ pub(super) trait TurnGateway: Send + Sync {
         content: &'a str,
     ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
         Box::pin(async move {
-            let chunks = formatting::split_message(content);
+            let chunks = super::semantic_boundaries::add_continuation_context(
+                formatting::split_message(content),
+            );
             if chunks.is_empty() {
                 return Ok(Vec::new());
             }
@@ -885,7 +887,9 @@ impl TurnGateway for HeadlessGateway {
         content: &'a str,
     ) -> GatewayFuture<'a, Result<Vec<MessageId>, String>> {
         Box::pin(async move {
-            let chunks = formatting::split_message(content);
+            let chunks = super::semantic_boundaries::add_continuation_context(
+                formatting::split_message(content),
+            );
             let count = chunks.len().max(1);
             Ok((0..count).map(|_| next_headless_message_id()).collect())
         })
@@ -1114,7 +1118,15 @@ mod tests {
         let sent = gateway.sent.lock().expect("sent lock");
         assert_eq!(
             sent.iter()
-                .map(|(_, chunk)| chunk.as_str())
+                .map(|(_, chunk)| {
+                    chunk
+                        .split_once('\n')
+                        .filter(|(prefix, _)| {
+                            prefix.starts_with('[') && prefix.ends_with(']') && prefix.contains('/')
+                        })
+                        .map(|(_, body)| body)
+                        .unwrap_or(chunk.as_str())
+                })
                 .collect::<String>(),
             body
         );

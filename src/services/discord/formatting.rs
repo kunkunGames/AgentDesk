@@ -301,6 +301,7 @@ pub(super) fn streaming_split_boundary(text: &str, max_len: usize) -> Option<usi
 
     let preferred = paragraph_split
         .or(newline_split)
+        .or_else(|| super::semantic_boundaries::semantic_sentence_split_boundary(window))
         .or(whitespace_split)
         .unwrap_or(safe_end);
     let split_at = if preferred < safe_end / 2 {
@@ -1249,8 +1250,12 @@ files, and memory recall below as new actionable input.\n\n\
     // `#[cfg(test)] mod` block => ZERO production LoC under the ratchet
     // (formatting.rs baseline 2802 stays unchanged).
     mod a0_characterization_tests {
+        use super::super::super::semantic_boundaries::{
+            message_split_boundary, semantic_sentence_split_boundary,
+        };
         use super::super::{
-            DISCORD_MSG_LIMIT, plan_streaming_rollover, split_message, streaming_split_boundary,
+            DISCORD_MSG_LIMIT, long_message_reply_builders, plan_streaming_rollover, split_message,
+            streaming_split_boundary,
         };
 
         // -------------------------------------------------------------------
@@ -1316,6 +1321,22 @@ files, and memory recall below as new actionable input.\n\n\
         }
 
         #[test]
+        fn a0_split_message_uses_semantic_sentence_boundary_when_no_newline_exists() {
+            let head = format!("{}확인합니다.", "a".repeat(1480));
+            let tail = format!("`NullRHI`{}", "b".repeat(1000));
+            let body = format!("{head}{tail}");
+            let chunks = split_message(&body);
+
+            assert_eq!(chunks.len(), 2);
+            assert_eq!(
+                chunks[0], head,
+                "newline-free prose should split at a sentence boundary before hard-splitting"
+            );
+            assert_eq!(chunks[1], tail);
+            assert_eq!(format!("{}{}", chunks[0], chunks[1]), body);
+        }
+
+        #[test]
         fn a0_split_message_leading_newline_does_not_emit_an_empty_chunk() {
             // Issue #1043 guard.
             let body = format!("\n{}", "a".repeat(2200));
@@ -1342,6 +1363,20 @@ files, and memory recall below as new actionable input.\n\n\
                 chunks[1].starts_with("```rust\n"),
                 "next chunk re-opens the fence with the same language tag"
             );
+        }
+
+        #[test]
+        fn a0_long_message_reply_builders_add_compact_continuation_context() {
+            let body = "a".repeat(2500);
+            let replies = long_message_reply_builders(&body);
+            assert_eq!(replies.len(), 2);
+            let first = replies[0].content.as_ref().expect("first content");
+            let second = replies[1].content.as_ref().expect("second content");
+
+            assert!(first.starts_with("[1/2]\n"));
+            assert!(second.starts_with("[2/2]\n"));
+            assert!(first.len() <= DISCORD_MSG_LIMIT);
+            assert!(second.len() <= DISCORD_MSG_LIMIT);
         }
 
         // -------------------------------------------------------------------
@@ -1423,6 +1458,62 @@ files, and memory recall below as new actionable input.\n\n\
                 streaming_split_boundary(&body, 50),
                 Some(31),
                 "single newline wins over a later space"
+            );
+        }
+
+        #[test]
+        fn a0_streaming_split_boundary_sentence_beats_a_later_space() {
+            let head = format!("{}확인합니다.", "x".repeat(20));
+            let body = format!("{}{} {}", head, "y".repeat(5), "z".repeat(100));
+            assert_eq!(
+                streaming_split_boundary(&body, 50),
+                Some(head.len()),
+                "sentence boundary wins over a later whitespace split"
+            );
+        }
+
+        #[test]
+        fn a0_semantic_sentence_split_boundary_skips_markdown_continuations_and_code_fences() {
+            assert_eq!(
+                semantic_sentence_split_boundary("확인합니다.`NullRHI`"),
+                Some("확인합니다.".len()),
+                "inline-code follow-up after Korean sentence is a readable split point"
+            );
+            assert_eq!(
+                semantic_sentence_split_boundary("Use `foo.bar` in config"),
+                None,
+                "inline code punctuation is not a sentence split point"
+            );
+            let code_window = "println!(\"done.\"); keep streaming inside fence";
+            assert_eq!(
+                message_split_boundary(code_window, code_window.len(), true),
+                (code_window.len(), "hard"),
+                "already-open code fences must not use semantic sentence splits"
+            );
+            assert_eq!(
+                semantic_sentence_split_boundary("- item. more text"),
+                None,
+                "list items keep their existing markdown continuation behavior"
+            );
+            assert_eq!(
+                semantic_sentence_split_boundary("| Col | value."),
+                None,
+                "table-like lines keep their existing markdown continuation behavior"
+            );
+            assert_eq!(
+                semantic_sentence_split_boundary("version 1.2"),
+                None,
+                "decimal points are not sentence boundaries"
+            );
+            assert_eq!(
+                semantic_sentence_split_boundary("config.yaml"),
+                None,
+                "single-token file extensions are not sentence boundaries"
+            );
+            assert_eq!(
+                semantic_sentence_split_boundary("```text\nDone.\n```"),
+                None,
+                "code-fence content must not be sentence-split"
             );
         }
 
@@ -1671,7 +1762,7 @@ pub(super) async fn send_long_message_ctx(ctx: Context<'_>, text: &str) -> Resul
         return Ok(());
     }
 
-    let chunks = split_message(text);
+    let chunks = super::semantic_boundaries::add_continuation_context(split_message(text));
     let total = chunks.len();
     for (i, chunk) in chunks.iter().enumerate() {
         tracing::debug!(
@@ -1700,7 +1791,7 @@ pub(in crate::services::discord) fn long_message_reply_builders(
         return vec![poise::CreateReply::default().content(text.to_string())];
     }
 
-    split_message(text)
+    super::semantic_boundaries::add_continuation_context(split_message(text))
         .into_iter()
         .map(|chunk| poise::CreateReply::default().content(chunk))
         .collect()
@@ -1799,7 +1890,7 @@ pub(in crate::services::discord) async fn send_long_message_raw_with_reference(
         }
     }
 
-    let chunks = split_message(text);
+    let chunks = super::semantic_boundaries::add_continuation_context(split_message(text));
     let total = chunks.len();
     // #3082 part B: hold the per-channel answer-flush barrier for the whole
     // multi-chunk send so a queued-turn notice POST cannot interleave between
@@ -1879,7 +1970,7 @@ pub(super) async fn send_long_message_raw_with_rollback(
     shared: &Arc<SharedData>,
 ) -> Result<Vec<MessageId>, Error> {
     let payload_byte_len = text.len();
-    let chunks = split_message(text);
+    let chunks = super::semantic_boundaries::add_continuation_context(split_message(text));
     let total = chunks.len();
     let rollback_key = replace_continuation_rollback_key(channel_id, rollback_anchor_msg_id);
 
@@ -2164,7 +2255,7 @@ pub(super) async fn replace_long_message_raw_with_outcome(
     shared: &Arc<SharedData>,
 ) -> Result<ReplaceLongMessageOutcome, Error> {
     let payload_byte_len = text.len();
-    let chunks = split_message(text);
+    let chunks = super::semantic_boundaries::add_continuation_context(split_message(text));
     let total = chunks.len();
     let Some(first_chunk) = chunks.first() else {
         tracing::debug!(
@@ -2928,10 +3019,8 @@ pub(super) fn split_message(text: &str) -> Vec<String> {
         // back to a hard split at `safe_end` (or skip the orphan newline when
         // `safe_end` is also 0 due to a multi-byte char on the boundary).
         let safe_end = floor_char_boundary(remaining, effective_limit);
-        let (mut split_at, mut boundary_kind) = match remaining[..safe_end].rfind('\n') {
-            Some(idx) => (idx, "newline"),
-            None => (safe_end, "hard"),
-        };
+        let (mut split_at, mut boundary_kind) =
+            super::semantic_boundaries::message_split_boundary(remaining, safe_end, in_code_block);
         if split_at == 0 {
             if safe_end > 0 {
                 split_at = safe_end;
