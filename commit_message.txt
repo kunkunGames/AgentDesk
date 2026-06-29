@@ -1,0 +1,18 @@
+Extract analytics route domain from overloaded admin module
+
+- **What changed**: Extracted analytics, stats, and achievements routes from `src/server/routes/domains/admin.rs` into a dedicated `src/server/routes/domains/analytics.rs` module. Updated Axum router merging and inventory documentation.
+- **Why**: To enforce a clear domain ownership boundary. The `admin` module was overloaded with observability and reporting routes. Extracting these into an `analytics` module makes route registration and configuration responsibility easier to reason about.
+- **WorkFingerprint**:
+  - Agent Name: DomainKeeper
+  - Category Boundary: `src/server/routes/domains/**`
+  - Primary Files: `src/server/routes/domains/admin.rs`, `src/server/routes/domains/analytics.rs`, `src/server/routes/domains/mod.rs`, `src/server/routes/mod.rs`
+  - Invariant Protected: Public API paths, auth middlewares, and response behavior remain identical (no functional regressions).
+  - Docs Impact: Updated generated route and module inventory docs via `scripts/generate_inventory_docs.py`.
+- **Duplicate/Overlap Check**: Run `git branch -a` and verified there are no overlapping open PRs related to `analytics` extraction or route refactoring in the `domains` module.
+- **Verification Commands and Results**:
+  - `git diff --check`: Clean.
+  - `cargo check --package agentdesk --lib`: Compiled successfully without errors.
+  - `python3 scripts/generate_inventory_docs.py`: Successfully regenerated `ARCHITECTURE.md` and `docs/generated/` inventories to match the new files.
+- **Skipped Checks**: `./scripts/verify-dashboard.sh` and `npm run test:policies` were skipped because this PR is scoped strictly to backend Axum route registration boundaries and introduces no frontend or policy changes.
+- **Risk**: Low. This is a behavior-preserving refactor to route registration boundaries. All routes remain wrapped in the same `protected_api_domain` middleware.
+- **Rollback Notes**: Revert this commit if the dashboard or CLI unexpectedly fails to reach any of the `/api/analytics/*` or `/api/stats/*` endpoints.

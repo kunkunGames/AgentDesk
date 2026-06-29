@@ -528,7 +528,8 @@ fn compose_api_router(state: AppState) -> ApiRouter {
         .merge(domains::ops::router(state.clone()))
         .merge(domains::integrations::router(state.clone()))
         .merge(v1::router(state.clone()))
-        .merge(domains::admin::router(state))
+        .merge(domains::admin::router(state.clone()))
+        .merge(domains::analytics::router(state))
 }
 
 pub(super) fn public_api_domain(router: ApiRouter) -> ApiRouter {
