@@ -889,6 +889,7 @@ mod tests {
         let marker = crate::services::codex_tui::session::CodexTuiRolloutMarker {
             rollout_path: rollout_path.clone(),
             session_id: Some("sess-1".to_string()),
+            rollout_start_offset: None,
         };
 
         assert_eq!(
@@ -912,14 +913,17 @@ mod tests {
         let stale_marker = crate::services::codex_tui::session::CodexTuiRolloutMarker {
             rollout_path: dir.path().join("deleted-rollout.jsonl"),
             session_id: Some("stale".to_string()),
+            rollout_start_offset: None,
         };
         let duplicate_marker = crate::services::codex_tui::session::CodexTuiRolloutMarker {
             rollout_path: existing_rollout_path.clone(),
             session_id: Some("duplicate".to_string()),
+            rollout_start_offset: None,
         };
         let claimed_marker = crate::services::codex_tui::session::CodexTuiRolloutMarker {
             rollout_path: existing_rollout_path.clone(),
             session_id: Some("claimed".to_string()),
+            rollout_start_offset: None,
         };
         let mut duplicate_marker_paths = HashSet::new();
         duplicate_marker_paths.insert(canonical_rollout_claim_path(&existing_rollout_path));

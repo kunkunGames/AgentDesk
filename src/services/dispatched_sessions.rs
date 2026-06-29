@@ -1580,6 +1580,9 @@ mod kill_tmux_resume_tests {
 
     #[test]
     fn latest_runtime_activity_uses_codex_tui_rollout_marker_target() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let tmux = format!("AgentDesk-codex-runtime-{}", uuid::Uuid::new_v4());
         let dir = tempfile::tempdir().expect("tempdir");
         let rollout = dir.path().join("rollout.jsonl");

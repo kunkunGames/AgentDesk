@@ -209,6 +209,7 @@ fn tail_latest_rollout_for_cwd_with_handoff_options(
         options.tmux_session_name.as_deref(),
         &rollout_path,
         rollout_session_id.as_deref(),
+        Some(0),
     );
     tail_rollout_file_until_assistant_response(
         &rollout_path,
@@ -385,6 +386,7 @@ fn tail_resumed_rollout_for_session_with_handoff_options(
         options.tmux_session_name.as_deref(),
         &rollout_path,
         Some(session_id),
+        Some(start_offset),
     );
     let known_session_id = (start_offset > 0).then(|| session_id.to_string());
     tail_rollout_file_until_assistant_response(
@@ -415,15 +417,19 @@ fn persist_codex_tui_rollout_marker(
     tmux_session_name: Option<&str>,
     rollout_path: &Path,
     session_id: Option<&str>,
+    rollout_start_offset: Option<u64>,
 ) {
     let Some(tmux_session_name) = tmux_session_name else {
         return;
     };
-    if let Err(error) = crate::services::codex_tui::session::write_codex_tui_rollout_marker(
-        tmux_session_name,
-        rollout_path,
-        session_id,
-    ) {
+    if let Err(error) =
+        crate::services::codex_tui::session::write_codex_tui_rollout_marker_with_start_offset(
+            tmux_session_name,
+            rollout_path,
+            session_id,
+            rollout_start_offset,
+        )
+    {
         tracing::warn!(
             tmux_session_name,
             rollout_path = %rollout_path.display(),

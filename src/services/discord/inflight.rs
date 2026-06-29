@@ -1156,11 +1156,61 @@ pub(in crate::services::discord) fn save_existing_inflight_rebind_adoption_if_ma
     )
 }
 
+pub(in crate::services::discord) fn save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity(
+    state: &InflightTurnState,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    expected_last_offset: u64,
+) -> GuardedSaveOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+        &root,
+        state,
+        expected,
+        expected_turn_start_offset,
+        expected_last_offset,
+    )
+}
+
 fn save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
     root: &Path,
     state: &InflightTurnState,
     expected: &InflightTurnIdentity,
     expected_turn_start_offset: Option<u64>,
+) -> GuardedSaveOutcome {
+    save_existing_inflight_rebind_adoption_impl_in_root(
+        root,
+        state,
+        expected,
+        expected_turn_start_offset,
+        None,
+    )
+}
+
+fn save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    expected_last_offset: u64,
+) -> GuardedSaveOutcome {
+    save_existing_inflight_rebind_adoption_impl_in_root(
+        root,
+        state,
+        expected,
+        expected_turn_start_offset,
+        Some(expected_last_offset),
+    )
+}
+
+fn save_existing_inflight_rebind_adoption_impl_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    expected_last_offset_for_rebase: Option<u64>,
 ) -> GuardedSaveOutcome {
     let Some(provider) = state.provider_kind() else {
         return GuardedSaveOutcome::IoError;
@@ -1194,12 +1244,24 @@ fn save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
             return GuardedSaveOutcome::IdentityMismatch;
         }
     }
+    if expected_last_offset_for_rebase
+        .is_some_and(|expected_last| on_disk.last_offset != expected_last)
+    {
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
 
     let mut updated = on_disk;
     updated.tmux_session_name = state.tmux_session_name.clone();
     updated.output_path = state.output_path.clone();
     updated.input_fifo_path = state.input_fifo_path.clone();
     updated.set_relay_owner_kind(state.effective_relay_owner_kind());
+    if expected_last_offset_for_rebase.is_some() {
+        updated.last_offset = state.last_offset;
+        updated.turn_start_offset = state.turn_start_offset;
+        updated.last_watcher_relayed_offset = state.last_watcher_relayed_offset;
+        updated.last_watcher_relayed_generation_mtime_ns =
+            state.last_watcher_relayed_generation_mtime_ns;
+    }
     updated.ensure_finalizer_turn_id();
     let _ = validate_inflight_state_for_save(
         root,
@@ -1682,6 +1744,19 @@ pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity(
     clear_inflight_state_if_matches_identity_in_root(&root, provider, channel_id, expected)
 }
 
+pub(in crate::services::discord) fn clear_rebind_origin_inflight_state_if_matches_identity(
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+        &root, provider, channel_id, expected,
+    )
+}
+
 pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity_after_delivery(
     provider: &ProviderKind,
     channel_id: u64,
@@ -1913,6 +1988,47 @@ fn clear_inflight_state_if_matches_identity_in_root(
                 expected_user_msg_id = expected.user_msg_id,
                 error = %error,
                 "inflight identity-guarded clear remove_file failed; treating as IoError so sweeper retries"
+            );
+            GuardedClearOutcome::IoError
+        }
+    }
+}
+
+fn clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+) -> GuardedClearOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedClearOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
+        return GuardedClearOutcome::Missing;
+    };
+    if state.restart_mode.is_some() {
+        return GuardedClearOutcome::PlannedRestartSkipped;
+    }
+    if !state.rebind_origin {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    if !expected.matches_state(&state) {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => GuardedClearOutcome::Cleared,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GuardedClearOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                expected_user_msg_id = expected.user_msg_id,
+                error = %error,
+                "rebind-origin inflight guarded-clear remove_file failed; treating as IoError so sweeper retries"
             );
             GuardedClearOutcome::IoError
         }
@@ -3022,8 +3138,9 @@ mod stall_recovery_tests {
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
-        clear_inflight_state_if_matches_zero_owned_in_root, clear_status_panel_if_current_in_root,
-        commit_watcher_terminal_delivery_locked_in_root,
+        clear_inflight_state_if_matches_zero_owned_in_root,
+        clear_rebind_origin_inflight_state_if_matches_identity_in_root,
+        clear_status_panel_if_current_in_root, commit_watcher_terminal_delivery_locked_in_root,
         inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
         load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
         offset_monotonic_invariant_severity, ownerless_external_input_inflight_is_stale_at,
@@ -3031,6 +3148,7 @@ mod stall_recovery_tests {
         persist_watcher_stream_progress_locked_in_root,
         refresh_inflight_last_offset_if_matches_identity_in_root,
         save_existing_inflight_rebind_adoption_if_matches_identity_in_root,
+        save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root,
         save_inflight_state_if_matches_identity_in_root, save_inflight_state_in_root,
         validate_inflight_state_for_save,
     };
@@ -5876,6 +5994,201 @@ mod stall_recovery_tests {
         assert_eq!(rows[0].last_offset, 4096);
         assert_eq!(rows[0].last_watcher_relayed_offset, Some(2048));
         assert_eq!(rows[0].full_response, "newer streamed text");
+    }
+
+    #[test]
+    fn existing_rebind_adoption_with_offset_rebase_persists_normalized_cursor_base() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut on_disk = build_inflight_for_guard_tests(ProviderKind::Codex, 324, 777);
+        on_disk.user_msg_id = 777;
+        on_disk.current_msg_id = 778;
+        on_disk.set_restart_mode(InflightRestartMode::DrainRestart);
+        on_disk.output_path = Some("/tmp/raw-rollout.jsonl".to_string());
+        on_disk.last_offset = 4096;
+        on_disk.turn_start_offset = Some(1024);
+        on_disk.last_watcher_relayed_offset = Some(2048);
+        on_disk.last_watcher_relayed_generation_mtime_ns = Some(9);
+        on_disk.full_response = "already relayed text".to_string();
+        save_inflight_state_in_root(temp.path(), &on_disk).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&on_disk);
+        let mut adopted = on_disk.clone();
+        adopted.tmux_session_name = Some("AgentDesk-codex-adk-restored".to_string());
+        adopted.output_path = Some("/tmp/normalized-rebind.jsonl".to_string());
+        adopted.input_fifo_path = None;
+        adopted.last_offset = 0;
+        adopted.turn_start_offset = Some(0);
+        adopted.last_watcher_relayed_offset = None;
+        adopted.last_watcher_relayed_generation_mtime_ns = None;
+        adopted.set_relay_owner_kind(RelayOwnerKind::Watcher);
+
+        let outcome =
+            save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+                temp.path(),
+                &adopted,
+                &expected,
+                on_disk.turn_start_offset,
+                on_disk.last_offset,
+            );
+
+        assert_eq!(outcome, GuardedSaveOutcome::Saved);
+        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].tmux_session_name.as_deref(),
+            Some("AgentDesk-codex-adk-restored")
+        );
+        assert_eq!(
+            rows[0].output_path.as_deref(),
+            Some("/tmp/normalized-rebind.jsonl")
+        );
+        assert_eq!(rows[0].last_offset, 0);
+        assert_eq!(rows[0].turn_start_offset, Some(0));
+        assert_eq!(rows[0].last_watcher_relayed_offset, None);
+        assert_eq!(rows[0].last_watcher_relayed_generation_mtime_ns, None);
+        assert_eq!(rows[0].full_response, "already relayed text");
+        assert_eq!(
+            rows[0].effective_relay_owner_kind(),
+            RelayOwnerKind::Watcher
+        );
+    }
+
+    #[test]
+    fn existing_rebind_adoption_with_offset_rebase_rejects_progressed_raw_cursor() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut on_disk = build_inflight_for_guard_tests(ProviderKind::Codex, 325, 777);
+        on_disk.user_msg_id = 777;
+        on_disk.current_msg_id = 778;
+        on_disk.output_path = Some("/tmp/raw-rollout.jsonl".to_string());
+        on_disk.last_offset = 4096;
+        on_disk.turn_start_offset = Some(1024);
+        save_inflight_state_in_root(temp.path(), &on_disk).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&on_disk);
+        let mut adopted = on_disk.clone();
+        adopted.tmux_session_name = Some("AgentDesk-codex-adk-restored".to_string());
+        adopted.output_path = Some("/tmp/normalized-rebind.jsonl".to_string());
+        adopted.last_offset = 0;
+        adopted.turn_start_offset = Some(0);
+        adopted.set_relay_owner_kind(RelayOwnerKind::Watcher);
+
+        let mut progressed = on_disk.clone();
+        progressed.last_offset = 8192;
+        progressed.last_watcher_relayed_offset = Some(6144);
+        save_inflight_state_in_root(temp.path(), &progressed).unwrap();
+
+        let outcome =
+            save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+                temp.path(),
+                &adopted,
+                &expected,
+                on_disk.turn_start_offset,
+                on_disk.last_offset,
+            );
+
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].output_path.as_deref(),
+            Some("/tmp/raw-rollout.jsonl")
+        );
+        assert_eq!(rows[0].last_offset, 8192);
+        assert_eq!(rows[0].turn_start_offset, Some(1024));
+        assert_eq!(rows[0].last_watcher_relayed_offset, Some(6144));
+        assert_eq!(rows[0].effective_relay_owner_kind(), RelayOwnerKind::None);
+    }
+
+    #[test]
+    fn clear_rebind_origin_identity_clears_matching_synthetic_row() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 326, 0);
+        state.current_msg_id = 0;
+        state.rebind_origin = true;
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&state);
+        let outcome = clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            state.channel_id,
+            &expected,
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::Cleared);
+        assert!(load_inflight_states_from_root(temp.path(), &ProviderKind::Codex).is_empty());
+    }
+
+    #[test]
+    fn clear_rebind_origin_identity_preserves_non_rebind_turn() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 327, 0);
+        state.current_msg_id = 0;
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&state);
+        let outcome = clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            state.channel_id,
+            &expected,
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        assert_eq!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Codex).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn clear_rebind_origin_identity_preserves_mismatched_synthetic_row() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 328, 0);
+        state.current_msg_id = 0;
+        state.rebind_origin = true;
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let mut expected = InflightTurnIdentity::from_state(&state);
+        expected.turn_start_offset = Some(99);
+        let outcome = clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            state.channel_id,
+            &expected,
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        assert_eq!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Codex).len(),
+            1
+        );
     }
 
     #[test]

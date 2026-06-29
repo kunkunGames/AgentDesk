@@ -967,6 +967,43 @@ impl TmuxWatcherRegistry {
         self.remove_tmux_session_locked(&guard, tmux_session_name)
     }
 
+    pub(super) fn cancel_and_remove_channel_if_current(
+        &self,
+        channel_id: &ChannelId,
+        expected_tmux_session_name: &str,
+        expected_output_path: &str,
+        expected_cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        let guard = lock_tmux_watcher_registry();
+        let Some(tmux_session_name) = self
+            .tmux_session_by_channel
+            .get(channel_id)
+            .map(|entry| entry.clone())
+        else {
+            return false;
+        };
+        if tmux_session_name != expected_tmux_session_name {
+            return false;
+        }
+        let matches_current = self
+            .by_tmux_session
+            .get(&tmux_session_name)
+            .is_some_and(|entry| {
+                entry.output_path == expected_output_path
+                    && Arc::ptr_eq(&entry.cancel, expected_cancel)
+            });
+        if !matches_current {
+            return false;
+        }
+        let Some((_, handle)) = self.remove_locked(&guard, channel_id) else {
+            return false;
+        };
+        handle
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     pub(super) fn iter(&self) -> dashmap::iter::Iter<'_, String, TmuxWatcherHandle> {
         self.by_tmux_session.iter()
     }
@@ -1216,6 +1253,38 @@ mod tmux_watcher_registry_restore_tests {
         registry.restore_owner_channel_for_tmux_session(tmux, channel);
         registry.clear_restored_owner_for_tmux_session(tmux);
         assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
+    }
+
+    #[test]
+    fn cancel_and_remove_channel_if_current_only_rolls_back_matching_claim() {
+        let registry = TmuxWatcherRegistry::new();
+        let tmux = "AgentDesk-codex-adk-cdx";
+        let channel = ChannelId::new(1_504_468_805_772_902_471);
+        let handle = live_watcher_handle(tmux);
+        let expected_output_path = handle.output_path.clone();
+        let expected_cancel = handle.cancel.clone();
+        registry.insert(channel, handle);
+
+        assert!(
+            !registry.cancel_and_remove_channel_if_current(
+                &channel,
+                tmux,
+                "/tmp/different.jsonl",
+                &expected_cancel
+            ),
+            "output-path mismatch must not remove a possibly newer watcher"
+        );
+        assert_eq!(registry.owner_channel_for_tmux_session(tmux), Some(channel));
+        assert!(!expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+        assert!(registry.cancel_and_remove_channel_if_current(
+            &channel,
+            tmux,
+            &expected_output_path,
+            &expected_cancel
+        ));
+        assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
+        assert!(expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 

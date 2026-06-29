@@ -1478,7 +1478,138 @@ fn watcher_should_yield_to_inflight_state(
     }
 
     let turn_start_offset = state.turn_start_offset.unwrap_or(state.last_offset);
-    data_start_offset <= turn_start_offset && turn_start_offset < current_offset
+    let range_intersects_turn =
+        data_start_offset <= turn_start_offset && turn_start_offset < current_offset;
+    if !range_intersects_turn {
+        return false;
+    }
+
+    // After a planned dcserver restart the old bridge owner is gone. If the
+    // terminal body has not been durably committed, yielding here black-holes the
+    // recovered watcher output instead of preventing a duplicate.
+    if state.restart_mode.is_some() && !state.terminal_delivery_committed {
+        return false;
+    }
+
+    true
+}
+
+#[cfg(test)]
+mod active_bridge_turn_guard_tests {
+    use super::watcher_should_yield_to_inflight_state;
+    use crate::services::discord::InflightRestartMode;
+    use crate::services::discord::inflight::{InflightTurnState, RelayOwnerKind};
+    use crate::services::provider::ProviderKind;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn with_ownerless_codex_tui_state(test: impl FnOnce(InflightTurnState)) {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _root = EnvGuard::set_path("AGENTDESK_ROOT_DIR", tmp.path());
+
+        let mut state = InflightTurnState::new(
+            ProviderKind::Codex,
+            1_479_671_301_387_059_200,
+            Some("adk-cdx".to_string()),
+            343_742_347_365_974_026,
+            1_520_972_895_491_325_952,
+            1_520_975_526_431_424_663,
+            "deploy release".to_string(),
+            Some("019f10e3-3dad-73c2-9d8c-e6188e4ccc7c".to_string()),
+            Some("AgentDesk-codex-adk-cdx".to_string()),
+            Some("/tmp/codex-rollout.jsonl".to_string()),
+            None,
+            0,
+        );
+        state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui);
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::None);
+
+        test(state);
+    }
+
+    #[test]
+    fn planned_restart_ownerless_uncommitted_turn_does_not_yield_to_dead_bridge() {
+        with_ownerless_codex_tui_state(|mut state| {
+            state.set_restart_mode(InflightRestartMode::DrainRestart);
+
+            assert!(
+                !watcher_should_yield_to_inflight_state(
+                    Some(&state),
+                    "AgentDesk-codex-adk-cdx",
+                    0,
+                    2_019_364,
+                ),
+                "restore_inflight watcher must deliver when no terminal delivery was committed"
+            );
+        });
+    }
+
+    #[test]
+    fn ownerless_ordinary_turn_still_yields_to_active_bridge() {
+        with_ownerless_codex_tui_state(|state| {
+            assert!(watcher_should_yield_to_inflight_state(
+                Some(&state),
+                "AgentDesk-codex-adk-cdx",
+                0,
+                2_019_364,
+            ));
+        });
+    }
+
+    #[test]
+    fn planned_restart_after_terminal_commit_may_still_yield_as_duplicate() {
+        with_ownerless_codex_tui_state(|mut state| {
+            state.set_restart_mode(InflightRestartMode::DrainRestart);
+            state.terminal_delivery_committed = true;
+
+            assert!(watcher_should_yield_to_inflight_state(
+                Some(&state),
+                "AgentDesk-codex-adk-cdx",
+                0,
+                2_019_364,
+            ));
+        });
+    }
+
+    #[test]
+    fn session_bound_relay_owner_still_suppresses_watcher_duplicate() {
+        with_ownerless_codex_tui_state(|mut state| {
+            state.set_relay_owner_kind(RelayOwnerKind::SessionBoundRelay);
+
+            assert!(watcher_should_yield_to_inflight_state(
+                Some(&state),
+                "AgentDesk-codex-adk-cdx",
+                0,
+                2_019_364,
+            ));
+        });
+    }
 }
 
 async fn reconcile_orphan_suppressed_placeholder_for_restored_watcher(
