@@ -86,6 +86,7 @@ pub(in crate::services::discord) mod task_supervisor;
 mod terminal_ui_obligation;
 #[cfg(unix)]
 mod tmux;
+pub(in crate::services::discord) mod turn_end_wip_warning;
 #[cfg(unix)]
 pub(crate) use tmux::write_spawn_nonce;
 #[cfg(unix)]
@@ -133,10 +134,8 @@ pub(crate) use router::HeadlessTurnStartError;
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
 // #3038 S4: re-export the live-placeholder cluster type so `SharedData`
 // declarations/constructors keep the S1/S2/S3 unqualified surface.
-pub(in crate::services::discord) use shared_state::PlaceholderState;
-pub(in crate::services::discord) use shared_state::PolicyRuntime;
-pub(in crate::services::discord) use shared_state::QueuedPlaceholderState;
-pub(in crate::services::discord) use shared_state::RuntimeHttpCache;
+pub(in crate::services::discord) use shared_state::{PlaceholderState, PolicyRuntime};
+pub(in crate::services::discord) use shared_state::{QueuedPlaceholderState, RuntimeHttpCache};
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
 // to `crate::services`), so the group type is re-exported with that same scope.
 pub(in crate::services) use shared_state::SessionOverrideState;
@@ -968,6 +967,43 @@ impl TmuxWatcherRegistry {
         self.remove_tmux_session_locked(&guard, tmux_session_name)
     }
 
+    pub(super) fn cancel_and_remove_channel_if_current(
+        &self,
+        channel_id: &ChannelId,
+        expected_tmux_session_name: &str,
+        expected_output_path: &str,
+        expected_cancel: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        let guard = lock_tmux_watcher_registry();
+        let Some(tmux_session_name) = self
+            .tmux_session_by_channel
+            .get(channel_id)
+            .map(|entry| entry.clone())
+        else {
+            return false;
+        };
+        if tmux_session_name != expected_tmux_session_name {
+            return false;
+        }
+        let matches_current = self
+            .by_tmux_session
+            .get(&tmux_session_name)
+            .is_some_and(|entry| {
+                entry.output_path == expected_output_path
+                    && Arc::ptr_eq(&entry.cancel, expected_cancel)
+            });
+        if !matches_current {
+            return false;
+        }
+        let Some((_, handle)) = self.remove_locked(&guard, channel_id) else {
+            return false;
+        };
+        handle
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
     pub(super) fn iter(&self) -> dashmap::iter::Iter<'_, String, TmuxWatcherHandle> {
         self.by_tmux_session.iter()
     }
@@ -1217,6 +1253,38 @@ mod tmux_watcher_registry_restore_tests {
         registry.restore_owner_channel_for_tmux_session(tmux, channel);
         registry.clear_restored_owner_for_tmux_session(tmux);
         assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
+    }
+
+    #[test]
+    fn cancel_and_remove_channel_if_current_only_rolls_back_matching_claim() {
+        let registry = TmuxWatcherRegistry::new();
+        let tmux = "AgentDesk-codex-adk-cdx";
+        let channel = ChannelId::new(1_504_468_805_772_902_471);
+        let handle = live_watcher_handle(tmux);
+        let expected_output_path = handle.output_path.clone();
+        let expected_cancel = handle.cancel.clone();
+        registry.insert(channel, handle);
+
+        assert!(
+            !registry.cancel_and_remove_channel_if_current(
+                &channel,
+                tmux,
+                "/tmp/different.jsonl",
+                &expected_cancel
+            ),
+            "output-path mismatch must not remove a possibly newer watcher"
+        );
+        assert_eq!(registry.owner_channel_for_tmux_session(tmux), Some(channel));
+        assert!(!expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
+
+        assert!(registry.cancel_and_remove_channel_if_current(
+            &channel,
+            tmux,
+            &expected_output_path,
+            &expected_cancel
+        ));
+        assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
+        assert!(expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 
@@ -3067,7 +3135,7 @@ pub(in crate::services::discord) async fn drain_pending_queue_exit_placeholder_c
     (deleted, failed)
 }
 
-async fn enqueue_internal_followup(
+pub(in crate::services::discord) async fn enqueue_internal_followup(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,

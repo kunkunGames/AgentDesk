@@ -37,6 +37,7 @@ impl CodexTuiSessionFiles {
 pub struct CodexTuiRolloutMarker {
     pub rollout_path: PathBuf,
     pub session_id: Option<String>,
+    pub rollout_start_offset: Option<u64>,
 }
 
 pub fn write_codex_tui_rollout_marker(
@@ -44,10 +45,29 @@ pub fn write_codex_tui_rollout_marker(
     rollout_path: &Path,
     session_id: Option<&str>,
 ) -> Result<(), String> {
+    write_codex_tui_rollout_marker_with_start_offset(
+        tmux_session_name,
+        rollout_path,
+        session_id,
+        None,
+    )
+}
+
+pub fn write_codex_tui_rollout_marker_with_start_offset(
+    tmux_session_name: &str,
+    rollout_path: &Path,
+    session_id: Option<&str>,
+    rollout_start_offset: Option<u64>,
+) -> Result<(), String> {
     let tmux_session_name = tmux_session_name.trim();
     if tmux_session_name.is_empty() {
         return Ok(());
     }
+    let rollout_start_offset = preserved_rollout_start_offset_for_marker(
+        tmux_session_name,
+        rollout_path,
+        rollout_start_offset,
+    );
     let path = crate::services::tmux_common::session_temp_path(
         tmux_session_name,
         crate::services::tmux_common::CODEX_TUI_ROLLOUT_MARKER_TEMP_EXT,
@@ -57,9 +77,47 @@ pub fn write_codex_tui_rollout_marker(
         "session_id": session_id
             .map(str::trim)
             .filter(|value| !value.is_empty()),
+        "rollout_start_offset": rollout_start_offset,
     });
     std::fs::write(&path, format!("{value}\n"))
         .map_err(|error| format!("failed to write Codex TUI rollout marker: {error}"))
+}
+
+pub fn advance_codex_tui_rollout_marker_start_offset(
+    tmux_session_name: &str,
+    rollout_path: &Path,
+    rollout_start_offset: u64,
+) -> Result<(), String> {
+    let existing_session_id = read_codex_tui_rollout_marker(tmux_session_name)
+        .filter(|marker| codex_tui_rollout_paths_same(&marker.rollout_path, rollout_path))
+        .and_then(|marker| marker.session_id);
+    write_codex_tui_rollout_marker_with_start_offset(
+        tmux_session_name,
+        rollout_path,
+        existing_session_id.as_deref(),
+        Some(rollout_start_offset),
+    )
+}
+
+fn preserved_rollout_start_offset_for_marker(
+    tmux_session_name: &str,
+    rollout_path: &Path,
+    rollout_start_offset: Option<u64>,
+) -> Option<u64> {
+    let existing = read_codex_tui_rollout_marker(tmux_session_name)
+        .filter(|marker| codex_tui_rollout_paths_same(&marker.rollout_path, rollout_path))
+        .and_then(|marker| marker.rollout_start_offset);
+    match (existing, rollout_start_offset) {
+        (Some(existing), Some(current)) => Some(existing.max(current)),
+        (Some(existing), None) => Some(existing),
+        (None, current) => current,
+    }
+}
+
+fn codex_tui_rollout_paths_same(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 pub fn read_codex_tui_rollout_marker(tmux_session_name: &str) -> Option<CodexTuiRolloutMarker> {
@@ -85,9 +143,11 @@ pub fn read_codex_tui_rollout_marker(tmux_session_name: &str) -> Option<CodexTui
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let rollout_start_offset = value.get("rollout_start_offset").and_then(Value::as_u64);
     Some(CodexTuiRolloutMarker {
         rollout_path,
         session_id,
+        rollout_start_offset,
     })
 }
 
@@ -257,9 +317,7 @@ fn matching_rollout_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use std::sync::MutexGuard;
 
     struct EnvRestore {
         previous_root: Option<std::ffi::OsString>,
@@ -334,7 +392,7 @@ mod tests {
     }
 
     fn lock_test_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK
+        crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -392,6 +450,139 @@ mod tests {
             Some(CodexTuiRolloutMarker {
                 rollout_path,
                 session_id: Some("sess-1".to_string()),
+                rollout_start_offset: None,
+            })
+        );
+    }
+
+    #[test]
+    fn codex_tui_rollout_marker_round_trips_start_offset() {
+        let _lock = lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _env =
+            EnvRestore::set_agentdesk_root_and_host(dir.path(), "codex-tui-marker-offset-host");
+        let rollout_path = dir.path().join("rollout-session.jsonl");
+        std::fs::write(&rollout_path, "{}\n").unwrap();
+
+        write_codex_tui_rollout_marker_with_start_offset(
+            "AgentDesk-codex-marker-offset",
+            &rollout_path,
+            Some("sess-2"),
+            Some(42),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_codex_tui_rollout_marker("AgentDesk-codex-marker-offset"),
+            Some(CodexTuiRolloutMarker {
+                rollout_path,
+                session_id: Some("sess-2".to_string()),
+                rollout_start_offset: Some(42),
+            })
+        );
+    }
+
+    #[test]
+    fn codex_tui_rollout_marker_plain_refresh_preserves_start_offset() {
+        let _lock = lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _env =
+            EnvRestore::set_agentdesk_root_and_host(dir.path(), "codex-tui-marker-refresh-host");
+        let rollout_path = dir.path().join("rollout-session.jsonl");
+        std::fs::write(&rollout_path, "{}\n").unwrap();
+
+        write_codex_tui_rollout_marker_with_start_offset(
+            "AgentDesk-codex-marker-refresh",
+            &rollout_path,
+            Some("sess-3"),
+            Some(42),
+        )
+        .unwrap();
+        write_codex_tui_rollout_marker(
+            "AgentDesk-codex-marker-refresh",
+            &rollout_path,
+            Some("sess-3"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_codex_tui_rollout_marker("AgentDesk-codex-marker-refresh")
+                .and_then(|marker| marker.rollout_start_offset),
+            Some(42),
+            "plain marker refresh must not erase the durable raw replay cursor"
+        );
+    }
+
+    #[test]
+    fn codex_tui_rollout_marker_keeps_start_offset_monotonic() {
+        let _lock = lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _env =
+            EnvRestore::set_agentdesk_root_and_host(dir.path(), "codex-tui-marker-monotonic-host");
+        let rollout_path = dir.path().join("rollout-session.jsonl");
+        std::fs::write(&rollout_path, "{}\n").unwrap();
+        let tmux_session = "AgentDesk-codex-marker-monotonic";
+
+        write_codex_tui_rollout_marker_with_start_offset(
+            tmux_session,
+            &rollout_path,
+            Some("sess-4"),
+            Some(88),
+        )
+        .unwrap();
+        write_codex_tui_rollout_marker_with_start_offset(
+            tmux_session,
+            &rollout_path,
+            Some("sess-4"),
+            Some(12),
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_tui_rollout_marker(tmux_session)
+                .and_then(|marker| marker.rollout_start_offset),
+            Some(88)
+        );
+
+        write_codex_tui_rollout_marker_with_start_offset(
+            tmux_session,
+            &rollout_path,
+            Some("sess-4"),
+            Some(144),
+        )
+        .unwrap();
+        assert_eq!(
+            read_codex_tui_rollout_marker(tmux_session)
+                .and_then(|marker| marker.rollout_start_offset),
+            Some(144)
+        );
+    }
+
+    #[test]
+    fn codex_tui_rollout_marker_advance_preserves_session_and_monotonic_offset() {
+        let _lock = lock_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _env =
+            EnvRestore::set_agentdesk_root_and_host(dir.path(), "codex-tui-marker-advance-host");
+        let rollout_path = dir.path().join("rollout-session.jsonl");
+        std::fs::write(&rollout_path, "{}\n").unwrap();
+        let tmux_session = "AgentDesk-codex-marker-advance";
+
+        write_codex_tui_rollout_marker_with_start_offset(
+            tmux_session,
+            &rollout_path,
+            Some("sess-advance"),
+            Some(88),
+        )
+        .unwrap();
+        advance_codex_tui_rollout_marker_start_offset(tmux_session, &rollout_path, 12).unwrap();
+        advance_codex_tui_rollout_marker_start_offset(tmux_session, &rollout_path, 144).unwrap();
+
+        assert_eq!(
+            read_codex_tui_rollout_marker(tmux_session),
+            Some(CodexTuiRolloutMarker {
+                rollout_path,
+                session_id: Some("sess-advance".to_string()),
+                rollout_start_offset: Some(144),
             })
         );
     }
