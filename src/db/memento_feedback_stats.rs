@@ -14,10 +14,7 @@ pub struct MementoFeedbackTurnStat {
     pub covered_recall_count: i64,
 }
 
-pub async fn upsert_turn_stat_pg(
-    pool: &PgPool,
-    stat: &MementoFeedbackTurnStat,
-) -> Result<()> {
+pub async fn upsert_turn_stat_pg(pool: &PgPool, stat: &MementoFeedbackTurnStat) -> Result<()> {
     sqlx::query(
         "INSERT INTO memento_feedback_turn_stats (
             turn_id, stat_date, agent_id, provider,
