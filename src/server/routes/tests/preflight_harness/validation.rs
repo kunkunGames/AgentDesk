@@ -28,6 +28,7 @@ pub(crate) fn apply_snapshot_to_report(report: &mut PreflightReport, snapshot: &
             .map(|dispatch| DispatchTerminal {
                 id: dispatch.id.clone(),
                 status: dispatch.status.clone(),
+                dispatch_type: dispatch.dispatch_type.clone(),
             })
             .collect(),
     };
@@ -39,6 +40,9 @@ pub(crate) fn validate_preflight_snapshot(snapshot: &PreflightSnapshot) -> Vec<S
 
     for dispatch in &snapshot.dispatches {
         if dispatch.status != "completed" {
+            continue;
+        }
+        if !is_entry_bound_dispatch(dispatch.dispatch_type.as_deref()) {
             continue;
         }
         let matching_entries: Vec<&EntrySnapshot> = snapshot
@@ -128,20 +132,27 @@ pub(crate) fn validate_preflight_snapshot(snapshot: &PreflightSnapshot) -> Vec<S
             safety.message_outbox_count
         ));
     }
-    if safety.dispatch_outbox_notify_count != 0 {
+    if safety.dispatch_outbox_count != 0 {
         failures.push(format!(
-            "sandbox preflight enqueued dispatch notifications: {}",
-            safety.dispatch_outbox_notify_count
+            "sandbox preflight enqueued dispatch outbox rows: {}",
+            safety.dispatch_outbox_count
         ));
     }
     if safety.worktree_or_branch_context_count != 0 {
         failures.push(format!(
-            "sandbox preflight recorded worktree/branch context: {}",
+            "sandbox preflight recorded worktree/branch context/result: {}",
             safety.worktree_or_branch_context_count
         ));
     }
 
     failures
+}
+
+fn is_entry_bound_dispatch(dispatch_type: Option<&str>) -> bool {
+    matches!(
+        dispatch_type,
+        None | Some("implementation") | Some("rework") | Some("plan") | Some("plan-review")
+    )
 }
 
 pub(crate) fn validate_history_contains_run(history: &Value, run_id: &str) -> Vec<String> {

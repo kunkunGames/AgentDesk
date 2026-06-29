@@ -22,6 +22,33 @@ fn state_enters_review(pipeline: &crate::pipeline::PipelineConfig, status: &str)
         .is_some_and(|hooks| hooks.on_enter.iter().any(|name| name == "OnReviewEnter"))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static PREFLIGHT_SUPPRESS_REVIEW_ENTER_OUTBOX: bool;
+}
+
+#[cfg(test)]
+pub(crate) async fn with_preflight_review_enter_outbox_suppressed<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PREFLIGHT_SUPPRESS_REVIEW_ENTER_OUTBOX
+        .scope(true, future)
+        .await
+}
+
+#[cfg(test)]
+fn suppress_review_enter_outbox_for_preflight_harness() -> bool {
+    PREFLIGHT_SUPPRESS_REVIEW_ENTER_OUTBOX
+        .try_with(|value| *value)
+        .unwrap_or(false)
+}
+
+#[cfg(not(test))]
+fn suppress_review_enter_outbox_for_preflight_harness() -> bool {
+    false
+}
+
 async fn ensure_review_dispatch_after_review_enter_pg(
     pg_pool: &sqlx::PgPool,
     pipeline: &crate::pipeline::PipelineConfig,
@@ -155,13 +182,21 @@ async fn ensure_review_dispatch_after_review_enter_pg(
         "review_dispatch_recovery": "missing_after_review_enter",
         "source": source.unwrap_or("transition"),
     });
-    if let Some(parent_dispatch_id) = parent_dispatch_id
+    if let Some(parent_dispatch_id) = parent_dispatch_id.as_deref()
         && let Some(obj) = context.as_object_mut()
     {
         obj.insert("parent_dispatch_id".to_string(), json!(parent_dispatch_id));
     }
 
     let title = format!("[Review R{review_round}] {card_id}");
+    let create_options = if suppress_review_enter_outbox_for_preflight_harness() {
+        DispatchCreateOptions {
+            skip_outbox: true,
+            sidecar_dispatch: false,
+        }
+    } else {
+        DispatchCreateOptions::default()
+    };
     match crate::dispatch::create_dispatch_core_with_options(
         pg_pool,
         card_id,
@@ -169,7 +204,7 @@ async fn ensure_review_dispatch_after_review_enter_pg(
         "review",
         &title,
         &context,
-        DispatchCreateOptions::default(),
+        create_options,
     )
     .await
     {

@@ -46,6 +46,39 @@ pub(super) fn json_string_field<'a>(value: &'a serde_json::Value, key: &str) -> 
         .filter(|s| !s.is_empty())
 }
 
+pub(crate) fn sandbox_preflight_metadata_disables_external_side_effects(
+    metadata: Option<&serde_json::Value>,
+) -> bool {
+    metadata.is_some_and(|metadata| {
+        metadata
+            .get("sandbox_preflight")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            && metadata
+                .get("production_mutation_allowed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+    })
+}
+
+pub(crate) async fn sandbox_preflight_card_disables_external_side_effects(
+    pool: &PgPool,
+    card_id: &str,
+) -> bool {
+    let metadata = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT metadata
+         FROM kanban_cards
+         WHERE id = $1",
+    )
+    .bind(card_id)
+    .fetch_optional(pool)
+    .await;
+    let Ok(Some(Some(metadata))) = metadata else {
+        return false;
+    };
+    sandbox_preflight_metadata_disables_external_side_effects(Some(&metadata))
+}
+
 pub(super) fn json_map_string_field<'a>(
     map: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -2618,14 +2651,19 @@ pub(super) async fn build_review_context(
         .get("rereview")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let sandbox_preflight_without_external_side_effects =
+        sandbox_preflight_card_disables_external_side_effects(pool, kanban_card_id).await;
     let card_issue_repo = load_card_issue_repo_pg(pool, kanban_card_id).await;
     let card_issue_number = card_issue_repo
         .as_ref()
         .and_then(|(issue_number, _)| *issue_number);
 
     if !is_noop_verification && !obj.contains_key("reviewed_commit") {
-        let latest_work_target =
-            latest_completed_work_dispatch_target_pg(pool, kanban_card_id).await;
+        let latest_work_target = if sandbox_preflight_without_external_side_effects {
+            None
+        } else {
+            latest_completed_work_dispatch_target_pg(pool, kanban_card_id).await
+        };
         let validated_work_target = if let Some(target) = latest_work_target.as_ref() {
             let valid = card_issue_number.is_none()
                 || commit_belongs_to_card_issue_pg(
@@ -2685,10 +2723,18 @@ pub(super) async fn build_review_context(
                 })
                 .map(|value| value.to_string());
 
-            let pr_tracking_target = if is_rereview_dispatch {
+            let pr_tracking_target = if is_rereview_dispatch
+                && !sandbox_preflight_without_external_side_effects
+            {
                 resolve_pr_tracking_review_target_pg(pool, kanban_card_id, Some(&ctx_snapshot))
                     .await?
             } else {
+                if is_rereview_dispatch && sandbox_preflight_without_external_side_effects {
+                    tracing::info!(
+                        "[dispatch] Review dispatch for card {}: sandbox preflight suppresses pr_tracking target resolution",
+                        kanban_card_id
+                    );
+                }
                 None
             };
 
@@ -2713,8 +2759,9 @@ pub(super) async fn build_review_context(
                     target.branch.as_deref(),
                     target.worktree_path.as_deref()
                 );
-            } else if let Some((wt_path, wt_branch, wt_commit)) =
-                resolve_card_worktree(pool, kanban_card_id, Some(&ctx_snapshot)).await?
+            } else if !sandbox_preflight_without_external_side_effects
+                && let Some((wt_path, wt_branch, wt_commit)) =
+                    resolve_card_worktree(pool, kanban_card_id, Some(&ctx_snapshot)).await?
             {
                 let reviewed_commit = wt_commit.clone();
                 let worktree_path = probe_clean_worktree_with_transient_retry(
@@ -2749,9 +2796,10 @@ pub(super) async fn build_review_context(
                         &reviewed_commit[..8.min(reviewed_commit.len())]
                     );
                 }
-            } else if let Some(target) =
-                resolve_card_issue_commit_target_pg(pool, kanban_card_id, Some(&ctx_snapshot))
-                    .await?
+            } else if !sandbox_preflight_without_external_side_effects
+                && let Some(target) =
+                    resolve_card_issue_commit_target_pg(pool, kanban_card_id, Some(&ctx_snapshot))
+                        .await?
             {
                 apply_review_target_context(&target, &mut obj);
                 tracing::info!(
@@ -2769,9 +2817,10 @@ pub(super) async fn build_review_context(
                     "[dispatch] Review dispatch for card {}: latest work target was rejected, downstream worktree recovery failed, and repo HEAD fallback is disabled",
                     kanban_card_id
                 );
-            } else if let Some(target) =
-                resolve_repo_head_fallback_target_pg(pool, kanban_card_id, Some(&ctx_snapshot))
-                    .await?
+            } else if !sandbox_preflight_without_external_side_effects
+                && let Some(target) =
+                    resolve_repo_head_fallback_target_pg(pool, kanban_card_id, Some(&ctx_snapshot))
+                        .await?
             {
                 apply_review_target_context(&target, &mut obj);
                 tracing::info!(
