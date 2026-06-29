@@ -5,9 +5,11 @@
 //!   1. The policy module `policies/timeouts/idle-recap.js` calls
 //!      `POST /api/sessions/{key}/idle-recap` every 5 minutes for each
 //!      eligible main-channel session.
-//!   2. `post_recap` captures scrollback, optionally asks Claude Haiku for a
-//!      short Korean summary/suggested reply, runs a deterministic read-only
-//!      relay-integrity probe, and posts the notify-bot recap card.
+//!   2. `post_recap` (here) captures the tail of the tmux scrollback, asks
+//!      Claude Haiku for a short Korean summary (graceful fallback to the raw
+//!      tail if the model call is unavailable), and posts a single-line notify-bot
+//!      message of the form
+//!         📦 {used}/{window} tokens ({pct}%) · idle {dur} · {summary}
 //!   3. The previous recap card (if any) for the same channel is deleted
 //!      best-effort, and the new message id is persisted on `sessions`.
 //!   4. The next user message in that channel deletes the card — handled
@@ -25,23 +27,16 @@ use tokio::task;
 use crate::services::provider::{CancelToken, ProviderKind};
 
 mod context_display;
-mod relay_integrity;
 mod scrollback;
 
 // Scrollback capture / Haiku summarizer (#3479): re-exported so external
 // callers (`server::routes::idle_recap`) keep the `idle_recap::<fn>` path,
 // and the in-file test module reaches them unqualified via `use super::*`.
 pub(crate) use self::scrollback::{
-    RecapComposerOutput, capture_tmux_scrollback, capture_transcript_scrollback,
-    compose_with_haiku, sanitize_recap_line,
+    capture_tmux_scrollback, capture_transcript_scrollback, summarize_with_haiku,
 };
 #[cfg(test)]
-use self::scrollback::{
-    extract_transcript_tail_text, parse_recap_composer_output, parse_transcript_line_text,
-};
-pub(crate) use relay_integrity::{
-    RelayIntegrityInput, RelayIntegrityProbe, RelayIntegrityStatus, decide_relay_integrity,
-};
+use self::scrollback::{extract_transcript_tail_text, parse_transcript_line_text};
 
 // Context-display helpers (#3479) used by `compose_recap_header` /
 // `attach_live_context_usage`; the test module reaches the rest unqualified.
@@ -74,8 +69,6 @@ const RECAP_SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
 /// handler resolves it back to a `session_key` via the
 /// `sessions.idle_recap_message_id` index.
 pub(crate) const IDLE_RECAP_CLEAR_BUTTON_PREFIX: &str = "idle_recap:clear:";
-pub(crate) const IDLE_RECAP_RELAY_DIAG_BUTTON_PREFIX: &str = "idle_recap:relay_diag:";
-pub(crate) const IDLE_RECAP_SUGGEST_BUTTON_PREFIX: &str = "idle_recap:suggest:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecapLiveContextUsage {
@@ -314,223 +307,30 @@ pub(crate) async fn attach_live_context_usage(
     }
 }
 
-/// Read-only relay integrity probe for idle recap.
-///
-/// This intentionally returns `unknown` unless both sides of the comparison are
-/// trusted: a current output file from the matching inflight/session row, and a
-/// current-generation durable delivery frontier. It never writes, retries, or
-/// cleans up relay state.
-pub(crate) fn probe_relay_integrity(
-    snapshot: &RecapSnapshot,
-    provider: &ProviderKind,
-    channel_id: u64,
-    recap_message_id: Option<u64>,
-) -> RelayIntegrityProbe {
-    let base_unknown = |reason: &str| {
-        decide_relay_integrity(RelayIntegrityInput {
-            provider: snapshot.provider.clone(),
-            session_key: snapshot.session_key.clone(),
-            provider_session_id: relay_probe_provider_session_id(snapshot),
-            channel_id,
-            recap_message_id,
-            output_path: None,
-            output_end: None,
-            committed_end: None,
-            committed_source: None,
-            committed_range: None,
-            anchor_message_id: None,
-            anchor_channel_id: None,
-            unknown_reason: Some(reason.to_string()),
-        })
-    };
-
-    let Some(state) = super::inflight::load_inflight_state_read_only(provider, channel_id) else {
-        return base_unknown("matching inflight state unavailable");
-    };
-    if !inflight_state_matches_recap_snapshot(&state, snapshot) {
-        return base_unknown("inflight state does not match recap session");
-    }
-
-    let Some(output_path) = state
-        .output_path
-        .clone()
-        .filter(|path| !path.trim().is_empty())
-    else {
-        return base_unknown("output path unavailable");
-    };
-    let Some(output_end) = std::fs::metadata(&output_path).ok().map(|meta| meta.len()) else {
-        return base_unknown("output file unavailable");
-    };
-    let Some(tmux_session_name) = state
-        .tmux_session_name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-    else {
-        return base_unknown("tmux session name unavailable");
-    };
-
-    let owner_channel_id = state.watcher_owner_channel_id.unwrap_or(channel_id);
-    let Some(frontier) =
-        super::outbound::delivery_frontier_probe::delivered_frontier_current_generation(
-            provider,
-            ChannelId::new(owner_channel_id),
-            tmux_session_name,
-        )
-    else {
-        return decide_relay_integrity(RelayIntegrityInput {
-            provider: snapshot.provider.clone(),
-            session_key: snapshot.session_key.clone(),
-            provider_session_id: relay_probe_provider_session_id(snapshot),
-            channel_id,
-            recap_message_id,
-            output_path: Some(output_path),
-            output_end: Some(output_end),
-            committed_end: None,
-            committed_source: None,
-            committed_range: None,
-            anchor_message_id: None,
-            anchor_channel_id: None,
-            unknown_reason: Some("current-generation delivery frontier unavailable".to_string()),
-        });
-    };
-
-    decide_relay_integrity(RelayIntegrityInput {
-        provider: snapshot.provider.clone(),
-        session_key: snapshot.session_key.clone(),
-        provider_session_id: relay_probe_provider_session_id(snapshot),
-        channel_id,
-        recap_message_id,
-        output_path: Some(output_path),
-        output_end: Some(output_end),
-        committed_end: Some(frontier.range.1),
-        committed_source: Some(format!(
-            "durable_delivery_record_current_generation:{owner_channel_id}"
-        )),
-        committed_range: Some(frontier.range),
-        anchor_message_id: frontier.panel_msg_id,
-        anchor_channel_id: frontier.panel_channel_id,
-        unknown_reason: None,
-    })
-}
-
-fn relay_probe_provider_session_id(snapshot: &RecapSnapshot) -> Option<String> {
-    provider_session_ids(snapshot).next().map(str::to_string)
-}
-
-fn inflight_state_matches_recap_snapshot(
-    state: &super::inflight::InflightTurnState,
-    snapshot: &RecapSnapshot,
-) -> bool {
-    if state.session_key.as_deref() == Some(snapshot.session_key.as_str()) {
-        return true;
-    }
-    let state_session = state.session_id.as_deref().and_then(normalized_text);
-    state_session
-        .is_some_and(|session_id| provider_session_ids(snapshot).any(|id| id == session_id))
-}
-
-/// Compose the recap card body. The header is deterministic; the optional
-/// summary and suggested reply come from the bounded recap composer output.
-pub(crate) fn compose_recap_text(
-    snapshot: &RecapSnapshot,
-    composer: Option<&RecapComposerOutput>,
-    relay_probe: &RelayIntegrityProbe,
-) -> String {
-    let mut lines = vec![compose_recap_header(snapshot, relay_probe.status)];
-    if let Some(summary) = composer
-        .and_then(|output| output.summary.as_deref())
-        .and_then(sanitize_recap_line)
-    {
-        // Blank line separates the header block from the summary so the card
-        // reads as distinct sections instead of one cramped quote.
-        lines.push(String::new());
-        lines.push("> 📝 **요약**".to_string());
-        lines.push(format!("> {summary}"));
-    }
-    if let Some(suggested_reply) = composer
-        .and_then(|output| output.suggested_reply.as_deref())
-        .and_then(sanitize_recap_line)
-    {
-        // The suggested reply gets its own labelled block on a separate line so
-        // it is easy to read (and copy) rather than trailing the summary.
-        // `suggested_reply_from_recap_content` parses the line after this label.
-        lines.push(String::new());
-        lines.push("> 💬 **추천 답변**".to_string());
-        lines.push(format!("> {suggested_reply}"));
-    }
-    lines.join("\n")
-}
-
-pub(crate) fn suggested_reply_from_recap_content(content: &str) -> Option<String> {
-    // Handles both the legacy inline form (`> 추천 답변: <reply>`) and the
-    // current labelled form (`> 💬 **추천 답변**` on one line, `> <reply>` on
-    // the next). Decorative emoji/markdown is tolerated around the label, but
-    // incidental mentions of "추천 답변" in summary text are ignored.
-    let mut lines = content.lines();
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim().trim_start_matches('>').trim();
-        if let Some(inline) = suggested_reply_inline_value(trimmed)
-            && let Some(reply) = sanitize_recap_line(inline)
-        {
-            return Some(reply);
+/// Compose the recap card body. PR #3b shipped a header-only card; PR #3c
+/// adds an optional `summary` line below the header (rendered as a Discord
+/// blockquote when present).
+pub(crate) fn compose_recap_text(snapshot: &RecapSnapshot, summary: Option<&str>) -> String {
+    let header = compose_recap_header(snapshot);
+    match summary.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => {
+            // Discord blockquote — single `>` on each line. Keep the
+            // summary on one line to avoid breaking the blockquote layout.
+            let single_line = s.replace('\n', " ");
+            format!("{header}\n> {single_line}")
         }
-        if !suggested_reply_label_is_standalone(trimmed) {
-            continue;
-        }
-        // Label-only line: the reply lives on the next quoted line.
-        if let Some(next) = lines.next() {
-            let next_trimmed = next
-                .trim()
-                .trim_start_matches('>')
-                .trim()
-                .trim_start_matches('*')
-                .trim();
-            if let Some(reply) = sanitize_recap_line(next_trimmed) {
-                return Some(reply);
-            }
-        }
-        return None;
+        None => header,
     }
-    None
 }
 
-fn suggested_reply_inline_value(line: &str) -> Option<&str> {
-    line.strip_prefix("추천 답변:")
-        .or_else(|| line.strip_prefix("추천 답변 :"))
-}
-
-fn suggested_reply_label_is_standalone(line: &str) -> bool {
-    let normalized = line
-        .chars()
-        .filter(|ch| {
-            !ch.is_whitespace()
-                && !matches!(
-                    ch,
-                    '>' | '*' | '_' | '`' | ':' | '：' | '💬' | '📝' | '📦' | '·' | '-' | '—'
-                )
-        })
-        .collect::<String>();
-    normalized == "추천답변"
-}
-
-fn compose_recap_header(snapshot: &RecapSnapshot, relay_status: RelayIntegrityStatus) -> String {
+fn compose_recap_header(snapshot: &RecapSnapshot) -> String {
     let now = Utc::now();
     let idle_since = snapshot
         .last_heartbeat
         .map(|t| format_korean_duration(now - t))
         .unwrap_or_else(|| "방금 전".to_string());
 
-    let state_label = match relay_status {
-        RelayIntegrityStatus::Suspect => "릴레이 누락 의심",
-        RelayIntegrityStatus::Ok | RelayIntegrityStatus::Unknown => "이어서 질문 가능",
-    };
-    let provider_label = snapshot.provider.trim();
-    let provider_label = if provider_label.is_empty() {
-        "unknown"
-    } else {
-        provider_label
-    };
-    let context_label = match select_recap_context(snapshot, now) {
+    match select_recap_context(snapshot, now) {
         RecapContextDisplay::Known { used, window } => {
             let used_label = format_token_count(used);
             let window_label = format_token_count(window);
@@ -541,19 +341,21 @@ fn compose_recap_header(snapshot: &RecapSnapshot, relay_status: RelayIntegritySt
             };
             match pct {
                 Some(percent) if used > window => {
-                    format!("{used_label} / {window_label} tokens ({percent}%+, over limit)")
+                    format!(
+                        "📦 {used_label} / {window_label} tokens ({percent}%+, over limit) · idle {idle_since}"
+                    )
                 }
-                Some(percent) => format!("{used_label} / {window_label} tokens ({percent}%)"),
-                None => "context unknown".to_string(),
+                Some(percent) => {
+                    format!(
+                        "📦 {used_label} / {window_label} tokens ({percent}%) · idle {idle_since}"
+                    )
+                }
+                None => format!("📦 context unknown · idle {idle_since}"),
             }
         }
-        RecapContextDisplay::Stale => "context stale".to_string(),
-        RecapContextDisplay::Unknown => "context unknown".to_string(),
-    };
-    format!(
-        "📦 응답 완료 · {state_label}\n세션: {provider_label} · {context_label} · idle {idle_since} · {}",
-        relay_status.label()
-    )
+        RecapContextDisplay::Stale => format!("📦 context stale · idle {idle_since}"),
+        RecapContextDisplay::Unknown => format!("📦 context unknown · idle {idle_since}"),
+    }
 }
 
 /// Post the recap card via the configured notify bot. Routes through
@@ -562,15 +364,16 @@ fn compose_recap_header(snapshot: &RecapSnapshot, relay_status: RelayIntegritySt
 /// stays happy — that helper lives in the allowlisted `discord/http.rs`
 /// module.
 ///
-/// The recap card always carries `[새 세션 시작]` and may add bounded
-/// diagnostic/suggested-reply actions. The interaction handler resolves the
-/// message-id suffix back to a `session_key` through
-/// `sessions.idle_recap_message_id` before acting.
+/// The recap card carries a single `[새 세션 시작]` button with a
+/// `idle_recap:clear:<message_id>` custom id. The interaction handler
+/// (see `idle_recap_interaction.rs`) resolves the suffix back to the
+/// session_key via the `sessions.idle_recap_message_id` lookup and calls
+/// the existing `adk_session::clear_provider_session_id` to perform the
+/// explicit "start a fresh session" action the user opted into.
 pub(crate) async fn post_recap_card(
     http: &serenity::Http,
     channel_id: u64,
     content: &str,
-    actions: RecapCardActions,
 ) -> Result<u64, String> {
     // We need the post-then-edit dance because the custom_id has to embed
     // the message id, but the message id is only known after Discord
@@ -578,7 +381,7 @@ pub(crate) async fn post_recap_card(
     // custom_id encodes a sentinel. Step 2: edit the card with the real
     // button. The brief window with the sentinel is harmless — the
     // interaction handler ignores unknown ids.
-    let placeholder = make_recap_components("0", actions);
+    let placeholder = make_recap_components("0");
     let msg = super::http::send_channel_message_with_components(
         http,
         ChannelId::new(channel_id),
@@ -588,7 +391,7 @@ pub(crate) async fn post_recap_card(
     .await
     .map_err(|e| format!("send_message: {e}"))?;
     let id = msg.id.get();
-    let real = make_recap_components(&id.to_string(), actions);
+    let real = make_recap_components(&id.to_string());
     if let Err(e) = super::http::edit_channel_message_with_components(
         http,
         ChannelId::new(channel_id),
@@ -610,77 +413,13 @@ pub(crate) async fn post_recap_card(
     Ok(id)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RecapCardActions {
-    pub(crate) relay_investigate: bool,
-    pub(crate) suggested_reply: bool,
-}
-
-impl RecapCardActions {
-    pub(crate) fn for_probe_and_composer(
-        relay_probe: &RelayIntegrityProbe,
-        composer: Option<&RecapComposerOutput>,
-    ) -> Self {
-        Self {
-            relay_investigate: relay_probe.is_suspect(),
-            suggested_reply: composer
-                .and_then(|output| output.suggested_reply.as_deref())
-                .and_then(sanitize_recap_line)
-                .is_some(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecapButtonKind {
-    ClearSession,
-    RelayInvestigate,
-    SendSuggestedReply,
-}
-
-fn recap_button_plan(actions: RecapCardActions) -> Vec<RecapButtonKind> {
-    let mut plan = vec![RecapButtonKind::ClearSession];
-    if actions.relay_investigate {
-        plan.push(RecapButtonKind::RelayInvestigate);
-    }
-    if actions.suggested_reply {
-        plan.push(RecapButtonKind::SendSuggestedReply);
-    }
-    plan
-}
-
-fn make_recap_components(
-    message_id_suffix: &str,
-    actions: RecapCardActions,
-) -> Vec<CreateActionRow> {
-    let buttons = recap_button_plan(actions)
-        .into_iter()
-        .map(|kind| recap_button(kind, message_id_suffix))
-        .collect();
-    vec![CreateActionRow::Buttons(buttons)]
-}
-
-fn recap_button(kind: RecapButtonKind, message_id_suffix: &str) -> CreateButton {
-    let (prefix, label, style) = match kind {
-        RecapButtonKind::ClearSession => (
-            IDLE_RECAP_CLEAR_BUTTON_PREFIX,
-            "새 세션 시작",
-            ButtonStyle::Secondary,
-        ),
-        RecapButtonKind::RelayInvestigate => (
-            IDLE_RECAP_RELAY_DIAG_BUTTON_PREFIX,
-            "릴레이 조사",
-            ButtonStyle::Danger,
-        ),
-        RecapButtonKind::SendSuggestedReply => (
-            IDLE_RECAP_SUGGEST_BUTTON_PREFIX,
-            "추천 답변 보내기",
-            ButtonStyle::Primary,
-        ),
-    };
-    CreateButton::new(format!("{prefix}{message_id_suffix}"))
-        .style(style)
-        .label(label)
+fn make_recap_components(message_id_suffix: &str) -> Vec<CreateActionRow> {
+    let custom_id = format!("{IDLE_RECAP_CLEAR_BUTTON_PREFIX}{message_id_suffix}");
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(custom_id)
+            .style(ButtonStyle::Secondary)
+            .label("새 세션 시작"),
+    ])]
 }
 
 fn content_looks_like_idle_recap_card(content: &str) -> bool {
@@ -1120,8 +859,11 @@ pub(in crate::services::discord) async fn spawn_clear_captured_idle_recap_for_ch
 
 /// Extract `tmux_session_name` from a session_key — the part after the last
 /// `:`. Mirrors `parseSessionTmuxName` from `policies/lib/timeouts-helpers.js`.
-pub(crate) fn tmux_session_name_from_key(session_key: &str) -> Option<String> {
-    crate::services::discord::session_identity::tmux_name_from_session_key(session_key)
+pub(crate) fn tmux_session_name_from_key(session_key: &str) -> Option<&str> {
+    session_key
+        .rsplit_once(':')
+        .map(|(_, name)| name)
+        .filter(|s| !s.is_empty())
 }
 
 /// #3146 Part 1 (codex clear/post race): does this channel currently have an
@@ -1597,142 +1339,6 @@ mod tests {
         ));
     }
 
-    fn relay_probe_with(status: RelayIntegrityStatus) -> RelayIntegrityProbe {
-        let (output_end, committed_end) = match status {
-            RelayIntegrityStatus::Ok => (Some(100), Some(100)),
-            RelayIntegrityStatus::Suspect => (Some(150), Some(100)),
-            RelayIntegrityStatus::Unknown => (None, Some(100)),
-        };
-        decide_relay_integrity(RelayIntegrityInput {
-            provider: "codex".to_string(),
-            session_key: "discord:codex:test".to_string(),
-            provider_session_id: Some("raw-1".to_string()),
-            channel_id: 7,
-            recap_message_id: Some(9),
-            output_path: Some("/tmp/out.jsonl".to_string()),
-            output_end,
-            committed_end,
-            committed_source: committed_end.map(|_| "durable".to_string()),
-            committed_range: committed_end.map(|end| (0, end)),
-            anchor_message_id: Some(11),
-            anchor_channel_id: Some(7),
-            unknown_reason: None,
-        })
-    }
-
-    #[test]
-    fn recap_renders_relay_labels_and_single_suggested_reply() {
-        let snapshot = snapshot_with_sessions(None, Some("raw-1"));
-        let composer = RecapComposerOutput {
-            summary: Some("작업 요약".to_string()),
-            suggested_reply: Some("테스트 계속 진행해줘".to_string()),
-        };
-        let ok = relay_probe_with(RelayIntegrityStatus::Ok);
-        let content = compose_recap_text(&snapshot, Some(&composer), &ok);
-        assert!(content.contains("relay OK"));
-        // Labelled blocks on their own lines for legibility (the summary and the
-        // suggested reply are separated by blank lines, not crammed together).
-        assert!(content.contains("> 📝 **요약**\n> 작업 요약"));
-        assert!(content.contains("> 💬 **추천 답변**\n> 테스트 계속 진행해줘"));
-        assert_eq!(
-            suggested_reply_from_recap_content(&content).as_deref(),
-            Some("테스트 계속 진행해줘")
-        );
-        // Backward compatibility: the parser still reads the legacy inline form
-        // from cards posted before the layout change.
-        assert_eq!(
-            suggested_reply_from_recap_content("📦 idle\n> 추천 답변: 옛날 형식 답변").as_deref(),
-            Some("옛날 형식 답변")
-        );
-        assert_eq!(
-            suggested_reply_from_recap_content(
-                "📦 idle\n> 📝 **요약**\n> 요약 안의 추천 답변 언급은 라벨이 아님\n\n> 💬 **추천 답변**\n> 진짜 답변"
-            )
-            .as_deref(),
-            Some("진짜 답변")
-        );
-        assert_eq!(
-            suggested_reply_from_recap_content(
-                "📦 idle\n> 📝 **요약**\n> 추천 답변 언급만 있고 실제 라벨은 없음"
-            ),
-            None
-        );
-        assert!(!content.contains("이어서 진행"));
-
-        let suspect = compose_recap_text(
-            &snapshot,
-            Some(&composer),
-            &relay_probe_with(RelayIntegrityStatus::Suspect),
-        );
-        assert!(suspect.contains("릴레이 누락 의심"));
-        assert!(suspect.contains("relay suspect"));
-
-        let unknown = compose_recap_text(
-            &snapshot,
-            Some(&composer),
-            &relay_probe_with(RelayIntegrityStatus::Unknown),
-        );
-        assert!(unknown.contains("relay unknown"));
-    }
-
-    #[test]
-    fn recap_button_plan_is_bounded_and_relay_diag_is_suspect_only() {
-        let composer = RecapComposerOutput {
-            summary: Some("요약".to_string()),
-            suggested_reply: Some("다음 단계 진행해줘".to_string()),
-        };
-        let normal = RecapCardActions::for_probe_and_composer(
-            &relay_probe_with(RelayIntegrityStatus::Ok),
-            Some(&composer),
-        );
-        assert_eq!(
-            recap_button_plan(normal),
-            vec![
-                RecapButtonKind::ClearSession,
-                RecapButtonKind::SendSuggestedReply
-            ]
-        );
-
-        let suspect = RecapCardActions::for_probe_and_composer(
-            &relay_probe_with(RelayIntegrityStatus::Suspect),
-            Some(&composer),
-        );
-        assert_eq!(
-            recap_button_plan(suspect),
-            vec![
-                RecapButtonKind::ClearSession,
-                RecapButtonKind::RelayInvestigate,
-                RecapButtonKind::SendSuggestedReply
-            ]
-        );
-
-        let unknown = RecapCardActions::for_probe_and_composer(
-            &relay_probe_with(RelayIntegrityStatus::Unknown),
-            Some(&composer),
-        );
-        assert_eq!(
-            recap_button_plan(unknown),
-            vec![
-                RecapButtonKind::ClearSession,
-                RecapButtonKind::SendSuggestedReply
-            ]
-        );
-
-        let no_suggestion = RecapCardActions::for_probe_and_composer(
-            &relay_probe_with(RelayIntegrityStatus::Suspect),
-            None,
-        );
-        assert_eq!(
-            recap_button_plan(no_suggestion),
-            vec![
-                RecapButtonKind::ClearSession,
-                RecapButtonKind::RelayInvestigate
-            ]
-        );
-        assert!(recap_button_plan(suspect).len() <= 3);
-        assert!(recap_button_plan(normal).len() <= 2);
-    }
-
     #[test]
     fn recap_prefers_known_live_session_context_window() {
         let mut snapshot = snapshot_with_sessions(None, Some("raw-1"));
@@ -1749,7 +1355,7 @@ mod tests {
                 window: 272_000
             }
         );
-        let header = compose_recap_header(&snapshot, RelayIntegrityStatus::Ok);
+        let header = compose_recap_header(&snapshot);
         assert!(header.contains("117.6k / 272.0k tokens (43%)"));
     }
 
@@ -1801,7 +1407,7 @@ mod tests {
             select_recap_context(&snapshot, now),
             RecapContextDisplay::Stale
         );
-        let header = compose_recap_header(&snapshot, RelayIntegrityStatus::Ok);
+        let header = compose_recap_header(&snapshot);
         assert!(header.contains("context stale"));
         assert!(!header.contains("303.0k"));
     }
@@ -1815,7 +1421,7 @@ mod tests {
             context_window_tokens: 272_000,
         });
 
-        let header = compose_recap_header(&snapshot, RelayIntegrityStatus::Ok);
+        let header = compose_recap_header(&snapshot);
         assert!(header.contains("303.0k / 272.0k tokens (100%+, over limit)"));
         assert!(!header.contains("(111%)"));
     }
@@ -1835,7 +1441,7 @@ mod tests {
                 window: 272_000
             }
         );
-        let header = compose_recap_header(&snapshot, RelayIntegrityStatus::Ok);
+        let header = compose_recap_header(&snapshot);
         assert!(header.contains("272.0k / 272.0k tokens (100%)"));
         assert!(!header.contains("2.3M"));
         assert!(!header.contains("over limit"));
@@ -1895,25 +1501,6 @@ mod tests {
         for case in cases {
             assert_eq!(parse_transcript_line_text(case), None, "case: {case}");
         }
-    }
-
-    #[test]
-    fn recap_composer_parser_accepts_single_suggested_reply() {
-        let raw = r#"{"summary":"구현 중입니다.","suggested_reply":"테스트 계속 진행해줘"}"#;
-        let parsed = parse_recap_composer_output(raw).expect("parsed composer output");
-        assert_eq!(parsed.summary.as_deref(), Some("구현 중입니다."));
-        assert_eq!(
-            parsed.suggested_reply.as_deref(),
-            Some("테스트 계속 진행해줘")
-        );
-    }
-
-    #[test]
-    fn recap_composer_parser_takes_at_most_one_suggestion_and_sanitizes_lines() {
-        let raw = "```json\n{\"summary\":\"요약\\n둘째줄\",\"suggested_replies\":[\"첫 답변\\n계속\",\"둘째 답변\"]}\n```";
-        let parsed = parse_recap_composer_output(raw).expect("parsed composer output");
-        assert_eq!(parsed.summary.as_deref(), Some("요약 둘째줄"));
-        assert_eq!(parsed.suggested_reply.as_deref(), Some("첫 답변 계속"));
     }
 
     #[test]

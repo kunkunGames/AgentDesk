@@ -53,30 +53,6 @@ SUPPORTED_CELLS: tuple[str, ...] = (
     "codex-pipe",
     "codex-tui",
 )
-AGENT_MODES: tuple[str, ...] = ("none", "controlled", "real_live")
-AGENT_MODE_RANK = {mode: rank for rank, mode in enumerate(AGENT_MODES)}
-COVERAGE_CLASSES: tuple[str, ...] = ("live", "fixture", "unsupported-known-gap")
-COVERAGE_CLASS_RANK = {
-    "unsupported-known-gap": 0,
-    "fixture": 1,
-    "live": 2,
-}
-REAL_PROVIDER_STEP_KEYS: tuple[str, ...] = (
-    "send_prompt",
-    "send_provider_hold_prompt",
-    "send_prompts_concurrent",
-    "send_keys",
-)
-CONTROLLED_HARNESS_STEP_KEYS: tuple[str, ...] = (
-    "restart_dcserver",
-    "poison_claude_tui_relay_offset",
-    "capture_session_identity",
-    "assert_session_preserved",
-    "cancel_turn",
-    "assert_health",
-    "kill_pane",
-    "send_keys_no_enter",
-)
 
 IDLE_MAILBOX_STATUSES = {"", "idle", "none"}
 IDLE_RELAY_STALL_STATES = {"", "healthy"}
@@ -104,7 +80,6 @@ REPORT_RECORD_KEYS: tuple[str, ...] = (
     "recent_raw",
     "tmux_key_sequences",
     "direct_input_prompts",
-    "concurrent_prompt_batches",
     "wait_timeouts",
     "provider_hold_prompts",
     "provider_hold_states",
@@ -116,16 +91,6 @@ REPORT_RECORD_KEYS: tuple[str, ...] = (
     "fixture_state",
     "fixture_health",
     "fixture_followup_probes",
-    "agent_mode",
-    "agent_mode_actual",
-    "agent_mode_contract",
-    "coverage_class",
-    "coverage_class_actual",
-    "coverage_class_contract",
-    "provider_identity",
-    "real_provider_contacted",
-    "controlled_harness_evidence",
-    "failure_attribution",
 )
 
 
@@ -135,14 +100,6 @@ class ScenarioStepAssertionError(assertions.AssertionError):
     def __init__(self, message: str, *, record: dict[str, Any]):
         super().__init__(message)
         self.record = record
-
-
-class ConcurrentPromptSendError(assertions.AssertionError):
-    """Concurrent prompt failure that preserves any successful sends."""
-
-    def __init__(self, message: str, *, partial_results: list[dict[str, Any]]):
-        super().__init__(message)
-        self.partial_results = partial_results
 
 
 def parse_args() -> argparse.Namespace:
@@ -235,24 +192,6 @@ def parse_args() -> argparse.Namespace:
         default=float(os.environ.get("AGENTDESK_E2E_TURN_START_TIMEOUT_S", "180")),
         help="How long send_prompt retries transient mailbox-busy turn/start responses.",
     )
-    parser.add_argument(
-        "--required-agent-mode",
-        choices=AGENT_MODES,
-        default=os.environ.get("AGENTDESK_E2E_REQUIRED_AGENT_MODE"),
-        help=(
-            "Fail selected scenarios whose declared agent_mode is shallower than "
-            "this required gate."
-        ),
-    )
-    parser.add_argument(
-        "--required-coverage-class",
-        choices=COVERAGE_CLASSES,
-        default=os.environ.get("AGENTDESK_E2E_REQUIRED_COVERAGE_CLASS"),
-        help=(
-            "Fail selected scenarios whose coverage_class is shallower than "
-            "this required gate, e.g. live."
-        ),
-    )
     return parser.parse_args()
 
 
@@ -281,435 +220,6 @@ def cell_channel_kind(cell: str) -> str:
 def cell_workspace_substring(cell: str) -> str:
     """Substring tagged onto runtime/jsonl paths to safely target this cell."""
     return f"adk-{cell}-e2e"
-
-
-def normalize_agent_mode(value: Any, *, scenario_id: str | None = None) -> str:
-    mode = str(value or "").strip().lower()
-    if mode not in AGENT_MODE_RANK:
-        label = f" for {scenario_id}" if scenario_id else ""
-        raise ValueError(
-            f"agent_mode{label} must be one of {', '.join(AGENT_MODES)}; got {value!r}"
-        )
-    return mode
-
-
-def scenario_agent_mode(scenario: dict[str, Any]) -> str:
-    return normalize_agent_mode(
-        scenario.get("agent_mode"),
-        scenario_id=str(scenario.get("id") or scenario.get("__path__") or "<unknown>"),
-    )
-
-
-def normalize_coverage_class(value: Any, *, scenario_id: str | None = None) -> str:
-    coverage = str(value or "").strip().lower()
-    if coverage not in COVERAGE_CLASS_RANK:
-        label = f" for {scenario_id}" if scenario_id else ""
-        raise ValueError(
-            f"coverage_class{label} must be one of "
-            f"{', '.join(COVERAGE_CLASSES)}; got {value!r}"
-        )
-    return coverage
-
-
-def infer_planned_coverage_class(
-    scenario: dict[str, Any],
-    *,
-    declared: str | None = None,
-) -> str:
-    if scenario.get("skip_reason") and declared is not None:
-        return declared
-    if is_local_fixture_scenario(scenario):
-        return "fixture"
-    agent_mode = str(scenario.get("agent_mode") or "").strip().lower()
-    if agent_mode == "none":
-        return "fixture"
-    return "live"
-
-
-def scenario_coverage_class(scenario: dict[str, Any]) -> str:
-    scenario_id = str(scenario.get("id") or scenario.get("__path__") or "<unknown>")
-    if "coverage_class" not in scenario:
-        return infer_planned_coverage_class(scenario)
-    return normalize_coverage_class(scenario.get("coverage_class"), scenario_id=scenario_id)
-
-
-def provider_identity(cell: str, channel_id: str | None = None) -> dict[str, Any]:
-    identity: dict[str, Any] = {
-        "cell": cell,
-        "provider": cell_provider(cell),
-        "runtime": cell_runtime(cell),
-        "worker_agent": cell_default_agent(cell),
-    }
-    if channel_id is not None:
-        identity["channel_id"] = str(channel_id)
-    return identity
-
-
-def _send_keys_sequence_contacts_provider(params: Any) -> bool:
-    if isinstance(params, dict):
-        return bool(params.get("mark_prompt_sent", True))
-    return True
-
-
-def _step_contacts_real_provider(step: dict[str, Any]) -> bool:
-    if any(key in step for key in REAL_PROVIDER_STEP_KEYS):
-        return True
-    if "send_keys_sequence" in step:
-        return _send_keys_sequence_contacts_provider(step["send_keys_sequence"])
-    return False
-
-
-def _controlled_harness_step_evidence(step: dict[str, Any]) -> str | None:
-    if _step_contacts_real_provider(step):
-        return None
-    for key in CONTROLLED_HARNESS_STEP_KEYS:
-        if key in step:
-            return key
-    if "send_keys_sequence" in step:
-        return "send_keys_sequence"
-    return None
-
-
-def scenario_has_controlled_harness_evidence(scenario: dict[str, Any]) -> bool:
-    for step in scenario.get("steps") or []:
-        if isinstance(step, dict) and _controlled_harness_step_evidence(step):
-            return True
-    return False
-
-
-def is_controlled_execution_scenario(scenario: dict[str, Any]) -> bool:
-    execution = str(scenario.get("execution") or "").strip().lower()
-    return execution in {
-        "controlled",
-        "controlled_hook",
-        "controlled_provider",
-        "hook",
-        "scripted",
-    }
-
-
-def infer_planned_agent_mode(
-    scenario: dict[str, Any],
-    *,
-    declared: str | None = None,
-) -> str:
-    if scenario.get("skip_reason") and declared is not None:
-        return declared
-    if is_local_fixture_scenario(scenario):
-        return "none"
-    for step in scenario.get("steps") or []:
-        if isinstance(step, dict) and _step_contacts_real_provider(step):
-            return "real_live"
-    if scenario.get("orchestration") == "cross_channel":
-        return "real_live"
-    if scenario_has_controlled_harness_evidence(scenario):
-        return "controlled"
-    if is_controlled_execution_scenario(scenario):
-        return "controlled"
-    return "none"
-
-
-def validate_scenario_agent_mode(scenario: dict[str, Any]) -> str:
-    declared = scenario_agent_mode(scenario)
-    planned = infer_planned_agent_mode(scenario, declared=declared)
-    if declared != planned:
-        scenario_id = str(scenario.get("id") or scenario.get("__path__") or "<unknown>")
-        raise ValueError(
-            f"{scenario_id} declares agent_mode={declared!r}, but scenario steps "
-            f"plan {planned!r}; update metadata or execution lane"
-        )
-    return declared
-
-
-def validate_scenario_coverage_class(scenario: dict[str, Any]) -> str:
-    scenario_id = str(scenario.get("id") or scenario.get("__path__") or "<unknown>")
-    if "coverage_class" not in scenario:
-        raise ValueError(f"{scenario_id} must declare coverage_class")
-    declared = scenario_coverage_class(scenario)
-    if declared == "unsupported-known-gap" and not scenario.get("skip_reason"):
-        raise ValueError(
-            f"{scenario_id} declares coverage_class='unsupported-known-gap' "
-            "without skip_reason"
-        )
-    planned = infer_planned_coverage_class(scenario, declared=declared)
-    if declared != planned:
-        raise ValueError(
-            f"{scenario_id} declares coverage_class={declared!r}, but scenario "
-            f"steps plan {planned!r}; update metadata or execution lane"
-        )
-    return declared
-
-
-def required_agent_mode_violation(
-    *,
-    declared: str,
-    actual: str | None = None,
-    required: str | None,
-    scenario_id: str,
-) -> str | None:
-    if not required:
-        return None
-    required_mode = normalize_agent_mode(required, scenario_id=scenario_id)
-    if actual is not None:
-        observed_mode = normalize_agent_mode(actual, scenario_id=scenario_id)
-    else:
-        observed_mode = declared
-    if AGENT_MODE_RANK[observed_mode] < AGENT_MODE_RANK[required_mode]:
-        if actual is not None:
-            return (
-                f"agent_mode gate requires {required_mode}, but {scenario_id} "
-                f"observed agent_mode_actual={observed_mode}"
-            )
-        return (
-            f"agent_mode gate requires {required_mode}, but {scenario_id} "
-            f"declares {declared}"
-        )
-    return None
-
-
-def required_coverage_class_violation(
-    *,
-    declared: str,
-    actual: str | None = None,
-    required: str | None,
-    scenario_id: str,
-) -> str | None:
-    if not required:
-        return None
-    required_class = normalize_coverage_class(required, scenario_id=scenario_id)
-    if actual is not None:
-        observed_class = normalize_coverage_class(actual, scenario_id=scenario_id)
-    else:
-        observed_class = declared
-    if COVERAGE_CLASS_RANK[observed_class] < COVERAGE_CLASS_RANK[required_class]:
-        if actual is not None:
-            return (
-                f"coverage_class gate requires {required_class}, but {scenario_id} "
-                f"observed coverage_class_actual={observed_class}"
-            )
-        return (
-            f"coverage_class gate requires {required_class}, but {scenario_id} "
-            f"declares {declared}"
-        )
-    return None
-
-
-def _apply_observed_required_agent_mode_gate(
-    result: dict[str, Any],
-    *,
-    required: str | None,
-    declared: str,
-    scenario_id: str,
-    record: dict[str, Any] | None = None,
-) -> bool:
-    actual = result.get("agent_mode_actual")
-    if actual is None:
-        return False
-    violation = required_agent_mode_violation(
-        declared=declared,
-        actual=str(actual),
-        required=required,
-        scenario_id=scenario_id,
-    )
-    if not violation:
-        return False
-    result["status"] = "fail"
-    result["reason"] = violation
-    result["failure_attribution"] = _failure_attribution(
-        "agent_mode_gate",
-        violation,
-        record=record,
-    )
-    return True
-
-
-def _apply_observed_required_coverage_class_gate(
-    result: dict[str, Any],
-    *,
-    required: str | None,
-    declared: str,
-    scenario_id: str,
-    record: dict[str, Any] | None = None,
-) -> bool:
-    actual = result.get("coverage_class_actual")
-    if actual is None:
-        return False
-    violation = required_coverage_class_violation(
-        declared=declared,
-        actual=str(actual),
-        required=required,
-        scenario_id=scenario_id,
-    )
-    if not violation:
-        return False
-    result["status"] = "fail"
-    result["reason"] = violation
-    result["failure_attribution"] = _failure_attribution(
-        "coverage_class_gate",
-        violation,
-        record=record,
-    )
-    return True
-
-
-def _agent_mode_contract(
-    *,
-    declared: str,
-    actual: str,
-    dry_run: bool,
-    real_provider_contacted: bool,
-) -> dict[str, Any]:
-    return {
-        "declared": declared,
-        "actual": actual,
-        "dry_run": dry_run,
-        "real_provider_contacted": real_provider_contacted,
-        "satisfied": dry_run or declared == actual,
-    }
-
-
-def _coverage_class_contract(
-    *,
-    declared: str,
-    actual: str,
-    dry_run: bool,
-) -> dict[str, Any]:
-    return {
-        "declared": declared,
-        "actual": actual,
-        "dry_run": dry_run,
-        "satisfied": dry_run or declared == actual,
-    }
-
-
-def _initial_coverage_class_actual(
-    scenario: dict[str, Any],
-    *,
-    declared: str,
-    dry_run: bool,
-) -> str:
-    if dry_run:
-        return declared
-    if is_local_fixture_scenario(scenario):
-        return "fixture"
-    if declared == "unsupported-known-gap":
-        return "unsupported-known-gap"
-    return "unsupported-known-gap"
-
-
-def _failure_attribution(
-    source: str,
-    reason: str,
-    *,
-    record: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    attribution: dict[str, Any] = {
-        "source": source,
-        "raw_reason": reason,
-    }
-    if record:
-        wait_timeouts = record.get("wait_timeouts")
-        if isinstance(wait_timeouts, list) and wait_timeouts:
-            classifications = [
-                item.get("classification")
-                for item in wait_timeouts
-                if isinstance(item, dict) and item.get("classification")
-            ]
-            if classifications:
-                attribution["wait_timeout_classifications"] = classifications
-        provider_states = record.get("provider_hold_states")
-        if isinstance(provider_states, list) and provider_states:
-            classifications = [
-                item.get("classification")
-                for item in provider_states
-                if isinstance(item, dict) and item.get("classification")
-            ]
-            if classifications:
-                attribution["provider_hold_classifications"] = classifications
-    return attribution
-
-
-def _mark_real_provider_contacted(
-    record: dict[str, Any],
-    *,
-    declared_agent_mode: str,
-    dry_run: bool,
-) -> None:
-    record["real_provider_contacted"] = True
-    record["agent_mode_actual"] = "real_live"
-    record["agent_mode_contract"] = _agent_mode_contract(
-        declared=declared_agent_mode,
-        actual="real_live",
-        dry_run=dry_run,
-        real_provider_contacted=True,
-    )
-    declared_coverage_class = record.get("coverage_class")
-    if declared_coverage_class:
-        record["coverage_class_actual"] = "live"
-        record["coverage_class_contract"] = _coverage_class_contract(
-            declared=str(declared_coverage_class),
-            actual="live",
-            dry_run=dry_run,
-        )
-
-
-def observed_agent_mode(scenario: dict[str, Any], record: dict[str, Any]) -> str:
-    if record.get("real_provider_contacted"):
-        return "real_live"
-    if record.get("controlled_harness_evidence"):
-        return "controlled"
-    return "none"
-
-
-def _refresh_agent_mode_record(
-    record: dict[str, Any],
-    *,
-    scenario: dict[str, Any],
-    declared_agent_mode: str,
-    dry_run: bool,
-) -> None:
-    actual_mode = observed_agent_mode(scenario, record)
-    record["agent_mode_actual"] = actual_mode
-    record["agent_mode_contract"] = _agent_mode_contract(
-        declared=declared_agent_mode,
-        actual=actual_mode,
-        dry_run=dry_run,
-        real_provider_contacted=bool(record.get("real_provider_contacted")),
-    )
-
-
-def observed_coverage_class(
-    scenario: dict[str, Any],
-    record: dict[str, Any],
-    *,
-    dry_run: bool,
-) -> str:
-    declared = scenario_coverage_class(scenario)
-    if dry_run:
-        return declared
-    if record.get("local_fixture") or is_local_fixture_scenario(scenario):
-        return "fixture"
-    if declared == "unsupported-known-gap":
-        return "unsupported-known-gap"
-    if record.get("real_provider_contacted") or record.get("controlled_harness_evidence"):
-        return "live"
-    return "unsupported-known-gap"
-
-
-def _refresh_coverage_class_record(
-    record: dict[str, Any],
-    *,
-    scenario: dict[str, Any],
-    declared_coverage_class: str,
-    dry_run: bool,
-) -> None:
-    actual_class = observed_coverage_class(scenario, record, dry_run=dry_run)
-    record["coverage_class_actual"] = actual_class
-    record["coverage_class_contract"] = _coverage_class_contract(
-        declared=declared_coverage_class,
-        actual=actual_class,
-        dry_run=dry_run,
-    )
 
 
 def _truncate_text(value: str, *, max_chars: int = 500) -> str:
@@ -790,8 +300,6 @@ def load_scenarios(scenarios_dir: Path, *, cell: str) -> list[dict[str, Any]]:
         if cell not in cells:
             continue
         data["__path__"] = str(yaml_path)
-        validate_scenario_agent_mode(data)
-        validate_scenario_coverage_class(data)
         scenarios.append(data)
     return scenarios
 
@@ -1120,7 +628,6 @@ def send_prompts_concurrent(
 
     specs = _normalize_concurrent_prompt_specs(params, channel_id=channel_id, cell=cell)
     results: list[dict[str, Any]] = []
-    failures: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as executor:
         futures = {
             executor.submit(
@@ -1136,11 +643,11 @@ def send_prompts_concurrent(
             try:
                 response = future.result()
             except Exception as error:  # noqa: BLE001 - report every failed branch
-                failures.append(
+                raise assertions.AssertionError(
+                    "send_prompts_concurrent failed "
                     f"index={spec['index']} channel={spec['channel_id']}: "
                     f"{type(error).__name__}: {error}"
-                )
-                continue
+                ) from error
             results.append(
                 {
                     "index": spec["index"],
@@ -1148,11 +655,6 @@ def send_prompts_concurrent(
                     "message_id": response.get("message_id") or response.get("id"),
                 }
             )
-    if failures:
-        raise ConcurrentPromptSendError(
-            "send_prompts_concurrent failed " + "; ".join(failures),
-            partial_results=sorted(results, key=lambda item: int(item["index"])),
-        )
     return sorted(results, key=lambda item: int(item["index"]))
 
 
@@ -2431,127 +1933,26 @@ def run_scenario(
 ) -> dict[str, Any]:
     scenario_id = str(scenario.get("id"))
     cell = args.cell
-    declared_agent_mode = scenario_agent_mode(scenario)
-    planned_agent_mode = infer_planned_agent_mode(
-        scenario,
-        declared=declared_agent_mode,
-    )
-    declared_coverage_class = scenario_coverage_class(scenario)
-    planned_coverage_class = infer_planned_coverage_class(
-        scenario,
-        declared=declared_coverage_class,
-    )
-    initial_coverage_actual = _initial_coverage_class_actual(
-        scenario,
-        declared=declared_coverage_class,
-        dry_run=bool(args.dry_run),
-    )
     result: dict[str, Any] = {
         "id": scenario_id,
         "path": scenario.get("__path__"),
-        "run_id": run_id,
         "cell": cell,
-        "provider": cell_provider(cell),
-        "runtime": cell_runtime(cell),
         "channel_id": args.channel_id,
         "status": "skipped",
         "reason": None,
         "started_at": dt.datetime.now().isoformat(timespec="seconds"),
         "assertions": [],
-        "agent_mode": declared_agent_mode,
-        "agent_mode_planned": planned_agent_mode,
-        "agent_mode_actual": "none",
-        "agent_mode_contract": _agent_mode_contract(
-            declared=declared_agent_mode,
-            actual="none",
-            dry_run=bool(args.dry_run),
-            real_provider_contacted=False,
-        ),
-        "coverage_class": declared_coverage_class,
-        "coverage_class_planned": planned_coverage_class,
-        "coverage_class_actual": initial_coverage_actual,
-        "coverage_class_contract": _coverage_class_contract(
-            declared=declared_coverage_class,
-            actual=initial_coverage_actual,
-            dry_run=bool(args.dry_run),
-        ),
-        "provider_identity": provider_identity(cell, args.channel_id),
-        "real_provider_contacted": False,
-        "failure_attribution": None,
     }
 
     target_channel_id = scenario_channel_id(scenario, args)
     if target_channel_id is None:
         result["reason"] = "requires --thread-channel-id or AGENTDESK_E2E_THREAD_CHANNEL_ID"
-        result["failure_attribution"] = _failure_attribution(
-            "config",
-            str(result["reason"]),
-        )
-        if not args.dry_run:
-            _apply_observed_required_agent_mode_gate(
-                result,
-                required=getattr(args, "required_agent_mode", None),
-                declared=declared_agent_mode,
-                scenario_id=scenario_id,
-            )
-            _apply_observed_required_coverage_class_gate(
-                result,
-                required=getattr(args, "required_coverage_class", None),
-                declared=declared_coverage_class,
-                scenario_id=scenario_id,
-            )
         return result
     result["channel_id"] = target_channel_id
-    result["provider_identity"] = provider_identity(cell, target_channel_id)
-
-    gate_violation = required_agent_mode_violation(
-        declared=declared_agent_mode,
-        required=getattr(args, "required_agent_mode", None),
-        scenario_id=scenario_id,
-    )
-    if gate_violation:
-        result["status"] = "fail"
-        result["reason"] = gate_violation
-        result["failure_attribution"] = _failure_attribution(
-            "agent_mode_gate",
-            gate_violation,
-        )
-        return result
-
-    coverage_gate_violation = required_coverage_class_violation(
-        declared=declared_coverage_class,
-        required=getattr(args, "required_coverage_class", None),
-        scenario_id=scenario_id,
-    )
-    if coverage_gate_violation:
-        result["status"] = "fail"
-        result["reason"] = coverage_gate_violation
-        result["failure_attribution"] = _failure_attribution(
-            "coverage_class_gate",
-            coverage_gate_violation,
-        )
-        return result
 
     if scenario.get("skip_reason"):
         result["reason"] = str(scenario["skip_reason"])
         result["acceptance_criteria"] = scenario.get("acceptance_criteria")
-        result["failure_attribution"] = _failure_attribution(
-            "scenario_skip",
-            str(result["reason"]),
-        )
-        if not args.dry_run:
-            _apply_observed_required_agent_mode_gate(
-                result,
-                required=getattr(args, "required_agent_mode", None),
-                declared=declared_agent_mode,
-                scenario_id=scenario_id,
-            )
-            _apply_observed_required_coverage_class_gate(
-                result,
-                required=getattr(args, "required_coverage_class", None),
-                declared=declared_coverage_class,
-                scenario_id=scenario_id,
-            )
         return result
 
     destructive = is_destructive(scenario)
@@ -2563,23 +1964,6 @@ def run_scenario(
         result["reason"] = (
             "destructive: requires --allow-destructive AND AGENTDESK_E2E_ALLOW_DESTRUCTIVE=1"
         )
-        result["failure_attribution"] = _failure_attribution(
-            "destructive_gate",
-            str(result["reason"]),
-        )
-        if not args.dry_run:
-            _apply_observed_required_agent_mode_gate(
-                result,
-                required=getattr(args, "required_agent_mode", None),
-                declared=declared_agent_mode,
-                scenario_id=scenario_id,
-            )
-            _apply_observed_required_coverage_class_gate(
-                result,
-                required=getattr(args, "required_coverage_class", None),
-                declared=declared_coverage_class,
-                scenario_id=scenario_id,
-            )
         return result
 
     if args.reset_before_each and not args.dry_run and not is_local_fixture_scenario(scenario):
@@ -2606,7 +1990,6 @@ def run_scenario(
         time.sleep(2.0)
 
     try:
-        partial_record_holder: dict[str, Any] = {}
         window = run_one_cell(
             scenario=scenario,
             cell=cell,
@@ -2615,62 +1998,13 @@ def run_scenario(
             run_id=run_id,
             dry_run=args.dry_run,
             args=args,
-            partial_record_sink=partial_record_holder,
         )
         _merge_record_into_result(result, window)
-        if not args.dry_run and _apply_observed_required_agent_mode_gate(
-            result,
-            required=getattr(args, "required_agent_mode", None),
-            declared=declared_agent_mode,
-            scenario_id=scenario_id,
-            record=window,
-        ):
-            pass
-        elif not args.dry_run and _apply_observed_required_coverage_class_gate(
-            result,
-            required=getattr(args, "required_coverage_class", None),
-            declared=declared_coverage_class,
-            scenario_id=scenario_id,
-            record=window,
-        ):
-            pass
-        elif not args.dry_run and result.get("agent_mode_actual") != declared_agent_mode:
-            result["status"] = "fail"
-            result["reason"] = (
-                "agent_mode contract mismatch: "
-                f"declared={declared_agent_mode} actual={result.get('agent_mode_actual')}"
-            )
-            result["failure_attribution"] = _failure_attribution(
-                "agent_mode_contract",
-                str(result["reason"]),
-                record=window,
-            )
-        elif (
-            not args.dry_run
-            and result.get("coverage_class_actual") != declared_coverage_class
-        ):
-            result["status"] = "fail"
-            result["reason"] = (
-                "coverage_class contract mismatch: "
-                f"declared={declared_coverage_class} "
-                f"actual={result.get('coverage_class_actual')}"
-            )
-            result["failure_attribution"] = _failure_attribution(
-                "coverage_class_contract",
-                str(result["reason"]),
-                record=window,
-            )
-        else:
-            result["status"] = "pass"
+        result["status"] = "pass"
     except ScenarioStepAssertionError as error:
         result["status"] = "fail"
         result["reason"] = f"assertion: {error}"
         _merge_record_into_result(result, error.record)
-        result["failure_attribution"] = _failure_attribution(
-            "assertion",
-            str(error),
-            record=error.record,
-        )
         if not args.dry_run:
             try:
                 send_teardown_marker(
@@ -2687,26 +2021,6 @@ def run_scenario(
     except assertions.AssertionError as error:
         result["status"] = "fail"
         result["reason"] = f"assertion: {error}"
-        partial_record = partial_record_holder.get("record")
-        if isinstance(partial_record, dict):
-            _refresh_agent_mode_record(
-                partial_record,
-                scenario=scenario,
-                declared_agent_mode=declared_agent_mode,
-                dry_run=args.dry_run,
-            )
-            _refresh_coverage_class_record(
-                partial_record,
-                scenario=scenario,
-                declared_coverage_class=declared_coverage_class,
-                dry_run=args.dry_run,
-            )
-            _merge_record_into_result(result, partial_record)
-        result["failure_attribution"] = _failure_attribution(
-            "assertion",
-            str(error),
-            record=partial_record if isinstance(partial_record, dict) else None,
-        )
         if not args.dry_run:
             try:
                 send_teardown_marker(
@@ -2723,26 +2037,6 @@ def run_scenario(
     except Exception as error:  # noqa: BLE001 — surfaced in report
         result["status"] = "fail"
         result["reason"] = f"{type(error).__name__}: {error}"
-        partial_record = partial_record_holder.get("record")
-        if isinstance(partial_record, dict):
-            _refresh_agent_mode_record(
-                partial_record,
-                scenario=scenario,
-                declared_agent_mode=declared_agent_mode,
-                dry_run=args.dry_run,
-            )
-            _refresh_coverage_class_record(
-                partial_record,
-                scenario=scenario,
-                declared_coverage_class=declared_coverage_class,
-                dry_run=args.dry_run,
-            )
-            _merge_record_into_result(result, partial_record)
-        result["failure_attribution"] = _failure_attribution(
-            "exception",
-            str(result["reason"]),
-            record=partial_record if isinstance(partial_record, dict) else None,
-        )
         if not args.dry_run:
             try:
                 send_teardown_marker(
@@ -2770,11 +2064,8 @@ def run_one_cell(
     run_id: str,
     dry_run: bool,
     args: argparse.Namespace,
-    partial_record_sink: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scenario_id = scenario.get("id")
-    declared_agent_mode = scenario_agent_mode(scenario)
-    declared_coverage_class = scenario_coverage_class(scenario)
     if is_local_fixture_scenario(scenario):
         return run_local_fixture_scenario(
             scenario=scenario,
@@ -2785,36 +2076,7 @@ def run_one_cell(
         )
 
     setup_marker = f"### E2E SETUP {scenario_id} cell={cell} run={run_id}"
-    record: dict[str, Any] = {
-        "assertions": [],
-        "agent_mode": declared_agent_mode,
-        "agent_mode_actual": "none",
-        "agent_mode_contract": _agent_mode_contract(
-            declared=declared_agent_mode,
-            actual="none",
-            dry_run=dry_run,
-            real_provider_contacted=False,
-        ),
-        "coverage_class": declared_coverage_class,
-        "coverage_class_actual": _initial_coverage_class_actual(
-            scenario,
-            declared=declared_coverage_class,
-            dry_run=dry_run,
-        ),
-        "coverage_class_contract": _coverage_class_contract(
-            declared=declared_coverage_class,
-            actual=_initial_coverage_class_actual(
-                scenario,
-                declared=declared_coverage_class,
-                dry_run=dry_run,
-            ),
-            dry_run=dry_run,
-        ),
-        "provider_identity": provider_identity(cell, channel_id),
-        "real_provider_contacted": False,
-    }
-    if partial_record_sink is not None:
-        partial_record_sink["record"] = record
+    record: dict[str, Any] = {"assertions": []}
 
     if dry_run:
         print(f"[dry-run] {scenario_id} ({cell}): would send setup → steps → teardown")
@@ -2857,11 +2119,6 @@ def run_one_cell(
     for step in scenario.get("steps") or []:
         if not isinstance(step, dict):
             continue
-        controlled_evidence = _controlled_harness_step_evidence(step)
-        if controlled_evidence:
-            record.setdefault("controlled_harness_evidence", []).append(
-                controlled_evidence
-            )
         if "send_prompt" in step:
             _prepare_first_prompt_window()
             window.mark_prompt_sent()
@@ -2870,11 +2127,6 @@ def run_one_cell(
                 channel_id,
                 last_sent_prompt,
                 channel_kind=cell_channel_kind(cell),
-            )
-            _mark_real_provider_contacted(
-                record,
-                declared_agent_mode=declared_agent_mode,
-                dry_run=dry_run,
             )
             last_turn_identity = turn_identity_from_send_response(
                 response,
@@ -2893,11 +2145,6 @@ def run_one_cell(
                 channel_id,
                 prompt,
                 channel_kind=cell_channel_kind(cell),
-            )
-            _mark_real_provider_contacted(
-                record,
-                declared_agent_mode=declared_agent_mode,
-                dry_run=dry_run,
             )
             last_turn_identity = turn_identity_from_send_response(
                 response,
@@ -2918,31 +2165,11 @@ def run_one_cell(
         elif "send_prompts_concurrent" in step:
             _prepare_first_prompt_window()
             params = step["send_prompts_concurrent"]
-            try:
-                batch = send_prompts_concurrent(
-                    client=client,
-                    channel_id=channel_id,
-                    cell=cell,
-                    params=params,
-                )
-            except ConcurrentPromptSendError as error:
-                batch = error.partial_results
-                if batch:
-                    _mark_real_provider_contacted(
-                        record,
-                        declared_agent_mode=declared_agent_mode,
-                        dry_run=dry_run,
-                    )
-                    for _ in batch:
-                        window.mark_prompt_sent()
-                    record.setdefault("concurrent_prompt_batches", []).append(batch)
-                    _update_record_window_snapshot(record, window)
-                    raise ScenarioStepAssertionError(str(error), record=record) from error
-                raise
-            _mark_real_provider_contacted(
-                record,
-                declared_agent_mode=declared_agent_mode,
-                dry_run=dry_run,
+            batch = send_prompts_concurrent(
+                client=client,
+                channel_id=channel_id,
+                cell=cell,
+                params=params,
             )
             for _ in batch:
                 window.mark_prompt_sent()
@@ -3040,34 +2267,18 @@ def run_one_cell(
                     "wait_for_provider_hold_state requires a preceding prompt send "
                     "with a turn identity"
                 )
-            try:
-                record.setdefault("provider_hold_states", []).append(
-                    wait_for_provider_hold_state(
-                        runtime_root=Path(args.queue_runtime_root),
-                        provider=cell_provider(cell),
-                        channel_id=channel_id,
-                        expected_identity=last_turn_identity,
-                        ok_marker=ok_marker,
-                        late_marker=late_marker,
-                        timeout_s=float(params.get("timeout_s", 180)),
-                        poll_interval_s=float(params.get("poll_interval_s", 1)),
-                    )
+            record.setdefault("provider_hold_states", []).append(
+                wait_for_provider_hold_state(
+                    runtime_root=Path(args.queue_runtime_root),
+                    provider=cell_provider(cell),
+                    channel_id=channel_id,
+                    expected_identity=last_turn_identity,
+                    ok_marker=ok_marker,
+                    late_marker=late_marker,
+                    timeout_s=float(params.get("timeout_s", 180)),
+                    poll_interval_s=float(params.get("poll_interval_s", 1)),
                 )
-            except assertions.AssertionError as error:
-                _update_record_window_snapshot(record, window)
-                _refresh_agent_mode_record(
-                    record,
-                    scenario=scenario,
-                    declared_agent_mode=declared_agent_mode,
-                    dry_run=dry_run,
-                )
-                _refresh_coverage_class_record(
-                    record,
-                    scenario=scenario,
-                    declared_coverage_class=declared_coverage_class,
-                    dry_run=dry_run,
-                )
-                raise ScenarioStepAssertionError(str(error), record=record) from error
+            )
         elif "restart_dcserver" in step:
             target = args.restart_target_override or (step["restart_dcserver"] or {}).get(
                 "target", "release"
@@ -3163,8 +2374,7 @@ def run_one_cell(
                 raise assertions.AssertionError(
                     f"send_keys_sequence requires a non-empty keys list: {step!r}"
                 )
-            mark_prompt_sent = bool(params.get("mark_prompt_sent", True))
-            if mark_prompt_sent:
+            if bool(params.get("mark_prompt_sent", True)):
                 window.mark_prompt_sent()
             key_args = [str(key) for key in keys]
             last_sent_prompt = (
@@ -3192,12 +2402,6 @@ def run_one_cell(
                     key_interval_s=key_interval_s,
                 )
             )
-            if mark_prompt_sent:
-                _mark_real_provider_contacted(
-                    record,
-                    declared_agent_mode=declared_agent_mode,
-                    dry_run=dry_run,
-                )
             time.sleep(float(params.get("sleep_s", 0.2)))
         elif "send_keys" in step:
             thread_channel_id = channel_id if scenario.get("requires_thread_channel") else None
@@ -3219,11 +2423,6 @@ def run_one_cell(
                 raise assertions.AssertionError(
                     f"tmux submit failed for session {session_name!r}"
                 )
-            _mark_real_provider_contacted(
-                record,
-                declared_agent_mode=declared_agent_mode,
-                dry_run=dry_run,
-            )
         else:
             raise assertions.AssertionError(f"unknown step shape: {step!r}")
 
@@ -3238,40 +2437,20 @@ def run_one_cell(
 
     _update_record_window_snapshot(record, window)
 
-    try:
-        for assertion_spec in scenario.get("assertions") or []:
-            run_assertion(assertion_spec, window=window, record=record)
-            record["assertions"].append({"spec": assertion_spec, "passed": True})
+    for assertion_spec in scenario.get("assertions") or []:
+        run_assertion(assertion_spec, window=window, record=record)
+        record["assertions"].append({"spec": assertion_spec, "passed": True})
 
-        idle_check = assert_cell_idle(
-            base_url=client.base_url,
-            channel_id=channel_id,
-            cell=cell,
-            runtime_root=Path(args.queue_runtime_root),
-        )
-        record["post_scenario_idle"] = idle_check
-        record["assertions"].append(
-            {
-                "spec": {"post_scenario_cell_idle": True},
-                "passed": True,
-                "details": idle_check,
-            }
-        )
-    except assertions.AssertionError as error:
-        _update_record_window_snapshot(record, window)
-        _refresh_agent_mode_record(
-            record,
-            scenario=scenario,
-            declared_agent_mode=declared_agent_mode,
-            dry_run=dry_run,
-        )
-        _refresh_coverage_class_record(
-            record,
-            scenario=scenario,
-            declared_coverage_class=declared_coverage_class,
-            dry_run=dry_run,
-        )
-        raise ScenarioStepAssertionError(str(error), record=record) from error
+    idle_check = assert_cell_idle(
+        base_url=client.base_url,
+        channel_id=channel_id,
+        cell=cell,
+        runtime_root=Path(args.queue_runtime_root),
+    )
+    record["post_scenario_idle"] = idle_check
+    record["assertions"].append(
+        {"spec": {"post_scenario_cell_idle": True}, "passed": True, "details": idle_check}
+    )
 
     send_teardown_marker(
         client=client,
@@ -3279,18 +2458,6 @@ def run_one_cell(
         scenario_id=str(scenario_id),
         cell=cell,
         run_id=run_id,
-    )
-    _refresh_agent_mode_record(
-        record,
-        scenario=scenario,
-        declared_agent_mode=declared_agent_mode,
-        dry_run=False,
-    )
-    _refresh_coverage_class_record(
-        record,
-        scenario=scenario,
-        declared_coverage_class=declared_coverage_class,
-        dry_run=False,
     )
     return record
 
@@ -3304,29 +2471,10 @@ def run_local_fixture_scenario(
     dry_run: bool,
 ) -> dict[str, Any]:
     scenario_id = str(scenario.get("id"))
-    declared_agent_mode = scenario_agent_mode(scenario)
-    declared_coverage_class = scenario_coverage_class(scenario)
     record: dict[str, Any] = {
         "assertions": [],
         "local_fixture": True,
         "fixture_steps": [],
-        "agent_mode": declared_agent_mode,
-        "agent_mode_actual": "none",
-        "agent_mode_contract": _agent_mode_contract(
-            declared=declared_agent_mode,
-            actual="none",
-            dry_run=dry_run,
-            real_provider_contacted=False,
-        ),
-        "coverage_class": declared_coverage_class,
-        "coverage_class_actual": "fixture",
-        "coverage_class_contract": _coverage_class_contract(
-            declared=declared_coverage_class,
-            actual="fixture",
-            dry_run=dry_run,
-        ),
-        "provider_identity": provider_identity(cell, channel_id),
-        "real_provider_contacted": False,
     }
     if dry_run:
         print(f"[dry-run] {scenario_id} ({cell}): would replay local fixture")
@@ -3745,46 +2893,6 @@ def run_assertion(
         raise assertions.AssertionError(f"unknown assertion: {spec!r}")
 
 
-def agent_mode_totals(results: list[dict[str, Any]]) -> dict[str, int]:
-    totals = {mode: 0 for mode in AGENT_MODES}
-    for result in results:
-        mode = str(result.get("agent_mode") or "")
-        if mode in totals:
-            totals[mode] += 1
-    return totals
-
-
-def coverage_class_totals(results: list[dict[str, Any]]) -> dict[str, int]:
-    totals = {coverage: 0 for coverage in COVERAGE_CLASSES}
-    for result in results:
-        coverage = str(result.get("coverage_class") or "")
-        if coverage in totals:
-            totals[coverage] += 1
-    return totals
-
-
-def coverage_class_violations(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    violations: list[dict[str, Any]] = []
-    for result in results:
-        attribution = result.get("failure_attribution")
-        if not isinstance(attribution, dict):
-            continue
-        if attribution.get("source") != "coverage_class_gate":
-            continue
-        violations.append(
-            {
-                "id": result.get("id"),
-                "cell": result.get("cell"),
-                "provider": result.get("provider"),
-                "runtime": result.get("runtime"),
-                "coverage_class": result.get("coverage_class"),
-                "coverage_class_actual": result.get("coverage_class_actual"),
-                "reason": result.get("reason"),
-            }
-        )
-    return violations
-
-
 def main() -> int:
     args = parse_args()
     cell = args.cell
@@ -3827,16 +2935,7 @@ def main() -> int:
     summary = {
         "run_id": run_id,
         "cell": cell,
-        "provider": cell_provider(cell),
-        "runtime": cell_runtime(cell),
         "channel_id": args.channel_id,
-        "provider_identity": provider_identity(cell, args.channel_id),
-        "agent_mode_totals": agent_mode_totals(results),
-        "coverage_class_totals": coverage_class_totals(results),
-        "coverage_class_violations": coverage_class_violations(results),
-        "real_provider_contacted": any(
-            result.get("real_provider_contacted") is True for result in results
-        ),
         "scenarios": results,
         "totals": {
             "pass": sum(1 for r in results if r["status"] == "pass"),
@@ -3844,7 +2943,7 @@ def main() -> int:
             "skipped": sum(1 for r in results if r["status"] == "skipped"),
         },
     }
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    summary_path.write_text(json.dumps(summary, indent=2))
     print(f"[e2e] report → {summary_path}")
     return 0 if summary["totals"]["fail"] == 0 else 1
 

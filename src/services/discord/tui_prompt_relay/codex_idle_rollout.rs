@@ -1,38 +1,5 @@
 use super::super::{inflight, task_supervisor};
-use super::claude_idle_bridge::compose_tui_idle_response;
 use super::*;
-
-#[cfg(unix)]
-fn advance_codex_tui_runtime_binding_and_marker_offset(
-    tmux_session_name: &str,
-    rollout_path: &std::path::Path,
-    offset: u64,
-) {
-    let rollout_path_str = rollout_path.to_str().unwrap_or_default();
-    if !crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
-        tmux_session_name,
-        rollout_path_str,
-        offset,
-    ) {
-        return;
-    }
-    if let Err(error) =
-        crate::services::codex_tui::session::advance_codex_tui_rollout_marker_start_offset(
-            tmux_session_name,
-            rollout_path,
-            offset,
-        )
-    {
-        tracing::warn!(
-            tmux_session_name,
-            rollout_path = %rollout_path.display(),
-            offset,
-            error,
-            "failed to advance Codex TUI rollout marker cursor"
-        );
-    }
-}
-
 #[cfg(unix)]
 pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
     if CODEX_IDLE_ROLLOUT_RELAY_STARTED.swap(true, Ordering::AcqRel) {
@@ -147,9 +114,9 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                                     );
                                     continue;
                                 }
-                                advance_codex_tui_runtime_binding_and_marker_offset(
+                                crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                                     &tmux_session_name,
-                                    &rollout_path,
+                                    &binding.output_path,
                                     line_end_offset,
                                 );
                                 active_tails.insert(tmux_session_name.clone());
@@ -246,9 +213,9 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                 match scan {
                     CodexIdleRolloutScan::NoPrompt { offset } => {
                         if offset != binding.last_offset {
-                            advance_codex_tui_runtime_binding_and_marker_offset(
+                            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                                 &tmux_session_name,
-                                &rollout_path,
+                                &binding.output_path,
                                 offset,
                             );
                         }
@@ -275,9 +242,9 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                             "codex idle rollout relay observed prompt"
                         );
                         if !codex_idle_prompt_observation_should_tail_response(observation) {
-                            advance_codex_tui_runtime_binding_and_marker_offset(
+                            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                                 &tmux_session_name,
-                                &rollout_path,
+                                &binding.output_path,
                                 line_end_offset,
                             );
                             continue;
@@ -307,9 +274,9 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                         )
                         .await
                         {
-                            advance_codex_tui_runtime_binding_and_marker_offset(
+                            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                                 &tmux_session_name,
-                                &rollout_path,
+                                &binding.output_path,
                                 line_end_offset,
                             );
                             tracing::info!(
@@ -322,9 +289,9 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                             continue;
                         }
                         if !bridge_adapter_owns_external_turn(lease.relay_owner) {
-                            advance_codex_tui_runtime_binding_and_marker_offset(
+                            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                                 &tmux_session_name,
-                                &rollout_path,
+                                &binding.output_path,
                                 line_end_offset,
                             );
                             tracing::debug!(
@@ -339,9 +306,9 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                             continue;
                         }
 
-                        advance_codex_tui_runtime_binding_and_marker_offset(
+                        crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                             &tmux_session_name,
-                            &rollout_path,
+                            &binding.output_path,
                             line_end_offset,
                         );
                         active_tails.insert(tmux_session_name.clone());
@@ -482,9 +449,9 @@ async fn run_codex_idle_response_tail(
     if !has_content {
         let _ = tokio::task::spawn_blocking(move || while reader_rx.recv().is_ok() {}).await;
         if let Ok(Ok(final_offset)) = offset_rx.await {
-            advance_codex_tui_runtime_binding_and_marker_offset(
+            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                 &tmux_session_name,
-                &rollout_path,
+                rollout_path.to_str().unwrap_or_default(),
                 final_offset,
             );
         }
@@ -527,9 +494,9 @@ async fn run_codex_idle_response_tail(
                 delivery_result.is_ok(),
             ) =>
         {
-            advance_codex_tui_runtime_binding_and_marker_offset(
+            crate::services::tui_prompt_dedupe::advance_tmux_runtime_binding_offset(
                 &tmux_session_name,
-                &rollout_path,
+                rollout_path.to_str().unwrap_or_default(),
                 final_offset,
             );
         }
