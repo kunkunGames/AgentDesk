@@ -6196,8 +6196,8 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        if let (Some(db), Some(analysis)) =
-            (None::<&crate::db::Db>, recall_feedback_analysis.as_ref())
+        if let (Some(pg_pool), Some(analysis)) =
+            (shared_owned.pg_pool.as_ref(), recall_feedback_analysis.as_ref())
             && analysis.recall_count > 0
         {
             let stat = crate::db::memento_feedback_stats::MementoFeedbackTurnStat {
@@ -6216,7 +6216,7 @@ pub(super) fn spawn_turn_bridge(
                 )
                 .unwrap_or(i64::MAX),
             };
-            if let Err(error) = crate::db::memento_feedback_stats::upsert_turn_stat(db, &stat) {
+            if let Err(error) = crate::db::memento_feedback_stats::upsert_turn_stat_pg(pg_pool, &stat).await {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::warn!("  [{ts}] ⚠ failed to persist memento feedback stats: {error}");
             }
