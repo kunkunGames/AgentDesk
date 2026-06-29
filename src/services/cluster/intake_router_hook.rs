@@ -533,6 +533,11 @@ async fn try_route_node_override(
                 reason: RanLocalReason::OpenRouteAlreadyExists,
             },
             Some(IntakeInsertConflict::DuplicateMessageAttempt) => {
+                tracing::info!(
+                    channel_id = ctx.channel_id,
+                    user_msg_id = ctx.user_msg_id,
+                    "[intake_router] duplicate Discord message — existing row already covers it; skipping local execution"
+                );
                 IntakeRouterDecision::SkippedDuplicate
             }
             None => IntakeRouterDecision::RanLocal {
