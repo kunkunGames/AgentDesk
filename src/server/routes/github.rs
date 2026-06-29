@@ -5,16 +5,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::Row;
-use std::collections::BTreeSet;
+use sqlx::{PgPool, Row};
 
 use super::AppState;
+use crate::db::kanban::{IssueCardUpsert, upsert_card_from_issue_pg};
 use crate::github;
-use crate::services::github_issue_creation::{
-    GitHubIssueCreateRequest, IssueAnnouncementSync, IssueAnnouncementSyncOptions,
-    IssueCreationError, KanbanCardSync, KanbanCardSyncOptions,
-    create_github_issue_with_side_effects, resolve_known_agent_id_pg,
-};
 
 // ── Body types ─────────────────────────────────────────────────
 
@@ -52,7 +47,6 @@ pub struct CreateIssueBody {
 }
 
 const ISSUE_FORMAT_VERSION: u32 = 1;
-const ISSUE_CREATE_UNSUPPORTED_FEATURES: &[&str] = &["auto_dispatch"];
 
 fn trim_non_empty(value: &str) -> Option<String> {
     let trimmed = value.trim();
@@ -66,39 +60,38 @@ fn normalize_string_list(values: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn normalize_block_on_issue_numbers(body: &CreateIssueBody) -> Result<Vec<i64>, String> {
-    let Some(items) = body.block_on.as_ref() else {
-        return Ok(Vec::new());
-    };
-
-    let mut numbers = BTreeSet::new();
-    for issue_number in items {
-        if *issue_number <= 0 {
-            return Err("block_on issue numbers must be positive".to_string());
-        }
-        numbers.insert(*issue_number);
-    }
-    Ok(numbers.into_iter().collect())
-}
-
-fn issue_metadata_json(labels: &[String], block_on_issue_numbers: &[i64]) -> Option<String> {
+fn labels_metadata_json(labels: &[String]) -> Option<String> {
     let labels = labels
         .iter()
         .filter_map(|label| trim_non_empty(label))
         .collect::<Vec<_>>();
 
-    if labels.is_empty() && block_on_issue_numbers.is_empty() {
+    if labels.is_empty() {
         None
     } else {
-        let mut metadata = serde_json::Map::new();
-        if !labels.is_empty() {
-            metadata.insert("labels".to_string(), json!(labels.join(",")));
-        }
-        if !block_on_issue_numbers.is_empty() {
-            metadata.insert("depends_on".to_string(), json!(block_on_issue_numbers));
-        }
-        Some(serde_json::Value::Object(metadata).to_string())
+        Some(json!({ "labels": labels.join(",") }).to_string())
     }
+}
+
+async fn resolve_known_agent_id_pg(
+    pool: &PgPool,
+    agent_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(agent_id) = agent_id.and_then(trim_non_empty) else {
+        return Ok(None);
+    };
+
+    let exists = sqlx::query_scalar::<_, String>("SELECT id FROM agents WHERE id = $1 LIMIT 1")
+        .bind(&agent_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| format!("resolve agent {agent_id}: {error}"))?;
+
+    if exists.is_none() {
+        tracing::warn!("[issues] ignoring unknown assignee '{agent_id}' for linked kanban card");
+    }
+
+    Ok(exists)
 }
 
 fn resolve_issue_repo(input: &str) -> Result<String, String> {
@@ -155,7 +148,7 @@ fn build_pmd_issue_body(body: &CreateIssueBody) -> Result<String, String> {
         return Err("dod items must be 10 or fewer".to_string());
     }
 
-    let mut dependencies = body
+    let dependencies = body
         .dependencies
         .as_deref()
         .map(|items| {
@@ -165,12 +158,6 @@ fn build_pmd_issue_body(body: &CreateIssueBody) -> Result<String, String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let block_on_issue_numbers = normalize_block_on_issue_numbers(body)?;
-    dependencies.extend(
-        block_on_issue_numbers
-            .into_iter()
-            .map(|issue_number| format!("- #{issue_number}")),
-    );
     let risks = body
         .risks
         .as_deref()
@@ -234,42 +221,7 @@ fn collect_issue_body_validation_errors(body: &CreateIssueBody) -> Vec<String> {
     } else if dod.len() > 10 {
         errors.push("dod items must be 10 or fewer".to_string());
     }
-    if let Err(error) = normalize_block_on_issue_numbers(body) {
-        errors.push(error);
-    }
     errors
-}
-
-fn issue_create_capabilities() -> serde_json::Value {
-    json!({
-        "auto_dispatch": false,
-        "block_on": true,
-        "unsupported_features": ISSUE_CREATE_UNSUPPORTED_FEATURES,
-    })
-}
-
-fn requested_unsupported_issue_create_features(body: &CreateIssueBody) -> Vec<&'static str> {
-    let mut features = Vec::new();
-    if body.auto_dispatch.unwrap_or(false) {
-        features.push("auto_dispatch");
-    }
-    features
-}
-
-fn unsupported_issue_create_warnings(features: &[&str]) -> Vec<String> {
-    features
-        .iter()
-        .map(|feature| {
-            format!("{feature} is reserved and unsupported; non-dry-run issue creation rejects it")
-        })
-        .collect()
-}
-
-fn unsupported_issue_create_error(features: &[&str]) -> String {
-    format!(
-        "unsupported reserved issue-create field(s): {}; send dry_run=true to inspect capabilities before creating an issue",
-        features.join(", ")
-    )
 }
 
 fn issue_validation_error(error: String, dry_run: bool) -> (StatusCode, Json<serde_json::Value>) {
@@ -281,8 +233,6 @@ fn issue_validation_error(error: String, dry_run: bool) -> (StatusCode, Json<ser
                 "dry_run": true,
                 "error": error,
                 "validation_warnings": [warning],
-                "capabilities": issue_create_capabilities(),
-                "unsupported_features": [],
             })),
         )
     } else {
@@ -301,20 +251,42 @@ pub async fn create_issue(
     Json(body): Json<CreateIssueBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let dry_run = body.dry_run.unwrap_or(false);
-    let unsupported_features = requested_unsupported_issue_create_features(&body);
-    if !dry_run && !unsupported_features.is_empty() {
+    if body.auto_dispatch.unwrap_or(false) {
+        if dry_run {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "dry_run": true,
+                    "error": "auto_dispatch is not implemented yet",
+                })),
+            );
+        }
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": unsupported_issue_create_error(&unsupported_features),
-                "capabilities": issue_create_capabilities(),
-                "unsupported_features": unsupported_features,
-            })),
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "auto_dispatch is not implemented yet"})),
+        );
+    }
+    if body
+        .block_on
+        .as_ref()
+        .is_some_and(|items| !items.is_empty())
+    {
+        if dry_run {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "dry_run": true,
+                    "error": "block_on is not implemented yet",
+                })),
+            );
+        }
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"error": "block_on is not implemented yet"})),
         );
     }
 
     if dry_run {
-        let unsupported_feature_warnings = unsupported_issue_create_warnings(&unsupported_features);
         let mut validation_warnings = Vec::new();
         let repo = match resolve_issue_repo(&body.repo) {
             Ok(repo) => Some(repo),
@@ -327,23 +299,18 @@ pub async fn create_issue(
             validation_warnings.push("title is required".to_string());
         }
         validation_warnings.extend(collect_issue_body_validation_errors(&body));
-        let block_on_issue_numbers = normalize_block_on_issue_numbers(&body).unwrap_or_default();
 
         if !validation_warnings.is_empty() {
             let error = validation_warnings
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "validation failed".to_string());
-            validation_warnings.extend(unsupported_feature_warnings);
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({
                     "dry_run": true,
                     "error": error,
                     "validation_warnings": validation_warnings,
-                    "capabilities": issue_create_capabilities(),
-                    "unsupported_features": unsupported_features,
-                    "block_on": block_on_issue_numbers,
                 })),
             );
         }
@@ -370,7 +337,6 @@ pub async fn create_issue(
                 }
             }
         }
-        validation_warnings.extend(unsupported_feature_warnings);
         let announcement_channel_id = body
             .announcement_channel_id
             .as_deref()
@@ -393,9 +359,6 @@ pub async fn create_issue(
                 "applied_labels": applied_labels,
                 "rendered_body": issue_body,
                 "validation_warnings": validation_warnings,
-                "capabilities": issue_create_capabilities(),
-                "unsupported_features": unsupported_features,
-                "block_on": block_on_issue_numbers,
                 "issue_format_version": ISSUE_FORMAT_VERSION,
                 // deprecated alias kept for transition; remove after clients migrate
                 "pmd_format_version": ISSUE_FORMAT_VERSION,
@@ -415,10 +378,6 @@ pub async fn create_issue(
         Ok(issue_body) => issue_body,
         Err(error) => return issue_validation_error(error, dry_run),
     };
-    let block_on_issue_numbers = match normalize_block_on_issue_numbers(&body) {
-        Ok(block_on_issue_numbers) => block_on_issue_numbers,
-        Err(error) => return issue_validation_error(error, dry_run),
-    };
 
     let applied_labels = body
         .agent_id
@@ -427,46 +386,157 @@ pub async fn create_issue(
         .map(|agent_id| vec![format!("agent:{agent_id}")])
         .unwrap_or_default();
 
-    let issue_create_request = GitHubIssueCreateRequest::new(
-        "api_github_issues_create",
-        repo.clone(),
-        title.clone(),
-        issue_body.clone(),
-    )
-    .with_labels(applied_labels.clone())
-    .with_kanban(KanbanCardSync::enabled(KanbanCardSyncOptions {
-        agent_id: body.agent_id.as_deref().and_then(trim_non_empty),
-        metadata_json: issue_metadata_json(&applied_labels, &block_on_issue_numbers),
-        status_on_create: Some("backlog".to_string()),
-    }))
-    .with_announcement(IssueAnnouncementSync::enabled(
-        IssueAnnouncementSyncOptions {
-            agent_id: body.agent_id.as_deref().and_then(trim_non_empty),
-            announcement_channel_id: body
-                .announcement_channel_id
-                .as_deref()
-                .and_then(trim_non_empty),
-            complete_if_closed: true,
-        },
-    ));
+    if !github::gh_available() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "gh CLI is not available on this system"})),
+        );
+    }
 
-    match create_github_issue_with_side_effects(state.pg_pool_ref(), issue_create_request).await {
-        Ok(result) => {
-            let issue = result.issue;
-            let kanban = result.kanban;
-            let announcement = result.announcement;
-            let kanban_card_id = kanban.card_id.clone();
-            let kanban_card_sync_error = kanban.error.clone();
-            let announcement_channel_id = announcement.channel_id.clone();
-            let announcement_message_id = announcement.message_id.clone();
-            let announcement_sync_error = announcement.error.clone();
+    match github::create_issue_with_labels(&repo, &title, &issue_body, &applied_labels).await {
+        Ok(created) => {
+            let metadata_json = labels_metadata_json(&applied_labels);
+            let (kanban_card_id, kanban_card_sync_error) = if let Some(pool) = state.pg_pool_ref() {
+                let assigned_agent_id = match resolve_known_agent_id_pg(
+                    pool,
+                    body.agent_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(agent_id) => agent_id,
+                    Err(error) => {
+                        tracing::error!(
+                            "[issues] created GitHub issue {}#{} but failed to resolve assignee: {}",
+                            repo,
+                            created.number,
+                            error
+                        );
+                        return (
+                            StatusCode::CREATED,
+                            Json(json!({
+                                "issue": {
+                                    "number": created.number,
+                                    "url": created.url,
+                                    "repo": repo,
+                                },
+                                "kanban_card_id": serde_json::Value::Null,
+                                "kanban_card_sync_error": error,
+                                "applied_labels": applied_labels,
+                                "issue_format_version": ISSUE_FORMAT_VERSION,
+                                // deprecated alias kept for transition; remove after clients migrate
+                                "pmd_format_version": ISSUE_FORMAT_VERSION,
+                            })),
+                        );
+                    }
+                };
+                match upsert_card_from_issue_pg(
+                    pool,
+                    IssueCardUpsert {
+                        repo_id: repo.clone(),
+                        issue_number: created.number,
+                        issue_url: Some(created.url.clone()),
+                        title: title.clone(),
+                        description: Some(issue_body.clone()),
+                        priority: None,
+                        assigned_agent_id,
+                        metadata_json: metadata_json.clone(),
+                        status_on_create: Some("backlog".to_string()),
+                    },
+                )
+                .await
+                {
+                    Ok(upserted) => (Some(upserted.card_id), None),
+                    Err(error) => {
+                        tracing::error!(
+                            "[issues] created GitHub issue {}#{} but failed to sync kanban card: {}",
+                            repo,
+                            created.number,
+                            error
+                        );
+                        (None, Some(error))
+                    }
+                }
+            } else {
+                (None, Some("postgres pool unavailable".to_string()))
+            };
+            let (announcement_channel_id, announcement_message_id, announcement_sync_error) =
+                if let Some(pool) = state.pg_pool_ref() {
+                    match crate::services::issue_announcements::create_issue_announcement_pg(
+                        pool,
+                        crate::services::issue_announcements::IssueAnnouncementCreate {
+                            repo: repo.clone(),
+                            issue_number: created.number,
+                            issue_url: created.url.clone(),
+                            title: title.clone(),
+                            agent_id: body.agent_id.as_deref().and_then(trim_non_empty),
+                            announcement_channel_id: body
+                                .announcement_channel_id
+                                .as_deref()
+                                .and_then(trim_non_empty),
+                        },
+                    )
+                    .await
+                    {
+                        Ok(Some(announcement)) => {
+                            if matches!(
+                                github::issue_state(&repo, created.number).as_deref(),
+                                Ok("CLOSED")
+                            ) {
+                                if let Err(error) =
+                                    crate::services::issue_announcements::complete_issue_announcement_pg(
+                                        pool,
+                                        crate::services::issue_announcements::IssueCompletionEvent {
+                                            repo: repo.clone(),
+                                            issue_number: created.number,
+                                            title: Some(title.clone()),
+                                            kind: crate::services::issue_announcements::IssueCompletionKind::Closed,
+                                            pr_number: None,
+                                            pr_url: None,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "[issues] immediate completion announcement edit failed for {}#{}: {}",
+                                        repo,
+                                        created.number,
+                                        error
+                                    );
+                                }
+                            }
+                            (
+                                Some(announcement.channel_id),
+                                Some(announcement.message_id),
+                                None,
+                            )
+                        }
+                        Ok(None) => (None, None, None),
+                        Err(error) => {
+                            tracing::warn!(
+                                "[issues] created GitHub issue {}#{} but failed to announce: {}",
+                                repo,
+                                created.number,
+                                error
+                            );
+                            (None, None, Some(error))
+                        }
+                    }
+                } else if body.announcement_channel_id.as_ref().is_some() {
+                    (
+                        None,
+                        None,
+                        Some("postgres pool unavailable for issue announcement".to_string()),
+                    )
+                } else {
+                    (None, None, None)
+                };
 
             (
                 StatusCode::CREATED,
                 Json(json!({
                     "issue": {
-                        "number": issue.number,
-                        "url": issue.url,
+                        "number": created.number,
+                        "url": created.url,
                         "repo": repo,
                     },
                     "kanban_card_id": kanban_card_id,
@@ -474,296 +544,17 @@ pub async fn create_issue(
                     "announcement_channel_id": announcement_channel_id,
                     "announcement_message_id": announcement_message_id,
                     "announcement_sync_error": announcement_sync_error,
-                    "applied_labels": result.applied_labels,
-                    "block_on": block_on_issue_numbers,
-                    "issue_creation_origin": result.origin,
-                    "issue_creation_mode": result.mode,
-                    "kanban_card_sync": kanban,
-                    "announcement_sync": announcement,
+                    "applied_labels": applied_labels,
                     "issue_format_version": ISSUE_FORMAT_VERSION,
                     // deprecated alias kept for transition; remove after clients migrate
                     "pmd_format_version": ISSUE_FORMAT_VERSION,
                 })),
             )
         }
-        Err(IssueCreationError::GhUnavailable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "gh CLI is not available on this system"})),
-        ),
-        Err(IssueCreationError::GitHub(error)) => (
+        Err(error) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": format!("gh issue create failed: {error}")})),
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsString;
-    use std::sync::Arc;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    fn test_state() -> AppState {
-        let config = crate::config::Config::default();
-        let tx = crate::server::ws::new_broadcast();
-        let buf = crate::server::ws::spawn_batch_flusher(tx.clone());
-        AppState {
-            pg_pool: None,
-            engine: crate::engine::PolicyEngine::new(&config).expect("test policy engine"),
-            config: Arc::new(config),
-            broadcast_tx: tx,
-            batch_buffer: buf,
-            health_registry: None,
-            cluster_instance_id: None,
-        }
-    }
-
-    fn base_issue_body() -> CreateIssueBody {
-        CreateIssueBody {
-            repo: "ADK".to_string(),
-            title: "Test issue".to_string(),
-            background: "Background".to_string(),
-            content: vec!["Do the thing".to_string()],
-            dod: vec!["It works".to_string()],
-            agent_id: None,
-            dependencies: None,
-            risks: None,
-            hints: None,
-            auto_dispatch: None,
-            block_on: None,
-            announcement_channel_id: None,
-            dry_run: None,
-        }
-    }
-
-    fn fake_gh_path(dir: &std::path::Path) -> std::path::PathBuf {
-        #[cfg(windows)]
-        {
-            dir.join("gh.ps1")
-        }
-        #[cfg(not(windows))]
-        {
-            dir.join("gh")
-        }
-    }
-
-    fn install_fake_gh(dir: &std::path::Path, fail_create: bool) -> std::path::PathBuf {
-        let path = fake_gh_path(dir);
-        #[cfg(windows)]
-        let script = if fail_create {
-            r#"
-param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
-if ($Rest[0] -eq "--version") { Write-Output "gh version 2.0.0"; exit 0 }
-if ($Rest[0] -eq "issue" -and $Rest[1] -eq "create") { Write-Error "boom"; exit 7 }
-Write-Error "unexpected gh args: $Rest"; exit 2
-"#
-        } else {
-            r#"
-param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
-if ($Rest[0] -eq "--version") { Write-Output "gh version 2.0.0"; exit 0 }
-if ($Rest[0] -eq "issue" -and $Rest[1] -eq "create") { Write-Output "https://github.com/itismyfield/AgentDesk/issues/4242"; exit 0 }
-Write-Error "unexpected gh args: $Rest"; exit 2
-"#
-        };
-        #[cfg(not(windows))]
-        let script = if fail_create {
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'gh version 2.0.0'; exit 0; fi\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"create\" ]; then echo 'boom' >&2; exit 7; fi\necho \"unexpected gh args: $*\" >&2\nexit 2\n"
-        } else {
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'gh version 2.0.0'; exit 0; fi\nif [ \"$1\" = \"issue\" ] && [ \"$2\" = \"create\" ]; then echo 'https://github.com/itismyfield/AgentDesk/issues/4242'; exit 0; fi\necho \"unexpected gh args: $*\" >&2\nexit 2\n"
-        };
-        std::fs::write(&path, script).expect("write fake gh script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&path)
-                .expect("stat fake gh")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions).expect("chmod fake gh");
-        }
-        path
-    }
-
-    #[tokio::test]
-    async fn create_issue_dry_run_reports_reserved_feature_capabilities_without_failing() {
-        let mut body = base_issue_body();
-        body.auto_dispatch = Some(true);
-        body.block_on = Some(vec![3718]);
-        body.dry_run = Some(true);
-
-        let (status, Json(response)) = create_issue(State(test_state()), Json(body)).await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["dry_run"], true);
-        assert_eq!(response["unsupported_features"], json!(["auto_dispatch"]));
-        assert_eq!(response["block_on"], json!([3718]));
-        assert_eq!(response["capabilities"]["auto_dispatch"], false);
-        assert_eq!(response["capabilities"]["block_on"], true);
-        assert_eq!(
-            response["capabilities"]["unsupported_features"],
-            json!(["auto_dispatch"])
-        );
-        assert!(
-            response["validation_warnings"]
-                .as_array()
-                .expect("warnings must be an array")
-                .iter()
-                .any(|warning| warning
-                    .as_str()
-                    .is_some_and(|message| message.contains("auto_dispatch is reserved"))),
-            "dry_run must expose unsupported reserved-field warnings: {response}"
-        );
-        assert!(response["rendered_body"].is_string());
-    }
-
-    #[test]
-    fn block_on_renders_dependency_section_and_kanban_metadata() {
-        let mut body = base_issue_body();
-        body.agent_id = Some("project-agentdesk".to_string());
-        body.block_on = Some(vec![42, 7, 42]);
-
-        let rendered = build_pmd_issue_body(&body).expect("issue body should render");
-        assert!(rendered.contains("## 의존성"));
-        assert!(rendered.contains("- #7"));
-        assert!(rendered.contains("- #42"));
-
-        let dependencies =
-            normalize_block_on_issue_numbers(&body).expect("block_on should normalize");
-        assert_eq!(dependencies, vec![7, 42]);
-        let metadata = issue_metadata_json(&["agent:project-agentdesk".to_string()], &dependencies)
-            .expect("metadata should exist");
-        let metadata: serde_json::Value =
-            serde_json::from_str(&metadata).expect("metadata should be JSON");
-        assert_eq!(metadata["labels"], "agent:project-agentdesk");
-        assert_eq!(metadata["depends_on"], json!([7, 42]));
-    }
-
-    #[test]
-    fn block_on_rejects_non_positive_issue_numbers() {
-        let mut body = base_issue_body();
-        body.block_on = Some(vec![0]);
-
-        assert_eq!(
-            normalize_block_on_issue_numbers(&body),
-            Err("block_on issue numbers must be positive".to_string())
-        );
-        assert_eq!(
-            build_pmd_issue_body(&body),
-            Err("block_on issue numbers must be positive".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn create_issue_rejects_reserved_fields_without_gh_side_effects() {
-        let mut body = base_issue_body();
-        body.auto_dispatch = Some(true);
-
-        let (status, Json(response)) = create_issue(State(test_state()), Json(body)).await;
-
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(response["unsupported_features"], json!(["auto_dispatch"]));
-        assert_eq!(response["capabilities"]["auto_dispatch"], false);
-        assert!(
-            response["error"]
-                .as_str()
-                .is_some_and(|message| message.contains("unsupported reserved issue-create")),
-            "non-dry-run unsupported fields must fail as a contract error: {response}"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_issue_non_dry_run_maps_shared_service_success_response() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock");
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let fake_gh = install_fake_gh(temp.path(), false);
-        let _gh_guard = EnvVarGuard::set("AGENTDESK_GH_PATH", &fake_gh);
-        let mut body = base_issue_body();
-        body.agent_id = Some("project-agentdesk".to_string());
-        body.block_on = Some(vec![7, 42]);
-
-        let (status, Json(response)) = create_issue(State(test_state()), Json(body)).await;
-
-        assert_eq!(status, StatusCode::CREATED, "{response}");
-        assert_eq!(response["issue"]["number"], json!(4242));
-        assert_eq!(
-            response["issue"]["url"],
-            json!("https://github.com/itismyfield/AgentDesk/issues/4242")
-        );
-        assert_eq!(
-            response["applied_labels"],
-            json!(["agent:project-agentdesk"])
-        );
-        assert_eq!(response["block_on"], json!([7, 42]));
-        assert_eq!(
-            response["issue_creation_origin"],
-            json!("api_github_issues_create")
-        );
-        assert_eq!(response["issue_creation_mode"], json!("standard"));
-        assert_eq!(
-            response["kanban_card_sync_error"],
-            json!("postgres pool unavailable")
-        );
-        assert_eq!(response["kanban_card_sync"]["enabled"], json!(true));
-        assert_eq!(response["announcement_sync"]["enabled"], json!(true));
-        assert_eq!(
-            response["announcement_sync"]["error"],
-            json!("postgres pool unavailable for issue announcement")
-        );
-        assert_eq!(
-            response["announcement_sync_error"],
-            json!("postgres pool unavailable for issue announcement")
-        );
-    }
-
-    #[tokio::test]
-    async fn create_issue_non_dry_run_maps_shared_service_github_failure() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock");
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let fake_gh = install_fake_gh(temp.path(), true);
-        let _gh_guard = EnvVarGuard::set("AGENTDESK_GH_PATH", &fake_gh);
-
-        let (status, Json(response)) =
-            create_issue(State(test_state()), Json(base_issue_body())).await;
-
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(
-            response["error"]
-                .as_str()
-                .is_some_and(|message| message.contains("gh issue create failed")),
-            "shared service GitHub errors must map to BAD_GATEWAY: {response}"
-        );
-        assert!(
-            response["error"]
-                .as_str()
-                .is_some_and(|message| message.contains("boom")),
-            "fake gh stderr should be preserved in the route error: {response}"
-        );
     }
 }
 

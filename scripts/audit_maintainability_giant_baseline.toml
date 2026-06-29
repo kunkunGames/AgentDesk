@@ -193,11 +193,7 @@
 # #3557 (A): per-turn hard-ceiling backstop helpers (turn_hard_ceiling_timeout,
 # codex_turn_hard_ceiling_timeout, turn_hard_ceiling_deadline_ms,
 # clamp_auto_extend_deadline_ms) + their unit tests. +55 prod LoC. 4056 -> 4111.
-# #3856/#3854 merge train: prompt-relay and inflight helper decomposition changed
-# the module inventory surface while shrinking `tui_prompt_relay.rs` below the
-# giant threshold; refresh the frozen parent-module count so script checks reflect
-# current main.
-"src/services/discord/mod.rs" = 4147
+"src/services/discord/mod.rs" = 4111
 # #3305: the local-only pass-through lifecycle-skip (kind hoist + note-only return
 # branch + idle-loop skip) is offset by comment dedup in the same root, lowering the
 # frozen baseline 5438 -> 5429 (-9). Locks in the shrink win (#3028 ratchet).
@@ -227,12 +223,7 @@
 # verbatim to `tui_prompt_relay/launch_script.rs` (107 prod LoC, below the giant
 # threshold), reached via re-import so the call sites stay byte-identical. Lowers
 # the frozen baseline 4458 -> 4376 (-82). Locks in the shrink win (zero logic change).
-# #3833 (behavior-preserving decomposition): external-input ownership,
-# synthetic-start, and Claude idle-tail/runtime/bridge clusters moved into
-# `tui_prompt_relay/` child modules. The root drops below the prod-giant
-# threshold, but keep a sub-threshold frozen ceiling so re-inflation trips this
-# gate if it crosses 1000 prod LoC again.
-"src/services/discord/tui_prompt_relay.rs" = 999
+"src/services/discord/tui_prompt_relay.rs" = 4574
 # #3038: lowered 4728 -> 4657 (-71) as `SensitivityState` (definition + impl)
 # moved to the `voice_sensitivity` sibling module. Locks in the shrink win.
 # #3038 VoiceBargeInRuntime S1: lowered 4657 -> 4350 (-307) as the STT
@@ -314,9 +305,7 @@
 # ownerless-inflight recovery predicates (phase_policy/relay_recovery/relay_health).
 # Hotfix was deployed via direct push to main and bypassed CI, so this baseline
 # re-inflation surfaced only when PR #3655 (which bases on it) ran the gate.
-# #3856 split moved TUI prompt relay external-input recovery support into this
-# existing tracked surface; refresh baseline to current main after the merge.
-"src/services/discord/recovery_engine.rs" = 3899
+"src/services/discord/recovery_engine.rs" = 3438
 # #3034 batch-8: lowered 3771 -> 3770 (dead-code removal).
 # #3038 S1: +1 (3770 -> 3771) for the mechanical `shared.queued_placeholders` ->
 # `shared.queued.queued_placeholders` re-wire (one extra method-chain line) forced
@@ -489,10 +478,8 @@
 # changed; only the warm placeholder-sweeper carries the liveness gate (never the
 # boot path) so a freshly-restarted live watcher is never false-classified as dead.
 # Tests live in the excluded `rebind_origin_reap_tests` module.
-"src/services/discord/inflight.rs" = 3138 # #3680 relay recovery review hardening / adoption guards
-# #3779 extracted relay-recovery auto-heal attempt accounting to a sibling
-# module, dropping relay_recovery.rs below the prod-giant threshold; the ratchet
-# entry is retired instead of raising the baseline.
+"src/services/discord/inflight.rs" = 3180 # #3680 relay recovery review hardening / adoption guards
+"src/services/discord/relay_recovery.rs" = 1008 # #3680 ownerless relay recovery reattach
 # #3038 Phase A: health.rs decomposed into health/ directory modules (root 402
 # prod LoC + 6 sub-1000-LoC submodules) — dropped below the giant threshold, so
 # its ratchet entry is deleted (win; no baseline raises).
@@ -527,9 +514,9 @@
 "src/services/discord/tmux.rs" = 2049
 # completion_guard.rs decomposed in #3479 (1834 -> 872 prod LoC); dropped below
 # the giant threshold, so its ratchet baseline is retired (no longer tracked).
-# session_runtime.rs decomposed in #3842 (worktree, restore_cwd, and
-# channel_routing child modules); dropped below the giant threshold, so its
-# ratchet baseline is retired.
+# #3034 batch-8: lowered 1781 -> 1753 (deleted the dead `assistant_turns` turn-cap
+# tracker — field + 3 methods + construction sites).
+"src/services/discord/session_runtime.rs" = 1753
 # #3034 batch-8: +1 for a test-only `#[allow(dead_code)]` on
 # `session_bound_terminal_delivery_route_decision` (#3041 route decision, tested).
 # #3610 PR-1: 1731 -> 1738 — pass terminal anchor (current_msg_id) explicitly to

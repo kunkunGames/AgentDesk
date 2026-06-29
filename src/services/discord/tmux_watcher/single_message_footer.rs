@@ -2,26 +2,6 @@
 
 use super::*;
 
-pub(super) fn make_owner(
-    identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
-    started_at_unix: i64,
-) -> crate::services::discord::single_message_panel::CompletionFooterOwner {
-    crate::services::discord::single_message_panel::CompletionFooterOwner::new(
-        identity.map(|identity| identity.user_msg_id).unwrap_or(0),
-        started_at_unix,
-    )
-}
-
-pub(super) fn make_owner_now(
-    identity: Option<&crate::services::discord::inflight::InflightTurnIdentity>,
-) -> (
-    i64,
-    crate::services::discord::single_message_panel::CompletionFooterOwner,
-) {
-    let started_at_unix = chrono::Utc::now().timestamp();
-    (started_at_unix, make_owner(identity, started_at_unix))
-}
-
 pub(super) fn watcher_single_message_panel_footer_enabled(status_panel_v2_enabled: bool) -> bool {
     footer_mode_enabled(
         crate::services::discord::single_message_panel_enabled(),
@@ -232,7 +212,6 @@ pub(super) async fn complete_watcher_single_message_completion_footer(
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
     terminal_msg_id: Option<serenity::MessageId>,
-    owner: crate::services::discord::single_message_panel::CompletionFooterOwner,
     provider: &ProviderKind,
     _started_at_unix: i64,
     terminal_text: &str,
@@ -251,10 +230,9 @@ pub(super) async fn complete_watcher_single_message_completion_footer(
         return true;
     };
     if let Some(edit) =
-        crate::services::discord::single_message_panel::register_completion_footer_target_for_owner(
+        crate::services::discord::single_message_panel::register_completion_footer_target(
             channel_id,
             msg_id,
-            owner,
             provider,
             chrono::Utc::now().timestamp(),
             terminal_text,
@@ -288,18 +266,6 @@ pub(super) async fn complete_watcher_single_message_completion_footer(
     else {
         return true;
     };
-    let inflight = crate::services::discord::turn_end_wip_warning::load_matching_inflight_state(
-        provider,
-        channel_id,
-        Some(owner.user_msg_id),
-    );
-    let _ = crate::services::discord::turn_end_wip_warning::warn_turn_end_wip_with_http(
-        http,
-        channel_id,
-        inflight.as_ref(),
-        "tmux_watcher_single_message_footer",
-    )
-    .await;
     rate_limit_wait(shared, channel_id).await;
     let edited = match crate::services::discord::http::edit_channel_message(
         http, channel_id, msg_id, &finalized,
@@ -317,20 +283,15 @@ pub(super) async fn complete_watcher_single_message_completion_footer(
             false
         }
     };
-    let recorded =
-        crate::services::discord::single_message_panel::completion_footer_record_committed_text_result_for_owner(
+    crate::services::discord::single_message_panel::completion_footer_record_edit_result(
         channel_id,
-        msg_id,
-        owner,
         !rendered.has_unfinished_entries,
         edited,
-        &finalized,
-        rendered.block.as_deref(),
     );
     // #3391: the finalize edit delivered this render's terminal marks once;
     // evict those slot identities so subsequent footer renders (incl. #3386
     // migration) drop the completed task AND subagent entries.
-    if edited && recorded {
+    if edited {
         shared
             .ui
             .placeholder_live_events
@@ -339,16 +300,14 @@ pub(super) async fn complete_watcher_single_message_completion_footer(
     edited
 }
 
-pub(super) async fn supersede_watcher_footer(
+pub(super) async fn supersede_watcher_registered_completion_footer(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     channel_id: ChannelId,
-    owner: crate::services::discord::single_message_panel::CompletionFooterOwner,
 ) -> bool {
     let Some(edit) =
-        crate::services::discord::single_message_panel::completion_footer_supersede_registered_target_for_owner(
+        crate::services::discord::single_message_panel::completion_footer_supersede_registered_target(
             channel_id,
-            Some(owner),
         )
     else {
         return false;
@@ -391,11 +350,6 @@ pub(super) async fn refresh_watcher_registered_completion_footer(
         return false;
     };
     rate_limit_wait(shared, channel_id).await;
-    if !crate::services::discord::single_message_panel::completion_footer_edit_still_registered(
-        channel_id, &edit,
-    ) {
-        return false;
-    }
     let edited = match crate::services::discord::http::edit_channel_message(
         http,
         channel_id,
@@ -449,10 +403,6 @@ pub(super) async fn complete_watcher_terminal_footer_or_status_panel(
                 text: last_edit_text.to_string(),
             });
         let target = terminal_target.or(fallback_target);
-        let owner = crate::services::discord::single_message_panel::CompletionFooterOwner::new(
-            status_panel_completion_user_msg_id.unwrap_or(0),
-            started_at_unix,
-        );
         let indicator =
             crate::services::discord::single_message_panel::single_message_panel_spinner_frame(
                 *spin_idx,
@@ -463,7 +413,6 @@ pub(super) async fn complete_watcher_terminal_footer_or_status_panel(
             shared,
             channel_id,
             target.as_ref().map(|target| target.msg_id),
-            owner,
             provider,
             started_at_unix,
             target

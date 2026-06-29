@@ -27,18 +27,9 @@ Last refreshed: 2026-06-16 (against `main` @ `8ec7336e32eb6ef89e1143fab2543f2fc6
 >
 > Last refreshed: 2026-06-20 (#3610 PR-1d — watcher legacy long-chunk arm now also records a durable terminal delivery. The same `record_long_chunk_terminal_delivery` helper in `outbound/delivery_record.rs` is now reached from the watcher long-chunk fallback (`tmux_watcher::terminal_send`, the `watcher_should_send_ordered_new_chunks_for_terminal_fallback` path that A4 EXCLUDES from the bridge controller), which is the arm that watcher-owned sessions — `relay_owner_kind=watcher`, the production majority — actually take for long messages. Same M4 gate: the call lives in that arm's `if committed && Delivered` success branch, so it fires only when the in-memory advance succeeded. Anchor is the last-chunk `message_ids.last()` msg_id (placeholders dropped → range-only), same-channel (frontier key = delivery = `channel_id`), range = (`watcher_lease_start`, `watcher_lease_end`); dedup byte-0. Recording logic mirrors the bridge sibling; `tmux_watcher.rs` only wires the anchor through. No outbound API / callsite-map change).
 >
-> Last refreshed: 2026-06-20 (#3610 PR-2 + codex r2 — adds a READ-ONLY recovery anchor reader, now housed in `outbound/delivery_frontier_probe.rs`: `current_generation_delivered_anchor(provider, channel, tmux_session_name) -> Option<CurrentGenerationAnchor>` (and its path-based core `…_at`), returning the durable `delivered_frontier`'s `(panel_msg_id, panel_channel_id, range)` ONLY when (a) the #1270 generation gate passes and (b) the anchor pair is fully populated/non-zero. It is the structural stale-anchor guard for the default-OFF `recovery_paths/restart.rs::try_recover_anchor_repost` fallback (#3607 "committed-then-gone" repost); it NEVER writes and resolves NO new offset, so it adds no new dedup writer. codex r2 follow-ups touch ONLY non-outbound files: (Issue-2 storm guard) the committed-branch dispose in `recovery_engine.rs` passes `tmux_alive = false` so a repeatedly-transient send-new is budget-bounded rather than pane-preserved forever; (Issue-1) `restart.rs` documents that this reader is keyed by `state.channel_id` (delivery channel) so the bridge-reused-watcher CROSS-channel case (owner ≠ delivery; frontier file keyed by `watcher_owner_channel_id`) is a known coverage gap — a missed repost, never a mis-repost — pending owner-channel persistence on the inflight row. No change to the read/write callsite map or outbound delivery semantics).
+> Last refreshed: 2026-06-20 (#3610 PR-2 + codex r2 — adds a READ-ONLY recovery anchor reader to `outbound/delivery_record.rs`: `current_generation_delivered_anchor(provider, channel, tmux_session_name) -> Option<CurrentGenerationAnchor>` (and its path-based core `…_at`), returning the durable `delivered_frontier`'s `(panel_msg_id, panel_channel_id, range)` ONLY when (a) the #1270 generation gate passes and (b) the anchor pair is fully populated/non-zero. It is the structural stale-anchor guard for the default-OFF `recovery_paths/restart.rs::try_recover_anchor_repost` fallback (#3607 "committed-then-gone" repost); it NEVER writes and resolves NO new offset, so it adds no new dedup writer. codex r2 follow-ups touch ONLY non-outbound files: (Issue-2 storm guard) the committed-branch dispose in `recovery_engine.rs` passes `tmux_alive = false` so a repeatedly-transient send-new is budget-bounded rather than pane-preserved forever; (Issue-1) `restart.rs` documents that this reader is keyed by `state.channel_id` (delivery channel) so the bridge-reused-watcher CROSS-channel case (owner ≠ delivery; frontier file keyed by `watcher_owner_channel_id`) is a known coverage gap — a missed repost, never a mis-repost — pending owner-channel persistence on the inflight row. No change to the read/write callsite map or outbound delivery semantics).
 >
 > Last refreshed: 2026-06-26 (#3709/#3710 — TUI-direct bridge long terminal relay now calls the explicit long-message-with-rollback gateway method instead of falling through the single-message trait default. The trait default itself now splits and rolls back partial chunks for custom test gateways. `turn_bridge/mod.rs` completion logging remains blocked until terminal delivery is committed, so a placeholder-only `RejectOverLimit` failure can no longer be logged as a completed relay. No v3 outbound API shape or durable delivery-record writer changed).
->
-> Last refreshed: 2026-06-28 (#3746 — release health now reports the delivery-record rollout mode as `delivery_record_rollout`: shadow flag state, authority flag state, effective dedup authority, same-turn backward-write enforcement mode, and configuration warning count. This is read-only visibility; `AGENTDESK_DELIVERY_RECORD_AUTHORITY=OFF` still means `effective_committed_offset` uses the in-memory committed offset and the same-turn backward-write guard remains observe-only. Synthetic-resume paths that intentionally read the current-generation durable frontier flag-independently are unchanged).
->
-> Last refreshed: 2026-06-28 (#3751 — `InflightTurnState` still carries `watcher_owner_channel_id` for same-binary fast reads, but the mixed-binary-safe source of restart recovery is the separate `discord_delivery_owner_context` sidecar stored under the delivery channel. `recovery_paths/restart.rs::try_recover_anchor_repost` first resolves that sidecar delivery-channel → watcher-owner mapping, falls back to the inflight field / `state.channel_id` for legacy rows, and rejects shared-owner stale anchors whose recorded `panel_channel_id` does not match the recovered delivery channel or whose range starts at/after the row's `last_offset`. `logical_channel_id` remains a thread-parent axis and is explicitly not used for delivery-record lookup. The repost target still comes from recorded `panel_channel_id`; stale-generation and `MessageGone` guards are unchanged).
->
-> Last refreshed: 2026-06-29 (#3807 — manual notification over-limit chunk delivery now wraps `split_message` output with compact continuation context markers, matching the other long-message split paths. This is still the existing compatibility chunk shim in `outbound/manual_delivery.rs`; no v3 outbound API shape, dedup writer, attachment policy, or direct-send inventory category changed).
-> Last refreshed: 2026-06-29 (#3872 — long-message split paths removed visible `[n/m]` continuation markers while preserving ordered chunk delivery and existing rollback/delivery-confirmation semantics. No v3 outbound API shape, attachment policy, or direct-send inventory category changed).
->
-> Last refreshed: 2026-06-29 (#3809 — idle-recap relay diagnostics add a READ-ONLY current-generation delivered-frontier report path in `outbound/delivery_frontier_probe.rs`. `outbound/delivery_record.rs` only widens existing internal read primitives (`delivery_record_path`, `read_record_at`, generation guard, generation mtime) so the probe can reuse the same trusted durable frontier without adding a writer, retry, cleanup, delivery API, or direct-send callsite. The production callsite coverage map is unchanged).
 >
 > Companion docs: [`docs/discord-outbound-remaining-producers.md`](../discord-outbound-remaining-producers.md) (#1175 closure), [`docs/source-of-truth.md`](../source-of-truth.md).
 
@@ -131,19 +122,17 @@ These callsites already use the unified delivery engine. Rows marked
 | `src/services/discord/gateway.rs:359` (`send_intake_placeholder`) | `placeholder_sends` (intake) | **migrated_v3**. Posts the `"..."` placeholder before a turn via direct v3. Uses `preserve_inline_content().without_idempotency()` to preserve streaming behavior. |
 | `src/services/discord/gateway.rs:377` (`edit_outbound_message`) | `placeholder_sends` (edit) | **migrated_v3**. Encodes edit through `OutboundOperation::Edit`. |
 | `src/services/discord/gateway.rs:400` (`TurnGateway::{send_message, edit_message}`) | turn-bridge messages/edits | **migrated_v3 transitively via gateway**. Used for handoff, rollover freeze, snapshot, stable update, and terminal edit. |
-| `src/services/discord/router/intake_gate.rs` (`send_reaction_control_reply`) | reaction-control lifecycle replies | **migrated_v3**. Short fixed replies for queued-card POST fallback and duplicate stop now use referenced v3 lifecycle notices. Correlation = `intake-reaction-control:<channel_id>:<message_id>`, semantic = `intake-reaction-control:<channel_id>:<message_id>:<reason_key>`. |
 | `src/services/discord/monitoring_status.rs:115` (`deliver_monitoring_status`) | monitoring status | **migrated_v3**. Status banner send + edit with `preserve_inline_content`; edits use `without_idempotency()`. |
 | `src/services/discord/meeting_orchestrator.rs:754, 796` (`meeting_outbound_message` / edit path) | meeting status / cancel / parse-error | **migrated_v3**. Stable meeting dedup metadata plus `OutboundOperation::Edit`. |
 | `src/services/routines/discord_log.rs:486, 531` (`deliver_or_update_discord_summary`) | routine Discord summary | **migrated_v3**. Uses direct v3 send/edit and disables semantic dedupe for repeated summary writes. |
 | `src/integration_tests/discord_flow/scenarios.rs` (removed in #3035 Phase 1) | integration test harness | Mock-Discord roundtrip for §1.2 validation; legacy-sqlite-only harness deleted. |
 | `src/integration_tests/agents_setup_e2e.rs` (removed in #3035 Phase 1) | integration test | Wizard-ready E2E; legacy-sqlite-only harness deleted. |
 
-Total **direct migrated_v3 production families: 12** (`dispatch_outbox`,
+Total **direct migrated_v3 production families: 11** (`dispatch_outbox`,
 `review_notifications`, final dispatch completion summaries, issue
 announcements, monitoring status, meeting notifications, routine Discord
 summaries, CLI text/DM helper, short manual notifications, short manual DM
-notifications, intake reaction-control replies, and gateway/turn-bridge
-placeholder sends/edits).
+notifications, and gateway/turn-bridge placeholder sends/edits).
 
 No production caller uses the removed legacy facade. Verify with
 `git grep -n 'deliver_outbound' -- src/services src/bin tests`.
@@ -175,9 +164,10 @@ interaction tokens or ephemeral visibility.
 | `src/services/discord/commands/meeting_cmd.rs:33, 42, 83, 97` | `/meeting` ACK | excluded |
 | `src/services/discord/commands/text_commands.rs:1239` | text-command running banner | excluded |
 | `src/services/discord/commands/model_picker.rs:60, 132` | `/model` picker | excluded |
+| `src/services/discord/router/intake_gate.rs:258` | reaction-control reply | excluded — reply with reference inside slash interaction |
 | `src/services/discord/router/intake_gate.rs:960, 1071` | "duplicate-queue" + "drain-pending" notices | candidate — these are bot notifications, not interaction tokens. Triage: **low priority**, very short fixed strings, no length risk. |
 
-Total commands-bucket: **61 callsites**, all explicitly excluded.
+Total commands-bucket: **62 callsites**, all explicitly excluded.
 
 #### B.2 File / attachment uploads
 
@@ -279,7 +269,7 @@ button hits the manual outbound API, which is covered under §3.A
    Remove the manual `/api/discord/send` and `/api/discord/send-dm` over-2k compatibility shims
    once v3 can send multipart attachment payloads or explicitly delegate to a
    chunk/attachment transport variant.
-5. **Direct-send candidates (low priority).** §B.1 remaining duplicate/drain
+5. **Direct-send candidates (low priority).** §B.1
    intake-gate notices, §B.4 tmux lifecycle notices, §B.5 router announces.
    Each is a fixed short string; v3 buys consistent dedup keying.
 6. **Out of scope (separate follow-up issues recommended).**
@@ -306,12 +296,6 @@ button hits the manual outbound API, which is covered under §3.A
   `v3_dm_user_target_resolves_before_posting` verifies `OutboundTarget::DmUser`
   resolves before first post and duplicate replay does not resolve the DM
   channel again.
-- `src/services/discord/outbound/delivery.rs`:
-  `v3_referenced_send_preserves_reference_and_dedupes` verifies referenced v3
-  sends preserve the reply target and duplicate replay avoids a second post.
-- `src/services/discord/outbound/reaction_control.rs`:
-  `reaction_control_reply_ids_are_stable_per_message_and_reason` verifies the
-  reaction-control lifecycle replies keep stable correlation and semantic ids.
 - `src/services/discord/turn_bridge/mod.rs`:
   `final_completion_delivery_stays_blocked_until_terminal_message_commits`
   verifies final completion delivery remains blocked until the terminal Discord
@@ -324,9 +308,6 @@ button hits the manual outbound API, which is covered under §3.A
   `api_send_rejects_user_supplied_voice_delivery_id_namespace` verifies manual
   `/api/discord/send` callers cannot forge the reserved `voice:` correlation
   namespace used by voice announce delivery ids.
-- `src/services/discord/outbound/manual_delivery.rs`:
-  #3807 keeps the manual over-limit notification path on the compatibility
-  chunk shim while adding compact continuation context to each split message.
 
 ## 6. Guardrail proposal (DoD #4)
 

@@ -9,7 +9,6 @@ use crate::services::service_error::{ErrorCode, ServiceError, ServiceResult};
 // migrated from `crate::services::discord_delivery` (the flat path is kept
 // as a re-export in `services/mod.rs` for compatibility).
 pub(crate) mod discord_delivery;
-pub(crate) mod thread_reuse;
 
 // #1730: Claim-owner capability matching and routing diagnostics semantics
 // live in the service layer; DB modules only select/mark/persist.
@@ -20,7 +19,6 @@ pub(crate) mod outbox_claiming;
 // route ↔ service ↔ db boundary.
 pub(crate) mod outbox_queue;
 pub(crate) mod outbox_route;
-pub(crate) mod result_header;
 pub(crate) mod routing_constraint;
 pub(crate) mod wait_queue;
 
