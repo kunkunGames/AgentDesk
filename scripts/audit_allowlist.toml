@@ -52,7 +52,6 @@ direct_discord_sends = [
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:cb8dfde9e6d19e3b",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:edafac97f164fd68",
   "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:b4849c24f5cb7d09",
-  "src/services/discord/turn_bridge/mod.rs#direct_discord_sends:1c6f6dcd93167903",
   # #3560: footer-mode migration reconcile — edits a pre-default-ON *separate*
   # status panel to a migration notice before dropping its handle (behaviorally
   # the same direct resume-notice edit already allowlisted in mod.rs; extracted
