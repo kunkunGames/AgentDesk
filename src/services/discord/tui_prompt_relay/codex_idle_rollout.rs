@@ -1,4 +1,5 @@
 use super::super::{inflight, task_supervisor};
+use super::claude_idle_bridge::compose_tui_idle_response;
 use super::*;
 
 #[cfg(unix)]
