@@ -56,6 +56,8 @@ mod state_extractors;
 // point is re-exported below so external call sites stay byte-identical.
 #[path = "recovery_engine/manual_rebind.rs"]
 mod manual_rebind;
+#[path = "recovery_engine/routing_orphan.rs"] // #3869 routing-orphan finalize
+mod routing_orphan;
 
 // Re-import moved items so existing call sites stay byte-identical.
 use self::jsonl_extract::extract_response_from_output;
@@ -1720,13 +1722,17 @@ pub(super) async fn restore_inflight_turns(
                 provider_channel_name.as_deref(),
                 is_dm,
             ) {
-                if !reason.is_expected_cross_bot_skip() {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!(
-                        "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
-                        state.channel_id,
-                    );
-                }
+                // #3869: orphan→finalize, else preserve (`false` ⇒ suppress expected-skip logs).
+                routing_orphan::route_recovery_skip(
+                    http,
+                    shared,
+                    provider,
+                    &state,
+                    tmux_name.as_deref(),
+                    reason,
+                    false,
+                )
+                .await;
                 continue;
             }
 
@@ -1762,11 +1768,17 @@ pub(super) async fn restore_inflight_turns(
                     provider_channel_name.as_deref(),
                     is_dm,
                 ) {
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
-                        state.channel_id,
-                    );
+                    // #3869: orphan→finalize, else preserve (`true` ⇒ log skips).
+                    routing_orphan::route_recovery_skip(
+                        http,
+                        shared,
+                        provider,
+                        &state,
+                        tmux_name.as_deref(),
+                        reason,
+                        true,
+                    )
+                    .await;
                     continue;
                 }
                 {
@@ -1956,11 +1968,16 @@ pub(super) async fn restore_inflight_turns(
             provider_channel_name.as_deref(),
             is_dm,
         ) {
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            tracing::info!(
-                "  [{ts}] ⏭ inflight recovery skip for channel {} — {reason}",
-                state.channel_id,
-            );
+            routing_orphan::route_recovery_skip(
+                http,
+                shared,
+                provider,
+                &state,
+                tmux_session_name.as_deref(),
+                reason,
+                true,
+            )
+            .await;
             continue;
         }
         let (fallback_output, fallback_input) = tmux_session_name
