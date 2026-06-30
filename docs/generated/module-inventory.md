@@ -233,7 +233,7 @@
 | `server::routes::dispatches::outbox` | `src/server/routes/dispatches/outbox.rs` | 10 | 10 | 0 |  |
 | `server::routes::dispatches::thread_reuse` | `src/server/routes/dispatches/thread_reuse.rs` | 141 | 141 | 0 |  |
 | `server::routes::dm_reply` | `src/server/routes/dm_reply.rs` | 60 | 60 | 0 |  |
-| `server::routes::docs` | `src/server/routes/docs.rs` | 818 | 331 | 487 |  |
+| `server::routes::docs` | `src/server/routes/docs.rs` | 913 | 363 | 550 |  |
 | `server::routes::docs::guides` | `src/server/routes/docs/guides.rs` | 247 | 247 | 0 |  |
 | `server::routes::docs::inventory` | `src/server/routes/docs/inventory.rs` | 279 | 279 | 0 |  |
 | `server::routes::docs::inventory::endpoints` | `src/server/routes/docs/inventory/endpoints/mod.rs` | 25 | 25 | 0 |  |
