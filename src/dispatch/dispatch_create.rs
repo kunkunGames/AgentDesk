@@ -15,7 +15,6 @@ use super::dispatch_context::{
     dispatch_type_requires_fresh_worktree, ensure_card_worktree,
     inject_review_dispatch_identifiers, json_string_field, resolve_card_target_repo_ref,
     resolve_card_worktree, resolve_parent_dispatch_context,
-    sandbox_preflight_card_disables_external_side_effects,
 };
 use super::dispatch_query::query_dispatch_row_pg;
 use super::{DispatchCreateOptions, cancel_dispatch_and_reset_auto_queue_on_pg_tx};
@@ -673,8 +672,6 @@ async fn create_dispatch_core_internal(
     };
     let mut context_with_session_strategy =
         dispatch_context_with_session_strategy(dispatch_type, context);
-    let sandbox_preflight_without_external_side_effects =
-        sandbox_preflight_card_disables_external_side_effects(pg_pool, kanban_card_id).await;
     let target_repo = resolve_card_target_repo_ref(
         pg_pool,
         kanban_card_id,
@@ -711,24 +708,20 @@ async fn create_dispatch_core_internal(
         } else if phase_gate_sidecar {
             None
         } else if dispatch_type_requires_fresh_worktree(Some(dispatch_type)) {
-            if sandbox_preflight_without_external_side_effects {
-                None
-            } else {
-                let (wt_path, wt_branch, _, created) = ensure_card_worktree(
-                    pg_pool,
-                    kanban_card_id,
-                    Some(&context_with_session_strategy),
+            let (wt_path, wt_branch, _, created) = ensure_card_worktree(
+                pg_pool,
+                kanban_card_id,
+                Some(&context_with_session_strategy),
+            )
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot create {} dispatch for card {}: fresh worktree required but card issue/repo could not be resolved",
+                    dispatch_type,
+                    kanban_card_id
                 )
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Cannot create {} dispatch for card {}: fresh worktree required but card issue/repo could not be resolved",
-                        dispatch_type,
-                        kanban_card_id
-                    )
-                })?;
-                Some((wt_path, Some(wt_branch), created))
-            }
+            })?;
+            Some((wt_path, Some(wt_branch), created))
         } else {
             resolve_card_worktree(
                 pg_pool,
@@ -800,7 +793,6 @@ async fn create_dispatch_core_internal(
         parent_dispatch_id.as_deref(),
         chain_depth,
         options,
-        sandbox_preflight_without_external_side_effects,
     )
     .await;
 
@@ -1263,7 +1255,6 @@ pub(crate) async fn apply_dispatch_attached_intents_pg(
     parent_dispatch_id: Option<&str>,
     chain_depth: i64,
     options: DispatchCreateOptions,
-    sandbox_preflight_without_external_side_effects: bool,
 ) -> Result<()> {
     let mut tx = pool
         .begin()
@@ -1296,7 +1287,6 @@ pub(crate) async fn apply_dispatch_attached_intents_pg(
             parent_dispatch_id,
             chain_depth,
             options,
-            sandbox_preflight_without_external_side_effects,
         )
         .await
     }
@@ -1334,7 +1324,6 @@ pub(crate) async fn apply_dispatch_attached_intents_on_pg_tx(
     parent_dispatch_id: Option<&str>,
     chain_depth: i64,
     options: DispatchCreateOptions,
-    sandbox_preflight_without_external_side_effects: bool,
 ) -> Result<()> {
     use crate::engine::transition::{
         self, CardState, GateSnapshot, TransitionContext, TransitionEvent, TransitionOutcome,
@@ -1424,7 +1413,7 @@ pub(crate) async fn apply_dispatch_attached_intents_on_pg_tx(
         None,
     )
     .await?;
-    if !options.skip_outbox && !sandbox_preflight_without_external_side_effects {
+    if !options.skip_outbox {
         ensure_dispatch_notify_outbox_on_pg_tx(tx, dispatch_id, to_agent_id, card_id, title)
             .await?;
     }

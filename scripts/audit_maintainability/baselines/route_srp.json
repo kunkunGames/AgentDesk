@@ -2,8 +2,8 @@
   "schema_version": 1,
   "rule": "route_srp_violations",
   "description": "No-regression baseline for route files that still mix raw SQL, json!() shaping, and crate::services calls.",
-  "captured_at": "2026-06-28",
-  "total_count": 10,
+  "captured_at": "2026-05-12",
+  "total_count": 12,
   "files": {
     "src/server/routes/agents_crud.rs": {
       "count": 1
@@ -14,10 +14,16 @@
     "src/server/routes/cron_api.rs": {
       "count": 1
     },
+    "src/server/routes/dispatches/thread_reuse.rs": {
+      "count": 1
+    },
     "src/server/routes/escalation.rs": {
       "count": 1
     },
     "src/server/routes/github.rs": {
+      "count": 1
+    },
+    "src/server/routes/health_api.rs": {
       "count": 1
     },
     "src/server/routes/memory_api.rs": {
