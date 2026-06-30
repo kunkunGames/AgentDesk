@@ -18,6 +18,25 @@ const PENDING_PROMPT_TTL: Duration = Duration::from_secs(10);
 const RECENT_OBSERVED_TTL: Duration = Duration::from_secs(30);
 const SESSION_MAPPING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const PROMPT_ANCHOR_TTL: Duration = Duration::from_secs(30 * 60);
+// #3885 follow-up: the per-`(provider, tmux)` PROMPT ANCHOR must outlive the
+// LONGEST realistic in-progress streaming turn. The anchor is stamped ONCE at
+// `record_prompt_anchor` (submit time) and is NOT re-stamped while the turn
+// streams; it is cleared on completion (`take`/`clear_prompt_anchor_for_response`)
+// and overwritten by the next submit (one entry per pane). Under the previous
+// 30min purge a build/agent turn that streams 30-60min (routine in the
+// issue-pipeline workflow) had its anchor purged MID-STREAM, after which the
+// bridge same-input correlation peek (and the watcher ⏳→✅ response match)
+// resolved `None` → the #3885 no-response requeue re-fired a duplicate, and a
+// long turn's ⏳ could strand. 4h is a generous ceiling over realistic turn
+// durations (no hard max-turn-duration constant exists to derive from). This is
+// DECOUPLED from `PROMPT_ANCHOR_TTL` on purpose: the `relayed_entry_ids_by_tmux`
+// ledger below keeps the 30min window its #3459/#3303 rationale documents, so
+// raising the anchor lifetime cannot perturb that missed-prompt dedup. The
+// anchor is one-per-pane and overwritten on the next submit, so the longer TTL
+// only bounds an idle pane's last (uncleared) anchor — bounded memory, and a
+// stale anchor with a DIFFERENT message id can never shadow a new prompt (lookups
+// match on `message_id`).
+const PROMPT_ANCHOR_SUBMIT_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 // Short window matching how long a Discord notify await + transcript flush
 // can plausibly take before `record_prompt_anchor` lands. 60s is generous;
 // the marker is also cleared explicitly when an anchor is consumed.
@@ -399,6 +418,38 @@ pub fn owner_channel_for_tmux_session(tmux_session_name: &str) -> Option<u64> {
 pub(crate) fn reset_state_for_tests() {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     *state = TuiPromptDedupeState::default();
+}
+
+/// Test-only: record a prompt anchor whose `recorded_at` is backdated by `age`,
+/// so a test can simulate an anchor stamped at submit time for a turn that has
+/// been streaming for `age`. Crate-visible so sibling modules (e.g. the
+/// `turn_bridge` same-input correlation tests) can pin that a long streaming
+/// turn's anchor still resolves past the legacy 30min purge under
+/// `PROMPT_ANCHOR_SUBMIT_TTL`.
+#[cfg(test)]
+pub(crate) fn record_prompt_anchor_aged_for_tests(
+    provider: &str,
+    tmux_session_name: &str,
+    channel_id: u64,
+    message_id: u64,
+    age: Duration,
+) {
+    let provider = normalize_provider(provider);
+    let tmux_session_name = tmux_session_name.trim();
+    if provider.is_empty() || tmux_session_name.is_empty() || channel_id == 0 || message_id == 0 {
+        return;
+    }
+    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.prompt_anchor_by_tmux.insert(
+        PromptKey::new(&provider, tmux_session_name),
+        TimedValue {
+            value: TuiPromptAnchor {
+                channel_id,
+                message_id,
+            },
+            recorded_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+        },
+    );
 }
 
 pub(crate) fn record_prompt_anchor(
@@ -861,7 +912,8 @@ fn observe_prompt_candidates_by_tmux_inner(
         // prompts → candidates stay empty → `PromptObservation::Ignored`.
         if prompt.is_empty()
             || is_synthetic_tui_user_prompt_for_provider(&provider, prompt)
-            || is_discord_relayed_user_prompt(prompt)
+            || (is_discord_relayed_user_prompt(prompt)
+                && !is_user_prefixed_subagent_notification_machine_event(prompt))
         {
             continue;
         }
@@ -1327,6 +1379,89 @@ fn is_discord_relayed_user_prompt(prompt: &str) -> bool {
     false
 }
 
+fn is_user_prefixed_subagent_notification_machine_event(prompt: &str) -> bool {
+    let mut current = prompt.trim_start();
+    let mut saw_user_prefix = false;
+
+    loop {
+        if let Some(tail) = strip_provider_session_reuse_prologue(current) {
+            current = tail.trim_start();
+            continue;
+        }
+
+        let stripped_chrome = strip_leading_tui_response_chrome(current);
+        if stripped_chrome != current {
+            current = stripped_chrome.trim_start();
+            continue;
+        }
+
+        if let Some(tail) = strip_leading_user_author_prefix(current) {
+            saw_user_prefix = true;
+            current = tail.trim_start();
+            continue;
+        }
+
+        break;
+    }
+
+    saw_user_prefix && starts_with_xmlish_tag(current.trim_start(), "subagent_notification")
+}
+
+fn strip_provider_session_reuse_prologue(normalized: &str) -> Option<&str> {
+    const RESUMED_THREAD_PROLOGUE: &str = "The prior authoritative Discord, role, and tool \
+         instructions already present in this Codex thread still apply. Treat only this turn's \
+         user request, reply context, uploaded files, and memory recall below as new actionable \
+         input.";
+    const FRESH_FORK_PROLOGUE: &str = "The prior authoritative Discord, role, and tool \
+         instructions already issued to this role in the current dcserver lifetime still apply. \
+         Treat only this turn's user request, reply context, uploaded files, and memory recall \
+         below as new actionable input.";
+
+    let rest = normalized
+        .strip_prefix("[Provider Session Reuse]")?
+        .trim_start();
+    provider_reuse_tail(rest, RESUMED_THREAD_PROLOGUE)
+        .or_else(|| provider_reuse_tail(rest, FRESH_FORK_PROLOGUE))
+}
+
+fn provider_reuse_tail<'a>(rest: &'a str, prologue: &str) -> Option<&'a str> {
+    rest.strip_prefix(prologue)
+        .and_then(|tail| tail.strip_prefix("\n\n"))
+}
+
+fn strip_leading_tui_response_chrome(input: &str) -> &str {
+    let mut stripped = input;
+    loop {
+        let trimmed = stripped.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("No response requested.")
+            && (rest.is_empty()
+                || rest.starts_with('\n')
+                || rest.starts_with('\r')
+                || rest.chars().next().is_some_and(|ch| !ch.is_whitespace()))
+        {
+            stripped = rest;
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+fn strip_leading_user_author_prefix(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("[User: ")?;
+    let close = rest.find(']')?;
+    Some(rest[close + 1..].trim_start())
+}
+
+fn starts_with_xmlish_tag(text: &str, tag: &str) -> bool {
+    let Some(rest) = text.strip_prefix('<') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(tag) else {
+        return false;
+    };
+    rest.starts_with('>') || rest.chars().next().is_some_and(char::is_whitespace)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptObservation {
     PublishedSshDirect,
@@ -1591,8 +1726,12 @@ impl TuiPromptDedupeState {
             .retain(|_, entry| now.duration_since(entry.recorded_at) <= SESSION_MAPPING_TTL);
         self.runtime_by_tmux
             .retain(|_, entry| now.duration_since(entry.recorded_at) <= SESSION_MAPPING_TTL);
+        // #3885 follow-up: anchors live `PROMPT_ANCHOR_SUBMIT_TTL` (4h) so a long
+        // streaming turn's anchor is not purged mid-stream (see the constant). The
+        // relayed-entry ledger below intentionally keeps the 30min
+        // `PROMPT_ANCHOR_TTL`.
         self.prompt_anchor_by_tmux
-            .retain(|_, entry| now.duration_since(entry.recorded_at) <= PROMPT_ANCHOR_TTL);
+            .retain(|_, entry| now.duration_since(entry.recorded_at) <= PROMPT_ANCHOR_SUBMIT_TTL);
         self.ssh_direct_observation_by_tmux
             .retain(|_, entry| now.duration_since(entry.recorded_at) <= SSH_DIRECT_OBSERVATION_TTL);
         self.external_input_relay_lease_by_tmux.retain(|_, entry| {
@@ -2528,6 +2667,48 @@ mod tests {
             !external_input_relay_lease_present("claude", "tmux-3527", 42),
             "a [User:] relay re-observation must not create an ExternalInput lease (#3527)"
         );
+    }
+
+    #[test]
+    fn observe_publishes_user_prefixed_subagent_notification_machine_event_3818() {
+        // #3818 regression: Codex subagent completions can be wrapped by
+        // Provider Session Reuse and the Discord author prefix before the TUI
+        // observer sees them. The #3527 self-relay filter must not swallow these
+        // terminal machine events, or the card renderer never gets a chance to
+        // hide the raw XML envelope from Discord.
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+        let prompt = "[Provider Session Reuse]\n\
+The prior authoritative Discord, role, and tool instructions already present in this \
+Codex thread still apply. Treat only this turn's user request, reply context, uploaded \
+files, and memory recall below as new actionable input.\n\n\
+[User: 0hbujang (ID: 343742347365974026)] No response requested.\n\
+<subagent_notification>{\"agent_path\":\"/tmp/private\",\"status\":{\"completed\":\"Review complete.\"}}</subagent_notification>";
+
+        assert_eq!(
+            observe_prompt_by_tmux("codex", "tmux-3818", prompt),
+            PromptObservation::PublishedSshDirect,
+            "start-anchored subagent_notification must bypass the [User:] duplicate filter"
+        );
+        assert!(clear_external_input_relay_lease("codex", "tmux-3818", 42));
+
+        let chrome_before_user = "[Provider Session Reuse]\n\
+The prior authoritative Discord, role, and tool instructions already present in this \
+Codex thread still apply. Treat only this turn's user request, reply context, uploaded \
+files, and memory recall below as new actionable input.\n\n\
+No response requested.\n\
+[User: 0hbujang (ID: 343742347365974026)] \
+<subagent_notification>{\"agent_path\":\"/tmp/private\",\"status\":{\"completed\":\"Review complete.\"}}</subagent_notification>";
+        assert_eq!(
+            observe_prompt_by_tmux("codex", "tmux-3818-chrome-first", chrome_before_user),
+            PromptObservation::PublishedSshDirect,
+            "TUI chrome before the Discord author prefix must not re-enable the [User:] duplicate filter"
+        );
+        assert!(clear_external_input_relay_lease(
+            "codex",
+            "tmux-3818-chrome-first",
+            42
+        ));
     }
 
     #[test]
@@ -3536,6 +3717,58 @@ mod tests {
         assert!(
             !relayed_entry_id_already_seen("claude", "tmux-3540", "uuid-T"),
             "entry ids older than PROMPT_ANCHOR_TTL are purged (bounded growth)"
+        );
+    }
+
+    /// #3885 follow-up: a long streaming turn's prompt anchor must survive past
+    /// the legacy 30min purge so the bridge same-input correlation peek still
+    /// resolves mid-stream (and the #3885 no-response requeue does NOT re-fire a
+    /// duplicate). An anchor aged beyond the new 4h ceiling is still purged so the
+    /// idle-pane bound stays bounded. Decoupled from the relayed-entry ledger,
+    /// which keeps the 30min `PROMPT_ANCHOR_TTL`.
+    #[test]
+    fn prompt_anchor_survives_long_streaming_turn_past_legacy_30min_ttl() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_state();
+
+        let tmux = "tmux-3885-longstream";
+        let channel = 7777_u64;
+        let streaming_msg = 8_888_u64;
+
+        // An anchor stamped at submit for a turn that has now been streaming 31min
+        // (> the legacy 30min purge, < the new 4h ceiling) must STILL resolve.
+        record_prompt_anchor_aged_for_tests(
+            "claude",
+            tmux,
+            channel,
+            streaming_msg,
+            Duration::from_secs(31 * 60),
+        );
+        assert_eq!(
+            prompt_anchor_for_response("claude", tmux, channel),
+            Some(TuiPromptAnchor {
+                channel_id: channel,
+                message_id: streaming_msg,
+            }),
+            "anchor for a 31min-streaming turn must survive the legacy 30min purge"
+        );
+        // Sanity: that age is past the OLD 30min TTL (so the win is real) but
+        // within the NEW 4h ceiling.
+        assert!(Duration::from_secs(31 * 60) > PROMPT_ANCHOR_TTL);
+        assert!(Duration::from_secs(31 * 60) < PROMPT_ANCHOR_SUBMIT_TTL);
+
+        // Beyond the 4h ceiling the anchor is purged (bounded idle-pane lifetime).
+        record_prompt_anchor_aged_for_tests(
+            "claude",
+            tmux,
+            channel,
+            streaming_msg,
+            PROMPT_ANCHOR_SUBMIT_TTL + Duration::from_secs(1),
+        );
+        assert_eq!(
+            prompt_anchor_for_response("claude", tmux, channel),
+            None,
+            "anchor older than PROMPT_ANCHOR_SUBMIT_TTL is purged"
         );
     }
 

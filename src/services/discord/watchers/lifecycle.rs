@@ -1,5 +1,16 @@
 use super::*;
-use crate::services::discord::watcher_lifecycle_decision::runtime_activity_heartbeat_at;
+
+#[path = "lifecycle/activity.rs"]
+mod activity;
+pub(super) use self::activity::maybe_refresh_watcher_activity_heartbeat;
+#[allow(unused_imports)]
+pub(in crate::services::discord) use self::activity::{
+    HeartbeatRefreshMatch, HeartbeatRefreshOutcome, refresh_session_heartbeat_from_tmux_output,
+    refresh_session_heartbeat_from_tmux_output_detailed, touch_session_activity,
+};
+
+#[path = "codex_tui_restore.rs"]
+mod codex_restore;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LivenessProbeOutcome {
@@ -15,29 +26,6 @@ pub(super) enum LivenessProbeOutcome {
     StaleMarkerClearAndAlive,
     /// Dead marker present and the pane really is gone — honour the marker.
     MarkerHonoredDead,
-}
-
-/// #2795 — for codex_tui sessions whose AgentDesk-side relay JSONL does not
-/// exist on disk, look up the actual codex rollout transcript by the
-/// inflight `session_id`. Returns `None` when the inflight is absent, is not
-/// a codex_tui handoff, lacks a session_id, or no rollout matches.
-fn codex_tui_rollout_fallback_for_session(
-    provider: &crate::services::provider::ProviderKind,
-    channel_id: serenity::model::id::ChannelId,
-) -> Option<String> {
-    if *provider != crate::services::provider::ProviderKind::Codex {
-        return None;
-    }
-    let state = super::super::inflight::load_inflight_state(provider, channel_id.get())?;
-    if !matches!(
-        state.runtime_kind,
-        Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui)
-    ) {
-        return None;
-    }
-    let session_id = state.session_id.as_deref()?;
-    let rollout = crate::services::codex_tui::rollout_tail::find_rollout_by_session_id(session_id)?;
-    Some(rollout.display().to_string())
 }
 
 /// #2853 — for claude_tui sessions whose AgentDesk-side relay JSONL never lands
@@ -513,7 +501,25 @@ pub(super) fn cancel_suppression_applies_to_watcher_death(
     cancel_induced_candidate && !terminal_delivery_observed
 }
 
-pub(super) fn should_send_session_ended_notice(
+/// #3898 — whether a watcher-observed tmux death should attempt the
+/// resume-aborted restart handoff (`resume_aborted_restart_turn`). This is the
+/// ONLY user-facing lifecycle signal for a genuinely abnormal mid-turn pane
+/// crash: the turn was aborted *before* terminal delivery and the pane did not
+/// exit through a normal-completion path (`turn completed` / `exit:0` /
+/// `routine fresh`).
+///
+/// The legacy "session ended: tmux pane exited. Send a new message to start a
+/// new session." Discord notice (removed in #3898) is intentionally NOT
+/// reinstated here. It was both noise and factually wrong:
+/// - It required `terminal_delivery_observed`, so it never covered a genuine
+///   mid-turn crash — that case routes to the restart handoff below, not to a
+///   notice. The only deaths it actually fired on were delivered-then-idle /
+///   cleanup / force-kill teardowns that left no normal-completion marker,
+///   i.e. normal idle exits (false positive).
+/// - A pane death does NOT start a fresh session: the DB `claude_session_id`
+///   persists and the next message resumes the conversation with `--resume`,
+///   so "start a new session" was incorrect for every death that reached it.
+pub(super) fn tmux_death_should_attempt_restart_handoff(
     cancel_induced: bool,
     prompt_too_long_killed: bool,
     terminal_delivery_observed: bool,
@@ -521,39 +527,8 @@ pub(super) fn should_send_session_ended_notice(
 ) -> bool {
     !cancel_induced
         && !prompt_too_long_killed
-        && terminal_delivery_observed
+        && !terminal_delivery_observed
         && !is_normal_completion
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct TmuxDeathLifecycleDecision {
-    pub(super) cancel_induced: bool,
-    pub(super) send_session_ended_notice: bool,
-}
-
-pub(super) fn tmux_death_lifecycle_decision(
-    cancel_induced_candidate: bool,
-    prompt_too_long_killed: bool,
-    terminal_delivery_observed: bool,
-    is_normal_completion: bool,
-) -> TmuxDeathLifecycleDecision {
-    let cancel_induced = cancel_suppression_applies_to_watcher_death(
-        cancel_induced_candidate,
-        terminal_delivery_observed,
-    );
-    TmuxDeathLifecycleDecision {
-        cancel_induced,
-        send_session_ended_notice: should_send_session_ended_notice(
-            cancel_induced,
-            prompt_too_long_killed,
-            terminal_delivery_observed,
-            is_normal_completion,
-        ),
-    }
-}
-
-pub(super) fn session_ended_notice() -> &'static str {
-    "session ended: tmux pane exited. Send a new message to start a new session."
 }
 
 pub(super) async fn handle_tmux_watcher_observed_death(
@@ -605,14 +580,25 @@ pub(super) async fn handle_tmux_watcher_observed_death(
         shared.pg_pool.as_ref(),
     )
     .await;
-    let decision = tmux_death_lifecycle_decision(
+    let cancel_induced = cancel_suppression_applies_to_watcher_death(
         cancel_induced_candidate,
+        terminal_delivery_observed,
+    );
+    // #3898 — the legacy "session ended … start a new session" Discord notice was
+    // removed. It false-fired on normal idle / cleanup / force-kill teardown
+    // (no `turn completed` / `exit:0` / `routine fresh` marker → classified
+    // abnormal) and was factually wrong (a pane death resumes via `--resume`, it
+    // does not start a fresh session). The genuine mid-turn crash signal is the
+    // restart handoff below; cancel suppression is still computed because it
+    // gates that handoff. `is_normal_completion` already folds in the exit-reason
+    // normal-completion check (`tmux_death_is_normal_completion`), so it is the
+    // single source of truth for the restart-handoff suppression.
+    let attempt_restart_handoff = tmux_death_should_attempt_restart_handoff(
+        cancel_induced,
         prompt_too_long_killed,
         terminal_delivery_observed,
         is_normal_completion,
     );
-    let cancel_induced = decision.cancel_induced;
-    let send_session_ended_notice = decision.send_session_ended_notice;
     if cancel_induced {
         tracing::info!(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after recent cancel/turn-stop, skipping lifecycle notification + restart handoff"
@@ -620,10 +606,6 @@ pub(super) async fn handle_tmux_watcher_observed_death(
     } else if cancel_induced_candidate {
         tracing::info!(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after a relayed terminal turn; ignoring stale cancel/turn-stop suppression"
-        );
-    } else if send_session_ended_notice {
-        tracing::info!(
-            "  [{ts}] 👁 tmux session {tmux_session_name} ended without normal completion, sending session-ended notice"
         );
     } else if !is_normal_completion {
         tracing::info!(
@@ -634,36 +616,10 @@ pub(super) async fn handle_tmux_watcher_observed_death(
             "  [{ts}] 👁 tmux session {tmux_session_name} ended after normal completion, skipping lifecycle notification"
         );
     }
-    if !cancel_induced && !prompt_too_long_killed && !terminal_delivery_observed {
-        // Suppress warning for normal dispatch completion — not an error.
-        let suppress_restart = is_normal_completion
-            || reason_short
-                .as_deref()
-                .is_some_and(tmux_exit_reason_is_normal_completion);
-        if !suppress_restart {
-            let _ = resume_aborted_restart_turn(
-                channel_id,
-                http,
-                shared,
-                tmux_session_name,
-                output_path,
-            )
-            .await;
-        }
-    }
-    if send_session_ended_notice {
-        rate_limit_wait(shared, channel_id).await;
-        if let Err(error) = crate::services::discord::http::send_channel_message(
-            http,
-            channel_id,
-            session_ended_notice(),
-        )
-        .await
-        {
-            tracing::warn!(
-                "  [{ts}] ⚠ tmux session {tmux_session_name} ended but session-ended notice send failed: {error}"
-            );
-        }
+    if attempt_restart_handoff {
+        let _ =
+            resume_aborted_restart_turn(channel_id, http, shared, tmux_session_name, output_path)
+                .await;
     }
 }
 
@@ -878,6 +834,73 @@ mod tests {
             turn_delivered: Arc::new(AtomicBool::new(false)),
             last_heartbeat_ts_ms: Arc::new(AtomicI64::new(tmux_watcher_now_ms())),
         }
+    }
+
+    // #3898 — cancel suppression is the surviving gate that protects the restart
+    // handoff (and previously gated the now-removed "session ended" notice).
+    #[test]
+    fn cancel_suppression_only_applies_before_terminal_delivery() {
+        // A cancel/turn-stop candidate that died before delivering its turn is
+        // suppressed (no restart handoff; historically no notice either).
+        assert!(cancel_suppression_applies_to_watcher_death(true, false));
+        // Once a terminal turn was delivered, a later pane death is a real
+        // lifecycle event for that turn — stale cancel suppression must NOT apply.
+        assert!(!cancel_suppression_applies_to_watcher_death(true, true));
+        // No cancel candidate → never suppressed.
+        assert!(!cancel_suppression_applies_to_watcher_death(false, false));
+        assert!(!cancel_suppression_applies_to_watcher_death(false, true));
+    }
+
+    // #3898 — the false-positive fix. A tmux pane that exits *after* delivering
+    // its turn (normal idle / cleanup / force-kill, which leave no
+    // normal-completion marker → `is_normal_completion == false`) must NOT
+    // surface any lifecycle signal: the removed notice never fires, and the
+    // restart handoff is gated off by `terminal_delivery_observed`. This is the
+    // noise the issue reported — a normal idle exit emitting a spurious notice.
+    #[test]
+    fn delivered_then_idle_death_surfaces_no_lifecycle_signal() {
+        let cancel_induced = cancel_suppression_applies_to_watcher_death(false, true);
+        assert!(!cancel_induced);
+        // Even with an "abnormal" exit reason (no normal-completion marker), a
+        // delivered turn means this is a normal idle/cleanup/force-kill teardown.
+        assert!(!tmux_death_should_attempt_restart_handoff(
+            cancel_induced,
+            /* prompt_too_long_killed */ false,
+            /* terminal_delivery_observed */ true,
+            /* is_normal_completion */ false,
+        ));
+        // The same holds when the pane DID exit through a normal-completion path.
+        assert!(!tmux_death_should_attempt_restart_handoff(
+            cancel_induced,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    // #3898 — a genuinely abnormal mid-turn pane crash (turn aborted BEFORE
+    // terminal delivery, no normal-completion marker) STILL surfaces a signal:
+    // the resume-aborted restart handoff fires. This is the case the removed
+    // notice never covered (it required `terminal_delivery_observed`), so
+    // removing the notice does not lose any genuine-crash signal.
+    #[test]
+    fn genuine_mid_turn_crash_triggers_restart_handoff() {
+        assert!(tmux_death_should_attempt_restart_handoff(
+            /* cancel_induced */ false, /* prompt_too_long_killed */ false,
+            /* terminal_delivery_observed */ false, /* is_normal_completion */ false,
+        ));
+        // Suppressed when the user canceled the turn themselves …
+        assert!(!tmux_death_should_attempt_restart_handoff(
+            true, false, false, false
+        ));
+        // … when the prompt-too-long teardown already handled it …
+        assert!(!tmux_death_should_attempt_restart_handoff(
+            false, true, false, false
+        ));
+        // … or when the pane exited through a normal-completion path.
+        assert!(!tmux_death_should_attempt_restart_handoff(
+            false, false, false, true
+        ));
     }
 
     #[test]
@@ -1365,221 +1388,6 @@ pub(in crate::services::discord) async fn clear_recovery_handled_channels(shared
     }
 
     let _ = shared;
-}
-
-/// Outcome of a single `last_heartbeat` refresh attempt, used for auditable
-/// logging at the `touch_session_activity` boundary (#3053). Distinguishes
-/// which candidate key path matched so silent no-ops (the original failure
-/// mode where TUI/watcher activity refreshed a non-matching row) are visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum HeartbeatRefreshMatch {
-    /// One of the namespaced/legacy `session_key` candidates matched.
-    SessionKey,
-    /// Fell back to `provider + thread_channel_id` and matched.
-    ThreadChannelFallback,
-    /// No row matched any candidate — activity went unobserved by idle-kill.
-    NoMatch,
-}
-
-pub(in crate::services::discord) struct HeartbeatRefreshOutcome {
-    pub matched: HeartbeatRefreshMatch,
-    pub rows_affected: u64,
-}
-
-impl HeartbeatRefreshOutcome {
-    pub fn refreshed(&self) -> bool {
-        self.rows_affected > 0
-    }
-}
-
-// Tmux watcher output is activity, but reusing hook_session here would also
-// overwrite status/tokens defaults. Touch only last_heartbeat instead.
-pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output(
-    db: Option<&crate::db::Db>,
-    pg_pool: Option<&sqlx::PgPool>,
-    token_hash: &str,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    thread_channel_id: Option<u64>,
-) -> bool {
-    refresh_session_heartbeat_from_tmux_output_detailed(
-        db,
-        pg_pool,
-        token_hash,
-        provider,
-        tmux_session_name,
-        thread_channel_id,
-    )
-    .refreshed()
-}
-
-/// Same as `refresh_session_heartbeat_from_tmux_output` but reports which
-/// candidate key matched and how many rows were touched, so callers can emit
-/// auditable activity logs (#3053).
-pub(in crate::services::discord) fn refresh_session_heartbeat_from_tmux_output_detailed(
-    db: Option<&crate::db::Db>,
-    pg_pool: Option<&sqlx::PgPool>,
-    token_hash: &str,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    thread_channel_id: Option<u64>,
-) -> HeartbeatRefreshOutcome {
-    let session_keys = super::super::adk_session::build_session_key_candidates(
-        token_hash,
-        provider,
-        tmux_session_name,
-    );
-
-    if let Some(pg_pool) = pg_pool {
-        let provider_name = provider.as_str().to_string();
-        let thread_channel_id = thread_channel_id.map(|value| value.to_string());
-        let activity_at = runtime_activity_heartbeat_at(tmux_session_name, chrono::Utc::now());
-        return crate::utils::async_bridge::block_on_pg_result(
-            pg_pool,
-            move |pool| async move {
-                let updated = sqlx::query("UPDATE sessions SET last_heartbeat = GREATEST(COALESCE(last_heartbeat, TIMESTAMPTZ 'epoch'), $3) WHERE session_key = $1 OR session_key = $2")
-                .bind(&session_keys[0])
-                .bind(&session_keys[1])
-                .bind(activity_at)
-                .execute(&pool)
-                .await
-                .map_err(|error| format!("refresh pg watcher heartbeat by session key: {error}"))?
-                .rows_affected();
-                if updated > 0 {
-                    return Ok(HeartbeatRefreshOutcome {
-                        matched: HeartbeatRefreshMatch::SessionKey,
-                        rows_affected: updated,
-                    });
-                }
-
-                let Some(thread_channel_id) = thread_channel_id else {
-                    return Ok(HeartbeatRefreshOutcome {
-                        matched: HeartbeatRefreshMatch::NoMatch,
-                        rows_affected: 0,
-                    });
-                };
-                let updated = sqlx::query("UPDATE sessions SET last_heartbeat = GREATEST(COALESCE(last_heartbeat, TIMESTAMPTZ 'epoch'), $3) WHERE provider = $1 AND thread_channel_id = $2 AND status IN ('idle', 'working')")
-                .bind(&provider_name)
-                .bind(&thread_channel_id)
-                .bind(activity_at)
-                .execute(&pool)
-                .await
-                .map_err(|error| {
-                    format!("refresh pg watcher heartbeat by thread channel: {error}")
-                })?
-                .rows_affected();
-                Ok(HeartbeatRefreshOutcome {
-                    matched: if updated > 0 {
-                        HeartbeatRefreshMatch::ThreadChannelFallback
-                    } else {
-                        HeartbeatRefreshMatch::NoMatch
-                    },
-                    rows_affected: updated,
-                })
-            },
-            |message| message,
-        )
-        .unwrap_or(HeartbeatRefreshOutcome {
-            matched: HeartbeatRefreshMatch::NoMatch,
-            rows_affected: 0,
-        });
-    }
-
-    let _ = (db, provider, thread_channel_id, session_keys);
-    HeartbeatRefreshOutcome {
-        matched: HeartbeatRefreshMatch::NoMatch,
-        rows_affected: 0,
-    }
-}
-
-/// Single auditable entry point for runtime-observed session activity (#3053).
-/// Refreshes `sessions.last_heartbeat = NOW()` for the row idle-kill selects
-/// on and logs the resolved `session_key`, BOTH candidate keys (namespaced +
-/// legacy `host:tmux`), rows-affected, `reason`/`source`, and whether the
-/// `thread_channel_id` fallback was used — the original #3053 failure mode was
-/// a silent no-op refresh of a non-matching row, after which idle-kill killed
-/// the live session. Returns true when at least one row was touched.
-pub(in crate::services::discord) fn touch_session_activity(
-    db: Option<&crate::db::Db>,
-    pg_pool: Option<&sqlx::PgPool>,
-    token_hash: &str,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    thread_channel_id: Option<u64>,
-    reason: &str,
-    source: &str,
-) -> bool {
-    let session_keys = super::super::adk_session::build_session_key_candidates(
-        token_hash,
-        provider,
-        tmux_session_name,
-    );
-    let outcome = refresh_session_heartbeat_from_tmux_output_detailed(
-        db,
-        pg_pool,
-        token_hash,
-        provider,
-        tmux_session_name,
-        thread_channel_id,
-    );
-
-    let used_thread_fallback = outcome.matched == HeartbeatRefreshMatch::ThreadChannelFallback;
-    if outcome.refreshed() {
-        tracing::debug!(
-            source,
-            reason,
-            tmux_session = %tmux_session_name,
-            namespaced_key = %session_keys[0],
-            legacy_key = %session_keys[1],
-            rows_affected = outcome.rows_affected,
-            used_thread_fallback,
-            thread_channel_id = ?thread_channel_id,
-            "touch_session_activity: refreshed idle-kill heartbeat (#3053)"
-        );
-    } else {
-        // No row matched — idle-kill will not observe this activity. This is the
-        // exact #3053 failure mode, so warn (not debug) to make it actionable.
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::warn!(
-            source,
-            reason,
-            tmux_session = %tmux_session_name,
-            namespaced_key = %session_keys[0],
-            legacy_key = %session_keys[1],
-            rows_affected = outcome.rows_affected,
-            thread_channel_id = ?thread_channel_id,
-            "  [{ts}] ⚠ touch_session_activity: NO session row matched runtime activity — idle-kill heartbeat NOT refreshed (#3053)",
-        );
-    }
-    outcome.refreshed()
-}
-
-pub(super) fn maybe_refresh_watcher_activity_heartbeat(
-    db: Option<&crate::db::Db>,
-    pg_pool: Option<&sqlx::PgPool>,
-    token_hash: &str,
-    provider: &ProviderKind,
-    tmux_session_name: &str,
-    thread_channel_id: Option<u64>,
-    last_heartbeat_at: &mut Option<std::time::Instant>,
-) {
-    let now = std::time::Instant::now();
-    if last_heartbeat_at
-        .is_some_and(|last| now.duration_since(last) < WATCHER_ACTIVITY_HEARTBEAT_INTERVAL)
-    {
-        return;
-    }
-
-    if refresh_session_heartbeat_from_tmux_output(
-        db,
-        pg_pool,
-        token_hash,
-        provider,
-        tmux_session_name,
-        thread_channel_id,
-    ) {
-        *last_heartbeat_at = Some(now);
-    }
 }
 
 pub(super) async fn clear_provider_session_for_retry(
@@ -2269,6 +2077,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
         session_name: String,
         initial_offset: u64,
         restored_turn: Option<RestoredWatcherTurn>,
+        codex_direct_resume_fallback: Option<codex_restore::DirectResumeFallback>,
     }
 
     // Dead sessions that need DB cleanup (idle status report + tmux kill)
@@ -2418,12 +2227,13 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
         );
 
         let mut selected_claude_tui_fallback_transcript: Option<std::path::PathBuf> = None;
+        let mut codex_direct_resume_fallback = None;
         let output_path =
             match crate::services::tmux_common::resolve_session_temp_path(session_name, "jsonl") {
                 Some(path) => path,
                 None => {
                     if let Some(path) =
-                        codex_tui_rollout_fallback_for_session(&provider, *channel_id)
+                        codex_restore::rollout_fallback_for_session(&provider, *channel_id)
                     {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::info!(
@@ -2432,6 +2242,16 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                             path
                         );
                         path
+                    } else if let Some(path) =
+                        codex_restore::rollout_fallback_for_live_direct_resume(
+                            &provider,
+                            session_name,
+                            *channel_id,
+                        )
+                    {
+                        let output_path = path.output_path().to_string();
+                        codex_direct_resume_fallback = Some(path);
+                        output_path
                     } else if let Some(path) = claude_tui_transcript_fallback_path(
                         &provider,
                         session_name,
@@ -2542,7 +2362,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
             );
         }
 
-        if !tmux_session_has_live_pane(session_name) {
+        if !probe_tmux_session_liveness(session_name).await {
             let ts = chrono::Local::now().format("%H:%M:%S");
             if let Some(diag) = build_tmux_death_diagnostic(session_name, Some(&output_path)) {
                 tracing::info!(
@@ -2609,6 +2429,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
             session_name: session_name.to_string(),
             initial_offset,
             restored_turn,
+            codex_direct_resume_fallback,
         });
         if let Some(path) = selected_claude_tui_fallback_transcript {
             restore_claimed_claude_tui_transcripts.insert(path);
@@ -2621,11 +2442,6 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
         let mut data = shared.core.lock().await;
         for (channel_id, channel_name) in &owned_sessions {
             let persisted_path = load_last_session_path(
-                shared.pg_pool.as_ref(),
-                &shared.token_hash,
-                channel_id.get(),
-            );
-            let remote_profile = load_last_remote_profile(
                 shared.pg_pool.as_ref(),
                 &shared.token_hash,
                 channel_id.get(),
@@ -2670,7 +2486,7 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                         cleared: false,
                         channel_name: Some(channel_name.clone()),
                         category_name: None,
-                        remote_profile_name: remote_profile.clone(),
+                        remote_profile_name: None,
                         channel_id: Some(channel_id.get()),
 
                         last_active: tokio::time::Instant::now(),
@@ -2708,7 +2524,6 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                     configured_path,
                     db_cwd,
                     persisted_path,
-                    remote_profile.as_deref(),
                     reusable_worktree,
                 );
                 if let Some(path) = effective_path {
@@ -2774,6 +2589,13 @@ pub(in crate::services::discord) async fn restore_tmux_watchers(
                 pw.session_name
             );
             continue;
+        }
+        if let Some(fallback) = pw.codex_direct_resume_fallback {
+            codex_restore::commit_live_direct_resume_fallback(
+                &pw.session_name,
+                pw.channel_id,
+                fallback,
+            );
         }
 
         let ts = chrono::Local::now().format("%H:%M:%S");

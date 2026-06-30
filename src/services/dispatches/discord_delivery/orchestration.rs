@@ -16,10 +16,16 @@ use crate::services::dispatches::outbox_route::{
     build_minimal_dispatch_message, format_dispatch_message, prefix_dispatch_message,
     review_submission_hint, review_target_hint,
 };
+use crate::services::dispatches::result_header::prepend_review_result_header;
 use sqlx::PgPool;
 use std::sync::OnceLock;
 
 const SLOT_THREAD_MAX_SLOTS: i64 = 32;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReviewFollowupDispatchOptions {
+    skip_review_decision_outbox: bool,
+}
 
 fn discord_api_base_url() -> String {
     super::discord_api_base_url()
@@ -1219,6 +1225,30 @@ pub(crate) async fn send_review_result_to_primary_with_transport<T: DispatchTran
         review_dispatch_id,
         verdict,
         transport,
+        ReviewFollowupDispatchOptions::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn send_review_result_to_primary_for_preflight_harness_with_transport<
+    T: DispatchTransport,
+>(
+    db: Option<&crate::db::Db>,
+    card_id: &str,
+    review_dispatch_id: &str,
+    verdict: &str,
+    transport: &T,
+) -> Result<(), String> {
+    send_review_result_to_primary_with_context_and_transport(
+        db,
+        card_id,
+        review_dispatch_id,
+        verdict,
+        transport,
+        ReviewFollowupDispatchOptions {
+            skip_review_decision_outbox: true,
+        },
     )
     .await
 }
@@ -1229,6 +1259,7 @@ async fn send_review_result_to_primary_with_context_and_transport<T: DispatchTra
     review_dispatch_id: &str,
     verdict: &str,
     transport: &T,
+    options: ReviewFollowupDispatchOptions,
 ) -> Result<(), String> {
     let pool = transport
         .pg_pool()
@@ -1301,7 +1332,6 @@ async fn send_review_result_to_primary_with_context_and_transport<T: DispatchTra
         {
             decision_context.insert("target_repo".to_string(), serde_json::json!(target_repo));
         }
-
         return match create_review_decision_followup_dispatch(
             db,
             Some(pool),
@@ -1309,6 +1339,7 @@ async fn send_review_result_to_primary_with_context_and_transport<T: DispatchTra
             &agent_id,
             &format!("[리뷰 검토] {title}"),
             &serde_json::Value::Object(decision_context),
+            options,
         ) {
             Ok((id, _old_status, _reused)) => {
                 let payload = serde_json::json!({
@@ -1354,9 +1385,16 @@ async fn send_review_result_to_primary_with_context_and_transport<T: DispatchTra
 
     let (kind, message) = if verdict == "pass" || verdict == "approved" {
         let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
+        let body = format!("✅ [리뷰 통과] {title} — done으로 이동{url_line}");
         (
             ReviewFollowupKind::Pass,
-            format!("✅ [리뷰 통과] {title} — done으로 이동{url_line}"),
+            prepend_review_result_header(
+                &title,
+                None,
+                review_context_json.as_ref(),
+                verdict,
+                &body,
+            ),
         )
     } else {
         let url_line = issue_url.map(|u| format!("\n{u}")).unwrap_or_default();
@@ -1403,6 +1441,7 @@ fn create_review_decision_followup_dispatch(
     agent_id: &str,
     title: &str,
     context: &serde_json::Value,
+    options: ReviewFollowupDispatchOptions,
 ) -> Result<(String, String, bool), String> {
     let pool = pg_pool.ok_or_else(|| {
         "Postgres pool required for review-decision follow-up dispatch".to_string()
@@ -1415,13 +1454,22 @@ fn create_review_decision_followup_dispatch(
             let title = title.to_string();
             let context = context.clone();
             move |bridge_pool| async move {
-                crate::dispatch::create_dispatch_core(
+                let create_options = if options.skip_review_decision_outbox {
+                    crate::dispatch::DispatchCreateOptions {
+                        skip_outbox: true,
+                        sidecar_dispatch: false,
+                    }
+                } else {
+                    crate::dispatch::DispatchCreateOptions::default()
+                };
+                crate::dispatch::create_dispatch_core_with_options(
                     &bridge_pool,
                     &card_id,
                     &agent_id,
                     "review-decision",
                     &title,
                     &context,
+                    create_options,
                 )
                 .await
                 .map_err(|error| error.to_string())

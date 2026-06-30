@@ -5,6 +5,7 @@
 //! `docs/relay-state-contract.md` (#1222 / #1224). Any change that touches
 //! relay producers/consumers must keep the invariants there satisfied.
 
+pub(in crate::services::discord) mod anchor_repost;
 pub(in crate::services::discord) mod budget;
 mod finalizer_identity;
 mod model;
@@ -33,12 +34,33 @@ pub(crate) use store::lock_inflight_state_path;
 // sibling module so this hot state parent stays below the frozen production-LoC
 // baseline without changing call-site names.
 mod rebind_reap;
-#[cfg(test)]
-use self::rebind_reap::should_reap_dead_watcher_rebind_origin;
 use self::rebind_reap::{
     RuntimeWatcherLiveness, WatcherLiveness, dead_watcher_rebind_structurally_reapable,
     inflight_json_path_for_lock, is_inflight_json_lock_path, metadata_mtime_unix_secs,
     rebind_origin_age_secs, watcher_runtime_activity_recent,
+};
+#[cfg(test)]
+use self::rebind_reap::{proven_dead_from_signals, should_reap_dead_watcher_rebind_origin};
+
+mod watcher_state;
+pub(in crate::services::discord) use self::watcher_state::{
+    WatcherProgressOutcome, WatcherRelayWatermarkOutcome, WatcherRelayWatermarkPatch,
+    WatcherStreamProgressPatch, WatcherTerminalCommitOutcome, WatcherTerminalCommitPatch,
+    commit_watcher_terminal_delivery_locked, persist_watcher_relay_watermark_locked,
+    persist_watcher_stream_progress_locked,
+};
+#[cfg(test)]
+use self::watcher_state::{
+    commit_watcher_terminal_delivery_locked_in_root,
+    persist_watcher_relay_watermark_locked_in_root, persist_watcher_stream_progress_locked_in_root,
+};
+
+// #3960: producer-liveness TOCTOU reclaim for orphaned `SessionBoundRelay`
+// TUI-direct rows (the #3876 residual deferred from PR #3953).
+mod orphan_relay_reclaim;
+pub(in crate::services::discord) use self::orphan_relay_reclaim::{
+    OrphanRelayReclaimOutcome, downgrade_orphaned_session_bound_relay_owner_locked,
+    session_bound_relay_external_input_orphan_shape,
 };
 
 use finalizer_identity::{
@@ -55,7 +77,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::InflightRestartMode;
 use super::runtime_store::{atomic_write, discord_inflight_root};
 use crate::dispatch::Source;
-use crate::services::agent_protocol::{RuntimeHandoffKind, TaskNotificationKind};
+use crate::services::agent_protocol::RuntimeHandoffKind;
 // #3552: short alias for the invariant-severity hint forwarded to observability.
 use crate::services::observability::InvariantSeverity as ObsSeverity;
 use crate::services::provider::ProviderKind;
@@ -1156,11 +1178,61 @@ pub(in crate::services::discord) fn save_existing_inflight_rebind_adoption_if_ma
     )
 }
 
+pub(in crate::services::discord) fn save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity(
+    state: &InflightTurnState,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    expected_last_offset: u64,
+) -> GuardedSaveOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedSaveOutcome::IoError;
+    };
+    save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+        &root,
+        state,
+        expected,
+        expected_turn_start_offset,
+        expected_last_offset,
+    )
+}
+
 fn save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
     root: &Path,
     state: &InflightTurnState,
     expected: &InflightTurnIdentity,
     expected_turn_start_offset: Option<u64>,
+) -> GuardedSaveOutcome {
+    save_existing_inflight_rebind_adoption_impl_in_root(
+        root,
+        state,
+        expected,
+        expected_turn_start_offset,
+        None,
+    )
+}
+
+fn save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    expected_last_offset: u64,
+) -> GuardedSaveOutcome {
+    save_existing_inflight_rebind_adoption_impl_in_root(
+        root,
+        state,
+        expected,
+        expected_turn_start_offset,
+        Some(expected_last_offset),
+    )
+}
+
+fn save_existing_inflight_rebind_adoption_impl_in_root(
+    root: &Path,
+    state: &InflightTurnState,
+    expected: &InflightTurnIdentity,
+    expected_turn_start_offset: Option<u64>,
+    expected_last_offset_for_rebase: Option<u64>,
 ) -> GuardedSaveOutcome {
     let Some(provider) = state.provider_kind() else {
         return GuardedSaveOutcome::IoError;
@@ -1194,12 +1266,24 @@ fn save_existing_inflight_rebind_adoption_if_matches_identity_in_root(
             return GuardedSaveOutcome::IdentityMismatch;
         }
     }
+    if expected_last_offset_for_rebase
+        .is_some_and(|expected_last| on_disk.last_offset != expected_last)
+    {
+        return GuardedSaveOutcome::IdentityMismatch;
+    }
 
     let mut updated = on_disk;
     updated.tmux_session_name = state.tmux_session_name.clone();
     updated.output_path = state.output_path.clone();
     updated.input_fifo_path = state.input_fifo_path.clone();
     updated.set_relay_owner_kind(state.effective_relay_owner_kind());
+    if expected_last_offset_for_rebase.is_some() {
+        updated.last_offset = state.last_offset;
+        updated.turn_start_offset = state.turn_start_offset;
+        updated.last_watcher_relayed_offset = state.last_watcher_relayed_offset;
+        updated.last_watcher_relayed_generation_mtime_ns =
+            state.last_watcher_relayed_generation_mtime_ns;
+    }
     updated.ensure_finalizer_turn_id();
     let _ = validate_inflight_state_for_save(
         root,
@@ -1682,6 +1766,19 @@ pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity(
     clear_inflight_state_if_matches_identity_in_root(&root, provider, channel_id, expected)
 }
 
+pub(in crate::services::discord) fn clear_rebind_origin_inflight_state_if_matches_identity(
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+        &root, provider, channel_id, expected,
+    )
+}
+
 pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity_after_delivery(
     provider: &ProviderKind,
     channel_id: u64,
@@ -1878,6 +1975,235 @@ pub(super) fn clear_inflight_state_if_matches_zero_owned_in_root(
     }
 }
 
+/// #3859: true when the row anchors a finalizable "🔄 처리 중" placeholder — a real
+/// placeholder message id (not 0, and not the placeholderless shape where the
+/// anchor mirrors the user's own message id), that is still a PURE placeholder
+/// (no streamed assistant content) or an explicitly-active long-running card.
+/// Mirrors the placeholder sweeper's abandon-eligibility gate so partial-output
+/// failure rows keep their delivered text (no "중단됨" clobber) exactly as the
+/// pre-#3859 path did.
+fn row_has_finalizable_placeholder(state: &InflightTurnState) -> bool {
+    if state.current_msg_id == 0
+        || (state.user_msg_id != 0 && state.current_msg_id == state.user_msg_id)
+    {
+        return false;
+    }
+    state.long_running_placeholder_active
+        || (state.full_response.is_empty() && state.response_sent_offset == 0)
+}
+
+/// #3859: record a durable abandon-request for `state`'s placeholder so the
+/// async `placeholder_sweeper` drain finalizes it to "중단됨" — enqueued UNDER the
+/// sidecar lock and BEFORE the caller's unlink, so the request survives even if
+/// the process dies right after the delete.
+///
+/// Returns `true` when it is SAFE for the caller to delete the inflight row:
+/// either the row anchors no finalizable placeholder (nothing to strand) OR the
+/// abandon-request was DURABLY persisted. Returns `false` ONLY when a finalizable
+/// placeholder's record FAILED to persist (#3859 r5 — codex P1); the caller MUST
+/// then keep the row so a later sweeper pass retries and the placeholder is never
+/// stranded without a record. Invariant: never `(row deleted ∧ record absent)`.
+#[must_use]
+fn enqueue_abandon_request_for_row(
+    provider: &ProviderKind,
+    channel_id: u64,
+    token_hash: &str,
+    state: &InflightTurnState,
+) -> bool {
+    if !row_has_finalizable_placeholder(state) {
+        return true;
+    }
+    match super::abandon_request_store::enqueue(
+        provider,
+        token_hash,
+        channel_id,
+        super::abandon_request_store::AbandonRecord {
+            msg_id: state.current_msg_id,
+            started_at: state.started_at.clone(),
+            current_tool_line: state.current_tool_line.clone(),
+        },
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                msg_id = state.current_msg_id,
+                error = %error,
+                "abandon-request enqueue failed; PRESERVING inflight row so the placeholder is not stranded (sweeper retries next pass)"
+            );
+            false
+        }
+    }
+}
+
+/// #3859: failure-path cleanup that drives a stranded placeholder to a TERMINAL
+/// "중단됨" card WITHOUT keeping the inflight row alive.
+///
+/// Identical ownership guards to [`clear_inflight_state_if_matches`]
+/// (planned-restart / rebind-origin preserved; `UserMsgMismatch` for a newer
+/// owner; `expected_user_msg_id == 0` refused) — so a restart/rebind/foreign row
+/// is never enqueued or deleted. When the guards pass and the row anchors a
+/// finalizable placeholder, a durable abandon-request is enqueued (so the
+/// placeholder sweeper finalizes the "🔄 처리 중" card to "중단됨" by message id),
+/// then the row is DELETED — freeing the channel immediately like the pre-#3859
+/// path. The abandon-request is decoupled from the inflight lifecycle, so a
+/// re-adopt (new row + new placeholder) never collides with it (#3859 r4).
+pub(crate) fn request_inflight_abandon_if_matches(
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected_user_msg_id: u64,
+    token_hash: &str,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    request_inflight_abandon_if_matches_in_root(
+        &root,
+        provider,
+        channel_id,
+        expected_user_msg_id,
+        token_hash,
+    )
+}
+
+/// Root-explicit variant for unit tests (the inflight ops use `root`; the
+/// abandon-request store is env-rooted via `discord_abandon_requests_root`, so a
+/// test must also set `AGENTDESK_ROOT_DIR`).
+pub(super) fn request_inflight_abandon_if_matches_in_root(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected_user_msg_id: u64,
+    token_hash: &str,
+) -> GuardedClearOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedClearOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    let Ok(state) = parse_inflight_state_content(&data) else {
+        return GuardedClearOutcome::Missing;
+    };
+    if state.restart_mode.is_some() {
+        return GuardedClearOutcome::PlannedRestartSkipped;
+    }
+    if state.rebind_origin {
+        return GuardedClearOutcome::RebindOriginSkipped;
+    }
+    if !state.matches_finalizer_turn_id(expected_user_msg_id) {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(pre) = fs::metadata(&path) else {
+            return GuardedClearOutcome::Missing;
+        };
+        let Ok(post) = fs::metadata(&path) else {
+            return GuardedClearOutcome::Missing;
+        };
+        if pre.dev() != post.dev() || pre.ino() != post.ino() {
+            return GuardedClearOutcome::UserMsgMismatch;
+        }
+        let Ok(reread) = fs::read_to_string(&path) else {
+            return GuardedClearOutcome::Missing;
+        };
+        let Ok(restate) = parse_inflight_state_content(&reread) else {
+            return GuardedClearOutcome::Missing;
+        };
+        if !restate.matches_finalizer_turn_id(expected_user_msg_id)
+            || restate.restart_mode.is_some()
+            || restate.rebind_origin
+        {
+            return GuardedClearOutcome::UserMsgMismatch;
+        }
+    }
+    // Enqueue BEFORE unlink (durable handoff). #3859 r5 (codex P1): if a
+    // FINALIZABLE placeholder's record fails to persist, DO NOT delete the row —
+    // return IoError so the sweeper retries (the row stays alive and the
+    // placeholder is finalized later). Never delete the row without its record.
+    if !enqueue_abandon_request_for_row(provider, channel_id, token_hash, &state) {
+        return GuardedClearOutcome::IoError;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => GuardedClearOutcome::Cleared,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GuardedClearOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                expected_user_msg_id = expected_user_msg_id,
+                error = %error,
+                "inflight abandon-request remove_file failed; treating as IoError so sweeper retries"
+            );
+            GuardedClearOutcome::IoError
+        }
+    }
+}
+
+/// #3859 zero-id variant — mirrors [`clear_inflight_state_if_matches_zero_owned`]
+/// guards, then enqueues an abandon-request (if the row anchors a finalizable
+/// placeholder) and deletes the row.
+pub(crate) fn request_inflight_abandon_if_matches_zero_owned(
+    provider: &ProviderKind,
+    channel_id: u64,
+    token_hash: &str,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    request_inflight_abandon_if_matches_zero_owned_in_root(&root, provider, channel_id, token_hash)
+}
+
+/// Root-explicit variant of [`request_inflight_abandon_if_matches_zero_owned`].
+pub(super) fn request_inflight_abandon_if_matches_zero_owned_in_root(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    token_hash: &str,
+) -> GuardedClearOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedClearOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
+        return GuardedClearOutcome::Missing;
+    };
+    if state.restart_mode.is_some() {
+        return GuardedClearOutcome::PlannedRestartSkipped;
+    }
+    if state.rebind_origin {
+        return GuardedClearOutcome::RebindOriginSkipped;
+    }
+    if state.user_msg_id != 0 {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    // #3859 r5: preserve the row if a finalizable placeholder's record fails to
+    // persist (never delete the row without its abandon-request).
+    if !enqueue_abandon_request_for_row(provider, channel_id, token_hash, &state) {
+        return GuardedClearOutcome::IoError;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => GuardedClearOutcome::Cleared,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GuardedClearOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                error = %error,
+                "inflight zero-owned abandon-request remove_file failed; treating as IoError so sweeper retries"
+            );
+            GuardedClearOutcome::IoError
+        }
+    }
+}
+
 fn clear_inflight_state_if_matches_identity_in_root(
     root: &std::path::Path,
     provider: &ProviderKind,
@@ -1913,6 +2239,47 @@ fn clear_inflight_state_if_matches_identity_in_root(
                 expected_user_msg_id = expected.user_msg_id,
                 error = %error,
                 "inflight identity-guarded clear remove_file failed; treating as IoError so sweeper retries"
+            );
+            GuardedClearOutcome::IoError
+        }
+    }
+}
+
+fn clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+    root: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+) -> GuardedClearOutcome {
+    let path = inflight_state_path(root, provider, channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedClearOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
+        return GuardedClearOutcome::Missing;
+    };
+    if state.restart_mode.is_some() {
+        return GuardedClearOutcome::PlannedRestartSkipped;
+    }
+    if !state.rebind_origin {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    if !expected.matches_state(&state) {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    match fs::remove_file(&path) {
+        Ok(()) => GuardedClearOutcome::Cleared,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => GuardedClearOutcome::Missing,
+        Err(error) => {
+            tracing::warn!(
+                provider = %provider.as_str(),
+                channel = channel_id,
+                expected_user_msg_id = expected.user_msg_id,
+                error = %error,
+                "rebind-origin inflight guarded-clear remove_file failed; treating as IoError so sweeper retries"
             );
             GuardedClearOutcome::IoError
         }
@@ -2156,349 +2523,6 @@ fn refresh_inflight_last_offset_if_matches_identity_in_root(
         .is_ok()
 }
 
-/// #3558: the watcher-owned streaming fields a single-flock RMW patches onto the
-/// persisted row. Plain value struct (moved into the helper). `last_offset` is
-/// deliberately ABSENT — the streaming caller does not own the relay watermark
-/// and the helper preserves whatever the in-lock disk reload carries (this is
-/// the core of the TOCTOU fix: the old unlocked load→save re-wrote a stale
-/// `last_offset`, racing a concurrent owner-gated `refresh_inflight_last_offset_*`
-/// advance and emitting a spurious `last_offset_monotonic` violation).
-#[derive(Debug, Clone)]
-pub(in crate::services::discord) struct WatcherStreamProgressPatch {
-    pub current_msg_id: Option<u64>,
-    pub full_response: String,
-    pub response_sent_offset: usize,
-    pub current_tool_line: Option<String>,
-    pub prev_tool_status: Option<String>,
-    pub task_notification_kind: Option<TaskNotificationKind>,
-    pub any_tool_used: bool,
-    pub has_post_tool_text: bool,
-}
-
-/// #3558: outcome of [`persist_watcher_stream_progress_locked_in_root`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum WatcherProgressOutcome {
-    /// The watcher-owned fields were patched and persisted.
-    Saved,
-    /// Either no row exists, or the in-lock reload no longer matches the
-    /// expected identity / tmux session (a fresh turn replaced it, or a
-    /// restart/rebind marker is now pinned). The write was skipped.
-    Skipped,
-    /// Filesystem or lock acquisition failure.
-    IoError,
-}
-
-/// #3558: single-flock read-modify-write for the tmux streaming-progress
-/// caller. Acquires the sidecar flock ONCE, reloads the on-disk row, re-checks
-/// the caller's identity/session guards against the freshly reloaded row, then
-/// patches ONLY the watcher-owned streaming fields and persists via
-/// [`persist_under_lock`] — never re-entering [`save_inflight_state`] (which
-/// would re-acquire the same non-reentrant flock and self-deadlock).
-///
-/// `last_offset` is preserved verbatim from the in-lock reload, so a concurrent
-/// owner-gated `refresh_inflight_last_offset_*` advance can no longer be
-/// clobbered backward by a stale unlocked snapshot.
-pub(in crate::services::discord) fn persist_watcher_stream_progress_locked(
-    provider: &ProviderKind,
-    channel_id: u64,
-    require_identity: Option<&InflightTurnIdentity>,
-    require_tmux_session_name: &str,
-    patch: WatcherStreamProgressPatch,
-) -> WatcherProgressOutcome {
-    let Some(root) = inflight_runtime_root() else {
-        return WatcherProgressOutcome::IoError;
-    };
-    persist_watcher_stream_progress_locked_in_root(
-        &root,
-        provider,
-        channel_id,
-        require_identity,
-        require_tmux_session_name,
-        patch,
-    )
-}
-
-/// Root-explicit variant of [`persist_watcher_stream_progress_locked`] for unit
-/// tests (avoids `AGENTDESK_ROOT_DIR` env-var races).
-fn persist_watcher_stream_progress_locked_in_root(
-    root: &Path,
-    provider: &ProviderKind,
-    channel_id: u64,
-    require_identity: Option<&InflightTurnIdentity>,
-    require_tmux_session_name: &str,
-    patch: WatcherStreamProgressPatch,
-) -> WatcherProgressOutcome {
-    let path = inflight_state_path(root, provider, channel_id);
-    if let Some(parent) = path.parent()
-        && fs::create_dir_all(parent).is_err()
-    {
-        return WatcherProgressOutcome::IoError;
-    }
-    let Ok(_lock) = lock_inflight_state_path(&path) else {
-        return WatcherProgressOutcome::IoError;
-    };
-    let Some(mut state) = load_inflight_state_unlocked(&path) else {
-        return WatcherProgressOutcome::Skipped;
-    };
-    // A pinned restart/rebind marker means a different lifecycle owns the row;
-    // the streaming caller must not touch it (mirrors the refresh-path guard).
-    if state.restart_mode.is_some() || state.rebind_origin {
-        return WatcherProgressOutcome::Skipped;
-    }
-    if state.tmux_session_name.as_deref() != Some(require_tmux_session_name) {
-        return WatcherProgressOutcome::Skipped;
-    }
-    // #3558: when the caller has captured a per-turn identity, reject a write
-    // onto a fresh row B (different user_msg_id / started_at / turn_start_offset)
-    // — exactly the late-frame race the old tmux-session-only guard let through.
-    // Before identity is captured (early frames) the caller passes `None` and we
-    // fall back to the historical tmux-session-only guard above.
-    if let Some(identity) = require_identity
-        && !identity.matches_state(&state)
-    {
-        return WatcherProgressOutcome::Skipped;
-    }
-
-    if let Some(msg_id) = patch.current_msg_id {
-        state.current_msg_id = msg_id;
-    }
-    state.full_response = patch.full_response;
-    // Recompute the boundary clamp against the freshly reloaded full_response so
-    // the persisted offset stays in-bounds even if the disk row's body differs
-    // from the caller's last unlocked snapshot.
-    state.response_sent_offset =
-        normalize_response_sent_offset(&state.full_response, patch.response_sent_offset);
-    state.current_tool_line = patch.current_tool_line;
-    state.prev_tool_status = patch.prev_tool_status;
-    state.any_tool_used = patch.any_tool_used;
-    state.has_post_tool_text = patch.has_post_tool_text;
-    if patch.task_notification_kind.is_some() {
-        state.task_notification_kind = patch.task_notification_kind;
-    }
-    // `last_offset` intentionally untouched — preserved from the in-lock reload.
-
-    match persist_under_lock(
-        root,
-        &path,
-        &state,
-        "src/services/discord/inflight.rs:persist_watcher_stream_progress_locked_in_root",
-    ) {
-        Ok(()) => WatcherProgressOutcome::Saved,
-        Err(_) => WatcherProgressOutcome::IoError,
-    }
-}
-
-/// #3558: the watcher-owned fields the terminal-commit RMW writes. Unlike the
-/// streaming patch, the commit caller IS the authoritative owner of the
-/// turn-end watermark, so it deliberately writes `last_offset` /
-/// `response_sent_offset` — but max-serializes them against the in-lock reload
-/// so a late commit observing a newer disk watermark never moves it backward.
-pub(in crate::services::discord) struct WatcherTerminalCommitPatch {
-    pub full_response: String,
-    pub last_offset: u64,
-    pub last_watcher_relayed_offset: Option<u64>,
-    pub last_watcher_relayed_generation_mtime_ns: Option<i64>,
-}
-
-/// #3558: outcome of [`commit_watcher_terminal_delivery_locked_in_root`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum WatcherTerminalCommitOutcome {
-    Committed,
-    Skipped,
-    IoError,
-}
-
-/// #3558: single-flock read-modify-write for the watcher terminal-commit caller
-/// (`commit_decisions::mark_watcher_terminal_delivery_committed`). Replaces the
-/// old unlocked `load_inflight_state` → mutate → `save_inflight_state` (which
-/// re-wrote a stale `last_offset`/`response_sent_offset`, racing a concurrent
-/// owner advance). Holds the flock across reload → identity guard → patch →
-/// `persist_under_lock`. The commit owns the watermark, so it writes
-/// `last_offset`/`response_sent_offset` but `max`-serializes both against the
-/// in-lock reload (forward writes are unchanged; only a backward commit is
-/// clamped up to the disk value).
-pub(in crate::services::discord) fn commit_watcher_terminal_delivery_locked(
-    provider: &ProviderKind,
-    channel_id: u64,
-    require_identity: &InflightTurnIdentity,
-    require_tmux_session_name: &str,
-    patch: WatcherTerminalCommitPatch,
-) -> WatcherTerminalCommitOutcome {
-    let Some(root) = inflight_runtime_root() else {
-        return WatcherTerminalCommitOutcome::IoError;
-    };
-    commit_watcher_terminal_delivery_locked_in_root(
-        &root,
-        provider,
-        channel_id,
-        require_identity,
-        require_tmux_session_name,
-        patch,
-    )
-}
-
-/// Root-explicit variant of [`commit_watcher_terminal_delivery_locked`] for unit
-/// tests.
-fn commit_watcher_terminal_delivery_locked_in_root(
-    root: &Path,
-    provider: &ProviderKind,
-    channel_id: u64,
-    require_identity: &InflightTurnIdentity,
-    require_tmux_session_name: &str,
-    patch: WatcherTerminalCommitPatch,
-) -> WatcherTerminalCommitOutcome {
-    let path = inflight_state_path(root, provider, channel_id);
-    let Ok(_lock) = lock_inflight_state_path(&path) else {
-        return WatcherTerminalCommitOutcome::IoError;
-    };
-    let Some(mut state) = load_inflight_state_unlocked(&path) else {
-        return WatcherTerminalCommitOutcome::Skipped;
-    };
-    if state.restart_mode.is_some() || state.rebind_origin {
-        return WatcherTerminalCommitOutcome::Skipped;
-    }
-    // Preserve the existing strong identity guard (user_msg_id + started_at +
-    // tmux_session + turn_start_offset) exactly — `matches_state` already
-    // compares all four, and we additionally pin the caller-supplied session.
-    if !require_identity.matches_state(&state)
-        || state.tmux_session_name.as_deref() != Some(require_tmux_session_name)
-    {
-        return WatcherTerminalCommitOutcome::Skipped;
-    }
-
-    state.terminal_delivery_committed = true;
-    // Max-serialize against the in-lock reload so a late commit never moves the
-    // watermark backward (the TOCTOU the old unlocked load→save introduced):
-    //  - `full_response`: keep whichever body is LONGER. A concurrent stream may
-    //    have persisted a longer body than this (possibly stale) commit carries;
-    //    adopting the longer one avoids truncating already-relayed content AND
-    //    keeps `response_sent_offset` in-bounds.
-    //  - `response_sent_offset`: the committed body length, never below disk.
-    //  - `last_offset`: the larger of the commit arg and the disk watermark.
-    if patch.full_response.len() >= state.full_response.len() {
-        state.full_response = patch.full_response;
-    }
-    let committed_response_offset = state.full_response.len().max(state.response_sent_offset);
-    state.response_sent_offset =
-        normalize_response_sent_offset(&state.full_response, committed_response_offset);
-    state.last_offset = patch.last_offset.max(state.last_offset);
-    state.last_watcher_relayed_offset = patch.last_watcher_relayed_offset;
-    state.last_watcher_relayed_generation_mtime_ns = patch.last_watcher_relayed_generation_mtime_ns;
-
-    match persist_under_lock(
-        root,
-        &path,
-        &state,
-        "src/services/discord/inflight.rs:commit_watcher_terminal_delivery_locked_in_root",
-    ) {
-        Ok(()) => WatcherTerminalCommitOutcome::Committed,
-        Err(_) => WatcherTerminalCommitOutcome::IoError,
-    }
-}
-
-/// #3558 (codex review follow-up): the watcher-owned relay-success watermark a
-/// single-flock RMW patches onto the persisted row. Unlike the terminal-commit
-/// patch this does NOT carry `last_offset` / `response_sent_offset` /
-/// `full_response` and does NOT set `terminal_delivery_committed` — those are
-/// preserved verbatim from the in-lock disk reload. The two
-/// session-bound-relay-success sites in `tmux_watcher.rs` only mean to advance
-/// the relay watermark; the old unlocked `load_inflight_state` → mutate →
-/// `save_inflight_state(&inflight)` re-wrote the whole stale row (including a
-/// possibly-backward `last_offset`/`response_sent_offset`), reintroducing the
-/// exact backward-write TOCTOU the #3558 fix closed elsewhere.
-#[derive(Debug, Clone, Copy)]
-pub(in crate::services::discord) struct WatcherRelayWatermarkPatch {
-    pub last_watcher_relayed_offset: Option<u64>,
-    pub last_watcher_relayed_generation_mtime_ns: Option<i64>,
-}
-
-/// #3558: outcome of [`persist_watcher_relay_watermark_locked_in_root`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::services::discord) enum WatcherRelayWatermarkOutcome {
-    Saved,
-    Skipped,
-    IoError,
-}
-
-/// #3558 (codex review follow-up): single-flock read-modify-write for the
-/// watcher's session-bound-relay-success watermark. Replaces the old unlocked
-/// `load_inflight_state` → mutate → `save_inflight_state` at
-/// `tmux_watcher.rs` (the two terminal-relay-success sites). Holds the sidecar
-/// flock across reload → identity guard → patch → [`persist_under_lock`], never
-/// re-entering [`save_inflight_state`] (which would re-acquire the same
-/// non-reentrant flock and self-deadlock). ONLY `last_watcher_relayed_*` is
-/// patched; `last_offset` / `response_sent_offset` / `full_response` are
-/// preserved verbatim from the in-lock reload so a concurrent owner-gated
-/// `refresh_inflight_last_offset_*` advance can no longer be clobbered backward
-/// by the stale unlocked snapshot these sites used to write back.
-pub(in crate::services::discord) fn persist_watcher_relay_watermark_locked(
-    provider: &ProviderKind,
-    channel_id: u64,
-    require_identity: &InflightTurnIdentity,
-    require_tmux_session_name: &str,
-    patch: WatcherRelayWatermarkPatch,
-) -> WatcherRelayWatermarkOutcome {
-    let Some(root) = inflight_runtime_root() else {
-        return WatcherRelayWatermarkOutcome::IoError;
-    };
-    persist_watcher_relay_watermark_locked_in_root(
-        &root,
-        provider,
-        channel_id,
-        require_identity,
-        require_tmux_session_name,
-        patch,
-    )
-}
-
-/// Root-explicit variant of [`persist_watcher_relay_watermark_locked`] for unit
-/// tests.
-fn persist_watcher_relay_watermark_locked_in_root(
-    root: &Path,
-    provider: &ProviderKind,
-    channel_id: u64,
-    require_identity: &InflightTurnIdentity,
-    require_tmux_session_name: &str,
-    patch: WatcherRelayWatermarkPatch,
-) -> WatcherRelayWatermarkOutcome {
-    let path = inflight_state_path(root, provider, channel_id);
-    let Ok(_lock) = lock_inflight_state_path(&path) else {
-        return WatcherRelayWatermarkOutcome::IoError;
-    };
-    let Some(mut state) = load_inflight_state_unlocked(&path) else {
-        return WatcherRelayWatermarkOutcome::Skipped;
-    };
-    if state.restart_mode.is_some() || state.rebind_origin {
-        return WatcherRelayWatermarkOutcome::Skipped;
-    }
-    // Same strong identity guard as the terminal-commit helper (user_msg_id +
-    // started_at + tmux_session + turn_start_offset, plus the caller-supplied
-    // session). Rejects a write onto a fresh row B that replaced the row this
-    // relay was for — the late-frame race the old tmux-session-only load→save
-    // let through.
-    if !require_identity.matches_state(&state)
-        || state.tmux_session_name.as_deref() != Some(require_tmux_session_name)
-    {
-        return WatcherRelayWatermarkOutcome::Skipped;
-    }
-
-    state.last_watcher_relayed_offset = patch.last_watcher_relayed_offset;
-    state.last_watcher_relayed_generation_mtime_ns = patch.last_watcher_relayed_generation_mtime_ns;
-    // `last_offset` / `response_sent_offset` / `full_response` /
-    // `terminal_delivery_committed` intentionally untouched — preserved from the
-    // in-lock reload.
-
-    match persist_under_lock(
-        root,
-        &path,
-        &state,
-        "src/services/discord/inflight.rs:persist_watcher_relay_watermark_locked_in_root",
-    ) {
-        Ok(()) => WatcherRelayWatermarkOutcome::Saved,
-        Err(_) => WatcherRelayWatermarkOutcome::IoError,
-    }
-}
-
 fn inflight_state_allows_idle_tmux_repair_state(state: &InflightTurnState) -> bool {
     state.full_response.trim().is_empty()
         && state.response_sent_offset == 0
@@ -2567,15 +2591,52 @@ pub(super) fn mark_all_inflight_states_restart_mode(
     let Some(root) = inflight_runtime_root() else {
         return 0;
     };
+    // #3860 — set restart_mode via a per-row lock-RMW instead of blind-saving
+    // the unlocked snapshot. `load_inflight_states_from_root` reads each row
+    // WITHOUT holding its flock; the old code then `save`d that stale whole-row
+    // snapshot back under the lock. A draining watcher that advanced the
+    // delivery frontier (`response_sent_offset` / `last_offset`) on disk in the
+    // gap therefore had its progress overwritten (frontier regression) → the
+    // replacement watcher re-relayed `full_response[response_sent_offset..]`,
+    // i.e. a duplicate Discord send (the issue's live sub-2000-char repro).
+    // The enumeration is reused only to discover the live rows (its stale-row
+    // GC side effects are preserved); the mutation re-reads the FRESH on-disk
+    // row under the flock and sets ONLY restart_mode / restart_generation,
+    // never the frontier, so it can no longer regress a concurrent writer.
     let states = load_inflight_states_from_root(&root, provider);
     let mut updated = 0usize;
-    for mut state in states {
-        state.set_restart_mode(restart_mode);
-        if save_inflight_state_in_root(&root, &state).is_ok() {
+    for state in states {
+        let path = inflight_state_path(&root, provider, state.channel_id);
+        if set_inflight_restart_mode_under_lock(&path, restart_mode) {
             updated += 1;
         }
     }
     updated
+}
+
+/// #3860 — RMW the restart-mode marker on one inflight row under its flock.
+///
+/// Re-reads the CURRENT on-disk state (so a delivery frontier that a concurrent
+/// draining watcher advanced between the unlocked enumeration and this write is
+/// preserved) and persists it with only `restart_mode` / `restart_generation`
+/// changed. Mirrors the lock-then-read pattern of `clear_inflight_by_tmux_name`.
+/// Returns whether the row was rewritten. Deliberately does NOT route through
+/// `save_inflight_state_in_root` (which writes the *caller's* snapshot): the
+/// whole point is to keep the on-disk frontier rather than carry a stale one.
+fn set_inflight_restart_mode_under_lock(path: &Path, restart_mode: InflightRestartMode) -> bool {
+    let Ok(_lock) = lock_inflight_state_path(path) else {
+        return false;
+    };
+    let Some(mut state) = read_inflight_state_content(path) else {
+        return false;
+    };
+    state.set_restart_mode(restart_mode);
+    state.ensure_finalizer_turn_id();
+    state.updated_at = now_string();
+    match serde_json::to_string_pretty(&state) {
+        Ok(json) => atomic_write(path, &json).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// #2437 (#2427 C wire) boot-time bulk invalidate. Removes inflight
@@ -2728,6 +2789,19 @@ pub(super) fn load_inflight_state(
     } else {
         Some(state)
     }
+}
+
+/// Load a single inflight state without compatibility backfills or cleanup.
+///
+/// Use this for diagnostic/read-only probes that must not mutate sidecar state.
+pub(super) fn load_inflight_state_read_only(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Option<InflightTurnState> {
+    let root = inflight_runtime_root()?;
+    let path = inflight_state_path(&root, provider, channel_id);
+    let data = fs::read_to_string(&path).ok()?;
+    parse_inflight_state_content(&data).ok()
 }
 
 pub(super) fn load_inflight_states(provider: &ProviderKind) -> Vec<InflightTurnState> {
@@ -3009,15 +3083,19 @@ mod stall_recovery_tests {
         clear_inflight_state_if_matches_identity_after_delivery_in_root,
         clear_inflight_state_if_matches_identity_in_root, clear_inflight_state_if_matches_in_root,
         clear_inflight_state_if_matches_tmux_response_in_root,
-        clear_inflight_state_if_matches_zero_owned_in_root, clear_status_panel_if_current_in_root,
-        commit_watcher_terminal_delivery_locked_in_root,
+        clear_inflight_state_if_matches_zero_owned_in_root,
+        clear_rebind_origin_inflight_state_if_matches_identity_in_root,
+        clear_status_panel_if_current_in_root, commit_watcher_terminal_delivery_locked_in_root,
         inflight_state_allows_idle_tmux_repair_state, inflight_state_is_stale, inflight_state_path,
         load_inflight_states_from_root, lock_inflight_state_path, normalize_response_sent_offset,
         offset_monotonic_invariant_severity, ownerless_external_input_inflight_is_stale_at,
         persist_watcher_relay_watermark_locked_in_root,
         persist_watcher_stream_progress_locked_in_root,
         refresh_inflight_last_offset_if_matches_identity_in_root,
+        request_inflight_abandon_if_matches_in_root,
+        request_inflight_abandon_if_matches_zero_owned_in_root, row_has_finalizable_placeholder,
         save_existing_inflight_rebind_adoption_if_matches_identity_in_root,
+        save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root,
         save_inflight_state_if_matches_identity_in_root, save_inflight_state_in_root,
         validate_inflight_state_for_save,
     };
@@ -3191,22 +3269,14 @@ mod stall_recovery_tests {
 
     #[test]
     fn status_message_id_round_trips_for_status_panel_resume() {
-        let temp = TempDir::new().unwrap();
-        let mut state = InflightTurnState::new(
-            ProviderKind::Claude,
+        let (_lock, temp, _env_reset) = status_panel_test_root();
+        let state = status_panel_test_state(
             42,
-            Some("adk-claude".to_string()),
-            7,
             8,
             99,
-            "hello".to_string(),
-            Some("session-1".to_string()),
-            Some("AgentDesk-claude-adk-claude".to_string()),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
+            Some("AgentDesk-claude-adk-claude"),
+            Some(123_456),
         );
-        state.status_message_id = Some(123_456);
 
         save_inflight_state_in_root(temp.path(), &state).expect("save inflight state");
 
@@ -3347,6 +3417,244 @@ mod stall_recovery_tests {
         super::atomic_write(&path, &json).expect("force write state");
     }
 
+    // ---- #3859: failure-path abandon-request (durable handoff, row deleted) ----
+
+    fn spinner_row(channel_id: u64, user_msg_id: u64, current_msg_id: u64) -> InflightTurnState {
+        InflightTurnState::new(
+            ProviderKind::Claude,
+            channel_id,
+            Some("adk-claude".to_string()),
+            7,
+            user_msg_id,
+            current_msg_id,
+            "prompt".to_string(),
+            Some("session-3859".to_string()),
+            Some("AgentDesk-claude-adk-claude".to_string()),
+            Some("/tmp/out.jsonl".to_string()),
+            None,
+            0,
+        )
+    }
+
+    /// `row_has_finalizable_placeholder` gate: a pure spinner is finalizable; a
+    /// placeholderless (`current_msg_id == user_msg_id`) or partial-output row is
+    /// not (so the failure path deletes the row WITHOUT a "중단됨" clobber).
+    #[test]
+    fn finalizable_placeholder_gate_matches_pure_spinner_only() {
+        // #3859 r5 (codex P2): seed a temp runtime root — `spinner_row` builds via
+        // `InflightTurnState::new`, which loads the generation and trips the #3293
+        // "test must set AGENTDESK_ROOT_DIR" guard under an isolated run.
+        let (_lock, _temp, _env) = status_panel_test_root();
+        let mut state = spinner_row(100, 8, 9001);
+        assert!(row_has_finalizable_placeholder(&state), "pure spinner");
+
+        let placeholderless = spinner_row(100, 8, 8);
+        assert!(
+            !row_has_finalizable_placeholder(&placeholderless),
+            "anchor mirrors user msg → no separate placeholder card"
+        );
+
+        let mut zero = spinner_row(100, 0, 0);
+        zero.current_msg_id = 0;
+        assert!(!row_has_finalizable_placeholder(&zero), "no anchor");
+
+        state.full_response = "partial answer".to_string();
+        assert!(
+            !row_has_finalizable_placeholder(&state),
+            "partial output → keep delivered text, no clobber"
+        );
+        state.full_response.clear();
+        state.response_sent_offset = 5;
+        assert!(!row_has_finalizable_placeholder(&state), "streamed offset");
+        state.response_sent_offset = 0;
+        state.long_running_placeholder_active = true;
+        state.full_response = "prose then long-running card".to_string();
+        assert!(
+            row_has_finalizable_placeholder(&state),
+            "explicit long-running placeholder is finalizable even with prose"
+        );
+    }
+
+    /// The failure path on a pure-spinner row: enqueue a durable abandon-request
+    /// (so the sweeper finalizes the "🔄 처리 중" card to "중단됨" by msg id) AND
+    /// DELETE the inflight row — freeing the channel immediately (no flag-on-live-
+    /// row, no busy regression).
+    #[test]
+    fn abandon_request_enqueues_record_and_deletes_row() {
+        let (_lock, temp, _env) = status_panel_test_root();
+        let state = spinner_row(4242, 8, 9001);
+        save_inflight_state_in_root(temp.path(), &state).expect("seed inflight row");
+
+        let outcome = request_inflight_abandon_if_matches_in_root(
+            temp.path(),
+            &ProviderKind::Claude,
+            4242,
+            8,
+            "tok",
+        );
+        assert_eq!(outcome, GuardedClearOutcome::Cleared);
+
+        // Row is DELETED (channel free).
+        assert!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Claude).is_empty(),
+            "inflight row must be deleted (channel freed immediately)"
+        );
+        // Durable abandon-request carries the placeholder id + render fields.
+        let pending =
+            super::super::abandon_request_store::load_pending(&ProviderKind::Claude, "tok");
+        assert_eq!(pending.len(), 1, "one durable abandon-request");
+        assert_eq!(pending[0].0, 4242);
+        assert_eq!(pending[0].1.msg_id, 9001);
+        assert_eq!(pending[0].1.started_at, state.started_at);
+    }
+
+    /// A placeholderless row (anchor == user msg) and a partial-output row are
+    /// DELETED but NOT enqueued — no "중단됨" clobber of the user's message / the
+    /// delivered partial answer.
+    #[test]
+    fn abandon_request_deletes_without_enqueue_for_non_finalizable_rows() {
+        let (_lock, temp, _env) = status_panel_test_root();
+        // Placeholderless: current_msg_id == user_msg_id.
+        let pl = spinner_row(4243, 8, 8);
+        save_inflight_state_in_root(temp.path(), &pl).expect("seed");
+        assert_eq!(
+            request_inflight_abandon_if_matches_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                4243,
+                8,
+                "tok"
+            ),
+            GuardedClearOutcome::Cleared
+        );
+
+        // Partial-output row.
+        let mut partial = spinner_row(4244, 9, 9100);
+        partial.full_response = "partial".to_string();
+        force_write_state(temp.path(), &partial);
+        assert_eq!(
+            request_inflight_abandon_if_matches_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                4244,
+                9,
+                "tok"
+            ),
+            GuardedClearOutcome::Cleared
+        );
+
+        assert!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Claude).is_empty(),
+            "both rows deleted (channels freed)"
+        );
+        assert!(
+            super::super::abandon_request_store::load_pending(&ProviderKind::Claude, "tok")
+                .is_empty(),
+            "non-finalizable rows must NOT enqueue an abandon-request"
+        );
+    }
+
+    /// Restart-mode / rebind-origin / newer-owner rows are PRESERVED: no enqueue,
+    /// no delete (recovery owns their lifecycle).
+    #[test]
+    fn abandon_request_preserves_recovery_owned_and_newer_owner_rows() {
+        let (_lock, temp, _env) = status_panel_test_root();
+
+        let mut restart = spinner_row(4245, 8, 9001);
+        restart.restart_mode = Some(InflightRestartMode::DrainRestart);
+        save_inflight_state_in_root(temp.path(), &restart).expect("seed restart");
+        assert_eq!(
+            request_inflight_abandon_if_matches_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                4245,
+                8,
+                "tok"
+            ),
+            GuardedClearOutcome::PlannedRestartSkipped
+        );
+
+        let mut rebind = spinner_row(4246, 0, 9002);
+        rebind.rebind_origin = true;
+        save_inflight_state_in_root(temp.path(), &rebind).expect("seed rebind");
+        assert_eq!(
+            request_inflight_abandon_if_matches_zero_owned_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                4246,
+                "tok"
+            ),
+            GuardedClearOutcome::RebindOriginSkipped
+        );
+
+        let newer = spinner_row(4247, 99, 9003);
+        save_inflight_state_in_root(temp.path(), &newer).expect("seed newer");
+        assert_eq!(
+            request_inflight_abandon_if_matches_in_root(
+                temp.path(),
+                &ProviderKind::Claude,
+                4247,
+                8, // stale signal for an older turn
+                "tok"
+            ),
+            GuardedClearOutcome::UserMsgMismatch
+        );
+
+        // All three row FILES survive on disk (the helpers returned early without
+        // deleting). Check paths directly — `load_inflight_states_from_root` GCs a
+        // generation-mismatched restart row and filters rebind-origin rows on read.
+        for ch in [4245u64, 4246, 4247] {
+            assert!(
+                inflight_state_path(temp.path(), &ProviderKind::Claude, ch).exists(),
+                "preserved row {ch} must survive on disk"
+            );
+        }
+        assert!(
+            super::super::abandon_request_store::load_pending(&ProviderKind::Claude, "tok")
+                .is_empty(),
+            "preserved rows must NOT enqueue"
+        );
+    }
+
+    /// #3859 r5 (codex P1): if the abandon-request fails to persist for a
+    /// finalizable placeholder, the inflight row MUST be PRESERVED (outcome
+    /// IoError) — never deleted without a record, which would re-strand the
+    /// placeholder forever (the original #3859 bug on the error path).
+    #[test]
+    fn abandon_request_preserves_row_when_enqueue_fails() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Seed the inflight row in its own temp root.
+        let inflight_temp = TempDir::new().unwrap();
+        // Point AGENTDESK_ROOT_DIR (→ abandon-requests root) at a FILE so the
+        // store's atomic_write fails → enqueue returns Err.
+        let bad = TempDir::new().unwrap();
+        let bad_root = bad.path().join("not_a_dir");
+        std::fs::write(&bad_root, b"x").expect("seed file at root path");
+        let _env = set_agentdesk_root_for_test(&bad_root);
+
+        let state = spinner_row(4248, 8, 9001);
+        save_inflight_state_in_root(inflight_temp.path(), &state).expect("seed inflight row");
+
+        let outcome = request_inflight_abandon_if_matches_in_root(
+            inflight_temp.path(),
+            &ProviderKind::Claude,
+            4248,
+            8,
+            "tok",
+        );
+        assert_eq!(
+            outcome,
+            GuardedClearOutcome::IoError,
+            "enqueue failure must NOT delete the row"
+        );
+        assert!(
+            inflight_state_path(inflight_temp.path(), &ProviderKind::Claude, 4248).exists(),
+            "inflight row must be PRESERVED so the placeholder is not stranded"
+        );
+    }
+
     /// #3558 core: a streaming progress write must PRESERVE the on-disk
     /// `last_offset` (which a concurrent owner-gated refresh advanced) instead
     /// of clobbering it backward from a stale unlocked snapshot.
@@ -3389,6 +3697,7 @@ mod stall_recovery_tests {
                 task_notification_kind: None,
                 any_tool_used: false,
                 has_post_tool_text: false,
+                streaming_rollover_frozen_msg_ids: Vec::new(),
             },
         );
         assert_eq!(outcome, WatcherProgressOutcome::Saved);
@@ -3438,6 +3747,7 @@ mod stall_recovery_tests {
                 task_notification_kind: None,
                 any_tool_used: false,
                 has_post_tool_text: false,
+                streaming_rollover_frozen_msg_ids: Vec::new(),
             },
         );
         assert_eq!(outcome, WatcherProgressOutcome::Skipped);
@@ -3706,6 +4016,7 @@ mod stall_recovery_tests {
                 task_notification_kind: None,
                 any_tool_used: false,
                 has_post_tool_text: false,
+                streaming_rollover_frozen_msg_ids: Vec::new(),
             },
         );
         assert_eq!(outcome, WatcherProgressOutcome::Saved);
@@ -3727,6 +4038,38 @@ mod stall_recovery_tests {
     /// Seeds a single inflight row in `root` and returns it. `user_msg_id` /
     /// `current_msg_id` / `status_message_id` are caller-controlled so the
     /// guard semantics can be exercised.
+    fn status_panel_test_state(
+        channel_id: u64,
+        user_msg_id: u64,
+        current_msg_id: u64,
+        tmux_session_name: Option<&str>,
+        status_message_id: Option<u64>,
+    ) -> InflightTurnState {
+        serde_json::from_value(serde_json::json!({
+            "version": 9,
+            "provider": "claude",
+            "channel_id": channel_id,
+            "channel_name": "adk-claude",
+            "request_owner_user_id": user_msg_id,
+            "user_msg_id": user_msg_id,
+            "current_msg_id": current_msg_id,
+            "current_msg_len": 0,
+            "status_message_id": status_message_id,
+            "user_text": "hello",
+            "source": "text",
+            "session_id": "session-1",
+            "tmux_session_name": tmux_session_name,
+            "output_path": "/tmp/out.jsonl",
+            "input_fifo_path": "/tmp/in.fifo",
+            "last_offset": 0,
+            "full_response": "",
+            "response_sent_offset": 0,
+            "started_at": "2026-01-01 00:00:00",
+            "updated_at": "2026-01-01 00:00:00"
+        }))
+        .expect("status-panel test inflight state")
+    }
+
     fn seed_status_panel_state(
         root: &Path,
         channel_id: u64,
@@ -3735,25 +4078,13 @@ mod stall_recovery_tests {
         tmux_session_name: Option<&str>,
         status_message_id: Option<u64>,
     ) -> InflightTurnState {
-        let mut state = InflightTurnState::new(
-            ProviderKind::Claude,
+        let state = status_panel_test_state(
             channel_id,
-            Some("adk-claude".to_string()),
-            user_msg_id,
             user_msg_id,
             current_msg_id,
-            "hello".to_string(),
-            Some("session-1".to_string()),
-            tmux_session_name.map(str::to_string),
-            Some("/tmp/out.jsonl".to_string()),
-            Some("/tmp/in.fifo".to_string()),
-            0,
+            tmux_session_name,
+            status_message_id,
         );
-        // `new()` takes (.., request_owner_user_id, user_msg_id, current_msg_id, ..);
-        // pin the guard-relevant fields explicitly so the test intent is exact.
-        state.user_msg_id = user_msg_id;
-        state.current_msg_id = current_msg_id;
-        state.status_message_id = status_message_id;
         save_inflight_state_in_root(root, &state).expect("seed inflight state");
         state
     }
@@ -3767,7 +4098,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn bind_status_panel_sets_id_when_unguarded() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(temp.path(), 7001, 10, 11, Some("AgentDesk-claude-a"), None);
 
         let outcome = bind_status_panel_in_root(
@@ -3784,7 +4115,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn bind_status_panel_is_idempotent_when_already_bound() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(
             temp.path(),
             7002,
@@ -3808,7 +4139,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn bind_status_panel_respects_user_msg_id_guard() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(temp.path(), 7003, 10, 11, Some("AgentDesk-claude-a"), None);
 
         // Guard expects a different user_msg_id (a newer turn now owns the row).
@@ -3829,7 +4160,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn bind_status_panel_skips_when_real_panel_already_set() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         // A real (non-synthetic) panel id already on the row.
         seed_status_panel_state(
             temp.path(),
@@ -3866,7 +4197,7 @@ mod stall_recovery_tests {
         // already owns must classify as `AlreadyBound`, NOT
         // `SkippedPanelAlreadySet`, even when `skip_if_panel_already_set` is set.
         // Misclassifying it routed the TUI-direct caller to DELETE its own panel.
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(
             temp.path(),
             7007,
@@ -3895,7 +4226,7 @@ mod stall_recovery_tests {
     fn bind_status_panel_different_id_skips_and_reports_owned_id() {
         // A DIFFERENT real panel id already set + skip flag → SkippedPanelAlreadySet
         // carrying the row's owned id (so the caller adopts the real panel).
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(
             temp.path(),
             7008,
@@ -3925,7 +4256,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn bind_status_panel_overwrites_synthetic_even_with_skip_flag() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         // A synthetic-headless id does NOT count as "already set".
         seed_status_panel_state(
             temp.path(),
@@ -3966,7 +4297,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn clear_status_panel_if_current_clears_on_match() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(
             temp.path(),
             7101,
@@ -3990,7 +4321,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn clear_status_panel_if_current_preserves_newer_turns_panel_on_mismatch() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         // A newer turn already rebound the panel to 9999; a stale actor still
         // believes it owns 5555 and asks to clear it. The compare-and-clear
         // must NOT wipe the newer turn's panel.
@@ -4017,7 +4348,7 @@ mod stall_recovery_tests {
 
     #[test]
     fn clear_status_panel_if_current_respects_extra_guards() {
-        let temp = TempDir::new().unwrap();
+        let (_lock, temp, _env_reset) = status_panel_test_root();
         seed_status_panel_state(
             temp.path(),
             7103,
@@ -4520,6 +4851,15 @@ mod stall_recovery_tests {
         let reset = EnvReset(std::env::var_os("AGENTDESK_ROOT_DIR"));
         unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", path) };
         reset
+    }
+
+    fn status_panel_test_root() -> (std::sync::MutexGuard<'static, ()>, TempDir, EnvReset) {
+        let lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let env_reset = set_agentdesk_root_for_test(temp.path());
+        (lock, temp, env_reset)
     }
 
     /// #2427 D/A wire — happy path. When the on-disk inflight has a
@@ -5395,6 +5735,38 @@ mod stall_recovery_tests {
     }
 
     #[test]
+    fn authority_guard_would_suppress_same_turn_frontier_reset_3860() {
+        // #3860 SAFETY rationale (why the compiled monotonic-guard default stays
+        // OFF and is NOT flipped to enforce-ON in this PR): when ON,
+        // `authority_blocks_backward_inflight_write` blocks ANY same-turn backward
+        // `response_sent_offset` write — including the LEGITIMATE Gemini/Qwen
+        // RetryBoundary reset (turn_bridge/retry_state.rs clears `full_response`
+        // and rewinds rso→0 for the SAME identity to re-stream the turn). Blocking
+        // it drops the re-streamed body (a real, observed danger — the live
+        // AGENTDESK_DELIVERY_RECORD_AUTHORITY=1 config enforce-skips that reset).
+        // The root-cause fix (the per-row RMW restart-mode marker) avoids the
+        // frontier regression WITHOUT this collateral suppression, so the risky
+        // default flip is deferred, not taken here.
+        use crate::services::discord::outbound::delivery_record as dr;
+        // authority ON + same-turn backward rso (monotonic == false) → blocked
+        // (this is the legitimate retry reset that would be wrongly suppressed).
+        assert!(dr::authority_blocks_backward_inflight_write(
+            true, false, true
+        ));
+        assert!(dr::authority_blocks_backward_inflight_write(
+            true, true, false
+        ));
+        // authority OFF (compiled default) → never blocks → reset persists.
+        assert!(!dr::authority_blocks_backward_inflight_write(
+            false, false, true
+        ));
+        // authority ON but fully monotonic → not blocked (forward writes pass).
+        assert!(!dr::authority_blocks_backward_inflight_write(
+            true, true, true
+        ));
+    }
+
+    #[test]
     fn delivery_response_sent_offset_stays_on_utf8_boundary() {
         let response = "안녕";
         let first_char_middle = 1;
@@ -5842,6 +6214,201 @@ mod stall_recovery_tests {
         assert_eq!(rows[0].last_offset, 4096);
         assert_eq!(rows[0].last_watcher_relayed_offset, Some(2048));
         assert_eq!(rows[0].full_response, "newer streamed text");
+    }
+
+    #[test]
+    fn existing_rebind_adoption_with_offset_rebase_persists_normalized_cursor_base() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut on_disk = build_inflight_for_guard_tests(ProviderKind::Codex, 324, 777);
+        on_disk.user_msg_id = 777;
+        on_disk.current_msg_id = 778;
+        on_disk.set_restart_mode(InflightRestartMode::DrainRestart);
+        on_disk.output_path = Some("/tmp/raw-rollout.jsonl".to_string());
+        on_disk.last_offset = 4096;
+        on_disk.turn_start_offset = Some(1024);
+        on_disk.last_watcher_relayed_offset = Some(2048);
+        on_disk.last_watcher_relayed_generation_mtime_ns = Some(9);
+        on_disk.full_response = "already relayed text".to_string();
+        save_inflight_state_in_root(temp.path(), &on_disk).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&on_disk);
+        let mut adopted = on_disk.clone();
+        adopted.tmux_session_name = Some("AgentDesk-codex-adk-restored".to_string());
+        adopted.output_path = Some("/tmp/normalized-rebind.jsonl".to_string());
+        adopted.input_fifo_path = None;
+        adopted.last_offset = 0;
+        adopted.turn_start_offset = Some(0);
+        adopted.last_watcher_relayed_offset = None;
+        adopted.last_watcher_relayed_generation_mtime_ns = None;
+        adopted.set_relay_owner_kind(RelayOwnerKind::Watcher);
+
+        let outcome =
+            save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+                temp.path(),
+                &adopted,
+                &expected,
+                on_disk.turn_start_offset,
+                on_disk.last_offset,
+            );
+
+        assert_eq!(outcome, GuardedSaveOutcome::Saved);
+        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].tmux_session_name.as_deref(),
+            Some("AgentDesk-codex-adk-restored")
+        );
+        assert_eq!(
+            rows[0].output_path.as_deref(),
+            Some("/tmp/normalized-rebind.jsonl")
+        );
+        assert_eq!(rows[0].last_offset, 0);
+        assert_eq!(rows[0].turn_start_offset, Some(0));
+        assert_eq!(rows[0].last_watcher_relayed_offset, None);
+        assert_eq!(rows[0].last_watcher_relayed_generation_mtime_ns, None);
+        assert_eq!(rows[0].full_response, "already relayed text");
+        assert_eq!(
+            rows[0].effective_relay_owner_kind(),
+            RelayOwnerKind::Watcher
+        );
+    }
+
+    #[test]
+    fn existing_rebind_adoption_with_offset_rebase_rejects_progressed_raw_cursor() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut on_disk = build_inflight_for_guard_tests(ProviderKind::Codex, 325, 777);
+        on_disk.user_msg_id = 777;
+        on_disk.current_msg_id = 778;
+        on_disk.output_path = Some("/tmp/raw-rollout.jsonl".to_string());
+        on_disk.last_offset = 4096;
+        on_disk.turn_start_offset = Some(1024);
+        save_inflight_state_in_root(temp.path(), &on_disk).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&on_disk);
+        let mut adopted = on_disk.clone();
+        adopted.tmux_session_name = Some("AgentDesk-codex-adk-restored".to_string());
+        adopted.output_path = Some("/tmp/normalized-rebind.jsonl".to_string());
+        adopted.last_offset = 0;
+        adopted.turn_start_offset = Some(0);
+        adopted.set_relay_owner_kind(RelayOwnerKind::Watcher);
+
+        let mut progressed = on_disk.clone();
+        progressed.last_offset = 8192;
+        progressed.last_watcher_relayed_offset = Some(6144);
+        save_inflight_state_in_root(temp.path(), &progressed).unwrap();
+
+        let outcome =
+            save_existing_inflight_rebind_adoption_with_offset_rebase_if_matches_identity_in_root(
+                temp.path(),
+                &adopted,
+                &expected,
+                on_disk.turn_start_offset,
+                on_disk.last_offset,
+            );
+
+        assert_eq!(outcome, GuardedSaveOutcome::IdentityMismatch);
+        let rows = load_inflight_states_from_root(temp.path(), &ProviderKind::Codex);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].output_path.as_deref(),
+            Some("/tmp/raw-rollout.jsonl")
+        );
+        assert_eq!(rows[0].last_offset, 8192);
+        assert_eq!(rows[0].turn_start_offset, Some(1024));
+        assert_eq!(rows[0].last_watcher_relayed_offset, Some(6144));
+        assert_eq!(rows[0].effective_relay_owner_kind(), RelayOwnerKind::None);
+    }
+
+    #[test]
+    fn clear_rebind_origin_identity_clears_matching_synthetic_row() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 326, 0);
+        state.current_msg_id = 0;
+        state.rebind_origin = true;
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&state);
+        let outcome = clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            state.channel_id,
+            &expected,
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::Cleared);
+        assert!(load_inflight_states_from_root(temp.path(), &ProviderKind::Codex).is_empty());
+    }
+
+    #[test]
+    fn clear_rebind_origin_identity_preserves_non_rebind_turn() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 327, 0);
+        state.current_msg_id = 0;
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let expected = InflightTurnIdentity::from_state(&state);
+        let outcome = clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            state.channel_id,
+            &expected,
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        assert_eq!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Codex).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn clear_rebind_origin_identity_preserves_mismatched_synthetic_row() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let temp = TempDir::new().unwrap();
+        let _env_reset = set_agentdesk_root_for_test(temp.path());
+        let mut state = build_inflight_for_guard_tests(ProviderKind::Codex, 328, 0);
+        state.current_msg_id = 0;
+        state.rebind_origin = true;
+        state.turn_start_offset = Some(0);
+        state.set_relay_owner_kind(RelayOwnerKind::Watcher);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+
+        let mut expected = InflightTurnIdentity::from_state(&state);
+        expected.turn_start_offset = Some(99);
+        let outcome = clear_rebind_origin_inflight_state_if_matches_identity_in_root(
+            temp.path(),
+            &ProviderKind::Codex,
+            state.channel_id,
+            &expected,
+        );
+
+        assert_eq!(outcome, GuardedClearOutcome::UserMsgMismatch);
+        assert_eq!(
+            load_inflight_states_from_root(temp.path(), &ProviderKind::Codex).len(),
+            1
+        );
     }
 
     #[test]
@@ -6369,11 +6936,12 @@ mod rebind_origin_reap_tests {
         DEAD_WATCHER_PROVEN_DEAD_SECS, InflightTurnState, REBIND_ORIGIN_DEADLINE_SECS_DEFAULT,
         RebindReapOutcome, RelayOwnerKind, TurnSource, WatcherLiveness,
         invalidate_stale_generation_in_root, load_inflight_states_from_root,
-        reap_abandoned_rebind_origin_locked_in_root,
+        proven_dead_from_signals, reap_abandoned_rebind_origin_locked_in_root,
         reap_dead_watcher_rebind_origin_locked_in_root, save_inflight_state_in_root,
         should_reap_abandoned_rebind_origin, should_reap_dead_watcher_rebind_origin,
     };
     use crate::services::discord::InflightRestartMode;
+    use crate::services::platform::tmux::PaneLiveness;
     use crate::services::provider::ProviderKind;
     use tempfile::TempDir;
 
@@ -6834,6 +7402,72 @@ mod rebind_origin_reap_tests {
     }
 
     #[test]
+    fn idle_live_pane_rebind_reaped_at_deadline_3879() {
+        // (a) #3879 REGRESSION GUARD — proven-dead/idle-stuck reaped at deadline.
+        //
+        // The live evidence: a watcher with a LIVE tmux pane (an idle TUI sitting
+        // at `❯`) but NO recent runtime activity never adopted its empty
+        // rebind-origin and was never reaped, leaving the placeholder LIVE for 64
+        // min (32× the 120s deadline) and ABORTing every new TUI-direct turn.
+        // The fixed `is_proven_dead` core now classifies `(Live, !activity)` as
+        // proven dead, so the (correct) structural+deadline predicate finally
+        // fires — but ONLY past the deadline (the re-adopt window stays open until
+        // then).
+        let proven_dead =
+            proven_dead_from_signals(PaneLiveness::Live, /* activity_recent */ false);
+        assert!(
+            proven_dead,
+            "#3879: an idle live-pane watcher (no recent activity) must be proven dead"
+        );
+        let oracle = StubLiveness { proven_dead };
+        let state = watcher_owned_rebind(7201, 4096, CURRENT_GEN);
+        assert!(
+            should_reap_dead_watcher_rebind_origin(&state, PAST_DEADLINE, CURRENT_GEN, &oracle),
+            "#3879: idle live-pane rebind-origin is reaped once past the deadline"
+        );
+        assert!(
+            !should_reap_dead_watcher_rebind_origin(&state, WITHIN_DEADLINE, CURRENT_GEN, &oracle),
+            "within the deadline the re-adopt window is still open — never reaped early"
+        );
+    }
+
+    #[test]
+    fn active_or_unknown_watcher_rebind_not_reaped_readopt_preserved_3879() {
+        // (b) #3879 REGRESSION GUARD — re-adopt path preserved (#897/#3635).
+        //
+        // A watcher producing RECENT runtime activity (jsonl/.generation/rollout
+        // writes) is genuinely working / re-adoptable and is NEVER proven dead,
+        // so its rebind-origin survives even past the deadline — distinguishing
+        // "temporarily quiet but re-adoptable" from "idle-stuck/dead".
+        assert!(
+            !proven_dead_from_signals(PaneLiveness::Live, /* activity_recent */ true),
+            "live pane WITH recent activity = working/re-adoptable ⇒ preserved"
+        );
+        // A just-restarting watcher touches `.generation` before its pane
+        // re-appears: DeadOrAbsent + recent activity must still preserve.
+        assert!(
+            !proven_dead_from_signals(PaneLiveness::DeadOrAbsent, /* activity_recent */ true),
+            "restarting watcher (recent activity, pane not yet up) ⇒ preserved"
+        );
+        // An UNKNOWN probe (transient tmux hiccup) preserves regardless of activity.
+        assert!(!proven_dead_from_signals(PaneLiveness::ProbeError, false));
+        assert!(!proven_dead_from_signals(PaneLiveness::ProbeError, true));
+
+        // End-to-end: the active-watcher verdict preserves the row past deadline.
+        let oracle = StubLiveness {
+            proven_dead: proven_dead_from_signals(
+                PaneLiveness::Live,
+                /* activity_recent */ true,
+            ),
+        };
+        let state = watcher_owned_rebind(7202, 4096, CURRENT_GEN);
+        assert!(
+            !should_reap_dead_watcher_rebind_origin(&state, PAST_DEADLINE, CURRENT_GEN, &oracle),
+            "active/re-adoptable watcher is NOT reaped — #897/#3635 re-adopt preserved"
+        );
+    }
+
+    #[test]
     fn dead_watcher_rebind_reaps_on_prior_generation_when_dead() {
         // (A') Generation disjunct mirrors the None-owner predicate: a prior-
         // generation dead-watcher orphan reaps even within the deadline.
@@ -7136,6 +7770,43 @@ mod recovery_relay_attempts_tests {
         )
     }
 
+    /// RAII guard that points `AGENTDESK_ROOT_DIR` at an isolated tempdir under
+    /// the shared env lock and restores the previous value on drop.
+    struct IsolatedRootEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl Drop for IsolatedRootEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", value) },
+                None => unsafe { std::env::remove_var("AGENTDESK_ROOT_DIR") },
+            }
+        }
+    }
+
+    /// #3860/#3293: isolate the process-global runtime root for a test. Any test
+    /// whose path reaches `InflightTurnState::new` (via `make_state`) or
+    /// `set_restart_mode` must hold one of these: both call
+    /// `runtime_store::load_generation`, which resolves `AGENTDESK_ROOT_DIR` and
+    /// trips the live-release safety assert when it is unset (→ `~/.adk/release`)
+    /// or already points at the live store. Holding the shared env lock also
+    /// makes such tests order-independent (the prior failure mode: these tests
+    /// passed only when a sibling env-touching test happened to have a tempdir
+    /// root set at the same moment).
+    fn isolated_root_env(temp: &TempDir) -> IsolatedRootEnv {
+        let lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var("AGENTDESK_ROOT_DIR").ok();
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        IsolatedRootEnv {
+            _lock: lock,
+            previous,
+        }
+    }
+
     #[test]
     fn budget_is_three_restarts() {
         assert_eq!(RECOVERY_RELAY_RESTART_ATTEMPT_BUDGET, 3);
@@ -7295,6 +7966,196 @@ mod recovery_relay_attempts_tests {
         assert_eq!(
             loaded[0].recovery_relay_attempts, 2,
             "re-marking must not reset the restart-relay budget counter"
+        );
+    }
+
+    /// #3860: model the shutdown bulk restart-mode mark racing a draining
+    /// watcher. The marker conceptually observed the row at rso=10; the watcher
+    /// then advanced the durable delivery frontier to rso=40 before the marker
+    /// wrote. The RMW marker must re-read the FRESH frontier (40) under the
+    /// flock and never rewind it to 10 — otherwise the replacement watcher
+    /// re-relays `full_response[10..40]`, a duplicate Discord send.
+    #[test]
+    fn restart_marker_rmw_preserves_concurrently_advanced_frontier_3860() {
+        let temp = TempDir::new().unwrap();
+        // `set_restart_mode`/`make_state` resolve the global runtime root; isolate
+        // it so the test is order-independent and never touches the live store.
+        let _env = isolated_root_env(&temp);
+        let provider = ProviderKind::Codex;
+
+        // The marker's stale view (rso=10) — what `load_inflight_states_from_root`
+        // returned at shutdown before the watcher advanced.
+        let mut early = make_state(555);
+        early.full_response = "Y".repeat(10);
+        early.response_sent_offset = 10;
+        early.last_offset = 10;
+        save_inflight_state_in_root(temp.path(), &early).unwrap();
+        let path = inflight_state_path(temp.path(), &provider, 555);
+
+        // The draining watcher advances the durable frontier (forward, same
+        // identity) to rso=40 before the marker writes.
+        let mut advanced = early.clone();
+        advanced.full_response = "Y".repeat(40);
+        advanced.response_sent_offset = 40;
+        advanced.last_offset = 40;
+        save_inflight_state_in_root(temp.path(), &advanced).unwrap();
+
+        // The marker writes LAST (the regression-prone ordering). RMW re-reads
+        // the on-disk frontier (40) rather than carrying the stale rso=10.
+        assert!(super::set_inflight_restart_mode_under_lock(
+            &path,
+            InflightRestartMode::DrainRestart
+        ));
+
+        let loaded = load_inflight_states_from_root(temp.path(), &provider);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].response_sent_offset, 40,
+            "RMW marker must keep the watcher's advanced frontier, not the stale rso=10"
+        );
+        assert_eq!(loaded[0].last_offset, 40, "last_offset must not regress");
+        assert_eq!(loaded[0].full_response.len(), 40);
+        assert_eq!(
+            loaded[0].restart_mode,
+            Some(InflightRestartMode::DrainRestart),
+            "the marker still records the restart mode"
+        );
+    }
+
+    /// #3860 end-to-end: `mark_all_inflight_states_restart_mode` (the boot/
+    /// shutdown bulk marker) must preserve a frontier a draining watcher
+    /// advanced and still set restart_mode on every live row.
+    #[test]
+    fn mark_all_restart_mode_preserves_advanced_frontier_3860() {
+        let temp = TempDir::new().unwrap();
+        let _env = isolated_root_env(&temp);
+
+        let inflight_root = super::inflight_runtime_root().expect("env root must resolve");
+        let mut state = make_state(932_940);
+        state.full_response = "Z".repeat(40);
+        state.response_sent_offset = 40;
+        state.last_offset = 40;
+        save_inflight_state_in_root(&inflight_root, &state).expect("seed advanced frontier");
+
+        let updated = super::mark_all_inflight_states_restart_mode(
+            &ProviderKind::Codex,
+            InflightRestartMode::DrainRestart,
+        );
+        assert_eq!(updated, 1, "the seeded row must be re-marked");
+
+        let loaded = load_inflight_states_from_root(&inflight_root, &ProviderKind::Codex);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].response_sent_offset, 40,
+            "bulk restart-mode mark must not regress the delivery frontier"
+        );
+        assert_eq!(loaded[0].last_offset, 40);
+        assert_eq!(
+            loaded[0].restart_mode,
+            Some(InflightRestartMode::DrainRestart)
+        );
+    }
+
+    /// #3860 SAFETY: the bulk restart-mode marker must NOT undo a legitimate
+    /// same-turn frontier reset. A Gemini/Qwen RetryBoundary clears
+    /// `full_response` and rewinds `response_sent_offset` to 0 for the SAME
+    /// identity (turn_bridge/retry_state.rs) to re-stream the turn. If the marker
+    /// then resurrected an older frontier the re-streamed body would be
+    /// suppressed (or double-relayed). The RMW marker re-reads the FRESH on-disk
+    /// row, so the legitimate rso=0 reset is preserved verbatim — independent of
+    /// the AGENTDESK_DELIVERY_RECORD_AUTHORITY guard (this path bypasses it).
+    #[test]
+    fn restart_marker_preserves_legitimate_frontier_reset_3860() {
+        let temp = TempDir::new().unwrap();
+        let _env = isolated_root_env(&temp);
+        let provider = ProviderKind::Codex;
+
+        // The turn_bridge persisted the retry reset: body cleared, frontier at 0.
+        let mut reset = make_state(556);
+        reset.full_response.clear();
+        reset.response_sent_offset = 0;
+        reset.last_offset = 0;
+        save_inflight_state_in_root(temp.path(), &reset).unwrap();
+        let path = inflight_state_path(temp.path(), &provider, 556);
+
+        assert!(super::set_inflight_restart_mode_under_lock(
+            &path,
+            InflightRestartMode::DrainRestart
+        ));
+
+        let loaded = load_inflight_states_from_root(temp.path(), &provider);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].response_sent_offset, 0,
+            "the marker must preserve the legitimate retry reset, not resurrect an old frontier"
+        );
+        assert!(
+            loaded[0].full_response.is_empty(),
+            "the cleared body must survive the restart-mode mark for the re-stream"
+        );
+        assert_eq!(
+            loaded[0].restart_mode,
+            Some(InflightRestartMode::DrainRestart)
+        );
+    }
+
+    /// #3860 edge: a row removed between the unlocked enumeration and the RMW
+    /// (e.g. a concurrent clear/finalize) must be skipped gracefully — the RMW
+    /// re-read returns `None`, so the marker reports no write and never
+    /// resurrects a stale row at the vacated path.
+    #[test]
+    fn restart_marker_skips_deleted_row_3860() {
+        let temp = TempDir::new().unwrap();
+        let _env = isolated_root_env(&temp);
+        let provider = ProviderKind::Codex;
+
+        let state = make_state(557);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+        let path = inflight_state_path(temp.path(), &provider, 557);
+        assert!(path.exists());
+
+        // The row vanishes after enumeration, before the RMW write.
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            !super::set_inflight_restart_mode_under_lock(&path, InflightRestartMode::DrainRestart),
+            "a deleted row must report no write"
+        );
+        assert!(
+            !path.exists(),
+            "the marker must not resurrect a stale row for a path that was cleared"
+        );
+        assert!(
+            load_inflight_states_from_root(temp.path(), &provider).is_empty(),
+            "no inflight row should exist after the skip"
+        );
+    }
+
+    /// #3860 edge: if the on-disk row is unparseable when the RMW re-reads it,
+    /// the marker must skip it gracefully (no panic) and leave the bytes
+    /// untouched rather than clobbering them with a regenerated state.
+    #[test]
+    fn restart_marker_skips_corrupt_row_3860() {
+        let temp = TempDir::new().unwrap();
+        let _env = isolated_root_env(&temp);
+        let provider = ProviderKind::Codex;
+
+        let state = make_state(558);
+        save_inflight_state_in_root(temp.path(), &state).unwrap();
+        let path = inflight_state_path(temp.path(), &provider, 558);
+
+        // Corrupt the row to an unparseable blob.
+        let corrupt: &[u8] = b"{ this is not valid inflight json";
+        std::fs::write(&path, corrupt).unwrap();
+
+        assert!(
+            !super::set_inflight_restart_mode_under_lock(&path, InflightRestartMode::DrainRestart),
+            "an unparseable row must report no write (graceful skip, no panic)"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            corrupt,
+            "the marker must not overwrite an unparseable row with a regenerated state"
         );
     }
 

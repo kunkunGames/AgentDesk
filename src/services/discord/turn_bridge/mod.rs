@@ -2,6 +2,7 @@ mod cancel_finalize_policy;
 mod chunk_compose;
 mod completion_guard;
 mod context_window;
+mod followup_requeue;
 mod headless_delivery;
 mod memory_lifecycle;
 mod output_lifecycle;
@@ -82,8 +83,10 @@ pub(in crate::services::discord) use status_panel::{
     complete_status_panel_v2_with_http, normalize_status_panel_message_id,
 };
 pub(super) use streaming_edit_text::{
-    bridge_pre_submission_tui_prompt_error, bridge_tui_transport_error_should_skip_quiescence,
-    build_turn_bridge_streaming_edit_text,
+    CLAUDE_TUI_FOLLOWUP_REQUEUE_DELIVERY_NOTICE, bridge_claude_tui_followup_requeue_prompt_error,
+    bridge_streaming_rollover_should_skip, bridge_tui_transport_error_should_skip_quiescence,
+    build_turn_bridge_streaming_edit_text, claude_tui_followup_requeue_streaming_aware,
+    claude_tui_followup_same_input_occupies_pane,
 };
 pub(super) use task_notification_lifecycle::{
     close_all_tracked_background_children, close_next_tracked_background_child,
@@ -932,6 +935,7 @@ fn handle_watcher_runtime_handoff(
     }
     inflight_state.input_fifo_path = fifo_path;
     inflight_state.last_offset = last_offset;
+    *state_dirty |= inflight_state.set_watcher_owner_channel_id(watcher_owner_channel_id.get());
     // #2235 NOTE: we deliberately do NOT durably save the row here.
     // `watcher_owns_live_relay` is still `false` at this point and only flips
     // to `true` after the watcher is successfully claimed and spawned (the
@@ -977,6 +981,7 @@ fn handle_watcher_runtime_handoff(
             "turn_bridge_runtime_ready",
         );
         *watcher_owner_channel_id = claim.owner_channel_id();
+        *state_dirty |= inflight_state.set_watcher_owner_channel_id(watcher_owner_channel_id.get());
         (claim.should_spawn(), claim.replaced_existing())
     };
     #[cfg(not(unix))]
@@ -1520,20 +1525,30 @@ pub(super) fn spawn_turn_bridge(
             provider: Option<ProviderKind>,
             channel_id: u64,
             user_msg_id: u64,
+            token_hash: String,
         }
         impl Drop for InflightCleanupGuard {
             fn drop(&mut self) {
                 if let Some(ref provider) = self.provider {
+                    // #3859: this Drop runs on ANY abnormal exit (panic /
+                    // early-return) while the turn may still own a live
+                    // "🔄 처리 중" placeholder. Route through the abandon-request
+                    // helper — identical ownership guards to the plain guarded
+                    // clear, but it durably records the placeholder for the
+                    // placeholder sweeper to finalize to "중단됨" BEFORE deleting
+                    // the row (which still frees the channel immediately).
                     if self.user_msg_id != 0 {
-                        super::inflight::clear_inflight_state_if_matches(
+                        super::inflight::request_inflight_abandon_if_matches(
                             provider,
                             self.channel_id,
                             self.user_msg_id,
+                            &self.token_hash,
                         );
                     } else {
-                        super::inflight::clear_inflight_state_if_matches_zero_owned(
+                        super::inflight::request_inflight_abandon_if_matches_zero_owned(
                             provider,
                             self.channel_id,
+                            &self.token_hash,
                         );
                     }
                 }
@@ -1543,9 +1558,11 @@ pub(super) fn spawn_turn_bridge(
             provider: Some(provider.clone()),
             channel_id: channel_id.get(),
             user_msg_id: user_msg_id.map(|id| id.get()).unwrap_or(0),
+            token_hash: shared_owned.token_hash.clone(),
         };
 
         let mut inflight_state = bridge.inflight_state.clone();
+        inflight_state.set_watcher_owner_channel_id(resolved_watcher_owner_channel_id.get());
         // Codex P2: a no-anchor recovery turn (bridge.current_msg_id == None)
         // had a fresh placeholder created above into the working `current_msg_id`,
         // but the cloned inflight still carries `current_msg_id == 0`. Mirror the
@@ -2843,6 +2860,7 @@ pub(super) fn spawn_turn_bridge(
                                     "turn_bridge_tmux_ready",
                                 );
                                 watcher_owner_channel_id = claim.owner_channel_id();
+                                let _ = inflight_state.set_watcher_owner_channel_id(watcher_owner_channel_id.get());
                                 (claim.should_spawn(), claim.replaced_existing())
                             };
                             #[cfg(not(unix))]
@@ -3417,6 +3435,9 @@ pub(super) fn spawn_turn_bridge(
                         current_tool_line.as_deref(),
                         &full_response,
                     );
+                    if bridge_streaming_rollover_should_skip(current_portion) {
+                        break;
+                    }
                     let Some(plan) =
                         super::formatting::plan_streaming_rollover(current_portion, &status_block)
                     else {
@@ -3467,19 +3488,8 @@ pub(super) fn spawn_turn_bridge(
                                 {
                                     pending_key.message_id = current_msg_id;
                                 }
-                                // #1255 codex round-1 P2: rollover advanced
-                                // `current_msg_id` past the message that owned the
-                                // active long-running placeholder. The old message
-                                // now holds delivered response content; retarget
-                                // the controller onto the new message_id so the
-                                // eventual terminal transition lands on the live
-                                // card instead of overwriting that frozen chunk.
-                                // codex round-2 P2: drop the active pointer if the
-                                // retarget edit fails — otherwise we'd suppress
-                                // streaming with no card visible.
-                                // codex round-4 P2: detach the old key first so
-                                // its `Active` controller entry doesn't linger as
-                                // a non-evictable row in the cap-bounded map.
+                                // #1255: rollover retargets the controller to the
+                                // new message and detaches the old key first.
                                 if let Some((old_key, snapshot, close_trigger, ack_consumed)) =
                                     long_running_placeholder_active.as_ref()
                                 {
@@ -3543,27 +3553,34 @@ pub(super) fn spawn_turn_bridge(
                     &provider,
                 );
 
-                // #1255 codex round-1 P2: while a long-running placeholder owns
-                // `current_msg_id`, the controller is the sole writer. Skipping the
-                // regular streaming edit prevents `stable_display_text` from
-                // overwriting the `🔄 백그라운드 처리 중` card mid-flight.
-                if stable_display_text != last_edit_text
+                if super::single_message_panel::streaming_footer_text_changed(
+                    single_message_panel_footer_mode,
+                    &last_edit_text,
+                    &stable_display_text,
+                )
                     && !done
                     && last_status_edit.elapsed() >= status_interval
                     && long_running_placeholder_active.is_none()
                     && pending_long_running_open_after_state_save.is_none()
                     && pending_long_running_retarget_after_state_save.is_none()
                 {
-                    let _ = gateway
-                        .edit_message(channel_id, current_msg_id, &stable_display_text)
-                        .await;
-                    last_edit_text = stable_display_text;
+                    let edit_ok = TurnGateway::edit_message(
+                        gateway.as_ref(),
+                        channel_id,
+                        current_msg_id,
+                        &stable_display_text,
+                    )
+                    .await
+                    .is_ok();
                     last_status_edit = tokio::time::Instant::now();
-                    inflight_state.current_msg_id = current_msg_id.get();
-                    inflight_state.current_msg_len = last_edit_text.len();
-                    inflight_state.response_sent_offset = response_sent_offset;
-                    inflight_state.full_response = full_response.clone();
-                    state_dirty = true;
+                    if edit_ok {
+                        last_edit_text = stable_display_text;
+                        inflight_state.current_msg_id = current_msg_id.get();
+                        inflight_state.current_msg_len = last_edit_text.len();
+                        inflight_state.response_sent_offset = response_sent_offset;
+                        inflight_state.full_response = full_response.clone();
+                        state_dirty = true;
+                    }
                 }
             }
 
@@ -3852,6 +3869,52 @@ pub(super) fn spawn_turn_bridge(
         for error in extracted_api_friction.parse_errors {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::warn!("  [{ts}] ⚠ invalid API_FRICTION marker: {error}");
+        }
+
+        let claude_tui_followup_pre_submit_requeue_candidate = {
+            let base = crate::services::claude::claude_tui_followup_requeue_enabled()
+                && bridge_claude_tui_followup_requeue_prompt_error(
+                    &provider,
+                    inflight_state.runtime_kind,
+                    &full_response,
+                );
+            // #3885 (reworked): a follow-up pre-submit readiness timeout normally
+            // requeues the inflight ("prompt never reached the pane → safe to
+            // retry"). The dup risk is re-injecting an input that ALREADY landed:
+            // when the SAME input is the turn the pane is streaming (or just
+            // completed), that turn already delivers the response, so a requeue
+            // produces duplicate prose. The first cut gated on a channel-scoped
+            // busy probe, which (a) DROPPED a genuinely-unsubmitted follow-up that
+            // happened to sit behind a DIFFERENT streaming turn, and (b) missed
+            // the already-completed same-input case (idle pane). Gate instead on
+            // INPUT CORRELATION: suppress ONLY when the recorded prompt anchor for
+            // this pane resolves to THIS inflight's user_msg_id (the relay records
+            // the submitted prompt's anchor as the synthetic inflight's
+            // user_msg_id; a non-consuming peek leaves it for the watcher). A
+            // different / absent anchor means the follow-up is genuinely
+            // unsubmitted, so it STILL requeues — the deferred idle-queue kickoff
+            // is itself gated on pane-busy, so a follow-up behind a different
+            // streaming turn is DEFERRED (preserved in the mailbox), not dropped.
+            let same_input_occupies_pane = base
+                && claude_tui_followup_same_input_occupies_pane(
+                    inflight_state
+                        .tmux_session_name
+                        .as_deref()
+                        .and_then(|tmux_session_name| {
+                            crate::services::tui_prompt_dedupe::prompt_anchor_for_response(
+                                provider.as_str(),
+                                tmux_session_name,
+                                channel_id.get(),
+                            )
+                        })
+                        .map(|anchor| anchor.message_id),
+                    inflight_state.user_msg_id,
+                );
+            claude_tui_followup_requeue_streaming_aware(base, same_input_occupies_pane)
+        };
+        if claude_tui_followup_pre_submit_requeue_candidate {
+            full_response = CLAUDE_TUI_FOLLOWUP_REQUEUE_DELIVERY_NOTICE.to_string();
+            inflight_state.full_response = full_response.clone();
         }
 
         let is_prompt_too_long = full_response.contains("__prompt too long__");
@@ -5609,12 +5672,13 @@ pub(super) fn spawn_turn_bridge(
             // the two gate sites.
             #[cfg(unix)]
             {
-                let tui_transport_error_skip_gate = transport_error
-                    && bridge_tui_transport_error_should_skip_quiescence(
+                let tui_transport_error_skip_gate = claude_tui_followup_pre_submit_requeue_candidate
+                    || (transport_error
+                        && bridge_tui_transport_error_should_skip_quiescence(
                         &provider,
                         inflight_state.runtime_kind,
                         &full_response,
-                    );
+                        ));
                 let bridge_gate_outcome = if terminal_delivery_committed
                     && !preserve_inflight_for_cleanup_retry
                     && !tui_transport_error_skip_gate
@@ -5643,36 +5707,17 @@ pub(super) fn spawn_turn_bridge(
                             "TUI transport error was already delivered; skipping quiescence gate so inflight cleanup can complete"
                         );
                     }
-                    if crate::services::claude::claude_tui_followup_requeue_enabled()
-                        && bridge_pre_submission_tui_prompt_error(&provider, &full_response)
-                    {
-                        // The follow-up never delivered its prompt (pre-submit
-                        // busy-timeout), so re-queue the inflight message to the
-                        // back of the mailbox for a retry instead of dropping it.
-                        super::mailbox_requeue_inflight_for_followup_retry(
+                    if claude_tui_followup_pre_submit_requeue_candidate {
+                        followup_requeue::requeue_claude_tui_followup_pre_submit_timeout(
                             &shared_owned,
                             &provider,
                             channel_id,
                             &inflight_state,
+                            dispatch_id.as_deref(),
+                            adk_session_key.as_deref(),
+                            turn_id.as_str(),
                         )
                         .await;
-                        tracing::info!(
-                            provider = %provider.as_str(),
-                            channel = channel_id.get(),
-                            user_msg_id = inflight_state.user_msg_id,
-                            "claude_tui follow-up pre-submit timeout: re-queued inflight message for retry"
-                        );
-                        // The bridge has already finalized the active turn and
-                        // computed its drain decision before this requeue runs, so
-                        // without an explicit kickoff the re-queued retry would sit
-                        // idle until unrelated activity pokes the mailbox. Schedule a
-                        // deferred idle-queue kickoff so it drains once the pane frees.
-                        super::schedule_deferred_idle_queue_kickoff(
-                            shared_owned.clone(),
-                            provider.clone(),
-                            channel_id,
-                            "claude_tui_followup_requeue_inflight",
-                        );
                     }
                     super::tmux::TuiCompletionGateOutcome::NotGated
                 };
@@ -5829,9 +5874,8 @@ pub(super) fn spawn_turn_bridge(
                     );
                 }
             }
-            let indicator = super::single_message_panel::single_message_panel_spinner_frame(
-                spin_idx,
-            );
+            let indicator =
+                super::single_message_panel::single_message_panel_spinner_frame(spin_idx);
             status_panel_completion_committed =
                 complete_bridge_terminal_footer_or_status_panel(
                     shared_owned.as_ref(),
@@ -5844,6 +5888,7 @@ pub(super) fn spawn_turn_bridge(
                     status_panel_started_at,
                     &mut last_status_panel_text,
                     single_message_panel_footer_mode,
+                    is_external_input_tui_direct, // #3959: suppress mirror chrome footer
                     completion_footer_terminal_text.as_deref(),
                     indicator,
                 )
