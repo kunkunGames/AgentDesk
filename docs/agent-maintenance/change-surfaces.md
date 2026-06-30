@@ -907,9 +907,17 @@
     normal long SILENT tool run (e.g. a big build) is never mistaken for an idle
     hang, with the 4h hard ceiling as the real backstop, and noted the limitation
     in the idle-kill error message + a delayed-event test).
-  - `src/services/tui_prompt_dedupe.rs` (1709 lines; shared TUI prompt
+  - `src/services/tui_prompt_dedupe.rs` (1764 lines; shared TUI prompt
     fingerprinting/dedupe state for hook and rollout relay paths, bugfix only
-    outside an extraction plan; +20 from #3676: Codex rollout user prompts now
+    outside an extraction plan; +55 from #3885 follow-up: decouple the PROMPT
+    ANCHOR purge into `PROMPT_ANCHOR_SUBMIT_TTL` (4h) so a routine 30-60min
+    streaming build/agent turn's anchor is no longer purged mid-stream — the
+    bridge same-input correlation peek (and the watcher ⏳→✅ response match) would
+    otherwise resolve `None` and re-fire the #3885 no-response duplicate; the
+    `relayed_entry_ids_by_tmux` ledger deliberately keeps the 30min
+    `PROMPT_ANCHOR_TTL` so the #3459/#3303 missed-prompt guard is untouched, plus
+    a `record_prompt_anchor_aged_for_tests` helper + TTL-boundary tests; +20 from
+    #3676: Codex rollout user prompts now
     prefer the stable message entry id when present so Codex TUI direct prompt
     relay can use the same entry-identity replay suppression as Claude while
     distinct Codex message ids still publish distinct direct prompts; +176
@@ -1101,7 +1109,19 @@
     clusters into `tmux_runtime/` child modules (`interrupt_policy.rs`,
     `process_table.rs`, `pid_exit.rs` — see their entries below); no longer a
     giant-file. Bugfix only outside a further extraction plan).
-  - `src/services/discord/turn_bridge/mod.rs` (6248 lines; production LoC; +11
+  - `src/services/discord/turn_bridge/mod.rs` (6283 lines; production LoC; +35
+    from #3885 (reworked) gating the Claude TUI follow-up pre-submit requeue on
+    INPUT CORRELATION instead of the channel-scoped busy probe: suppress only
+    when the recorded prompt anchor for this pane resolves to THIS inflight's
+    `user_msg_id` (`prompt_anchor_for_response` peek +
+    `claude_tui_followup_same_input_occupies_pane` +
+    `claude_tui_followup_requeue_streaming_aware` wiring) — i.e. the SAME input
+    already landed (streaming or just-completed) so the response is covered and a
+    requeue would duplicate it; a different/absent anchor means the follow-up is
+    genuinely unsubmitted, so it still requeues and the deferred idle-queue
+    kickoff defers it behind any occupying turn rather than dropping it as a
+    transport-error failure; the pure decisions live in `streaming_edit_text.rs`;
+    +11
     from #3859 threading `token_hash` into the `InflightCleanupGuard` so its
     abnormal-exit cleanup routes through `request_inflight_abandon_if_matches`
     (durable abandon-request enqueue + row delete) instead of a bare clear; +4
