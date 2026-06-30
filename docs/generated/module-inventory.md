@@ -77,7 +77,7 @@
 | `compat` | `src/compat/mod.rs` | 39 | 39 | 0 |  |
 | `compat::legacy_db_paths` | `src/compat/legacy_db_paths.rs` | 12 | 12 | 0 |  |
 | `compat::legacy_tmp_paths` | `src/compat/legacy_tmp_paths.rs` | 27 | 27 | 0 |  |
-| `config` | `src/config.rs` | 2973 | 2631 | 342 | giant-file |
+| `config` | `src/config.rs` | 2986 | 2644 | 342 | giant-file |
 | `config_live_reload` | `src/config_live_reload.rs` | 966 | 525 | 441 |  |
 | `crate` | `src/main.rs` | 7 | 7 | 0 |  |
 | `credential` | `src/credential.rs` | 212 | 59 | 153 |  |
@@ -200,7 +200,7 @@
 | `runtime_layout::legacy_migration` | `src/runtime_layout/legacy_migration.rs` | 396 | 396 | 0 |  |
 | `runtime_layout::paths` | `src/runtime_layout/paths.rs` | 144 | 110 | 34 |  |
 | `runtime_layout::skill_sync` | `src/runtime_layout/skill_sync.rs` | 806 | 806 | 0 |  |
-| `server` | `src/server/mod.rs` | 3060 | 2650 | 410 | giant-file |
+| `server` | `src/server/mod.rs` | 3080 | 2670 | 410 | giant-file |
 | `server::cluster` | `src/server/cluster.rs` | 9 | 9 | 0 |  |
 | `server::cluster_session_routing` | `src/server/cluster_session_routing.rs` | 9 | 9 | 0 |  |
 | `server::cron_catalog` | `src/server/cron_catalog.rs` | 67 | 67 | 0 |  |
@@ -214,7 +214,7 @@
 | `server::maintenance` | `src/server/maintenance.rs` | 1082 | 974 | 108 |  |
 | `server::multinode_regression` | `src/server/multinode_regression.rs` | 419 | 0 | 419 |  |
 | `server::resource_locks` | `src/server/resource_locks.rs` | 416 | 239 | 177 |  |
-| `server::routes` | `src/server/routes/mod.rs` | 312 | 244 | 68 |  |
+| `server::routes` | `src/server/routes/mod.rs` | 566 | 331 | 235 |  |
 | `server::routes::agents` | `src/server/routes/agents.rs` | 1328 | 1278 | 50 | giant-file |
 | `server::routes::agents_crud` | `src/server/routes/agents_crud.rs` | 1903 | 1903 | 0 | giant-file |
 | `server::routes::agents_setup` | `src/server/routes/agents_setup.rs` | 1365 | 1365 | 0 | giant-file |
