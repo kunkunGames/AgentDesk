@@ -786,12 +786,15 @@ test("timeouts long turn monitor module alerts every 30-minute threshold", () =>
       }
     ],
     dbQuery: createSqlRouter([
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] },
       { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
       {
         match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
         result: []
       },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] },
     ])
   });
 
@@ -825,6 +828,8 @@ test("timeouts long turn monitor module skips synthetic reattach placeholders", 
       }
     ],
     dbQuery: createSqlRouter([
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
     ])
@@ -855,13 +860,12 @@ test("timeouts long turn monitor module skips repeated 30-minute threshold", () 
       }
     ],
     dbQuery: createSqlRouter([
-      {
-        match: (sql, params) => sql.includes("SELECT value FROM kv_meta WHERE key = ?") && params[0] === "long_turn_tier:codex:channel-1",
-        result: [{ value: "90" }]
-      },
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [{ key: "long_turn_tier:codex:channel-1", value: "90" }] },
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] },
       { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] }
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
     ])
   });
 
@@ -885,13 +889,16 @@ test("timeouts long turn monitor module uses configured alert interval", () => {
       }
     ],
     dbQuery: createSqlRouter([
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
+      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] },
       { match: "SELECT value FROM kv_meta WHERE key = ?", result: [] },
       {
         match: "SELECT id FROM agents WHERE discord_channel_id = ? OR discord_channel_alt = ? OR discord_channel_cc = ? OR discord_channel_cdx = ? LIMIT 1",
         result: []
       },
       { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_tier:%'", result: [] },
-      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] }
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_alert:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'", result: [] }
     ])
   });
 

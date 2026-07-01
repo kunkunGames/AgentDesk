@@ -45,6 +45,19 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
             inflights.push(rawInflights[fi]);
           }
         }
+
+        // Batch fetch kv_meta keys to avoid N+1 queries in the loop
+        var allTierKeys = agentdesk.db.query("SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_tier:%'");
+        var tierMap = {};
+        for (var tki = 0; tki < allTierKeys.length; tki++) {
+          tierMap[allTierKeys[tki].key] = allTierKeys[tki].value;
+        }
+        var allExtKeys = agentdesk.db.query("SELECT key, value FROM kv_meta WHERE key LIKE 'long_turn_watchdog_extension:%'");
+        var extMap = {};
+        for (var eki = 0; eki < allExtKeys.length; eki++) {
+          extMap[allExtKeys[eki].key] = allExtKeys[eki].value;
+        }
+
         for (var li = 0; li < inflights.length; li++) {
           var inf = inflights[li];
           if (!inf.started_at) continue;
@@ -58,10 +71,10 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
           if (currentThreshold < ALERT_INTERVAL_MINUTES) continue; // under 30min, skip
           // Check if we already alerted at this tier
           var tierKey = "long_turn_tier:" + inf.provider + ":" + inf.channel_id;
-          var lastTier = agentdesk.db.query("SELECT value FROM kv_meta WHERE key = ?", [tierKey]);
+          var lastTierVal = tierMap[tierKey];
           var lastAlertedThreshold = -1;
-          if (lastTier.length > 0) {
-            var rawLastTier = parseInt(lastTier[0].value, 10);
+          if (lastTierVal !== undefined) {
+            var rawLastTier = parseInt(lastTierVal, 10);
             if (!isNaN(rawLastTier)) {
               // Backward compatibility for pre-30-minute cadence values:
               // old tier index 0/1/2 meant 30/60/120 minutes.
@@ -76,8 +89,8 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
           var recentProgress = updatedAgeMin !== null && updatedAgeMin <= WATCHDOG_EXTENSION_RECENT_PROGRESS_MINUTES;
           var extensionLine = "";
           var extensionKey = "long_turn_watchdog_extension:" + inf.provider + ":" + inf.channel_id;
-          var lastExtensionRows = agentdesk.db.query("SELECT value FROM kv_meta WHERE key = ?", [extensionKey]);
-          var lastExtensionAt = lastExtensionRows.length > 0 ? parseInt(lastExtensionRows[0].value, 10) : 0;
+          var extVal = extMap[extensionKey];
+          var lastExtensionAt = extVal !== undefined ? parseInt(extVal, 10) : 0;
           var nowMs = Date.now();
           var extensionCooldownElapsed = !lastExtensionAt ||
             (nowMs - lastExtensionAt) >= WATCHDOG_EXTENSION_COOLDOWN_MINUTES * 60 * 1000;
@@ -90,6 +103,7 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
                   "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
                   [extensionKey, "" + nowMs]
                 );
+                extMap[extensionKey] = "" + nowMs;
                 agentdesk.log.info("[long-turn] " + (inf.channel_name || inf.channel_id) +
                   " — recent inflight progress; extended watchdog +" + WATCHDOG_EXTENSION_MINUTES + "min");
               } else {
@@ -141,6 +155,7 @@ module.exports = function attachLongTurnMonitor(timeouts, helpers) {
             "INSERT OR REPLACE INTO kv_meta (key, value) VALUES (?, ?)",
             [tierKey, "" + currentThreshold]
           );
+          tierMap[tierKey] = "" + currentThreshold;
           agentdesk.log.warn("[long-turn] " + (inf.channel_name || inf.channel_id) + " — " + Math.round(elapsedMin) + "min (" + currentThreshold + "min threshold)");
         }
         // Pre-compute active inflight keys for O(1) lookups
