@@ -6242,32 +6242,6 @@ pub(super) fn spawn_turn_bridge(
             }
         }
 
-        if let (Some(db), Some(analysis)) =
-            (None::<&crate::db::Db>, recall_feedback_analysis.as_ref())
-            && analysis.recall_count > 0
-        {
-            let stat = crate::db::memento_feedback_stats::MementoFeedbackTurnStat {
-                turn_id: turn_id.clone(),
-                stat_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
-                agent_id: memory_role_id.clone(),
-                provider: provider.as_str().to_string(),
-                recall_count: i64::try_from(analysis.recall_count).unwrap_or(i64::MAX),
-                manual_tool_feedback_count: i64::try_from(analysis.manual_feedback_count)
-                    .unwrap_or(i64::MAX),
-                manual_covered_recall_count: i64::try_from(analysis.manual_covered_recall_count)
-                    .unwrap_or(i64::MAX),
-                auto_tool_feedback_count: i64::try_from(auto_feedback_count).unwrap_or(i64::MAX),
-                covered_recall_count: i64::try_from(
-                    analysis.covered_recall_count_after(auto_feedback_count),
-                )
-                .unwrap_or(i64::MAX),
-            };
-            if let Err(error) = crate::db::memento_feedback_stats::upsert_turn_stat(db, &stat) {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::warn!("  [{ts}] ⚠ failed to persist memento feedback stats: {error}");
-            }
-        }
-
         let mut background_memory_tasks = Vec::new();
         if let Some(reflect_request) = reflect_request {
             background_memory_tasks.push(BackgroundMemoryTask {
