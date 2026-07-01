@@ -205,7 +205,7 @@ def is_scratch_file_path(path):
 def main():
     repo = _detect_repo()
     print("Fetching PRs...")
-    prs_json, gh_code = run(f"gh pr list --repo {repo} --state open --limit 50 --json number,title,headRefName,createdAt,headRefOid,body")
+    prs_json, gh_code = run(f"gh pr list --repo {repo} --state open --limit 100 --json number,title,headRefName,createdAt,headRefOid,body,baseRefName,author,labels,updatedAt")
 
     if gh_code != 0 or not prs_json:
         print("Warning: `gh` CLI not available or failed. Skipping PR analysis.")
