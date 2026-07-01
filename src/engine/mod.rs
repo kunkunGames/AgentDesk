@@ -5,7 +5,6 @@ pub mod ops;
 pub mod sql_guard;
 pub mod transition;
 pub mod transition_executor_pg;
-pub(crate) mod transition_timeout;
 
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
@@ -255,7 +254,7 @@ struct PolicyEngineRuntimeDeps {
 pub struct PolicyEngine {
     inner: Arc<Mutex<PolicyEngineInner>>,
     actor: Arc<PolicyEngineActor>,
-    /// Runtime deps for bridge ops that need PostgreSQL access.
+    /// Transitional runtime deps kept only while SQLite compatibility remains.
     runtime_deps: Arc<PolicyEngineRuntimeDeps>,
     tick_hook_in_flight: Arc<AtomicBool>,
 }
@@ -279,9 +278,9 @@ pub struct PolicyInfo {
 
 impl PolicyEngine {
     /// Create a new policy engine, initializing QuickJS and loading policies.
-    // reason: non-PG constructor consumed only by cross-module test setups
+    // reason: SQLite-path constructor consumed only by cross-module test setups
     // (server route tests build engines via new_with_pg); kept as the public
-    // no-runtime-deps entry point.
+    // non-PG entry point.
     #[allow(dead_code)]
     pub fn new(config: &Config) -> Result<Self> {
         Self::new_with_pg_and_label(config, None, "main")

@@ -85,7 +85,6 @@ pub(super) fn run_bot_spawn_recovery_and_flush_restart_reports(
                 let mut skipped_unowned = 0usize;
                 let mut skipped_sender = 0usize;
                 let mut skipped_duplicate = 0usize;
-                let mut skipped_persist_error = 0usize;
                 for (channel_id, items) in restored_queues {
                     if !matches!(
                         resolve_runtime_channel_binding_status(&http_for_tmux, channel_id).await,
@@ -94,58 +93,38 @@ pub(super) fn run_bot_spawn_recovery_and_flush_restart_reports(
                         skipped_unowned += items.len();
                         continue;
                     }
-                    // #3864: the sender filter is stateless, so it stays
-                    // out-of-actor; collect the allowed items here. The merge
-                    // into the live queue (dedup + front-insert + persist) then
-                    // happens INSIDE the mailbox actor in one serialized step,
-                    // so a live reconcile-window `Enqueue` can no longer be lost
-                    // between an out-of-actor snapshot and a blind replace.
-                    let mut allowed_items: Vec<Intervention> = Vec::with_capacity(items.len());
+                    let snapshot = mailbox_snapshot(&shared_for_tmux2, channel_id).await;
+                    let mut existing_ids = queued_message_ids(&snapshot);
+                    let mut queue = snapshot.intervention_queue;
                     for item in items {
-                        if super::is_allowed_turn_sender(
+                        if !super::is_allowed_turn_sender(
                             &allowed_bot_ids_for_restore,
                             announce_bot_id_for_restore,
                             item.author_id.get(),
                             item.author_is_bot,
                             &item.text,
                         ) {
-                            allowed_items.push(item);
-                        } else {
                             skipped_sender += 1;
+                            continue;
+                        }
+                        if enqueue_restored_intervention(&mut existing_ids, &mut queue, item) {
+                            added += 1;
+                        } else {
+                            skipped_duplicate += 1;
                         }
                     }
-                    let allowed_count = allowed_items.len();
-                    if allowed_count == 0 {
-                        continue;
-                    }
-                    let result = mailbox_merge_restored_queue_items(
+                    mailbox_replace_queue(
                         &shared_for_tmux2,
                         &provider_for_restore,
                         channel_id,
-                        allowed_items,
+                        queue,
                     )
                     .await;
-                    if let Some(error) = result.persistence_error {
-                        // Merge-persist failed → the actor rolled the in-memory
-                        // queue back. The live reconcile-window enqueue survives
-                        // (it was persisted by its own `Enqueue` and lives in the
-                        // rolled-back-to previous queue). Surface the failure;
-                        // don't miscount the restored items as duplicates.
-                        skipped_persist_error += allowed_count;
-                        let ts = chrono::Local::now().format("%H:%M:%S");
-                        tracing::warn!(
-                            "  [{ts}] 📋 FLUSH: persist failed merging {allowed_count} restored queue item(s) for channel {channel_id}: {error}"
-                        );
-                    } else {
-                        added += result.absorbed;
-                        skipped_duplicate += allowed_count - result.absorbed;
-                    }
                 }
-                let skipped =
-                    skipped_unowned + skipped_sender + skipped_duplicate + skipped_persist_error;
+                let skipped = skipped_unowned + skipped_sender + skipped_duplicate;
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
-                    "  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped}: unowned={skipped_unowned}, sender={skipped_sender}, duplicate={skipped_duplicate}, persist_error={skipped_persist_error})"
+                    "  [{ts}] 📋 FLUSH: restored {added} pending queue item(s) from disk (skipped {skipped}: unowned={skipped_unowned}, sender={skipped_sender}, duplicate={skipped_duplicate})"
                 );
             }
 

@@ -354,7 +354,7 @@ github:
     - "owner/repo-name"
   sync_interval_minutes: 10
 
-# PostgreSQL is the live datastore; old SQLite files are retired migration history.
+# PostgreSQL is the live datastore (SQLite is legacy / test-only since the #868 / #1239 cutover).
 database:
   enabled: true
   host: 127.0.0.1
@@ -666,9 +666,8 @@ agentdesk api GET /api/health                    # Public safe health summary
 agentdesk api GET /api/health/detail             # Authenticated/local detailed health
 agentdesk deploy                                 # Build workspace + promote to release
 agentdesk migrate openclaw <ARGS>                # Import OpenClaw durable state
-# `migrate postgres-cutover` was retired (production cutover landed 2026-04-19) and the
-# subcommand has been removed. Restore src/cli/migrate/postgres_cutover.rs from history
-# for an explicitly approved emergency re-cutover.
+# `migrate postgres-cutover` is retired (production cutover landed 2026-04-19); the
+# subcommand is parsed but returns an error so help/scripts don't break. Do not run it.
 agentdesk provider-cli <SUBCOMMAND>              # Provider CLI safe-migration ops (status/plan/upgrade/canary/promote/rollback/cleanup/run/resume/smoke)
 
 # Process wrappers (internal — invoked by tmux session lifecycle)
@@ -741,7 +740,7 @@ Full API documentation is available at `/api/docs` when the server is running, w
 ### Design Principles
 1. **Single Binary** — One Rust binary; PostgreSQL is the only required external runtime dependency
 2. **Single Process Per Node** — Each node is one `agentdesk dcserver` process; multinode coordination is persisted in PostgreSQL rather than a sidecar coordinator
-3. **Single Database Control Plane** — PostgreSQL holds all live state (agents, cards, dispatches, sessions, kv_meta, worker nodes, resource locks, phase evidence). The old SQLite-only test feature was retired after the #868 / #1239 / #3035 cutovers; SQLite compatibility files are migration inputs, not a live runtime backend.
+3. **Single Database Control Plane** — PostgreSQL holds all live state (agents, cards, dispatches, sessions, kv_meta, worker nodes, resource locks, phase evidence). The legacy SQLite path is gated behind a `legacy-sqlite-tests` cargo feature and only used by tests after the #868 / #1239 cutover
 4. **Hot-Reloadable Policies** — Business logic in JS, editable without rebuild
 5. **Self-Contained** — No Node.js, Python, or other runtimes needed at deploy time
 6. **Pipeline-Driven** — State machines defined in YAML, not hardcoded in Rust or JS
@@ -766,7 +765,7 @@ AgentDesk/
 │   ├── kanban.rs               # Kanban state machine + transition hooks
 │   ├── pipeline.rs             # Pipeline config resolution
 │   ├── cli/                    # CLI commands (dcserver, init, client)
-│   ├── db/                     # PostgreSQL schema helpers, migrations, typed queries
+│   ├── db/                     # SQLite schema, migrations, typed queries
 │   ├── dispatch/               # Dispatch creation, outbox, delivery
 │   ├── engine/                 # QuickJS policy engine + bridge ops
 │   │   └── ops/                # ~21 bridge namespaces (cards, kanban, dispatch, kv, http, runtime, quality, ...)

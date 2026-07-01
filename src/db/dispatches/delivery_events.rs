@@ -104,19 +104,8 @@ pub(crate) async fn insert_reserved_dispatch_delivery_event_pg(
     Ok(result.rows_affected() > 0)
 }
 
-/// Finalize the typed delivery ledger on an arbitrary connection.
-///
-/// Accepting a `&mut PgConnection` (rather than a `&PgPool`) lets the delivery
-/// guard run this typed-ledger finalize INSIDE its STEP 2 bookkeeping
-/// transaction, atomically with the `dispatch_reserving:*` delete (#3861). NOTE:
-/// the `dispatch_notified:*` dedup anchor is deliberately NOT part of that
-/// transaction — the guard commits it first, independently, in STEP 1, so a
-/// bookkeeping rollback can never take the durable anchor down with it. The
-/// previous pool-only entrypoint wrote each finalize statement independently and
-/// swallowed its error, which could leave a delivered message with no dedup key
-/// and let recovery re-send it.
-pub(crate) async fn finalize_dispatch_delivery_event_conn(
-    conn: &mut sqlx::PgConnection,
+pub(crate) async fn finalize_dispatch_delivery_event_pg(
+    pool: &PgPool,
     input: DispatchDeliveryEventFinalize<'_>,
 ) -> Result<bool, sqlx::Error> {
     let correlation_id = correlation_id(input.dispatch_id);
@@ -160,7 +149,7 @@ pub(crate) async fn finalize_dispatch_delivery_event_conn(
     .bind(input.fallback_kind)
     .bind(input.error)
     .bind(&input.result_json)
-    .execute(&mut *conn)
+    .execute(pool)
     .await?;
 
     if update.rows_affected() > 0 {
@@ -212,7 +201,7 @@ pub(crate) async fn finalize_dispatch_delivery_event_conn(
     .bind(input.fallback_kind)
     .bind(input.error)
     .bind(&input.result_json)
-    .execute(&mut *conn)
+    .execute(pool)
     .await?;
     Ok(insert.rows_affected() > 0)
 }

@@ -1463,7 +1463,6 @@ Any other message is sent to {p}.
                 None,
                 TurnKind::Foreground,
                 Vec::new(),
-                None, // #3905: text-command skill dispatch is not a voice announcement.
             )
             .await?;
             return Ok(true);

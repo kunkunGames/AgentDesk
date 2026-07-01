@@ -424,8 +424,9 @@ pub(super) async fn recent_scope_mismatch_finalized_pg_first(
 /// we still refuse to terminalize a card that was reopened between the tx
 /// commit and the transition.
 ///
-/// If PostgreSQL is unavailable this operation fails closed; the retired
-/// SQLite-era fallback is not a supported close path.
+/// In sqlite-test mode we fall back to sequential statements (the legacy
+/// `set_dispatch_status_with_backends` path) since the test fixture is the
+/// only consumer there. This matches the rest of the file.
 pub(super) async fn atomic_finalize_scope_mismatch_close_pg(
     state: &AppState,
     card_id: &str,
@@ -528,8 +529,9 @@ pub(super) async fn atomic_finalize_scope_mismatch_close_pg(
         return Ok(1);
     }
 
-    // No PG pool: fail closed. This path needs row locks and the PG
-    // transaction is the only supported implementation.
+    // No PG pool: fall back to the legacy `set_dispatch_status_with_backends`
+    // path so the sqlite test fixture exercises the same close shape. The
+    // lifecycle re-check is best-effort here (sqlite has no FOR UPDATE).
 
     {
         let _ = state;

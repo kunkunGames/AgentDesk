@@ -53,7 +53,6 @@ pub mod db_retention;
 pub mod hang_dump_cleanup;
 pub mod memento_consolidation;
 pub mod target_sweep;
-pub mod voice_cache_sweep;
 pub mod worktree_orphan_sweep;
 
 /// Weekly cadence for postgres-backed retention jobs. Long enough that a single
@@ -61,8 +60,8 @@ pub mod worktree_orphan_sweep;
 /// are never breached by more than a week.
 pub const STORAGE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Register all storage maintenance jobs. Call from server boot; tests that
-/// need to suppress scheduler startup should do so with a direct test guard.
+/// Register all storage maintenance jobs. Call from server boot under
+/// `#[cfg(not(all(test, feature = "legacy-sqlite-tests")))]`.
 ///
 /// The PG pool is optional — worktree orphan sweep degrades to a no-op when
 /// Postgres is not configured, and the db_retention job is skipped entirely

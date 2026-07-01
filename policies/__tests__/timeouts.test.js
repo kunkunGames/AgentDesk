@@ -578,25 +578,6 @@ test("timeouts active monitor module checks tmux live panes exactly", () => {
   assert.equal(policy._tmuxHasLivePane("AgentDesk-codex-project-agentdesk"), true);
 });
 
-test("timeouts active monitor deadlock section uses typed timeout facade", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    timeouts: {
-      staleWorkingSessions: [],
-      deadlockCandidates: []
-    }
-  });
-
-  policy._section_I();
-
-  assert.equal(state.queries.length, 0);
-  assert.equal(state.executions.length, 0);
-  assert.deepEqual(toPlain(state.timeoutClearFreshCounterCalls), [{ staleScanMinutes: 30 }]);
-  assert.deepEqual(toPlain(state.timeoutStaleWorkingScans), [{ graceMinutes: 10 }]);
-  assert.deepEqual(toPlain(state.timeoutDeadlockCandidateScans), [{ staleScanMinutes: 30, limit: 50 }]);
-  assert.equal(state.timeoutInactiveCounterCleanups, 1);
-  assert.equal(state.timeoutHistoryCleanupCalls.length, 1);
-});
-
 test("timeouts active monitor module treats synthetic reattach placeholders as absent", () => {
   const sessionKey = "provider:AgentDesk-codex-project-agentdesk";
   const { policy, state } = loadPolicy("policies/timeouts.js", {
@@ -617,16 +598,35 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
         updated_at: timestampMinutesAgo(95)
       }
     ],
-    timeouts: {
-      deadlockCandidates: [
-        {
-          session_key: sessionKey,
-          agent_id: "agent-1",
-          active_dispatch_id: "dispatch-1",
-          last_heartbeat: "2026-04-29 10:00:00"
-        }
-      ]
-    },
+    dbQuery: createSqlRouter([
+      {
+        match: "DELETE FROM kv_meta WHERE key IN",
+        result: []
+      },
+      {
+        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        result: []
+      },
+      {
+        match: "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat FROM sessions WHERE status IN ('turn_active', 'working')",
+        result: [
+          {
+            session_key: sessionKey,
+            agent_id: "agent-1",
+            active_dispatch_id: "dispatch-1",
+            last_heartbeat: "2026-04-29 10:00:00"
+          }
+        ]
+      },
+      {
+        match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_check:%'",
+        result: []
+      },
+      {
+        match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_history:%'",
+        result: []
+      }
+    ]),
     exec() {
       return "0\n";
     }
@@ -636,9 +636,9 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
 
   assert.equal(state.deadlockAlerts.length, 0);
   assert.equal(state.httpPosts.length, 0);
-  assert.deepEqual(toPlain(state.timeoutMarkSessionIdleCalls), [
-    { sessionKey, options: { clear_active_dispatch_id: false } }
-  ]);
+  assert.match(state.executions[1].sql, /SET status = 'idle'/);
+  assert.deepEqual(toPlain(state.executions[1].params), [sessionKey]);
+  assert.deepEqual(toPlain(state.executions[2].params), ["deadlock_check:" + sessionKey]);
 });
 
 test("timeouts active monitor opt-in review hang recovery retries stale review dispatches", () => {
@@ -663,19 +663,34 @@ test("timeouts active monitor opt-in review hang recovery retries stale review d
         dispatch_id: "dispatch-review-1"
       }
     ],
-    timeouts: {
-      deadlockCandidates: [
-        {
-          session_key: sessionKey,
-          agent_id: "agent-review",
-          active_dispatch_id: "dispatch-review-1",
-          last_heartbeat: timestampMinutesAgo(16)
-        }
-      ],
-      dispatchTypes: {
-        "dispatch-review-1": "review"
-      }
-    },
+    dbQuery: createSqlRouter([
+      { match: "DELETE FROM kv_meta WHERE key IN", result: [] },
+      {
+        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        result: []
+      },
+      {
+        match: "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat FROM sessions WHERE status IN ('turn_active', 'working')",
+        result: [
+          {
+            session_key: sessionKey,
+            agent_id: "agent-review",
+            active_dispatch_id: "dispatch-review-1",
+            last_heartbeat: timestampMinutesAgo(16)
+          }
+        ]
+      },
+      {
+        match: "SELECT dispatch_type FROM task_dispatches WHERE id = ?",
+        result: [{ dispatch_type: "review" }]
+      },
+      {
+        match: "SELECT value FROM kv_meta WHERE key = ?",
+        result: [{ value: JSON.stringify({ count: 1, ts: previousCheck }) }]
+      },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_check:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_history:%'", result: [] }
+    ]),
     exec() {
       return "0\n";
     },
@@ -688,7 +703,6 @@ test("timeouts active monitor opt-in review hang recovery retries stale review d
       };
     }
   });
-  state.kv.set("deadlock_check:" + sessionKey, JSON.stringify({ count: 1, ts: previousCheck }));
 
   policy._section_I();
 
@@ -701,8 +715,6 @@ test("timeouts active monitor opt-in review hang recovery retries stale review d
   assert.match(state.httpPosts[0].body.reason, /review hang timeout/);
   assert.equal(state.deadlockAlerts.length, 1);
   assert.match(state.deadlockAlerts[0].message, /재디스패치 완료/);
-  assert.equal(state.timeoutTerminationRecords.length, 1);
-  assert.equal(state.timeoutTerminationRecords[0].session_key, sessionKey);
 });
 
 test("timeouts active monitor review fast path leaves non-review sessions on the normal threshold", () => {
@@ -713,19 +725,30 @@ test("timeouts active monitor review fast path leaves non-review sessions on the
       review_hang_auto_recovery_enabled: true,
       review_hang_auto_recovery_stale_min: 15
     },
-    timeouts: {
-      deadlockCandidates: [
-        {
-          session_key: sessionKey,
-          agent_id: "agent-impl",
-          active_dispatch_id: "dispatch-impl-1",
-          last_heartbeat: timestampMinutesAgo(16)
-        }
-      ],
-      dispatchTypes: {
-        "dispatch-impl-1": "implementation"
-      }
-    },
+    dbQuery: createSqlRouter([
+      { match: "DELETE FROM kv_meta WHERE key IN", result: [] },
+      {
+        match: "SELECT session_key FROM sessions WHERE status IN ('turn_active', 'working') AND last_heartbeat < datetime('now', '-10 minutes')",
+        result: []
+      },
+      {
+        match: "SELECT session_key, agent_id, active_dispatch_id, last_heartbeat FROM sessions WHERE status IN ('turn_active', 'working')",
+        result: [
+          {
+            session_key: sessionKey,
+            agent_id: "agent-impl",
+            active_dispatch_id: "dispatch-impl-1",
+            last_heartbeat: timestampMinutesAgo(16)
+          }
+        ]
+      },
+      {
+        match: "SELECT dispatch_type FROM task_dispatches WHERE id = ?",
+        result: [{ dispatch_type: "implementation" }]
+      },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_check:%'", result: [] },
+      { match: "SELECT key FROM kv_meta WHERE key LIKE 'deadlock_history:%'", result: [] }
+    ]),
     exec() {
       throw new Error("non-review session under 30 minutes should not probe tmux");
     }
@@ -990,39 +1013,9 @@ test("timeouts idle-kill module calls kill-tmux API for expired idle sessions", 
   assert.match(state.httpPosts[0].body.reason, /idle 6시간 초과/);
   assert.equal(state.httpPosts[0].body.minimum_idle_minutes, 360);
   const idleSql = state.queries.map((q) => q.sql).join("\n");
-  assert.match(idleSql, /COALESCE\(s\.last_heartbeat, s\.created_at\) AS last_seen_at/);
-  assert.doesNotMatch(idleSql, /turn_lifecycle_events/);
-  assert.doesNotMatch(idleSql, /active_dispatch_id IS NOT NULL/);
+  assert.match(idleSql, /turn_lifecycle_events/);
+  assert.match(idleSql, /GREATEST\(COALESCE\(s\.last_heartbeat, s\.created_at\)/);
   assert.match(state.logs.info.join("\n"), /idle kill: agent-idle-1/);
-});
-
-test("timeouts idle-kill module leaves active-dispatch sessions to dispatch cleanup", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    config: { server_port: 8791 },
-    dbQuery: createSqlRouter([
-      { match: "SELECT id, name, name_ko, discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx FROM agents", result: [] },
-      { match: "FROM sessions WHERE provider IN ('claude', 'codex', 'qwen') AND (agent_id IS NULL OR TRIM(agent_id) = '')", result: [] },
-      {
-        match(sql) {
-          return sql.includes("WHERE status = 'idle'") &&
-            sql.includes("active_dispatch_id IS NULL") &&
-            sql.includes("INTERVAL '6 hours'");
-        },
-        result: []
-      }
-    ]),
-    httpPost() {
-      throw new Error("active-dispatch idle rows must not call kill-tmux");
-    }
-  });
-
-  policy._section_O();
-
-  assert.equal(state.httpPosts.length, 0);
-  assert.doesNotMatch(
-    state.queries.map((q) => q.sql).join("\n"),
-    /active_dispatch_id IS NOT NULL/
-  );
 });
 
 test("timeouts idle-kill module does not let zombie (already-gone tmux) rows starve live idle sessions (#2861)", () => {

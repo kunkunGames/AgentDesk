@@ -1313,9 +1313,8 @@ async fn assign_transition_to_dispatchable_pg(
     })
 }
 
-// reason: compatibility wrapper keeping `kanban_db::card_row_to_json`
-// reachable from disabled DB callers; PG paths build card JSON directly.
-// See #3034 / #3035.
+// reason: legacy-sqlite parity wrapper keeping `kanban_db::card_row_to_json`
+// reachable from the test backend; PG paths build card JSON directly. See #3034.
 
 pub(super) async fn load_card_json_pg(
     pool: &sqlx::PgPool,
@@ -2362,11 +2361,11 @@ fn force_transition_force_intent_present(body: &ForceTransitionBody) -> bool {
     body.force.unwrap_or(false) || body.cancel_dispatches.unwrap_or(false)
 }
 
-// reason: compatibility wrappers retained so the disabled DB path keeps a
-// single call surface mirroring the `_pg` route paths; the PG production paths
-// call `kanban_db::*` directly, so these read as dead in the default lib build.
-// They keep the `db::kanban_cards` `_on_conn` test helpers reachable from one
-// place. See #3034 / #3035.
+// reason: legacy-sqlite parity wrappers retained so the `legacy-sqlite-tests`
+// backend keeps a single call surface mirroring the `_pg` route paths; the PG
+// production paths call `kanban_db::*` directly, so these read as dead in the
+// default lib build. They keep the `db::kanban_cards` `_on_conn` test helpers
+// reachable from one place. See #3034.
 
 /// POST /api/kanban-cards/:id/force-transition
 ///

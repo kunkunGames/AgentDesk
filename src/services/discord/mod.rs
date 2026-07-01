@@ -1,4 +1,3 @@
-mod abandon_request_store;
 mod adk_session;
 pub(crate) mod agent_handoff;
 pub(crate) mod agentdesk_config;
@@ -11,7 +10,6 @@ mod discord_io;
 mod dispatch_policy;
 pub(crate) mod formatting;
 mod gateway;
-mod gateway_voice_queue;
 pub(crate) mod health;
 pub(crate) mod http;
 mod idle_detector;
@@ -61,7 +59,6 @@ pub(crate) mod restart_report;
 mod role_map;
 mod router;
 mod runtime_bootstrap;
-pub(in crate::services::discord) mod semantic_boundaries;
 // #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
 // + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
 pub mod runtime_store;
@@ -87,7 +84,6 @@ pub(in crate::services::discord) mod task_supervisor;
 mod terminal_ui_obligation;
 #[cfg(unix)]
 mod tmux;
-pub(in crate::services::discord) mod turn_end_wip_warning;
 #[cfg(unix)]
 pub(crate) use tmux::write_spawn_nonce;
 #[cfg(unix)]
@@ -135,8 +131,10 @@ pub(crate) use router::HeadlessTurnStartError;
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
 // #3038 S4: re-export the live-placeholder cluster type so `SharedData`
 // declarations/constructors keep the S1/S2/S3 unqualified surface.
-pub(in crate::services::discord) use shared_state::{PlaceholderState, PolicyRuntime};
-pub(in crate::services::discord) use shared_state::{QueuedPlaceholderState, RuntimeHttpCache};
+pub(in crate::services::discord) use shared_state::PlaceholderState;
+pub(in crate::services::discord) use shared_state::PolicyRuntime;
+pub(in crate::services::discord) use shared_state::QueuedPlaceholderState;
+pub(in crate::services::discord) use shared_state::RuntimeHttpCache;
 // #3038 S2: the cluster-D members were `pub(super)` on `SharedData` (visible up
 // to `crate::services`), so the group type is re-exported with that same scope.
 pub(in crate::services) use shared_state::SessionOverrideState;
@@ -194,7 +192,7 @@ use restart_report::flush_restart_reports;
 use router::handle_event;
 use settings::{
     RoleBinding, channel_upload_dir, cleanup_old_uploads, load_bot_settings,
-    load_last_session_path, resolve_role_binding, save_bot_settings,
+    load_last_remote_profile, load_last_session_path, resolve_role_binding, save_bot_settings,
     validate_bot_channel_routing_with_provider_channel,
 };
 #[cfg(unix)]
@@ -968,43 +966,6 @@ impl TmuxWatcherRegistry {
         self.remove_tmux_session_locked(&guard, tmux_session_name)
     }
 
-    pub(super) fn cancel_and_remove_channel_if_current(
-        &self,
-        channel_id: &ChannelId,
-        expected_tmux_session_name: &str,
-        expected_output_path: &str,
-        expected_cancel: &Arc<std::sync::atomic::AtomicBool>,
-    ) -> bool {
-        let guard = lock_tmux_watcher_registry();
-        let Some(tmux_session_name) = self
-            .tmux_session_by_channel
-            .get(channel_id)
-            .map(|entry| entry.clone())
-        else {
-            return false;
-        };
-        if tmux_session_name != expected_tmux_session_name {
-            return false;
-        }
-        let matches_current = self
-            .by_tmux_session
-            .get(&tmux_session_name)
-            .is_some_and(|entry| {
-                entry.output_path == expected_output_path
-                    && Arc::ptr_eq(&entry.cancel, expected_cancel)
-            });
-        if !matches_current {
-            return false;
-        }
-        let Some((_, handle)) = self.remove_locked(&guard, channel_id) else {
-            return false;
-        };
-        handle
-            .cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        true
-    }
-
     pub(super) fn iter(&self) -> dashmap::iter::Iter<'_, String, TmuxWatcherHandle> {
         self.by_tmux_session.iter()
     }
@@ -1254,38 +1215,6 @@ mod tmux_watcher_registry_restore_tests {
         registry.restore_owner_channel_for_tmux_session(tmux, channel);
         registry.clear_restored_owner_for_tmux_session(tmux);
         assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
-    }
-
-    #[test]
-    fn cancel_and_remove_channel_if_current_only_rolls_back_matching_claim() {
-        let registry = TmuxWatcherRegistry::new();
-        let tmux = "AgentDesk-codex-adk-cdx";
-        let channel = ChannelId::new(1_504_468_805_772_902_471);
-        let handle = live_watcher_handle(tmux);
-        let expected_output_path = handle.output_path.clone();
-        let expected_cancel = handle.cancel.clone();
-        registry.insert(channel, handle);
-
-        assert!(
-            !registry.cancel_and_remove_channel_if_current(
-                &channel,
-                tmux,
-                "/tmp/different.jsonl",
-                &expected_cancel
-            ),
-            "output-path mismatch must not remove a possibly newer watcher"
-        );
-        assert_eq!(registry.owner_channel_for_tmux_session(tmux), Some(channel));
-        assert!(!expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
-
-        assert!(registry.cancel_and_remove_channel_if_current(
-            &channel,
-            tmux,
-            &expected_output_path,
-            &expected_cancel
-        ));
-        assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
-        assert!(expected_cancel.load(std::sync::atomic::Ordering::Relaxed));
     }
 }
 
@@ -3136,7 +3065,7 @@ pub(in crate::services::discord) async fn drain_pending_queue_exit_placeholder_c
     (deleted, failed)
 }
 
-pub(in crate::services::discord) async fn enqueue_internal_followup(
+async fn enqueue_internal_followup(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -3397,10 +3326,11 @@ pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_
     provider: &ProviderKind,
     channel_id: ChannelId,
     inflight_state: &InflightTurnState,
-) -> MailboxEnqueueOutcome {
+) {
+    let request_owner_user_id = inflight_state.request_owner_user_id;
     let user_msg_id = inflight_state.user_msg_id;
     if user_msg_id == 0 || inflight_state.user_text.trim().is_empty() {
-        return MailboxEnqueueOutcome::default();
+        return;
     }
     let message_id = MessageId::new(user_msg_id);
     // FIX #6 (Codex P2): rebuild the retry Intervention from the persisted
@@ -3409,7 +3339,7 @@ pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_
     // context, attachments, and voice metadata. Legacy rows (pre-v9) default
     // these to None/empty/false, matching the previous behavior exactly.
     let intervention = Intervention {
-        author_id: UserId::new(inflight_state.request_owner_user_id),
+        author_id: UserId::new(request_owner_user_id),
         author_is_bot: false,
         message_id,
         source_message_ids: vec![message_id],
@@ -3422,147 +3352,7 @@ pub(in crate::services::discord) async fn mailbox_requeue_inflight_for_followup_
         pending_uploads: inflight_state.followup_pending_uploads.clone(),
         voice_announcement: inflight_state.followup_voice_announcement.clone(),
     };
-    mailbox_enqueue_intervention(shared, provider, channel_id, intervention).await
-}
-
-#[cfg(test)]
-mod followup_retry_requeue_tests {
-    use super::*;
-
-    const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
-
-    struct EnvGuard {
-        previous: Option<String>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.previous.as_deref() {
-                Some(value) => unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, value) },
-                None => unsafe { std::env::remove_var(AGENTDESK_ROOT_DIR_ENV) },
-            }
-        }
-    }
-
-    fn followup_inflight(channel_id: ChannelId, user_msg_id: MessageId) -> InflightTurnState {
-        let mut state = InflightTurnState::new(
-            ProviderKind::Claude,
-            channel_id.get(),
-            Some("adk-cc".to_string()),
-            42,
-            user_msg_id.get(),
-            user_msg_id.get() + 1,
-            "please continue".to_string(),
-            Some("session-3752".to_string()),
-            Some("AgentDesk-claude-3752".to_string()),
-            Some("/tmp/agentdesk-3752.jsonl".to_string()),
-            None,
-            0,
-        );
-        state.set_followup_requeue_context(
-            Some("reply context".to_string()),
-            true,
-            false,
-            vec!["attachment-a".to_string(), "attachment-b".to_string()],
-            None,
-        );
-        state
-    }
-
-    #[test]
-    fn pre_submit_requeue_preserves_context_and_returns_enqueue_outcome() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard {
-            previous: std::env::var(AGENTDESK_ROOT_DIR_ENV).ok(),
-        };
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path()) };
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let shared = make_shared_data_for_tests();
-            let provider = ProviderKind::Claude;
-            let channel_id = ChannelId::new(3_752_001);
-            let user_msg_id = MessageId::new(3_752_101);
-            let state = followup_inflight(channel_id, user_msg_id);
-
-            let outcome =
-                mailbox_requeue_inflight_for_followup_retry(&shared, &provider, channel_id, &state)
-                    .await;
-
-            assert!(outcome.enqueued);
-            assert!(!outcome.merged);
-            assert_eq!(outcome.refusal_reason, None);
-            assert_eq!(outcome.persistence_error, None);
-
-            let snapshot = mailbox_snapshot(&shared, channel_id).await;
-            assert_eq!(snapshot.intervention_queue.len(), 1);
-            let intervention = &snapshot.intervention_queue[0];
-            assert_eq!(intervention.author_id, UserId::new(42));
-            assert_eq!(intervention.message_id, user_msg_id);
-            assert_eq!(intervention.source_message_ids, vec![user_msg_id]);
-            assert_eq!(intervention.text, "please continue");
-            assert_eq!(intervention.reply_context.as_deref(), Some("reply context"));
-            assert!(intervention.has_reply_boundary);
-            assert!(!intervention.merge_consecutive);
-            assert_eq!(
-                intervention.pending_uploads,
-                vec!["attachment-a".to_string(), "attachment-b".to_string()]
-            );
-            assert!(intervention.voice_announcement.is_none());
-        });
-    }
-
-    #[test]
-    fn pre_submit_requeue_reports_duplicate_refusal_outcome() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .expect("shared env lock poisoned");
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard {
-            previous: std::env::var(AGENTDESK_ROOT_DIR_ENV).ok(),
-        };
-        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path()) };
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let shared = make_shared_data_for_tests();
-            let provider = ProviderKind::Claude;
-            let channel_id = ChannelId::new(3_752_002);
-            let user_msg_id = MessageId::new(3_752_102);
-            let state = followup_inflight(channel_id, user_msg_id);
-
-            let first =
-                mailbox_requeue_inflight_for_followup_retry(&shared, &provider, channel_id, &state)
-                    .await;
-            let second =
-                mailbox_requeue_inflight_for_followup_retry(&shared, &provider, channel_id, &state)
-                    .await;
-
-            assert!(first.enqueued);
-            assert!(!second.enqueued);
-            assert_eq!(
-                second.refusal_reason,
-                Some(
-                    crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdAlreadyQueued
-                )
-            );
-            let snapshot = mailbox_snapshot(&shared, channel_id).await;
-            assert_eq!(
-                snapshot.intervention_queue.len(),
-                1,
-                "duplicate pre-submit requeue must not create a second queued prompt"
-            );
-        });
-    }
+    let _ = mailbox_enqueue_intervention(shared, provider, channel_id, intervention).await;
 }
 
 async fn mailbox_cancel_soft_intervention(
@@ -3665,25 +3455,19 @@ async fn mailbox_clear_channel(
     result
 }
 
-/// #3864: in-actor merge of SIGTERM-restored disk queue items into the live
-/// mailbox queue. Replaces the out-of-actor snapshot→build→`replace_queue`
-/// read-modify-write the startup restore path used, which silently lost any
-/// live reconcile-window `Enqueue` landing between its snapshot and its
-/// replace. The actor reads, dedups, front-inserts and persists in one
-/// serialized step (cf. `mailbox_hydrate_pending_queue_from_disk`, #1683).
-async fn mailbox_merge_restored_queue_items(
+async fn mailbox_replace_queue(
     shared: &SharedData,
     provider: &ProviderKind,
     channel_id: ChannelId,
-    items: Vec<Intervention>,
-) -> HydratePendingQueueResult {
+    queue: Vec<Intervention>,
+) {
     shared
         .mailbox(channel_id)
-        .merge_restored_queue_items(
-            items,
+        .replace_queue(
+            queue,
             queue_persistence_context(shared, provider, channel_id),
         )
-        .await
+        .await;
 }
 
 /// #1683: actor-local disk -> in-memory hydration helper. The mailbox
@@ -3910,12 +3694,14 @@ pub(super) async fn kickoff_idle_queues(
             shared,
             token,
         };
-        // #2266 compatibility: kickoff_idle_queues is the other queued-dispatch
-        // entrypoint alongside `DiscordGateway::dispatch_queued_turn`. Older
-        // queued interventions may still carry a voice accepted-replay payload,
-        // so reinsert it before re-entering `handle_text_message`. New queue
-        // commits strip that payload and let dispatch claim the durable row
-        // from the readable announcement text.
+        // #2266: kickoff_idle_queues is the other queued-dispatch entrypoint
+        // alongside `DiscordGateway::dispatch_queued_turn`. It is reached by
+        // `schedule_deferred_idle_queue_kickoff` from the very same race-loss
+        // branch that embeds the voice payload into the queued Intervention,
+        // so we must reinsert the announcement into the per-process store
+        // before re-entering `handle_text_message`. Without this hook the
+        // race-loss path that takes the idle-kickoff branch would still
+        // degrade to plain text.
         if let Some(announcement) = intervention.voice_announcement.as_ref() {
             crate::voice::announce_meta::global_store()
                 .insert_accepted_replay(intervention.message_id, announcement.clone());
@@ -3939,8 +3725,6 @@ pub(super) async fn kickoff_idle_queues(
             // Foreground keeps legacy behavior.
             router::TurnKind::Foreground,
             intervention.pending_uploads.clone(),
-            // #3905: queued kickoff uses the accepted-replay store reinsert above, not gate carry-forward.
-            None,
         )
         .await
         {
